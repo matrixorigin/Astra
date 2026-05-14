@@ -70,7 +70,6 @@ cp -r .claude/skills/some-skill .astra/skills/some-skill
 |-------|---------|
 | `analyze_session` | Diagnostic analysis and debugging of astra sessions (includes stall/escalation forensics) |
 | `audit_cloud_sync` | Audit edge-cloud sync: events, learning, checkpoints, tasks |
-| `batch_parallel` | Execute independent tasks in parallel using git worktrees |
 | `evaluate_session` | Evaluate session performance metrics and optimization |
 | `optimize_prompt` | Analyze and optimize LLM prompt assembly and token usage |
 | `review_changes` | Context-aware code review with git diffs + code intelligence |

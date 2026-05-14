@@ -10,6 +10,14 @@ pub(crate) enum TuiAppEvent {
     ToolStarted {
         name: String,
         description: String,
+        tool_use_id: String,
+        parent_tool_use_id: Option<String>,
+    },
+    AgentControlStarted {
+        action: String,
+        label: String,
+        tool_use_id: String,
+        agent_id: Option<String>,
     },
     ToolCompleted {
         name: String,
@@ -18,6 +26,17 @@ pub(crate) enum TuiAppEvent {
         duration_ms: u64,
         output_summary: Option<String>,
         output: Option<String>,
+        tool_use_id: String,
+        parent_tool_use_id: Option<String>,
+    },
+    AgentControlCompleted {
+        action: String,
+        label: String,
+        status: String,
+        duration_ms: u64,
+        output: Option<String>,
+        tool_use_id: String,
+        agent_id: Option<String>,
     },
     ToolOutput {
         name: String,
@@ -27,6 +46,12 @@ pub(crate) enum TuiAppEvent {
     WaitingForModel,
     ModelResponding,
     StatusLine(String),
+    AgentLive(astra_turn_core::agent_live_event::AgentLiveEvent),
+    AgentLiveBatch(Vec<astra_turn_core::agent_live_event::AgentLiveEvent>),
+    PermissionAutoApproved {
+        tool: String,
+        reason: String,
+    },
 
     // ── Turn lifecycle ──────────────────────────────────────────────────
     TurnComplete,

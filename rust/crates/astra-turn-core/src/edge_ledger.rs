@@ -166,14 +166,58 @@ pub fn tool_content_from_ledger_entry(entry: &Value) -> String {
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let output = body.get("output").and_then(Value::as_str).unwrap_or("");
+    // If `output` is present but NOT a JSON string (e.g. some caller
+    // posted `output: {}` or `output: null`), `as_str()` returns None
+    // and we'd silently emit an empty body here. Detect that case and
+    // fall back to the object's JSON form so the model sees SOMETHING
+    // useful instead of `{"status":"ok"}`. Also logs so future
+    // regressions of this kind surface in the session's tracing.
+    let output = if let Some(s) = body.get("output").and_then(Value::as_str) {
+        s.to_string()
+    } else if let Some(v) = body.get("output") {
+        // Non-string output value — likely a bug in the poster. Log
+        // with enough fingerprint to track down the source.
+        if !v.is_null() {
+            tracing::warn!(
+                target: "astra_turn_core::edge_ledger",
+                status = %status,
+                output_type = %json_type_name(v),
+                sample = %truncate_for_log(&v.to_string(), 200),
+                "tool_result body.output was not a string — recovering as JSON blob"
+            );
+            v.to_string()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
     if output.is_empty() {
         serde_json::to_string(&json!({"status": status})).unwrap_or_else(|_| status.to_string())
     } else if matches!(status, "ok" | "success" | "completed") {
-        output.to_string()
+        output
     } else {
         format!("status={status}\n{output}")
     }
+}
+
+fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn truncate_for_log(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max_chars).collect();
+    format!("{cut}…")
 }
 
 pub fn persist_value_for_ledger_tool_result(
@@ -448,6 +492,42 @@ mod tests {
             "body": {"request_id": "c1", "status": "ok", "output": "done"}
         });
         assert_eq!(tool_content_from_ledger_entry(&entry), "done");
+    }
+
+    #[test]
+    fn tool_content_recovers_non_string_output_instead_of_emitting_empty() {
+        // Regression guard: some posters may send `output` as a JSON
+        // object or number instead of a string (e.g. the bash tool
+        // serializing a structured result body). `as_str()` returns
+        // None and the old code silently collapsed to `{"status":"ok"}`
+        // — the model then sees the tool as having produced nothing.
+        // Recover by stringifying the object so the content is at least
+        // readable.
+        let entry = json!({
+            "kind": "tool_result",
+            "body": {"status": "ok", "output": {"stdout": "hello"}}
+        });
+        let got = tool_content_from_ledger_entry(&entry);
+        assert!(
+            got.contains("hello"),
+            "non-string output must be preserved as JSON, got: {got}"
+        );
+        assert_ne!(
+            got, r#"{"status":"ok"}"#,
+            "empty-body fallback would hide real output"
+        );
+    }
+
+    #[test]
+    fn tool_content_null_output_still_reports_status() {
+        // JSON null output is explicitly "nothing to say" — keep the
+        // historical status-only fallback rather than panicking or
+        // emitting the literal string "null".
+        let entry = json!({
+            "kind": "tool_result",
+            "body": {"status": "ok", "output": null}
+        });
+        assert_eq!(tool_content_from_ledger_entry(&entry), r#"{"status":"ok"}"#);
     }
 
     #[test]

@@ -46,6 +46,8 @@ pub struct SpawnAgentContext {
     pub inherited_permissions: InheritedPermissions,
     /// Skills available to this agent (inherited by children).
     pub active_skills: Vec<String>,
+    /// Optional sink for live child token/tool/status events.
+    pub live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
 }
 
 // ─── Tool Handler ──────────────────────────────────────────────────────────
@@ -55,7 +57,9 @@ pub struct SpawnAgentContext {
 /// This is called by the tool executor when the LLM invokes spawn_agent.
 pub async fn handle_spawn_agent_tool(args: &Value, ctx: Option<&SpawnAgentContext>) -> String {
     // Parse input
-    let input: SpawnAgentInput = match serde_json::from_value(args.clone()) {
+    let input: SpawnAgentInput = match normalize_spawn_agent_args(args)
+        .and_then(|patched_args| serde_json::from_value(patched_args).map_err(|e| e.to_string()))
+    {
         Ok(i) => i,
         Err(e) => {
             return json!({
@@ -88,6 +92,7 @@ pub async fn handle_spawn_agent_tool(args: &Value, ctx: Option<&SpawnAgentContex
         working_dir: ctx.working_dir.clone(),
         inherited_permissions: Some(inherited_permissions),
         inherited_skills: ctx.active_skills.clone(),
+        live_event_sink: ctx.live_event_sink.clone(),
     };
 
     // Execute spawn
@@ -107,6 +112,51 @@ pub async fn handle_spawn_agent_tool(args: &Value, ctx: Option<&SpawnAgentContex
     }
 }
 
+fn non_empty_string(value: Option<&Value>) -> Option<&str> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn summarize_prompt(prompt: &str) -> String {
+    const MAX_DESCRIPTION_CHARS: usize = 60;
+    if prompt.chars().count() > MAX_DESCRIPTION_CHARS {
+        let truncated: String = prompt
+            .chars()
+            .take(MAX_DESCRIPTION_CHARS.saturating_sub(1))
+            .collect();
+        format!("{}…", truncated.trim_end())
+    } else {
+        prompt.to_string()
+    }
+}
+
+fn normalize_spawn_agent_args(args: &Value) -> Result<Value, String> {
+    let mut patched_args = args.clone();
+    let obj = patched_args
+        .as_object_mut()
+        .ok_or_else(|| "spawn input must be a JSON object".to_string())?;
+
+    let description = non_empty_string(obj.get("description")).map(str::to_string);
+    let prompt = non_empty_string(obj.get("prompt")).map(str::to_string);
+    if description.is_none() && prompt.is_none() {
+        return Err("missing required field `prompt` or `description`".to_string());
+    }
+
+    if description.is_none() {
+        let derived = summarize_prompt(prompt.as_deref().expect("checked above"));
+        obj.insert("description".to_string(), Value::String(derived));
+    }
+
+    if prompt.is_none() {
+        let derived = description.expect("checked above");
+        obj.insert("prompt".to_string(), Value::String(derived));
+    }
+
+    Ok(patched_args)
+}
+
 // ─── get_agent_result tool ─────────────────────────────────────────────────
 
 /// Handle get_agent_result tool call — retrieves a background child's result.
@@ -119,7 +169,7 @@ pub async fn handle_get_agent_result_tool(args: &Value, ctx: Option<&SpawnAgentC
         Some(id) => id,
         None => {
             return json!({
-                "status": "error",
+                "status": "failed",
                 "error": "Missing required field: agent_id"
             })
             .to_string();
@@ -130,7 +180,7 @@ pub async fn handle_get_agent_result_tool(args: &Value, ctx: Option<&SpawnAgentC
         Some(c) => c,
         None => {
             return json!({
-                "status": "error",
+                "status": "failed",
                 "error": "Agent spawning not available in this context."
             })
             .to_string();
@@ -147,23 +197,7 @@ pub async fn handle_get_agent_result_tool(args: &Value, ctx: Option<&SpawnAgentC
         Some(AgentStatus::Completed {
             result,
             finish_reason,
-        }) => {
-            // Surface `finish_reason` so the parent agent can
-            // distinguish normal completion from budget-exhaustion
-            // and other resumable interruptions without regex-
-            // matching the output string. A value other than
-            // `"normal"` signals "the child still had more work to
-            // do" — the parent may want to spawn a continuation or
-            // raise the budget.
-            let reason = finish_reason.as_deref().unwrap_or("normal");
-            json!({
-                "status": "completed",
-                "agent_id": agent_id,
-                "result": result,
-                "finish_reason": reason,
-            })
-            .to_string()
-        }
+        }) => render_completed_agent_result(agent_id, &result, finish_reason.as_deref()),
         Some(AgentStatus::Failed {
             error,
             finish_reason,
@@ -199,6 +233,28 @@ pub async fn handle_get_agent_result_tool(args: &Value, ctx: Option<&SpawnAgentC
             render_wait_timeout_outcome(agent_id, live_status.as_ref(), timeout)
         }
     }
+}
+
+fn render_completed_agent_result(
+    agent_id: &str,
+    result: &str,
+    finish_reason: Option<&str>,
+) -> String {
+    let reason = finish_reason.unwrap_or("normal");
+    let interrupted = reason != "normal";
+    let mut body = json!({
+        "status": if interrupted { "interrupted" } else { "completed" },
+        "agent_id": agent_id,
+        "result": result,
+        "finish_reason": reason,
+        "incomplete": interrupted,
+    });
+    if interrupted {
+        body["hint"] = json!(
+            "The child agent stopped before fully finishing. Treat this as incomplete and either continue it or report the interruption explicitly."
+        );
+    }
+    body.to_string()
 }
 
 /// Decide the outcome JSON when `wait_for_agent` returns `None`.
@@ -290,7 +346,40 @@ mod tests {
     async fn test_handle_invalid_input() {
         let args = json!({"invalid": "data"});
         let result = handle_spawn_agent_tool(&args, None).await;
-        assert!(result.contains("Invalid input"));
+        assert!(
+            result.contains("Invalid input"),
+            "expected invalid input error, got: {result}"
+        );
+        assert!(result.contains("\"status\":\"failed\""), "{result}");
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_null_and_non_object_inputs() {
+        for args in [Value::Null, json!("spawn"), json!(["prompt"])] {
+            let result = handle_spawn_agent_tool(&args, None).await;
+            assert!(result.contains("Invalid input"), "{result}");
+            assert!(result.contains("\"status\":\"failed\""), "{result}");
+        }
+    }
+
+    #[test]
+    fn spawn_arg_normalization_derives_description_from_unicode_prompt() {
+        let prompt = "审查并发安全、事件顺序、日志因果链、用户交互、失败恢复、批处理、取消传播、状态渲染、详情页滚动".repeat(2);
+        let normalized = normalize_spawn_agent_args(&json!({ "prompt": prompt })).unwrap();
+        let desc = normalized["description"].as_str().unwrap();
+        assert!(desc.ends_with('…'), "{desc}");
+        assert!(desc.chars().count() <= 60);
+        assert_eq!(normalized["prompt"].as_str().unwrap(), prompt);
+    }
+
+    #[test]
+    fn spawn_arg_normalization_never_fabricates_placeholder_prompt() {
+        let err = normalize_spawn_agent_args(&json!({ "name": "reviewer-only" }))
+            .expect_err("name alone is not enough to spawn a meaningful agent");
+        assert!(
+            err.contains("prompt") || err.contains("description"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -301,6 +390,7 @@ mod tests {
         });
         let result = handle_spawn_agent_tool(&args, None).await;
         assert!(result.contains("not available"));
+        assert!(result.contains("\"status\":\"failed\""), "{result}");
     }
 
     #[tokio::test]
@@ -308,6 +398,7 @@ mod tests {
         let args = json!({});
         let result = handle_get_agent_result_tool(&args, None).await;
         assert!(result.contains("Missing required field"));
+        assert!(result.contains("\"status\":\"failed\""), "{result}");
     }
 
     #[tokio::test]
@@ -315,6 +406,7 @@ mod tests {
         let args = json!({"agent_id": "child-1"});
         let result = handle_get_agent_result_tool(&args, None).await;
         assert!(result.contains("not available"));
+        assert!(result.contains("\"status\":\"failed\""), "{result}");
     }
 
     // ── P2: wait-timeout decision (session 8d9e5903 T10 regression) ──
@@ -380,5 +472,32 @@ mod tests {
                 "terminal state must not render as still_running: status={terminal:?} out={out}"
             );
         }
+    }
+
+    #[test]
+    fn completed_result_reports_budget_exhaustion_as_interrupted() {
+        let out = render_completed_agent_result(
+            "reviewer-tests",
+            "partial findings",
+            Some("budget_exhausted"),
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["status"], "interrupted");
+        assert_eq!(v["finish_reason"], "budget_exhausted");
+        assert_eq!(v["incomplete"], true);
+        assert!(
+            v["hint"].as_str().unwrap_or("").contains("incomplete"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn completed_result_keeps_normal_completion_completed() {
+        let out = render_completed_agent_result("reviewer-tests", "done", Some("normal"));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["finish_reason"], "normal");
+        assert_eq!(v["incomplete"], false);
+        assert!(v.get("hint").is_none(), "{out}");
     }
 }

@@ -236,9 +236,59 @@ pub(super) fn strip_xml_tags_inplace(text: &mut String) {
     }
 
     if changed {
+        // Strip orphan opening code fences left behind when a model emits
+        // ```<think>…</think>``` style leakage (MiniMax pattern). After the
+        // <think> block is removed, a lone ``` (or ```lang) at start-of-line
+        // would otherwise open a code block that swallows the rest of the
+        // answer.
+        strip_orphan_opening_fences(text);
+
         while text.contains("\n\n\n") {
             *text = text.replace("\n\n\n", "\n\n");
         }
+    }
+}
+
+/// Remove orphan opening code fences (``` or ```lang on its own line) that
+/// have no matching closing fence in the remaining text. Only fences at the
+/// very start of `text` or immediately after a newline are considered.
+fn strip_orphan_opening_fences(text: &mut String) {
+    loop {
+        // Find a candidate fence: either at byte 0 or right after '\n'.
+        let candidate = if text.starts_with("```") {
+            Some(0usize)
+        } else {
+            text.find("\n```").map(|p| p + 1)
+        };
+        let Some(start) = candidate else { break };
+
+        // Determine the line containing the fence.
+        let line_end = text[start..]
+            .find('\n')
+            .map(|p| start + p)
+            .unwrap_or(text.len());
+        let line = &text[start..line_end];
+        // Fence line must be just ``` optionally followed by a language tag
+        // (no spaces, no other content).
+        let after_ticks = &line[3..];
+        if after_ticks.contains(' ') || after_ticks.contains('`') {
+            break;
+        }
+
+        // Look for a matching closing fence after this one.
+        let search_from = line_end;
+        let has_close = text[search_from..].lines().any(|l| l.trim_end() == "```");
+        if has_close {
+            break;
+        }
+
+        // Orphan: drop the fence line (and the following newline if any).
+        let drop_end = if text.as_bytes().get(line_end) == Some(&b'\n') {
+            line_end + 1
+        } else {
+            line_end
+        };
+        text.drain(start..drop_end);
     }
 }
 
@@ -555,6 +605,32 @@ mod tests {
     fn has_open_xml_tag_handles_multiple_tags() {
         assert!(!has_open_xml_tag("<think>a</think><think>b</think>"));
         assert!(has_open_xml_tag("<think>a</think><think>still open"));
+    }
+
+    #[test]
+    fn strip_orphan_fence_after_think_leak() {
+        // MiniMax pattern: ```<think>…</think> at start, with no closing fence.
+        let mut s =
+            "```<think>The user wants me to verify the changes.\n</think>\n\nReal answer here."
+                .to_string();
+        strip_xml_tags_inplace(&mut s);
+        assert!(
+            !s.contains("```"),
+            "orphan opening fence must be removed: {s:?}"
+        );
+        assert!(
+            s.contains("Real answer here."),
+            "real content preserved: {s:?}"
+        );
+    }
+
+    #[test]
+    fn keep_fence_when_closing_present() {
+        // A proper code block must NOT be stripped.
+        let mut s = "<think>x</think>\n```rust\nfn main() {}\n```\nafter".to_string();
+        strip_xml_tags_inplace(&mut s);
+        assert!(s.contains("```rust"), "valid code fence preserved: {s:?}");
+        assert!(s.contains("```\nafter"), "closing fence preserved: {s:?}");
     }
 
     #[test]

@@ -88,6 +88,19 @@ pub fn skill_listing_section_for_edge_profile(
     ))
 }
 
+fn deferred_tools_section_for_edge_profile(
+    raw: Option<&str>,
+) -> Option<crate::prompts::PromptSection> {
+    let text = raw?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(crate::prompts::PromptSection::stable(
+        text.to_string(),
+        crate::prompts::CacheScope::Session,
+    ))
+}
+
 /// Decide whether the bridge should run its own `prefetch_memories` call.
 ///
 /// Returns `false` (= skip) when the CLI has already injected
@@ -1730,12 +1743,12 @@ impl InProcessChatTurnBridge {
             // TOML: pinned_tools additive over defaults; `-name` removes a
             // default. Loaded via the same `RuntimeConfig::load()` path as
             // `tool_selection` above (line 1451) for consistency.
-            let surface_cfg = astra_config::runtime_config::RuntimeConfig::cached()
-                .tool_surface
-                .clone();
-            let deferred_block_str = String::new();
-            let _ = surface_cfg;
-            let skill_block_str = String::new();
+            let deferred_block_str = edge_profile
+                .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT)
+                .and_then(Value::as_str)
+                .and_then(|text| deferred_tools_section_for_edge_profile(Some(text)))
+                .map(|section| section.text)
+                .unwrap_or_default();
             let pipeline_outcome = crate::turn::prompt_cache::assemble_bridge_pipeline_outcome(
                 &tool_names,
                 &edge_tools,
@@ -1752,7 +1765,7 @@ impl InProcessChatTurnBridge {
                 edge_profile.get("git_branch").and_then(Value::as_str),
                 project_context,
                 &deferred_block_str,
-                &skill_block_str,
+                "",
             );
             let system_msg = pipeline_outcome.primary_system;
             let dynamic_msg = pipeline_outcome.dynamic_system;

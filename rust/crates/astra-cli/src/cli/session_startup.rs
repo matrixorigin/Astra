@@ -49,7 +49,7 @@ pub(crate) async fn complete_session_startup(
 
     // --session-id: override with explicit session UUID
     if let Ok(sid) = std::env::var("ASTRA_CLI_SESSION_ID") {
-        state.session_id = Some(sid.clone());
+        state.set_session_id(sid.clone());
         state.pending_recovery = None;
         eprintln!(
             "{}",
@@ -242,7 +242,9 @@ pub(crate) async fn complete_session_startup(
         &pref_keys_after_pull,
     );
 
-    if let Some(token) = current_access_token(profile) {
+    let startup_token = session_runtime::fresh_access_token(api, profile).await;
+
+    if let Some(token) = startup_token.as_deref() {
         let has_models = session_runtime::check_server_has_models(api, &token).await;
         if !has_models {
             state.model = Some("⚠ none".to_string());
@@ -265,7 +267,7 @@ pub(crate) async fn complete_session_startup(
     // Proxy info now shown in startup card — no separate line needed.
 
     let mut edge_heartbeat_task: Option<tokio::task::JoinHandle<()>> = None;
-    if let Some(ref tok) = current_access_token(profile) {
+    if let Some(tok) = startup_token.as_deref() {
         edge_heartbeat_task = register_and_start_heartbeat(api, tok, profile).await;
     }
     tracer.phase("edge_heartbeat");
@@ -282,8 +284,8 @@ pub(crate) async fn complete_session_startup(
 
     tracer.phase("completions_deferred");
 
-    if let Some(token) = current_access_token(profile) {
-        initialize_multi_agent_runtime(state, api, token).await;
+    if let Some(token) = startup_token {
+        initialize_multi_agent_runtime(state, api, token, profile).await;
     }
     tracer.phase("multi_agent_runtime");
 

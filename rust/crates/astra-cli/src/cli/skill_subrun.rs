@@ -24,7 +24,8 @@ use astra_runtime::{
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::chat_turn_payload::{
-        ChatTurnBasePayloadInput, chat_turn_base_payload, set_payload_tool_results_if_non_empty,
+        ChatTurnBasePayloadInput, chat_turn_base_payload, merge_edge_profile_extensions,
+        set_payload_tool_results_if_non_empty,
     },
     turn::tool_schema_prune::openai_tool_names_from_schemas,
     turn::turn_guard::TurnGuard,
@@ -82,6 +83,11 @@ pub(crate) struct SubRunHost {
     pub(crate) progress_tx: Option<tokio::sync::mpsc::UnboundedSender<SubRunProgressEvent>>,
     /// Agent identifier used to tag progress events.
     pub(crate) agent_id: String,
+    /// Fine-grained live stream for spawned-agent UI drill-in.
+    pub(crate) stream_event_tx: Option<crate::chat_stream::StreamEventTx>,
+    /// Direct live stream sink for spawned agents; avoids buffering
+    /// child output through an unbounded channel.
+    pub(crate) stream_event_sink: Option<crate::chat_stream::SharedStreamEventSink>,
     /// Cross-turn tool output cache for edge-path dedup within this sub-run.
     pub(crate) tool_cache: super::stream_render::EdgeToolCache,
     /// Captured parent prefix, if the spawner resolved one. Consumed
@@ -222,11 +228,22 @@ impl AgenticLoopHost for SubRunHost {
         // canonical schemas so the tool-schema hash matches the parent's
         // cached prefix (cache key alignment). Falls back to live
         // registry if no frozen schemas are available.
-        let schemas_to_use = self
-            .inherited_prefix
-            .as_ref()
-            .and_then(|ip| ip.frozen_tool_schemas.clone())
-            .unwrap_or_else(|| self.all_schemas.clone());
+        let tool_surface = astra_runtime::tool_registry::surface::ToolSurface::from_runtime_config(
+            &self.all_schemas,
+        );
+        if let Some(deferred_tools_text) = tool_surface.deferred_block_text() {
+            merge_edge_profile_extensions(
+                &mut payload,
+                &json!({
+                    astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT:
+                        deferred_tools_text
+                }),
+            );
+        }
+        let schemas_to_use = resolve_subrun_schemas(
+            self.inherited_prefix.as_ref(),
+            tool_surface.pinned_schemas(),
+        );
         astra_runtime::turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools(
             &mut payload,
             schemas_to_use,
@@ -281,7 +298,8 @@ impl AgenticLoopHost for SubRunHost {
             render_policy: RenderPolicy::Silent,
             perm_manager: Some(&mut self.perm_manager),
             cancel_token: self.cancel_token.as_ref().map(|t| t.as_ref()),
-            stream_event_tx: None,
+            stream_event_tx: self.stream_event_tx.clone(),
+            stream_event_sink: self.stream_event_sink.clone(),
             approval_request_tx: None,
             skill_resolver: self.skill_resolver.clone(),
             skill_continuation: false,
@@ -538,6 +556,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             skill_resolver: self.skill_resolver.clone(),
             progress_tx: None,
             agent_id: String::new(),
+            stream_event_tx: None,
+            stream_event_sink: None,
             tool_cache: super::stream_render::EdgeToolCache::new(
                 resolved_tool_policy.max_identical_tool_calls,
             ),
@@ -601,6 +621,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             volatile_pending: Vec::new(),
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
+            session_memory_state: Default::default(),
+            session_memory_llm_params: None,
             current_session_id: None,
             current_run_id: None,
             context_manifest_pool: None,
@@ -727,6 +749,42 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
     }
 }
 
+/// Resolve the tool schema set for a sub-run.
+///
+/// Returns the parent's frozen canonical schemas when fork-prefix
+/// inheritance is active **and** schemas were captured; otherwise
+/// returns `fallback_pinned` (the live surface's T1 set).
+///
+/// When fork inheritance is configured but `frozen_tool_schemas` is
+/// `None` we **must** fall back, but we also emit a warning: the
+/// resulting `tool_schema_hash` will not align with the parent's, so
+/// the prefix-cache reuse path silently misses. Without telemetry the
+/// regression looks like "cache just doesn't help today" and lingers
+/// in production unnoticed (silent miss → wasted tokens). Loud is
+/// better than silent.
+fn resolve_subrun_schemas(
+    inherited: Option<&astra_runtime::orchestration::InheritedChildPrefix>,
+    fallback_pinned: Vec<Value>,
+) -> Vec<Value> {
+    match inherited {
+        Some(ip) => match &ip.frozen_tool_schemas {
+            Some(schemas) => schemas.clone(),
+            None => {
+                tracing::warn!(
+                    target: "astra_cli::skill_subrun",
+                    prefix_id = %ip.prefix_id,
+                    parent_run_id = %ip.parent_run_id,
+                    "fork inheritance active but frozen_tool_schemas is None; \
+                     falling back to T1 pinned schemas — child tool_schema_hash \
+                     will not match parent's, prefix-cache reuse will miss"
+                );
+                fallback_pinned
+            }
+        },
+        None => fallback_pinned,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,6 +820,8 @@ mod tests {
             skill_resolver: None,
             progress_tx: None,
             agent_id: String::new(),
+            stream_event_tx: None,
+            stream_event_sink: None,
             tool_cache: crate::stream_render::EdgeToolCache::new(3),
             inherited_prefix: None,
             fork_cache_sink: None,
@@ -791,6 +851,8 @@ mod tests {
             skill_resolver: None,
             progress_tx: Some(tx),
             agent_id: "test-agent".to_string(),
+            stream_event_tx: None,
+            stream_event_sink: None,
             tool_cache: crate::stream_render::EdgeToolCache::new(3),
             inherited_prefix: None,
             fork_cache_sink: None,
@@ -819,6 +881,8 @@ mod tests {
             skill_resolver: None,
             progress_tx: None,
             agent_id: String::new(),
+            stream_event_tx: None,
+            stream_event_sink: None,
             tool_cache: crate::stream_render::EdgeToolCache::new(3),
             inherited_prefix: None,
             fork_cache_sink: None,
@@ -906,6 +970,56 @@ mod tests {
     #[test]
     fn cli_subrun_max_cumulative_tokens_is_exactly_120_000() {
         assert_eq!(SUBRUN_MAX_CUMULATIVE_TOKENS, 120_000);
+    }
+
+    /// No fork inheritance → just use the live surface's pinned set.
+    #[test]
+    fn resolve_subrun_schemas_no_inheritance_uses_pinned_fallback() {
+        let pinned = vec![schema("read_file"), schema("write_file")];
+        let resolved = resolve_subrun_schemas(None, pinned.clone());
+        assert_eq!(resolved, pinned);
+    }
+
+    /// Fork inheritance with captured schemas → use the captured set
+    /// verbatim so the child's tool_schema_hash matches the parent's.
+    #[test]
+    fn resolve_subrun_schemas_fork_with_frozen_uses_parent_schemas() {
+        use astra_runtime::orchestration::InheritedChildPrefix;
+        let frozen = vec![schema("bash"), schema("grep")];
+        let pinned_fallback = vec![schema("read_file"), schema("write_file")];
+        let ip = InheritedChildPrefix {
+            prefix_id: "p1".into(),
+            parent_run_id: "r1".into(),
+            provider: astra_turn_core::fork_prefix::ProviderKind::Anthropic,
+            prefix_messages: Vec::new(),
+            frozen_tool_schemas: Some(frozen.clone()),
+            expected_cache_read_tokens: 0,
+        };
+        let resolved = resolve_subrun_schemas(Some(&ip), pinned_fallback);
+        assert_eq!(resolved, frozen);
+    }
+
+    /// Fork inheritance present but `frozen_tool_schemas` is None — the
+    /// degenerate case the reviewer flagged. We still have to return
+    /// *something* that lets the child run, so we fall back to the
+    /// T1 pinned set, but the helper's job is to make the regression
+    /// loud (verified by the tracing target/log assertions in the
+    /// surrounding integration; here we pin behavior + payload shape).
+    #[test]
+    fn resolve_subrun_schemas_fork_without_frozen_falls_back_to_pinned() {
+        use astra_runtime::orchestration::InheritedChildPrefix;
+        let pinned_fallback = vec![schema("read_file"), schema("write_file")];
+        let ip = InheritedChildPrefix {
+            prefix_id: "p2".into(),
+            parent_run_id: "r2".into(),
+            provider: astra_turn_core::fork_prefix::ProviderKind::Anthropic,
+            prefix_messages: Vec::new(),
+            frozen_tool_schemas: None,
+            expected_cache_read_tokens: 0,
+        };
+        let resolved = resolve_subrun_schemas(Some(&ip), pinned_fallback.clone());
+        // Behaviour: must return fallback (NOT empty, NOT inherited).
+        assert_eq!(resolved, pinned_fallback);
     }
 
     // Session c47c2dca regression guard. Same invariant as

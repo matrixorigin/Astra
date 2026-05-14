@@ -203,8 +203,8 @@ fn git_worktree_exit_when_not_in_session() {
     assert!(result.contains("Not in a worktree session"));
 }
 
-#[test]
-fn git_worktree_enter_records_rollback_handle() {
+#[tokio::test]
+async fn git_worktree_enter_records_rollback_handle() {
     let dir = init_temp_git_repo();
     let exe = ToolExecutor::new(dir.path());
     exe.journal_turn_index
@@ -221,7 +221,7 @@ fn git_worktree_enter_records_rollback_handle() {
     );
     assert!(exe.in_worktree_session(), "should enter worktree session");
 
-    let listed = exe.rollback_turn_actions(&json!({"scope": "list"}));
+    let listed = exe.rollback_turn_actions(&json!({"scope": "list"})).await;
     let listed_json: serde_json::Value = serde_json::from_str(&listed).unwrap();
     assert_eq!(listed_json["total_git_worktree_entries"].as_u64(), Some(1));
 

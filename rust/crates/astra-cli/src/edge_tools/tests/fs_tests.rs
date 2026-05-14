@@ -272,8 +272,8 @@ fn rollback_file_edits_restores_git_checkout_file() {
     assert_eq!(std::fs::read_to_string(&tracked).unwrap(), "working tree\n");
 }
 
-#[test]
-fn rollback_turn_actions_reverts_file_edits_when_no_db_snapshots_exist() {
+#[tokio::test]
+async fn rollback_turn_actions_reverts_file_edits_when_no_db_snapshots_exist() {
     let dir = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(dir.path());
     executor
@@ -286,7 +286,9 @@ fn rollback_turn_actions_reverts_file_edits_when_no_db_snapshots_exist() {
         "got: {write_result}"
     );
 
-    let rollback = executor.rollback_turn_actions(&json!({"scope": "current_turn"}));
+    let rollback = executor
+        .rollback_turn_actions(&json!({"scope": "current_turn"}))
+        .await;
     let rollback_json: serde_json::Value = serde_json::from_str(&rollback).unwrap();
     assert_eq!(
         rollback_json["success"].as_bool(),
@@ -313,8 +315,8 @@ fn rollback_turn_actions_reverts_file_edits_when_no_db_snapshots_exist() {
     assert!(!dir.path().join("mixed.txt").exists());
 }
 
-#[test]
-fn rollback_turn_actions_list_combines_file_and_db_journals() {
+#[tokio::test]
+async fn rollback_turn_actions_list_combines_file_and_db_journals() {
     let dir = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(dir.path());
 
@@ -324,7 +326,9 @@ fn rollback_turn_actions_list_combines_file_and_db_journals() {
         "got: {write_result}"
     );
 
-    let rollback = executor.rollback_turn_actions(&json!({"scope": "list"}));
+    let rollback = executor
+        .rollback_turn_actions(&json!({"scope": "list"}))
+        .await;
     let rollback_json: serde_json::Value = serde_json::from_str(&rollback).unwrap();
     assert_eq!(
         rollback_json["success"].as_bool(),
@@ -350,8 +354,8 @@ fn rollback_turn_actions_list_combines_file_and_db_journals() {
     );
 }
 
-#[test]
-fn rollback_turn_actions_reapplies_recorded_git_stash_for_current_turn() {
+#[tokio::test]
+async fn rollback_turn_actions_reapplies_recorded_git_stash_for_current_turn() {
     let dir = init_temp_git_repo();
     let tracked = dir.path().join("tracked.txt");
     let executor = ToolExecutor::new(dir.path());
@@ -371,11 +375,15 @@ fn rollback_turn_actions_reapplies_recorded_git_stash_for_current_turn() {
         "committed\n"
     );
 
-    let listed = executor.rollback_turn_actions(&json!({"scope": "list"}));
+    let listed = executor
+        .rollback_turn_actions(&json!({"scope": "list"}))
+        .await;
     let listed_json: serde_json::Value = serde_json::from_str(&listed).unwrap();
     assert_eq!(listed_json["total_git_stash_entries"].as_u64(), Some(1));
 
-    let rollback = executor.rollback_turn_actions(&json!({"scope": "current_turn"}));
+    let rollback = executor
+        .rollback_turn_actions(&json!({"scope": "current_turn"}))
+        .await;
     let rollback_json: serde_json::Value = serde_json::from_str(&rollback).unwrap();
     assert_eq!(
         rollback_json["success"].as_bool(),
@@ -393,7 +401,9 @@ fn rollback_turn_actions_reapplies_recorded_git_stash_for_current_turn() {
         "working tree\n"
     );
 
-    let listed_after = executor.rollback_turn_actions(&json!({"scope": "list"}));
+    let listed_after = executor
+        .rollback_turn_actions(&json!({"scope": "list"}))
+        .await;
     let listed_after_json: serde_json::Value = serde_json::from_str(&listed_after).unwrap();
     assert_eq!(
         listed_after_json["total_git_stash_entries"].as_u64(),
@@ -401,8 +411,8 @@ fn rollback_turn_actions_reapplies_recorded_git_stash_for_current_turn() {
     );
 }
 
-#[test]
-fn rollback_turn_actions_reverts_recorded_git_commit_for_current_turn() {
+#[tokio::test]
+async fn rollback_turn_actions_reverts_recorded_git_commit_for_current_turn() {
     let dir = init_temp_git_repo();
     let tracked = dir.path().join("tracked.txt");
     let executor = ToolExecutor::new(dir.path());
@@ -418,11 +428,15 @@ fn rollback_turn_actions_reverts_recorded_git_commit_for_current_turn() {
         commit.output
     );
 
-    let listed = executor.rollback_turn_actions(&json!({"scope": "list"}));
+    let listed = executor
+        .rollback_turn_actions(&json!({"scope": "list"}))
+        .await;
     let listed_json: serde_json::Value = serde_json::from_str(&listed).unwrap();
     assert_eq!(listed_json["total_git_commit_entries"].as_u64(), Some(1));
 
-    let rollback = executor.rollback_turn_actions(&json!({"scope": "current_turn"}));
+    let rollback = executor
+        .rollback_turn_actions(&json!({"scope": "current_turn"}))
+        .await;
     let rollback_json: serde_json::Value = serde_json::from_str(&rollback).unwrap();
     assert_eq!(
         rollback_json["success"].as_bool(),
@@ -440,7 +454,9 @@ fn rollback_turn_actions_reverts_recorded_git_commit_for_current_turn() {
         "committed\n"
     );
 
-    let listed_after = executor.rollback_turn_actions(&json!({"scope": "list"}));
+    let listed_after = executor
+        .rollback_turn_actions(&json!({"scope": "list"}))
+        .await;
     let listed_after_json: serde_json::Value = serde_json::from_str(&listed_after).unwrap();
     assert_eq!(
         listed_after_json["total_git_commit_entries"].as_u64(),
@@ -448,8 +464,8 @@ fn rollback_turn_actions_reverts_recorded_git_commit_for_current_turn() {
     );
 }
 
-#[test]
-fn rollback_turn_actions_refuses_git_commit_when_head_tail_moved() {
+#[tokio::test]
+async fn rollback_turn_actions_refuses_git_commit_when_head_tail_moved() {
     let dir = init_temp_git_repo();
     let tracked = dir.path().join("tracked.txt");
     let executor = ToolExecutor::new(dir.path());
@@ -477,7 +493,9 @@ fn rollback_turn_actions_refuses_git_commit_when_head_tail_moved() {
         String::from_utf8_lossy(&later_commit.stderr)
     );
 
-    let rollback = executor.rollback_turn_actions(&json!({"scope": "current_turn"}));
+    let rollback = executor
+        .rollback_turn_actions(&json!({"scope": "current_turn"}))
+        .await;
     let rollback_json: serde_json::Value = serde_json::from_str(&rollback).unwrap();
     assert_eq!(
         rollback_json["success"].as_bool(),
@@ -495,13 +513,15 @@ fn rollback_turn_actions_refuses_git_commit_when_head_tail_moved() {
         "later head\n"
     );
 
-    let listed = executor.rollback_turn_actions(&json!({"scope": "list"}));
+    let listed = executor
+        .rollback_turn_actions(&json!({"scope": "list"}))
+        .await;
     let listed_json: serde_json::Value = serde_json::from_str(&listed).unwrap();
     assert_eq!(listed_json["total_git_commit_entries"].as_u64(), Some(1));
 }
 
-#[test]
-fn rollback_turn_actions_removes_recorded_git_worktree_for_current_turn() {
+#[tokio::test]
+async fn rollback_turn_actions_removes_recorded_git_worktree_for_current_turn() {
     let dir = init_temp_git_repo();
     let executor = ToolExecutor::new(dir.path());
     executor
@@ -528,11 +548,15 @@ fn rollback_turn_actions_removes_recorded_git_worktree_for_current_turn() {
         .expect("recorded worktree path");
     assert!(recorded_path.exists(), "worktree should exist");
 
-    let listed = executor.rollback_turn_actions(&json!({"scope": "list"}));
+    let listed = executor
+        .rollback_turn_actions(&json!({"scope": "list"}))
+        .await;
     let listed_json: serde_json::Value = serde_json::from_str(&listed).unwrap();
     assert_eq!(listed_json["total_git_worktree_entries"].as_u64(), Some(1));
 
-    let rollback = executor.rollback_turn_actions(&json!({"scope": "current_turn"}));
+    let rollback = executor
+        .rollback_turn_actions(&json!({"scope": "current_turn"}))
+        .await;
     let rollback_json: serde_json::Value = serde_json::from_str(&rollback).unwrap();
     assert_eq!(
         rollback_json["success"].as_bool(),
@@ -547,7 +571,9 @@ fn rollback_turn_actions_removes_recorded_git_worktree_for_current_turn() {
     );
     assert!(!recorded_path.exists(), "worktree should be removed");
 
-    let listed_after = executor.rollback_turn_actions(&json!({"scope": "list"}));
+    let listed_after = executor
+        .rollback_turn_actions(&json!({"scope": "list"}))
+        .await;
     let listed_after_json: serde_json::Value = serde_json::from_str(&listed_after).unwrap();
     assert_eq!(
         listed_after_json["total_git_worktree_entries"].as_u64(),
@@ -555,8 +581,8 @@ fn rollback_turn_actions_removes_recorded_git_worktree_for_current_turn() {
     );
 }
 
-#[test]
-fn rollback_turn_actions_refuses_dirty_recorded_git_worktree() {
+#[tokio::test]
+async fn rollback_turn_actions_refuses_dirty_recorded_git_worktree() {
     let dir = init_temp_git_repo();
     let executor = ToolExecutor::new(dir.path());
     executor
@@ -583,7 +609,9 @@ fn rollback_turn_actions_refuses_dirty_recorded_git_worktree() {
         .expect("recorded worktree path");
     std::fs::write(recorded_path.join("dirty.txt"), "dirty\n").expect("dirty worktree");
 
-    let rollback = executor.rollback_turn_actions(&json!({"scope": "current_turn"}));
+    let rollback = executor
+        .rollback_turn_actions(&json!({"scope": "current_turn"}))
+        .await;
     let rollback_json: serde_json::Value = serde_json::from_str(&rollback).unwrap();
     assert_eq!(
         rollback_json["success"].as_bool(),
@@ -610,10 +638,12 @@ fn rollback_turn_actions_refuses_dirty_recorded_git_worktree() {
     );
 }
 
-#[test]
-fn rollback_turn_actions_turn_scope_requires_turn_index() {
+#[tokio::test]
+async fn rollback_turn_actions_turn_scope_requires_turn_index() {
     let executor = test_executor();
-    let rollback = executor.rollback_turn_actions(&json!({"scope": "turn"}));
+    let rollback = executor
+        .rollback_turn_actions(&json!({"scope": "turn"}))
+        .await;
     let rollback_json: serde_json::Value = serde_json::from_str(&rollback).unwrap();
     assert_eq!(
         rollback_json["success"].as_bool(),

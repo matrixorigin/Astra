@@ -402,6 +402,31 @@ fn categorize_reference(line: &str, _symbol: &str) -> &'static str {
     "usage"
 }
 
+/// Commands queued by the tool executor for the TUI's BackgroundTaskRegistry.
+pub(crate) enum BgTaskCommand {
+    SpawnShell {
+        command: String,
+        description: String,
+        reply: tokio::sync::oneshot::Sender<String>,
+    },
+    Kill {
+        task_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    GetOutput {
+        task_id: String,
+        tail_bytes: usize,
+        reply: tokio::sync::oneshot::Sender<Result<(String, u64), String>>,
+    },
+    /// Returns whether the task has reached terminal status. Used by
+    /// `task(action='output', block=true)` so an empty-output task that
+    /// completed doesn't spin until the timeout.
+    IsTerminal {
+        task_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<bool, String>>,
+    },
+}
+
 pub struct ToolExecutor {
     pub project_root: PathBuf,
     /// Cloud API base URL — used to proxy memory tool calls through the server
@@ -493,6 +518,15 @@ pub struct ToolExecutor {
     worktree_session: std::sync::Mutex<Option<WorktreeSession>>,
     /// In-memory task manager for the current session.
     task_manager: std::sync::Arc<task_mgmt::TaskManager>,
+    /// Command queue for background task operations. Drained by the
+    /// TUI event loop each tick. Allows the tool executor (which runs
+    /// inside the agentic loop) to spawn/kill background tasks without
+    /// owning the registry directly.
+    ///
+    /// `None` when no TUI/REPL is attached — in that case background
+    /// task actions fail fast with a clear error rather than pushing
+    /// to a queue nobody drains (which would hang the LLM turn forever).
+    pub(crate) bg_task_commands: Option<std::sync::Arc<std::sync::Mutex<Vec<BgTaskCommand>>>>,
     /// Optional agent spawning context for the `spawn_agent` tool.
     pub spawn_context: Option<agent_spawning::SpawnAgentContext>,
     /// Optional shared context cache for cross-agent knowledge sharing.
@@ -607,7 +641,8 @@ impl ToolExecutor {
             )),
             journal_turn_index: std::sync::atomic::AtomicU32::new(0),
             worktree_session: std::sync::Mutex::new(None),
-            task_manager: std::sync::Arc::new(task_mgmt::TaskManager::new()),
+            task_manager: std::sync::Arc::new(task_mgmt::TaskManager::in_memory()),
+            bg_task_commands: None,
             spawn_context: None,
             context_cache: None,
             agent_id: None,
@@ -982,6 +1017,14 @@ impl ToolExecutor {
         self
     }
 
+    pub fn with_bg_task_commands(
+        mut self,
+        commands: std::sync::Arc<std::sync::Mutex<Vec<BgTaskCommand>>>,
+    ) -> Self {
+        self.bg_task_commands = Some(commands);
+        self
+    }
+
     /// Configure cloud proxy for memory tool calls.
     pub fn with_cloud(mut self, base: impl Into<String>, token: impl Into<String>) -> Self {
         self.cloud_base = Some(base.into());
@@ -1002,10 +1045,30 @@ impl ToolExecutor {
 
     // ─── Task management methods (delegated to task_mgmt module) ────────────
 
+    fn task_output_success(output: &str) -> bool {
+        if output.starts_with("Error:") {
+            return false;
+        }
+        // task_mgmt now prefixes success responses with a human-readable
+        // summary line followed by the JSON body (see `prefix_summary`).
+        // Strip up to the first `{` so JSON parsing still works for
+        // the old-format (pure JSON) and new-format (summary + JSON)
+        // responses. Pre-prefix responses still work — `find('{')` on
+        // a pure-JSON string returns 0 and we parse the whole string.
+        let json_body = match output.find('{') {
+            Some(pos) => &output[pos..],
+            None => return false,
+        };
+        serde_json::from_str::<Value>(json_body)
+            .ok()
+            .and_then(|value| value.get("success").and_then(Value::as_bool))
+            .unwrap_or(false)
+    }
+
     async fn task_create(&self, args: &Value) -> String {
-        let snapshot = self.task_manager.snapshot_state();
+        let snapshot = self.task_manager.snapshot_state().await;
         let output = self.task_manager.create(args).await;
-        if !output.starts_with("Error:") {
+        if Self::task_output_success(&output) {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
@@ -1023,14 +1086,9 @@ impl ToolExecutor {
         self.task_manager.get(args).await
     }
     async fn task_update(&self, args: &Value) -> String {
-        let snapshot = self.task_manager.snapshot_state();
+        let snapshot = self.task_manager.snapshot_state().await;
         let output = self.task_manager.update(args).await;
-        if !output.starts_with("Error:")
-            && serde_json::from_str::<Value>(&output)
-                .ok()
-                .and_then(|value| value.get("success").and_then(Value::as_bool))
-                .unwrap_or(false)
-        {
+        if Self::task_output_success(&output) {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
@@ -1044,14 +1102,9 @@ impl ToolExecutor {
         output
     }
     async fn task_stop(&self, args: &Value) -> String {
-        let snapshot = self.task_manager.snapshot_state();
+        let snapshot = self.task_manager.snapshot_state().await;
         let output = self.task_manager.stop(args).await;
-        if !output.starts_with("Error:")
-            && serde_json::from_str::<Value>(&output)
-                .ok()
-                .and_then(|value| value.get("success").and_then(Value::as_bool))
-                .unwrap_or(false)
-        {
+        if Self::task_output_success(&output) {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
@@ -1063,6 +1116,186 @@ impl ToolExecutor {
             );
         }
         output
+    }
+
+    async fn task_background_shell(&self, args: &Value) -> String {
+        let Some(ref bg_commands) = self.bg_task_commands else {
+            return "Error: background task subsystem not active in this session (no TUI/REPL attached). \
+                    Use the regular `bash` tool for foreground shell commands, or run inside the interactive REPL \
+                    (`astra`) to access background_shell."
+                .to_string();
+        };
+        let command = match args.get("command").and_then(Value::as_str) {
+            Some(c) if !c.trim().is_empty() => c.to_string(),
+            _ => return "Error: 'command' is required for background_shell".to_string(),
+        };
+        let description = args
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or(&command)
+            .to_string();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut cmds = bg_commands.lock().unwrap();
+            cmds.push(BgTaskCommand::SpawnShell {
+                command,
+                description,
+                reply: tx,
+            });
+        }
+        match rx.await {
+            Ok(id) => format!(
+                "Background task started: {id}\nUse task(action='output', task_id='{id}') to check progress or task(action='kill', task_id='{id}') to stop."
+            ),
+            Err(_) => "Error: background task registry not available".to_string(),
+        }
+    }
+
+    async fn task_background_agent(&self, args: &Value) -> String {
+        let prompt = match args.get("prompt").and_then(Value::as_str) {
+            Some(p) if !p.trim().is_empty() => p.to_string(),
+            _ => return "Error: 'prompt' is required for background_agent".to_string(),
+        };
+        let description = args
+            .get("description")
+            .and_then(Value::as_str)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| astra_text_utils::str_preview::truncate_line(&prompt, 60));
+
+        let Some(ctx) = self.spawn_context.as_ref() else {
+            return "Error: background_agent requires agent spawning context; use the spawn_agent tool when available".to_string();
+        };
+
+        let mut spawn_args = json!({
+            "description": description,
+            "prompt": prompt,
+            "agent_type": args
+                .get("agent_type")
+                .and_then(Value::as_str)
+                .unwrap_or("general-purpose"),
+            "background": true,
+        });
+        if let Some(model) = args.get("model").and_then(Value::as_str) {
+            spawn_args["model"] = json!(model);
+        }
+
+        agent_spawning::handle_spawn_agent_tool(&spawn_args, Some(ctx)).await
+    }
+
+    async fn task_output(&self, args: &Value) -> String {
+        let Some(ref bg_commands) = self.bg_task_commands else {
+            return "Error: background task subsystem not active in this session (no TUI/REPL attached). \
+                    `task(action='output')` only works for tasks spawned via `task(action='background_shell')` \
+                    inside the interactive REPL."
+                .to_string();
+        };
+        let task_id = match args.get("task_id").and_then(Value::as_str) {
+            Some(id) => id.to_string(),
+            None => return "Error: 'task_id' is required for output".to_string(),
+        };
+        let block = args.get("block").and_then(Value::as_bool).unwrap_or(true);
+        let timeout_ms = args
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(30_000)
+            .min(300_000);
+
+        if block {
+            let deadline =
+                tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
+            loop {
+                // Check terminal status first — a task that completed
+                // with no output must exit the loop, not spin to timeout.
+                let (status_tx, status_rx) = tokio::sync::oneshot::channel();
+                {
+                    let mut cmds = bg_commands.lock().unwrap();
+                    cmds.push(BgTaskCommand::IsTerminal {
+                        task_id: task_id.clone(),
+                        reply: status_tx,
+                    });
+                }
+                let is_terminal = match status_rx.await {
+                    Ok(Ok(t)) => t,
+                    Ok(Err(e)) => return format!("Error: {e}"),
+                    Err(_) => return "Error: background task registry not available".to_string(),
+                };
+
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                {
+                    let mut cmds = bg_commands.lock().unwrap();
+                    cmds.push(BgTaskCommand::GetOutput {
+                        task_id: task_id.clone(),
+                        tail_bytes: 8192,
+                        reply: tx,
+                    });
+                }
+                match rx.await {
+                    Ok(Ok((output, total_bytes))) => {
+                        if is_terminal
+                            || !output.is_empty()
+                            || tokio::time::Instant::now() >= deadline
+                        {
+                            return format!(
+                                "<task_output task_id=\"{task_id}\" total_bytes=\"{total_bytes}\" terminal=\"{is_terminal}\">\n{output}\n</task_output>"
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => return format!("Error: {e}"),
+                    Err(_) => return "Error: background task registry not available".to_string(),
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return format!(
+                        "<task_output task_id=\"{task_id}\" status=\"timeout\">\nTask still running after {timeout_ms}ms.\n</task_output>"
+                    );
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+        } else {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            {
+                let mut cmds = bg_commands.lock().unwrap();
+                cmds.push(BgTaskCommand::GetOutput {
+                    task_id: task_id.clone(),
+                    tail_bytes: 8192,
+                    reply: tx,
+                });
+            }
+            match rx.await {
+                Ok(Ok((output, total_bytes))) => {
+                    format!(
+                        "<task_output task_id=\"{task_id}\" total_bytes=\"{total_bytes}\">\n{output}\n</task_output>"
+                    )
+                }
+                Ok(Err(e)) => format!("Error: {e}"),
+                Err(_) => "Error: background task registry not available".to_string(),
+            }
+        }
+    }
+
+    async fn task_kill_bg(&self, args: &Value) -> String {
+        let Some(ref bg_commands) = self.bg_task_commands else {
+            return "Error: background task subsystem not active in this session (no TUI/REPL attached). \
+                    Nothing to kill — background_shell is unavailable outside the interactive REPL."
+                .to_string();
+        };
+        let task_id = match args.get("task_id").and_then(Value::as_str) {
+            Some(id) => id.to_string(),
+            None => return "Error: 'task_id' is required for kill".to_string(),
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut cmds = bg_commands.lock().unwrap();
+            cmds.push(BgTaskCommand::Kill {
+                task_id: task_id.clone(),
+                reply: tx,
+            });
+        }
+        match rx.await {
+            Ok(Ok(())) => format!("Background task {task_id} killed."),
+            Ok(Err(e)) => format!("Error: {e}"),
+            Err(_) => "Error: background task registry not available".to_string(),
+        }
     }
 
     /// Sleep for a specified duration without holding a shell process.
@@ -1147,7 +1380,7 @@ impl ToolExecutor {
 
     // ── Session summary: structured overview of current session ────────────────
 
-    fn render_session_summary(&self) -> String {
+    async fn render_session_summary(&self) -> String {
         let session_id = match self.active_session_id() {
             Some(s) if !s.trim().is_empty() => s,
             _ => return "Error: no active session.".to_string(),
@@ -1215,7 +1448,7 @@ impl ToolExecutor {
         }
         // Task status nudge: if there are active tasks, remind the
         // agent to update them (Claude Code parity: proactive nudge).
-        let tasks = self.task_manager.snapshot();
+        let tasks = self.task_manager.snapshot().await;
         let active_tasks: Vec<_> = tasks
             .iter()
             .filter(|t| t.status == "pending" || t.status == "in_progress")
@@ -1999,8 +2232,8 @@ impl ToolExecutor {
                     }
                 }
                 "rollback_database_snapshots" => self.rollback_database_snapshots(args),
-                "rollback_session_state" => self.rollback_session_state(args),
-                "rollback_turn_actions" => self.rollback_turn_actions(args),
+                "rollback_session_state" => self.rollback_session_state(args).await,
+                "rollback_turn_actions" => self.rollback_turn_actions(args).await,
                 "str_replace" => {
                     // edits array routes to multi_edit handler
                     if args.get("edits").and_then(Value::as_array).is_some() {
@@ -2175,9 +2408,32 @@ impl ToolExecutor {
                 "agent" => {
                     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
                     match action {
+                        // `delegate` was a placeholder action that returned a
+                        // fake-success acknowledgement string while spawning
+                        // nothing — the CLI never wired a delegation engine,
+                        // and `agentic_delegate_interception` only matches on
+                        // tool NAME == "delegate", so `agent(action='delegate')`
+                        // was never intercepted and never spawned a sub-agent.
+                        // Models trusted the "Delegation request acknowledged"
+                        // string and reported success to the user (observed in
+                        // session f3c4b457: 5 fake delegations in 0 ms each).
+                        //
+                        // Defense in depth: the schema enum no longer advertises
+                        // "delegate", so this branch is unreachable from the
+                        // model. Kept for two reasons: (1) old session journals
+                        // may replay tool_calls with the legacy action; (2) a
+                        // sharp Error: result is far better than the silent
+                        // success the placeholder produced. The error names
+                        // `agent.spawn` so the model has a working alternative
+                        // — one assistant message with N parallel spawns +
+                        // run_in_background:true is the correct fan-out shape.
                         "delegate" => {
-                            "Delegation request acknowledged. The delegation engine will execute \
-                             this request and provide results in the next round."
+                            "Error: agent.delegate has been removed because it had no execution \
+                             backend in CLI mode and silently no-op'd. Use agent(action='spawn', \
+                             description='...', prompt='...', run_in_background: true) instead. \
+                             To run N sub-agents in parallel, emit N spawn calls in a single \
+                             assistant message and then `agent(action='get_result', agent_id=...)` \
+                             on each."
                                 .to_string()
                         }
                         "run_chain" => {
@@ -2228,7 +2484,7 @@ impl ToolExecutor {
                             agent_messaging::handle_send_message_tool(args, ctx.as_ref()).await
                         }
                         _ => format!(
-                            "Error: unknown agent action '{action}'. Use one of: delegate, run_chain, spawn, get_result, send_message"
+                            "Error: unknown agent action '{action}'. Use one of: spawn, get_result, run_chain, send_message"
                         ),
                     }
                 }
@@ -2244,7 +2500,7 @@ impl ToolExecutor {
                         "ask_user" => self.ask_user(args),
                         "sleep" => self.sleep_tool(args).await,
                         "timeline" => self.render_session_timeline(args),
-                        "summary" => self.render_session_summary(),
+                        "summary" => self.render_session_summary().await,
                         "history" => self.render_session_history(args),
                         "suppress_memory" => self.suppress_memory(args),
                         "unsuppress_memory" => self.unsuppress_memory(args),
@@ -2264,8 +2520,12 @@ impl ToolExecutor {
                         "get" => self.task_get(args).await,
                         "update" => self.task_update(args).await,
                         "stop" => self.task_stop(args).await,
-                        "" => "Missing required parameter: action. Use: create, update, list, get, stop".to_string(),
-                        other => format!("Unknown task action: '{other}'. Use: create, update, list, get, stop"),
+                        "background_shell" => self.task_background_shell(args).await,
+                        "background_agent" => self.task_background_agent(args).await,
+                        "output" => self.task_output(args).await,
+                        "kill" => self.task_kill_bg(args).await,
+                        "" => "Missing required parameter: action. Use: create, update, list, get, stop, background_shell, output, kill".to_string(),
+                        other => format!("Unknown task action: '{other}'. Use: create, update, list, get, stop, background_shell, output, kill"),
                     }
                 }
                 // Legacy separate task_* names (backward compat)
@@ -2324,7 +2584,7 @@ impl ToolExecutor {
                 "env" => self.env_tool(args),
                 "notebook_edit" => self.notebook_edit(args),
                 "config" => self.config_tool(args),
-                "brief" => self.brief(args),
+                "brief" => self.brief(args).await,
                 "context_analysis" => self.context_analysis(args),
                 _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
                 _ => {
@@ -2561,8 +2821,8 @@ impl ToolExecutor {
                                 || worktree_entries_added > 0
                                 || session_state_entries_added > 0
                             {
-                                let rollback_output =
-                                    self.rollback_turn_actions(&serde_json::json!({
+                                let rollback_output = self
+                                    .rollback_turn_actions(&serde_json::json!({
                                         "scope": "turn",
                                         "turn_index": rollback_turn_index,
                                         "file_after_sequence": file_checkpoint,
@@ -2571,7 +2831,8 @@ impl ToolExecutor {
                                         "commit_after_sequence": commit_checkpoint,
                                         "worktree_after_sequence": worktree_checkpoint,
                                         "session_state_after_sequence": session_state_checkpoint,
-                                    }));
+                                    }))
+                                    .await;
                                 rollback = Some(
                                     serde_json::from_str(&rollback_output).unwrap_or_else(
                                         |error| {
@@ -2859,6 +3120,67 @@ mod tests {
     // github, memory, session, agent, lsp, symbols. CLI users hitting
     // `tool_search(select:github)` got `missing:["github"]` and the
     // entire deferred-activation flow was dead on CLI.
+
+    /// P0 regression: when ToolExecutor is constructed without a
+    /// wired `bg_task_commands` queue (no TUI to drain), the
+    /// background_shell action MUST fail fast with a clear error
+    /// instead of pushing to an orphan queue and hanging on rx.await.
+    #[tokio::test]
+    async fn task_background_shell_fails_fast_when_unwired() {
+        let executor = test_executor();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            executor.task_background_shell(&serde_json::json!({
+                "command": "echo hi",
+                "description": "test"
+            })),
+        )
+        .await
+        .expect("should fail fast, not hang");
+        assert!(
+            result.contains("not available")
+                || result.contains("not active")
+                || result.contains("Error"),
+            "should fail fast, not hang. got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_kill_bg_fails_fast_when_unwired() {
+        let executor = test_executor();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            executor.task_kill_bg(&serde_json::json!({"task_id": "bg-shell-1"})),
+        )
+        .await
+        .expect("should fail fast, not hang");
+        assert!(
+            result.contains("not available")
+                || result.contains("not active")
+                || result.contains("Error"),
+            "should fail fast, not hang. got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_output_fails_fast_when_unwired() {
+        let executor = test_executor();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            executor.task_output(&serde_json::json!({
+                "task_id": "bg-shell-1",
+                "block": false
+            })),
+        )
+        .await
+        .expect("should fail fast, not hang");
+        assert!(
+            result.contains("not available")
+                || result.contains("not active")
+                || result.contains("Error"),
+            "should fail fast, not hang. got: {result}"
+        );
+    }
 
     #[tokio::test]
     async fn tool_search_select_github_returns_schema_on_cli_path() {

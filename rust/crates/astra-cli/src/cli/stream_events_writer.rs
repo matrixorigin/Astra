@@ -29,8 +29,33 @@ fn event_to_json(event: &StreamEvent) -> String {
         StreamEvent::ThinkingChunk(text) => {
             serde_json::json!({"type": "thinking_chunk", "text": text})
         }
-        StreamEvent::ToolStarted { name, description } => {
-            serde_json::json!({"type": "tool_started", "name": name, "description": description})
+        StreamEvent::ToolStarted {
+            name,
+            description,
+            tool_use_id,
+            parent_tool_use_id,
+        } => {
+            serde_json::json!({
+                "type": "tool_started",
+                "name": name,
+                "description": description,
+                "tool_use_id": tool_use_id,
+                "parent_tool_use_id": parent_tool_use_id,
+            })
+        }
+        StreamEvent::AgentControlStarted {
+            action,
+            label,
+            tool_use_id,
+            agent_id,
+        } => {
+            serde_json::json!({
+                "type": "agent_control_started",
+                "action": action,
+                "label": label,
+                "tool_use_id": tool_use_id,
+                "agent_id": agent_id,
+            })
         }
         StreamEvent::ToolCompleted {
             name,
@@ -39,6 +64,8 @@ fn event_to_json(event: &StreamEvent) -> String {
             duration_ms,
             output_summary,
             output,
+            tool_use_id,
+            parent_tool_use_id,
         } => {
             serde_json::json!({
                 "type": "tool_completed",
@@ -48,6 +75,28 @@ fn event_to_json(event: &StreamEvent) -> String {
                 "duration_ms": duration_ms,
                 "output_summary": output_summary,
                 "output": output,
+                "tool_use_id": tool_use_id,
+                "parent_tool_use_id": parent_tool_use_id,
+            })
+        }
+        StreamEvent::AgentControlCompleted {
+            action,
+            label,
+            status,
+            duration_ms,
+            output,
+            tool_use_id,
+            agent_id,
+        } => {
+            serde_json::json!({
+                "type": "agent_control_completed",
+                "action": action,
+                "label": label,
+                "status": status,
+                "duration_ms": duration_ms,
+                "output": output,
+                "tool_use_id": tool_use_id,
+                "agent_id": agent_id,
             })
         }
         StreamEvent::WaitingForModel => {
@@ -59,6 +108,12 @@ fn event_to_json(event: &StreamEvent) -> String {
         StreamEvent::StatusLine(text) => {
             serde_json::json!({"type": "status", "text": text})
         }
+        StreamEvent::AgentLive(event) => {
+            serde_json::json!({
+                "type": "agent_live",
+                "event": event,
+            })
+        }
         StreamEvent::ToolOutput { name, lines, bytes } => {
             serde_json::json!({
                 "type": "tool_output",
@@ -66,6 +121,9 @@ fn event_to_json(event: &StreamEvent) -> String {
                 "lines": lines,
                 "bytes": bytes,
             })
+        }
+        StreamEvent::PermissionAutoApproved { tool, reason } => {
+            serde_json::json!({"type": "permission_auto_approved", "tool": tool, "reason": reason})
         }
     };
     serde_json::to_string(&value).unwrap_or_default()
@@ -96,10 +154,28 @@ mod tests {
         let json = event_to_json(&StreamEvent::ToolStarted {
             name: "bash".into(),
             description: "ls -la".into(),
+            tool_use_id: "tu_01H000000000000000000001".into(),
+            parent_tool_use_id: None,
         });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "tool_started");
         assert_eq!(v["name"], "bash");
+        assert_eq!(v["tool_use_id"], "tu_01H000000000000000000001");
+        // Parent field is present as null when absent so consumers can rely on the key
+        assert!(v.get("parent_tool_use_id").is_some());
+        assert!(v["parent_tool_use_id"].is_null());
+    }
+
+    #[test]
+    fn tool_started_event_with_parent_serializes() {
+        let json = event_to_json(&StreamEvent::ToolStarted {
+            name: "bash".into(),
+            description: "ls -la".into(),
+            tool_use_id: "tu_child".into(),
+            parent_tool_use_id: Some("tu_parent".into()),
+        });
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["parent_tool_use_id"], "tu_parent");
     }
 
     #[test]
@@ -111,11 +187,14 @@ mod tests {
             duration_ms: 42,
             output_summary: Some("150 lines".into()),
             output: None,
+            tool_use_id: "tu_01H000000000000000000002".into(),
+            parent_tool_use_id: None,
         });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "tool_completed");
         assert_eq!(v["duration_ms"], 42);
         assert_eq!(v["output_summary"], "150 lines");
+        assert_eq!(v["tool_use_id"], "tu_01H000000000000000000002");
     }
 
     #[test]
@@ -127,6 +206,8 @@ mod tests {
             StreamEvent::ToolStarted {
                 name: "t".into(),
                 description: "d".into(),
+                tool_use_id: "tu_test".into(),
+                parent_tool_use_id: None,
             },
             StreamEvent::ToolCompleted {
                 name: "t".into(),
@@ -135,6 +216,8 @@ mod tests {
                 duration_ms: 0,
                 output_summary: None,
                 output: None,
+                tool_use_id: "tu_test".into(),
+                parent_tool_use_id: None,
             },
             StreamEvent::WaitingForModel,
             StreamEvent::ModelResponding,
@@ -176,6 +259,8 @@ mod tests {
         let json = event_to_json(&StreamEvent::ToolStarted {
             name: "mcp__memoria/search".into(),
             description: "query=\"test\"".into(),
+            tool_use_id: "tu_test".into(),
+            parent_tool_use_id: None,
         });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["name"], "mcp__memoria/search");
@@ -191,6 +276,8 @@ mod tests {
             duration_ms: 5,
             output_summary: None,
             output: None,
+            tool_use_id: "tu_test".into(),
+            parent_tool_use_id: None,
         });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(v["output_summary"].is_null());
@@ -202,5 +289,28 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "status");
         assert!(v["text"].as_str().unwrap().contains("clippy"));
+    }
+
+    #[test]
+    fn agent_live_event_uses_stable_structured_json() {
+        let json = event_to_json(&StreamEvent::AgentLive(
+            astra_turn_core::agent_live_event::AgentLiveEvent {
+                agent_id: "reviewer@abc12345".into(),
+                kind: astra_turn_core::agent_live_event::AgentLiveEventKind::ToolCompleted {
+                    name: "bash".into(),
+                    description: "cargo test".into(),
+                    status: "success".into(),
+                    duration_ms: 42,
+                    output_summary: Some("ok".into()),
+                    output: None,
+                    tool_use_id: "tool-1".into(),
+                },
+            },
+        ));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "agent_live");
+        assert_eq!(v["event"]["agent_id"], "reviewer@abc12345");
+        assert_eq!(v["event"]["kind"]["type"], "tool_completed");
+        assert_eq!(v["event"]["kind"]["tool_use_id"], "tool-1");
     }
 }

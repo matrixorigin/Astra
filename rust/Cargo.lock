@@ -426,6 +426,7 @@ dependencies = [
  "dotenvy",
  "fastrand",
  "flate2",
+ "fs2",
  "futures-util",
  "http-body-util",
  "notify",
@@ -449,6 +450,7 @@ dependencies = [
  "tower 0.5.3",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -562,6 +564,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "serial_test",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

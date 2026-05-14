@@ -863,11 +863,7 @@ impl BuildTestResult {
         if !self.passed && raw_output.len() > 200 {
             parts.push(String::new());
             parts.push("─── Raw output (last 2000 chars) ───".to_string());
-            let tail = if raw_output.len() > 2000 {
-                &raw_output[raw_output.len() - 2000..]
-            } else {
-                raw_output
-            };
+            let tail = tail_by_chars(raw_output, 2000);
             parts.push(tail.to_string());
         } else if !self.passed {
             parts.push(String::new());
@@ -875,11 +871,7 @@ impl BuildTestResult {
         } else if !raw_output.is_empty() && self.error_messages.is_empty() {
             // Successful build/test — include compact tail so agent can see
             // warnings, compilation summary, and "Finished ..." line.
-            let tail = if raw_output.len() > 500 {
-                &raw_output[raw_output.len() - 500..]
-            } else {
-                raw_output
-            };
+            let tail = tail_by_chars(raw_output, 500);
             // Only include if there's something beyond whitespace
             let trimmed = tail.trim();
             if !trimmed.is_empty() {
@@ -938,6 +930,26 @@ impl BuildTestResult {
 fn error_signature(loc: &ErrorLocation) -> String {
     let msg_prefix: String = loc.message.chars().take(60).collect();
     format!("{}::{}::{}", loc.file, loc.error_code, msg_prefix)
+}
+
+/// Return the last `max_chars` characters of `s` as a `&str` that
+/// always respects UTF-8 boundaries. Plain byte-slice indexing panics
+/// when the boundary cuts a multi-byte codepoint (e.g. the
+/// `─` box-drawing char in insta snapshot headers) — this helper is
+/// the safe equivalent for tailing raw command output.
+fn tail_by_chars(s: &str, max_chars: usize) -> &str {
+    if s.chars().count() <= max_chars {
+        return s;
+    }
+    // `char_indices` gives the byte offset of each char; skip the
+    // first `(total - max_chars)` chars so the slice starts on a
+    // boundary.
+    let total = s.chars().count();
+    let drop = total - max_chars;
+    match s.char_indices().nth(drop) {
+        Some((byte_idx, _)) => &s[byte_idx..],
+        None => s,
+    }
 }
 
 /// Delta between two build/test iterations.
@@ -3884,5 +3896,41 @@ error[E0425]: cannot find value `nonexistent` in this scope
             complex_pos > 2,
             "Complex error should come after trivial/fixable"
         );
+    }
+
+    // ── tail_by_chars — UTF-8 boundary safety ────────────────────
+
+    #[test]
+    fn tail_by_chars_returns_full_input_when_within_limit() {
+        assert_eq!(tail_by_chars("hello", 10), "hello");
+        assert_eq!(tail_by_chars("hello", 5), "hello");
+    }
+
+    #[test]
+    fn tail_by_chars_takes_last_n_chars_when_over_limit() {
+        assert_eq!(tail_by_chars("abcdefghij", 3), "hij");
+    }
+
+    #[test]
+    fn tail_by_chars_never_panics_on_multibyte_boundary() {
+        // Regression for the panic at build_test.rs slicing raw output
+        // containing the `─` box-drawing char (3 bytes in UTF-8) —
+        // naive byte-indexing starts the slice in the middle of the
+        // codepoint and crashes at runtime.
+        let s = "prefix ─────────── suffix".repeat(10);
+        // Pick a limit that forces a cut anywhere in the string; any
+        // offset that would land mid-`─` on byte slicing must now be
+        // safe.
+        for limit in [1, 2, 3, 5, 17, 100, 199] {
+            let out = tail_by_chars(&s, limit);
+            assert!(out.is_char_boundary(0));
+            assert!(out.chars().count() <= limit);
+        }
+    }
+
+    #[test]
+    fn tail_by_chars_handles_empty_input() {
+        assert_eq!(tail_by_chars("", 5), "");
+        assert_eq!(tail_by_chars("", 0), "");
     }
 }

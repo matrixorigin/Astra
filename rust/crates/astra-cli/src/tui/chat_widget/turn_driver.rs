@@ -21,7 +21,7 @@ use std::time::Instant;
 use ratatui::text::Line;
 
 use super::super::history_cell::HistoryCell;
-use super::{AppEvent, ChatWidget, TurnStats};
+use super::{AppEvent, ChatWidget, TurnStats, UserEvent, WireEvent};
 use crate::tui::testing::render::{buffer_to_string, draw_widget};
 
 /// Render the widget's committed history as a single scrollback
@@ -52,42 +52,58 @@ fn canonical_turn_commits_every_cell_kind_in_order() {
     let _ = Instant::now();
 
     // User kicks off the turn.
-    w.handle_event(AppEvent::UserSubmit("build the plan and run ls".into()));
+    w.handle_event(AppEvent::User(UserEvent::Submit(
+        "build the plan and run ls".into(),
+    )));
 
     // Model reasons first.
-    w.handle_event(AppEvent::ReasoningDelta("user wants X. ".into()));
-    w.handle_event(AppEvent::ReasoningDelta("I'll do Y.".into()));
-    w.handle_event(AppEvent::ReasoningDone);
+    w.handle_event(AppEvent::Wire(WireEvent::ReasoningDelta(
+        "user wants X. ".into(),
+    )));
+    w.handle_event(AppEvent::Wire(WireEvent::ReasoningDelta(
+        "I'll do Y.".into(),
+    )));
+    w.handle_event(AppEvent::Wire(WireEvent::ReasoningDone));
 
     // Tool invocation mid-turn.
-    w.handle_event(AppEvent::ToolStarted {
+    w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
         name: "bash".into(),
         description: "ls /tmp".into(),
-    });
-    w.handle_event(AppEvent::ToolCompleted {
+        tool_use_id: "tu_drv_1".into(),
+        parent_tool_use_id: None,
+    }));
+    w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
         name: "bash".into(),
         description: String::new(),
         status: "success".into(),
         duration_ms: 42,
         output_summary: Some("3 entries".into()),
         output: None,
-    });
+        tool_use_id: "tu_drv_1".into(),
+        parent_tool_use_id: None,
+    }));
 
     // Answer streams in two chunks.
-    w.handle_event(AppEvent::AnswerDelta("Here is the plan:\n\n".into()));
-    w.handle_event(AppEvent::AnswerDelta("- step one\n- step two\n".into()));
+    w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta(
+        "Here is the plan:\n\n".into(),
+    )));
+    w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta(
+        "- step one\n- step two\n".into(),
+    )));
 
     // Turn ends — widget emits the summary.
-    w.handle_event(AppEvent::TurnComplete(Box::new(TurnStats {
-        elapsed_ms: Some(1_500),
-        ttft_ms: Some(400),
-        tokens_in: Some(220),
-        tokens_out: Some(50),
-        cache_read_tokens: None,
-        tools: 1,
-        cumulative_tokens: Some(270),
-        cumulative_cost_usd: Some(0.0015),
-    })));
+    w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::new(
+        TurnStats {
+            elapsed_ms: Some(1_500),
+            ttft_ms: Some(400),
+            tokens_in: Some(220),
+            tokens_out: Some(50),
+            cache_read_tokens: None,
+            tools: 1,
+            cumulative_tokens: Some(270),
+            cumulative_cost_usd: Some(0.0015),
+        },
+    ))));
 
     assert!(w.active_cell().is_none(), "no dangling live cell");
     let kinds: Vec<&'static str> = w
@@ -110,30 +126,38 @@ fn canonical_turn_snapshots_full_scrollback() {
     // gutter, backtick strip) surfaces as a file diff.
     let mut w = ChatWidget::new("");
 
-    w.handle_event(AppEvent::UserSubmit("run ls".into()));
-    w.handle_event(AppEvent::ToolStarted {
+    w.handle_event(AppEvent::User(UserEvent::Submit("run ls".into())));
+    w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
         name: "bash".into(),
         description: "ls /tmp".into(),
-    });
-    w.handle_event(AppEvent::ToolCompleted {
+        tool_use_id: "tu_drv_2".into(),
+        parent_tool_use_id: None,
+    }));
+    w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
         name: "bash".into(),
         description: String::new(),
         status: "success".into(),
         duration_ms: 42,
         output_summary: Some("3 entries".into()),
         output: None,
-    });
-    w.handle_event(AppEvent::AnswerDelta("There are 3 files.".into()));
-    w.handle_event(AppEvent::TurnComplete(Box::new(TurnStats {
-        elapsed_ms: Some(1_200),
-        ttft_ms: Some(400),
-        tokens_in: Some(200),
-        tokens_out: Some(40),
-        cache_read_tokens: None,
-        tools: 1,
-        cumulative_tokens: Some(240),
-        cumulative_cost_usd: None,
-    })));
+        tool_use_id: "tu_drv_2".into(),
+        parent_tool_use_id: None,
+    }));
+    w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta(
+        "There are 3 files.".into(),
+    )));
+    w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::new(
+        TurnStats {
+            elapsed_ms: Some(1_200),
+            ttft_ms: Some(400),
+            tokens_in: Some(200),
+            tokens_out: Some(40),
+            cache_read_tokens: None,
+            tools: 1,
+            cumulative_tokens: Some(240),
+            cumulative_cost_usd: None,
+        },
+    ))));
 
     insta::assert_snapshot!("canonical_turn_80", render_history(&w, 80));
 }
@@ -145,13 +169,17 @@ fn interleaved_reasoning_and_answer_collapses_reasoning_first() {
     // the reasoning cell so scrollback shows: Reasoning ✓,
     // Assistant ✓ (not a single mixed cell).
     let mut w = ChatWidget::new("");
-    w.handle_event(AppEvent::UserSubmit("hi".into()));
-    w.handle_event(AppEvent::ReasoningDelta("some thought".into()));
-    w.handle_event(AppEvent::AnswerDelta("answer".into()));
-    w.handle_event(AppEvent::TurnComplete(Box::new(TurnStats {
-        elapsed_ms: Some(500),
-        ..Default::default()
-    })));
+    w.handle_event(AppEvent::User(UserEvent::Submit("hi".into())));
+    w.handle_event(AppEvent::Wire(WireEvent::ReasoningDelta(
+        "some thought".into(),
+    )));
+    w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta("answer".into())));
+    w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::new(
+        TurnStats {
+            elapsed_ms: Some(500),
+            ..Default::default()
+        },
+    ))));
 
     let kinds: Vec<&'static str> = w
         .history()
@@ -170,24 +198,29 @@ fn two_back_to_back_tools_both_commit() {
     // Back-to-back tool calls without an Answer in between —
     // each ToolStarted must commit the previous ToolCell.
     let mut w = ChatWidget::new("");
-    w.handle_event(AppEvent::UserSubmit("do two things".into()));
+    w.handle_event(AppEvent::User(UserEvent::Submit("do two things".into())));
 
     for (i, dur) in [(1u64, 10u64), (2, 20)] {
-        w.handle_event(AppEvent::ToolStarted {
+        let tid = format!("tu_drv_b2b_{i}");
+        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
             name: format!("t{i}"),
             description: format!("call {i}"),
-        });
-        w.handle_event(AppEvent::ToolCompleted {
+            tool_use_id: tid.clone(),
+            parent_tool_use_id: None,
+        }));
+        w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
             name: format!("t{i}"),
             description: String::new(),
             status: "success".into(),
             duration_ms: dur,
             output_summary: None,
             output: None,
-        });
+            tool_use_id: tid,
+            parent_tool_use_id: None,
+        }));
     }
 
-    w.handle_event(AppEvent::TurnComplete(Box::default()));
+    w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
     // user + t1 + t2 + summary
     assert_eq!(w.history().len(), 4);
 }
@@ -195,9 +228,11 @@ fn two_back_to_back_tools_both_commit() {
 #[test]
 fn turn_error_mid_stream_commits_partial_assistant_then_error() {
     let mut w = ChatWidget::new("");
-    w.handle_event(AppEvent::UserSubmit("hi".into()));
-    w.handle_event(AppEvent::AnswerDelta("half an answer".into()));
-    w.handle_event(AppEvent::TurnError("rate limited".into()));
+    w.handle_event(AppEvent::User(UserEvent::Submit("hi".into())));
+    w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta(
+        "half an answer".into(),
+    )));
+    w.handle_event(AppEvent::Wire(WireEvent::TurnError("rate limited".into())));
 
     // User + partial Assistant + SystemError. No summary on
     // error-ended turns.

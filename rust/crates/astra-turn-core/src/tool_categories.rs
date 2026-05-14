@@ -298,6 +298,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("task_stop", MU, OR),
     tool("task_list", RO, OR),
     tool("task_get", RO, OR),
+    tool("task", MU, OR),
     // ── Shell execution (highest risk) ───────────────────────────────
     tool("bash", SH, AE.union(EX)),
     tool("BashTool", SH, AE.union(AL)),
@@ -631,8 +632,25 @@ pub struct ToolClassification {
 /// which unlocks parallel execution and approval bypass.
 pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassification {
     let r = registry();
-    let meta_category = r.category(name);
-    let meta_flags = r.flags(name);
+    let mut meta_category = r.category(name);
+    let mut meta_flags = r.flags(name);
+
+    if name == "task" {
+        match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
+            Some("list" | "get" | "output") => {
+                meta_category = ToolCategory::ReadOnly;
+                meta_flags = OR;
+            }
+            Some("background_shell") => {
+                meta_category = ToolCategory::Shell;
+                meta_flags = AE.union(OR);
+            }
+            _ => {
+                meta_category = ToolCategory::Mutating;
+                meta_flags = OR;
+            }
+        }
+    }
 
     let shell_read_only = meta_category.is_shell()
         && args
@@ -668,6 +686,11 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
 
     let idempotency = if shell_read_only {
         ToolIdempotency::PureRead
+    } else if name == "task" {
+        match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
+            Some("list" | "get" | "output") => ToolIdempotency::PureRead,
+            _ => ToolIdempotency::NonIdempotent,
+        }
     } else {
         r.idempotency(name)
     };
@@ -835,6 +858,35 @@ mod tests {
             );
             assert!(!r.is_read_only_for("memory", Some(&args)));
         }
+    }
+
+    #[test]
+    fn consolidated_task_tool_is_action_aware_for_shell_approval() {
+        use serde_json::json;
+
+        let shell = classify(
+            "task",
+            Some(&json!({"action": "background_shell", "command": "npm run dev"})),
+        );
+        assert_eq!(shell.category, ToolCategory::Shell);
+        assert!(shell.approval_required);
+        assert!(!shell.parallelizable);
+
+        let read_only_shell = classify(
+            "task",
+            Some(&json!({"action": "background_shell", "command": "git status"})),
+        );
+        assert_eq!(read_only_shell.category, ToolCategory::ReadOnly);
+        assert!(!read_only_shell.approval_required);
+        assert!(read_only_shell.parallelizable);
+
+        let output = classify("task", Some(&json!({"action": "output"})));
+        assert_eq!(output.category, ToolCategory::ReadOnly);
+        assert!(!output.approval_required);
+
+        let update = classify("task", Some(&json!({"action": "update"})));
+        assert_eq!(update.category, ToolCategory::Mutating);
+        assert!(!update.approval_required);
     }
 
     #[test]

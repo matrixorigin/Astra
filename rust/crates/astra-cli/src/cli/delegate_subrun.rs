@@ -279,6 +279,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             skill_resolver: self.skill_resolver.clone(),
             progress_tx: self.progress_tx.clone(),
             agent_id: profile.agent_id.clone(),
+            stream_event_tx: None,
+            stream_event_sink: None,
             tool_cache: super::stream_render::EdgeToolCache::new(
                 resolved_tool_policy.max_identical_tool_calls,
             ),
@@ -353,6 +355,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             volatile_pending: Vec::new(),
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
+            session_memory_state: Default::default(),
+            session_memory_llm_params: None,
             current_session_id: Some(config.session_id.clone()),
             current_run_id: Some(config.run_id.clone()),
             context_manifest_pool: None,

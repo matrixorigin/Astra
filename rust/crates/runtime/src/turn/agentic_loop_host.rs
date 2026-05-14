@@ -1042,6 +1042,25 @@ pub struct AgenticLoopState {
     pub memory_extraction_service:
         Option<std::sync::Arc<crate::session_memory::MemoryExtractionService>>,
 
+    /// Debounce state for the LLM-backed session-memory extractor that
+    /// writes `session-memory.md` in the background (fire-and-forget).
+    /// Persists across turns so `should_extract` can compare growth deltas.
+    /// Reset to `Default::default()` only when a new session starts.
+    ///
+    /// Wrapped in `Arc<Mutex<>>` so the background extraction task can
+    /// flip `mark_extracted` itself *after* the write completes.
+    pub session_memory_state: std::sync::Arc<
+        std::sync::Mutex<astra_turn_core::cloud_session_memory_extract::SessionMemoryState>,
+    >,
+
+    /// Resolved selector-model params used by the background memory
+    /// extraction runner (see `turn::memory_extraction_runner`). Shared
+    /// with `memory_relevance` and lesson synthesis — same "cheap
+    /// background LLM" resolved once per session via
+    /// `resolve_memory_model`. `None` → extraction falls back to the
+    /// rule-based L1 builder.
+    pub session_memory_llm_params: Option<crate::memory_relevance::LlmConnParams>,
+
     /// Provider-aware compaction strategy for microcompact placeholders.
     pub compact_strategy: astra_turn_core::microcompact::CompactStrategy,
 
@@ -1795,6 +1814,8 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         interruption: None,
         session_facts: Default::default(),
         memory_extraction_service: None,
+        session_memory_state: Default::default(),
+        session_memory_llm_params: None,
         compact_strategy: Default::default(),
         approval_overrides: None,
         confidence_trend: Default::default(),
@@ -2138,6 +2159,8 @@ pub(crate) mod tests {
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: None,
+            session_memory_state: Default::default(),
+            session_memory_llm_params: None,
             compact_strategy: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),

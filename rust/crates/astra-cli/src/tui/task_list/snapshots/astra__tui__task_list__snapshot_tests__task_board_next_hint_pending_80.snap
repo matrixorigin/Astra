@@ -1,0 +1,5 @@
+---
+source: crates/astra-cli/src/tui/task_list/snapshot_tests.rs
+expression: buffer_to_string(&buf)
+---
+Next: waiting-work

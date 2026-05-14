@@ -1438,6 +1438,57 @@ mod tests {
         // Implicit: no panic, no file, no events.
     }
 
+    // I11 test removed in rebase: the branch wired a now-deleted
+    // `memory_extraction_runner` module directly from
+    // `finalize_and_render`. Main's refactor routes session-memory
+    // extraction through a dedicated service that fires on its own
+    // schedule, not synchronously from finalize. Re-add equivalent
+    // coverage when the new service surfaces a synchronous hook.
+
+    // ── I13: clean turn below init gate → no write ──────────────────────
+    //
+    // Ensures the runner's debounce (tokens < 10K init gate, no error)
+    // actually prevents a write on a fresh session that hasn't grown
+    // enough yet. Guards against a regression where the gate is
+    // bypassed and every turn writes.
+    #[tokio::test]
+    async fn finalize_and_render_skips_below_init_gate() {
+        use astra_services::SessionArtifactStore;
+
+        let _tmp = tempfile::TempDir::new().unwrap();
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(_tmp.path());
+
+        let sid = format!(
+            "finalize-skips-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.current_session_id = Some(sid.clone());
+        state.error_recovery.consecutive_same_error = 0; // no error
+        state
+            .messages
+            .push(serde_json::json!({"role": "user", "content": "clean turn"}));
+        state.total_prompt = 3_000; // well below the 10K init gate
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        // Give any misbehaving spawn a moment to fire, then assert nothing
+        // was written.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let path = astra_services::local_session_artifact_store()
+            .session_path(&sid, "session-memory.md")
+            .unwrap();
+        assert!(
+            !path.exists(),
+            "no extraction should run when below the init gate and no error"
+        );
+    }
+
     #[tokio::test]
     async fn error_triggered_l1_sets_error_state_and_builds_l1() {
         let mut state = make_state();

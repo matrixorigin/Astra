@@ -461,11 +461,7 @@ fn display_path(path: PathBuf) -> String {
 }
 
 fn detect_git_branch() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    let repo = gix::discover(cwd).ok()?;
-    let head = repo.head().ok()?;
-    let name = head.referent_name()?;
-    Some(name.shorten().to_string())
+    crate::git_branch_cache::detect_git_branch_cached()
 }
 
 fn now_millis() -> u128 {

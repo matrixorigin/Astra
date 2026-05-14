@@ -1020,7 +1020,6 @@ pub(super) async fn handle_memory_domain_command(
                 "cloud" => {
                     // List or load plans from cloud
                     if let Some(ref svc) = state.task_service {
-                        use astra_services::TaskService;
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
 
                         match svc.list_tasks(user_id, None).await {
@@ -1076,7 +1075,6 @@ pub(super) async fn handle_memory_domain_command(
                 "load" if !sub_arg.is_empty() => {
                     // Load a specific plan from cloud by task_id (or prefix)
                     if let Some(ref svc) = state.task_service {
-                        use astra_services::TaskService;
                         use plan_decompose::{PlanModeState, analyze_project, format_plan};
 
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
@@ -1243,7 +1241,7 @@ pub(super) async fn handle_memory_domain_command(
 
                     // Find the task to rate - use the most recent task for current goal
                     if let Some(ref svc) = state.task_service {
-                        use astra_services::{TaskOutcome, TaskService};
+                        use astra_services::TaskOutcome;
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
 
                         // Find task by current plan goal or executing plan goal
@@ -1367,7 +1365,6 @@ pub(super) async fn handle_memory_domain_command(
 
                     if let Some(goal) = query_goal {
                         if let Some(ref svc) = state.task_service {
-                            use astra_services::TaskService;
                             let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
                             let project_type = state
                                 .plan_mode
@@ -1445,7 +1442,6 @@ pub(super) async fn handle_memory_domain_command(
 
                     if let Some(pattern) = query_pattern {
                         if let Some(ref svc) = state.task_service {
-                            use astra_services::TaskService;
                             let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
 
                             match svc.get_learning_stats(user_id, &pattern).await {
@@ -1701,7 +1697,6 @@ pub(super) async fn handle_memory_domain_command(
 
                     // Increment replan count in cloud if available
                     if let Some(ref svc) = state.task_service {
-                        use astra_services::TaskService;
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
                         if let Ok(tasks) = svc.list_tasks(user_id, None).await
                             && let Some(task) = tasks.iter().find(|t| t.title == ps.goal)

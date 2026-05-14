@@ -68,7 +68,7 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
             system_prompt_addendum: EXPLORE_PROMPT.to_string(),
             default_model: "claude-haiku".to_string(),
             max_turns: 20,
-            allowed_tools: ["view", "glob", "grep", "bash"]
+            allowed_tools: ["bash", "glob", "grep", "list_dir", "read_file"]
                 .into_iter()
                 .map(String::from)
                 .collect(),
@@ -79,8 +79,8 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
             description: "Review code changes with high signal-to-noise ratio.".to_string(),
             system_prompt_addendum: CODE_REVIEW_PROMPT.to_string(),
             default_model: "claude-sonnet".to_string(),
-            max_turns: 15,
-            allowed_tools: ["view", "glob", "grep", "bash"]
+            max_turns: 30,
+            allowed_tools: ["bash", "glob", "grep", "list_dir", "read_file"]
                 .into_iter()
                 .map(String::from)
                 .collect(),
@@ -92,10 +92,18 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
             system_prompt_addendum: TASK_PROMPT.to_string(),
             default_model: "claude-haiku".to_string(),
             max_turns: 30,
-            allowed_tools: ["bash", "view", "glob", "grep", "edit", "create"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            allowed_tools: [
+                "bash",
+                "glob",
+                "grep",
+                "list_dir",
+                "read_file",
+                "write_file",
+                "str_replace",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
             read_only: false,
         },
         AgentTypeDefinition {
@@ -151,5 +159,37 @@ mod tests {
     fn test_get_builtin_agent_types() {
         let types = get_builtin_agent_types();
         assert_eq!(types.len(), 4);
+        let code_review = types
+            .iter()
+            .find(|def| def.agent_type == "code-review")
+            .expect("builtins must include code-review");
+        assert_eq!(code_review.max_turns, 30);
+    }
+
+    #[test]
+    fn read_only_agents_use_current_consolidated_read_tools() {
+        let types = get_builtin_agent_types();
+        for agent_type in ["explore", "code-review"] {
+            let def = types
+                .iter()
+                .find(|def| def.agent_type == agent_type)
+                .unwrap_or_else(|| panic!("missing built-in agent type {agent_type}"));
+            assert!(def.allowed_tools.contains("read_file"));
+            assert!(def.allowed_tools.contains("list_dir"));
+            assert!(!def.allowed_tools.contains("view"));
+        }
+    }
+
+    #[test]
+    fn task_agent_uses_current_consolidated_edit_tools() {
+        let task = get_builtin_agent_types()
+            .into_iter()
+            .find(|def| def.agent_type == "task")
+            .expect("builtins must include task");
+        assert!(task.allowed_tools.contains("read_file"));
+        assert!(task.allowed_tools.contains("write_file"));
+        assert!(task.allowed_tools.contains("str_replace"));
+        assert!(!task.allowed_tools.contains("edit"));
+        assert!(!task.allowed_tools.contains("create"));
     }
 }

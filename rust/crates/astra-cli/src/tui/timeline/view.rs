@@ -305,10 +305,9 @@ fn render_drill(tl: &Timeline, area: Rect, buf: &mut Buffer) {
         ]));
     }
     if let Some(ctx) = t.context_ms {
-        let detail = if let Some(m) = t.memoria_ms {
-            format!(" (memoria: {m}ms)")
-        } else {
-            String::new()
+        let detail = match t.memoria_ms {
+            Some(m) => format!(" (memoria: {m}ms)"),
+            None => String::new(),
         };
         lines.push(Line::from(vec![
             Span::styled("  Context  ", label),

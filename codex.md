@@ -92,7 +92,6 @@ When the user asks you to perform any of the following tasks, read the correspon
 - **Review code changes**: `skills/review_changes/SKILL.md` — code review with symbol-level impact analysis.
 - **Review code (test quality)**: `skills/review_code/SKILL.md` — unhappy paths, E2E with DB assertions.
 - **Verify task completion**: `skills/verify_task/SKILL.md` — build/test/lint checks, delivery report.
-- **Batch parallel execution**: `skills/batch_parallel/SKILL.md` — parallel tasks via git worktrees.
 - **Analyze session**: `skills/analyze_session/SKILL.md` — diagnose session issues.
 - **Evaluate session**: `skills/evaluate_session/SKILL.md` — performance metrics and optimization.
 - **Optimize prompt**: `skills/optimize_prompt/SKILL.md` — reduce context bloat.

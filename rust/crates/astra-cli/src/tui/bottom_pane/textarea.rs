@@ -55,6 +55,7 @@ impl TextArea {
         self.text.clear();
         self.cursor_pos = 0;
         self.preferred_col = None;
+        self.paste_burst.reset();
         self.invalidate_wrap();
     }
 
@@ -62,6 +63,7 @@ impl TextArea {
         self.text = text.to_string();
         self.cursor_pos = self.text.len();
         self.preferred_col = None;
+        self.paste_burst.reset();
         self.invalidate_wrap();
     }
 
@@ -96,6 +98,11 @@ impl TextArea {
 
     pub fn paste_burst_tick_ms() -> u64 {
         PasteBurstDetector::recommended_tick_ms()
+    }
+
+    #[cfg(test)]
+    pub(super) fn force_pending_paste_burst_for_test(&mut self, text: &str, now: Instant) {
+        self.paste_burst.force_due_buffer_for_test(text, now);
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> TextAreaAction {
@@ -174,6 +181,8 @@ impl TextArea {
                 TextAreaAction::Changed
             }
 
+            KeyCode::Char(c) if c.is_control() => TextAreaAction::Unhandled,
+
             // Basic editing — route through paste burst detector
             KeyCode::Char(c) if !ctrl && !alt => {
                 let now = Instant::now();
@@ -185,10 +194,7 @@ impl TextArea {
                     BurstDecision::Buffered => TextAreaAction::Changed,
                 }
             }
-            KeyCode::Char(c) => {
-                self.insert_char(c);
-                TextAreaAction::Changed
-            }
+            KeyCode::Char(_) => TextAreaAction::Unhandled,
             KeyCode::Backspace => {
                 self.delete_backward();
                 TextAreaAction::Changed
@@ -621,4 +627,40 @@ pub(crate) enum TextAreaAction {
     HistoryNext,
     Consumed,
     Unhandled,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::time::Duration;
+
+    #[test]
+    fn clear_resets_pending_paste_burst_state() {
+        let mut textarea = TextArea::new();
+        let t0 = Instant::now();
+        textarea.paste_burst.on_char('a', t0);
+        textarea
+            .paste_burst
+            .on_char('b', t0 + Duration::from_millis(2));
+        textarea
+            .paste_burst
+            .on_char('c', t0 + Duration::from_millis(4));
+        assert!(textarea.paste_burst_active());
+
+        textarea.clear();
+
+        assert!(!textarea.paste_burst_active());
+        assert!(!textarea.flush_paste_burst());
+        assert_eq!(textarea.text(), "");
+    }
+
+    #[test]
+    fn raw_control_chars_are_not_inserted_into_text() {
+        let mut textarea = TextArea::new();
+        let action = textarea.handle_key(KeyEvent::new(KeyCode::Char('\u{3}'), KeyModifiers::NONE));
+
+        assert_eq!(action, TextAreaAction::Unhandled);
+        assert_eq!(textarea.text(), "");
+    }
 }

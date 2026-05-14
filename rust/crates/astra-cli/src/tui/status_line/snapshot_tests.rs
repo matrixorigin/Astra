@@ -135,3 +135,43 @@ fn snapshot_very_long_cwd_truncates() {
     };
     insta::assert_snapshot!("status_long_cwd_80", render_ctx(&ctx, 80));
 }
+
+#[test]
+fn snapshot_task_chip_collapsed_mixed() {
+    let ctx = StatusContext {
+        task_counts: Some((2, 5)),
+        task_board_expanded: false,
+        ..base_ctx()
+    };
+    insta::assert_snapshot!("status_task_chip_collapsed_80", render_ctx(&ctx, 80));
+}
+
+#[test]
+fn snapshot_task_chip_expanded_mixed() {
+    let ctx = StatusContext {
+        task_counts: Some((2, 5)),
+        task_board_expanded: true,
+        ..base_ctx()
+    };
+    insta::assert_snapshot!("status_task_chip_expanded_80", render_ctx(&ctx, 80));
+}
+
+#[test]
+fn snapshot_task_chip_all_done() {
+    let ctx = StatusContext {
+        task_counts: Some((0, 4)),
+        task_board_expanded: false,
+        ..base_ctx()
+    };
+    insta::assert_snapshot!("status_task_chip_all_done_80", render_ctx(&ctx, 80));
+}
+
+#[test]
+fn snapshot_task_chip_empty_board_hidden() {
+    // total == 0 → chip must not render.
+    let ctx = StatusContext {
+        task_counts: Some((0, 0)),
+        ..base_ctx()
+    };
+    insta::assert_snapshot!("status_task_chip_empty_80", render_ctx(&ctx, 80));
+}

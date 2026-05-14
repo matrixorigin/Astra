@@ -1,18 +1,26 @@
 //! Inline slash-menu popup widget.
 //!
-//! Renders a compact dropdown list of filtered commands with their
-//! descriptions. Selected row is highlighted. Long item lists scroll
-//! around the selection so the active row stays visible.
+//! Renders a lightweight dropdown of filtered commands directly above
+//! the composer, matching the style of claude-code and cursor: no
+//! decorative border, no title, no footer — just the list of commands.
 //!
-//! Layout per row (80-col example):
+//! Visual anatomy (80-col example, 5 matches):
 //! ```text
-//!   /help         show help
-//! ▌ /history     browse history
-//!   /model        pick a model
+//!   ▌ /help        show this help screen
+//!     /history     browse session history
+//!     /model       pick a model
+//!     ↓ 2 more
 //! ```
-//! - 2-space gutter (or ▌ for the selected row)
-//! - padded command name column (width = longest name)
-//! - single space, then description (truncated with ellipsis if needed)
+//!
+//! Key features:
+//! * **Selected row** gets a cursor-gutter (`▌`), tinted background, and
+//!   bold accent-coloured name.
+//! * **Matched characters** (from the filter token) render in the
+//!   accent colour with UNDERLINE so the user can see why the row ranked.
+//! * **Scroll hints**: `↑ N more` / `↓ N more` above/below the window
+//!   when the list overflows.
+//! * **Aliases**: shown inline as a dim `(h)` badge right of the name.
+//! * **Responsive**: at <18 cols descriptions drop and only names render.
 
 #![allow(dead_code)]
 
@@ -24,14 +32,21 @@ use ratatui::widgets::{Paragraph, Widget};
 
 use super::SlashMenu;
 
-/// Maximum visible rows. If more items match, the window scrolls.
+/// Maximum number of **data rows** shown at once. Does not include the
+/// scroll-indicator rows (↑ N more / ↓ N more).
 pub(crate) const MAX_VISIBLE_ROWS: u16 = 10;
 
-/// Minimum height the popup should request from its parent (always at
-/// least 1 row, even when empty, so "no matches" can be shown).
+/// Minimum width at which descriptions are shown. Below this we only
+/// render names.
+const MIN_DESC_WIDTH: u16 = 18;
+
+/// Height the popup would like to occupy for the given menu.
+///
+/// Just the visible rows — no border, no header, no footer. Always at
+/// least 1 row so the "no matches" line fits.
 pub(crate) fn desired_height(menu: &SlashMenu) -> u16 {
     if menu.is_empty() {
-        1
+        1 // "no matching commands"
     } else {
         (menu.len() as u16).min(MAX_VISIBLE_ROWS)
     }
@@ -44,107 +59,255 @@ pub(crate) fn render(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
         return;
     }
 
+    let theme = crate::tui::theme::current();
+
     if menu.is_empty() {
-        let msg = Line::from(Span::styled(
-            "  no matching commands",
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-        Paragraph::new(msg).render(area, buf);
+        render_empty(area, buf, theme);
         return;
     }
 
-    // Fixed 2-space gutter ("  " or "▌ " for the selected row).
+    // Decide how many rows the body gets.
+    let body_height = area.height.min(MAX_VISIBLE_ROWS);
+
     let matches = menu.matches();
     let selected = menu.selected().unwrap_or(0);
 
-    // Compute visible window around the selection so the active row
-    // stays on-screen when the list is long.
-    let max_rows = area.height.min(MAX_VISIBLE_ROWS) as usize;
-    let (window_start, window_end) = window_around(selected, matches.len(), max_rows);
+    // Compute which window of items is visible, keeping the selection
+    // roughly centred.
+    let (window_start, window_end) = window_around(selected, matches.len(), body_height as usize);
 
-    // Width of the name column — pad to the widest visible command name
-    // so descriptions align.
+    // Reserve one body-row for each scroll indicator if needed.
+    let need_top_hint = window_start > 0;
+    let need_bot_hint = window_end < matches.len();
+    let hint_rows = need_top_hint as usize + need_bot_hint as usize;
+    let visible_slots = (body_height as usize).saturating_sub(hint_rows);
+
+    // Re-compute window so that, after reserving hint rows, the selected
+    // item is inside `[window_start + top_hint, window_start + top_hint + visible_slots)`.
+    let (window_start, window_end) = window_around(selected, matches.len(), visible_slots.max(1));
+    let need_top_hint = window_start > 0;
+    let need_bot_hint = window_end < matches.len();
+
+    // Width of the name column — pad to the widest visible name so
+    // descriptions align cleanly.
     let name_col_width = matches[window_start..window_end]
         .iter()
-        .map(|i| i.name.len())
+        .map(|i| i.name.chars().count())
         .max()
         .unwrap_or(0);
 
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(window_end - window_start);
+    // Layout columns: gutter (2) + name_col + 2 + alias_col + 2 + desc.
+    let alias_col_width = matches[window_start..window_end]
+        .iter()
+        .map(|i| alias_label(i).map(|s| s.chars().count()).unwrap_or(0))
+        .max()
+        .unwrap_or(0);
 
-    let theme = crate::tui::theme::current();
+    let content_width = area.width as usize;
+    let show_desc = area.width >= MIN_DESC_WIDTH;
+    let gutter_w = 2;
+    let sep_w = 2;
+    let alias_budget = if alias_col_width > 0 {
+        alias_col_width + sep_w
+    } else {
+        0
+    };
+    let desc_budget = if show_desc {
+        content_width
+            .saturating_sub(gutter_w)
+            .saturating_sub(name_col_width)
+            .saturating_sub(sep_w)
+            .saturating_sub(alias_budget)
+    } else {
+        0
+    };
 
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(area.height as usize);
+
+    // ── Scroll-up hint ───────────────────────────────────────────
+    if need_top_hint {
+        lines.push(scroll_hint(format!("↑ {} more", window_start), theme));
+    }
+
+    // ── Visible data rows ───────────────────────────────────────
+    let highlights = menu.match_indices();
     for (idx, item) in matches[window_start..window_end].iter().enumerate() {
         let absolute = window_start + idx;
         let is_selected = absolute == selected;
+        let hi = highlights.get(absolute).cloned().unwrap_or_default();
 
-        let gutter = if is_selected {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(8);
+
+        // Gutter / cursor.
+        spans.push(if is_selected {
             Span::styled("▌ ", Style::default().fg(theme.gutter))
         } else {
             Span::raw("  ")
-        };
+        });
 
-        let padded_name = pad_right(item.name, name_col_width);
-        let name_style = if is_selected {
-            Style::default()
-                .fg(ratatui::style::Color::Green)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(ratatui::style::Color::Green)
-        };
+        // Name — with per-char highlights.
+        spans.extend(render_name_spans(
+            item.name,
+            &hi,
+            name_col_width,
+            is_selected,
+            theme,
+        ));
 
-        // Compute remaining width for the description column:
-        //   total width − gutter (2) − name column − 2 separating spaces
-        let desc_budget = (area.width as usize)
-            .saturating_sub(2)
-            .saturating_sub(name_col_width)
-            .saturating_sub(2);
-        let truncated_desc = truncate_ellipsis(item.description, desc_budget);
+        // Alias column.
+        if alias_col_width > 0 {
+            spans.push(Span::raw("  "));
+            let alias = alias_label(item).unwrap_or_default();
+            spans.push(Span::styled(
+                pad_right_chars(&alias, alias_col_width),
+                Style::default()
+                    .fg(theme.dim)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        }
 
-        let mut line = Line::from(vec![
-            gutter,
-            Span::styled(padded_name, name_style),
-            Span::raw("  "),
-            Span::styled(truncated_desc, Style::default().add_modifier(Modifier::DIM)),
-        ]);
-        // Cursor-style: the whole row gets a subtle tinted background
-        // when selected so it stays visible even on wide terminals
-        // where the left gutter is off-screen in peripheral vision.
+        // Description column.
+        if show_desc && desc_budget > 0 {
+            spans.push(Span::raw("  "));
+            let desc = truncate_ellipsis(item.description, desc_budget);
+            let desc_style = if is_selected {
+                Style::default().fg(theme.selected_fg)
+            } else {
+                Style::default().add_modifier(Modifier::DIM)
+            };
+            spans.push(Span::styled(desc, desc_style));
+        }
+
+        let mut line = Line::from(spans);
         if is_selected {
             line = line.style(Style::default().bg(theme.selected_bg));
         }
         lines.push(line);
     }
 
+    // ── Scroll-down hint ────────────────────────────────────────
+    if need_bot_hint {
+        let remaining = matches.len() - window_end;
+        lines.push(scroll_hint(format!("↓ {} more", remaining), theme));
+    }
+
     Paragraph::new(lines).render(area, buf);
 }
 
-/// Compute the half-open range `[start, end)` of items to show so that
-/// `selected` remains visible within a window of at most `max_rows` rows.
+// ─── Helpers ────────────────────────────────────────────────────────
+
+fn render_empty(area: Rect, buf: &mut Buffer, theme: &crate::tui::theme::Theme) {
+    let lines = vec![Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "no matching commands — try a shorter prefix",
+            Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
+        ),
+    ])];
+    Paragraph::new(lines).render(area, buf);
+}
+
+fn scroll_hint(label: String, theme: &crate::tui::theme::Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            label,
+            Style::default()
+                .fg(theme.accent_dim())
+                .add_modifier(Modifier::ITALIC),
+        ),
+    ])
+}
+
+/// Split `name` into styled spans so that bytes whose offsets appear in
+/// `match_indices` render with the accent colour + UNDERLINE, and the
+/// whole string is padded to `col_width` characters.
+fn render_name_spans(
+    name: &str,
+    match_indices: &[u32],
+    col_width: usize,
+    is_selected: bool,
+    theme: &crate::tui::theme::Theme,
+) -> Vec<Span<'static>> {
+    let base_name = if is_selected {
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.accent)
+    };
+    let matched = base_name.add_modifier(Modifier::UNDERLINED);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if match_indices.is_empty() {
+        spans.push(Span::styled(name.to_string(), base_name));
+    } else {
+        // Walk char-by-char, grouping runs of (matched?).
+        let mut cur = String::new();
+        let mut cur_hit = false;
+        let set: std::collections::HashSet<u32> = match_indices.iter().copied().collect();
+        for (i, ch) in name.char_indices() {
+            let hit = set.contains(&(i as u32));
+            if hit != cur_hit && !cur.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut cur),
+                    if cur_hit { matched } else { base_name },
+                ));
+            }
+            cur.push(ch);
+            cur_hit = hit;
+        }
+        if !cur.is_empty() {
+            spans.push(Span::styled(cur, if cur_hit { matched } else { base_name }));
+        }
+    }
+
+    // Trailing padding to align into `col_width`.
+    let name_chars = name.chars().count();
+    if col_width > name_chars {
+        spans.push(Span::raw(" ".repeat(col_width - name_chars)));
+    }
+
+    spans
+}
+
+fn alias_label(item: &super::SlashItem) -> Option<String> {
+    if item.aliases.is_empty() {
+        None
+    } else {
+        Some(format!("({})", item.aliases.join(", ")))
+    }
+}
+
+/// Compute the half-open range `[start, end)` so the selected row stays
+/// visible with at most `max_rows` slots. Centres the selection when
+/// possible so the user sees context above AND below.
 fn window_around(selected: usize, total: usize, max_rows: usize) -> (usize, usize) {
+    if max_rows == 0 || total == 0 {
+        return (0, 0);
+    }
     if total <= max_rows {
         return (0, total);
     }
-    // Try to centre-ish: keep at most 2 rows above the selection.
-    let above = 2.min(selected);
+    // Keep ~half above when possible.
+    let above = (max_rows / 2).min(selected);
     let start = selected.saturating_sub(above);
     let end = (start + max_rows).min(total);
-    // If we hit the bottom, pull the start up.
     let start = end.saturating_sub(max_rows);
     (start, end)
 }
 
-fn pad_right(s: &str, width: usize) -> String {
-    if s.len() >= width {
-        s.to_string()
-    } else {
-        let mut out = String::with_capacity(width);
-        out.push_str(s);
-        for _ in s.len()..width {
-            out.push(' ');
-        }
-        out
+fn pad_right_chars(s: &str, width: usize) -> String {
+    let n = s.chars().count();
+    if n >= width {
+        return s.to_string();
     }
+    let mut out = String::with_capacity(s.len() + (width - n));
+    out.push_str(s);
+    for _ in n..width {
+        out.push(' ');
+    }
+    out
 }
 
 fn truncate_ellipsis(s: &str, width: usize) -> String {
@@ -170,21 +333,9 @@ mod tests {
 
     fn menu_fixture() -> SlashMenu {
         SlashMenu::new(vec![
-            SlashItem {
-                name: "/help",
-                description: "show help",
-                subcommands: &[],
-            },
-            SlashItem {
-                name: "/history",
-                description: "browse session history",
-                subcommands: &[],
-            },
-            SlashItem {
-                name: "/model",
-                description: "pick a model",
-                subcommands: &[],
-            },
+            SlashItem::simple("/help", "show help"),
+            SlashItem::simple("/history", "browse session history"),
+            SlashItem::simple("/model", "pick a model"),
         ])
     }
 
@@ -204,70 +355,62 @@ mod tests {
     #[test]
     fn snapshot_three_items_default_selection() {
         let menu = menu_fixture();
-        insta::assert_snapshot!("slash_popup_three_default_80", render_menu(&menu, 80, 3));
+        insta::assert_snapshot!("slash_popup_three_default_80", render_menu(&menu, 80, 5));
     }
 
     #[test]
     fn snapshot_filtered_to_one() {
         let mut menu = menu_fixture();
         menu.set_filter("/he");
-        insta::assert_snapshot!("slash_popup_filtered_he_80", render_menu(&menu, 80, 3));
+        insta::assert_snapshot!("slash_popup_filtered_he_80", render_menu(&menu, 80, 5));
     }
 
     #[test]
     fn snapshot_second_item_selected() {
         let mut menu = menu_fixture();
         menu.move_down();
-        insta::assert_snapshot!("slash_popup_second_selected_80", render_menu(&menu, 80, 3));
+        insta::assert_snapshot!("slash_popup_second_selected_80", render_menu(&menu, 80, 5));
     }
 
     #[test]
     fn snapshot_no_matches_shows_message() {
         let mut menu = menu_fixture();
         menu.set_filter("/zzz_no_match_here");
-        insta::assert_snapshot!("slash_popup_no_matches_80", render_menu(&menu, 80, 2));
+        insta::assert_snapshot!("slash_popup_no_matches_80", render_menu(&menu, 80, 3));
     }
 
     #[test]
     fn snapshot_narrow_truncates_description() {
         let menu = menu_fixture();
-        insta::assert_snapshot!("slash_popup_narrow_28", render_menu(&menu, 28, 3));
+        insta::assert_snapshot!("slash_popup_narrow_28", render_menu(&menu, 28, 5));
     }
 
     #[test]
     fn snapshot_long_list_windows_around_selection() {
-        // 12 items, max 10 visible — selecting #11 must scroll.
+        // 12 items, body fits 10 — selecting #11 must scroll AND show
+        // the "↑ N more" hint at the top.
         let items: Vec<SlashItem> = (0..12)
             .map(|i| {
-                // Leak a static-lifetime string via Box::leak — cheap in test.
                 let name: &'static str = Box::leak(format!("/cmd{i:02}").into_boxed_str());
                 let desc: &'static str = Box::leak(format!("description {i}").into_boxed_str());
-                SlashItem {
-                    name,
-                    description: desc,
-                    subcommands: &[],
-                }
+                SlashItem::simple(name, desc)
             })
             .collect();
         let mut menu = SlashMenu::new(items);
         for _ in 0..11 {
             menu.move_down();
         }
-        insta::assert_snapshot!("slash_popup_long_list_sel11_80", render_menu(&menu, 80, 10));
+        insta::assert_snapshot!("slash_popup_long_list_sel11_80", render_menu(&menu, 80, 12));
     }
 
     // ─── Non-snapshot unit tests ──────────────────────────────────
 
     #[test]
-    fn desired_height_clamps_at_max() {
+    fn desired_height_clamps_at_max_plus_chrome() {
         let items: Vec<SlashItem> = (0..20)
             .map(|i| {
                 let name: &'static str = Box::leak(format!("/x{i}").into_boxed_str());
-                SlashItem {
-                    name,
-                    description: "",
-                    subcommands: &[],
-                }
+                SlashItem::simple(name, "")
             })
             .collect();
         let menu = SlashMenu::new(items);
@@ -275,16 +418,16 @@ mod tests {
     }
 
     #[test]
-    fn desired_height_minimum_one_for_empty_menu() {
+    fn desired_height_minimum_for_empty_menu() {
         let mut menu = menu_fixture();
         menu.set_filter("/zzz");
         assert_eq!(desired_height(&menu), 1);
     }
 
     #[test]
-    fn pad_right_and_truncate_behaviour() {
-        assert_eq!(pad_right("abc", 5), "abc  ");
-        assert_eq!(pad_right("abcdef", 3), "abcdef");
+    fn pad_and_truncate_behaviour() {
+        assert_eq!(pad_right_chars("abc", 5), "abc  ");
+        assert_eq!(pad_right_chars("abcdef", 3), "abcdef");
         assert_eq!(truncate_ellipsis("abcdef", 4), "abc…");
         assert_eq!(truncate_ellipsis("abc", 4), "abc");
         assert_eq!(truncate_ellipsis("abc", 1), "…");
@@ -292,11 +435,30 @@ mod tests {
     }
 
     #[test]
-    fn window_around_keeps_selection_visible() {
+    fn window_around_keeps_selection_visible_and_centred() {
+        // Small list → full window.
         assert_eq!(window_around(0, 3, 10), (0, 3));
-        assert_eq!(window_around(5, 10, 10), (0, 10));
+        // Big list, selection at end → window pinned to bottom.
         assert_eq!(window_around(11, 12, 10), (2, 12));
-        // Selection near start with big list: window pinned to top.
-        assert_eq!(window_around(1, 20, 10), (0, 10));
+        // Selection in middle centres roughly.
+        let (s, e) = window_around(5, 20, 10);
+        assert_eq!(e - s, 10);
+        assert!(s <= 5 && 5 < e);
+        // Edge: empty list or zero rows.
+        assert_eq!(window_around(0, 0, 10), (0, 0));
+        assert_eq!(window_around(0, 10, 0), (0, 0));
+    }
+
+    #[test]
+    fn narrow_terminal_falls_back_to_chromeless() {
+        // Width below MIN_CHROME_WIDTH should still render something.
+        let menu = menu_fixture();
+        let out = render_menu(&menu, 14, 5);
+        // No border glyphs.
+        assert!(
+            !out.contains('╭'),
+            "narrow popup should not draw box: {out}"
+        );
+        assert!(out.contains("/help"), "name must still render: {out}");
     }
 }

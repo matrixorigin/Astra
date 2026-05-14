@@ -26,7 +26,8 @@ use crate::stream_events::{
     build_edge_tool_call_event, build_tool_call_end_event, build_tool_request_event,
 };
 use crate::tool_argument_hints::{
-    normalize_llm_function_arguments, path_hint_from_args, permission_prompt_primary_detail,
+    normalize_llm_function_arguments, path_hint_from_args, permission_prompt_display_label,
+    permission_prompt_primary_detail,
 };
 use crate::tool_result_sanitize::tool_result_content_for_model;
 
@@ -84,6 +85,23 @@ fn tool_approval_detail(tool_call: &Value) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
     (!detail.is_empty()).then_some(detail)
+}
+
+/// Rich display label for the approval dialog header. Parallel to
+/// [`tool_approval_detail`] — same `tool_call` input but the label is
+/// suitable for direct UI presentation ("$ ls -la", "Writing: foo").
+/// `detail` stays the raw-value path for fingerprint/classifier
+/// matching; they MUST NOT be collapsed into one field.
+fn tool_approval_display_label(tool_call: &Value) -> Option<String> {
+    let tool_name = tool_call
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let raw = raw_tool_arguments(tool_call);
+    let parsed = normalize_llm_function_arguments(&raw);
+    let label = permission_prompt_display_label(tool_name, &parsed);
+    (!label.is_empty()).then_some(label)
 }
 
 fn tool_approval_kind(tool_call: &Value) -> ApprovalKind {
@@ -628,7 +646,10 @@ pub struct ApprovalBatchItem {
     pub tool_name: String,
     pub approval_kind: ApprovalKind,
     pub path: Option<String>,
+    /// Raw command/path for fingerprint/classifier matching.
     pub detail: Option<String>,
+    /// Rich preview for UI display — see [`tool_approval_display_label`].
+    pub display_label: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -663,6 +684,7 @@ pub fn collect_approval_batches(tool_calls: &[Value]) -> Vec<ApprovalBatch> {
             approval_kind,
             path: tool_path_hint(tc),
             detail: tool_approval_detail(tc),
+            display_label: tool_approval_display_label(tc),
         };
         if let Some(batch) = batches
             .iter_mut()
@@ -695,6 +717,7 @@ fn append_approval_batch_events(out: &mut EdgeToolRoundDelivery, batches: &[Appr
                 item.approval_kind,
                 item.path.as_deref(),
                 item.detail.as_deref(),
+                item.display_label.as_deref(),
             ));
         } else {
             let requests = batch
@@ -706,6 +729,7 @@ fn append_approval_batch_events(out: &mut EdgeToolRoundDelivery, batches: &[Appr
                     approval_kind: item.approval_kind,
                     path: item.path.as_deref(),
                     detail: item.detail.as_deref(),
+                    display_label: item.display_label.as_deref(),
                 })
                 .collect::<Vec<_>>();
             out.sse_maps

@@ -154,16 +154,55 @@ pub fn build_skill_listing_section(
     }
     body.push_str("</available_skills>\n\n");
     body.push_str(
-        "When a user request matches a skill above, call the `skill` tool \
-         with that skill's name FIRST (before any other tool). On seeing \
-         `<skill-loaded name=\"...\"/>` in a tool result, follow that skill's \
-         instructions — do not re-invoke it.",
+        "When a user request matches a skill above, prefer calling the \
+         `skill` tool with that skill's name before any other tool. On \
+         seeing `<skill-loaded name=\"...\"/>` in a tool result, follow \
+         that skill's instructions — do not re-invoke it.\n\
+         \n\
+         EXCEPTION: when the user explicitly asks for parallel / \
+         multi-agent / multiple-agent fan-out (e.g. \"多agents\", \"N \
+         agents\", \"parallel review\", \"different angles in parallel\"), \
+         route through `agent.spawn` instead — emit N spawn calls in a \
+         single assistant message, each with `run_in_background: true`, \
+         then collect with `agent.get_result`. Skills usually run \
+         sequentially inside the parent turn, which contradicts the \
+         user's explicit fan-out intent.",
     );
 
     Some(PromptSection::stable(body, CacheScope::Session))
 }
 
-// build_deferred_tools_section removed (selector deleted; no deferred tool surface).
+#[allow(dead_code)]
+pub fn build_deferred_tools_section(
+    surface: &crate::tool_registry::surface::ToolSurface,
+) -> Option<PromptSection> {
+    let entries = surface.deferred();
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut body = String::with_capacity(entries.len() * 80 + 256);
+    body.push_str("<deferred_tools>\n");
+    for entry in entries {
+        body.push_str("  <tool>\n    <name>");
+        body.push_str(&xml_escape_text(&entry.name));
+        body.push_str("</name>\n    <description>");
+        body.push_str(&xml_escape_text(&entry.short_desc));
+        body.push_str("</description>\n  </tool>\n");
+    }
+    body.push_str("</deferred_tools>\n\n");
+    body.push_str(
+        "If a tool in `<deferred_tools>` fits your next step, call \
+         `tool_search(query=\"select:NAME\")` first — the tool_result will contain the \
+         full schema so you can invoke it on the next turn. Never guess at a tool that is \
+         not in `tools[]` without doing this. If you are about to say a needed tool is \
+         unavailable, first call `tool_search`; for dotted legacy names such as \
+         `agent.spawn`, select the consolidated tool name (`tool_search(query=\"select:agent\")`) \
+         and then use its `action` field.",
+    );
+
+    Some(PromptSection::stable(body, CacheScope::Session))
+}
 
 /// Builder that enforces the **static-before-dynamic** invariant at the API
 /// level, so callers cannot silently push a volatile section into the cached
@@ -504,6 +543,21 @@ pub(crate) fn tool_conditional_section(
     String::new()
 }
 
+fn task_lifecycle_section(tool_names: &[&str]) -> Option<String> {
+    if !tool_names.contains(&"task") {
+        return None;
+    }
+    Some(
+        "\n## Task Lifecycle\n\
+         Use the `task` tool automatically for multi-step work, just like a durable task board:\n\
+         - Create a task before substantial implementation, debugging, refactoring, testing, or cloud/agent work.\n\
+         - Keep it current: mark `in_progress` before execution, update subtasks/dependencies when the plan changes, and mark terminal status when done.\n\
+         - Do not create tasks for simple Q&A, one-file lookups, or work that will finish in a single direct response.\n\
+         - If work is delegated or queued for another agent, record ownership and blocking dependencies so the TUI/CLI can show real status.\n"
+            .to_string(),
+    )
+}
+
 /// Per-turn advisory for tool-selector uncertainty.
 ///
 /// This must stay out of Session-scoped prompt blocks: confidence is computed
@@ -786,9 +840,25 @@ pub fn build_system_prompt_sections_with_style(
 
     let tool_cond = tool_conditional_section(tool_names, profile_desc, selection_confidence);
     if !tool_cond.is_empty() {
+        // Tool-conditional guidance is composed from the live tool list and
+        // the runtime profile description — both vary per turn — so it must
+        // be billed to the `Environment` bucket, not `BasePersona`. Putting
+        // dynamic content under `BasePersona` makes the persona bucket look
+        // larger than the immutable persona text actually is, distorting
+        // budget alerts.
         sections.push(PromptSection::dynamic(
             tool_cond,
-            PromptTokenBucket::BasePersona,
+            PromptTokenBucket::Environment,
+        ));
+    }
+
+    if let Some(task_lifecycle) = task_lifecycle_section(tool_names) {
+        // Task-lifecycle guidance is conditional on the active tool set
+        // (e.g. whether plan/task tools are exposed) and is per-turn —
+        // belongs in `Environment`, not `BasePersona`.
+        sections.push(PromptSection::dynamic(
+            task_lifecycle,
+            PromptTokenBucket::Environment,
         ));
     }
 
@@ -801,9 +871,13 @@ pub fn build_system_prompt_sections_with_style(
 
     let tt = task_type_section(task_type);
     if !tt.is_empty() {
+        // The detected task type is recomputed each turn from the user
+        // request — it's environmental signal, not part of the agent
+        // persona. Bill to `Environment` so token accounting reflects
+        // reality.
         sections.push(PromptSection::dynamic(
             tt.to_string(),
-            PromptTokenBucket::BasePersona,
+            PromptTokenBucket::Environment,
         ));
     }
 
@@ -1802,6 +1876,21 @@ mod tests {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
         assert!(p.contains("Plan, Batch, Execute"));
         assert!(p.contains("<think>"));
+    }
+
+    #[test]
+    fn task_tool_adds_lifecycle_guidance() {
+        let p = build_main_system_prompt(&["task", "bash"], "", 1.0, None);
+        assert!(p.contains("Task Lifecycle"));
+        assert!(p.contains("Use the `task` tool automatically"));
+        assert!(p.contains("mark `in_progress`"));
+    }
+
+    #[test]
+    fn no_task_tool_omits_lifecycle_guidance() {
+        let p = build_main_system_prompt(&["bash", "read_file"], "", 1.0, None);
+        assert!(!p.contains("Task Lifecycle"));
+        assert!(!p.contains("Use the `task` tool automatically"));
     }
 
     #[test]
@@ -3018,7 +3107,15 @@ mod tests {
         assert_eq!(section.scope, CacheScope::Session);
         assert!(section.text.contains("<available_skills>"));
         assert!(!section.text.contains("<deferred_tools>"));
-        assert!(section.text.contains("call the `skill` tool"));
+        // Pin the actionable phrasing — wording can drift but the
+        // contract is "model calls the `skill` tool when a skill matches
+        // the user request". The source says "calling the `skill` tool";
+        // keep both forms accepted so a one-word edit doesn't break this.
+        assert!(
+            section.text.contains("`skill` tool"),
+            "skill listing must direct the model at the `skill` tool: {section_text}",
+            section_text = section.text
+        );
     }
 
     // ── SystemPromptBuilder invariants ─────────────────────────────────

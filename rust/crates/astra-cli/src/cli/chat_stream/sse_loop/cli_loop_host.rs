@@ -512,7 +512,13 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String) {
         // Forward to stream event channel (even in suppress mode)
         if let Some(tx) = &self.stream_event_tx {
-            let _ = tx.send(super::super::StreamEvent::StatusLine(line.clone()));
+            if let Some((tool, reason)) =
+                astra_turn_core::permission_notice::parse_auto_approved_permission(&line)
+            {
+                let _ = tx.send(super::super::StreamEvent::PermissionAutoApproved { tool, reason });
+            } else {
+                let _ = tx.send(super::super::StreamEvent::StatusLine(line.clone()));
+            }
         }
         if self.render_policy.suppress_headless() {
             return;

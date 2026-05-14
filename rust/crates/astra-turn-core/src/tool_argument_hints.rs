@@ -5,8 +5,6 @@
 
 use serde_json::Value;
 
-use astra_text_utils::str_preview::truncate_str;
-
 use super::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind_with_args};
 
 /// Parse `function.arguments` from an LLM tool call: either a JSON object or a string of JSON.
@@ -56,12 +54,19 @@ pub fn normalized_argv_prefix(cmd: &str) -> String {
     tokens.join(" ")
 }
 
-/// One-line detail next to the CLI permission icon and cloud `approval_required` prompts.
+/// Raw hint used for **permission rule matching** — `starts_with`
+/// checks against deny/allow rule patterns depend on this being the
+/// naked `command` / `path` value, not a formatted preview.
+///
+/// Must NOT be changed to wrap or decorate the value: rule patterns
+/// like `bash(rm -rf:*)` match against raw commands, so returning
+/// "$ rm -rf ..." would silently stop blocking them. Previously this
+/// function also drove the approval-dialog display label, which
+/// coupled the two concerns; now the display label is generated
+/// separately via [`crate::tool_preview::render_preview`].
 pub fn permission_prompt_primary_detail(tool_name: &str, args: &Value) -> Option<String> {
-    // MCP tools: show a compact summary of arguments since they don't have
-    // standard "command" or "path" keys.
     if tool_name.starts_with("mcp_") {
-        return Some(mcp_args_summary(args));
+        return Some(crate::tool_preview::mcp_args_summary(args));
     }
     match cloud_gated_tool_kind_with_args(tool_name, Some(args)) {
         Some(CloudGatedToolKind::Execute) => command_hint_from_args(args).map(String::from),
@@ -72,37 +77,21 @@ pub fn permission_prompt_primary_detail(tool_name: &str, args: &Value) -> Option
     }
 }
 
-/// Compact summary of MCP tool arguments for permission prompts.
-fn mcp_args_summary(args: &Value) -> String {
-    let obj = match args.as_object() {
-        Some(o) if !o.is_empty() => o,
-        _ => return "(no arguments)".into(),
-    };
-    let mut parts: Vec<String> = Vec::new();
-    for (k, v) in obj.iter().take(3) {
-        let val_str = match v {
-            Value::String(s) => {
-                if s.chars().count() > 60 {
-                    format!("\"{}\"", truncate_str(s, 57))
-                } else {
-                    format!("\"{s}\"")
-                }
-            }
-            other => {
-                let s = other.to_string();
-                if s.chars().count() > 60 {
-                    truncate_str(&s, 57)
-                } else {
-                    s
-                }
-            }
-        };
-        parts.push(format!("{k}={val_str}"));
-    }
-    if obj.len() > 3 {
-        parts.push(format!("+{} more", obj.len() - 3));
-    }
-    parts.join(", ")
+/// Human-readable label for the **approval dialog** — the one-line
+/// preview shown above the Accept / Reject buttons. Delegates to the
+/// shared [`crate::tool_preview::render_preview`] so it matches what
+/// the scrollback renders when the tool actually runs.
+///
+/// Kept separate from [`permission_prompt_primary_detail`] because
+/// the two have different contracts: rule matching wants raw args,
+/// display wants pretty labels.
+pub fn permission_prompt_display_label(tool_name: &str, args: &Value) -> String {
+    crate::tool_preview::render_preview(
+        tool_name,
+        args,
+        crate::tool_preview::PreviewStyle::Concise,
+        80,
+    )
 }
 
 #[cfg(test)]
@@ -155,6 +144,12 @@ mod tests {
         assert!(command_hint_from_args(&args).is_none());
     }
 
+    // `permission_prompt_primary_detail` returns the RAW arg for rule
+    // matching (rules use starts_with checks). The pretty display
+    // label lives in `permission_prompt_display_label` — separating
+    // the two avoids silently bypassing deny rules when the display
+    // format changes.
+
     #[test]
     fn normalized_argv_prefix_stops_at_flags_and_shell_meta() {
         assert_eq!(normalized_argv_prefix("cargo test --release"), "cargo test");
@@ -191,6 +186,17 @@ mod tests {
         assert_eq!(
             permission_prompt_primary_detail("read_file", &args).as_deref(),
             Some("/r")
+        );
+    }
+
+    #[test]
+    fn permission_display_label_uses_rich_preview() {
+        let args = json!({"command": "ls -la"});
+        assert_eq!(permission_prompt_display_label("bash", &args), "$ ls -la");
+        let args = json!({"path": "foo.txt"});
+        assert_eq!(
+            permission_prompt_display_label("write_file", &args),
+            "Writing: foo.txt"
         );
     }
 

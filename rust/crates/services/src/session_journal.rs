@@ -3086,6 +3086,7 @@ impl JournalEvent {
         run_id: &str,
         agent_type: &str,
         status: &str,
+        finish_reason: Option<&str>,
         turns_completed: u32,
         tool_calls: u32,
         prompt_tokens: u64,
@@ -3093,7 +3094,7 @@ impl JournalEvent {
         duration_ms: u64,
     ) -> Self {
         let mut evt = Self::base(JournalEventType::AgentTerminated, session_id);
-        evt.metadata = Some(serde_json::json!({
+        let mut metadata = serde_json::json!({
             "agent_id": agent_id,
             "run_id": run_id,
             "agent_type": agent_type,
@@ -3103,7 +3104,11 @@ impl JournalEvent {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "duration_ms": duration_ms,
-        }));
+        });
+        if let Some(finish_reason) = finish_reason.filter(|reason| !reason.is_empty()) {
+            metadata["finish_reason"] = serde_json::Value::String(finish_reason.to_string());
+        }
+        evt.metadata = Some(metadata);
         evt
     }
 

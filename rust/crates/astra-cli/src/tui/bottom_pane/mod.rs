@@ -5,6 +5,7 @@ pub(crate) mod context_panel_view;
 pub(crate) mod footer;
 pub(crate) mod help_view;
 pub(crate) mod history_view;
+pub(crate) mod in_flight_agents_view;
 pub(crate) mod info_view;
 pub(crate) mod list_selection_view;
 pub(crate) mod login_view;
@@ -12,6 +13,7 @@ pub(crate) mod paste_burst;
 pub(crate) mod session_picker_view;
 pub(crate) mod skill_popup;
 pub(crate) mod table_view;
+pub(crate) mod task_detail_view;
 pub(crate) mod textarea;
 pub(crate) mod timeline_view;
 pub(crate) mod transcript_view;
@@ -182,6 +184,33 @@ impl BottomPane {
 
     pub fn push_view(&mut self, view: Box<dyn BottomPaneView>) {
         self.view_stack.push(view);
+    }
+
+    pub fn refresh_task_detail(
+        &mut self,
+        id: &str,
+        cell: &crate::tui::history_cell::task::TaskCell,
+    ) -> bool {
+        self.active_view_mut()
+            .is_some_and(|view| view.refresh_task_cell(id, cell))
+    }
+
+    pub fn active_live_task_id(&self) -> Option<&str> {
+        self.view_stack.last().and_then(|view| view.live_task_id())
+    }
+
+    pub fn refresh_agent_rows(
+        &mut self,
+        rows: Vec<crate::tui::bottom_pane::in_flight_agents_view::AgentRow>,
+    ) -> bool {
+        self.active_view_mut()
+            .is_some_and(|view| view.refresh_agent_rows(rows))
+    }
+
+    pub fn agent_monitor_is_open(&self) -> bool {
+        self.view_stack
+            .last()
+            .is_some_and(|view| view.accepts_agent_rows())
     }
 
     #[allow(dead_code)]
@@ -554,16 +583,50 @@ impl BottomPane {
         }
     }
 
+    /// Top-level key routing. Dispatches to named phase handlers so
+    /// each concern reads as a single paragraph:
+    ///
+    /// 1. Ctrl+C / Ctrl+D (quit / interrupt / clear-draft)
+    /// 2. Approval queue (← → Enter Esc Tab when an approval is pending)
+    /// 3. Active overlay view (push_view'd full-screen widgets)
+    /// 4. Popup dismissal (Esc)
+    /// 5. Popup navigation (slash / skill / mention menus)
+    /// 6. Composer (text input)
     pub fn handle_key(&mut self, key: KeyEvent) -> BottomPaneAction {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some(a) = self.handle_ctrl_keys(key) {
+            return a;
+        }
+        if let Some(a) = self.handle_approval_keys(key) {
+            return a;
+        }
+        if let Some(a) = self.handle_active_view_key(key) {
+            return a;
+        }
+        if let Some(a) = self.handle_popup_dismiss(key) {
+            return a;
+        }
+        if let Some(a) = self.handle_slash_menu_key(key) {
+            return a;
+        }
+        if let Some(a) = self.handle_skill_popup_key(key) {
+            return a;
+        }
+        if let Some(a) = self.handle_mention_menu_key(key) {
+            return a;
+        }
+        self.route_to_composer(key)
+    }
 
-        // Ctrl+C state machine
+    fn handle_ctrl_keys(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Ctrl+C state machine: view.on_ctrl_c → composer clear →
+        // interrupt if task active → quit.
         if key.code == KeyCode::Char('c') && ctrl {
             if let Some(view) = self.active_view_mut() {
                 match view.on_ctrl_c() {
                     CancellationEvent::Consumed => {
                         self.view_stack.pop();
-                        return BottomPaneAction::Consumed;
+                        return Some(BottomPaneAction::Consumed);
                     }
                     CancellationEvent::Escalate => {}
                 }
@@ -571,14 +634,13 @@ impl BottomPane {
             if !self.composer.is_empty() {
                 self.composer.clear_draft();
                 self.sync_popups();
-                return BottomPaneAction::Consumed;
+                return Some(BottomPaneAction::Consumed);
             }
             if self.task_status.is_active() {
-                return BottomPaneAction::Interrupt;
+                return Some(BottomPaneAction::Interrupt);
             }
-            return BottomPaneAction::Quit;
+            return Some(BottomPaneAction::Quit);
         }
-
         // Ctrl+D: route by context.
         //
         // Issue #326 P3 / R2 Major 6: plan v3 §P3 wants Reject to be
@@ -598,266 +660,260 @@ impl BottomPane {
         if key.code == KeyCode::Char('d') && ctrl {
             if self.has_pending_approvals() && self.composer.is_empty() {
                 if let Some(id) = self.reject_focused_approval() {
-                    return BottomPaneAction::ApprovalResolved { id };
+                    return Some(BottomPaneAction::ApprovalResolved { id });
                 }
-                return BottomPaneAction::Consumed;
+                return Some(BottomPaneAction::Consumed);
             }
             if self.composer.is_empty() && self.view_stack.is_empty() {
-                return BottomPaneAction::Quit;
+                return Some(BottomPaneAction::Quit);
             }
-            return BottomPaneAction::Consumed;
+            return Some(BottomPaneAction::Consumed);
         }
+        None
+    }
 
-        // ── Approval keys ────────────────────────────────────────
-        //
-        // The focused approval cell captures:
-        //   • ← / →          — move button focus
-        //   • Enter          — activate the focused button
-        //   • Ctrl+Enter     — quick-Accept regardless of focus
-        //   • Esc            — default-Reject the focused approval
-        //   • Tab            — cycle focus to next pending (empty composer only)
-        //
-        // We intentionally do NOT map bare letters or Ctrl+Y/N: the
-        // Cursor-style button row already exposes every action, and
-        // any letter shortcut risks consuming text the user is still
-        // typing.
-        if self.has_pending_approvals() {
-            if self.approval_queue.focused_custom_prefix_active() {
-                match key.code {
-                    KeyCode::Enter => {
-                        if let Some(response) =
-                            self.approval_queue.submit_custom_prefix_for_focused()
-                        {
-                            if let Some(id) = self.respond_focused_approval(response) {
-                                return BottomPaneAction::ApprovalResolved { id };
-                            }
+    /// When an approval is pending, capture the narrow set of keys
+    /// that drive it (← → Enter Esc Tab). Intentionally does NOT map
+    /// bare letters or Ctrl+Y/N — the Cursor-style button row already
+    /// exposes every action, and a letter shortcut risks consuming
+    /// text the user is still typing.
+    fn handle_approval_keys(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
+        if !self.has_pending_approvals() {
+            return None;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.approval_queue.focused_custom_prefix_active() {
+            return match key.code {
+                KeyCode::Enter => {
+                    if let Some(response) = self.approval_queue.submit_custom_prefix_for_focused() {
+                        if let Some(id) = self.respond_focused_approval(response) {
+                            return Some(BottomPaneAction::ApprovalResolved { id });
                         }
-                        return BottomPaneAction::Consumed;
                     }
-                    KeyCode::Esc => {
-                        self.approval_queue.cancel_custom_prefix_for_focused();
-                        return BottomPaneAction::Consumed;
-                    }
-                    KeyCode::Backspace => {
-                        self.approval_queue.pop_custom_prefix_char();
-                        return BottomPaneAction::Consumed;
-                    }
-                    KeyCode::Char(ch) if !ctrl => {
-                        self.approval_queue.push_custom_prefix_char(ch);
-                        return BottomPaneAction::Consumed;
-                    }
-                    _ => {}
+                    Some(BottomPaneAction::Consumed)
                 }
-            }
-
-            // Ctrl+Enter → quick accept regardless of button focus.
-            if key.code == KeyCode::Enter && ctrl {
-                if let Some(id) = self.respond_focused_approval(ApprovalResponse::AllowOnce) {
-                    return BottomPaneAction::ApprovalResolved { id };
+                KeyCode::Esc => {
+                    self.approval_queue.cancel_custom_prefix_for_focused();
+                    Some(BottomPaneAction::Consumed)
                 }
-                return BottomPaneAction::Consumed;
-            }
-
-            match key.code {
-                // Horizontal navigation: ←/→ move the focused-button
-                // cursor within the approval cell's button row.
-                // Up/Down intentionally mirror left/right. Many users
-                // reach for the arrow keys without reading the hint
-                // and expected a vertical menu; rather than force
-                // them to learn an arrow-axis mapping, we accept all
-                // four arrows as equivalent. No ambiguity: the
-                // composer never consumes arrow keys while an
-                // approval is pending (early-return below), so
-                // there's no cost to this looseness.
-                KeyCode::Left | KeyCode::Up => {
-                    self.move_approval_button_left();
-                    return BottomPaneAction::Consumed;
+                KeyCode::Backspace => {
+                    self.approval_queue.pop_custom_prefix_char();
+                    Some(BottomPaneAction::Consumed)
                 }
-                KeyCode::Right | KeyCode::Down => {
-                    self.move_approval_button_right();
-                    return BottomPaneAction::Consumed;
+                KeyCode::Char(ch) if !ctrl => {
+                    self.approval_queue.push_custom_prefix_char(ch);
+                    Some(BottomPaneAction::Consumed)
                 }
-                // Tab cycles between PENDING approvals (not buttons).
-                // Previously gated on `composer.is_empty()` so stray
-                // whitespace in the composer would hand Tab to
-                // completion instead — an accidental footgun during
-                // an approval flow. Relaxed to: route Tab to the
-                // approval queue UNLESS an inline menu (slash or
-                // mention) is actively capturing Tab for completion.
-                // That menu exception is what the
-                // `slash_menu_open_with_approval_pending_routes_tab_
-                // to_slash_selection` integration test enforces.
-                KeyCode::Tab if self.slash_menu.is_none() && self.mention_menu.is_none() => {
-                    self.move_approval_focus_down();
-                    return BottomPaneAction::Consumed;
-                }
-                KeyCode::BackTab if self.slash_menu.is_none() && self.mention_menu.is_none() => {
-                    self.move_approval_focus_up();
-                    return BottomPaneAction::Consumed;
-                }
-                KeyCode::Enter
-                    if self.composer.is_empty()
-                        && self.slash_menu.is_none()
-                        && self.mention_menu.is_none()
-                        && self.skill_popup.is_none()
-                        && self.view_stack.is_empty() =>
-                {
-                    // Composer empty and no popup is capturing Enter —
-                    // activate the focused approval button. With text
-                    // in the composer, Enter submits the message
-                    // instead; `Ctrl+Enter` (handled above) is the
-                    // explicit approval shortcut.
-                    if let Some(act) = self.activate_focused_approval_button() {
-                        return match act {
-                            ApprovalActivation::Single { id, .. } => {
-                                BottomPaneAction::ApprovalResolved { id }
-                            }
-                            ApprovalActivation::Batch { .. } => {
-                                BottomPaneAction::ApprovalResolved { id: 0 }
-                            }
-                        };
-                    }
-                }
-                KeyCode::Esc
-                    if self.slash_menu.is_none()
-                        && self.mention_menu.is_none()
-                        && self.skill_popup.is_none()
-                        && self.view_stack.is_empty() =>
-                {
-                    if let Some(id) = self.reject_focused_approval() {
-                        return BottomPaneAction::ApprovalResolved { id };
-                    }
-                }
-                _ => {}
-            }
+                _ => None,
+            };
         }
 
-        // Route to active view first (view handles its own Esc)
-        if let Some(view) = self.active_view_mut() {
-            view.handle_key(key);
-            if view.is_complete() {
-                let completion = view.completion();
-                self.view_stack.pop();
-                if let Some(vc) = completion {
-                    return BottomPaneAction::ViewCompleted {
-                        result: vc.result,
-                        reopen: vc.reopen,
-                    };
-                }
-                return BottomPaneAction::ViewCompleted {
+        // Ctrl+Enter → quick accept regardless of button focus.
+        if key.code == KeyCode::Enter && ctrl {
+            if let Some(id) = self.respond_focused_approval(ApprovalResponse::AllowOnce) {
+                return Some(BottomPaneAction::ApprovalResolved { id });
+            }
+            return Some(BottomPaneAction::Consumed);
+        }
+        match key.code {
+            KeyCode::Left | KeyCode::Up => {
+                self.move_approval_button_left();
+                Some(BottomPaneAction::Consumed)
+            }
+            KeyCode::Right | KeyCode::Down => {
+                self.move_approval_button_right();
+                Some(BottomPaneAction::Consumed)
+            }
+            KeyCode::Enter
+                if self.composer.is_empty()
+                    && self.slash_menu.is_none()
+                    && self.mention_menu.is_none()
+                    && self.skill_popup.is_none()
+                    && self.view_stack.is_empty() =>
+            {
+                // Composer empty and no popup is capturing Enter —
+                // activate the focused approval button. With text
+                // in the composer, Enter submits the message
+                // instead; `Ctrl+Enter` (handled above) is the
+                // explicit approval shortcut.
+                self.activate_focused_approval_button()
+                    .map(|act| match act {
+                        ApprovalActivation::Single { id, .. } => {
+                            BottomPaneAction::ApprovalResolved { id }
+                        }
+                        ApprovalActivation::Batch { .. } => {
+                            BottomPaneAction::ApprovalResolved { id: 0 }
+                        }
+                    })
+            }
+            KeyCode::Esc
+                if self.slash_menu.is_none()
+                    && self.mention_menu.is_none()
+                    && self.skill_popup.is_none()
+                    && self.view_stack.is_empty() =>
+            {
+                self.reject_focused_approval()
+                    .map(|id| BottomPaneAction::ApprovalResolved { id })
+            }
+            KeyCode::Tab if self.slash_menu.is_none() && self.mention_menu.is_none() => {
+                self.move_approval_focus_down();
+                Some(BottomPaneAction::Consumed)
+            }
+            KeyCode::BackTab if self.slash_menu.is_none() && self.mention_menu.is_none() => {
+                self.move_approval_focus_up();
+                Some(BottomPaneAction::Consumed)
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_active_view_key(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
+        let view = self.active_view_mut()?;
+        view.handle_key(key);
+        if view.is_complete() {
+            let completion = view.completion();
+            self.view_stack.pop();
+            return Some(match completion {
+                Some(vc) => BottomPaneAction::ViewCompleted {
+                    result: vc.result,
+                    reopen: vc.reopen,
+                },
+                None => BottomPaneAction::ViewCompleted {
                     result: None,
                     reopen: None,
-                };
-            }
-            return BottomPaneAction::Consumed;
+                },
+            });
         }
+        Some(BottomPaneAction::Consumed)
+    }
 
-        // Esc: dismiss popup
-        if key.code == KeyCode::Esc {
-            if self.slash_menu.is_some() {
-                self.slash_menu = None;
-                return BottomPaneAction::Consumed;
-            }
-            if self.mention_menu.is_some() {
-                self.close_mention();
-                return BottomPaneAction::Consumed;
-            }
-            if self.skill_popup.is_some() {
-                self.skill_popup = None;
-                return BottomPaneAction::Consumed;
-            }
+    fn handle_popup_dismiss(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
+        if key.code != KeyCode::Esc {
+            return None;
         }
-
-        // Popup key handling: Up/Down/Tab/Enter when slash menu is visible.
-        //
-        // Enter with no matches falls through so the composer handles it
-        // (submits the raw draft), avoiding a silent no-op.
         if self.slash_menu.is_some() {
-            match key.code {
-                KeyCode::Up => {
-                    self.slash_menu.as_mut().unwrap().move_up();
-                    return BottomPaneAction::Consumed;
-                }
-                KeyCode::Down => {
-                    self.slash_menu.as_mut().unwrap().move_down();
-                    return BottomPaneAction::Consumed;
-                }
-                KeyCode::Tab => {
-                    if let Some(picked) = self
-                        .slash_menu
-                        .as_ref()
-                        .and_then(|m| m.selected_item())
-                        .map(|i| i.name.to_string())
-                    {
-                        self.composer.set_text(&format!("{picked} "));
-                        self.slash_menu = None;
-                    }
-                    return BottomPaneAction::Consumed;
-                }
-                KeyCode::Enter => {
-                    if let Some(picked) = self
-                        .slash_menu
-                        .as_ref()
-                        .and_then(|m| m.selected_item())
-                        .map(|i| i.name.to_string())
-                    {
-                        self.composer.clear_draft();
-                        self.slash_menu = None;
-                        return BottomPaneAction::SubmitInput(picked);
-                    }
-                    // Empty matches: fall through to composer so the raw
-                    // draft gets submitted as-is.
-                }
-                _ => {}
-            }
+            self.slash_menu = None;
+            return Some(BottomPaneAction::Consumed);
         }
-
-        if self.skill_popup.is_some() {
-            match key.code {
-                KeyCode::Up => {
-                    self.skill_popup.as_mut().unwrap().move_up();
-                    return BottomPaneAction::Consumed;
-                }
-                KeyCode::Down => {
-                    self.skill_popup.as_mut().unwrap().move_down();
-                    return BottomPaneAction::Consumed;
-                }
-                KeyCode::Tab | KeyCode::Enter => {
-                    if let Some(name) = self.skill_popup.as_ref().and_then(|p| p.selected_name()) {
-                        self.composer.set_text(&format!("${name} "));
-                        self.skill_popup = None;
-                    }
-                    return BottomPaneAction::Consumed;
-                }
-                _ => {}
-            }
-        }
-
-        // Mention menu: Up/Down/Tab; Enter falls through to composer so
-        // the user can submit the whole line with an inline mention.
         if self.mention_menu.is_some() {
-            match key.code {
-                KeyCode::Up => {
-                    self.mention_menu.as_mut().unwrap().move_up();
-                    return BottomPaneAction::Consumed;
-                }
-                KeyCode::Down => {
-                    self.mention_menu.as_mut().unwrap().move_down();
-                    return BottomPaneAction::Consumed;
-                }
-                KeyCode::Tab => {
-                    if self.accept_mention() {
-                        // After accept, re-sync in case the new draft
-                        // (e.g. a directory `/`) keeps a menu open.
-                        self.sync_popups();
-                    }
-                    return BottomPaneAction::Consumed;
-                }
-                _ => {}
-            }
+            self.close_mention();
+            return Some(BottomPaneAction::Consumed);
         }
+        if self.skill_popup.is_some() {
+            self.skill_popup = None;
+            return Some(BottomPaneAction::Consumed);
+        }
+        None
+    }
 
-        // Route to composer
+    /// Slash menu navigation. Enter with no matches falls through to
+    /// the composer so the raw draft gets submitted as-is (avoids a
+    /// silent no-op).
+    fn handle_slash_menu_key(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
+        self.slash_menu.as_mut()?;
+        match key.code {
+            KeyCode::Up => {
+                self.slash_menu.as_mut().unwrap().move_up();
+                Some(BottomPaneAction::Consumed)
+            }
+            KeyCode::Down => {
+                self.slash_menu.as_mut().unwrap().move_down();
+                Some(BottomPaneAction::Consumed)
+            }
+            KeyCode::PageUp => {
+                // Jump by a page-ish chunk. Keep in sync with popup's visible rows.
+                self.slash_menu.as_mut().unwrap().page_up(5);
+                Some(BottomPaneAction::Consumed)
+            }
+            KeyCode::PageDown => {
+                self.slash_menu.as_mut().unwrap().page_down(5);
+                Some(BottomPaneAction::Consumed)
+            }
+            KeyCode::Home => {
+                self.slash_menu.as_mut().unwrap().go_first();
+                Some(BottomPaneAction::Consumed)
+            }
+            KeyCode::End => {
+                self.slash_menu.as_mut().unwrap().go_last();
+                Some(BottomPaneAction::Consumed)
+            }
+            KeyCode::Tab => {
+                if let Some(picked) = self
+                    .slash_menu
+                    .as_ref()
+                    .and_then(|m| m.selected_item())
+                    .map(|i| i.name.to_string())
+                {
+                    self.composer.set_text(&format!("{picked} "));
+                    self.slash_menu = None;
+                }
+                Some(BottomPaneAction::Consumed)
+            }
+            KeyCode::Enter => {
+                if let Some(picked) = self
+                    .slash_menu
+                    .as_ref()
+                    .and_then(|m| m.selected_item())
+                    .map(|i| i.name.to_string())
+                {
+                    self.composer.clear_draft();
+                    self.slash_menu = None;
+                    return Some(BottomPaneAction::SubmitInput(picked));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_skill_popup_key(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
+        self.skill_popup.as_mut()?;
+        match key.code {
+            KeyCode::Up => {
+                self.skill_popup.as_mut().unwrap().move_up();
+                Some(BottomPaneAction::Consumed)
+            }
+            KeyCode::Down => {
+                self.skill_popup.as_mut().unwrap().move_down();
+                Some(BottomPaneAction::Consumed)
+            }
+            KeyCode::Tab | KeyCode::Enter => {
+                if let Some(name) = self.skill_popup.as_ref().and_then(|p| p.selected_name()) {
+                    self.composer.set_text(&format!("${name} "));
+                    self.skill_popup = None;
+                }
+                Some(BottomPaneAction::Consumed)
+            }
+            _ => None,
+        }
+    }
+
+    /// Mention menu: Up/Down/Tab. Enter falls through to the composer
+    /// so the user can submit the whole line with an inline mention.
+    fn handle_mention_menu_key(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
+        self.mention_menu.as_mut()?;
+        match key.code {
+            KeyCode::Up => {
+                self.mention_menu.as_mut().unwrap().move_up();
+                Some(BottomPaneAction::Consumed)
+            }
+            KeyCode::Down => {
+                self.mention_menu.as_mut().unwrap().move_down();
+                Some(BottomPaneAction::Consumed)
+            }
+            KeyCode::Tab => {
+                if self.accept_mention() {
+                    // After accept, re-sync in case the new draft
+                    // (e.g. a directory `/`) keeps a menu open.
+                    self.sync_popups();
+                }
+                Some(BottomPaneAction::Consumed)
+            }
+            _ => None,
+        }
+    }
+
+    fn route_to_composer(&mut self, key: KeyEvent) -> BottomPaneAction {
         let action = match self.composer.handle_key(key) {
             ComposerAction::Submit => {
                 let text = self.composer.clear_and_submit();
@@ -870,7 +926,6 @@ impl BottomPane {
             ComposerAction::Consumed => BottomPaneAction::Consumed,
             ComposerAction::Unhandled => BottomPaneAction::Escalate(key),
         };
-
         self.sync_popups();
         action
     }
@@ -880,7 +935,9 @@ impl BottomPane {
             view.pre_draw_tick(now);
         }
         // Flush paste burst buffer when idle timeout expires.
-        self.composer.flush_paste_burst();
+        if self.composer.flush_paste_burst() {
+            self.sync_popups();
+        }
     }
 
     /// True when something in the bottom pane is currently animating and

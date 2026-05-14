@@ -213,8 +213,8 @@ pub(crate) fn section_line_index(
         Section::Memory => "Memory · /memory",
         Section::Skills => {
             // Skills heading varies depending on whether we're in
-            // the shortlist-fallback form or the full one.  Match
-            // on the core label, ignoring the ` (shortlist)` suffix.
+            // the tokenless fallback form or the full one. Match on
+            // the core label, ignoring any explanatory suffix.
             "Skills · /skills"
         }
     };
@@ -613,11 +613,10 @@ fn free_space_row(free_tokens: u32, limit: u32, label_width: usize) -> Line<'sta
 
 // ─── Sub-sections ─────────────────────────────────────────────────
 
-/// Skills sub-section. Skills have a `tokens=0` fallback: when the
-/// runtime only records a selector shortlist (no per-skill token
-/// counts), we still want to list the skill names. When the
-/// section is expanded we also surface the shortlist description
-/// and source.
+/// Skills sub-section. Skills can fall back to a tokenless form when
+/// the runtime did not record a per-skill cost breakdown. We still
+/// surface the names, and expanded rows can include any description or
+/// provenance the model supplied.
 fn append_skill_section(
     out: &mut Vec<Line<'static>>,
     skills: &[SkillItem],
@@ -629,7 +628,7 @@ fn append_skill_section(
     }
     let all_zero = skills.iter().all(|s| s.tokens == 0);
     let heading = if all_zero {
-        "Skills · /skills (shortlist)"
+        "Skills · /skills (no token breakdown)"
     } else {
         "Skills · /skills"
     };

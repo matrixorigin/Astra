@@ -37,13 +37,122 @@ async fn execute_unknown_tool_returns_error() {
     );
 }
 
+/// Standalone `delegate` tool (the engine-managed delegation flow).
+/// In server mode the runtime intercepts this call upstream in
+/// `agentic_delegate_interception.rs` and runs real sub-agents — the
+/// executor placeholder is only seen if interception was bypassed.
+/// CLI mode wires no engine, but the tool name is reserved for
+/// server-mode parity. Keep the deferred-acknowledgement contract
+/// here; the broken path was the OTHER one (agent action='delegate'),
+/// which is now removed entirely.
 #[tokio::test]
-async fn execute_delegate_returns_deferred_acknowledgment() {
+async fn execute_delegate_tool_returns_deferred_acknowledgment_for_interception_fallback() {
     let executor = test_executor();
     let result = executor.execute("delegate", &json!({})).await;
     assert!(
         result.contains("Delegation request acknowledged"),
         "got: {result}"
+    );
+}
+
+/// REGRESSION: the consolidated `agent` tool MUST NOT accept
+/// `action='delegate'`. The CLI never wires a delegation engine, and
+/// `agentic_delegate_interception` only intercepts calls whose tool
+/// NAME is "delegate" — it ignores `agent(action='delegate')`. So the
+/// old executor branch returned a "Delegation request acknowledged"
+/// string while spawning nothing, and the model believed it had queued
+/// real sub-agents. Bug observed: session f3c4b457-... shipped 5 fake
+/// "Task done Delegating" rows in 0 ms each.
+///
+/// The fix is twofold: (1) the schema enum drops "delegate" so the
+/// model can't pick it, and (2) defence-in-depth — the executor
+/// rejects it as an unknown action with an actionable redirect.
+#[tokio::test]
+async fn agent_action_delegate_is_rejected_with_redirect_to_spawn() {
+    let executor = test_executor();
+    let result = executor
+        .execute(
+            "agent",
+            &json!({
+                "action": "delegate",
+                "task": "review HEAD~3..HEAD"
+            }),
+        )
+        .await;
+    assert!(
+        result.starts_with("Error"),
+        "agent.delegate must return an Error: prefix so the TUI renders \
+         it as a failure (red banner), not as a normal tool result. Got: {result}"
+    );
+    assert!(
+        result.contains("spawn"),
+        "agent.delegate's error must name `agent.spawn` as the \
+         alternative — without that, the model has no path to recovery. \
+         Got: {result}"
+    );
+    assert!(
+        !result.contains("Delegation request acknowledged"),
+        "the old fake-success placeholder must be gone — its presence \
+         is what tricked the model into believing 5 sub-agents were \
+         queued when none had spawned. Got: {result}"
+    );
+    // End-to-end UX assertion: the Error: prefix must classify through
+    // tool_result_semantics::is_tool_error → cloud_tool_result_status_label
+    // → "error", so the TUI renders the red `•` failure banner instead
+    // of the green success banner. This is the load-bearing wire that
+    // makes the failure visible to the human.
+    assert!(
+        astra_turn_core::tool_result_semantics::is_tool_error(&result),
+        "the new error must be classified as an error by is_tool_error \
+         (drives TUI red banner / Failed label). Got: {result}"
+    );
+    assert_eq!(
+        astra_turn_core::tool_result_semantics::cloud_tool_result_status_label(&result),
+        "error",
+        "the new error must produce status='error' for cloud reporting; \
+         status='success' would re-poison the model's belief that the \
+         delegation succeeded. Got: {result}"
+    );
+}
+
+/// The `agent` tool's action enum must NOT advertise "delegate" to
+/// the model. Schema-level removal is the strongest signal — the
+/// model cannot even shape-validly emit a call the runtime would
+/// silently no-op.
+#[test]
+fn agent_schema_enum_does_not_advertise_delegate_action() {
+    let schemas = astra_tools::schemas::all_tool_schemas();
+    let agent = schemas
+        .iter()
+        .find(|s| {
+            s.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(serde_json::Value::as_str)
+                == Some("agent")
+        })
+        .expect("agent schema must exist");
+    let actions = agent
+        .get("function")
+        .and_then(|f| f.get("parameters"))
+        .and_then(|p| p.get("properties"))
+        .and_then(|p| p.get("action"))
+        .and_then(|a| a.get("enum"))
+        .and_then(serde_json::Value::as_array)
+        .expect("agent.action must declare an enum")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(
+        !actions.contains(&"delegate"),
+        "agent.action must NOT include 'delegate' — the action was \
+         dead code (no delegation engine wired) and silently no-op'd. \
+         Use spawn/get_result instead. Got actions: {actions:?}"
+    );
+    // Spawn must still be there — it's the working alternative.
+    assert!(
+        actions.contains(&"spawn"),
+        "agent.action must still include 'spawn' (the working path the \
+         delegate-error message redirects to). Got: {actions:?}"
     );
 }
 
