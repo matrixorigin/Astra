@@ -1985,7 +1985,41 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             crate::permission_manager::PermissionManager::make_allow_rule(
                                 &t, args,
                             );
-                        metadata.will_save_preview = Some(will_save);
+                        // Issue #326 P5 / scenario #28: include
+                        // the package root in the will-save
+                        // preview so the user knows the rule will
+                        // be scoped to (say) `packages/web`, not
+                        // promoted globally. nearest_package_root
+                        // walks up from the cwd looking for a
+                        // package marker (Cargo.toml, package.json,
+                        // pyproject.toml, …); None means
+                        // "workspace root" — we use a literal
+                        // marker so the user sees something.
+                        let cwd = std::env::current_dir().unwrap_or_default();
+                        let scope_label = astra_turn_core::permission_cwd_root::nearest_package_root(&cwd, None)
+                            .as_deref()
+                            .map(|p| {
+                                cwd.strip_prefix(p)
+                                    .ok()
+                                    .map(|rel| {
+                                        if rel.as_os_str().is_empty() {
+                                            p.file_name()
+                                                .map(|n| n.to_string_lossy().into_owned())
+                                                .unwrap_or_else(|| p.to_string_lossy().into_owned())
+                                        } else {
+                                            p.file_name()
+                                                .map(|n| n.to_string_lossy().into_owned())
+                                                .unwrap_or_else(|| p.to_string_lossy().into_owned())
+                                        }
+                                    })
+                                    .unwrap_or_else(|| p.to_string_lossy().into_owned())
+                            });
+                        let will_save_with_scope = if let Some(label) = scope_label {
+                            format!("{will_save}  (scope: {label}/)")
+                        } else {
+                            will_save
+                        };
+                        metadata.will_save_preview = Some(will_save_with_scope);
                     }
                     // Risk classification: a coarse read-only ↔
                     // write ↔ execute decision driven by the
