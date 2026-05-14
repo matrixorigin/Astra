@@ -121,27 +121,52 @@ impl PermissionRule {
     }
 
     /// Check if this rule matches a tool call.
+    ///
+    /// Issue #326 P5 / R2 Major 2: a pattern that contains glob
+    /// metacharacters (`*` / `**` / `?` / `{a,b}`) is matched
+    /// against the command string via [`crate::permission_path_glob::glob_match`].
+    /// Patterns without metacharacters fall back to the legacy
+    /// word-boundary prefix match so existing rules continue to
+    /// behave the same way (`Bash(npm test:*)` still allows
+    /// `npm test --verbose`).
     pub fn matches(&self, tool_name: &str, command: Option<&str>) -> bool {
         if self.tool != tool_name.to_lowercase() {
             return false;
         }
         match (&self.pattern, command) {
             (None, _) => true, // Bare tool name matches all
-            (Some(prefix), Some(cmd)) => {
-                let lower_cmd = cmd.to_lowercase();
-                let lower_prefix = prefix.to_lowercase();
-                // Prefix match with word boundary
-                if !lower_cmd.starts_with(&lower_prefix) {
-                    return false;
+            (Some(pattern), Some(cmd)) => {
+                if pattern_contains_glob_metachars(pattern) {
+                    // Glob path: match the WHOLE command (post-
+                    // lower-casing) against the user's pattern.
+                    // We don't lowercase the pattern itself
+                    // because path globs are case-sensitive on
+                    // Linux.
+                    let lower_cmd = cmd.to_lowercase();
+                    crate::permission_path_glob::glob_match(pattern, &lower_cmd)
+                } else {
+                    // Legacy word-boundary prefix path.
+                    let lower_cmd = cmd.to_lowercase();
+                    let lower_prefix = pattern.to_lowercase();
+                    if !lower_cmd.starts_with(&lower_prefix) {
+                        return false;
+                    }
+                    let rest = &lower_cmd[lower_prefix.len()..];
+                    rest.is_empty()
+                        || rest.starts_with(char::is_whitespace)
+                        || rest.starts_with(&['-', '=', ';', '|', '&', '>', '<'][..])
                 }
-                let rest = &lower_cmd[lower_prefix.len()..];
-                rest.is_empty()
-                    || rest.starts_with(char::is_whitespace)
-                    || rest.starts_with(&['-', '=', ';', '|', '&', '>', '<'][..])
             }
             (Some(_), None) => false, // Pattern rule but no command to match
         }
     }
+}
+
+/// Cheap predicate: does `pattern` contain any of the glob
+/// metacharacters [`crate::permission_path_glob`] recognizes?
+/// Used to decide between glob-match and legacy prefix-match.
+fn pattern_contains_glob_metachars(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?') || pattern.contains('{')
 }
 
 impl std::fmt::Display for PermissionRule {
@@ -639,6 +664,42 @@ mod tests {
         assert!(!rule.matches("bash", Some("git commitizen")));
         assert!(!rule.matches("bash", Some("git push")));
         assert!(!rule.matches("edit", Some("git commit")));
+    }
+
+    #[test]
+    fn rule_matches_with_glob_pattern() {
+        // Issue #326 P5 / R2 Major 2: glob metacharacters in
+        // the pattern switch from prefix-match to full glob.
+        let rule = PermissionRule {
+            tool: "edit".into(),
+            pattern: Some("src/**/*.rs".into()),
+        };
+        assert!(rule.matches("edit", Some("src/lib.rs")));
+        assert!(rule.matches("edit", Some("src/auth/login.rs")));
+        assert!(rule.matches("edit", Some("src/a/b/c/d.rs")));
+        assert!(!rule.matches("edit", Some("docs/readme.md")));
+    }
+
+    #[test]
+    fn rule_matches_with_brace_alternatives() {
+        let rule = PermissionRule {
+            tool: "edit".into(),
+            pattern: Some("**/*.{rs,ts,js}".into()),
+        };
+        assert!(rule.matches("edit", Some("lib.rs")));
+        assert!(rule.matches("edit", Some("ui/component.ts")));
+        assert!(rule.matches("edit", Some("server.js")));
+        assert!(!rule.matches("edit", Some("config.toml")));
+    }
+
+    #[test]
+    fn rule_matches_falls_back_to_prefix_when_no_metachars() {
+        // No * / ? / { → legacy word-boundary prefix path
+        // remains unchanged so existing v1 rules still work.
+        let rule = PermissionRule::parse("bash(npm test:*)");
+        assert!(rule.matches("bash", Some("npm test")));
+        assert!(rule.matches("bash", Some("npm test --watch")));
+        assert!(!rule.matches("bash", Some("npm run deploy")));
     }
 
     #[test]
