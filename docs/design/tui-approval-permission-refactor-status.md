@@ -83,6 +83,10 @@ Implemented and verified in code:
 - P6 local trace surface exists through `/allow trace` in TUI and
   `astra permissions trace` in CLI; redacted JSONL export is available through
   `/allow trace --export <path>` and `astra permissions trace --export <path>`.
+  The same evaluated/resolved/persisted audit events are also appended to the
+  durable session journal as `permission_audit` records, so
+  `~/.astra/sessions/<session>.jsonl` can reconstruct the permission chain after
+  a run.
 
 ## Remaining Boundaries
 

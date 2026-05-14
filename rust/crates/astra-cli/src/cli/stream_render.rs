@@ -1351,6 +1351,15 @@ impl<'a> CliSseStreamHost<'a> {
         let _ = writer.append(&event);
     }
 
+    fn sync_permission_manager_session_id(&mut self) {
+        let Some(session_id) = self.executor.active_session_id() else {
+            return;
+        };
+        if let Some(pm) = self.perm_manager.as_mut() {
+            pm.set_active_session_id(&session_id);
+        }
+    }
+
     fn emit_execution_boundary_opened(
         &self,
         turn_index: u32,
@@ -2107,6 +2116,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         if self.executor.active_session_id().as_deref() != Some(session_id) {
             self.executor.set_active_session_id(session_id.to_string());
         }
+        if let Some(pm) = self.perm_manager.as_mut() {
+            pm.set_active_session_id(session_id);
+        }
     }
 
     fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
@@ -2212,6 +2224,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         tool: &str,
         args: &serde_json::Value,
     ) -> EdgeToolExecResult {
+        self.sync_permission_manager_session_id();
+
         // Forward tool-started event to observer channel
         let tool_description = self.render.format_tool_description(tool, args);
         if let Some(tx) = &self.stream_event_tx {
@@ -2621,7 +2635,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         let scope = response
                             .always_scope(always_scope)
                             .map(audit_scope_for_always);
-                        astra_turn_core::permission_audit::record_resolved(
+                        astra_turn_core::permission_audit::record_resolved_for_session(
+                            self.executor.active_session_id().as_deref(),
                             astra_turn_core::permission_audit::ApprovalResolvedEvent {
                                 timestamp_ms,
                                 correlation_id,
@@ -3131,6 +3146,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         &mut self,
         requests: Vec<ToolBatchRequest>,
     ) -> Vec<EdgeToolExecResult> {
+        self.sync_permission_manager_session_id();
+
         let n = requests.len();
 
         // Set batch progress for multi-tool turns.

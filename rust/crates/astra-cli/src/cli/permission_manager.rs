@@ -776,6 +776,8 @@ pub(super) struct PermissionManager {
     /// Effective workspace trust decision when this manager was
     /// constructed through the trust-aware interactive path.
     workspace_trust: Option<WorkspaceTrustEvaluation>,
+    /// Active session id for durable permission audit events.
+    active_session_id: Option<String>,
 }
 
 impl PermissionManager {
@@ -883,6 +885,14 @@ impl PermissionManager {
         self.mode = mode;
     }
 
+    pub(super) fn set_active_session_id(&mut self, session_id: &str) {
+        self.active_session_id = Some(session_id.to_string());
+    }
+
+    fn active_session_id(&self) -> Option<&str> {
+        self.active_session_id.as_deref()
+    }
+
     /// Start a new LLM turn: per-turn approvals from the previous
     /// SSE stream must not leak into the next user message.
     pub(super) fn clear_turn_overrides(&mut self) {
@@ -940,6 +950,7 @@ impl PermissionManager {
             load_errors: Vec::new(),
             load_policy: PermissionLoadPolicy::TrustAll,
             workspace_trust: None,
+            active_session_id: None,
         }
     }
 
@@ -1070,6 +1081,7 @@ impl PermissionManager {
             load_errors,
             load_policy: policy,
             workspace_trust,
+            active_session_id: None,
         }
     }
 
@@ -1156,6 +1168,7 @@ impl PermissionManager {
             load_errors,
             load_policy,
             workspace_trust: None,
+            active_session_id: None,
         }
     }
 
@@ -2045,6 +2058,7 @@ impl PermissionManager {
     }
 
     fn record_rule_persisted(
+        &self,
         timestamp_ms: u64,
         correlation_id: String,
         target: astra_turn_core::permission_audit::PersistTarget,
@@ -2052,7 +2066,8 @@ impl PermissionManager {
         saved: bool,
         failure_reason: Option<String>,
     ) {
-        astra_turn_core::permission_audit::record_persisted(
+        astra_turn_core::permission_audit::record_persisted_for_session(
+            self.active_session_id(),
             astra_turn_core::permission_audit::RulePersistedEvent {
                 timestamp_ms,
                 correlation_id,
@@ -2219,7 +2234,7 @@ impl PermissionManager {
                 // RulePersistedEvent on failure so audit /
                 // `/permissions trace` can show the attempt + the
                 // error reason.
-                Self::record_rule_persisted(
+                self.record_rule_persisted(
                     timestamp_ms,
                     correlation_id,
                     PersistTarget::Project,
@@ -2232,7 +2247,7 @@ impl PermissionManager {
                 self.replace_project_settings(settings);
                 self.refresh_workspace_trust_hash_after_project_save();
                 self.last_save_error = None;
-                Self::record_rule_persisted(
+                self.record_rule_persisted(
                     timestamp_ms,
                     correlation_id,
                     PersistTarget::Project,
@@ -2295,7 +2310,7 @@ impl PermissionManager {
                 );
                 self.last_save_error = Some(e.to_string());
                 self.remember_allow_rule_in_memory(PersistTarget::User, &rule_text);
-                Self::record_rule_persisted(
+                self.record_rule_persisted(
                     timestamp_ms,
                     correlation_id,
                     PersistTarget::User,
@@ -2307,7 +2322,7 @@ impl PermissionManager {
             Ok(settings) => {
                 self.replace_user_settings(settings);
                 self.last_save_error = None;
-                Self::record_rule_persisted(
+                self.record_rule_persisted(
                     timestamp_ms,
                     correlation_id,
                     PersistTarget::User,
@@ -2623,8 +2638,13 @@ impl PermissionManager {
         }
 
         let envelope = self.evaluate_permission_envelope(name, args);
-        astra_turn_core::permission_audit::record_evaluated_envelope(
-            name, args, &envelope, "cli", None,
+        astra_turn_core::permission_audit::record_evaluated_envelope_for_session(
+            self.active_session_id(),
+            name,
+            args,
+            &envelope,
+            "cli",
+            None,
         );
 
         if matches!(envelope.source, DecisionSource::SandboxExpansion)
@@ -3086,6 +3106,48 @@ mod tests {
             pm.check_nonblocking("bash", &args),
             PermissionDecision::NeedApproval { .. }
         ));
+    }
+
+    #[test]
+    fn check_nonblocking_persists_permission_audit_to_active_session() {
+        let journal_dir = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
+        let session_id = format!("perm-manager-audit-{}", uuid::Uuid::new_v4());
+        let project_dir = tempfile::tempdir().unwrap();
+        let mut pm =
+            PermissionManager::with_project_mode(PermissionMode::Prompt, project_dir.path());
+        pm.set_active_session_id(&session_id);
+        let args = serde_json::json!({"path": "x.md", "content": "# x"});
+
+        assert!(matches!(
+            pm.check_nonblocking("write_file", &args),
+            PermissionDecision::NeedApproval { .. }
+        ));
+
+        let events = astra_services::session_journal::read_journal(&session_id).unwrap();
+        let permission_event = events
+            .iter()
+            .find(|event| {
+                event.event_type
+                    == astra_services::session_journal::JournalEventType::PermissionAudit
+            })
+            .expect("permission audit event");
+        let metadata = permission_event.metadata.as_ref().expect("metadata");
+        assert_eq!(
+            metadata.get("kind").and_then(serde_json::Value::as_str),
+            Some("evaluated")
+        );
+        assert_eq!(
+            metadata.get("decision").and_then(serde_json::Value::as_str),
+            Some("need_external")
+        );
+        assert_eq!(
+            metadata
+                .get("request_key")
+                .and_then(|value| value.get("tool"))
+                .and_then(serde_json::Value::as_str),
+            Some("write_file")
+        );
     }
 
     #[test]

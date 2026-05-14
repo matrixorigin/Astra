@@ -357,28 +357,71 @@ fn ring() -> &'static Mutex<PermissionAuditRing> {
 
 /// Append an [`PermissionEvaluatedEvent`] to the global ring.
 pub fn record_evaluated(event: PermissionEvaluatedEvent) {
+    record_evaluated_for_session(None, event);
+}
+
+/// Append a [`PermissionEvaluatedEvent`] to the global ring and, when a
+/// session id is available, to that session's durable JSONL journal.
+pub fn record_evaluated_for_session(session_id: Option<&str>, event: PermissionEvaluatedEvent) {
+    let journal_event = PermissionAuditEvent::Evaluated(event.clone());
     if let Ok(mut r) = ring().lock() {
         r.push_evaluated(event);
     }
+    append_to_session_journal(session_id, &journal_event);
 }
 
 /// Append an [`ApprovalResolvedEvent`] to the global ring.
 pub fn record_resolved(event: ApprovalResolvedEvent) {
+    record_resolved_for_session(None, event);
+}
+
+/// Append an [`ApprovalResolvedEvent`] to the global ring and, when a
+/// session id is available, to that session's durable JSONL journal.
+pub fn record_resolved_for_session(session_id: Option<&str>, event: ApprovalResolvedEvent) {
+    let journal_event = PermissionAuditEvent::Resolved(event.clone());
     if let Ok(mut r) = ring().lock() {
         r.push_resolved(event);
     }
+    append_to_session_journal(session_id, &journal_event);
 }
 
 /// Append a [`RulePersistedEvent`] to the global ring.
 pub fn record_persisted(event: RulePersistedEvent) {
+    record_persisted_for_session(None, event);
+}
+
+/// Append a [`RulePersistedEvent`] to the global ring and, when a session id
+/// is available, to that session's durable JSONL journal.
+pub fn record_persisted_for_session(session_id: Option<&str>, event: RulePersistedEvent) {
+    let journal_event = PermissionAuditEvent::Persisted(event.clone());
     if let Ok(mut r) = ring().lock() {
         r.push_persisted(event);
     }
+    append_to_session_journal(session_id, &journal_event);
 }
 
 /// Convenience wrapper for call sites that already have a
 /// [`DecisionEnvelope`]. Keeps CLI/runtime evaluated-event wiring consistent.
 pub fn record_evaluated_envelope(
+    tool_name: &str,
+    args: &serde_json::Value,
+    envelope: &DecisionEnvelope,
+    correlation_prefix: &str,
+    source_agent: Option<String>,
+) {
+    record_evaluated_envelope_for_session(
+        None,
+        tool_name,
+        args,
+        envelope,
+        correlation_prefix,
+        source_agent,
+    );
+}
+
+/// Session-aware variant of [`record_evaluated_envelope`].
+pub fn record_evaluated_envelope_for_session(
+    session_id: Option<&str>,
     tool_name: &str,
     args: &serde_json::Value,
     envelope: &DecisionEnvelope,
@@ -403,15 +446,53 @@ pub fn record_evaluated_envelope(
         HardDecision::NeedExternal { .. } => "need_external",
     }
     .to_string();
-    record_evaluated(PermissionEvaluatedEvent {
-        timestamp_ms,
-        correlation_id: format!("{correlation_prefix}-{timestamp_ms}-{tool_name}"),
-        request_key,
-        decision,
-        source: (&envelope.source).into(),
-        risk_tags: envelope.risk_tags.clone(),
-        need_external: matches!(&envelope.decision, HardDecision::NeedExternal { .. }),
-    });
+    record_evaluated_for_session(
+        session_id,
+        PermissionEvaluatedEvent {
+            timestamp_ms,
+            correlation_id: format!("{correlation_prefix}-{timestamp_ms}-{tool_name}"),
+            request_key,
+            decision,
+            source: (&envelope.source).into(),
+            risk_tags: envelope.risk_tags.clone(),
+            need_external: matches!(&envelope.decision, HardDecision::NeedExternal { .. }),
+        },
+    );
+}
+
+fn append_to_session_journal(session_id: Option<&str>, event: &PermissionAuditEvent) {
+    let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) else {
+        return;
+    };
+    let Ok(payload) = serde_json::to_value(event) else {
+        tracing::warn!("permission_audit: failed to serialize audit event for journal");
+        return;
+    };
+    let journal_event = astra_services::session_journal::JournalEvent::permission_audit(
+        Some(session_id),
+        None,
+        payload,
+    );
+    match astra_services::session_journal::JournalWriter::new(session_id) {
+        Ok(writer) => {
+            if let Err(error) = writer.append(&journal_event) {
+                tracing::warn!(
+                    session_id,
+                    correlation_id = event.correlation_id(),
+                    error = %error,
+                    "permission_audit: failed to append session journal event"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                session_id,
+                correlation_id = event.correlation_id(),
+                error = %error,
+                "permission_audit: failed to open session journal"
+            );
+        }
+    }
 }
 
 /// Snapshot the global ring as time-sorted JSONL events.
@@ -646,6 +727,52 @@ mod tests {
         // events without inspecting fields.
         assert!(line.contains("\"kind\":\"evaluated\""));
         assert!(line.contains("\"decision\":\"allow\""));
+    }
+
+    #[test]
+    fn session_journal_receives_permission_audit_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = format!("perm-audit-{}", Uuid::new_v4());
+
+        record_evaluated_for_session(
+            Some(&session_id),
+            PermissionEvaluatedEvent {
+                timestamp_ms: 1,
+                correlation_id: "c-journal".into(),
+                request_key: fixture_request(),
+                decision: "need_external".into(),
+                source: SourceLabel {
+                    step: "mode".into(),
+                    matched_rule: Some("prompt".into()),
+                    origin: None,
+                },
+                risk_tags: vec![],
+                need_external: true,
+            },
+        );
+
+        let events = astra_services::session_journal::read_journal(&session_id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].event_type,
+            astra_services::session_journal::JournalEventType::PermissionAudit
+        );
+        let metadata = events[0].metadata.as_ref().expect("metadata");
+        assert_eq!(
+            metadata.get("kind").and_then(serde_json::Value::as_str),
+            Some("evaluated")
+        );
+        assert_eq!(
+            metadata
+                .get("correlation_id")
+                .and_then(serde_json::Value::as_str),
+            Some("c-journal")
+        );
+        assert_eq!(
+            metadata.get("decision").and_then(serde_json::Value::as_str),
+            Some("need_external")
+        );
     }
 
     #[test]

@@ -799,6 +799,8 @@ pub enum JournalEventType {
     ApprovalDecision,
     /// An approval prompt timed out before a decision arrived.
     ApprovalTimeout,
+    /// Permission evaluation / approval / persistence audit event.
+    PermissionAudit,
     /// A rollback-capable execution boundary started tracking side effects.
     ExecutionBoundaryOpened,
     /// A rollback-capable execution boundary finished successfully.
@@ -2155,6 +2157,21 @@ impl JournalEvent {
         if let Some(n) = note.filter(|s| !s.is_empty()) {
             evt.user_input = Some(truncate(n, 200));
         }
+        evt
+    }
+
+    /// Permission audit event. The payload shape is owned by
+    /// `astra-turn-core::permission_audit`; the journal stores it as
+    /// structured metadata so offline session inspection can reconstruct the
+    /// complete permission chain.
+    pub fn permission_audit(
+        session_id: Option<&str>,
+        turn: Option<u32>,
+        payload: serde_json::Value,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::PermissionAudit, session_id);
+        evt.turn = turn;
+        evt.metadata = Some(payload);
         evt
     }
 
@@ -3535,6 +3552,38 @@ mod approval_tests {
         assert_eq!(found.turn, Some(11));
         assert_eq!(found.tool_name.as_deref(), Some("bash"));
         assert_eq!(found.approval_kind.as_deref(), Some("explicit"));
+    }
+
+    #[test]
+    fn permission_audit_event_round_trips_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-permission-audit").unwrap();
+
+        writer
+            .append(&JournalEvent::permission_audit(
+                Some("sess-permission-audit"),
+                Some(3),
+                serde_json::json!({
+                    "kind": "evaluated",
+                    "correlation_id": "perm-1",
+                    "decision": "need_external",
+                }),
+            ))
+            .unwrap();
+
+        let events = read_journal("sess-permission-audit").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, JournalEventType::PermissionAudit);
+        assert_eq!(events[0].turn, Some(3));
+        assert_eq!(
+            events[0]
+                .metadata
+                .as_ref()
+                .and_then(|value| value.get("kind"))
+                .and_then(serde_json::Value::as_str),
+            Some("evaluated")
+        );
     }
 
     #[test]

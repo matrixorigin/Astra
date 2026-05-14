@@ -62,6 +62,54 @@ fn format_u64_grouped(n: u64) -> String {
     out.chars().rev().collect()
 }
 
+fn permission_audit_summary(metadata: Option<&serde_json::Value>) -> String {
+    let Some(meta) = metadata else {
+        return "unknown".to_string();
+    };
+    let kind = meta
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let tool = meta
+        .get("request_key")
+        .and_then(|value| value.get("tool"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    match kind {
+        "evaluated" => {
+            let decision = meta
+                .get("decision")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            format!("evaluated {tool} -> {decision}")
+        }
+        "resolved" => {
+            let response = meta
+                .get("response")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let mut summary = format!("resolved {tool} -> {response}");
+            if let Some(scope) = meta.get("scope").and_then(serde_json::Value::as_str) {
+                summary.push_str(&format!(" ({scope})"));
+            }
+            summary
+        }
+        "persisted" => {
+            let target = meta
+                .get("target")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let saved = meta
+                .get("saved")
+                .and_then(serde_json::Value::as_bool)
+                .map(|value| if value { "saved" } else { "failed" })
+                .unwrap_or("?");
+            format!("persisted {target} rule ({saved})")
+        }
+        other => other.to_string(),
+    }
+}
+
 /// One-line hint for session lists: cwd, git, turns (from `workspace.yaml` if present).
 fn workspace_summary_line(sid: &str) -> String {
     match session_workspace::read_workspace(sid) {
@@ -1384,6 +1432,14 @@ pub(super) async fn handle_session_command(
                                     ts_short.dim(),
                                     theme::icon_warn(),
                                     tool,
+                                );
+                            }
+                            session_journal::JournalEventType::PermissionAudit => {
+                                eprintln!(
+                                    "  {} {} permission audit: {}",
+                                    ts_short.dim(),
+                                    "🔐".cyan(),
+                                    permission_audit_summary(evt.metadata.as_ref()),
                                 );
                             }
                             session_journal::JournalEventType::ExecutionBoundaryOpened => {
