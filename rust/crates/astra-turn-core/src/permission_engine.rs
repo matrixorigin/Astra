@@ -1022,7 +1022,10 @@ fn content_aware_fingerprint(tool_name: &str, args: &Value) -> ApprovalFingerpri
         ),
         Some(CloudGatedToolKind::Write) => {
             let path = path_hint_from_args(args);
-            ApprovalFingerprint::file_op(tool_name, path.as_deref())
+            path.map_or_else(
+                || ApprovalFingerprint::bare(tool_name),
+                |path| ApprovalFingerprint::file_op_exact(tool_name, Some(&path)),
+            )
         }
         None => ApprovalFingerprint::bare(tool_name),
     }

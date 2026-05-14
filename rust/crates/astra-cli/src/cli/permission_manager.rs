@@ -160,6 +160,89 @@ fn content_aware_fingerprint(
     }
 }
 
+/// Candidate fingerprint for looking up a specific request in the override set.
+///
+/// Stored path rules may be exact, literal-prefix, directory-pattern, or bare
+/// tool rules. The lookup side must keep the raw path so exact rules for deep
+/// paths still match; broader stored patterns continue to subsume it.
+fn approval_lookup_fingerprint(
+    name: &str,
+    args: &serde_json::Value,
+) -> astra_turn_core::approval_fingerprint::ApprovalFingerprint {
+    use astra_turn_core::approval_fingerprint::ApprovalFingerprint;
+
+    match cloud_gated_tool_kind_with_args(name, Some(args)) {
+        Some(CloudGatedToolKind::Execute) => {
+            if let Some(cmd) = command_hint_from_args(args) {
+                let lower = cmd.to_ascii_lowercase();
+                let is_ro = is_read_only_allowlisted(&lower);
+                ApprovalFingerprint::shell(name, cmd, is_ro)
+            } else {
+                ApprovalFingerprint::bare(name)
+            }
+        }
+        Some(CloudGatedToolKind::Write) => {
+            if let Some(path) = path_hint_from_args(args) {
+                ApprovalFingerprint::file_op_exact(name, Some(&path))
+            } else {
+                ApprovalFingerprint::bare(name)
+            }
+        }
+        None => ApprovalFingerprint::bare(name),
+    }
+}
+
+fn cloud_detail_lookup_fingerprint(
+    tool: &str,
+    detail: Option<&str>,
+) -> astra_turn_core::approval_fingerprint::ApprovalFingerprint {
+    use astra_turn_core::approval_fingerprint::ApprovalFingerprint;
+
+    match (cloud_gated_tool_kind(tool), detail) {
+        (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
+            ApprovalFingerprint::shell(tool, cmd, false)
+        }
+        (Some(CloudGatedToolKind::Write), Some(path)) => {
+            ApprovalFingerprint::file_op_exact(tool, Some(path))
+        }
+        _ => ApprovalFingerprint::bare(tool),
+    }
+}
+
+fn cloud_detail_is_sensitive(tool: &str, detail: Option<&str>) -> bool {
+    match (cloud_gated_tool_kind(tool), detail) {
+        (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
+            sensitive_path_match(&serde_json::json!({ "command": cmd })).is_some()
+        }
+        (Some(CloudGatedToolKind::Write), Some(path)) => {
+            sensitive_path_match(&serde_json::json!({ "path": path })).is_some()
+        }
+        _ => false,
+    }
+}
+
+fn stored_override_allows_sensitive_path(
+    stored: &astra_turn_core::approval_fingerprint::ApprovalFingerprint,
+) -> bool {
+    if let Some(command) = stored
+        .command_exact
+        .as_deref()
+        .or(stored.command_prefix.as_deref())
+    {
+        return sensitive_path_match(&serde_json::json!({ "command": command })).is_some();
+    }
+
+    let Some(path) = stored.path_pattern.as_deref() else {
+        return false;
+    };
+
+    if stored.path_match == astra_turn_core::approval_fingerprint::PathMatchKind::Exact {
+        return true;
+    }
+
+    sensitive_path_match(&serde_json::json!({ "path": path })).is_some()
+}
+
 fn sensitive_path_match(args: &serde_json::Value) -> Option<String> {
     if let Some(path) = path_hint_from_args(args)
         && !path.is_empty()
@@ -930,6 +1013,32 @@ impl PermissionManager {
             .or_else(|| self.session_overrides.check(fp))
     }
 
+    fn matching_override(
+        &self,
+        fp: &astra_turn_core::approval_fingerprint::ApprovalFingerprint,
+    ) -> Option<(
+        &astra_turn_core::approval_fingerprint::ApprovalFingerprint,
+        bool,
+    )> {
+        self.turn_overrides
+            .matching_rule(fp)
+            .or_else(|| self.session_overrides.matching_rule(fp))
+            .map(|(stored, allowed)| (stored, *allowed))
+    }
+
+    fn check_overrides_for_request(
+        &self,
+        fp: &astra_turn_core::approval_fingerprint::ApprovalFingerprint,
+        sensitive_path: bool,
+    ) -> Option<bool> {
+        let (stored, allowed) = self.matching_override(fp)?;
+        if !sensitive_path || !allowed || stored_override_allows_sensitive_path(stored) {
+            Some(allowed)
+        } else {
+            None
+        }
+    }
+
     fn combined_overrides_for_evaluation(
         &self,
     ) -> astra_turn_core::approval_fingerprint::FingerprintedOverrides {
@@ -1332,20 +1441,14 @@ impl PermissionManager {
         quiet: bool,
     ) -> astra_thin_client::ApprovalDecision {
         use astra_thin_client::ApprovalDecision;
-        if quiet {
-            return if self.mode == PermissionMode::Auto {
-                ApprovalDecision::Allow
-            } else {
-                ApprovalDecision::Deny
-            };
+        if let Some(decision) =
+            self.preflight_cloud_approval_decision(tool, detail, approval_kind, quiet)
+        {
+            return decision;
         }
+
         let explicit = Self::cloud_approval_is_explicit(approval_kind);
         if explicit {
-            match self.mode {
-                PermissionMode::Deny => return ApprovalDecision::Deny,
-                PermissionMode::Auto => return ApprovalDecision::Allow,
-                PermissionMode::Prompt => {}
-            }
             eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
             if let Some(detail) = detail.filter(|s| !s.is_empty()) {
                 eprintln!("{}", Self::format_prompt_detail(detail).dim());
@@ -1366,36 +1469,6 @@ impl PermissionManager {
                 }
                 _ => ApprovalDecision::Deny,
             };
-        }
-        match self.mode {
-            PermissionMode::Auto => return ApprovalDecision::Allow,
-            PermissionMode::Deny => return ApprovalDecision::Deny,
-            PermissionMode::Prompt => {}
-        }
-        let synthetic_args = detail.map(|d| serde_json::json!({"command": d}));
-        let kind = cloud_gated_tool_kind_with_args(tool, synthetic_args.as_ref());
-        let fp = match (kind, detail) {
-            (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
-                astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(tool, cmd, false)
-            }
-            (Some(CloudGatedToolKind::Write), d) => {
-                astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
-            }
-            _ => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool),
-        };
-        if let Some(allowed) = self.check_overrides(&fp) {
-            return if allowed {
-                ApprovalDecision::Allow
-            } else {
-                ApprovalDecision::Deny
-            };
-        }
-        match self.denial_tracker.should_prompt(&fp) {
-            astra_turn_core::approval_fingerprint::DenialAction::SkipTool => {
-                return ApprovalDecision::Deny;
-            }
-            astra_turn_core::approval_fingerprint::DenialAction::FallbackToUser => {}
-            astra_turn_core::approval_fingerprint::DenialAction::Continue => {}
         }
 
         eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
@@ -1587,24 +1660,12 @@ impl PermissionManager {
         // re-prompted, which is the user-reported "Always doesn't
         // stick for bash" bug.
         //
-        // Use `cloud_gated_tool_kind(tool)` (not the args-aware
-        // variant) here so the lookup fingerprint matches what
-        // `apply_cloud_approval_choice` stores. The args-aware
-        // classifier returns `None` for read-only bash commands like
-        // `git status`, which would drop the fingerprint to `bare` —
-        // that doesn't match the `shell`-keyed override the store
-        // path wrote, and the user gets re-prompted. Keeping both
-        // sides on the tool-name-only classifier keeps them in sync.
-        let kind = cloud_gated_tool_kind(tool);
-        let fp = match (kind, detail) {
-            (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
-                astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(tool, cmd, false)
-            }
-            (Some(CloudGatedToolKind::Write), d) => {
-                astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
-            }
-            _ => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool),
-        };
+        // The lookup fingerprint uses the tool-name-only classifier for
+        // cloud details so read-only bash commands do not collapse to `bare`.
+        // For path-shaped tools it preserves the raw path; exact, prefix,
+        // pattern, and bare stored overrides can all match that candidate.
+        let fp = cloud_detail_lookup_fingerprint(tool, detail);
+        let sensitive_path = cloud_detail_is_sensitive(tool, detail);
 
         // Session override check — applies to every kind. A matched
         // `Always` means the user has already made an informed
@@ -1612,12 +1673,29 @@ impl PermissionManager {
         // re-ask regardless of `approval_kind` or `quiet`. This also
         // means silent sub-runs can honour `Always` instead of
         // auto-denying.
-        if let Some(allowed) = self.check_overrides(&fp) {
+        if let Some(allowed) = self.check_overrides_for_request(&fp, sensitive_path) {
             return Some(if allowed {
                 ApprovalDecision::Allow
             } else {
                 ApprovalDecision::Deny
             });
+        }
+
+        if sensitive_path {
+            if self.mode == PermissionMode::Deny {
+                return Some(ApprovalDecision::Deny);
+            }
+            if self.mode == PermissionMode::Auto
+                && (self.settings.allow_sensitive_path_writes
+                    || self.user_settings.allow_sensitive_path_writes)
+            {
+                return Some(ApprovalDecision::Allow);
+            }
+            return if quiet {
+                Some(ApprovalDecision::Deny)
+            } else {
+                None
+            };
         }
 
         if quiet {
@@ -2450,7 +2528,7 @@ impl PermissionManager {
                     }
                     if let Some(allowed) = self
                         .session_overrides
-                        .check(&content_aware_fingerprint(name, args))
+                        .check(&approval_lookup_fingerprint(name, args))
                     {
                         return allowed;
                     }
@@ -2518,7 +2596,7 @@ impl PermissionManager {
         // explicit-approval and mode gating so a prior approval isn't re-prompted).
         if let Some(allowed) = self
             .session_overrides
-            .check(&content_aware_fingerprint(name, args))
+            .check(&approval_lookup_fingerprint(name, args))
         {
             return allowed;
         }
@@ -2655,7 +2733,7 @@ impl PermissionManager {
         if matches!(envelope.source, DecisionSource::SandboxExpansion)
             && matches!(envelope.decision, HardDecision::NeedExternal { .. })
         {
-            if let Some(allowed) = self.check_overrides(&content_aware_fingerprint(name, args)) {
+            if let Some(allowed) = self.check_overrides(&approval_lookup_fingerprint(name, args)) {
                 return if allowed {
                     PermissionDecision::Allow
                 } else {
@@ -2679,7 +2757,9 @@ impl PermissionManager {
         if matches!(envelope.source, DecisionSource::SensitivePath { .. })
             && matches!(envelope.decision, HardDecision::NeedExternal { .. })
         {
-            if let Some(allowed) = self.check_overrides(&content_aware_fingerprint(name, args)) {
+            if let Some(allowed) =
+                self.check_overrides_for_request(&approval_lookup_fingerprint(name, args), true)
+            {
                 return if allowed {
                     PermissionDecision::Allow
                 } else {
@@ -4618,8 +4698,9 @@ mod tests {
     #[test]
     fn session_override_cannot_bypass_dangerous_path() {
         // Hard boundary: Auto mode is strict on sensitive paths by default,
-        // even with a session override — operator must flip the explicit
-        // `allow_sensitive_path_writes` opt-in to proceed unattended.
+        // even with a broad tool-level session override. The operator must
+        // flip the explicit `allow_sensitive_path_writes` opt-in to proceed
+        // unattended without a content-specific approval.
         let mut pm = PermissionManager::new(true);
         pm.session_overrides.insert(bare_fp("write_file"), true);
         let args = serde_json::json!({"path": ".git/config", "content": "bad"});
@@ -4635,6 +4716,53 @@ mod tests {
         assert!(
             matches!(decision2, PermissionDecision::Allow),
             "opt-in should unlock Auto mode sensitive writes: got {decision2:?}"
+        );
+    }
+
+    #[test]
+    fn exact_session_override_allows_previously_approved_sensitive_path() {
+        let mut pm = PermissionManager::new(true);
+        let args = serde_json::json!({"path": ".git/config", "content": "ok"});
+        pm.record_approval_with_match_target("write_file", &args, &AllowMatchTarget::Exact, true);
+
+        let decision = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "content-specific sensitive path approval should be honored: got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn directory_override_cannot_bypass_sensitive_sibling_path() {
+        let mut pm = PermissionManager::new(true);
+        let safe = serde_json::json!({"path": "src/deep/main.rs", "content": "ok"});
+        let sensitive = serde_json::json!({"path": "src/deep/.env", "content": "SECRET=x"});
+
+        pm.record_approval("write_file", Some(&safe), true);
+
+        let decision = pm.check_nonblocking("write_file", &sensitive);
+        assert!(
+            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            "non-sensitive directory approval must not unlock sensitive sibling: got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn sensitive_prefix_override_can_allow_matching_sensitive_path() {
+        let mut pm = PermissionManager::new(true);
+        let args = serde_json::json!({"path": ".git/config", "content": "ok"});
+        pm.record_approval_with_match_target(
+            "write_file",
+            &args,
+            &AllowMatchTarget::Prefix(".git/".to_string()),
+            true,
+        );
+
+        let later = serde_json::json!({"path": ".git/hooks/pre-commit", "content": "hook"});
+        let decision = pm.check_nonblocking("write_file", &later);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "sensitive prefix approval should cover matching sensitive path: got {decision:?}"
         );
     }
 
@@ -5593,6 +5721,28 @@ mod tests {
     }
 
     #[test]
+    fn exact_path_match_target_allows_only_same_deep_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        let args = serde_json::json!({"path": "src/deep/main.rs", "content": "a"});
+        let sibling = serde_json::json!({"path": "src/deep/other.rs", "content": "b"});
+
+        pm.record_approval_with_match_target("write_file", &args, &AllowMatchTarget::Exact, true);
+
+        let decision = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "exact path approval should match the same deep path: got {decision:?}"
+        );
+
+        let sibling_decision = pm.check_nonblocking("write_file", &sibling);
+        assert!(
+            matches!(sibling_decision, PermissionDecision::NeedApproval { .. }),
+            "exact path approval must not match a sibling path: got {sibling_decision:?}"
+        );
+    }
+
+    #[test]
     fn record_approval_without_args_falls_back_to_bare() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
@@ -5739,6 +5889,78 @@ mod tests {
         assert!(
             matches!(d3, PermissionDecision::Allow),
             "allow_sensitive_path_writes opt-in should let Auto mode proceed, got {d3:?}"
+        );
+    }
+
+    #[test]
+    fn cloud_preflight_strict_on_sensitive_path_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+
+        let interactive = pm.preflight_cloud_approval_decision(
+            "write_file",
+            Some(".ssh/id_rsa"),
+            ApprovalKind::Standard,
+            false,
+        );
+        assert!(
+            interactive.is_none(),
+            "interactive Auto mode should prompt for sensitive cloud writes: got {interactive:?}"
+        );
+
+        let quiet = pm.preflight_cloud_approval_decision(
+            "write_file",
+            Some(".ssh/id_rsa"),
+            ApprovalKind::Standard,
+            true,
+        );
+        assert_eq!(
+            quiet,
+            Some(astra_thin_client::ApprovalDecision::Deny),
+            "quiet Auto mode cannot prompt, so sensitive cloud writes must deny"
+        );
+
+        pm.settings.allow_sensitive_path_writes = true;
+        let opted_in = pm.preflight_cloud_approval_decision(
+            "write_file",
+            Some(".ssh/id_rsa"),
+            ApprovalKind::Standard,
+            true,
+        );
+        assert_eq!(
+            opted_in,
+            Some(astra_thin_client::ApprovalDecision::Allow),
+            "sensitive cloud writes should allow only after explicit opt-in"
+        );
+    }
+
+    #[test]
+    fn cloud_preflight_bare_override_does_not_allow_sensitive_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        pm.session_overrides.insert(bare_fp("write_file"), true);
+
+        let decision = pm.preflight_cloud_approval_decision(
+            "write_file",
+            Some(".git/config"),
+            ApprovalKind::Standard,
+            false,
+        );
+        assert!(
+            decision.is_none(),
+            "broad cloud override must not bypass sensitive path prompt: got {decision:?}"
+        );
+
+        let quiet = pm.preflight_cloud_approval_decision(
+            "write_file",
+            Some(".git/config"),
+            ApprovalKind::Standard,
+            true,
+        );
+        assert_eq!(
+            quiet,
+            Some(astra_thin_client::ApprovalDecision::Deny),
+            "quiet cloud sensitive path with only broad override must deny"
         );
     }
 

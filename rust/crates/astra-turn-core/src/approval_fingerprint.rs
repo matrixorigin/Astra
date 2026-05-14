@@ -564,9 +564,18 @@ impl FingerprintedOverrides {
     /// Look up whether a fingerprint is covered by an existing override.
     #[must_use]
     pub fn check(&self, fingerprint: &ApprovalFingerprint) -> Option<bool> {
+        self.matching_rule(fingerprint).map(|(_, allowed)| *allowed)
+    }
+
+    /// Look up the first stored rule that covers a fingerprint.
+    #[must_use]
+    pub fn matching_rule(
+        &self,
+        fingerprint: &ApprovalFingerprint,
+    ) -> Option<(&ApprovalFingerprint, &bool)> {
         for (stored, allowed) in &self.rules {
             if stored.matches(fingerprint) {
-                return Some(*allowed);
+                return Some((stored, allowed));
             }
         }
         None
@@ -717,6 +726,18 @@ mod tests {
 
         assert!(exact.matches(&exact));
         assert!(!exact.matches(&sibling));
+    }
+
+    #[test]
+    fn matching_rule_returns_stored_fingerprint() {
+        let mut overrides = FingerprintedOverrides::default();
+        let broad = ApprovalFingerprint::bare("write_file");
+        let exact = ApprovalFingerprint::file_op_exact("write_file", Some("src/main.rs"));
+        overrides.insert(broad.clone(), true);
+
+        let (stored, allowed) = overrides.matching_rule(&exact).expect("matching rule");
+        assert_eq!(stored, &broad);
+        assert!(*allowed);
     }
 
     #[test]
