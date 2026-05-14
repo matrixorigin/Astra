@@ -677,19 +677,10 @@ pub(super) async fn execute_cli_command(
             let username = prompt_or("Username", args.username)?;
             let email = prompt_or("Email   ", args.email)?;
             let password = prompt_password_masked("Password", args.password)?;
-            api.post_auth_register_json(&serde_json::json!({
-                "username": username,
-                "email": email,
-                "password": password
-            }))
-            .await
-            .map_err(map_thin_err)?;
-            eprintln!("{}", "  ✓  Registered! Now logging in…".green());
-            // Auto-login after register
-            do_login(api, profile.as_deref(), &username, &password).await?;
+            do_register(api, profile.as_deref(), &username, &email, &password).await?;
             eprintln!(
                 "{}",
-                "  ✓  Logged in. Run `astra` to start chatting.".green()
+                "  ✓  Registered and logged in. Run `astra` to start chatting.".green()
             );
             Ok(ExitCode::Success)
         }

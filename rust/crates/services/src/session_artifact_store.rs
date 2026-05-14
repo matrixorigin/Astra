@@ -97,6 +97,12 @@ pub struct StoredSessionArtifact {
     pub round: Option<u32>,
     pub content: Value,
     pub metadata: Option<Value>,
+    pub retention_policy: Option<String>,
+    pub retention_until: Option<String>,
+    pub status: Option<String>,
+    pub referenced_by_manifest_count: u32,
+    pub referenced_by_state_items_count: u32,
+    pub referenced_by_citation_count: u32,
     pub created_at: Option<String>,
 }
 
@@ -209,6 +215,21 @@ fn stored_artifact_from_row(
             .and_then(|value| u32::try_from(value).ok()),
         content,
         metadata,
+        retention_policy: row.try_get("retention_policy").ok(),
+        retention_until: row.try_get("retention_until").ok(),
+        status: row.try_get("status").ok(),
+        referenced_by_manifest_count: row
+            .try_get::<i64, _>("referenced_by_manifest_count")
+            .unwrap_or(0)
+            .max(0) as u32,
+        referenced_by_state_items_count: row
+            .try_get::<i64, _>("referenced_by_state_items_count")
+            .unwrap_or(0)
+            .max(0) as u32,
+        referenced_by_citation_count: row
+            .try_get::<i64, _>("referenced_by_citation_count")
+            .unwrap_or(0)
+            .max(0) as u32,
         created_at: row.try_get("created_at")?,
     })
 }
@@ -255,7 +276,10 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
 
         let row = query(
             "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
-                    content_json, CAST(metadata AS CHAR) AS metadata_json, CAST(created_at AS CHAR) AS created_at \
+                    content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
+                    CAST(retention_until AS CHAR) AS retention_until, status, \
+                    referenced_by_manifest_count, referenced_by_state_items_count, \
+                    referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
              FROM session_artifacts WHERE artifact_id = ?",
         )
         .bind(&record.artifact_id)
@@ -277,7 +301,10 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         let pool = self.get_pool().await?;
         let row = query(
             "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
-                    content_json, CAST(metadata AS CHAR) AS metadata_json, CAST(created_at AS CHAR) AS created_at \
+                    content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
+                    CAST(retention_until AS CHAR) AS retention_until, status, \
+                    referenced_by_manifest_count, referenced_by_state_items_count, \
+                    referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
              FROM session_artifacts WHERE artifact_id = ?",
         )
         .bind(artifact_id)
@@ -295,8 +322,11 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         validate_session_id(session_id)?;
         let pool = self.get_pool().await?;
         let row = query(
-             "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
-                     content_json, CAST(metadata AS CHAR) AS metadata_json, CAST(created_at AS CHAR) AS created_at \
+            "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
+                     content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
+                     CAST(retention_until AS CHAR) AS retention_until, status, \
+                     referenced_by_manifest_count, referenced_by_state_items_count, \
+                     referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
               FROM session_artifacts \
               WHERE session_id = ? AND artifact_kind = ? \
               ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
@@ -325,7 +355,10 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         let rows = if let Some(kind) = artifact_kind {
             query(
                 "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
-                        content_json, CAST(metadata AS CHAR) AS metadata_json, CAST(created_at AS CHAR) AS created_at \
+                        content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
+                        CAST(retention_until AS CHAR) AS retention_until, status, \
+                        referenced_by_manifest_count, referenced_by_state_items_count, \
+                        referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
                  FROM session_artifacts \
                  WHERE session_id = ? AND artifact_kind = ? \
                  ORDER BY created_at DESC, artifact_id DESC LIMIT ?",
@@ -338,7 +371,10 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         } else {
             query(
                 "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
-                        content_json, CAST(metadata AS CHAR) AS metadata_json, CAST(created_at AS CHAR) AS created_at \
+                        content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
+                        CAST(retention_until AS CHAR) AS retention_until, status, \
+                        referenced_by_manifest_count, referenced_by_state_items_count, \
+                        referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
                  FROM session_artifacts \
                  WHERE session_id = ? \
                  ORDER BY created_at DESC, artifact_id DESC LIMIT ?",

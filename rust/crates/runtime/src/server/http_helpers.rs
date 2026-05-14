@@ -1,4 +1,5 @@
 use super::*;
+use astra_services::runs::SSE_HEARTBEAT_INTERVAL_SECS;
 
 pub(super) fn sse_json_response(events: Vec<serde_json::Value>) -> Response {
     let body = events
@@ -46,7 +47,33 @@ pub(super) fn sse_streaming_response(
         let mut pending_run_error = None;
         let mut pending_terminal_error = None;
         let mut saw_terminal = false;
-        while let Some(event) = event_rx.recv().await {
+        let heartbeat_interval = std::time::Duration::from_secs(SSE_HEARTBEAT_INTERVAL_SECS);
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + heartbeat_interval,
+            heartbeat_interval,
+        );
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let event = tokio::select! {
+                maybe_event = event_rx.recv() => {
+                    let Some(event) = maybe_event else {
+                        break;
+                    };
+                    event
+                }
+                _ = heartbeat.tick() => {
+                    let heartbeat_event = serde_json::json!({
+                        "type": "ping",
+                        "run_id": run_id,
+                        "heartbeat_interval_ms": SSE_HEARTBEAT_INTERVAL_SECS * 1000,
+                    });
+                    yield Ok::<_, std::convert::Infallible>(format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&heartbeat_event).unwrap_or_default()
+                    ));
+                    continue;
+                }
+            };
             let incoming_client_error =
                 event.get("type").and_then(serde_json::Value::as_str) == Some("error");
             if event

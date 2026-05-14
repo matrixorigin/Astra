@@ -203,8 +203,42 @@ pub async fn build_server_state(
     // Wire run lifecycle service: uses ServerAgenticLoopHost for agentic loops.
     // Attach RunEngine for durable persistence of run state.
     let run_encryptor = Arc::clone(&shared_encryptor);
-    let run_store = Arc::new(astra_services::runs::InMemoryRunStateStore::default());
-    let run_engine = crate::server::run_engine::RunEngine::new(run_store);
+    let run_store = Arc::new(astra_services::runs::DatabaseRunStateStore::new(
+        shared_pool.clone(),
+    ));
+    let state_projection_store = Arc::new(astra_services::DatabaseStateProjectionStore::new(
+        shared_pool.clone(),
+    ));
+    let run_engine = crate::server::run_engine::RunEngine::new(run_store)
+        .with_projection_store(Arc::clone(&state_projection_store));
+    match run_engine.recover_active_runs().await {
+        Ok(recovered_runs) => {
+            if !recovered_runs.is_empty() {
+                let waiting = recovered_runs
+                    .iter()
+                    .filter(|run| run.status == astra_core::STATUS_WAITING)
+                    .count();
+                let failed = recovered_runs
+                    .iter()
+                    .filter(|run| run.status == astra_core::STATUS_FAILED)
+                    .count();
+                tracing::warn!(
+                    target: "astra_runtime::state_builder",
+                    recovered_total = recovered_runs.len(),
+                    recovered_waiting = waiting,
+                    recovered_failed = failed,
+                    "recovered durable active runs during startup"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                target: "astra_runtime::state_builder",
+                error = %error,
+                "failed to recover durable active runs during startup"
+            );
+        }
+    }
 
     // Wire multi-agent coordination: profile registry + delegation engine.
     let mut profile_registry = astra_services::AgentProfileRegistry::new();
@@ -289,7 +323,8 @@ pub async fn build_server_state(
             Arc::new(run_engine.clone()),
             delegation_tracker,
             sub_run_executor,
-        ),
+        )
+        .with_projection_store(Arc::clone(&state_projection_store)),
     );
 
     // ── Resource governor (Phase 5) ───────────────────────────────────
@@ -361,6 +396,9 @@ pub async fn build_server_state(
                 as Arc<dyn crate::matrix_cloud_runtime::BridgePersistTracker>),
         ))
         .with_chat_turn_bridge_secret(bridge_chat_turn_bridge_secret);
+
+    super::device_lease_sweeper::spawn_device_lease_expiry_sweeper(shared_pool.clone());
+    super::artifact_retention_sweeper::spawn_artifact_retention_sweeper(shared_pool.clone());
 
     let state = state.with_matrix_cloud_runtime(Some(matrix_rt));
     Ok(state)

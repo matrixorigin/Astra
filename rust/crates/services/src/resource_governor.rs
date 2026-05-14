@@ -85,6 +85,39 @@ pub trait ResourceGovernor: Send + Sync + 'static {
     /// Check whether a new session can be created for `user_id`.
     async fn check_session_create(&self, user_id: &str) -> LimitCheck;
 
+    /// Check whether a new agentic run can start for `user_id`.
+    ///
+    /// This intentionally does not inspect or mutate `sessions_created`.
+    /// A web chat session can have many turns, and each turn starts a durable
+    /// run. Counting every run as a newly-created session would make a normal
+    /// conversation exhaust the daily session cap.
+    async fn check_run_start(&self, user_id: &str) -> LimitCheck {
+        let limits = self.get_limits(user_id).await;
+        let usage = self.get_usage(user_id).await;
+
+        if limits.max_concurrent_sessions > 0
+            && usage.active_sessions >= limits.max_concurrent_sessions
+        {
+            return LimitCheck::Denied {
+                reason: format!(
+                    "concurrent session limit reached ({}/{})",
+                    usage.active_sessions, limits.max_concurrent_sessions
+                ),
+            };
+        }
+
+        if limits.max_tokens_per_day > 0 && usage.tokens_consumed >= limits.max_tokens_per_day {
+            return LimitCheck::Denied {
+                reason: format!(
+                    "daily token budget exhausted ({}/{})",
+                    usage.tokens_consumed, limits.max_tokens_per_day
+                ),
+            };
+        }
+
+        LimitCheck::Allowed
+    }
+
     /// Record that a session was created (increment daily counter).
     async fn record_session_created(&self, user_id: &str);
 
@@ -164,15 +197,17 @@ impl DatabaseResourceGovernor {
         Ok(())
     }
 
-    /// Count sessions that still "hold" the concurrent cap — open or idle, can be resumed
-    /// or listed, but not finished. **`ended` must be excluded**: runs are persisted with
-    /// `status = 'ended'` (see `event_ingestion`, `session_reaper`); counting those rows
-    /// made the limit hit (e.g. 19/5) as soon as the user had completed past runs.
+    /// Count sessions that currently hold execution capacity.
+    ///
+    /// Web sessions are durable and resumable, so historical/open chat sessions must
+    /// not consume the concurrent cap. The cap is enforced on sessions with an
+    /// active run only; otherwise a user who has more than five persisted chats
+    /// would be unable to start a new turn.
     async fn count_active_sessions(&self, user_id: &str) -> u32 {
         let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT COUNT(*) FROM agent_sessions \
+            "SELECT COUNT(DISTINCT session_id) FROM agent_runs \
              WHERE user_id = ? \
-               AND status NOT IN ('ended', 'closed', 'cancelled')",
+               AND status IN ('running', 'paused', 'waiting')",
         )
         .bind(user_id)
         .fetch_optional(self.pool.get())
@@ -489,7 +524,6 @@ impl ResourceGovernor for InMemoryResourceGovernor {
             });
         let usage = Self::get_or_reset(entry, today);
         usage.sessions_created += 1;
-        usage.active_sessions += 1;
     }
 
     async fn record_tool_calls(&self, user_id: &str, count: u64) {
@@ -664,9 +698,56 @@ mod tests {
         gov.record_tokens("u1", 1000).await;
         let u = gov.get_usage("u1").await;
         assert_eq!(u.sessions_created, 1);
-        assert_eq!(u.active_sessions, 1);
+        assert_eq!(u.active_sessions, 0);
         assert_eq!(u.tool_calls, 5);
         assert_eq!(u.tokens_consumed, 1000);
+    }
+
+    #[tokio::test]
+    async fn run_start_does_not_enforce_daily_session_cap() {
+        let gov = InMemoryResourceGovernor::new();
+        {
+            let mut map = gov.usage.lock().unwrap();
+            map.insert(
+                "u1".into(),
+                DatedUsage {
+                    date: chrono::Utc::now().date_naive(),
+                    usage: ResourceUsage {
+                        sessions_created: 50,
+                        active_sessions: 0,
+                        tokens_consumed: 0,
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        assert_eq!(
+            gov.check_run_start("u1").await,
+            LimitCheck::Allowed,
+            "continuing an existing chat must not consume or enforce daily session quota"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_start_still_enforces_execution_capacity() {
+        let gov = InMemoryResourceGovernor::new();
+        {
+            let mut map = gov.usage.lock().unwrap();
+            map.insert(
+                "u1".into(),
+                DatedUsage {
+                    date: chrono::Utc::now().date_naive(),
+                    usage: ResourceUsage {
+                        active_sessions: 5,
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        match gov.check_run_start("u1").await {
+            LimitCheck::Denied { reason } => assert!(reason.contains("concurrent")),
+            _ => panic!("expected denied"),
+        }
     }
 
     #[tokio::test]

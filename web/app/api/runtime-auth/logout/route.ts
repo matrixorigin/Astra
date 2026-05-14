@@ -1,27 +1,15 @@
 import { NextResponse } from 'next/server';
 import { ACCESS_TOKEN_COOKIE, API_URL_COOKIE, DEMO_MODE_COOKIE, REFRESH_TOKEN_COOKIE, getRuntimeConfig } from '@/lib/runtime-config';
+import { runtimeLogout } from '@/lib/auth/runtime-auth-client';
 
 export async function POST() {
   const config = await getRuntimeConfig();
   let backendLogoutError: string | null = null;
 
   if (config.apiUrl && config.refreshToken) {
-    try {
-      const response = await fetch(new URL('/auth/logout', config.apiUrl).toString(), {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          refresh_token: config.refreshToken,
-        }),
-      });
-
-      if (!response.ok) {
-        backendLogoutError = `Backend logout failed with ${response.status} ${response.statusText}.`;
-      }
-    } catch {
-      backendLogoutError = 'Backend logout request failed before a response was returned.';
+    const result = await runtimeLogout(config.apiUrl, config.refreshToken);
+    if (!result.ok) {
+      backendLogoutError = result.error;
     }
   }
 

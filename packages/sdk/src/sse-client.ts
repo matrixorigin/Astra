@@ -62,6 +62,7 @@ export class SSEClient {
   private controller: AbortController | null = null;
   private retryCount = 0;
   private closed = false;
+  private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(options: SSEClientOptions) {
     this.options = {
@@ -134,6 +135,7 @@ export class SSEClient {
 
   close(): void {
     this.closed = true;
+    this.clearHeartbeatTimer();
     this.controller?.abort();
     this.controller = null;
     this.options.onStateChange?.('disconnected');
@@ -145,6 +147,7 @@ export class SSEClient {
     let buffer = '';
 
     try {
+      this.resetHeartbeatTimer();
       while (!this.closed) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -163,6 +166,7 @@ export class SSEClient {
       if (buffer.trim().length > 0) {
         this.processSSEChunk(buffer);
       }
+      this.clearHeartbeatTimer();
       reader.releaseLock();
     }
   }
@@ -185,9 +189,32 @@ export class SSEClient {
 
     try {
       const event = JSON.parse(data) as StreamEvent;
+      this.resetHeartbeatTimer();
       this.options.onEvent(event);
     } catch {
       // Ignore malformed JSON
+    }
+  }
+
+  private resetHeartbeatTimer(): void {
+    this.clearHeartbeatTimer();
+    if (!this.options.heartbeatTimeoutMs || this.options.heartbeatTimeoutMs <= 0) return;
+    this.heartbeatTimer = setTimeout(() => {
+      if (this.closed) return;
+      this.controller?.abort();
+      this.options.onStateChange?.('error');
+      this.options.onEvent({
+        type: 'error',
+        message: `Connection timed out after ${this.options.heartbeatTimeoutMs}ms without heartbeat`,
+        retryable: true,
+      } as StreamEvent);
+    }, this.options.heartbeatTimeoutMs);
+  }
+
+  private clearHeartbeatTimer(): void {
+    if (this.heartbeatTimer) {
+      clearTimeout(this.heartbeatTimer);
+      this.heartbeatTimer = null;
     }
   }
 

@@ -156,10 +156,19 @@ pub(super) async fn stream_run_handler(
 
     match state
         .run_lifecycle_service
-        .stream_run(run_id.clone(), user.user_id, query.last_index)
+        .stream_run_live(run_id.clone(), user.user_id, query.last_index)
         .await
     {
-        Ok(events) => sse_json_response(transform_stream_run_events_for_client(&run_id, events)),
+        Ok(mut stream) => {
+            if let Some(event_rx) = stream.event_rx.take() {
+                sse_streaming_response(stream.session_id, stream.run_id, event_rx)
+            } else {
+                sse_json_response(transform_stream_run_events_for_client(
+                    &run_id,
+                    stream.events,
+                ))
+            }
+        }
         Err((status, error)) => sse_error_response(status, error.0.detail),
     }
 }
@@ -214,6 +223,45 @@ pub(super) async fn resume_run_handler(
         .resume_run(run_id, user.user_id)
         .await?;
     Ok(Json(RunMutationResponse::from(result)))
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct RunInputRequest {
+    pub idempotency_key: String,
+    #[serde(default)]
+    pub input: serde_json::Value,
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct RunInputResponse {
+    pub run_id: String,
+    pub accepted: bool,
+    pub duplicate: bool,
+}
+
+pub(super) async fn submit_run_input_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<RunInputRequest>,
+) -> Result<Json<RunInputResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let result = state
+        .run_lifecycle_service
+        .submit_run_input(
+            run_id,
+            user.user_id,
+            astra_services::runs::RunInputData {
+                idempotency_key: request.idempotency_key,
+                input: request.input,
+            },
+        )
+        .await?;
+    Ok(Json(RunInputResponse {
+        run_id: result.run_id,
+        accepted: result.accepted,
+        duplicate: result.duplicate,
+    }))
 }
 
 #[cfg(test)]

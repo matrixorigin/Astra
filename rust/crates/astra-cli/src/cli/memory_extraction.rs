@@ -11,7 +11,7 @@
 //! - **Single in-flight**: at most one extraction runs at a time.
 //! - **Quality gate**: extracted content must pass `is_high_quality_lesson`.
 //! - **Auditable**: every run emits a `[memory-extraction]` stderr line
-//!   and a `MemoryExtraction` journal event.
+//!   and a `SessionMemoryExtraction` journal event.
 
 use std::sync::Arc;
 
@@ -870,7 +870,7 @@ pub fn journal_event_for_outcome(
     turn: u32,
     outcome: &ExtractionOutcome,
 ) -> astra_services::session_journal::JournalEvent {
-    use astra_services::session_journal::JournalEvent;
+    use astra_services::session_journal::{JournalEvent, JournalEventType};
     let (memories_saved, categories, duration_ms, prefix_reused) = match outcome {
         ExtractionOutcome::Extracted {
             count,
@@ -881,27 +881,28 @@ pub fn journal_event_for_outcome(
         } => (*count, categories.clone(), *duration_ms, *prefix_reused),
         _ => (0usize, Vec::<String>::new(), 0u64, false),
     };
-    let mut evt = JournalEvent::memory_extraction_ex(
-        session_id,
-        turn,
-        outcome.tag(),
-        memories_saved,
-        &categories,
-        duration_ms,
-        prefix_reused,
-    );
+    let mut evt = JournalEvent::base_public(JournalEventType::SessionMemoryExtraction, session_id);
+    evt.turn = Some(turn);
+    evt.duration_ms = Some(duration_ms);
+    let mut meta = serde_json::json!({
+        "outcome": outcome.tag(),
+        "memories_saved": memories_saved,
+        "categories": categories,
+        "prefix_reused": prefix_reused,
+    });
     // Merge outcome-specific structured fields into the metadata JSON.
-    if let Some(meta) = evt.metadata.as_mut().and_then(|m| m.as_object_mut()) {
+    if let Some(obj) = meta.as_object_mut() {
         match outcome {
             ExtractionOutcome::SkippedBusy { prior_turn } => {
-                meta.insert("prior_turn".into(), serde_json::Value::from(*prior_turn));
+                obj.insert("prior_turn".into(), serde_json::Value::from(*prior_turn));
             }
             ExtractionOutcome::Error(err) => {
-                meta.insert("error".into(), serde_json::Value::from(err.clone()));
+                obj.insert("error".into(), serde_json::Value::from(err.clone()));
             }
             _ => {}
         }
     }
+    evt.metadata = Some(meta);
     evt
 }
 
@@ -1454,7 +1455,7 @@ mod tests {
     //
     // P0-3's commit message claimed prior_turn was "plumbed into journal
     // for ops correlation" — but the chat_turn path only used
-    // JournalEvent::memory_extraction, dropping the field. Ops saw
+    // the legacy Memoria extraction event, dropping the field. Ops saw
     // `tag="skipped_busy"` with no way to know WHICH turn was blocking.
 
     #[test]
@@ -1691,8 +1692,8 @@ mod tests {
     fn journal_event_type_exists() {
         let src = include_str!("../../../services/src/session_journal.rs");
         assert!(
-            src.contains("MemoryExtraction"),
-            "JournalEventType must include MemoryExtraction variant"
+            src.contains("SessionMemoryExtraction"),
+            "JournalEventType must include SessionMemoryExtraction variant"
         );
     }
 
@@ -1700,8 +1701,8 @@ mod tests {
     fn journal_event_factory_exists() {
         let src = include_str!("../../../services/src/session_journal.rs");
         assert!(
-            src.contains("pub fn memory_extraction("),
-            "JournalEvent must have memory_extraction factory method"
+            src.contains("pub fn session_memory_extraction("),
+            "JournalEvent must have session_memory_extraction factory method"
         );
     }
 

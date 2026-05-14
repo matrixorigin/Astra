@@ -151,9 +151,10 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         self.ctx
             .tool_call_records
             .push(journal_record_unknown_tool(slot.name.clone(), 0));
-        // Track unknown tool as a failure so ToolHealthTracker can deprioritize
-        // after CONSECUTIVE_FAILURE_THRESHOLD hits (prevents infinite retry loops).
-        self.ctx.turn_guard.health.record_failure(&slot.name);
+        // Unknown local tool names are catalog misses, not runtime failures.
+        // Keeping them out of ToolHealth prevents removed or hallucinated
+        // tools from being carried forward as "available but broken" hints.
+        // Same-turn duplicate/empty-name guards still stop retry loops.
         if self.consecutive_empty_name >= self.ctx.max_consecutive_empty_name {
             agent_warn!(
                 "step",
@@ -495,9 +496,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 execution.name.clone(),
                 execution.early_exit_ms,
             ));
-            // Track unknown tool as a failure so ToolHealthTracker can deprioritize
-            // after CONSECUTIVE_FAILURE_THRESHOLD hits (prevents infinite retry loops).
-            self.ctx.turn_guard.health.record_failure(&execution.name);
+            // Unknown local tool names are catalog misses, not runtime failures.
+            // Do not persist them into ToolHealth/deprioritized state; otherwise
+            // removed tools keep resurfacing as "failed repeatedly" context.
             return HeadlessPipelineStage::ShortCircuit;
         }
 

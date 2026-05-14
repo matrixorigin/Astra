@@ -853,6 +853,34 @@ mod tests {
     // ── Schemas ────────────────────────────────────────────────────────
 
     #[test]
+    fn all_tool_schemas_has_expected_tools() {
+        let schemas = schemas::all_tool_schemas();
+        let names: Vec<String> = schemas
+            .iter()
+            .filter_map(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(String::from)
+            })
+            .collect();
+        // Core tools that must be present
+        assert!(names.contains(&"bash".into()));
+        assert!(names.contains(&"read_file".into()));
+        assert!(names.contains(&"write_file".into()));
+        assert!(names.contains(&"str_replace".into()));
+        assert!(names.contains(&"grep".into()));
+        assert!(names.contains(&"glob".into()));
+        assert!(names.contains(&"memory".into()));
+        assert!(names.contains(&"session".into()));
+        assert!(names.contains(&"ask_user".into()));
+        assert!(
+            !names.contains(&"memory_search".into()),
+            "memory_search remains a memory action, not a top-level tool"
+        );
+    }
+
+    #[test]
     fn spawn_agent_and_get_agent_result_registered_together() {
         // Regression guard: if spawn_agent is in the catalog but
         // get_agent_result is not, the LLM can launch background

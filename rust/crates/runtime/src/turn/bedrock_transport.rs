@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use crate::turn::bedrock_eventstream::FrameDecoder;
 use crate::turn::bedrock_stream::{BedrockStreamAccumulator, BedrockStreamEvent};
 use crate::turn::bridge_sse_helpers::render_sse;
-use crate::turn::llm_client::{LlmCallResult, LlmCancel};
+use crate::turn::llm_client::{LlmCallResult, LlmCancel, LlmStreamCallback, LlmStreamUpdate};
 
 /// Public error returned by [`call_bedrock_and_collect`]. Mirrors the shape
 /// of [`crate::turn::llm_client::StreamCollectError`] but without the
@@ -221,6 +221,7 @@ pub(crate) async fn collect_bedrock_stream(
     started: Instant,
     cancel: LlmCancel<'_>,
     idle_timeout: std::time::Duration,
+    mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
 ) -> Result<LlmCallResult, BedrockStreamError> {
     let mut decoder = FrameDecoder::new();
     let mut accum = BedrockStreamAccumulator::new();
@@ -254,6 +255,19 @@ pub(crate) async fn collect_bedrock_stream(
                 .push_frame(&frame)
                 .map_err(|e| BedrockStreamError::Transport(e.to_string()))?;
             for ev in events {
+                match &ev {
+                    BedrockStreamEvent::TextDelta(text) => {
+                        if let Some(callback) = stream_callback.as_deref_mut() {
+                            callback(LlmStreamUpdate::TextDelta(text.clone()));
+                        }
+                    }
+                    BedrockStreamEvent::ReasoningDelta(text) => {
+                        if let Some(callback) = stream_callback.as_deref_mut() {
+                            callback(LlmStreamUpdate::ReasoningDelta(text.clone()));
+                        }
+                    }
+                    _ => {}
+                }
                 if let BedrockStreamEvent::Exception { kind, message } = ev {
                     return Err(BedrockStreamError::Exception { kind, message });
                 }

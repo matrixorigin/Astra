@@ -307,7 +307,7 @@ pub(crate) async fn stream_chat_sse(
     // ─── Context pre-fetch (disabled) ─────────────────────────────────────
     // Returns (all_schemas, mcp_plugin_schemas) so the edge executor can
     // install MCP tools for `tool_search(select:)` resolution while the
-    // registry gets the combined list.
+    // registry gets the capability-filtered list.
     let all_schemas: (Vec<Value>, Vec<Value>) = if p.plan_only_chat {
         messages.insert(
             0,
@@ -325,7 +325,6 @@ pub(crate) async fn stream_chat_sse(
             m.consume_prompt_changes();
             m.consume_resource_changes();
         }
-        let mut schemas = edge_tools::all_tool_schemas();
         // Inject MCP tool schemas from connected servers.
         // Tracked separately from the static catalog so the edge
         // `ToolExecutor` can install them via `set_plugin_schemas` for
@@ -336,7 +335,10 @@ pub(crate) async fn stream_chat_sse(
         } else {
             Vec::new()
         };
-        schemas.extend(mcp_schemas.iter().cloned());
+        let schemas = astra_runtime::capabilities::cli_local_tool_schemas(
+            edge_tools::all_tool_schemas(),
+            mcp_schemas.clone(),
+        );
         (schemas, mcp_schemas)
     };
     let mcp_plugin_schemas = all_schemas.1.clone();
@@ -588,6 +590,9 @@ pub(crate) async fn stream_chat_sse(
         tool_results: Vec::new(),
         current_session_id,
         current_run_id: Some(parent_turn_run_id.clone()),
+        context_manifest_pool: None,
+        context_manifest_user_id: None,
+        context_manifest_model_name: None,
         recursion_depth: 0,
         final_text: String::new(),
         final_text_streamed: false,

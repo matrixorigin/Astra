@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/chat_widget/turn_driver.rs
+assertion_line: 138
 expression: "render_history(&w, 80)"
 ---
 › run ls
@@ -8,6 +9,6 @@ expression: "render_history(&w, 80)"
   │ ls /tmp
   └ 3 entries
 
-┃ There are 3 files.
+█ There are 3 files.
 
   ─ ⏱ 1.2s (ttft 400ms) │ ⚡  240 ↑200 ↓40 │ 🛠 1 │ Σ 240 ─

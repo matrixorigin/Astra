@@ -1,38 +1,69 @@
 import { NextResponse, type NextRequest } from 'next/server';
-import { ACCESS_TOKEN_COOKIE } from '@/lib/runtime-config';
+import { ACCESS_TOKEN_COOKIE, REFRESH_TOKEN_COOKIE } from '@/lib/runtime-config';
 
-// Pages that don't require authentication at all
-const PUBLIC_PATHS = new Set(['/login', '/register', '/settings', '/api/runtime-config', '/api/runtime-auth/login', '/api/runtime-auth/logout']);
+const PUBLIC_PAGE_PATHS = new Set(['/', '/login', '/register']);
 
-// Pages that require authentication (write operations, workspace)
-const AUTH_REQUIRED_PATHS = ['/workspace'];
+const PUBLIC_API_PATHS = new Set([
+  '/api/runtime-config',
+  '/api/runtime-auth/login',
+  '/api/runtime-auth/logout',
+  '/api/runtime-auth/refresh',
+  '/api/runtime-auth/me',
+]);
 
-function isPublicPath(pathname: string): boolean {
-  return PUBLIC_PATHS.has(pathname) || pathname.startsWith('/api/');
+function isStaticAsset(pathname: string): boolean {
+  return (
+    pathname.startsWith('/_next/') ||
+    pathname.startsWith('/fonts/') ||
+    pathname === '/favicon.ico' ||
+    pathname === '/robots.txt' ||
+    pathname === '/sitemap.xml'
+  );
 }
 
-function requiresAuth(pathname: string): boolean {
-  return AUTH_REQUIRED_PATHS.some((p) => pathname.startsWith(p));
+function hasAuthCredential(request: NextRequest): boolean {
+  return (
+    request.cookies.has(ACCESS_TOKEN_COOKIE) ||
+    request.cookies.has(REFRESH_TOKEN_COOKIE)
+  );
+}
+
+function loginRedirect(request: NextRequest): NextResponse {
+  const url = request.nextUrl.clone();
+  url.pathname = '/login';
+  url.search = '';
+  const nextPath = `${request.nextUrl.pathname}${request.nextUrl.search}`;
+  url.searchParams.set('next', nextPath || '/');
+  return NextResponse.redirect(url);
 }
 
 export function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
-  // Skip for public paths and static assets
-  if (isPublicPath(pathname) || pathname.startsWith('/_next/')) {
+  if (isStaticAsset(pathname)) {
     return NextResponse.next();
   }
 
-  // Only require auth for specific protected paths (workspace, etc.)
-  // Read-only dashboard pages work without auth
-  if (requiresAuth(pathname)) {
-    const hasToken = request.cookies.has(ACCESS_TOKEN_COOKIE) || process.env.ASTRA_ACCESS_TOKEN;
-    if (!hasToken) {
-      const url = request.nextUrl.clone();
-      url.pathname = '/login';
-      url.searchParams.set('next', pathname);
-      return NextResponse.redirect(url);
+  if (PUBLIC_API_PATHS.has(pathname)) {
+    return NextResponse.next();
+  }
+
+  if (pathname.startsWith('/api/')) {
+    if (!hasAuthCredential(request)) {
+      return NextResponse.json(
+        { error: 'Authentication required.' },
+        { status: 401 },
+      );
     }
+    return NextResponse.next();
+  }
+
+  if (PUBLIC_PAGE_PATHS.has(pathname)) {
+    return NextResponse.next();
+  }
+
+  if (!hasAuthCredential(request)) {
+    return loginRedirect(request);
   }
 
   return NextResponse.next();

@@ -118,9 +118,13 @@ ws.sendMessage('Build a REST API', { sessionId: 'sess-1' });
 
 ### Browser apps and the BFF pattern
 
-Do not expose long-lived **refresh tokens** in browser-accessible JavaScript. The dashboard (`web/`) keeps tokens in **httpOnly cookies** and proxies to the runtime via **Next.js Route Handlers** (`/api/backend/[...path]` → upstream paths like `/chat/stream`). Reuse that pattern in other SPAs (any server-side proxy that attaches `Authorization: Bearer …`).
-
-`AstraClient` with `baseUrl` pointing at the **origin** of your BFF and `pathPrefix: '/api/backend'` is one way to align with that layout, provided the proxy forwards to the same paths the SDK calls.
+Do not expose long-lived **refresh tokens** in browser-accessible JavaScript.
+The dashboard (`web/`) keeps tokens in **httpOnly cookies** and routes browser
+requests through explicit **Next.js Route Handlers** such as `/api/chats`,
+`/api/models`, `/api/skills`, and `/api/chats/{id}/stream`. Those BFF handlers
+construct an authenticated `AstraClient` server-side and call the runtime with
+typed SDK methods. Avoid adding a generic browser-visible runtime proxy; add a
+small typed BFF route instead when a new browser surface needs runtime access.
 
 ### Gateway prefix
 

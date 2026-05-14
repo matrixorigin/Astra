@@ -1,5 +1,5 @@
 use super::*;
-use crate::{cli_dim, cli_err, cli_ok, cli_section, cli_warn};
+use crate::{cli_dim, cli_err, cli_ok, cli_section};
 use crate::{current_access_token, initialize_multi_agent_runtime, post_auth_cloud_resync};
 
 async fn refresh_auth_runtime(
@@ -39,21 +39,11 @@ pub(super) async fn handle_account_command(
             let username = prompt_or("Username", None)?;
             let email = prompt_or("Email   ", None)?;
             let password = prompt_password_masked("Password", None)?;
-            match do_register(api, &username, &email, &password).await {
+            match do_register(api, profile, &username, &email, &password).await {
                 Ok(_) => {
-                    cli_ok!("Registered! Logging in…");
-                    match do_login(api, profile, &username, &password).await {
-                        Ok(_) => {
-                            cli_ok!("Logged in");
-                            post_auth_cloud_resync(profile, state).await;
-                            refresh_auth_runtime(api, profile, state).await;
-                        }
-                        Err(e) => {
-                            clear_local_auth_state(profile, state);
-                            cli_err!("Login failed: {}", e);
-                            cli_warn!("Registration succeeded, but no user is logged in now.");
-                        }
-                    }
+                    cli_ok!("Registered and logged in");
+                    post_auth_cloud_resync(profile, state).await;
+                    refresh_auth_runtime(api, profile, state).await;
                 }
                 Err(e) => cli_err!("Register failed: {}", e),
             }

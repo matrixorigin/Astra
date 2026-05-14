@@ -125,7 +125,7 @@ pub(crate) trait HistoryCell: Debug + Send + Sync + Any {
 ///   * `revived()` — launch-independent sentinel for cells rebuilt
 ///     from persistence. Note: revived cells are *settled*, not
 ///     active — they render through `display_lines` directly with a
-///     static `┃` marker, not the animated gradient. The stamp
+///     static `█` marker, not the animated gradient. The stamp
 ///     exists so that if a revived cell is ever (incorrectly) routed
 ///     through the active slot it still produces a deterministic,
 ///     non-flickering hue.

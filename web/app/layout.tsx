@@ -3,7 +3,7 @@ import './globals.css';
 
 export const metadata: Metadata = {
   title: 'astra web',
-  description: 'Frontend platform for agent, session, run, and event observability.',
+  description: 'Astra web agent workspace.',
 };
 
 export default function RootLayout({
@@ -13,7 +13,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className="bg-slate-950 text-slate-100">{children}</body>
+      <body>{children}</body>
     </html>
   );
 }

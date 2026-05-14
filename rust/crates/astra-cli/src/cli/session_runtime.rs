@@ -35,23 +35,19 @@ fn create_pipeline_modules_inner(
     // Selector removed — tool schemas are now sent in full to the LLM each turn
     // via edge_tools::all_tool_schemas(). No registry/selector state to build here.
 
-    // Initialize unified skill registry with providers (priority: Local > Bundled)
-    let mut unified_skill_registry = astra_runtime::skills::UnifiedSkillRegistry::new();
-    unified_skill_registry.add_provider(Box::new(
-        astra_skills::providers::LocalSkillProvider::standard(),
-    ));
-    unified_skill_registry.add_provider(Box::new(
-        astra_skills::providers::BundledSkillProvider::with_defaults(),
-    ));
-    let unified_skill_registry = std::sync::Arc::new(unified_skill_registry);
-    // Discover skills eagerly so the `skill` tool schema is populated from the first turn.
-    // This is a sync context, so bridge to async via a scoped thread.
-    let handle = tokio::runtime::Handle::current();
-    let _ = std::thread::scope(|s| {
-        s.spawn(|| handle.block_on(unified_skill_registry.discover_all()))
-            .join()
-            .expect("skill discover thread panicked")
+    // Initialize the local CLI capability catalog.
+    //
+    // Local project/home skills remain CLI-local. If the user is authenticated
+    // against an API server, we also mount that server's visible catalog
+    // (server HOME skills + database skills visible to this user). That keeps
+    // CLI and Web aligned for shared server capabilities without pretending
+    // that project-local CLI skills are available to Web sessions.
+    let remote_catalog = current_access_token(profile).map(|token| {
+        astra_runtime::capabilities::RemoteSkillCatalogProvider::new(api.clone(), token)
     });
+    let unified_skill_registry =
+        astra_runtime::capabilities::build_cli_local_skill_registry(remote_catalog);
+    let handle = tokio::runtime::Handle::current();
 
     // Initialize MCP client manager and connect any MCP servers declared in
     // skill manifests. This registers `skill://` resources from connected
@@ -149,18 +145,11 @@ fn create_pipeline_modules_inner(
         .and_then(|p| p.access_token.as_ref())
         .cloned();
 
-    let modules = PipelineModules {
+    PipelineModules {
         unified_skill_registry,
         mcp_manager,
         _skill_watcher: skill_watcher,
-    };
-
-    // TF-IDF selector only — no LLM-based tool selection.
-    // The previous FallbackSelector(LLM, TfIdf) added an extra LLM API call per turn
-    // just to pick tools, adding 10-80s latency depending on the model. TF-IDF is
-    // fast (<1ms), deterministic, and works well for all common query patterns.
-    // Skill activation is handled by the `skill` tool in the agentic loop.
-    modules
+    }
 }
 
 /// Quick check whether the server has at least one LLM model configured.

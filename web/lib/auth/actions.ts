@@ -8,20 +8,15 @@ import {
   REFRESH_TOKEN_COOKIE,
   DEFAULT_API_URL,
 } from '@/lib/runtime-config';
-
-type AuthTokens = {
-  access_token: string;
-  refresh_token: string;
-  token_type: string;
-  expires_in: number;
-};
-
-type AuthUser = {
-  user_id: string;
-  username: string;
-  email: string;
-  display_name: string | null;
-};
+import {
+  runtimeLogin,
+  runtimeLogout,
+  runtimeMe,
+  runtimeRefresh,
+  runtimeRegister,
+  type AuthTokens,
+  type AuthUser,
+} from '@/lib/auth/runtime-auth-client';
 
 type ActionResult = {
   ok: boolean;
@@ -62,24 +57,13 @@ export async function loginAction(
   const cookieStore = await cookies();
   const apiUrl = getApiUrl(cookieStore);
 
-  try {
-    const response = await fetch(new URL('/auth/login', apiUrl).toString(), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password }),
-    });
-
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({})) as { detail?: string; error?: string };
-      return { ok: false, error: body.detail ?? body.error ?? `Login failed: ${response.status}` };
-    }
-
-    const tokens = (await response.json()) as AuthTokens;
-    await saveTokens(tokens);
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  const result = await runtimeLogin(apiUrl, { username, password });
+  if (!result.ok) {
+    return { ok: false, error: result.error };
   }
+
+  await saveTokens(result.data);
+  return { ok: true };
 }
 
 export async function registerAction(
@@ -98,24 +82,18 @@ export async function registerAction(
   const cookieStore = await cookies();
   const apiUrl = getApiUrl(cookieStore);
 
-  try {
-    const response = await fetch(new URL('/auth/register', apiUrl).toString(), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, email, password, display_name: displayName }),
-    });
-
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({})) as { detail?: string; error?: string };
-      return { ok: false, error: body.detail ?? body.error ?? `Registration failed: ${response.status}` };
-    }
-
-    const data = (await response.json()) as AuthTokens & { user_id: string };
-    await saveTokens(data);
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  const result = await runtimeRegister(apiUrl, {
+    username,
+    email,
+    password,
+    display_name: displayName,
+  });
+  if (!result.ok) {
+    return { ok: false, error: result.error };
   }
+
+  await saveTokens(result.data);
+  return { ok: true };
 }
 
 export async function logoutAction(): Promise<void> {
@@ -123,22 +101,13 @@ export async function logoutAction(): Promise<void> {
   const apiUrl = getApiUrl(cookieStore);
   const refreshToken = cookieStore.get(REFRESH_TOKEN_COOKIE)?.value;
 
-  // Try server-side logout to revoke tokens
   if (apiUrl && refreshToken) {
-    try {
-      await fetch(new URL('/auth/logout', apiUrl).toString(), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refresh_token: refreshToken }),
-      });
-    } catch {
-      // Best effort — still clear cookies
-    }
+    await runtimeLogout(apiUrl, refreshToken);
   }
 
   cookieStore.delete(ACCESS_TOKEN_COOKIE);
   cookieStore.delete(REFRESH_TOKEN_COOKIE);
-  redirect('/login');
+  redirect('/');
 }
 
 export async function refreshTokenAction(): Promise<ActionResult> {
@@ -150,23 +119,13 @@ export async function refreshTokenAction(): Promise<ActionResult> {
     return { ok: false, error: 'No refresh token available.' };
   }
 
-  try {
-    const response = await fetch(new URL('/auth/refresh', apiUrl).toString(), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refresh_token: refreshToken }),
-    });
-
-    if (!response.ok) {
-      return { ok: false, error: `Token refresh failed: ${response.status}` };
-    }
-
-    const tokens = (await response.json()) as AuthTokens;
-    await saveTokens(tokens);
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  const result = await runtimeRefresh(apiUrl, refreshToken);
+  if (!result.ok) {
+    return { ok: false, error: result.error };
   }
+
+  await saveTokens(result.data);
+  return { ok: true };
 }
 
 export async function getCurrentUser(): Promise<AuthUser | null> {
@@ -176,35 +135,22 @@ export async function getCurrentUser(): Promise<AuthUser | null> {
 
   if (!accessToken) return null;
 
-  try {
-    const response = await fetch(new URL('/auth/me', apiUrl).toString(), {
-      headers: { Authorization: `Bearer ${accessToken}` },
-      cache: 'no-store',
-    });
+  const result = await runtimeMe(apiUrl, accessToken);
+  if (result.ok) {
+    return result.data;
+  }
 
-    if (!response.ok) {
-      // Try refresh if access token is expired (401)
-      if (response.status === 401) {
-        const refreshResult = await refreshTokenAction();
-        if (!refreshResult.ok) return null;
-
-        // Retry with new token
-        const newCookieStore = await cookies();
-        const newToken = newCookieStore.get(ACCESS_TOKEN_COOKIE)?.value;
-        if (!newToken) return null;
-
-        const retryResponse = await fetch(new URL('/auth/me', apiUrl).toString(), {
-          headers: { Authorization: `Bearer ${newToken}` },
-          cache: 'no-store',
-        });
-        if (!retryResponse.ok) return null;
-        return (await retryResponse.json()) as AuthUser;
-      }
-      return null;
-    }
-
-    return (await response.json()) as AuthUser;
-  } catch {
+  if (result.status !== 401) {
     return null;
   }
+
+  const refreshResult = await refreshTokenAction();
+  if (!refreshResult.ok) return null;
+
+  const newCookieStore = await cookies();
+  const newToken = newCookieStore.get(ACCESS_TOKEN_COOKIE)?.value;
+  if (!newToken) return null;
+
+  const retryResult = await runtimeMe(apiUrl, newToken);
+  return retryResult.ok ? retryResult.data : null;
 }

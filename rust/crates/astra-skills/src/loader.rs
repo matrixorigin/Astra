@@ -490,34 +490,77 @@ pub fn discover_skills_in_dir(dir: &Path) -> Vec<(String, PathBuf)> {
 /// either tool work in both. Claude Code skills are discovered at lower
 /// priority so astra-native skills take precedence when names collide.
 pub fn skill_search_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::with_capacity(12);
-
+    let home = dirs::home_dir();
     if let Ok(cwd) = std::env::current_dir() {
-        // Single walk-up collecting both .astra/skills/ and .claude/skills/.
-        // .astra paths first at each level so they take priority over .claude.
-        let (astra, claude) = walk_up_skill_paths(&cwd);
-        paths.extend(astra);
-        paths.extend(claude);
-        // Legacy: skills/ in cwd only (not walked up).
-        paths.push(cwd.join("skills"));
-    } else {
-        paths.push(PathBuf::from(".astra/skills"));
-        paths.push(PathBuf::from(".claude/skills"));
-        paths.push(PathBuf::from("skills"));
+        return skill_search_paths_from(&cwd, home.as_deref());
     }
 
-    if let Some(home) = dirs::home_dir() {
-        let global = home.join(".astra").join("skills");
-        if !paths.contains(&global) {
-            paths.push(global);
+    let mut paths = vec![
+        PathBuf::from(".astra/skills"),
+        PathBuf::from(".claude/skills"),
+        PathBuf::from("skills"),
+    ];
+    if let Some(home) = home {
+        for global in home_skill_search_paths_from(&home) {
+            if !paths.contains(&global) {
+                paths.push(global);
+            }
         }
-        let cc_global = home.join(".claude").join("skills");
-        if !paths.contains(&cc_global) {
-            paths.push(cc_global);
+    }
+    paths
+}
+
+/// Return CLI skill search paths for an explicit cwd/HOME pair.
+///
+/// Standalone CLI discovery intentionally includes project-local walk-up paths
+/// in addition to HOME-level skills. Server-backed discovery must not call this
+/// helper because project-local skills have no server-side user ACL and could be
+/// exposed to unrelated web users.
+pub fn skill_search_paths_from(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(12);
+
+    // Single walk-up collecting both .astra/skills/ and .claude/skills/.
+    // .astra paths first at each level so they take priority over .claude.
+    let (astra, claude) = walk_up_skill_paths_from(cwd, home);
+    paths.extend(astra);
+    paths.extend(claude);
+    // Legacy: skills/ in cwd only (not walked up).
+    paths.push(cwd.join("skills"));
+
+    if let Some(home) = home {
+        for global in home_skill_search_paths_from(home) {
+            if !paths.contains(&global) {
+                paths.push(global);
+            }
         }
     }
 
     paths
+}
+
+/// Return the user-level global skill paths for a specific HOME directory.
+///
+/// This intentionally excludes cwd/project walk-up paths. Server-backed runtimes
+/// use these paths as the "api-server local" catalog: skills installed into the
+/// account that runs the API server are deployment-level skills visible to every
+/// authenticated user of that server, while project-local `.astra/skills` or
+/// `.claude/skills` directories remain CLI-only unless explicitly published.
+pub fn home_skill_search_paths_from(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(".astra").join("skills"),
+        home.join(".claude").join("skills"),
+    ]
+}
+
+/// Return the user-level global skill paths for the current process HOME.
+///
+/// See [`home_skill_search_paths_from`] for the visibility boundary. Unlike
+/// [`skill_search_paths`], this function never inspects the current working
+/// directory.
+pub fn home_skill_search_paths() -> Vec<PathBuf> {
+    dirs::home_dir()
+        .map(|home| home_skill_search_paths_from(&home))
+        .unwrap_or_default()
 }
 
 /// Walk from `start` upward once, collecting both `.astra/skills/` and
@@ -526,10 +569,19 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 ///
 /// Stops at repository root (`.git`) or user's home directory.
 pub fn walk_up_skill_paths(start: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let home = dirs::home_dir();
+    walk_up_skill_paths_from(start, home.as_deref())
+}
+
+/// Walk from `start` upward using an explicit HOME boundary.
+///
+/// This exists so tests can assert the CLI/Web skill visibility boundary
+/// without mutating process-global cwd or HOME. See [`skill_search_paths_from`]
+/// for why API servers must not expose the project-local paths discovered here.
+pub fn walk_up_skill_paths_from(start: &Path, home: Option<&Path>) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut astra = Vec::new();
     let mut claude = Vec::new();
     let mut dir = start.to_path_buf();
-    let home = dirs::home_dir();
 
     loop {
         let a = dir.join(".astra").join("skills");
@@ -544,7 +596,7 @@ pub fn walk_up_skill_paths(start: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
         if dir.join(".git").exists() {
             break;
         }
-        if matches!(&home, Some(h) if dir == *h) {
+        if matches!(home, Some(h) if dir == h) {
             break;
         }
         if !dir.pop() {
@@ -923,6 +975,78 @@ Hooked body."#;
         assert!(
             has_claude,
             "should include .claude/skills/ paths, got: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn home_skill_search_paths_are_home_only() {
+        let home = PathBuf::from("/tmp/astra-home-test");
+        let paths = home_skill_search_paths_from(&home);
+        assert_eq!(
+            paths,
+            vec![
+                home.join(".astra").join("skills"),
+                home.join(".claude").join("skills")
+            ],
+            "api-server local skill discovery must be restricted to HOME-level catalogs"
+        );
+        assert!(
+            paths.iter().all(|path| path.starts_with(&home)),
+            "HOME-only catalog must not include cwd/project paths: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn cli_and_server_skill_search_paths_keep_visibility_boundary() {
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let home = sandbox.path().join("home");
+        let project = sandbox.path().join("project");
+        let cwd = project.join("subdir");
+
+        for dir in [
+            home.join(".astra").join("skills"),
+            home.join(".claude").join("skills"),
+            project.join(".astra").join("skills"),
+            project.join(".claude").join("skills"),
+            cwd.join("skills"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+
+        let cli_paths = skill_search_paths_from(&cwd, Some(&home));
+        assert!(
+            cli_paths.contains(&project.join(".astra").join("skills")),
+            "CLI discovery must see project-local .astra skills: {cli_paths:?}"
+        );
+        assert!(
+            cli_paths.contains(&project.join(".claude").join("skills")),
+            "CLI discovery must see project-local .claude skills: {cli_paths:?}"
+        );
+        assert!(
+            cli_paths.contains(&cwd.join("skills")),
+            "CLI discovery must preserve legacy cwd/skills lookup: {cli_paths:?}"
+        );
+        assert!(
+            cli_paths.contains(&home.join(".astra").join("skills"))
+                && cli_paths.contains(&home.join(".claude").join("skills")),
+            "CLI discovery must also see HOME-level skills: {cli_paths:?}"
+        );
+
+        let server_paths = home_skill_search_paths_from(&home);
+        assert_eq!(
+            server_paths,
+            vec![
+                home.join(".astra").join("skills"),
+                home.join(".claude").join("skills")
+            ],
+            "Web/server discovery must be restricted to API-server HOME catalogs"
+        );
+        assert!(
+            !server_paths
+                .iter()
+                .any(|path| path.starts_with(&project) || path.starts_with(&cwd)),
+            "Web/server discovery must not expose CLI project-local paths: {server_paths:?}"
         );
     }
 

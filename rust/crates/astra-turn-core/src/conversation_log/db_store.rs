@@ -116,17 +116,20 @@ impl CslStore for DbCslStore {
         let pool = self.get_pool().await?;
 
         // First check if any snapshot exists — avoids deserializing all rows
-        // when the subquery would return -1 (no snapshot → seq >= -1 → all rows).
-        let has_snapshot: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM conversation_log \
-             WHERE session_id = ? AND entry_type = 0)",
+        // when the subquery would return NULL. MatrixOne's MySQL protocol does
+        // not consistently decode SQL existence probes as a Rust bool through
+        // sqlx, so use COUNT(*) and propagate decode/query errors instead of
+        // silently treating them as an empty log.
+        let snapshot_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_log \
+             WHERE session_id = ? AND entry_type = 0",
         )
         .bind(session_id)
         .fetch_one(&pool)
         .await
-        .unwrap_or(false);
+        .map_err(|e| CslStoreError::Other(format!("snapshot count: {e}")))?;
 
-        if !has_snapshot {
+        if snapshot_count <= 0 {
             return Ok(Vec::new());
         }
 
@@ -324,6 +327,27 @@ mod tests {
     // Run with: cargo test -p astra-turn-core conversation_log::db_store -- --ignored
     //
     // The DB must have the `conversation_log` table created (via ensure_core_schema).
+
+    #[test]
+    fn db_snapshot_probe_uses_count_instead_of_exists() {
+        let source = include_str!("db_store.rs");
+        let implementation = source
+            .split("// ─── Tests")
+            .next()
+            .expect("db_store implementation section must exist");
+        assert!(
+            implementation.contains("SELECT COUNT(*) FROM conversation_log"),
+            "MatrixOne CSL snapshot probe must use COUNT(*) for SQLx MySQL decode stability"
+        );
+        assert!(
+            !implementation.contains("SELECT EXISTS("),
+            "MatrixOne CSL snapshot probe must not use SELECT EXISTS(...) as a bool"
+        );
+        assert!(
+            !implementation.contains("unwrap_or(false)"),
+            "CSL load errors must not be silently treated as an empty log"
+        );
+    }
 
     async fn test_store() -> DbCslStore {
         let settings = MatrixOneSettings::from_env_with_database("astra_test");

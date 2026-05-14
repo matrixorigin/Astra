@@ -12,7 +12,7 @@
 //! thinking window). One source of truth, one render path. See
 //! `docs/design/tui-refactor.md` §3.3.
 //!
-//! Reply body is rendered with a `┃ ` accent-gutter Cursor-style,
+//! Reply body is rendered with a `█ ` accent-gutter block-style,
 //! matching existing visual grammar. A trailing blinking cursor
 //! block (`▎`) is appended to the final rendered line while the
 //! cell is still live, as a "more is coming" cue.
@@ -39,7 +39,7 @@
 use std::any::Any;
 use std::time::Instant;
 
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::HistoryCell;
@@ -363,9 +363,9 @@ fn rhythm_dots_span() -> Span<'static> {
 }
 
 /// Render the reply body. Settled (scrollback) cells get a static
-/// `┃ ` accent gutter on every line. Live cells drop the gutter —
+/// `█ ` accent gutter on every line. Live cells drop the gutter —
 /// the active-slot wrapper (`tui::LiveFramedCell`) paints its own
-/// gradient `┃` at the same column, and stacking both produces a
+/// gradient `█` at the same column, and stacking both produces a
 /// visible double bar.
 fn render_body_with_gutter(
     source: &str,
@@ -376,15 +376,20 @@ fn render_body_with_gutter(
     if source.trim().is_empty() {
         return Vec::new();
     }
-    // When the cell owns the gutter, reserve 2 cols for `┃ `. While
-    // live, the active-slot wrapper (`tui::LiveFramedCell`) has
-    // *already* subtracted those 2 cols from the `width` it forwarded
-    // via `display_lines`, so on both paths `width` is the inner
-    // width — apply the floor uniformly. Keeping the two paths on the
-    // same `inner_w` formula prevents a one-column re-wrap when a
+    // Settled cells prepend `█ ` (2 cols) to every line, so wrap text
+    // at `width - 2` to avoid terminal hard-wrap overflow. Live cells
+    // already receive `width - 2` from `active_viewport` (the
+    // `LiveFramedCell` wrapper paints its own gutter column) — so the
+    // asymmetry below is intentional. Do *not* "unify" the arms by
+    // adding `saturating_sub(2)` to both: that double-subtracts on
+    // the live path and re-introduces a one-column re-wrap when a
     // cell transitions live → settled near the floor boundary.
     let prepend_gutter = !live;
-    let inner_w = (width as usize).max(20);
+    let inner_w = if prepend_gutter {
+        (width as usize).saturating_sub(2).max(20)
+    } else {
+        (width as usize).max(20)
+    };
     let text = render_markdown_text_with_width(source, Some(inner_w));
     let rendered: Vec<Line<'static>> = text.lines.iter().map(line_to_static).collect();
 
@@ -393,7 +398,7 @@ fn render_body_with_gutter(
     }
 
     let theme = crate::tui::theme::current();
-    let gutter_style = Style::default().fg(theme.gutter).bold();
+    let gutter_style = Style::default().fg(theme.gutter_frozen);
     let dim = Style::default().fg(Color::DarkGray);
     let last_idx = rendered.len() - 1;
 
@@ -403,7 +408,7 @@ fn render_body_with_gutter(
         .map(|(i, line)| {
             let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 3);
             if prepend_gutter {
-                spans.push(Span::styled("┃ ", gutter_style));
+                spans.push(Span::styled("█ ", gutter_style));
             }
             spans.extend(line.spans.iter().cloned());
             // Trailing rhythm-dot indicator + tok/s suffix on the
@@ -588,8 +593,8 @@ mod tests {
         let out = render(&c, 60, 4);
         for row in out.lines().filter(|l| !l.is_empty()) {
             assert!(
-                row.starts_with('┃'),
-                "every rendered row needs the ┃ gutter: {row:?}"
+                row.starts_with('█'),
+                "every rendered row needs the █ gutter: {row:?}"
             );
         }
     }
@@ -771,9 +776,9 @@ mod tests {
             out.contains("step one"),
             "earlier line must stay visible under the window cap: {out}"
         );
-        // Body hasn't arrived yet — no `┃ ` gutter.
+        // Body hasn't arrived yet — no `█ ` gutter.
         assert!(
-            !out.contains('┃'),
+            !out.contains('█'),
             "body gutter shouldn't render while still thinking: {out}"
         );
     }

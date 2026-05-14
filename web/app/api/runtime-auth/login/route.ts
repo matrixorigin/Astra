@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { ACCESS_TOKEN_COOKIE, API_URL_COOKIE, DEFAULT_API_URL, DEMO_MODE_COOKIE, REFRESH_TOKEN_COOKIE } from '@/lib/runtime-config';
+import { runtimeLogin } from '@/lib/auth/runtime-auth-client';
 
 type LoginBody = {
   apiUrl?: string;
@@ -18,34 +19,16 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const response = await fetch(new URL('/auth/login', apiUrl).toString(), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      username: body.username,
-      password: body.password,
-    }),
+  const result = await runtimeLogin(apiUrl, {
+    username: body.username,
+    password: body.password,
   });
 
-  const payload = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    const detail =
-      (payload as { detail?: string; error?: string }).detail ??
-      (payload as { detail?: string; error?: string }).error ??
-      'Login failed.';
-
-    return NextResponse.json({ error: detail }, { status: response.status });
+  if (!result.ok) {
+    return NextResponse.json({ error: result.error }, { status: result.status });
   }
 
-  const json = payload as {
-    access_token: string;
-    refresh_token: string;
-    expires_in?: number;
-    token_type?: string;
-  };
+  const json = result.data;
 
   const nextResponse = NextResponse.json({
     ok: true,

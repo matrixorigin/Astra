@@ -292,6 +292,14 @@ pub(crate) struct LlmCallResult {
     pub finish_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LlmStreamUpdate {
+    TextDelta(String),
+    ReasoningDelta(String),
+}
+
+pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
+
 fn llm_result_has_partial_signal(result: &LlmCallResult) -> bool {
     !result.full_text.is_empty()
         || !result.reasoning.is_empty()
@@ -875,14 +883,23 @@ fn build_bedrock_message_content(msg: &Value, include_reasoning_content: bool) -
                 && let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str)
             {
                 if !rc.is_empty() {
-                    let mut reasoning_text = json!({"text": rc});
-                    if let Some(sig) = msg.get("reasoning_signature").and_then(Value::as_str) {
-                        if !sig.is_empty() {
-                            reasoning_text["signature"] = Value::String(sig.to_string());
-                        }
+                    let signature = msg
+                        .get("reasoning_signature")
+                        .and_then(Value::as_str)
+                        .filter(|sig| !sig.is_empty());
+                    if let Some(sig) = signature {
+                        let reasoning_text = json!({"text": rc, "signature": sig});
+                        blocks.push(json!({"reasoningContent": {"reasoningText": reasoning_text}}));
+                        true
+                    } else {
+                        // Bedrock thinking blocks are cryptographically bound to a
+                        // provider-emitted signature. Replaying unsigned reasoning
+                        // text is invalid and produces HTTP 400, especially after a
+                        // session switches from an OpenAI-compatible thinking model
+                        // to Bedrock. Keep the visible assistant text/tool calls, but
+                        // do not serialize an invalid reasoningContent block.
+                        false
                     }
-                    blocks.push(json!({"reasoningContent": {"reasoningText": reasoning_text}}));
-                    true
                 } else {
                     false
                 }
@@ -2127,6 +2144,44 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
     request_timeout: Option<std::time::Duration>,
     thinking: &ThinkingConfig,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    call_llm_and_collect_with_request_overrides_and_stream_callback(
+        messages,
+        tools,
+        model_name,
+        wire_model_name,
+        api_key,
+        base_url,
+        provider,
+        max_output_tokens,
+        has_fallback,
+        cancel,
+        header_overrides,
+        completions_url_override,
+        request_timeout,
+        thinking,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callback(
+    messages: &[Value],
+    tools: &[Value],
+    model_name: &str,
+    wire_model_name: Option<&str>,
+    api_key: &str,
+    base_url: &str,
+    provider: &str,
+    max_output_tokens: Option<usize>,
+    has_fallback: bool,
+    cancel: LlmCancel<'_>,
+    header_overrides: Option<&HashMap<String, String>>,
+    completions_url_override: Option<&str>,
+    request_timeout: Option<std::time::Duration>,
+    thinking: &ThinkingConfig,
+    mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     let cooldown = rate_limit_cooldown();
     // `model_key` indexes rate-limit state on the local row name.
     let model_key = model_name;
@@ -2260,7 +2315,12 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
             cooldown.with(model_key, |c| c.record_success());
             if provider_uses_bedrock_converse(provider) {
                 match crate::turn::bedrock_transport::collect_bedrock_stream(
-                    response, model_name, started, cancel, idle_pre,
+                    response,
+                    model_name,
+                    started,
+                    cancel,
+                    idle_pre,
+                    stream_callback.as_deref_mut(),
                 )
                 .await
                 {
@@ -2314,6 +2374,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
                     cancel,
                     idle_pre,
                     idle_post,
+                    stream_callback.as_deref_mut(),
                 )
                 .await
             } else {
@@ -2324,6 +2385,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
                     cancel,
                     idle_pre,
                     idle_post,
+                    stream_callback.as_deref_mut(),
                 )
                 .await
             };
@@ -2594,6 +2656,7 @@ async fn collect_llm_stream(
     cancel: LlmCancel<'_>,
     idle_pre: std::time::Duration,
     idle_post: std::time::Duration,
+    mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
 ) -> Result<LlmCallResult, StreamCollectError> {
     let mut full_text = String::new();
     let mut reasoning = String::new();
@@ -2728,6 +2791,9 @@ async fn collect_llm_stream(
                 });
             }
             full_text.push_str(content);
+            if let Some(callback) = stream_callback.as_deref_mut() {
+                callback(LlmStreamUpdate::TextDelta(content.to_string()));
+            }
             made_progress = true;
         }
 
@@ -2751,6 +2817,9 @@ async fn collect_llm_stream(
                 });
             }
             reasoning.push_str(r);
+            if let Some(callback) = stream_callback.as_deref_mut() {
+                callback(LlmStreamUpdate::ReasoningDelta(r.to_string()));
+            }
             made_progress = true;
         }
 
@@ -2880,6 +2949,7 @@ async fn collect_anthropic_llm_stream(
     cancel: LlmCancel<'_>,
     idle_pre: std::time::Duration,
     idle_post: std::time::Duration,
+    mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
 ) -> Result<LlmCallResult, StreamCollectError> {
     let mut full_text = String::new();
     let mut reasoning = String::new();
@@ -3047,6 +3117,9 @@ async fn collect_anthropic_llm_stream(
                                 });
                             }
                             full_text.push_str(text);
+                            if let Some(callback) = stream_callback.as_deref_mut() {
+                                callback(LlmStreamUpdate::TextDelta(text.to_string()));
+                            }
                             made_progress = true;
                         }
                     }
@@ -3069,6 +3142,9 @@ async fn collect_anthropic_llm_stream(
                                 });
                             }
                             reasoning.push_str(text);
+                            if let Some(callback) = stream_callback.as_deref_mut() {
+                                callback(LlmStreamUpdate::ReasoningDelta(text.to_string()));
+                            }
                             made_progress = true;
                         }
                     }
@@ -4360,6 +4436,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await;
         assert!(
@@ -4380,6 +4457,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect_err("transport error");
@@ -4412,6 +4490,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("collect");
@@ -4436,6 +4515,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_invokes_incremental_callback() {
+        let d1 = json!({"choices":[{"delta":{"content":"Hi ","reasoning_content":"R"}}]});
+        let d2 = json!({"choices":[{"delta":{"content":"there"}}]});
+        let body = format!("data: {d1}\n\ndata: {d2}\n\n");
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let mut updates = Vec::new();
+        let mut callback = |update| updates.push(update);
+        let res = collect_llm_stream(
+            stream,
+            "gpt-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            Some(&mut callback),
+        )
+        .await
+        .expect("collect");
+        assert_eq!(res.full_text, "Hi there");
+        assert_eq!(
+            updates,
+            vec![
+                LlmStreamUpdate::TextDelta("Hi ".to_string()),
+                LlmStreamUpdate::ReasoningDelta("R".to_string()),
+                LlmStreamUpdate::TextDelta("there".to_string()),
+            ],
+            "callback should receive deltas before aggregate completion",
+        );
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_extracts_finish_reason_stop() {
         let d1 = json!({"choices":[{"delta":{"content":"Hello"}}]});
         let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
@@ -4448,6 +4558,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("collect");
@@ -4468,6 +4579,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("collect");
@@ -4487,6 +4599,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("collect");
@@ -4511,6 +4624,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await;
         assert!(
@@ -4538,6 +4652,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await;
         match res.expect_err("idle timeout after partial output") {
@@ -4567,6 +4682,7 @@ mod tests {
                 LlmCancel::Flag(flag.as_ref()),
                 stream_idle_timeout(),
                 stream_idle_timeout_after_progress(),
+                None,
             )
             .await
         });
@@ -4593,6 +4709,7 @@ mod tests {
                 LlmCancel::Token(&token_for_stream),
                 stream_idle_timeout(),
                 stream_idle_timeout_after_progress(),
+                None,
             )
             .await
         });
@@ -4621,6 +4738,7 @@ mod tests {
                 LlmCancel::FlagAndToken(flag.as_ref(), &token_signal),
                 stream_idle_timeout(),
                 stream_idle_timeout_after_progress(),
+                None,
             )
             .await
         });
@@ -4887,6 +5005,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("collect");
@@ -4921,6 +5040,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("stream should succeed");
@@ -4973,6 +5093,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("stream should succeed");
@@ -5016,6 +5137,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("stream should succeed");
@@ -5053,6 +5175,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("stream should succeed");
@@ -5090,6 +5213,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("stream should succeed");
@@ -5117,6 +5241,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("stream should succeed");
@@ -5146,6 +5271,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await;
         assert!(
@@ -5168,6 +5294,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await;
         match r {
@@ -6060,6 +6187,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("collect");
@@ -7167,6 +7295,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("collect")
@@ -7803,35 +7932,20 @@ mod tests {
         );
     }
 
-    /// Helper for counter tests: build a body that would violate the
-    /// signature contract, catching the debug_assert panic so the test can
-    /// observe the counter's post-increment state.
-    fn attempt_violating_bedrock_thinking_build() {
-        let messages = vec![
-            json!({"role": "user", "content": "q"}),
-            json!({
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": "tc1", "type": "function",
-                    "function": {"name": "noop", "arguments": "{}"}
-                }],
-                "reasoning_content": "thinking without signature",
-            }),
-            json!({"role": "tool", "tool_call_id": "tc1", "content": "ok"}),
-        ];
-        let _ = build_provider_request_body(
-            &messages,
-            &[],
-            "us.anthropic.claude-sonnet-4-6",
-            "bedrock",
-            Some(4096),
-            None,
-            true,
-            &ThinkingConfig::Enabled {
-                budget_tokens: 1024,
-            },
-        );
+    /// Helper for counter tests: feed a deliberately malformed Bedrock message
+    /// directly into the guard. Normal request construction strips unsigned
+    /// reasoning before this point, so direct guard tests are the only valid way
+    /// to exercise the invariant.
+    fn assert_malformed_bedrock_thinking_body() {
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": [{
+                "reasoningContent": {
+                    "reasoningText": {"text": "thinking without signature"}
+                }
+            }]
+        })];
+        assert_bedrock_thinking_signature_contract(&messages);
     }
 
     // Counter increments alongside the debug_assert so release builds can
@@ -7846,7 +7960,7 @@ mod tests {
         // counter afterward. The fetch_add runs *before* the debug_assert so
         // the counter observes the violation even when the assert fires.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-            attempt_violating_bedrock_thinking_build,
+            assert_malformed_bedrock_thinking_body,
         ));
         let after = BEDROCK_THINKING_SIGNATURE_VIOLATION_COUNT.load(Ordering::Relaxed);
         assert!(
@@ -7863,9 +7977,15 @@ mod tests {
     #[test]
     #[should_panic(expected = "Bedrock thinking contract violation")]
     fn bedrock_thinking_signature_contract_panics_on_missing_signature() {
-        // Simulate what happens if the SSE → accum → next-assistant-message
-        // pipeline ever drops the signature: reasoning_content is present but
-        // reasoning_signature is empty.
+        assert_malformed_bedrock_thinking_body();
+    }
+
+    // Request construction must never produce the malformed body above. If a
+    // session carries reasoning text from a provider/model that did not emit a
+    // Bedrock-compatible signature, the Bedrock request keeps text/tool calls
+    // and omits the invalid reasoningContent block.
+    #[test]
+    fn build_bedrock_body_omits_unsigned_reasoning_when_thinking_on() {
         let messages = vec![
             json!({"role": "user", "content": "What is 2+2?"}),
             json!({
@@ -7873,11 +7993,11 @@ mod tests {
                 "content": null,
                 "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "calc", "arguments": "{}"}}],
                 "reasoning_content": "let me compute",
-                // reasoning_signature intentionally MISSING
+                // reasoning_signature intentionally missing
             }),
             json!({"role": "tool", "tool_call_id": "tc1", "content": "4"}),
         ];
-        let _ = build_provider_request_body(
+        let body = build_provider_request_body(
             &messages,
             &[],
             "us.anthropic.claude-sonnet-4-6",
@@ -7888,6 +8008,17 @@ mod tests {
             &ThinkingConfig::Enabled {
                 budget_tokens: 1024,
             },
+        );
+        let content = body["messages"][1]["content"].as_array().unwrap();
+        assert!(
+            !content
+                .iter()
+                .any(|block| block.get("reasoningContent").is_some()),
+            "unsigned historical reasoning must not be serialized into Bedrock reasoningContent"
+        );
+        assert!(
+            content.iter().any(|block| block.get("toolUse").is_some()),
+            "assistant tool calls must remain visible after unsigned reasoning is omitted"
         );
     }
 

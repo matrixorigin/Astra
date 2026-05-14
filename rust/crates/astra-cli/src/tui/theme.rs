@@ -36,8 +36,10 @@ pub(crate) struct Theme {
     pub selected_bg: Color,
     /// Foreground on top of `selected_bg`. Guaranteed readable.
     pub selected_fg: Color,
-    /// Gutter indicator colour (same as accent in current presets).
+    /// Gutter indicator colour for live (streaming) cells.
     pub gutter: Color,
+    /// Muted gutter colour for settled (frozen) cells.
+    pub gutter_frozen: Color,
     pub success: Color,
     pub warn: Color,
     pub error: Color,
@@ -58,12 +60,14 @@ impl Theme {
             // Clearly visible grey band for user input (matches Claude Code).
             selected_bg: Color::Rgb(55, 55, 60),
             selected_fg: Color::Rgb(232, 220, 245),
-            // Soft pink for the assistant-reply gutter (`┃ `) — reads
-            // clearly on any dark terminal background while feeling
-            // warmer than the previous cyan accent and providing a
-            // visual break between the composer accent (cyan) and
-            // the model's output.
+            // Soft pink for the live gutter (`█`) — reads clearly on
+            // any dark terminal background while feeling warmer than
+            // the previous cyan accent.
             gutter: Color::Rgb(246, 168, 195),
+            // Muted lavender for settled cells — visually distinct
+            // from the live gradient but still recognisable as the
+            // assistant's voice.
+            gutter_frozen: Color::Rgb(140, 120, 160),
             success: Color::Green,
             warn: Color::Yellow,
             error: Color::Red,
@@ -82,6 +86,7 @@ impl Theme {
             selected_bg: Color::Rgb(245, 232, 250),
             selected_fg: Color::Rgb(24, 17, 35),
             gutter: Color::Rgb(180, 60, 120),
+            gutter_frozen: Color::Rgb(130, 90, 120),
             success: Color::Rgb(22, 115, 46),
             warn: Color::Rgb(135, 89, 0),
             error: Color::Rgb(170, 34, 34),

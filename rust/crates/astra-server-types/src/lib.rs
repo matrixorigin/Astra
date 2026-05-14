@@ -181,6 +181,12 @@ pub struct SessionArtifactResponse {
     pub round: Option<u32>,
     pub content: serde_json::Value,
     pub metadata: Option<serde_json::Value>,
+    pub retention_policy: Option<String>,
+    pub retention_until: Option<String>,
+    pub status: Option<String>,
+    pub referenced_by_manifest_count: u32,
+    pub referenced_by_state_items_count: u32,
+    pub referenced_by_citation_count: u32,
     pub created_at: Option<String>,
 }
 

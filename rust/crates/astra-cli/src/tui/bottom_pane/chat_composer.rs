@@ -49,7 +49,8 @@ pub(crate) struct ChatComposer {
 /// Multi-line pastes above this threshold are swapped for a placeholder.
 /// Single-line pastes are inserted literally regardless of length — users
 /// expect URLs and one-liners to appear verbatim.
-const PASTE_PLACEHOLDER_MIN_LINES: usize = 4;
+const PASTE_INLINE_MAX_CHARS: usize = 800;
+const PASTE_INLINE_MAX_LINES: usize = 2;
 
 impl ChatComposer {
     pub fn new() -> Self {
@@ -144,8 +145,25 @@ impl ChatComposer {
     /// a `[Pasted #N · M lines]` placeholder; short pastes go in verbatim.
     /// Returns `true` when a placeholder was inserted.
     pub fn handle_paste(&mut self, text: &str) -> bool {
-        let line_count = text.lines().count();
-        if line_count < PASTE_PLACEHOLDER_MIN_LINES {
+        // Count line breaks: \r\n counts as one break, lone \r or \n also one.
+        let mut line_breaks = 0usize;
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\r' {
+                line_breaks += 1;
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                    i += 1;
+                }
+            } else if bytes[i] == b'\n' {
+                line_breaks += 1;
+            }
+            i += 1;
+        }
+        let line_count = if text.is_empty() { 0 } else { line_breaks + 1 };
+        let char_count = text.chars().count();
+        let is_small = char_count <= PASTE_INLINE_MAX_CHARS && line_count <= PASTE_INLINE_MAX_LINES;
+        if is_small {
             self.textarea.insert_str(text);
             return false;
         }
@@ -301,6 +319,10 @@ impl ChatComposer {
 
     fn prefix_display_width(&self) -> u16 {
         self.prompt_prefix.width() as u16
+    }
+
+    pub fn flush_paste_burst(&mut self) {
+        self.textarea.flush_paste_burst();
     }
 
     pub fn desired_height(&self, width: u16) -> u16 {

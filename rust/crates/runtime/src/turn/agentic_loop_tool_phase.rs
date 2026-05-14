@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
+use uuid::Uuid;
 
 use astra_services::EvaluationService;
 use astra_services::evaluation::SessionQualityAssessmentRequest;
+use astra_services::runs::ToolOutputBatchItem;
+use astra_services::session_journal::ToolCallRecord;
 
 use super::agentic_adaptive_tuning::{
     apply_per_turn_adaptation, apply_tactical_actions, maybe_run_tuning_cycle,
@@ -99,6 +102,76 @@ fn tool_record_was_rejected(rec: &astra_services::session_journal::ToolCallRecor
         .unwrap_or(false)
 }
 
+fn tool_result_string_field(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn build_tool_output_batch_items(
+    round_tool_calls: &[ToolCallRecord],
+    new_tool_results: &[Value],
+) -> Vec<ToolOutputBatchItem> {
+    new_tool_results
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, result)| {
+            let record = round_tool_calls
+                .iter()
+                .filter(|record| !record.is_synthetic_placeholder())
+                .nth(idx);
+            let tool_name = tool_result_string_field(result, "name")
+                .or_else(|| record.map(|record| record.name.clone()))?;
+            Some(ToolOutputBatchItem {
+                output_id: format!("out-{}", Uuid::new_v4()),
+                tool_call_id: tool_result_string_field(result, "tool_call_id"),
+                tool_name,
+                output_json: result.clone(),
+            })
+        })
+        .collect()
+}
+
+async fn persist_tool_output_batch_for_round(
+    state: &AgenticLoopState,
+    round_tool_calls: &[ToolCallRecord],
+    new_tool_results: &[Value],
+) {
+    if new_tool_results.is_empty() {
+        return;
+    }
+    let (Some(pool), Some(user_id), Some(session_id), Some(run_id)) = (
+        state.context_manifest_pool.clone(),
+        state.context_manifest_user_id.as_deref(),
+        state.current_session_id.as_deref(),
+        state.current_run_id.as_deref(),
+    ) else {
+        return;
+    };
+    let items = build_tool_output_batch_items(round_tool_calls, new_tool_results);
+    if items.is_empty() {
+        return;
+    }
+    let batch_id = format!("batch-{}", Uuid::new_v4());
+    let store = astra_services::DatabaseRunStateStore::new(pool);
+    if let Err(error) = store
+        .insert_tool_output_batch(&batch_id, session_id, run_id, user_id, &items)
+        .await
+    {
+        astra_core::agent_warn!(
+            "tool-output-persistence",
+            "failed to persist tool output batch batch_id={} session_id={} run_id={} outputs={} error={}",
+            batch_id,
+            session_id,
+            run_id,
+            items.len(),
+            error
+        );
+    }
+}
 fn record_recent_read_file_path(
     recent_file_reads: &mut Vec<(String, u32)>,
     tool_name: &str,
@@ -560,7 +633,7 @@ async fn finalize_server_rollback_boundary(
     session_id: Option<&str>,
     executor: &crate::server::server_tool_executor::ServerToolExecutor,
     active: &ServerRollbackBoundary,
-    new_records: &[astra_services::session_journal::ToolCallRecord],
+    new_records: &[ToolCallRecord],
     new_tool_results: &[Value],
 ) {
     let file_entries_added = active.file_checkpoint.map_or(0, |checkpoint| {
@@ -902,7 +975,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         .collect();
 
     let evo_records_before = state.stall.tool_call_records.len();
-    let tool_results_before = state.tool_results.len();
     {
         let mut term_adapter = HostTerminalAdapter(host);
         let headless_quiet = prep.quiet || state.skill_produced_output;
@@ -1081,23 +1153,31 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             agentic_step: Some(agentic_step),
             source: Some("agentic_loop".into()),
             run_id,
-            tool_calls: Some(round_tool_calls),
+            tool_calls: Some(round_tool_calls.clone()),
             ..Default::default()
         });
     }
+
+    // `run_agentic_headless_tool_round` resets `state.tool_results` at the
+    // start of every tool round, so after it returns the vector is already the
+    // current round's result set. Do not slice by the pre-round length: a
+    // resumed or retried turn can enter with stale results from a prior round,
+    // the headless round clears them, and using the old index would panic with
+    // `range start index ... out of range`.
+    let new_tool_results = state.tool_results.clone();
+    persist_tool_output_batch_for_round(state, &round_tool_calls, &new_tool_results).await;
 
     if let (Some(active), Some(executor)) = (
         active_server_rollback_boundary.as_ref(),
         state.server_tool_executor.as_deref(),
     ) {
         let new_records = &state.stall.tool_call_records[evo_records_before..];
-        let new_tool_results = &state.tool_results[tool_results_before..];
         finalize_server_rollback_boundary(
             state.current_session_id.as_deref(),
             executor,
             active,
             new_records,
-            new_tool_results,
+            &new_tool_results,
         )
         .await;
     }
@@ -1507,6 +1587,29 @@ fn build_introspect_snapshot(
     // this snapshot (e.g., for server-side introspect API) leave it empty.
     let current_round = state.current_round_index;
 
+    let bias_map = state.turn_guard.health.outcome_bias_by_tool(3600);
+    let tool_health: Vec<astra_turn_core::introspect::ToolHealthEntry> = state
+        .turn_guard
+        .health
+        .all()
+        .iter()
+        .filter(|(_, h)| h.total_calls > 0)
+        .map(|(name, h)| {
+            let last_fail_cat = bias_map.get(name).and_then(|b| b.last_failure_tag.clone());
+            astra_turn_core::introspect::ToolHealthEntry {
+                name: name.clone(),
+                calls: h.total_calls as u32,
+                errors: h.total_failures as u32,
+                avg_ms: 0,
+                deprioritized: h.deprioritized,
+                consecutive_failures: h.consecutive_failures as u32,
+                last_failure_category: last_fail_cat,
+            }
+        })
+        .collect();
+
+    let tool_errors = state.turn_guard.health.recent_errors(10);
+
     astra_turn_core::introspect::IntrospectSnapshot {
         token_pressure: 0.0, // TODO: wire from pipeline_session.stats when available
         cache_hit_ratio: cache_ratio,
@@ -1514,7 +1617,7 @@ fn build_introspect_snapshot(
         turns_remaining: state.remaining_turns as u32,
         compaction_tier: format!("{:?}", state.compact_tier_applied),
         alerts: Vec::new(),
-        tool_health: Vec::new(), // TODO: wire from step_recorder.tool_timings
+        tool_health,
         working_memory_summary: working_mem,
         total_input_tokens: state.total_prompt + state.total_cache_read,
         total_output_tokens: state.total_completion,
@@ -1525,6 +1628,8 @@ fn build_introspect_snapshot(
         stall_state,
         injection_freshness: Vec::new(),
         current_round,
+        tool_errors,
+        circuit_breaker: None, // populated by bridge when available
     }
 }
 

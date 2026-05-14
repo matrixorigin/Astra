@@ -307,6 +307,34 @@ pub fn compact_tiered(
     compact_tiered_with_result(messages, budget_chars, keep_chars, tier, keep_recent_turns).messages
 }
 
+/// Apply context release stubs to messages: replace content of tool results
+/// whose `tool_call_id` is in `released_ids` with a short stub. Called before
+/// sending messages to the LLM so released context doesn't consume tokens.
+/// Returns the number of tool results stubbed.
+pub fn apply_context_release(
+    messages: &mut [Value],
+    released_ids: &std::collections::HashSet<String>,
+) -> usize {
+    if released_ids.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    for msg in messages.iter_mut() {
+        if msg.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        let Some(tcid) = msg.get("tool_call_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if released_ids.contains(tcid) {
+            msg["content"] =
+                Value::String("[context released by agent — re-read if needed]".to_string());
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Tier-aware compaction returning a [`CompactResult`] with rich metadata.
 ///
 /// Same algorithm as [`compact_tiered`], but also returns a [`CompactBoundary`]
@@ -1977,5 +2005,120 @@ mod tests {
         let stub = duplicate_read_stub("src/main.rs");
         assert!(stub.contains("src/main.rs"));
         assert!(stub.contains("duplicate read"));
+    }
+
+    // ── Tests for apply_context_release ──────────────────────────────────
+
+    #[test]
+    fn apply_context_release_stubs_matching_tool_call_ids() {
+        let mut msgs = vec![
+            user("hello"),
+            assistant_tool("c1", "bash", "{}"),
+            tool_with_id("c1", "long output that takes many tokens"),
+            assistant_tool("c2", "read_file", "{}"),
+            tool_with_id("c2", "file contents here"),
+        ];
+        let released: std::collections::HashSet<String> = ["c1".to_string()].into_iter().collect();
+
+        let count = apply_context_release(&mut msgs, &released);
+        assert_eq!(count, 1);
+        let content = msgs[2].get("content").unwrap().as_str().unwrap();
+        assert!(
+            content.contains("context released"),
+            "released stub missing: {content}"
+        );
+        // c2 should be untouched
+        let c2_content = msgs[4].get("content").unwrap().as_str().unwrap();
+        assert_eq!(c2_content, "file contents here");
+    }
+
+    #[test]
+    fn apply_context_release_empty_set_is_noop() {
+        let original = vec![
+            user("hello"),
+            assistant_tool("c1", "bash", "{}"),
+            tool_with_id("c1", "original content"),
+        ];
+        let mut msgs = original.clone();
+        let released: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let count = apply_context_release(&mut msgs, &released);
+        assert_eq!(count, 0);
+        assert_eq!(
+            msgs[2].get("content").unwrap().as_str().unwrap(),
+            "original content"
+        );
+    }
+
+    #[test]
+    fn apply_context_release_skips_non_tool_messages() {
+        let mut msgs = vec![
+            user("hello"),
+            assistant("some response"),
+            json!({"role": "system", "content": "system msg"}),
+        ];
+        let released: std::collections::HashSet<String> = ["c1".to_string()].into_iter().collect();
+
+        let count = apply_context_release(&mut msgs, &released);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn apply_context_release_handles_multiple_ids() {
+        let mut msgs = vec![
+            assistant_tool("c1", "bash", "{}"),
+            tool_with_id("c1", "output1"),
+            assistant_tool("c2", "bash", "{}"),
+            tool_with_id("c2", "output2"),
+            assistant_tool("c3", "bash", "{}"),
+            tool_with_id("c3", "output3"),
+        ];
+        let released: std::collections::HashSet<String> =
+            ["c1".to_string(), "c3".to_string()].into_iter().collect();
+
+        let count = apply_context_release(&mut msgs, &released);
+        assert_eq!(count, 2);
+        assert!(
+            msgs[1]
+                .get("content")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("context released")
+        );
+        assert_eq!(msgs[3].get("content").unwrap().as_str().unwrap(), "output2");
+        assert!(
+            msgs[5]
+                .get("content")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("context released")
+        );
+    }
+
+    #[test]
+    fn apply_context_release_uses_released_snapshot_pipeline() {
+        let sid = "apply-release-pipeline-test";
+        astra_tools::memoria::MemoriaClient::reset_released(sid);
+        astra_tools::memoria::MemoriaClient::release_context(sid, "call_001");
+        let released = astra_tools::memoria::MemoriaClient::released_snapshot(sid);
+        let mut msgs = vec![
+            assistant_tool("call_001", "bash", "{}"),
+            tool_with_id("call_001", "large output"),
+        ];
+
+        let count = apply_context_release(&mut msgs, &released);
+
+        astra_tools::memoria::MemoriaClient::reset_released(sid);
+        assert_eq!(count, 1);
+        assert!(
+            msgs[1]
+                .get("content")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("context released")
+        );
     }
 }

@@ -2679,7 +2679,14 @@ fn initialize_journal(state: &mut SessionState, session_id: &str) {
 /// rejected — it produced false positives whenever an unrelated error message
 /// happened to contain the digits 401 (timeouts in ms, file offsets, body
 /// snippets, etc.), causing spurious "Session expired. Run /login" prompts.
+///
+/// Excludes LLM provider auth failures — those indicate the upstream
+/// model credentials (Bedrock/Anthropic API key) are invalid, not the
+/// astra session token. Refreshing `/login` won't help for those.
 pub(super) fn is_auth_error(error: &str) -> bool {
+    if is_llm_provider_auth_error(error) {
+        return false;
+    }
     let lower = error.to_lowercase();
     lower.contains("unauthorized")
         || lower.contains("could not validate credentials")
@@ -2691,6 +2698,13 @@ pub(super) fn is_auth_error(error: &str) -> bool {
         || lower.contains("http 401")
 }
 
+/// Detect LLM provider authentication failures — upstream Bedrock/Anthropic
+/// credential issues that `/login` cannot fix.
+pub(super) fn is_llm_provider_auth_error(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("llm provider authentication failed") || lower.contains("[auth] llm provider")
+}
+
 fn report_turn_failure(
     state: &mut SessionState,
     profile: Option<&str>,
@@ -2699,7 +2713,9 @@ fn report_turn_failure(
     turn_start: Instant,
     ui: &mut dyn crate::ui_adapter::ReplUiAdapter,
 ) {
-    if is_auth_error(&failure.error) {
+    if is_llm_provider_auth_error(&failure.error) {
+        ui.show_error("  LLM provider credentials invalid — check model API key configuration.");
+    } else if is_auth_error(&failure.error) {
         ui.show_error("  Session expired. Run /login to refresh.");
     } else {
         ui.show_error(&format!(
@@ -3205,6 +3221,29 @@ mod tests {
             panic!("poison observability lock");
         }));
         session
+    }
+
+    #[test]
+    fn auth_error_predicates_distinguish_provider_from_session() {
+        // Regression: provider-auth strings must route to is_llm_provider_auth_error
+        // (which triggers a model retry) and NOT to is_auth_error (which would
+        // wrongly send the user to /login).
+        // Upstream emit sites:
+        //   - rust/crates/runtime/src/turn/llm_client.rs (~L2485): the literal
+        //     "LLM provider authentication failed" classified-error message.
+        //   - "[auth] LLM provider" prefix used by upstream agent_warn! emits.
+        let provider_msg = "LLM provider authentication failed";
+        assert!(super::is_llm_provider_auth_error(provider_msg));
+        assert!(!super::is_auth_error(provider_msg));
+
+        let prefixed = "[auth] LLM provider rejected request: 401";
+        assert!(super::is_llm_provider_auth_error(prefixed));
+        assert!(!super::is_auth_error(prefixed));
+
+        // Plain session 401 must still be detected by the generic predicate.
+        let session_msg = "HTTP 401 Unauthorized";
+        assert!(!super::is_llm_provider_auth_error(session_msg));
+        assert!(super::is_auth_error(session_msg));
     }
 
     #[test]

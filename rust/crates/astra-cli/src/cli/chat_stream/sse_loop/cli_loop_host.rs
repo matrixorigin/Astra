@@ -427,7 +427,22 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 turns_remaining: state.remaining_turns as u32,
                 compaction_tier: format!("{:?}", state.compact_tier_applied),
                 alerts: Vec::new(),
-                tool_health: Vec::new(),
+                tool_health: state
+                    .turn_guard
+                    .health
+                    .all()
+                    .iter()
+                    .filter(|(_, h)| h.total_calls > 0)
+                    .map(|(name, h)| astra_turn_core::introspect::ToolHealthEntry {
+                        name: name.clone(),
+                        calls: h.total_calls as u32,
+                        errors: h.total_failures as u32,
+                        avg_ms: 0,
+                        deprioritized: h.deprioritized,
+                        consecutive_failures: h.consecutive_failures as u32,
+                        last_failure_category: None,
+                    })
+                    .collect(),
                 working_memory_summary: working_mem,
                 total_input_tokens: state.total_prompt + state.total_cache_read,
                 total_output_tokens: state.total_completion,
@@ -486,6 +501,8 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 // `handle_introspect` from `ObservabilitySession.injection_history`).
                 injection_freshness: Vec::new(),
                 current_round: state.current_round_index,
+                tool_errors: state.turn_guard.health.recent_errors(10),
+                circuit_breaker: None,
             });
 
         Ok(HostTurnResult {

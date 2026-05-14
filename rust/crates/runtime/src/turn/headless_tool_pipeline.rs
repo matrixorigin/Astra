@@ -1238,7 +1238,7 @@ mod tests {
         );
     }
 
-    // ── Unknown tool health tracking tests ───────────────────────────
+    // ── Unknown tool validation tests ────────────────────────────────
 
     /// Helper: push a server tool_call JSON for an unknown tool and run validate_slot.
     fn push_unknown_server_tool_call(harness: &mut PipelineHarness, tool_name: &str) {
@@ -1253,7 +1253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_tool_records_health_failure() {
+    async fn unknown_tool_records_journal_without_health_failure() {
         let mut harness = PipelineHarness::new();
         push_unknown_server_tool_call(&mut harness, "outline");
         begin_recorded_turn(&mut harness, 1);
@@ -1289,14 +1289,14 @@ mod tests {
             Some("unknown_tool")
         );
 
-        // The health tracker must have recorded a failure for "outline".
+        // Catalog misses are not runtime failures. Recording them in health
+        // would make removed/hallucinated tools resurface as "failed often"
+        // context in later turns.
         let health = harness.turn_guard.health.get("outline");
-        assert!(health.is_some(), "outline should be tracked");
-        let h = health.unwrap();
-        assert_eq!(h.total_calls, 1);
-        assert_eq!(h.total_failures, 1);
-        assert_eq!(h.consecutive_failures, 1);
-        assert!(!h.deprioritized, "1 failure should not deprioritize yet");
+        assert!(
+            health.is_none(),
+            "unknown catalog tool should not pollute ToolHealth"
+        );
     }
 
     /// P0-T contract: the real validator must admit a deferred catalog
@@ -1386,7 +1386,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_tool_deprioritized_after_consecutive_failures() {
+    async fn unknown_tool_retries_do_not_deprioritize_missing_catalog_entry() {
         let mut harness = PipelineHarness::new();
         // Push 3 calls with different args so dedup doesn't block them.
         for i in 0..3 {
@@ -1405,20 +1405,18 @@ mod tests {
             assert!(matches!(result, HeadlessPipelineStage::ShortCircuit));
         }
 
-        // After 3 consecutive failures, the tool must be deprioritized.
-        let health = pipeline.ctx.turn_guard.health.get("outline").unwrap();
-        assert_eq!(health.consecutive_failures, 3);
         assert!(
-            health.deprioritized,
-            "outline should be deprioritized after 3 consecutive failures"
+            pipeline.ctx.turn_guard.health.get("outline").is_none(),
+            "unknown catalog tool should not be tracked in ToolHealth"
         );
         assert!(
-            pipeline
+            !pipeline
                 .ctx
                 .turn_guard
                 .health
                 .deprioritized_tools()
                 .contains(&"outline"),
+            "unknown catalog tool should not be deprioritized"
         );
     }
 
@@ -1460,7 +1458,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_name_tool_records_health_failure() {
+    async fn empty_name_tool_does_not_pollute_health() {
         let mut harness = PipelineHarness::new();
         // Push a tool call with empty name.
         harness.tool_calls.push(json!({
@@ -1500,10 +1498,13 @@ mod tests {
             Some("unknown_tool")
         );
 
-        // Empty-name tool should also be tracked in health.
+        // Empty-name calls use a separate consecutive-name guard; they should
+        // not create a ToolHealth entry under the empty string.
         let health = harness.turn_guard.health.get("");
-        assert!(health.is_some(), "empty-name tool should be tracked");
-        assert_eq!(health.unwrap().total_failures, 1);
+        assert!(
+            health.is_none(),
+            "empty-name catalog miss should not pollute ToolHealth"
+        );
     }
 
     #[tokio::test]
@@ -1557,13 +1558,21 @@ mod tests {
             "3rd call should be caught by dedup, not unknown_tool path"
         );
 
-        // Health should show 2 failures (dedup doesn't add a 3rd failure).
-        let health = pipeline.ctx.turn_guard.health.get("outline").unwrap();
-        assert_eq!(health.total_failures, 2);
+        let health = pipeline.ctx.turn_guard.health.get("outline");
+        if let Some(health) = health {
+            assert_eq!(
+                health.total_failures, 0,
+                "deduped unknown catalog tools may record neutral cache stats, not failures"
+            );
+            assert!(
+                !health.deprioritized,
+                "deduped unknown catalog tools should not be deprioritized"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn multiple_different_unknown_tools_each_tracked_independently() {
+    async fn multiple_different_unknown_tools_do_not_pollute_health() {
         let mut harness = PipelineHarness::new();
         harness.tool_calls.push(json!({
             "id": "call-outline-0",
@@ -1583,19 +1592,21 @@ mod tests {
             pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(i));
         }
 
-        let outline_h = pipeline.ctx.turn_guard.health.get("outline").unwrap();
-        assert_eq!(outline_h.consecutive_failures, 2);
-        assert!(!outline_h.deprioritized);
-
-        let foobar_h = pipeline.ctx.turn_guard.health.get("foobar").unwrap();
-        assert_eq!(foobar_h.consecutive_failures, 1);
-        assert!(!foobar_h.deprioritized);
+        assert!(
+            pipeline.ctx.turn_guard.health.get("outline").is_none(),
+            "outline is not in the catalog and should not be tracked"
+        );
+        assert!(
+            pipeline.ctx.turn_guard.health.get("foobar").is_none(),
+            "foobar is not in the catalog and should not be tracked"
+        );
     }
 
     #[tokio::test]
-    async fn unknown_tool_deprioritize_warning_generated() {
+    async fn unknown_tool_deprioritize_warning_not_generated() {
         let mut harness = PipelineHarness::new();
-        // 3 calls with different args to avoid dedup, trigger deprioritization.
+        // 3 calls with different args to avoid dedup. They should remain
+        // short-circuited catalog misses, not health failures.
         for i in 0..3 {
             harness.tool_calls.push(json!({
                 "id": format!("call-outline-{i}"),
@@ -1612,10 +1623,9 @@ mod tests {
         }
 
         let warning = pipeline.ctx.turn_guard.health.deprioritize_warning();
-        assert!(warning.is_some(), "should generate deprioritize warning");
         assert!(
-            warning.unwrap().contains("outline"),
-            "warning should mention the deprioritized tool"
+            warning.is_none(),
+            "unknown catalog tool should not generate a deprioritize warning"
         );
     }
 
@@ -1644,14 +1654,14 @@ mod tests {
             "3 consecutive empty-name calls should abort the round"
         );
 
-        // All 3 should have recorded health failures.
-        let health = pipeline.ctx.turn_guard.health.get("").unwrap();
-        assert_eq!(health.total_failures, 3);
-        assert_eq!(health.consecutive_failures, 3);
+        assert!(
+            pipeline.ctx.turn_guard.health.get("").is_none(),
+            "empty-name catalog misses use the consecutive-name guard only"
+        );
     }
 
     #[tokio::test]
-    async fn deprioritized_unknown_tool_merges_into_restricted() {
+    async fn unknown_tool_does_not_merge_into_restricted() {
         let mut harness = PipelineHarness::new();
         for i in 0..3 {
             harness.tool_calls.push(json!({
@@ -1675,8 +1685,8 @@ mod tests {
             pipeline.ctx.restricted_tools,
         );
         assert!(
-            pipeline.ctx.restricted_tools.contains("outline"),
-            "deprioritized unknown tool should be added to restricted_tools"
+            !pipeline.ctx.restricted_tools.contains("outline"),
+            "unknown catalog tool should not be added to restricted_tools"
         );
     }
 
@@ -2303,15 +2313,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_tool_failure_not_reset_by_valid_tool_success() {
+    async fn unknown_tool_missing_catalog_does_not_affect_valid_tool_health() {
         let mut harness = PipelineHarness::new();
-        // Call 1: unknown tool "outline"
+        // Call 1: schema-invalid tool "outline"
         harness.tool_calls.push(json!({
             "id": "call-outline-0",
             "function": { "name": "outline", "arguments": "{}" }
         }));
         // Call 2: valid tool "grep" (via synthetic edge, already in harness)
-        // Call 3: unknown tool "outline" with different args
+        // Call 3: schema-invalid tool "outline" with different args
         harness.tool_calls.push(json!({
             "id": "call-outline-1",
             "function": { "name": "outline", "arguments": "{\"path\": \"b.rs\"}" }
@@ -2337,11 +2347,9 @@ mod tests {
         // Unknown tool failure #2
         pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(1));
 
-        // grep success should NOT reset outline's consecutive failures.
-        let outline_h = pipeline.ctx.turn_guard.health.get("outline").unwrap();
-        assert_eq!(
-            outline_h.consecutive_failures, 2,
-            "valid tool success should not reset unknown tool's consecutive failures"
+        assert!(
+            pipeline.ctx.turn_guard.health.get("outline").is_none(),
+            "schema-invalid tools should not create health state"
         );
 
         // grep should show success.

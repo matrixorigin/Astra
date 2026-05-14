@@ -72,7 +72,7 @@ use frame_requester::FrameRequester;
 /// - **Settled** (not represented here) — committed `HistoryCell`s
 ///   already painted to terminal scrollback. Flat, no border.
 /// - **Active** — something's happening right now. Rendered with a
-///   left `┃` gutter whose colour gradient flows while live and
+///   left `█` gutter whose colour gradient flows while live and
 ///   freezes in place on completion.
 /// - **Status** — a one-line indicator (`✶ Thinking …`) when we
 ///   have a turn in flight but no cell content yet. No border —
@@ -106,7 +106,7 @@ fn active_viewport(
     width: u16,
 ) -> ActiveView {
     if let Some(cell) = chat_widget.active_cell() {
-        // Reserve 2 cols for the `┃ ` gutter.
+        // Reserve 2 cols for the `█ ` gutter.
         let inner_w = width.saturating_sub(2).max(20);
         let lines = cell.display_lines(inner_w);
         if !lines.is_empty() {
@@ -902,18 +902,10 @@ pub(crate) async fn run_tui(
                                         let username = parts.next().unwrap_or("").to_string();
                                         let email = parts.next().unwrap_or("").to_string();
                                         let password = parts.next().unwrap_or("").to_string();
-                                        match crate::auth_flow::do_register(api, &username, &email, &password).await {
+                                        match crate::auth_flow::do_register(api, profile, &username, &email, &password).await {
                                             Ok(_) => {
-                                                chat_widget.commit_system(history_cell::system::SystemCell::response("Registered — logging in…"));
-                                                match crate::auth_flow::do_login(api, profile, &username, &password).await {
-                                                    Ok(_) => {
-                                                        chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
-                                                        crate::post_auth_cloud_resync(profile, &mut state).await;
-                                                    }
-                                                    Err(e) => {
-                                                        chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Auto-login failed: {e}")));
-                                                    }
-                                                }
+                                                chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Registered and logged in as {username}")));
+                                                crate::post_auth_cloud_resync(profile, &mut state).await;
                                             }
                                             Err(e) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Register failed: {e}")));
@@ -1414,7 +1406,7 @@ pub(crate) async fn run_tui(
     result
 }
 
-/// Left-gutter renderable: a single `┃` bar on the left edge with a
+/// Left-gutter renderable: a solid `█` bar on the left edge with a
 /// top-to-bottom colour gradient. While the cell is still streaming
 /// (`live == true`) the gradient flows downward over time; once
 /// finalized (`live == false`) the gradient freezes in place so there
@@ -1434,14 +1426,14 @@ impl render::renderable::Renderable for LiveFramedCell {
     fn render(&self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
         use ratatui::widgets::{Paragraph, Widget};
 
-        // Need at least 3 cols: `┃` + space + 1 col of content.
+        // Need at least 3 cols: `█` + space + 1 col of content.
         // At width < 3 the inner paragraph would be empty, leaving a
         // lone gutter bar with no body — drop the frame entirely.
         if area.width < 3 || area.height == 0 {
             return;
         }
 
-        // Inner paragraph area: 2 cols reserved for `┃ ` on the left.
+        // Inner paragraph area: 2 cols reserved for `█ ` on the left.
         // `saturating_sub` is defense-in-depth: the `width < 3` guard
         // above already guarantees `width >= 3`, but a future edit
         // that loosens the guard mustn't UB here.
@@ -1468,7 +1460,7 @@ impl render::renderable::Renderable for LiveFramedCell {
         for row in 0..height {
             let (r, g, b) = shimmer::gradient_color_at_t(row, height.max(1), period, t);
             let color = ratatui::style::Color::Rgb(r, g, b);
-            set_char(buf, area.x, area.y + row as u16, '┃', color);
+            set_char(buf, area.x, area.y + row as u16, '█', color);
         }
     }
 
@@ -1514,7 +1506,7 @@ pub(super) fn do_draw(
             let para = Paragraph::new(ratatui::text::Text::from(vec![line]));
             RenderableItem::Owned(Box::new(para))
         }
-        // Active cell: left `┃` gutter with flowing gradient while
+        // Active cell: left `█` gutter with flowing gradient while
         // live, freezing in place on completion.
         ActiveView::Active {
             lines,

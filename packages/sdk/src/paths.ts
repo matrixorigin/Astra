@@ -14,6 +14,8 @@ export const PATH_SESSIONS = '/sessions';
 export const PATH_CHAT = '/chat';
 export const PATH_CHAT_STREAM = '/chat/stream';
 
+export const PATH_MODELS = '/models';
+
 export const PATH_MEMORY_STORE = '/memory/store';
 export const PATH_MEMORY_SEARCH = '/memory/search';
 export const PATH_MEMORY_RETRIEVE = '/memory/retrieve';
@@ -62,6 +64,52 @@ export function sessionCancelPath(sessionId: string): string {
 
 export function sessionActivityPath(sessionId: string): string {
   return `${PATH_SESSIONS}/${encodeURIComponent(sessionId)}/activity`;
+}
+
+export function sessionStatePath(sessionId: string): string {
+  return `${PATH_SESSIONS}/${encodeURIComponent(sessionId)}/state`;
+}
+
+export function sessionTranscriptPath(sessionId: string): string {
+  return `${PATH_SESSIONS}/${encodeURIComponent(sessionId)}/transcript`;
+}
+
+export function sessionArtifactsPath(sessionId: string): string {
+  return `${PATH_SESSIONS}/${encodeURIComponent(sessionId)}/artifacts`;
+}
+
+function isSafePathSegment(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value !== '.' &&
+    value !== '..' &&
+    /^[A-Za-z0-9._-]+$/.test(value)
+  );
+}
+
+/**
+ * Runtime route for the latest artifact of a kind.
+ *
+ * Artifact kind is a path segment in the Rust runtime. To keep the TS SDK and
+ * Rust ThinClient behavior aligned, path-unsafe values return `null` instead
+ * of being percent-encoded into a different segment meaning.
+ */
+export function sessionArtifactLatestPath(
+  sessionId: string,
+  artifactKind: string,
+): string | null {
+  if (!isSafePathSegment(artifactKind)) return null;
+  return `${PATH_SESSIONS}/${encodeURIComponent(sessionId)}/artifacts/latest/${artifactKind}`;
+}
+
+export function sessionArtifactPath(sessionId: string, artifactId: string): string | null {
+  if (!isSafePathSegment(artifactId)) return null;
+  return `${PATH_SESSIONS}/${encodeURIComponent(sessionId)}/artifacts/${artifactId}`;
+}
+
+export function sessionArtifactDownloadPath(sessionId: string, artifactId: string): string | null {
+  if (!isSafePathSegment(artifactId)) return null;
+  return `${PATH_SESSIONS}/${encodeURIComponent(sessionId)}/artifacts/${artifactId}/download`;
 }
 
 export function chatSessionReflectPath(sessionId: string): string {
@@ -118,6 +166,14 @@ export function skillPath(skillId: string): string {
 
 export function skillUnpublishPath(skillName: string): string {
   return `${PATH_SKILLS}/${encodeURIComponent(skillName)}/unpublish`;
+}
+
+export function modelPath(modelName: string): string {
+  return `${PATH_MODELS}/${encodeURIComponent(modelName)}`;
+}
+
+export function modelCheckPath(modelName: string): string {
+  return `${PATH_MODELS}/${encodeURIComponent(modelName)}/check`;
 }
 
 /** Build `?a=1&b=2` from plain values (skips undefined / null). */

@@ -33,9 +33,12 @@
 
 use std::sync::Arc;
 
-use astra_services::runs::{DurableRunRecord, RunStateStore};
+use astra_services::{
+    DatabaseStateProjectionStore,
+    runs::{DurableRunRecord, RunStateStore},
+};
 
-use astra_core::STATUS_RUNNING;
+use astra_core::{STATUS_RUNNING, STATUS_WAITING};
 
 /// Durable run execution engine.
 ///
@@ -48,12 +51,29 @@ use astra_core::STATUS_RUNNING;
 #[derive(Clone)]
 pub struct RunEngine {
     store: Arc<dyn RunStateStore>,
+    projection_store: Option<Arc<DatabaseStateProjectionStore>>,
 }
 
 impl RunEngine {
     /// Create a new engine backed by the given store.
     pub fn new(store: Arc<dyn RunStateStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            projection_store: None,
+        }
+    }
+
+    /// Attach the database projection store used by web-agent session state.
+    ///
+    /// Delegation paths call `RunEngine::start_run_ext` and
+    /// `RunEngine::persist_status`; wiring here keeps projection persistence on
+    /// the production run lifecycle instead of isolated test helpers.
+    pub fn with_projection_store(
+        mut self,
+        projection_store: Arc<DatabaseStateProjectionStore>,
+    ) -> Self {
+        self.projection_store = Some(projection_store);
+        self
     }
 
     /// Create a durable run record in the store.
@@ -82,17 +102,47 @@ impl RunEngine {
         retry_of: Option<&str>,
     ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
+        let (root_run_id, ancestor_path, depth) = if let Some(parent_run_id) = parent_run_id {
+            match self.store.load_run(parent_run_id).await? {
+                Some(parent) => {
+                    let parent_root = parent.root_run_id.unwrap_or(parent.run_id.clone());
+                    let parent_path = parent.ancestor_path.unwrap_or(parent.run_id);
+                    (
+                        Some(parent_root),
+                        Some(format!("{parent_path}/{run_id}")),
+                        parent.depth.saturating_add(1),
+                    )
+                }
+                None => (
+                    Some(parent_run_id.to_string()),
+                    Some(format!("{parent_run_id}/{run_id}")),
+                    1,
+                ),
+            }
+        } else {
+            (Some(run_id.to_string()), Some(run_id.to_string()), 0)
+        };
         let record = DurableRunRecord {
             run_id: run_id.to_string(),
             user_id: user_id.to_string(),
             session_id: session_id.to_string(),
             parent_run_id: parent_run_id.map(ToString::to_string),
+            root_run_id,
+            ancestor_path,
+            depth,
             delegation_id: delegation_id.map(ToString::to_string),
             agent_id: agent_id.map(ToString::to_string),
             retry_of: retry_of.map(ToString::to_string),
+            retry_scope: Some("node".to_string()),
             status: STATUS_RUNNING.to_string(),
             waiting_for: None,
+            owner_pod_id: None,
+            owner_lease_expires_at: None,
+            run_generation: 0,
+            last_event_idx: -1,
+            checkpoint_version: None,
             checkpoint_json: None,
+            error_code: None,
             error_message: None,
             retry_count: 0,
             total_prompt_tokens: 0,
@@ -102,7 +152,10 @@ impl RunEngine {
             created_at: now.clone(),
             updated_at: now,
         };
-        self.store.insert_run(record).await
+        self.store.insert_run(record).await?;
+        self.project_delegation_run_if_needed(run_id, STATUS_RUNNING, None)
+            .await?;
+        Ok(())
     }
 
     /// Persist a status change to the durable store.
@@ -113,9 +166,44 @@ impl RunEngine {
         waiting_for: Option<&str>,
         error_message: Option<&str>,
     ) -> Result<bool, String> {
-        self.store
+        let updated = self
+            .store
             .update_run_status(run_id, status, waiting_for, error_message)
+            .await?;
+        if updated {
+            let summary = error_message.or(waiting_for);
+            self.project_delegation_run_if_needed(run_id, status, summary)
+                .await?;
+        }
+        Ok(updated)
+    }
+
+    async fn project_delegation_run_if_needed(
+        &self,
+        run_id: &str,
+        status: &str,
+        last_summary_text: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(projection_store) = self.projection_store.as_ref() else {
+            return Ok(());
+        };
+        let Some(run) = self.store.load_run(run_id).await? else {
+            return Ok(());
+        };
+        if run.parent_run_id.is_none() || run.delegation_id.is_none() {
+            return Ok(());
+        }
+        projection_store
+            .upsert_delegation_projection_for_run(
+                run_id,
+                status,
+                run.agent_id.as_deref(),
+                last_summary_text,
+            )
             .await
+            .map_err(|error| {
+                format!("state projection update failed for delegated run {run_id}: {error}")
+            })
     }
 
     /// Persist token/tool usage counters.
@@ -175,37 +263,76 @@ impl RunEngine {
     /// Recover active runs after a crash/restart.
     ///
     /// - `waiting` runs: returned for the caller to resume.
-    /// - `running` runs: were in-flight when the process died; marked `failed`
-    ///   with reason "recovered from crash" and returned so callers can notify
-    ///   subscribers.
+    /// - `running` runs with graceful checkpoint_v1: moved to `waiting` and
+    ///   annotated with `run_resumed_after_restart` for exactly-once replay.
+    /// - other `running` runs: were in-flight when the process died; marked
+    ///   `failed` with reason "recovered from crash".
     pub async fn recover_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         let waiting = self.store.find_waiting_runs().await?;
         let running = self.store.find_running_runs().await?;
 
-        // Mark crashed running runs as failed.
-        for run in &running {
-            if let Err(e) = self
-                .store
-                .update_run_status(
-                    &run.run_id,
-                    astra_core::STATUS_FAILED,
-                    None,
-                    Some("recovered from crash"),
-                )
-                .await
-            {
-                tracing::warn!(
-                    target: "astra_runtime::run_engine",
-                    run_id = %run.run_id,
-                    error = %e,
-                    "failed to mark crashed run as failed during recovery"
-                );
+        let mut recovered_running = Vec::with_capacity(running.len());
+        for mut run in running {
+            if has_graceful_checkpoint_v1(&run) {
+                if let Err(e) = self
+                    .store
+                    .update_run_status(&run.run_id, STATUS_WAITING, Some("restart_resume"), None)
+                    .await
+                {
+                    tracing::warn!(
+                        target: "astra_runtime::run_engine",
+                        run_id = %run.run_id,
+                        error = %e,
+                        "failed to mark graceful run waiting during recovery"
+                    );
+                }
+                if let Err(e) = self
+                    .store
+                    .append_event(
+                        &run.run_id,
+                        serde_json::json!({
+                            "event_type": "run_resumed_after_restart",
+                            "data": {"checkpoint_version": "checkpoint_v1"}
+                        }),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target: "astra_runtime::run_engine",
+                        run_id = %run.run_id,
+                        error = %e,
+                        "failed to append graceful restart event"
+                    );
+                }
+                run.status = STATUS_WAITING.to_string();
+                run.waiting_for = Some("restart_resume".to_string());
+            } else {
+                if let Err(e) = self
+                    .store
+                    .update_run_status(
+                        &run.run_id,
+                        astra_core::STATUS_FAILED,
+                        None,
+                        Some("recovered from crash"),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target: "astra_runtime::run_engine",
+                        run_id = %run.run_id,
+                        error = %e,
+                        "failed to mark crashed run as failed during recovery"
+                    );
+                }
+                run.status = astra_core::STATUS_FAILED.to_string();
+                run.error_message = Some("recovered from crash".to_string());
             }
+            recovered_running.push(run);
         }
 
-        // Return all: waiting (to resume) + running (now failed, for notification).
+        // Return all: waiting (to resume) + recovered running runs.
         let mut all = waiting;
-        all.extend(running);
+        all.extend(recovered_running);
         Ok(all)
     }
 
@@ -223,6 +350,19 @@ impl RunEngine {
     pub fn store(&self) -> &Arc<dyn RunStateStore> {
         &self.store
     }
+}
+
+fn has_graceful_checkpoint_v1(run: &DurableRunRecord) -> bool {
+    if run.checkpoint_version.as_deref() != Some("checkpoint_v1") {
+        return false;
+    }
+    let Some(checkpoint_json) = run.checkpoint_json.as_deref() else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(checkpoint_json)
+        .ok()
+        .and_then(|value| value.get("graceful").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

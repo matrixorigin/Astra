@@ -185,6 +185,9 @@ pub struct RetrievedMemoryRef {
     pub memory_id: String,
     pub memory_type: String,
     pub score: Option<f64>,
+    /// First ~200 chars of the memory content for diagnostics.
+    #[serde(default)]
+    pub content_preview: Option<String>,
 }
 
 /// One compaction-time injection event, post-hoc.
