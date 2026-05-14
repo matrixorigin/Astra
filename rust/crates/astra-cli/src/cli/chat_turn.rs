@@ -2833,12 +2833,28 @@ where
         _ = tokio::signal::ctrl_c() => {
             // User pressed ^C twice — they want OUT now, even at the cost
             // of partial-data loss. Suggest them, but don't wait further.
+            tracing::warn!(
+                target: "astra::cli::cancel",
+                source,
+                "user force-exited via second Ctrl+C; partial assistant text + tool records discarded"
+            );
             eprintln!("{}", "  Force-exiting (partial response lost).".dim());
             fabricate_user_cancel_failure(&format!(
                 "user_interrupted ({source}, force-exit)"
             ))
         }
         _ = tokio::time::sleep(timeout) => {
+            // Wedged runtime — the cancel token was flipped but the loop
+            // didn't unwind in time. Surface a diagnostic line: this is the
+            // only signal a user gets that something is stuck below the
+            // turn boundary (e.g. an unkillable Bash, an MCP call without
+            // cancel propagation).
+            tracing::warn!(
+                target: "astra::cli::cancel",
+                source,
+                drain_secs = timeout.as_secs(),
+                "agentic loop drain timed out after cancel; runtime may be wedged in a tool call"
+            );
             fabricate_user_cancel_failure(&format!(
                 "user_interrupted ({source}, drain timed out after {}s)",
                 timeout.as_secs()
@@ -2916,6 +2932,20 @@ async fn apply_user_cancelled_turn(
             // already told the user. report_turn_failure still writes the
             // journal + history.
             report_turn_failure(state, profile, line, &failure, turn_start, &mut SilentUi);
+
+            // `report_turn_failure` only pushes onto history when
+            // `partial_text` is non-empty. For very-early cancels (no token
+            // streamed yet) we still need the user line in history, otherwise
+            // the next turn's prompt assembly anchors two turns back —
+            // exactly the regression this whole change exists to fix. Push a
+            // placeholder so `history_as_messages` produces a coherent
+            // sequence.
+            if failure.partial.partial_text.is_empty() {
+                state.history.push((
+                    line.to_string(),
+                    "[Interrupted by user before any response was produced]".to_string(),
+                ));
+            }
         }
     }
 }
@@ -4776,6 +4806,14 @@ mod tests {
     /// `Ok(StreamResult { full_text: <partial>, interruption: Some(..), ... })`
     /// — NOT Err. Without this routing the partial text + user line would
     /// have been dropped on the floor.
+    ///
+    /// Marked `#[serial_test::serial]` because the Ok path runs through
+    /// `apply_turn_success_async`, which mutates the per-process sessions
+    /// directory and shares lock state with other `apply_turn_success_*`
+    /// tests (see `apply_turn_success_sets_prompt_hint_for_followup` for
+    /// the same pattern). The Err-branch tests below skip this annotation
+    /// because `report_turn_failure` only writes the per-test journal
+    /// file, which is already isolated by `isolated_sessions_dir()`.
     #[tokio::test]
     #[serial_test::serial]
     async fn user_cancelled_turn_with_ok_outcome_persists_history_and_flags_interrupted() {
@@ -4832,12 +4870,16 @@ mod tests {
     }
 
     /// Regression: even when the cancelled turn produced no partial text
-    /// (user pressed ^C very early), the user's line must still be visible
-    /// in some persistent form. Today `report_turn_failure` only pushes
-    /// onto history when `partial_text` is non-empty, so the user line is
-    /// preserved through the journal, and `last_turn_interrupted` stays set.
+    /// (user pressed ^C before the first token), the user line must still
+    /// reach `state.history` — otherwise the next turn's prompt assembly
+    /// (which reads `history`, not the journal) anchors two turns back,
+    /// the same regression `partial_text`-non-empty case fixes.
+    ///
+    /// `apply_user_cancelled_turn` pushes a placeholder
+    /// `[Interrupted by user before any response was produced]` so
+    /// `history_as_messages` produces a coherent user/assistant alternation.
     #[tokio::test]
-    async fn user_cancelled_turn_without_partial_text_still_journals_and_flags() {
+    async fn user_cancelled_turn_without_partial_text_still_pushes_user_line_to_history() {
         let (_tmp, _g) = isolated_sessions_dir();
         let sid = format!("test-user-cancel-empty-{}", uuid::Uuid::new_v4());
         let mut state = SessionState {
@@ -4862,12 +4904,18 @@ mod tests {
         )
         .await;
 
-        // No partial text → history stays empty (existing report_turn_failure
-        // semantics), but the user-line still reaches the journal so it's
-        // recoverable via /turn / /debug.
-        assert_eq!(state.history.len(), 0);
+        // History must contain the user line (with a placeholder assistant
+        // entry) so the next turn's prompt sees the cancelled exchange.
+        assert_eq!(state.history.len(), 1, "user line must be pushed to history");
+        assert_eq!(state.history[0].0, "what's in run_lifecycle.rs");
+        assert!(
+            state.history[0].1.contains("Interrupted by user before any response"),
+            "history should carry an explicit no-response placeholder: {:?}",
+            state.history[0].1
+        );
         assert!(state.last_turn_interrupted);
 
+        // Journal also records the cancel for /turn / /debug audit trails.
         let events = session_journal::read_journal(&sid).unwrap();
         let event = events
             .iter()
