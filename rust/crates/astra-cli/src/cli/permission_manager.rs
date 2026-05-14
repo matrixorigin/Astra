@@ -646,7 +646,7 @@ impl PermissionSettings {
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&lock_path)
+            .open(lock_path)
             .map_err(|e| ModifyError::Io {
                 stage: "open lockfile",
                 source: e,

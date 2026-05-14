@@ -357,7 +357,6 @@ impl PendingApproval {
             workspace_untrusted: self.workspace_untrusted,
             is_compound_command: self.is_compound_command,
             has_dynamic_eval: self.has_dynamic_eval,
-            ..Default::default()
         }
     }
 
@@ -606,8 +605,7 @@ impl ApprovalQueue {
             if astra_turn_core::permission_match_target::is_valid_custom_prefix(
                 &proposed,
                 &entry.custom_match_source,
-            )
-            {
+            ) {
                 *input = proposed;
                 return true;
             }
