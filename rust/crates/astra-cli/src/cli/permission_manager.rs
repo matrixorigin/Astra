@@ -1638,6 +1638,22 @@ impl PermissionManager {
             detail_lines.push(Self::format_prompt_detail(&compensation));
         }
         let detail = Some(detail_lines.join("\n"));
+
+        // Issue #326 P3 / scenario #8: redact secret-looking
+        // content from the detail block before it lands in the
+        // approval card. The redactor is a no-op for benign
+        // detail; for sensitive-path tools (e.g. write_file
+        // .env) it collapses the body to "<N bytes redacted>"
+        // plus the gitignore reminder. We pass the path arg
+        // when present so the full-body collapse applies; for
+        // path-less detail the line-level redactor still runs.
+        let detail = detail.map(|d| {
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str());
+            astra_turn_core::permission_redact::redact_for_approval_display(&d, path).display
+        });
+
         (header, detail)
     }
 
