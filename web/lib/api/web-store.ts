@@ -55,6 +55,7 @@ type Store = {
 
 const AGENT_RESPONSE_TIMEOUT_MS = 30_000;
 const AGENT_STREAM_TIMEOUT_MS = 180_000;
+const SESSION_SYNC_PAGE_SIZE = 200;
 const LEGACY_LOCAL_CHAT_IDS = new Set(['chat-web-agent-notes']);
 
 type StreamResult = {
@@ -795,6 +796,51 @@ function chatRecordFromBackendSession(session: RuntimeSessionResponse, existing?
   };
 }
 
+async function listAllBackendSessions(
+  client: WebRuntimeClient,
+  ownerUserId: string,
+): Promise<RuntimeSessionResponse[]> {
+  const sessions: RuntimeSessionResponse[] = [];
+  let offset = 0;
+
+  for (;;) {
+    let parsed: RuntimeSessionListResponse;
+    try {
+      parsed = await client.sdk.listRuntimeSessions({
+        limit: SESSION_SYNC_PAGE_SIZE,
+        offset,
+      });
+    } catch (error) {
+      throw runtimeOperationError(
+        `Cannot sync persisted sessions for user ${ownerUserId}`,
+        error,
+      );
+    }
+
+    const page = Array.isArray(parsed.sessions) ? parsed.sessions : [];
+    sessions.push(...page);
+
+    const responseLimit = typeof parsed.limit === 'number' && parsed.limit > 0
+      ? parsed.limit
+      : SESSION_SYNC_PAGE_SIZE;
+    const total = typeof parsed.total === 'number' && Number.isFinite(parsed.total)
+      ? parsed.total
+      : null;
+
+    if (
+      page.length === 0
+      || page.length < responseLimit
+      || (total !== null && offset + page.length >= total)
+    ) {
+      break;
+    }
+
+    offset += page.length;
+  }
+
+  return sessions;
+}
+
 async function syncBackendSessions(ownerUserId: string): Promise<void> {
   const client = await getRuntimeClient({
     auth: 'required',
@@ -804,19 +850,10 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
     return;
   }
 
-  const limit = 200;
-  let parsed: RuntimeSessionListResponse;
-  try {
-    parsed = await client.sdk.listRuntimeSessions({ limit, offset: 0 });
-  } catch (error) {
-    throw runtimeOperationError(
-      `Cannot sync persisted sessions for user ${ownerUserId}`,
-      error,
-    );
-  }
-  const sessions = Array.isArray(parsed.sessions) ? parsed.sessions : [];
+  const sessions = await listAllBackendSessions(client, ownerUserId);
   const store = getStore(ownerUserId);
   const byId = new Map(store.chats.map((chat) => [chat.id, chat]));
+  const backendChatIds = new Set<string>();
 
   for (const session of sessions) {
     const existing = session.session_id ? byId.get(session.session_id) : undefined;
@@ -824,6 +861,7 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
     if (!record) {
       continue;
     }
+    backendChatIds.add(record.id);
     const index = store.chats.findIndex((chat) => chat.id === record.id);
     if (index >= 0) {
       store.chats[index] = record;
@@ -832,6 +870,12 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
     }
   }
 
+  // The runtime session table is the source of truth. Once a full paginated
+  // sync succeeds, remove local web-chat shells whose persisted runtime session
+  // disappeared (for example after a developer resets the MatrixOne database).
+  // Keeping those shells lets the UI send messages to non-existent sessions and
+  // turns a clean 404 into a fake assistant error message.
+  store.chats = store.chats.filter((chat) => backendChatIds.has(chat.id));
   store.chats.sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt));
 }
 

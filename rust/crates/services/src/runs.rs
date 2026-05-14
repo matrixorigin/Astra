@@ -1720,7 +1720,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             "message": data.get("error").cloned().unwrap_or(serde_json::Value::String("Unknown error".to_string())),
             "code": "RUN_ERROR",
         }),
-        "approval_request" => {
+        "approval_request" | "approval_required" => {
             let mut out = serde_json::json!({ "type": "approval_required" });
             if let Some(obj) = out.as_object_mut() {
                 for (k, v) in &data {
@@ -2046,6 +2046,12 @@ mod tests {
         ));
         assert_eq!(approval["type"], "approval_required");
         assert_eq!(approval["approval_id"], "approval-1");
+        let canonical_approval = transform_run_event_for_client(make_event(
+            "approval_required",
+            json!({"approval_id": "approval-2"}),
+        ));
+        assert_eq!(canonical_approval["type"], "approval_required");
+        assert_eq!(canonical_approval["approval_id"], "approval-2");
 
         let input =
             transform_run_event_for_client(make_event("user_input", json!({"text": "approved"})));

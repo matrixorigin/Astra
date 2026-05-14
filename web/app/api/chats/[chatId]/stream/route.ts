@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { PATH_CHAT_STREAM, type RuntimeArtifactResponse } from '@astra/sdk';
+import { AstraApiError, PATH_CHAT_STREAM, type RuntimeArtifactResponse } from '@astra/sdk';
 import { requireRuntimeUser } from '@/lib/api/auth-guard';
 import {
   beginStreamingMessage,
@@ -195,6 +195,10 @@ async function readErrorDetail(response: Response) {
   return readRuntimeErrorDetail(response);
 }
 
+function isRuntimeSessionNotFound(error: unknown) {
+  return error instanceof AstraApiError && error.status === 404;
+}
+
 export async function POST(
   request: NextRequest,
   context: { params: Promise<{ chatId: string }> },
@@ -218,11 +222,6 @@ export async function POST(
     return NextResponse.json({ error: 'archived chat is read-only' }, { status: 409 });
   }
 
-  const started = beginStreamingMessage(ownerUserId, chatId, body);
-  if (!started) {
-    return NextResponse.json({ error: 'chat not found' }, { status: 404 });
-  }
-
   let runtime: WebRuntimeClient;
   try {
     runtime = await requireRuntimeClient({
@@ -230,16 +229,22 @@ export async function POST(
       operation: 'stream web chat turn',
     });
   } catch {
-    updateStreamingAssistantMessage(ownerUserId, chatId, started.assistantMessage.id, {
-      content: 'Runtime authentication is required.',
-      status: 'failed',
-    });
     return NextResponse.json({ error: 'AUTH_REQUIRED' }, { status: 401 });
+  }
+
+  try {
+    await runtime.sdk.getRuntimeSession(chatId);
+  } catch (error) {
+    if (isRuntimeSessionNotFound(error)) {
+      return NextResponse.json({ error: `session not found: ${chatId}` }, { status: 404 });
+    }
+    const message = error instanceof Error ? error.message : 'Failed to verify runtime session.';
+    return NextResponse.json({ error: message }, { status: 502 });
   }
 
   const model = await resolveBackendModelName(runtime, body.options?.model);
   const activeSkills = normalizedActiveSkills(body.options?.activeSkills);
-  const sessionId = started.sessionId;
+  const sessionId = chatId;
   const knownArtifactIds = new Set<string>();
   try {
     const existingArtifacts = await fetchSessionArtifacts(runtime, sessionId);
@@ -248,11 +253,12 @@ export async function POST(
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to load artifacts.';
-    updateStreamingAssistantMessage(ownerUserId, chatId, started.assistantMessage.id, {
-      content: message,
-      status: 'failed',
-    });
     return NextResponse.json({ error: message }, { status: 502 });
+  }
+
+  const started = beginStreamingMessage(ownerUserId, chatId, body);
+  if (!started) {
+    return NextResponse.json({ error: 'chat not found' }, { status: 404 });
   }
   const backendResponse = await runtime.fetchResponse(PATH_CHAT_STREAM, {
     method: 'POST',

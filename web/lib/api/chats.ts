@@ -1,4 +1,5 @@
 import { requestJson, toQuery } from '@/lib/api/request';
+import { WebApiError } from '@/lib/api/errors';
 import type {
   ChatDetail,
   ChatMessage,
@@ -277,7 +278,7 @@ export async function streamChatMessage(
     } catch {
       // Preserve the HTTP status.
     }
-    throw new Error(detail);
+    throw new WebApiError(response.status, detail);
   }
 
   if (!response.body) {

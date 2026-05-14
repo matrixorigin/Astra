@@ -767,7 +767,7 @@ pub async fn ensure_core_schema(
             content LONGTEXT NOT NULL,
             source_event_id VARCHAR(128) NULL,
             source_event_idx BIGINT NULL,
-            content_hash VARCHAR(64) NOT NULL,
+            content_hash VARCHAR(128) NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (session_id, item_seq),
             INDEX idx_transcript_user_session_seq (user_id, session_id, item_seq),
@@ -775,6 +775,15 @@ pub async fn ensure_core_schema(
         )",
     )
     .execute(&pool)
+    .await?;
+    widen_varchar_if_shorter(
+        &pool,
+        &settings.database,
+        "session_transcript_items",
+        "content_hash",
+        128,
+        "ALTER TABLE session_transcript_items MODIFY COLUMN content_hash VARCHAR(128) NOT NULL",
+    )
     .await?;
 
     query(

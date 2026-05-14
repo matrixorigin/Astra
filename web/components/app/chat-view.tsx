@@ -13,7 +13,7 @@ import { IconButton } from '@/components/ui/icon-button';
 import { useChatLifecycleActions } from '@/hooks/use-chat-lifecycle-actions';
 import { subscribeChatLifecycleChange } from '@/lib/chat-lifecycle-events';
 import { getChat, streamChatMessage, updateChatModel } from '@/lib/api/chats';
-import { isAuthRequiredError } from '@/lib/api/errors';
+import { isAuthRequiredError, isNotFoundError } from '@/lib/api/errors';
 import type { ChatDetail, ChatMessage, ComposerOptions } from '@/lib/api/types';
 
 export function ChatView({ initial }: { initial: ChatDetail }) {
@@ -117,6 +117,16 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         router.push(`/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`);
         return;
       }
+      if (isNotFoundError(error)) {
+        setDetail((current) => ({
+          ...current,
+          messages: current.messages.filter((message) => (
+            message.id !== assistantId && (!appendUser || message.id !== userMessage.id)
+          )),
+        }));
+        router.replace(chatListHref);
+        return;
+      }
       const message = error instanceof Error ? error.message : 'Astra stream failed.';
       patchAssistant({
         content: `I could not reach the Astra runtime from the web UI. (${message})`,
@@ -125,7 +135,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     } finally {
       setSending(false);
     }
-  }, [detail.chat.archivedAt, detail.chat.id, router]);
+  }, [chatListHref, detail.chat.archivedAt, detail.chat.id, router]);
 
   useEffect(() => {
     if (pinnedRef.current) {

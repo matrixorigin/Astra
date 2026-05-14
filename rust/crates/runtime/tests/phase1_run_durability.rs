@@ -12,7 +12,7 @@ use astra_services::runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DatabaseRunStateStore,
     DurableRunRecord, RunInputData, RunInputRecord, RunLifecycleService, RunListRecord,
     RunMutationRecord, RunStateStore, RunStatusRecord, SSE_HEARTBEAT_INTERVAL_SECS,
-    ToolOutputBatchItem,
+    ToolOutputBatchItem, transform_run_event_for_client,
 };
 use async_trait::async_trait;
 use axum::{
@@ -859,7 +859,13 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
                 "version": "checkpoint_v1",
                 "graceful": true,
                 "last_batch_id": "batch-17",
-                "extra": {"partial_progress": {"step_index": 17, "total_steps": 17}}
+                "extra": {
+                    "partial_progress": {
+                        "step_index": 17,
+                        "total_steps": 17,
+                        "resumable_marker": "after-reconnect-17"
+                    }
+                }
             })
             .to_string(),
         )
@@ -958,9 +964,20 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
                 .unwrap()
         })
         .collect::<Vec<_>>();
+    let client_visible_indexes = loaded
+        .events
+        .iter()
+        .filter_map(|event| {
+            let transformed = transform_run_event_for_client(event.clone());
+            if transformed.is_null() {
+                return None;
+            }
+            event.get("index").and_then(serde_json::Value::as_i64)
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        client_indexes, indexes,
-        "client-side HTTP SSE replay should receive every event exactly once"
+        client_indexes, client_visible_indexes,
+        "client-side HTTP SSE replay should receive every externally visible event exactly once"
     );
     assert_eq!(
         indexes,

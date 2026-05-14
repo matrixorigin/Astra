@@ -2,7 +2,7 @@ jest.mock('@/lib/runtime-config', () => ({
   getRuntimeConfig: jest.fn(),
 }));
 
-import { createChatWithMessage, listChats } from '@/lib/api/web-store';
+import { createChatWithMessage, getChatHydrated, listChats } from '@/lib/api/web-store';
 import { getRuntimeConfig } from '@/lib/runtime-config';
 
 const mockGetRuntimeConfig = getRuntimeConfig as jest.MockedFunction<typeof getRuntimeConfig>;
@@ -15,6 +15,29 @@ function jsonResponse(body: unknown, status = 200) {
     json: jest.fn().mockResolvedValue(body),
     text: jest.fn().mockResolvedValue(JSON.stringify(body)),
     headers: new Headers({ 'content-type': 'application/json' }),
+  };
+}
+
+function runtimeSession(sessionId: string, userId: string, title: string) {
+  return {
+    session_id: sessionId,
+    user_id: userId,
+    title,
+    metadata: {
+      source: 'web_v1',
+    },
+    status: 'active',
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function runtimeSessionList(sessions: unknown[]) {
+  return {
+    sessions,
+    total: sessions.length,
+    limit: 200,
+    offset: 0,
   };
 }
 
@@ -45,7 +68,14 @@ describe('web store user scoping', () => {
   });
 
   it('does not expose one user chat list to another authenticated user', async () => {
+    const fetchMock = globalThis.fetch as jest.Mock;
     const uniqueMessage = `private scoped prompt ${crypto.randomUUID()}`;
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(runtimeSession('session-user-a', 'user-a', 'test'), 201))
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([
+        runtimeSession('session-user-a', 'user-a', 'test'),
+      ])))
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([])));
 
     const result = await createChatWithMessage('user-a', {
       message: uniqueMessage,
@@ -61,5 +91,33 @@ describe('web store user scoping', () => {
     expect(result.chatId).toBe('session-user-a');
     expect((await listChats('user-a', { q: uniqueMessage })).items).toHaveLength(1);
     expect((await listChats('user-b', { q: uniqueMessage })).items).toHaveLength(0);
+  });
+
+  it('removes stale chat shells after a successful persisted session sync', async () => {
+    const fetchMock = globalThis.fetch as jest.Mock;
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(runtimeSession('session-stale-after-reset', 'user-a', 'stale'), 201))
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([
+        runtimeSession('session-stale-after-reset', 'user-a', 'stale'),
+      ])))
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([])))
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([])));
+
+    const result = await createChatWithMessage('user-a', {
+      message: 'this chat will disappear remotely',
+      model: 'sonnet-4.6-adaptive',
+      options: {
+        webSearch: false,
+        thinking: true,
+        activeSkills: [],
+      },
+      projectId: null,
+    });
+
+    expect(result.chatId).toBe('session-stale-after-reset');
+    expect((await listChats('user-a', { q: 'disappear remotely' })).items).toHaveLength(1);
+
+    await expect(getChatHydrated('user-a', result.chatId)).resolves.toBeNull();
+    expect((await listChats('user-a', { q: 'disappear remotely' })).items).toHaveLength(0);
   });
 });
