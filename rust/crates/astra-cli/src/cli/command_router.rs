@@ -442,9 +442,6 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
                 PermissionMode::Prompt => PermissionMode::Auto,
                 PermissionMode::Auto => PermissionMode::Deny,
                 PermissionMode::Deny => PermissionMode::Prompt,
-                // BypassSafety doesn't participate in the Shift+Tab cycle
-                // (issue #326 P0 / R1 Minor 5). Cycling out returns to Prompt.
-                PermissionMode::BypassSafety => PermissionMode::Prompt,
             };
             state.perm_manager.set_mode(next);
             eprintln!(
@@ -1865,8 +1862,7 @@ pub(super) async fn run_print_mode(
     // `auto_approve = true` (= PermissionMode::Auto) here. The
     // bypass-immune deny rules (sensitive paths, git-destructive,
     // execute hard-deny, sandbox circuit breaker) still fire in Auto
-    // mode, so this is **not** a YOLO bypass; it's just "don't pop
-    // a non-existent prompt". If a tool genuinely requires
+    // mode; this only avoids popping a non-existent prompt. If a tool genuinely requires
     // NeedApproval (e.g. compensation prompts after a denial), the
     // gate fans out to silent-fail-closed in stream_render.rs (line
     // ~1983), surfacing the deny reason to the LLM instead of hanging.

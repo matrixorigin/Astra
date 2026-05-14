@@ -435,9 +435,6 @@ Set permission mode for tool execution.
 /allow rules     # Show rules
 ```
 
-### `/yolo`
-Alias for `/allow auto` (auto-approve all tools).
-
 ### `/instructions [subcommand]`
 Project instructions from `.astra/instructions.md`.
 

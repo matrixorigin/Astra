@@ -204,15 +204,8 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         }
 
         // ── Allow / permission mode ─────────────────────────────────
-        "/allow" | "/yolo" => {
+        "/allow" => {
             use crate::permission_manager::PermissionMode;
-            if resolved == "/yolo" {
-                ctx.state.perm_manager.set_mode(PermissionMode::Auto);
-                ctx.show_info(
-                    "⚡ YOLO mode! All tools auto-approved. Use /allow prompt to restore.".into(),
-                );
-                return SlashResult::Handled;
-            }
             match args {
                 "" => {
                     let current = ctx.state.perm_manager.mode();

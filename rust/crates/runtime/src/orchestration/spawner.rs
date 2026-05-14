@@ -1384,7 +1384,6 @@ fn build_permission_summary(context: &SpawnContext) -> PermissionSummary {
             super::permission_sync::PermissionMode::Auto => "auto".to_string(),
             super::permission_sync::PermissionMode::Prompt => "prompt".to_string(),
             super::permission_sync::PermissionMode::Deny => "deny".to_string(),
-            super::permission_sync::PermissionMode::BypassSafety => "bypass-safety".to_string(),
         };
         summary.allow_rules = inherited.allow_rules.len() as u32;
         summary.deny_rules = inherited.deny_rules.len() as u32;

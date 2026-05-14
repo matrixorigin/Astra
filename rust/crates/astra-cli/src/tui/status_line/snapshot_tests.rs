@@ -63,15 +63,6 @@ fn snapshot_deny_mode() {
 }
 
 #[test]
-fn snapshot_bypass_mode() {
-    let ctx = StatusContext {
-        permission_mode: PermissionMode::Bypass,
-        ..base_ctx()
-    };
-    insta::assert_snapshot!("status_bypass_mode_80", render_ctx(&ctx, 80));
-}
-
-#[test]
 fn snapshot_high_token_usage_with_cost() {
     let ctx = StatusContext {
         token_budget: Some((92_000, 100_000)),

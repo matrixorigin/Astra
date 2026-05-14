@@ -17,7 +17,6 @@ pub(crate) enum PermissionMode {
     Ask,
     Auto,
     Deny,
-    Bypass,
 }
 
 impl PermissionMode {
@@ -26,7 +25,6 @@ impl PermissionMode {
             Self::Ask => "",
             Self::Auto => "⚡auto",
             Self::Deny => "⚡deny",
-            Self::Bypass => "⚡bypass",
         }
     }
 }
@@ -120,12 +118,6 @@ impl StatusLine {
             PermissionMode::Deny => {
                 out.left.push(Segment::styled(
                     PermissionMode::Deny.chip_text(),
-                    Style::default().fg(Color::Red),
-                ));
-            }
-            PermissionMode::Bypass => {
-                out.left.push(Segment::styled(
-                    PermissionMode::Bypass.chip_text(),
                     Style::default().fg(Color::Red),
                 ));
             }

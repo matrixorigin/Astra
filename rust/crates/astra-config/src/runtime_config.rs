@@ -2771,7 +2771,7 @@ mod tests {
         let toml = r#"
             version = "1.0"
             [safety]
-            trust_mode = "yolo"
+            trust_mode = "unsafe"
         "#;
         let result: Result<RuntimeConfig, _> = toml::from_str(toml);
         assert!(result.is_err(), "unknown trust_mode should fail to parse");

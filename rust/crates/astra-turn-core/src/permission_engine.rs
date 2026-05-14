@@ -555,7 +555,7 @@ pub fn evaluate_permission(
 
     if let Some(inner_tool) = tool_name.strip_prefix("sandbox_expand:") {
         return match ctx.mode() {
-            PermissionMode::Auto | PermissionMode::BypassSafety => {
+            PermissionMode::Auto => {
                 let decision = HardDecision::Allow;
                 push_matched(
                     &mut trace,
@@ -722,22 +722,6 @@ pub fn evaluate_permission(
                     risk_tags,
                 )
             }
-            PermissionMode::BypassSafety => {
-                let decision = HardDecision::Allow;
-                push_matched(
-                    &mut trace,
-                    EvaluationStep::ExplicitApproval,
-                    &decision,
-                    "explicit approval relaxed by mode",
-                );
-                envelope(
-                    decision,
-                    DecisionSource::ExplicitApprovalGate { reason },
-                    trace,
-                    will_save,
-                    risk_tags,
-                )
-            }
             PermissionMode::Prompt => {
                 let decision = HardDecision::NeedExternal {
                     prompt: approval_prompt(tool_name, args, reason.clone(), risk_tags.clone()),
@@ -791,10 +775,8 @@ pub fn evaluate_permission(
 
     let mode = ctx.mode();
     let decision = match mode {
-        PermissionMode::Auto | PermissionMode::BypassSafety => {
-            if mode == PermissionMode::Auto
-                && !ctx.inherited.is_tool_allowed_by_allowlist(tool_name)
-            {
+        PermissionMode::Auto => {
+            if !ctx.inherited.is_tool_allowed_by_allowlist(tool_name) {
                 HardDecision::Deny {
                     reason: format!("Tool '{tool_name}' not in allowed tools list"),
                 }
@@ -1114,7 +1096,7 @@ mod tests {
 
     /// Catastrophic-command checks (the `rm -rf /` circuit breaker)
     /// run inside `SafetyMiddleware`, which must precede everything
-    /// the user could relax — so even YOLO can't bypass it.
+    /// the user could relax.
     #[test]
     fn safety_middleware_precedes_user_relaxable_steps() {
         let safety_idx = EVALUATION_ORDER

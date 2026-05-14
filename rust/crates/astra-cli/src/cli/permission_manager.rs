@@ -1094,9 +1094,6 @@ impl PermissionManager {
             astra_runtime::orchestration::PermissionMode::Auto => PermissionMode::Auto,
             astra_runtime::orchestration::PermissionMode::Prompt => PermissionMode::Prompt,
             astra_runtime::orchestration::PermissionMode::Deny => PermissionMode::Deny,
-            astra_runtime::orchestration::PermissionMode::BypassSafety => {
-                PermissionMode::BypassSafety
-            }
         };
         let project_outcome = PermissionSettings::try_load(project_root);
         let user_outcome = PermissionSettings::try_load_user();
@@ -1248,7 +1245,6 @@ impl PermissionManager {
             PermissionMode::Auto => RuntimePermissionMode::Auto,
             PermissionMode::Prompt => RuntimePermissionMode::Prompt,
             PermissionMode::Deny => RuntimePermissionMode::Deny,
-            PermissionMode::BypassSafety => RuntimePermissionMode::BypassSafety,
         };
 
         let mut inherited = self
@@ -1313,9 +1309,7 @@ impl PermissionManager {
         if explicit {
             match self.mode {
                 PermissionMode::Deny => return ApprovalDecision::Deny,
-                PermissionMode::Auto | PermissionMode::BypassSafety => {
-                    return ApprovalDecision::Allow;
-                }
+                PermissionMode::Auto => return ApprovalDecision::Allow,
                 PermissionMode::Prompt => {}
             }
             eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
@@ -1340,9 +1334,7 @@ impl PermissionManager {
             };
         }
         match self.mode {
-            PermissionMode::Auto | PermissionMode::BypassSafety => {
-                return ApprovalDecision::Allow;
-            }
+            PermissionMode::Auto => return ApprovalDecision::Allow,
             PermissionMode::Deny => return ApprovalDecision::Deny,
             PermissionMode::Prompt => {}
         }
@@ -1604,18 +1596,14 @@ impl PermissionManager {
 
         if Self::cloud_approval_is_explicit(approval_kind) {
             return match self.mode {
-                PermissionMode::Auto | PermissionMode::BypassSafety => {
-                    Some(ApprovalDecision::Allow)
-                }
+                PermissionMode::Auto => Some(ApprovalDecision::Allow),
                 PermissionMode::Deny => Some(ApprovalDecision::Deny),
                 PermissionMode::Prompt => None,
             };
         }
 
         match self.mode {
-            PermissionMode::Auto | PermissionMode::BypassSafety => {
-                return Some(ApprovalDecision::Allow);
-            }
+            PermissionMode::Auto => return Some(ApprovalDecision::Allow),
             PermissionMode::Deny => return Some(ApprovalDecision::Deny),
             PermissionMode::Prompt => {}
         }
@@ -2535,7 +2523,7 @@ impl PermissionManager {
 
         // Step 7: Permission mode determines final action.
         match self.mode {
-            PermissionMode::Auto | PermissionMode::BypassSafety => return true,
+            PermissionMode::Auto => return true,
             PermissionMode::Deny => {
                 let (header, _) = Self::format_tool_display(name, args);
                 eprintln!("  {}", format!("  ✗ {header} — blocked").red());
@@ -2665,16 +2653,13 @@ impl PermissionManager {
 
         if matches!(envelope.source, DecisionSource::SensitivePath { .. })
             && matches!(envelope.decision, HardDecision::NeedExternal { .. })
-            && matches!(
-                self.mode,
-                PermissionMode::Auto | PermissionMode::BypassSafety
-            )
+            && self.mode == PermissionMode::Auto
             && (self.settings.allow_sensitive_path_writes
                 || self.user_settings.allow_sensitive_path_writes)
         {
             astra_core::agent_warn!(
                 "permission",
-                "Auto/BypassSafety mode allowed write to sensitive path (opt-in): tool={name}"
+                "Auto mode allowed write to sensitive path (opt-in): tool={name}"
             );
             return PermissionDecision::Allow;
         }

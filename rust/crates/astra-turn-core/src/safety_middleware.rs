@@ -509,14 +509,12 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
 
 /// Catastrophic command circuit breaker — bypass-immune, not configurable.
 ///
-/// Issue #326 P0 / R1 Major 6: even in YOLO / `PermissionMode::BypassSafety`
-/// mode (where the user has explicitly opted into "skip every approval"),
-/// these specific patterns must still be denied. They are unrecoverable
+/// These specific patterns must always be denied. They are unrecoverable
 /// (delete the user's home, the whole disk, fork-bomb the machine).
 ///
 /// The allowlist here is intentionally **tiny and not configurable**.
 /// Extending it requires a code change + review; users cannot bypass it
-/// via env vars, settings files, or YOLO mode.
+/// via env vars or settings files.
 #[must_use]
 pub fn catastrophic_command_reason(command: &str) -> Option<String> {
     // Normalize: trim, lowercase, collapse whitespace runs to a single
@@ -554,7 +552,7 @@ pub fn catastrophic_command_reason(command: &str) -> Option<String> {
         if normalized == pattern || normalized.starts_with(&format!("{pattern} ")) {
             return Some(format!(
                 "catastrophic command refused (circuit breaker): `{command}` would delete the entire root or home directory; \
-                 this check is not configurable and cannot be bypassed even by --yolo / PermissionMode::BypassSafety"
+                 this check is not configurable"
             ));
         }
     }
@@ -602,13 +600,12 @@ pub fn catastrophic_command_reason(command: &str) -> Option<String> {
 /// `is_catastrophic_command` matches a fixed allowlist of "you cannot
 /// undo this" patterns (`rm -rf /`, `rm -rf $HOME`, `rm -rf ~`,
 /// `rm -rf /*`, fork bombs, `dd of=/dev/sda`). It runs **before** any
-/// trust-mode-relaxed rules so a YOLO/`BypassSafety` mode still cannot
-/// execute it. The list is intentionally tiny and not configurable.
+/// trust-mode-relaxed rules. The list is intentionally tiny and not
+/// configurable.
 #[must_use]
 pub fn check_shell_command_safety_with_mode(command: &str, mode: TrustMode) -> Option<String> {
-    // 0. Catastrophic command circuit breaker — bypass-immune, not
-    //    configurable. Even YOLO mode (PermissionMode::BypassSafety)
-    //    cannot disable this.
+    // 0. Catastrophic command circuit breaker — bypass-immune and not
+    //    configurable.
     if let Some(reason) = catastrophic_command_reason(command) {
         return Some(reason);
     }
@@ -2125,9 +2122,9 @@ mod tests {
 
     #[test]
     fn circuit_breaker_runs_before_trust_mode_relaxation() {
-        // YOLO / Trusted mode must still see catastrophic commands
-        // refused. Rule 0 in check_shell_command_safety_with_mode
-        // fires before any trust-mode-relaxed rules.
+        // Trusted mode must still see catastrophic commands refused. Rule 0
+        // in check_shell_command_safety_with_mode fires before any
+        // trust-mode-relaxed rules.
         let trusted = check_shell_command_safety_with_mode("rm -rf /", TrustMode::Trusted);
         assert!(trusted.is_some());
         assert!(trusted.unwrap().contains("circuit breaker"));

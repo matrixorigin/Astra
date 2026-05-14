@@ -114,16 +114,6 @@ fn deny_mode_renders_red_chip() {
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Red));
 }
 
-#[test]
-fn bypass_mode_renders_red_chip() {
-    let c = StatusContext {
-        permission_mode: PermissionMode::Bypass,
-        ..ctx()
-    };
-    let s = StatusLine::from_context(&c);
-    assert!(s.plain().contains("⚡bypass"));
-}
-
 // ─── Right-side segments: model · dir · tokens · cost · branch ────
 
 #[test]

@@ -678,12 +678,6 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_subcommands(ALLOW_SUBCOMMANDS)
     .with_arg_hint("[auto|prompt|deny|all|rules]"),
     CommandMeta::new(
-        "/yolo",
-        "Auto-approve all tools (alias for /allow auto)",
-        CommandGroup::System,
-    )
-    .alias(),
-    CommandMeta::new(
         "/instructions",
         "Project instructions: /instructions [show|reload|off]",
         CommandGroup::System,
@@ -920,10 +914,6 @@ mod tests {
         let quit = COMMANDS.iter().find(|m| m.name == "/quit");
         assert!(quit.is_some(), "/quit should exist");
         assert!(quit.unwrap().is_alias, "/quit should be marked as alias");
-
-        let yolo = COMMANDS.iter().find(|m| m.name == "/yolo");
-        assert!(yolo.is_some(), "/yolo should exist");
-        assert!(yolo.unwrap().is_alias, "/yolo should be marked as alias");
     }
 
     #[test]

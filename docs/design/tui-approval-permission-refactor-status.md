@@ -48,6 +48,8 @@ Implemented and verified in code:
 - P2 hard checks are covered in turn-core tests: catastrophic shell commands
   beat Auto mode, explicit approval beats allow rules in Prompt mode, and
   sensitive-path writes still require external approval in Auto mode.
+- Permission modes are intentionally limited to `auto`, `prompt`, and `deny`;
+  the former extra auto-approve alias/mode has been removed.
 - P3 backend scope semantics: local and cloud Always decisions map to Project,
   RestOfSession, RestOfTurn, or OnceThisCall according to risk and persistence
   safety.
