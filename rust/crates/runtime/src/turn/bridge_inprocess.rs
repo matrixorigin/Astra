@@ -1860,6 +1860,8 @@ impl InProcessChatTurnBridge {
             // Apply context release: stub tool results the agent marked as
             // no longer needed so they don't consume tokens. Idempotent: runs
             // every turn, so emit the per-turn stub count for observability.
+            // We log to tracing AND to the session journal so prod runs (where
+            // debug tracing is off) still leave a durable audit trail.
             let released_count = apply_session_context_release(&session_id, &mut llm_messages);
             if released_count > 0 {
                 tracing::debug!(
@@ -1868,6 +1870,25 @@ impl InProcessChatTurnBridge {
                     stubbed = released_count,
                     "context_release applied"
                 );
+                if let Ok(writer) =
+                    astra_services::session_journal::JournalWriter::new(&session_id)
+                {
+                    let mut evt = astra_services::session_journal::JournalEvent::base_public(
+                        astra_services::session_journal::JournalEventType::ContextReleased,
+                        Some(&session_id),
+                    );
+                    // The applied-phase event is emitted *before* the LLM
+                    // round counter (`cloud_loop_turns`) is incremented for
+                    // this turn, so we leave `turn` unset here. The companion
+                    // `JournalEvent::context_released` (intent, written when
+                    // the agent calls `session(release_context)`) carries the
+                    // turn at intent time. Distinguished by `phase`.
+                    evt.metadata = Some(serde_json::json!({
+                        "applied_count": released_count,
+                        "phase": "per_turn_apply",
+                    }));
+                    let _ = writer.append(&evt);
+                }
             }
 
             // Strip old reasoning_content from history messages to reduce token
