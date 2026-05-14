@@ -77,25 +77,17 @@ The v1 web-agent implementation was driven from the original scenario set rather
 | G28 | open | deferred | add `cancel` mutation enum in v1.0.1 |
 | G29 | open | deferred | formalize `checkpoint_v1.extra` recommendation in v1.0.1 |
 
-### §1.3 Verification Report Index
+### §1.3 Verification Summary
 
-Design regression reports:
+The detailed sprint walkthroughs and phase verification notes were review
+artifacts for the feature branch and are intentionally not committed to `main`.
+The durable evidence kept in the repository is:
 
-- `REGRESSION-SPRINT-A.md`
-- `REGRESSION-SPRINT-B.md`
-- `REGRESSION-SPRINT-C.md`
-- `REGRESSION-SPRINT-D.md`
-
-Implementation verification reports:
-
-- `IMPL-VERIFY-PHASE-1.md`: `PASS_WITH_WARNINGS`; residuals carried into later phases.
-- `IMPL-VERIFY-PHASE-2.md`: `PASS_WITH_WARNINGS`; hard SSE reconnect blocker fixed before Phase 3.
-- `IMPL-VERIFY-PHASE-3.md`: `PASS_WITH_WARNINGS`; four critical deviations fixed in Phase 3B.
-- `IMPL-VERIFY-PHASE-3B.md`: `PASS`.
-- `IMPL-VERIFY-PHASE-4.md`: `PASS_WITH_WARNINGS`; FP3 production wiring fixed in Phase 5.
-- `IMPL-VERIFY-PHASE-5.md`: `PASS`.
-- `IMPL-VERIFY-PHASE-6.md`: `PASS`.
-- `IMPL-VERIFY-E2E-JOINT.md`: `PASS`; 5/5 E2E, 5/5 PERF, 3/3 Phase 6 watchlist closed.
+- The scenario specs in this directory (`S01` through `S14`).
+- The implementation contract in `IMPL-TEST-PLAN.md`.
+- The regression and E2E tests under `rust/crates/runtime/tests/`.
+- The schema assertions under `rust/crates/services/tests/schema_assertions.rs`.
+- This final delivery summary, including the gap resolution index above.
 
 ## §2 Code Delivery Inventory
 
@@ -248,8 +240,8 @@ Web UI MVP items:
     JSON. The Web app now routes server-side runtime calls through
     `web/lib/runtime-client`, which centralizes API URL resolution, bearer
     auth, token refresh, JSON parsing, and structured runtime errors. This is
-    step 1 of the JS SDK refactor plan tracked in
-    `WEB-RUNTIME-CLIENT-TODO.md`. The first stabilization pass also moves
+    first step of the JS SDK refactor plan. Remaining SDK contract work should
+    be tracked as follow-up issues. The first stabilization pass also moves
     Web-used runtime path helpers and response DTOs for sessions, transcript,
     artifacts, models, skills, auth, and chat responses into `@astra/sdk`, with
     matching Rust ThinClient path helpers where applicable. Shared HTTP helper

@@ -4,7 +4,7 @@
 > Date: 2026-05-07
 > Owner: regression reviewer
 > 目的: 建立"实现 ↔ 设计"之间的**强契约锚点**，防止 Phase 1-6 实现过程中偏离 14 场景推演所依赖的假设
-> 参考: design doc v0.3 (3653 行) / 14 WALKTHROUGH-S<NN>.md / REGRESSION-SPRINT-A/B/C/D.md
+> 参考: `web-agent-session-state.md` v0.3 / scenario specs `S01` through `S14`
 
 ## 为什么需要这份文件
 
@@ -61,7 +61,7 @@ Sprint A-D 历经 4 轮 "patch → 回归"，19 gap review + 10 端到端推演 
 | L2-8 | batch_insert ≤500 行 / ≤16 MiB，超过拆 batch | S08 T5 | property test |
 | L2-9 | 1000 行 session_tool_outputs INSERT < 500ms（MatrixOne 本地实例基准）| S08 blocker | performance |
 
-**注（IMPL-VERIFY-PHASE-1 反馈）**：
+**注（Phase 1 验收反馈）**：
 - L2-7 拆为两部分：字段持久化（retry_scope 列 + payload）属 Phase 1；`superseded` 状态转换属 Phase 4（与 G14 mutation 契约同步）。Phase 1 验收只验前者。
 - L2-1 到 L2-9 对应测试均用 `#[ignore = "requires ASTRA_TEST_DB_IT=1"]` 标记，**CI pipeline 必须显式启用** `ASTRA_TEST_DB_IT=1` 才能跑到行为分支，否则 PR merge 前人工确认在本地 MatrixOne 实例跑过。
 
@@ -73,7 +73,7 @@ Sprint A-D 历经 4 轮 "patch → 回归"，19 gap review + 10 端到端推演 
 | L3-2 | **S08 T5 批量工具输出**：扫 1000 文件，每个写 session_tool_outputs，整体回合完成 < 2s | batch 生效 |
 | L3-3 | **S10 T8 retry_scope**：user 说"重做 executor-2"，agent 正确携带 retry_scope，原 executor run 变 superseded | scope 传递 |
 
-**注（IMPL-VERIFY-PHASE-1 反馈）**：
+**注（Phase 1 验收反馈）**：
 - L3-1 Phase 1 仅做"追加+重读 event_idx 单调"骨架测试；真 SSE `?last_index=N` 多次 reconnect 的完整 E2E 要等 Phase 2 Web hook 就位后补充一次跨 Phase 回归。
 - L3-3 Phase 1 仅验 `retry_scope` 字段持久化（payload 含该字段的断言）；`superseded` 状态转换归 Phase 4 完成，届时补充对称测试。
 
@@ -350,7 +350,7 @@ Sprint A-D 历经 4 轮 "patch → 回归"，19 gap review + 10 端到端推演 
 1. **设计 agent 完成 Phase N 实现** → 提交说"Phase N 做完"
 2. **我启动一个 regression sub-agent** 按此文件 Phase N 章节验收
 3. **sub-agent 跑 L1 schema check (SQL query on DB) + L2 code scan (grep for assertions) + L3 scenario test run**
-4. **产出 IMPL-VERIFY-PHASE-N.md**，列出每条测试点状态
+4. **产出一次性验收记录**，列出每条测试点状态；过程记录不要求提交到 `main`
 5. **任何 L1/L2 不过 → 退回设计 agent 修正**
 6. **L3 不过 → 标记 warning，允许进下一 Phase 但必须在总联合验收补**
 
