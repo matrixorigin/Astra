@@ -1352,7 +1352,7 @@ mod tests {
     /// Test: child requests permission but parent denies
     #[tokio::test]
     async fn child_permission_request_via_mailbox_denied() {
-        use crate::orchestration::permission_sync::PermissionRequestHandler;
+        use crate::orchestration::permission_sync::{PermissionRequestHandler, PermissionRule};
 
         let (router, parent_mb, mut child_mb, _dt) = setup_two_agents().await;
 
@@ -1362,17 +1362,13 @@ mod tests {
         )));
         let handler = PermissionRequestHandler::new(parent_ctx.clone());
 
-        // Child requires asking parent for all tools.
-        // `allowed_tools: None` is required to exercise the
-        // request-parent flow this test pins: when an explicit
-        // allowlist is set, the gate denies up-front for tools
-        // outside it (and approves up-front for tools inside it),
-        // never reaching the mailbox.
+        // Child requires asking parent for bash. The ask rule pins the
+        // request-parent flow before the read-only shortcut can decide locally.
         let child_inherited = InheritedPermissions {
             mode: PermissionMode::Prompt,
             allow_rules: vec![],
             deny_rules: vec![],
-            ask_rules: vec![],
+            ask_rules: vec![PermissionRule::parse("bash(*)")],
             allowed_tools: None,
             is_background: false,
             ..Default::default()
