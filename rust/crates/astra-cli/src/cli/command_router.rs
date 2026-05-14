@@ -1615,7 +1615,7 @@ async fn execute_repl_bridge_command(
     state.unified_skill_registry = pipeline_modules.unified_skill_registry.clone();
     state.mcp_manager = pipeline_modules.mcp_manager.clone();
 
-    let token = current_access_token(profile);
+    let token = session_runtime::fresh_access_token(api, profile).await;
     if let Some(ref tok) = token {
         maybe_wire_delegation_engine(&mut state, api, tok);
     }

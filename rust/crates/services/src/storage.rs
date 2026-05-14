@@ -1219,8 +1219,17 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
+    // PR #330 plan-driven todo tracking. NAMING: distinct from
+    // `session_todos` (Tier 1 task scratchpad created further below)
+    // because the two schemas are incompatible — earlier revisions
+    // shared the name, which caused the second `CREATE TABLE IF NOT
+    // EXISTS` to silently no-op and code that expected the other
+    // shape to fail with `column does not exist`. The two tables now
+    // co-exist with disjoint columns and disjoint consumers:
+    //   - `session_plan_todos`: `state_projection` + plan/backlog pool
+    //   - `session_todos`     : `astra_tools::task_mgmt` (TaskManager)
     query(
-        "CREATE TABLE IF NOT EXISTS session_todos (
+        "CREATE TABLE IF NOT EXISTS session_plan_todos (
             todo_id VARCHAR(128) PRIMARY KEY,
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(128) NOT NULL,
@@ -1235,9 +1244,9 @@ pub async fn ensure_core_schema(
             payload_json LONGTEXT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_session_todos_active (session_id, status, priority, updated_at),
-            INDEX idx_session_todos_pool (user_id, backlog_pool_id, status, updated_at),
-            INDEX idx_session_todos_tree (session_id, parent_todo_id, priority)
+            INDEX idx_session_plan_todos_active (session_id, status, priority, updated_at),
+            INDEX idx_session_plan_todos_pool (user_id, backlog_pool_id, status, updated_at),
+            INDEX idx_session_plan_todos_tree (session_id, parent_todo_id, priority)
         )",
     )
     .execute(&pool)

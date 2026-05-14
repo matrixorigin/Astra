@@ -184,11 +184,14 @@ impl WorktreeRegistry {
     /// concurrent writers between processes.
     fn flush(&self) -> io::Result<()> {
         // 1. Snapshot under in-memory lock; release immediately.
+        // Poison-recover: a previous panicking writer must not freeze
+        // the registry. Same rationale as the in-memory update at the
+        // bottom of this function.
         let file = {
             let entries = self
                 .entries
                 .read()
-                .map_err(|_| io::Error::other("registry lock poisoned"))?;
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             RegistryFile {
                 version: 1,
                 entries: entries.clone(),
@@ -206,8 +209,8 @@ impl WorktreeRegistry {
         let tombstones: std::collections::HashSet<String> = self
             .tombstones
             .read()
-            .map(|t| t.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let merged = if self.state_path.exists() {
             match Self::read_file(&self.state_path) {
                 Ok(on_disk) => {
@@ -254,23 +257,39 @@ impl WorktreeRegistry {
 
         // 5. Make the merged view the in-memory truth so subsequent
         //    operations see entries written by other processes too.
-        if let Ok(mut entries) = self.entries.write() {
-            *entries = merged.entries;
-        }
-        // Tombstones consumed by this flush.
-        if let Ok(mut tomb) = self.tombstones.write() {
-            tomb.clear();
-        }
+        //
+        // We use `unwrap_or_else(PoisonError::into_inner)` rather than
+        // `if let Ok(...)`: a poisoned lock here means a prior writer
+        // panicked, which is recoverable for *us* — the on-disk write
+        // already succeeded. Skipping the in-memory update would leave
+        // stale entries forever, masking the disk truth.
+        let mut entries = self
+            .entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *entries = merged.entries;
+        drop(entries);
+
+        // Tombstones consumed by this flush — same poison rationale.
+        let mut tomb = self
+            .tombstones
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tomb.clear();
+        drop(tomb);
         Ok(())
     }
 
     /// Register a new agent worktree. Overwrites any prior entry with the same `run_id`.
     pub fn register(&self, entry: WorktreeEntry) -> io::Result<()> {
         {
+            // Poison-recover: a prior writer panicking left the lock
+            // poisoned, but our work is well-defined (insert this
+            // entry) so we recover the inner data and proceed.
             let mut entries = self
                 .entries
                 .write()
-                .map_err(|_| io::Error::other("registry lock poisoned"))?;
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             entries.insert(entry.run_id.clone(), entry);
         }
         self.flush()
@@ -282,7 +301,7 @@ impl WorktreeRegistry {
             let mut entries = self
                 .entries
                 .write()
-                .map_err(|_| io::Error::other("registry lock poisoned"))?;
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(e) = entries.get_mut(run_id) {
                 e.last_heartbeat = SystemTime::now();
             } else {
@@ -301,10 +320,14 @@ impl WorktreeRegistry {
             let mut entries = self
                 .entries
                 .write()
-                .map_err(|_| io::Error::other("registry lock poisoned"))?;
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             entries.remove(run_id);
         }
-        if let Ok(mut tomb) = self.tombstones.write() {
+        {
+            let mut tomb = self
+                .tombstones
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             tomb.insert(run_id.to_string());
         }
         self.flush()
@@ -312,10 +335,10 @@ impl WorktreeRegistry {
 
     /// Entries whose heartbeat is older than `ttl`.
     pub fn list_stale(&self, ttl: Duration) -> Vec<WorktreeEntry> {
-        let entries = match self.entries.read() {
-            Ok(e) => e,
-            Err(_) => return Vec::new(),
-        };
+        let entries = self
+            .entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         entries
             .values()
             .filter(|e| e.is_stale(ttl))
@@ -340,7 +363,7 @@ impl WorktreeRegistry {
             let entries = self
                 .entries
                 .read()
-                .map_err(|_| io::Error::other("registry lock poisoned"))?;
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             entries
                 .values()
                 .filter(|e| e.is_stale(ttl))
@@ -354,12 +377,16 @@ impl WorktreeRegistry {
             let mut entries = self
                 .entries
                 .write()
-                .map_err(|_| io::Error::other("registry lock poisoned"))?;
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for id in &stale_ids {
                 entries.remove(id);
             }
         }
-        if let Ok(mut tomb) = self.tombstones.write() {
+        {
+            let mut tomb = self
+                .tombstones
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for id in &stale_ids {
                 tomb.insert(id.clone());
             }
@@ -374,10 +401,10 @@ impl WorktreeRegistry {
     /// scanning `<base>/*` and filtering to dirs). An entry is orphaned iff no
     /// registered worktree points to the same path.
     pub fn list_orphaned(&self, fs_entries: &[PathBuf]) -> Vec<PathBuf> {
-        let entries = match self.entries.read() {
-            Ok(e) => e,
-            Err(_) => return fs_entries.to_vec(),
-        };
+        let entries = self
+            .entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let known: std::collections::HashSet<_> =
             entries.values().map(|e| e.worktree_path.clone()).collect();
         fs_entries
@@ -389,10 +416,11 @@ impl WorktreeRegistry {
 
     /// Snapshot of all registered entries (for diagnostics / `astra worktree list`).
     pub fn snapshot(&self) -> Vec<WorktreeEntry> {
-        self.entries
+        let entries = self
+            .entries
             .read()
-            .map(|e| e.values().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.values().cloned().collect()
     }
 
     #[cfg(test)]
@@ -573,6 +601,53 @@ mod tests {
         fs::write(&path, "{not valid json").unwrap();
         let r = WorktreeRegistry::load_or_init(td.path()).unwrap();
         assert!(r.snapshot().is_empty());
+    }
+
+    /// REGRESSION (review HIGH): if a writer panicked while holding the
+    /// `entries` RwLock, the lock becomes poisoned. Earlier `flush()`
+    /// used `if let Ok(...) = self.entries.write()`, which silently
+    /// skipped the in-memory update — the disk got the merged truth
+    /// but in-memory state stayed stale forever, and every subsequent
+    /// `snapshot()` returned the stale view.
+    ///
+    /// Pin the recovered behavior: after deliberately poisoning the
+    /// lock, the next `register()` (which calls `flush()`) must still
+    /// land its update in the in-memory entries.
+    #[test]
+    fn flush_recovers_in_memory_state_after_lock_poisoned() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let td = TempDir::new().unwrap();
+        let r = WorktreeRegistry::load_or_init(td.path()).unwrap();
+        r.register(mk_entry("first", &td.path().join("first")))
+            .unwrap();
+
+        // Poison the entries lock by panicking while a write guard is
+        // held. catch_unwind contains the panic; the lock survives in
+        // PoisonError state.
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = r.entries.write().unwrap();
+            panic!("intentional panic to poison the lock");
+        }));
+
+        // Lock is now poisoned. Registering a second entry calls flush,
+        // which must update in-memory state through the poison.
+        r.register(mk_entry("second", &td.path().join("second")))
+            .unwrap();
+
+        let snap = r.snapshot();
+        let ids: std::collections::HashSet<String> =
+            snap.iter().map(|e| e.run_id.clone()).collect();
+        assert!(
+            ids.contains("first") && ids.contains("second"),
+            "in-memory state must contain both entries after poison recovery; got {ids:?}"
+        );
+
+        // Reload from disk to confirm nothing diverged.
+        let r2 = WorktreeRegistry::load_or_init(td.path()).unwrap();
+        let on_disk: std::collections::HashSet<String> =
+            r2.snapshot().iter().map(|e| e.run_id.clone()).collect();
+        assert_eq!(on_disk, ids, "disk and in-memory state must match");
     }
 
     #[test]

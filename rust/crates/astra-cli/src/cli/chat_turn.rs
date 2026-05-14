@@ -2748,14 +2748,18 @@ pub(super) fn is_auth_error(error: &str) -> bool {
         return false;
     }
     let lower = error.to_lowercase();
-    lower.contains("unauthorized")
-        || lower.contains("could not validate credentials")
+    // Keep this predicate tightly scoped to Astra session-auth failures.
+    // Generic `401 Unauthorized` / `HTTP 401` text can come from tools and
+    // upstream services (GitHub, MCP servers, provider bridges, etc.) and
+    // should not send the user to `/login`.
+    lower.contains("could not validate credentials")
         || lower.contains("session expired")
         || lower.contains("token expired")
-        || lower.contains("401 unauthorized")
-        || lower.contains("status: 401")
-        || lower.contains("status code: 401")
-        || lower.contains("http 401")
+        || lower.contains("invalid token")
+        || lower.contains("invalid token type")
+        || lower.contains("authentication required — try /login")
+        || lower.contains("hint: session expired — try /login")
+        || lower.contains("hint: authentication required — try /login")
 }
 
 /// Detect LLM provider authentication failures — upstream Bedrock/Anthropic
@@ -3300,10 +3304,17 @@ mod tests {
         assert!(super::is_llm_provider_auth_error(prefixed));
         assert!(!super::is_auth_error(prefixed));
 
-        // Plain session 401 must still be detected by the generic predicate.
-        let session_msg = "HTTP 401 Unauthorized";
+        let session_msg =
+            "API Error (401): Could not validate credentials\n  Hint: Session expired — try /login";
         assert!(!super::is_llm_provider_auth_error(session_msg));
         assert!(super::is_auth_error(session_msg));
+
+        let unrelated_401 = "GitHub API Error: 401 Unauthorized";
+        assert!(!super::is_llm_provider_auth_error(unrelated_401));
+        assert!(
+            !super::is_auth_error(unrelated_401),
+            "generic upstream 401s must not be reported as Astra session expiry"
+        );
     }
 
     #[test]

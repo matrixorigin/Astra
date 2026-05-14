@@ -409,11 +409,6 @@ pub(crate) enum BgTaskCommand {
         description: String,
         reply: tokio::sync::oneshot::Sender<String>,
     },
-    SpawnAgent {
-        description: String,
-        run_fn: std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>,
-        reply: tokio::sync::oneshot::Sender<String>,
-    },
     Kill {
         task_id: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,

@@ -60,7 +60,6 @@ pub fn sweep_orphaned_worktrees(
         }
     };
 
-    let now = SystemTime::now();
     let live: std::collections::HashMap<String, WorktreeEntry> = registry
         .snapshot()
         .into_iter()
@@ -79,12 +78,15 @@ pub fn sweep_orphaned_worktrees(
         };
         report.scanned += 1;
 
+        // Use WorktreeEntry::is_stale so clock-rewind polarity matches
+        // the registry's `prune_stale` path (a future heartbeat from
+        // an NTP correction / VM restore is reclaimable, not immortal).
+        // Inline `duration_since(...).unwrap_or(false)` had the
+        // opposite polarity and let future-stamped entries leak
+        // forever.
         let should_remove = match live.get(&run_id) {
             None => true, // no registry entry → orphan
-            Some(entry) => now
-                .duration_since(entry.last_heartbeat)
-                .map(|age| age > ttl)
-                .unwrap_or(false),
+            Some(entry) => entry.is_stale(ttl),
         };
 
         if !should_remove {
@@ -102,10 +104,7 @@ pub fn sweep_orphaned_worktrees(
             .collect();
         let still_orphan = match fresh.get(&run_id) {
             None => true,
-            Some(entry) => SystemTime::now()
-                .duration_since(entry.last_heartbeat)
-                .map(|age| age > ttl)
-                .unwrap_or(false),
+            Some(entry) => entry.is_stale(ttl),
         };
         if !still_orphan {
             debug!(
@@ -324,5 +323,42 @@ mod tests {
         assert!(!stale.exists());
         // registry entry should be gone too
         assert!(reg.snapshot().iter().all(|e| e.run_id != "stale-run"));
+    }
+
+    /// REGRESSION (review HIGH): clock-rewind polarity must match
+    /// `WorktreeEntry::is_stale`. A future heartbeat (NTP correction,
+    /// VM restore, daylight shift, restored snapshot) used to keep
+    /// orphan worktrees alive forever because the inline match fell
+    /// through `unwrap_or(false)` — opposite of `is_stale`'s
+    /// `unwrap_or(true)` behavior. After fix, future heartbeats are
+    /// treated as stale and the directory is reclaimed.
+    #[test]
+    fn sweep_treats_future_heartbeat_as_stale() {
+        let tmp = tempdir().unwrap();
+        init_git_repo(tmp.path());
+        let base = tmp.path().join(".agent-worktrees");
+        fs::create_dir_all(&base).unwrap();
+        let rewound = base.join("rewound-run");
+        fs::create_dir_all(&rewound).unwrap();
+
+        let reg = WorktreeRegistry::load_or_init(&base).unwrap();
+        let future_ts = SystemTime::now() + Duration::from_secs(3600);
+        reg.register(WorktreeEntry {
+            run_id: "rewound-run".into(),
+            worktree_path: rewound.clone(),
+            pid: 999998,
+            started_at: future_ts,
+            last_heartbeat: future_ts,
+        })
+        .unwrap();
+
+        let r = sweep_orphaned_worktrees(&base, &reg, Duration::from_secs(60));
+        assert_eq!(
+            r.removed.len(),
+            1,
+            "future-stamped entry must be reclaimed; got removed={:?}",
+            r.removed
+        );
+        assert!(!rewound.exists());
     }
 }

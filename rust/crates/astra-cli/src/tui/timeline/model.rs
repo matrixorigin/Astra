@@ -173,7 +173,14 @@ mod tests {
     use astra_services::session_journal::{JournalDirGuard, JournalEvent, JournalWriter};
     use tempfile::tempdir;
 
+    // `#[serial]` because `JournalDirGuard` is thread-local but
+    // `JournalWriter` resolves the sessions dir under nextest's
+    // shared thread pool — under heavy parallelism the writer can
+    // observe a sibling test's HOME / cwd state if both run on the
+    // same OS thread before the guard establishes the override.
+    // Forcing serial execution removes the cross-test contention.
     #[test]
+    #[serial_test::serial]
     fn journal_source_propagates_context_time() {
         let dir = tempdir().expect("tempdir");
         let sessions_dir = dir.path().join("sessions");

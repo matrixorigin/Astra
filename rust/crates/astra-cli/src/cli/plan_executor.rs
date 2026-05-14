@@ -490,14 +490,14 @@ fn is_credential_error(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("could not validate credentials")
         || lower.contains("invalid credentials")
-        || lower.contains("unauthorized")
         || lower.contains("authentication failed")
         || lower.contains("token expired")
         || lower.contains("session expired")
-        || lower.contains("401 unauthorized")
-        || lower.contains("status: 401")
-        || lower.contains("status code: 401")
-        || lower.contains("http 401")
+        || lower.contains("invalid token")
+        || lower.contains("invalid token type")
+        || lower.contains("authentication required — try /login")
+        || lower.contains("hint: session expired — try /login")
+        || lower.contains("hint: authentication required — try /login")
 }
 
 /// Pick the `plan_progress` action for end-of-plan emission.
@@ -3731,10 +3731,13 @@ All acceptance checks pass:
     #[test]
     fn credential_error_detection() {
         assert!(is_credential_error("could not validate credentials"));
-        assert!(is_credential_error("401 Unauthorized"));
+        assert!(is_credential_error(
+            "request failed (401): invalid token\n  Hint: Authentication required — try /login"
+        ));
         assert!(is_credential_error("Authentication failed: token expired"));
         assert!(!is_credential_error("network timeout"));
         assert!(!is_credential_error("tool execution failed"));
+        assert!(!is_credential_error("GitHub API Error: 401 Unauthorized"));
     }
 
     // ── Bug #3 regression: plan_completion_action must reflect verification

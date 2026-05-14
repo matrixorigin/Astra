@@ -722,7 +722,7 @@ pub(crate) async fn run_tui_repl(
                                         slash_dispatch::SlashResult::Fallback => {
                                             let slash_text = text.clone();
                                             let slash_result = guard.with_restored(|| async {
-                                                let token = crate::session_runtime::current_access_token(profile);
+                                                let token = crate::session_runtime::fresh_access_token(api, profile).await;
                                                 crate::slash_router::handle_slash_command(
                                                     &slash_text, api, profile, &mut state,
                                                     token.as_deref(),
@@ -793,7 +793,7 @@ pub(crate) async fn run_tui_repl(
                                         // inner select.
                                         let task_service_for_cancel = state.task_service.clone();
                                         let ctx = crate::chat_turn::TurnContext { api, profile };
-                                        let token = crate::session_runtime::current_access_token(profile);
+                                        let token = crate::session_runtime::fresh_access_token(api, profile).await;
                                         let mut tui_ui = ui_adapter::TuiUiAdapter::new(tui_tx.clone());
                                         let fut = crate::chat_turn::handle_chat_input_with_ui(text, token.as_deref(), &mut state, ctx, &mut tui_ui);
                                         tokio::pin!(fut);
@@ -1396,7 +1396,7 @@ pub(crate) async fn run_tui_repl(
                                         name.strip_prefix(slash_dispatch::MODEL_PICK_SENTINEL)
                                     {
                                         let base_model = base_model.to_string();
-                                        let token = crate::session_runtime::current_access_token(profile);
+                                        let token = crate::session_runtime::fresh_access_token(api, profile).await;
                                         let raw = crate::slash_router::fetch_model_list_raw(
                                             api,
                                             token.as_deref(),
@@ -1466,7 +1466,7 @@ pub(crate) async fn run_tui_repl(
                                         let mut parts = rest.splitn(2, '\n');
                                         let base_model = parts.next().unwrap_or("").to_string();
                                         let label = parts.next().unwrap_or("").to_string();
-                                        let token = crate::session_runtime::current_access_token(profile);
+                                        let token = crate::session_runtime::fresh_access_token(api, profile).await;
                                         let raw = crate::slash_router::fetch_model_list_raw(
                                             api,
                                             token.as_deref(),
@@ -1533,7 +1533,7 @@ pub(crate) async fn run_tui_repl(
                                         let pre_sid = state.session_id.clone();
                                         let slash_text = format!("/resume {name}");
                                         let slash_result = guard.with_restored(|| async {
-                                            let token = crate::session_runtime::current_access_token(profile);
+                                            let token = crate::session_runtime::fresh_access_token(api, profile).await;
                                             crate::slash_router::handle_slash_command(
                                                 &slash_text, api, profile, &mut state,
                                                 token.as_deref(),
@@ -1740,10 +1740,6 @@ pub(crate) async fn run_tui_repl(
                         match cmd {
                             crate::edge_tools::BgTaskCommand::SpawnShell { command, description, reply } => {
                                 let id = background_registry.spawn_shell(&command, &description);
-                                let _ = reply.send(id);
-                            }
-                            crate::edge_tools::BgTaskCommand::SpawnAgent { description, run_fn, reply } => {
-                                let id = background_registry.spawn_agent(&description, run_fn);
                                 let _ = reply.send(id);
                             }
                             crate::edge_tools::BgTaskCommand::Kill { task_id, reply } => {

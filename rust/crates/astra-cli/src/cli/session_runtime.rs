@@ -475,6 +475,66 @@ pub(super) async fn attempt_token_refresh(
     }
 }
 
+const ACCESS_TOKEN_REFRESH_SKEW_SECS: i64 = 60;
+
+fn jwt_expiry_epoch(token: &str) -> Option<i64> {
+    use base64::Engine;
+
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    value.get("exp").and_then(|v| {
+        v.as_i64()
+            .or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
+    })
+}
+
+fn access_token_needs_refresh(token: &str, now_epoch: i64) -> bool {
+    jwt_expiry_epoch(token)
+        .map(|exp| exp <= now_epoch + ACCESS_TOKEN_REFRESH_SKEW_SECS)
+        .unwrap_or(false)
+}
+
+pub(super) async fn fresh_access_token(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+) -> Option<String> {
+    if let Ok(token) = std::env::var("ASTRA_ACCESS_TOKEN")
+        && !token.is_empty()
+    {
+        return Some(token);
+    }
+
+    let creds = load_credentials();
+    let name = profile_name(profile, &creds);
+    let profile_entry = creds.profiles.get(&name)?;
+    let access = profile_entry.access_token.clone();
+    let has_refresh = profile_entry.refresh_token.is_some();
+    drop(creds);
+
+    if let Some(token) = access {
+        if !has_refresh {
+            return Some(token);
+        }
+        if !access_token_needs_refresh(&token, chrono::Utc::now().timestamp()) {
+            return Some(token);
+        }
+        if attempt_token_refresh(api, profile).await {
+            return current_access_token(profile).or(Some(token));
+        }
+        return Some(token);
+    }
+
+    if has_refresh && attempt_token_refresh(api, profile).await {
+        return current_access_token(profile);
+    }
+
+    None
+}
+
 pub(crate) fn initialize_session_state(
     profile: Option<&str>,
     initial_model: Option<&str>,
@@ -1005,6 +1065,8 @@ mod tests {
     use crate::cli_utils::{CredentialsFile, Profile};
     use crate::tests::isolate_credentials;
     use tempfile::tempdir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     struct EnvGuard {
         key: &'static str,
@@ -1827,5 +1889,98 @@ mod tests {
             Some("file-token-abc".to_string()),
             "should fall back to credentials file when env var is empty"
         );
+    }
+
+    #[test]
+    fn access_token_needs_refresh_only_when_expired_or_near_expiry() {
+        fn jwt_with_exp(exp: i64) -> String {
+            use base64::Engine;
+
+            let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(br#"{"alg":"none","typ":"JWT"}"#);
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(format!(r#"{{"exp":{exp}}}"#));
+            format!("{header}.{payload}.sig")
+        }
+
+        let now = 1_700_000_000_i64;
+        assert!(access_token_needs_refresh(
+            &jwt_with_exp(now + ACCESS_TOKEN_REFRESH_SKEW_SECS - 1),
+            now
+        ));
+        assert!(access_token_needs_refresh(&jwt_with_exp(now - 1), now));
+        assert!(!access_token_needs_refresh(
+            &jwt_with_exp(now + ACCESS_TOKEN_REFRESH_SKEW_SECS + 120),
+            now
+        ));
+        assert!(!access_token_needs_refresh("not-a-jwt", now));
+    }
+
+    #[tokio::test]
+    async fn fresh_access_token_refreshes_expired_saved_token() {
+        let _g = isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                access_token: Some(
+                    "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjF9.sig".to_string(),
+                ),
+                refresh_token: Some("refresh-old".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh-access",
+                "refresh_token": "fresh-refresh"
+            })))
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+
+        let token = fresh_access_token(&api, None).await;
+
+        assert_eq!(token.as_deref(), Some("fresh-access"));
+        let creds = load_credentials();
+        let profile = creds.profiles.get("default").unwrap();
+        assert_eq!(profile.access_token.as_deref(), Some("fresh-access"));
+        assert_eq!(profile.refresh_token.as_deref(), Some("fresh-refresh"));
+    }
+
+    #[tokio::test]
+    async fn fresh_access_token_keeps_valid_saved_token_without_refresh() {
+        let _g = isolate_credentials();
+        let token = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjQxMDAwMDAwMDB9.sig".to_string();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                access_token: Some(token.clone()),
+                refresh_token: Some("refresh-old".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+
+        let fresh = fresh_access_token(&api, None).await;
+
+        assert_eq!(fresh.as_deref(), Some(token.as_str()));
+        let creds = load_credentials();
+        let profile = creds.profiles.get("default").unwrap();
+        assert_eq!(profile.access_token.as_deref(), Some(token.as_str()));
+        assert_eq!(profile.refresh_token.as_deref(), Some("refresh-old"));
     }
 }

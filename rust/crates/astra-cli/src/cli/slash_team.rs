@@ -1,5 +1,5 @@
 use super::*;
-use crate::{current_access_token, is_session_not_found_error};
+use crate::is_session_not_found_error;
 use astra_runtime::server::team_orchestrator::ExecutionPhase;
 #[allow(unused_imports)]
 use astra_services::team_persistence::{TeamPersistenceService, WorktreeMode};
@@ -427,7 +427,9 @@ async fn ensure_team_run_session(
     profile: Option<&str>,
     state: &mut super::SessionState,
 ) -> Result<String, String> {
-    let token = current_access_token(profile).ok_or_else(|| "Not logged in".to_string())?;
+    let token = crate::session_runtime::fresh_access_token(api, profile)
+        .await
+        .ok_or_else(|| "Not logged in".to_string())?;
     if let Some(session_id) = state.session_id.clone() {
         match api.get_session_text(&token, &session_id).await {
             Ok(_) => return Ok(session_id),
@@ -902,7 +904,7 @@ pub(super) async fn handle_team_command(
                     return;
                 }
             };
-            let token = match crate::current_access_token(profile) {
+            let token = match crate::session_runtime::fresh_access_token(api, profile).await {
                 Some(t) => t,
                 None => {
                     eprintln!("  {} Not logged in", theme::icon_err());

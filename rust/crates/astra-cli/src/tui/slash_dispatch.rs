@@ -1367,7 +1367,7 @@ fn push_model_picker(ctx: &mut DispatchContext<'_>, models: Vec<String>) -> bool
 }
 
 async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
-    let token = crate::session_runtime::current_access_token(ctx.profile);
+    let token = crate::session_runtime::fresh_access_token(ctx.api, ctx.profile).await;
     match crate::slash_router::fetch_model_list(ctx.api, token.as_deref()).await {
         Ok(models) => {
             if push_model_picker(ctx, models) {

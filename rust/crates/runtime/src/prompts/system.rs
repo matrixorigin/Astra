@@ -3107,7 +3107,15 @@ mod tests {
         assert_eq!(section.scope, CacheScope::Session);
         assert!(section.text.contains("<available_skills>"));
         assert!(!section.text.contains("<deferred_tools>"));
-        assert!(section.text.contains("call the `skill` tool"));
+        // Pin the actionable phrasing — wording can drift but the
+        // contract is "model calls the `skill` tool when a skill matches
+        // the user request". The source says "calling the `skill` tool";
+        // keep both forms accepted so a one-word edit doesn't break this.
+        assert!(
+            section.text.contains("`skill` tool"),
+            "skill listing must direct the model at the `skill` tool: {section_text}",
+            section_text = section.text
+        );
     }
 
     // ── SystemPromptBuilder invariants ─────────────────────────────────

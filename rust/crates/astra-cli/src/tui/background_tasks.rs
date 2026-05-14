@@ -1,10 +1,13 @@
 //! Background task execution registry.
 //!
-//! Manages in-flight background tasks (shell commands, agent sessions)
-//! that run independently of the main conversation. Provides:
+//! Manages in-flight background shell tasks that run independently of
+//! the main conversation. Provides:
 //! - Spawn / kill lifecycle with CancellationToken
 //! - File-backed output capture (stdout/stderr → disk)
-//! - Completion event broadcast for TUI + model notification
+//! - Single-channel `pending_completions` queue drained by
+//!   `poll_completions`; the TUI tick consumes lifecycle events
+//!   (Started / Completed / Failed / Killed / Stalled) exactly once
+//!   per occurrence
 //! - Stall detection for shell tasks stuck on interactive input
 
 use std::collections::HashMap;
@@ -15,19 +18,12 @@ use std::time::{Duration, Instant};
 
 use astra_text_utils::str_preview::truncate_line;
 use tokio::process::Command;
-use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 // ── Public types ────────────────────────────────────────────────────
 
 static NEXT_BG_ID: AtomicU32 = AtomicU32::new(1);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BgTaskKind {
-    Shell,
-    Agent,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -49,7 +45,6 @@ impl BgTaskStatus {
 pub(crate) enum BgTaskEvent {
     Started {
         id: String,
-        kind: BgTaskKind,
         description: String,
     },
     Completed {
@@ -83,7 +78,6 @@ struct TaskCompletion {
 
 pub(crate) struct BackgroundTaskHandle {
     pub id: String,
-    pub kind: BgTaskKind,
     pub description: String,
     status: Arc<AtomicU8>,
     pub started_at: Instant,
@@ -154,7 +148,6 @@ const PROMPT_PATTERNS: &[&str] = &[
 pub(crate) struct BackgroundTaskRegistry {
     tasks: HashMap<String, BackgroundTaskHandle>,
     join_set: JoinSet<TaskCompletion>,
-    event_tx: broadcast::Sender<BgTaskEvent>,
     output_dir: PathBuf,
     pending_completions: Vec<BgTaskEvent>,
 }
@@ -162,114 +155,12 @@ pub(crate) struct BackgroundTaskRegistry {
 impl BackgroundTaskRegistry {
     pub fn new(output_dir: PathBuf) -> Self {
         std::fs::create_dir_all(&output_dir).ok();
-        let (event_tx, _) = broadcast::channel(64);
         Self {
             tasks: HashMap::new(),
             join_set: JoinSet::new(),
-            event_tx,
             output_dir,
             pending_completions: Vec::new(),
         }
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<BgTaskEvent> {
-        self.event_tx.subscribe()
-    }
-
-    /// Spawn a background agent (agentic loop) that runs independently.
-    /// `run_fn` is a boxed future that performs the actual agent work.
-    ///
-    /// **Note:** Production background agents currently flow through
-    /// `agent_spawning::handle_spawn_agent_tool` (the proper agentic
-    /// loop with tools/permissions/budget). This API is kept for the
-    /// "shell-process style background agent" pattern (run a separate
-    /// `astra task run` subprocess) — used by tests today, available
-    /// for future caller use.
-    #[allow(dead_code)]
-    pub fn spawn_agent(
-        &mut self,
-        description: &str,
-        run_fn: std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>,
-    ) -> String {
-        let id = format!("bg-agent-{}", NEXT_BG_ID.fetch_add(1, Ordering::Relaxed));
-        let cancel = CancellationToken::new();
-        let stdout_path = self.output_dir.join(format!("{id}.stdout"));
-        let status = Arc::new(AtomicU8::new(BgTaskStatus::Running as u8));
-
-        let handle = BackgroundTaskHandle {
-            id: id.clone(),
-            kind: BgTaskKind::Agent,
-            description: description.to_string(),
-            status: status.clone(),
-            started_at: Instant::now(),
-            cancel_token: cancel.clone(),
-            stdout_path: stdout_path.clone(),
-            stderr_path: self.output_dir.join(format!("{id}.stderr")),
-            last_output_size: 0,
-            last_activity: Instant::now(),
-        };
-        self.tasks.insert(id.clone(), handle);
-
-        let event_tx = self.event_tx.clone();
-        let task_id = id.clone();
-        let task_status = status;
-
-        self.join_set.spawn(async move {
-            let result = tokio::select! {
-                res = run_fn => res,
-                _ = cancel.cancelled() => {
-                    // Status set by poll_completions; runner just returns.
-                    let _ = &task_status;
-                    return TaskCompletion {
-                        id: task_id,
-                        status: BgTaskStatus::Killed,
-                        exit_code: None,
-                        summary: String::new(),
-                        error: None,
-                    };
-                }
-            };
-            match result {
-                Ok(output) => {
-                    // Write output to file for retrieval
-                    std::fs::write(&stdout_path, &output).ok();
-                    let summary = truncate_line(output.lines().next_back().unwrap_or(""), 80);
-                    let _ = event_tx.send(BgTaskEvent::Completed {
-                        id: task_id.clone(),
-                        exit_code: Some(0),
-                        summary: summary.clone(),
-                    });
-                    TaskCompletion {
-                        id: task_id,
-                        status: BgTaskStatus::Completed,
-                        exit_code: Some(0),
-                        summary,
-                        error: None,
-                    }
-                }
-                Err(e) => {
-                    let _ = event_tx.send(BgTaskEvent::Failed {
-                        id: task_id.clone(),
-                        error: e.clone(),
-                    });
-                    TaskCompletion {
-                        id: task_id,
-                        status: BgTaskStatus::Failed,
-                        exit_code: None,
-                        summary: String::new(),
-                        error: Some(e),
-                    }
-                }
-            }
-        });
-
-        let _ = self.event_tx.send(BgTaskEvent::Started {
-            id: id.clone(),
-            kind: BgTaskKind::Agent,
-            description: description.to_string(),
-        });
-
-        id
     }
 
     /// Spawn a shell command in the background. Returns the task ID.
@@ -282,7 +173,6 @@ impl BackgroundTaskRegistry {
 
         let handle = BackgroundTaskHandle {
             id: id.clone(),
-            kind: BgTaskKind::Shell,
             description: description.to_string(),
             status: status.clone(),
             started_at: Instant::now(),
@@ -294,8 +184,16 @@ impl BackgroundTaskRegistry {
         };
         self.tasks.insert(id.clone(), handle);
 
+        // Enqueue Started BEFORE spawning the JoinSet future. A fast-
+        // resolving runner can otherwise emit Completed before the
+        // outer code reaches the Started push, producing an out-of-
+        // order event stream for any consumer that relies on ordering.
+        self.pending_completions.push(BgTaskEvent::Started {
+            id: id.clone(),
+            description: description.to_string(),
+        });
+
         let cmd = command.to_string();
-        let event_tx = self.event_tx.clone();
         let task_id = id.clone();
         let task_status = status;
 
@@ -305,17 +203,10 @@ impl BackgroundTaskRegistry {
                 &stdout_path,
                 &stderr_path,
                 cancel,
-                &event_tx,
                 &task_id,
                 &task_status,
             )
             .await
-        });
-
-        let _ = self.event_tx.send(BgTaskEvent::Started {
-            id: id.clone(),
-            kind: BgTaskKind::Shell,
-            description: description.to_string(),
         });
 
         id
@@ -368,7 +259,6 @@ impl BackgroundTaskRegistry {
                         BgTaskStatus::Killed => BgTaskEvent::Killed { id: completion.id },
                         _ => continue,
                     };
-                    let _ = self.event_tx.send(event.clone());
                     self.pending_completions.push(event);
                 }
                 Err(e) => {
@@ -442,7 +332,7 @@ impl BackgroundTaskRegistry {
     pub fn stall_check(&mut self) {
         let mut stall_events = Vec::new();
         for handle in self.tasks.values_mut() {
-            if handle.kind != BgTaskKind::Shell || handle.status().is_terminal() {
+            if handle.status().is_terminal() {
                 continue;
             }
             if handle.status() == BgTaskStatus::Stalled {
@@ -484,12 +374,18 @@ impl BackgroundTaskRegistry {
                         stall_events.push(event);
                     }
                 }
-                // Reset timer even if not a prompt (just slow output)
-                handle.last_activity = Instant::now();
+                // No reset on the non-prompt path. Resetting hides
+                // genuinely stuck no-output processes (deadlock,
+                // infinite sleep) — every later tick would see
+                // `elapsed() <= STALL_THRESHOLD` again and never look
+                // at the tail. With reset removed, subsequent ticks
+                // keep checking on every poll; if the tail eventually
+                // grows into a recognizable prompt we still catch it.
+                // The handle.status == Stalled guard at the top of the
+                // loop already short-circuits once we DO fire.
             }
         }
         for event in stall_events {
-            let _ = self.event_tx.send(event.clone());
             self.pending_completions.push(event);
         }
     }
@@ -520,7 +416,6 @@ async fn run_shell_task(
     stdout_path: &Path,
     stderr_path: &Path,
     cancel: CancellationToken,
-    _event_tx: &broadcast::Sender<BgTaskEvent>,
     task_id: &str,
     status: &Arc<AtomicU8>,
 ) -> TaskCompletion {
@@ -790,21 +685,25 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn test_handle_with_status(status: BgTaskStatus) -> BackgroundTaskHandle {
+    /// Build a handle whose stdout/stderr live under a fresh tempdir.
+    /// Returns the `TempDir` along with the handle so the caller can
+    /// keep the dir alive for the duration of the test — Drop reclaims
+    /// it. The earlier shape used `TempDir::keep()` which leaked
+    /// `/tmp/<dir>` once per test invocation.
+    fn test_handle_with_status(status: BgTaskStatus) -> (BackgroundTaskHandle, TempDir) {
         let dir = TempDir::new().expect("temp dir");
-        let base = dir.keep();
-        BackgroundTaskHandle {
+        let handle = BackgroundTaskHandle {
             id: "bg-1".into(),
-            kind: BgTaskKind::Shell,
             description: "test".into(),
             status: Arc::new(AtomicU8::new(status as u8)),
             started_at: Instant::now(),
             cancel_token: CancellationToken::new(),
-            stdout_path: base.join("stdout.log"),
-            stderr_path: base.join("stderr.log"),
+            stdout_path: dir.path().join("stdout.log"),
+            stderr_path: dir.path().join("stderr.log"),
             last_output_size: 0,
             last_activity: Instant::now(),
-        }
+        };
+        (handle, dir)
     }
 
     #[test]
@@ -814,12 +713,52 @@ mod tests {
             "stalling only means output stopped; it must not freeze later completion/failure updates"
         );
 
-        let handle = test_handle_with_status(BgTaskStatus::Stalled);
+        let (handle, _dir) = test_handle_with_status(BgTaskStatus::Stalled);
         assert!(
             handle.set_status_if_non_terminal(BgTaskStatus::Completed),
             "real process exit must still replace a stalled placeholder state"
         );
         assert_eq!(handle.status(), BgTaskStatus::Completed);
+    }
+
+    /// REGRESSION (review MED): stall_check must NOT reset
+    /// `last_activity` on the non-prompt path. The original code
+    /// reset unconditionally with the comment "Reset timer even if
+    /// not a prompt (just slow output)" — but if size hasn't grown
+    /// there is no output at all, slow or otherwise, so the reset
+    /// just hides truly stuck no-output processes (deadlock,
+    /// infinite sleep). With STALL_THRESHOLD = 45s this is awkward
+    /// to exercise via a real process in a unit test, so we pin the
+    /// invariant at source level: the non-prompt branch contains
+    /// no `last_activity = ...` assignment.
+    #[test]
+    fn stall_check_non_prompt_branch_does_not_reset_last_activity() {
+        let source = include_str!("background_tasks.rs");
+        // Find the body of stall_check.
+        let start = source
+            .find("pub fn stall_check(&mut self) {")
+            .expect("stall_check must exist");
+        // Body ends at the closing brace of the for-loop completion;
+        // a sentinel from the function tail keeps us from over-reading.
+        let body_end = source[start..]
+            .find("for event in stall_events {")
+            .expect("stall_check must finish with the events drain");
+        let body = &source[start..start + body_end];
+
+        // Locate the else-if that handles the elapsed-without-growth path.
+        let elapsed_branch_start = body
+            .find("} else if handle.last_activity.elapsed() > STALL_THRESHOLD {")
+            .expect("elapsed-threshold branch must exist");
+        let elapsed_branch = &body[elapsed_branch_start..];
+        // Inside that arm there is exactly one `last_activity` access we
+        // care about: the unconditional-reset bug. The fix removes that
+        // line, so the branch must contain no further `last_activity =`
+        // assignment.
+        assert!(
+            !elapsed_branch.contains("handle.last_activity = Instant::now()"),
+            "non-prompt branch must NOT reset last_activity; it hides genuinely \
+             stuck processes (review MED). Branch:\n{elapsed_branch}"
+        );
     }
 
     #[tokio::test]
@@ -831,16 +770,20 @@ mod tests {
         // Wait for completion
         tokio::time::sleep(Duration::from_millis(500)).await;
         let events = reg.poll_completions();
-        assert!(!events.is_empty());
-        match &events[0] {
-            BgTaskEvent::Completed {
-                id: eid, summary, ..
-            } => {
-                assert_eq!(eid, &id);
-                assert!(summary.contains("hello"), "summary: {summary}");
-            }
-            other => panic!("expected Completed, got {other:?}"),
-        }
+        // The queue carries Started → Completed; pick out the Completed
+        // event (Started is also asserted by the dedicated ordering
+        // test `progress_events_emitted_during_long_task`).
+        let completed = events
+            .iter()
+            .find_map(|ev| match ev {
+                BgTaskEvent::Completed {
+                    id: eid, summary, ..
+                } => Some((eid.clone(), summary.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected Completed in events; got {events:?}"));
+        assert_eq!(completed.0, id);
+        assert!(completed.1.contains("hello"), "summary: {}", completed.1);
     }
 
     #[tokio::test]
@@ -910,29 +853,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unicode_summary_truncation_never_slices_mid_codepoint() {
-        let tmp = TempDir::new().unwrap();
-        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
-        let id = reg.spawn_agent("unicode", Box::pin(async { Ok("界".repeat(120)) }));
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let events = reg.poll_completions();
-        let summary = events
-            .iter()
-            .find_map(|event| match event {
-                BgTaskEvent::Completed {
-                    id: eid, summary, ..
-                } if eid == &id => Some(summary),
-                _ => None,
-            })
-            .expect("completion event");
-        assert!(
-            summary.ends_with('…'),
-            "summary should be truncated: {summary}"
-        );
-    }
-
-    #[tokio::test]
     async fn spawn_nonexistent_command_fails() {
         let tmp = TempDir::new().unwrap();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
@@ -940,17 +860,26 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(500)).await;
         let events = reg.poll_completions();
-        assert!(!events.is_empty());
-        match &events[0] {
+        // Skip Started; the terminal event is what we care about
+        // (`sh -c /missing` exits 127 without a spawn error).
+        let terminal = events
+            .iter()
+            .find(|ev| {
+                matches!(
+                    ev,
+                    BgTaskEvent::Failed { .. } | BgTaskEvent::Completed { .. }
+                )
+            })
+            .unwrap_or_else(|| panic!("expected terminal event in {events:?}"));
+        match terminal {
             BgTaskEvent::Failed { id: eid, error } => {
                 assert_eq!(eid, &id);
                 assert!(!error.is_empty());
             }
             BgTaskEvent::Completed { exit_code, .. } => {
-                // sh -c with unknown command exits 127, not spawn error
                 assert_ne!(*exit_code, Some(0));
             }
-            other => panic!("expected Failed or non-zero Completed, got {other:?}"),
+            _ => unreachable!(),
         }
     }
 
@@ -1044,30 +973,82 @@ mod tests {
     async fn progress_events_emitted_during_long_task() {
         let tmp = TempDir::new().unwrap();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
-        let mut rx = reg.subscribe();
 
         let _id = reg.spawn_shell(
             "for i in 1 2 3; do echo line$i; sleep 0.1; done",
             "progress test",
         );
 
-        // Collect events over ~500ms
+        // poll_completions drains the queue. Calling it before the
+        // task finishes captures only Started; calling it after also
+        // captures Completed. We do both to catch ordering bugs:
+        // Started must surface before Completed.
+        let early = reg.poll_completions();
         tokio::time::sleep(Duration::from_millis(600)).await;
-        let _ = reg.poll_completions();
+        let late = reg.poll_completions();
 
-        // Should have received at least Started + Completed
         let mut events = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            events.push(ev);
+        events.extend(early);
+        events.extend(late);
+
+        let started_pos = events
+            .iter()
+            .position(|e| matches!(e, BgTaskEvent::Started { .. }))
+            .expect("missing Started event");
+        let completed_pos = events
+            .iter()
+            .position(|e| matches!(e, BgTaskEvent::Completed { .. }))
+            .expect("missing Completed event");
+        assert!(
+            started_pos < completed_pos,
+            "Started must precede Completed in the event stream; got {events:?}"
+        );
+    }
+
+    /// REGRESSION (review CRIT): every lifecycle event must surface
+    /// from `poll_completions` exactly once. Prior code pushed each
+    /// event to BOTH a broadcast channel AND `pending_completions`,
+    /// so a consumer that subscribed and polled saw the same event
+    /// twice (and `drain_join_set` even fired the broadcast twice
+    /// for the spawn_agent runner that emitted Completed inside the
+    /// closure). Pin the post-fix invariant: each event-id appears
+    /// at most once in the full event stream.
+    #[tokio::test]
+    async fn poll_completions_yields_each_event_exactly_once() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell("echo hi", "dedup test");
+
+        // Drain across multiple polls until we observe terminal status
+        // OR exceed a generous timeout. Each call appends to `events`.
+        let mut events = Vec::new();
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            events.extend(reg.poll_completions());
+            if events
+                .iter()
+                .any(|e| matches!(e, BgTaskEvent::Completed { .. }))
+            {
+                break;
+            }
         }
-        let has_started = events
+
+        let started_count = events
             .iter()
-            .any(|e| matches!(e, BgTaskEvent::Started { .. }));
-        let has_completed = events
+            .filter(|e| matches!(e, BgTaskEvent::Started { id: eid, .. } if eid == &id))
+            .count();
+        let completed_count = events
             .iter()
-            .any(|e| matches!(e, BgTaskEvent::Completed { .. }));
-        assert!(has_started, "missing Started event");
-        assert!(has_completed, "missing Completed event");
+            .filter(|e| matches!(e, BgTaskEvent::Completed { id: eid, .. } if eid == &id))
+            .count();
+        assert_eq!(
+            started_count, 1,
+            "Started must appear exactly once across all polls; events: {events:?}"
+        );
+        assert_eq!(
+            completed_count, 1,
+            "Completed must appear exactly once across all polls; events: {events:?}"
+        );
     }
 
     // ── TDD: spinner state for active tasks ─────────────────────

@@ -1063,6 +1063,29 @@ impl ChatWidget {
             label
         };
         self.cancelled_task_ids.remove(&key);
+        // If a prior `ToolStarted("agent", tool_use_id)` already bound
+        // `tool_use_id → <provisional key>` (either the bare
+        // `tool_use_id` for action=="agent", or `pending:<tool_use_id>`
+        // for action=="spawn"/"get_result"), and a structured
+        // `AgentControlStarted` now arrives with the real `agent_id`,
+        // explicitly rename. Without this, `tool_use_to_key` points at
+        // the provisional key forever and `tool_uses_for_key(real_agent_id)`
+        // returns empty — child tool events never reach the parent
+        // task panel.
+        //
+        // Guard with the provisional-key shape so a stray duplicate
+        // ToolStarted whose agent_id binding has already been promoted
+        // to a real id can't clobber the canonical row.
+        let provisional = provisional_agent_key(&tool_use_id);
+        if let Some(existing) = self
+            .agent_runs
+            .key_for_tool_use(&tool_use_id)
+            .map(str::to_string)
+            && existing != key
+            && (existing == tool_use_id || existing == provisional)
+        {
+            self.agent_runs.rename(&existing, key.clone());
+        }
         self.agent_runs
             .ensure_running_for_tool_use(key, label, Some(&tool_use_id));
     }

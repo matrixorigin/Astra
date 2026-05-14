@@ -518,6 +518,22 @@ async fn spawn_tcp_router(app: Router) -> (SocketAddr, tokio::task::JoinHandle<(
     (addr, handle)
 }
 
+/// Build a reqwest client that bypasses any ambient HTTP proxy.
+///
+/// Local dev environments commonly export `http_proxy` (e.g. for
+/// reaching internal hosts). The default `Client::new()` honors that
+/// proxy and routes the test's `http://127.0.0.1:<random_port>` calls
+/// through it — the proxy can't reach a private listener port and
+/// returns 503 with `proxy-connection: close`. `no_proxy()` forces
+/// reqwest to ignore proxy env so the loopback request lands at the
+/// axum router we just spawned.
+fn local_client() -> Client {
+    Client::builder()
+        .no_proxy()
+        .build()
+        .expect("reqwest Client::builder().no_proxy() must build")
+}
+
 fn parse_sse_events(body: &str) -> Vec<Value> {
     body.lines()
         .filter_map(|line| line.strip_prefix("data: "))
@@ -540,14 +556,14 @@ async fn get_stream(
         .await
         .expect("GET run stream must reach axum router");
     let status = response.status();
-    assert!(
-        status == StatusCode::OK,
-        "GET run stream expected 200, got {status}"
-    );
     let body = response
         .text()
         .await
         .expect("SSE run stream body must be readable");
+    assert!(
+        status == StatusCode::OK,
+        "GET run stream expected 200, got {status}; body: {body}"
+    );
     parse_sse_events(&body)
 }
 
@@ -913,7 +929,7 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
     let shared_store = Arc::new(RwLock::new(initial_store.clone()));
     let app = build_joint_app(pool.clone(), user_id.clone(), shared_store.clone());
     let (addr, handle) = spawn_tcp_router(app).await;
-    let client = Client::new();
+    let client = local_client();
     let mut seen = BTreeSet::new();
     let mut next_index = 0_i64;
 
@@ -1116,7 +1132,7 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
     let shared_store = Arc::new(RwLock::new(store));
     let app = build_joint_app(pool.clone(), user_id.clone(), shared_store.clone());
     let (addr, handle) = spawn_tcp_router(app).await;
-    let client = Client::new();
+    let client = local_client();
     let initial_events = get_stream(&client, addr, &run_id, 0).await;
     assert!(
         initial_events.iter().any(|event| event
@@ -1364,7 +1380,7 @@ async fn e2e_joint_4_s10_five_level_delegation_bubble_up_and_retry_node() {
     let shared_store = Arc::new(RwLock::new(store));
     let app = build_joint_app(pool.clone(), user_id.clone(), shared_store);
     let (addr, handle) = spawn_tcp_router(app).await;
-    let client = Client::new();
+    let client = local_client();
     let health = client
         .get(format!("http://{addr}/health"))
         .send()
@@ -1604,7 +1620,7 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
     let shared_store = Arc::new(RwLock::new(store));
     let app = build_joint_app(pool.clone(), user_id.clone(), shared_store);
     let (addr, handle) = spawn_tcp_router(app).await;
-    let client = Client::new();
+    let client = local_client();
 
     for device_idx in 1..=4 {
         let state: Value = client
@@ -1707,10 +1723,25 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
         expired >= 1,
         "S14 sweeper must expire at least device-2 lease, got {expired}"
     );
-    let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .expect("S14 device lease SSE parity event must be published")
-        .expect("S14 device lease event receiver must be open");
+    // The sweeper publishes one event per expired lease across the
+    // process-wide broadcast channel. When other concurrent tests
+    // also leak stale leases, our `rx` sees their events too — so we
+    // can't take the first event blindly. Drain the channel until we
+    // find the one keyed to *our* session_id (or time out).
+    let event = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let ev = tokio::time::timeout(remaining, rx.recv())
+                .await
+                .expect("S14 device lease SSE parity event must be published")
+                .expect("S14 device lease event receiver must be open");
+            if ev.get("session_id").and_then(Value::as_str) == Some(session_id.as_str()) {
+                break ev;
+            }
+            // Foreign session — keep draining until we hit ours.
+        }
+    };
     assert!(
         event.get("type").and_then(Value::as_str) == Some("device_lease_expired")
             && event.get("device_id").and_then(Value::as_str) == Some("device-2"),
