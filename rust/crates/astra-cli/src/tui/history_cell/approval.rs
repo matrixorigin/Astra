@@ -192,6 +192,32 @@ impl ApprovalCell {
         }
     }
 
+    /// Issue #326 P3: returns the human-readable reason the
+    /// Always button cannot persist a Project/User rule for
+    /// this approval, or None when persistence is allowed.
+    /// Mirrors the policy in
+    /// [`astra_turn_core::permission_scope::permitted_scopes`]
+    /// using only the labels we render in the cell — keeps the
+    /// view layer free of the engine's `RiskTag` enum.
+    pub fn always_disabled_reason(&self) -> Option<&'static str> {
+        // Sub-agent requests can never persist on the parent's
+        // permissions.json.
+        if self.source_agent.is_some() {
+            return Some("sub-agent");
+        }
+        for label in &self.risk_tag_labels {
+            match label.as_str() {
+                "WritesSensitiveFile" => return Some("sensitive path"),
+                "GitDestructive" => return Some("git destructive"),
+                "WritesOutsideWorkspace" => return Some("outside workspace"),
+                "CredentialAccess" => return Some("credential access"),
+                "MCPUnknownCapability" => return Some("MCP unknown"),
+                _ => {}
+            }
+        }
+        None
+    }
+
     fn button_line(&self) -> Line<'static> {
         // Button row lives INSIDE the card, so the caller pads the
         // leading bar. We only emit spans for the buttons + their
@@ -345,6 +371,34 @@ impl HistoryCell for ApprovalCell {
             lines.push(Line::from(vec![
                 bar.clone(),
                 Span::styled(outcome.clone(), outcome_style),
+            ]));
+        }
+
+        // Issue #326 P3 / scenarios #6/#9/#15: when the request
+        // carries destructive risk tags, advertise that the
+        // Always button can't be used to persist a project /
+        // user rule. The button row itself stays clickable —
+        // the Always-resolve handler upstream still records
+        // the override in session-only memory — but the user
+        // sees up-front why no on-disk rule landed.
+        if self.always_disabled_reason().is_some() {
+            let reason_text = self.always_disabled_reason().unwrap_or_default();
+            lines.push(Line::from(vec![
+                bar.clone(),
+                Span::styled(
+                    "Always: ".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    "session-only ".to_string(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("({reason_text})"),
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]));
         }
 
@@ -620,6 +674,83 @@ mod tests {
             Color::LightRed
         );
         assert_eq!(highest_risk_color(&["BashExecute".into()]), Color::Cyan);
+    }
+
+    // ── Issue #326 P3 / R2 Major 1: scope-picker policy ──────
+
+    #[test]
+    fn always_disabled_for_destructive_risk() {
+        let cell = ApprovalCell::new(
+            1,
+            "edit_file".into(),
+            "edit /etc/hosts".into(),
+            None,
+            "writes outside workspace".into(),
+            true,
+        )
+        .with_risk_tag_labels(vec!["WritesOutsideWorkspace".into()]);
+        assert_eq!(cell.always_disabled_reason(), Some("outside workspace"));
+    }
+
+    #[test]
+    fn always_disabled_for_sensitive_path() {
+        let cell = ApprovalCell::new(
+            1,
+            "write_file".into(),
+            "write .env".into(),
+            None,
+            "sensitive path".into(),
+            true,
+        )
+        .with_risk_tag_labels(vec!["WritesSensitiveFile".into()]);
+        assert_eq!(cell.always_disabled_reason(), Some("sensitive path"));
+    }
+
+    #[test]
+    fn always_disabled_for_sub_agent_request() {
+        let cell = ApprovalCell::new(
+            1,
+            "bash".into(),
+            "npm test".into(),
+            None,
+            "execute".into(),
+            true,
+        )
+        .with_source_agent("review-subagent");
+        assert_eq!(cell.always_disabled_reason(), Some("sub-agent"));
+    }
+
+    #[test]
+    fn always_enabled_for_benign_request() {
+        let cell = ApprovalCell::new(
+            1,
+            "bash".into(),
+            "npm test".into(),
+            None,
+            "execute".into(),
+            true,
+        )
+        .with_risk_tag_labels(vec!["BashExecute".into()]);
+        assert!(cell.always_disabled_reason().is_none());
+    }
+
+    #[test]
+    fn always_disabled_renders_in_card() {
+        let cell = ApprovalCell::new(
+            1,
+            "bash".into(),
+            "rm -rf /".into(),
+            None,
+            "execute".into(),
+            true,
+        )
+        .with_risk_tag_labels(vec!["GitDestructive".into()]);
+        let rendered = render(&cell);
+        assert!(
+            rendered.contains("Always: session-only"),
+            "destructive cell must advertise the disabled-Always state, got:\n{rendered}"
+        );
+        assert!(rendered.contains("git destructive"));
     }
 
     // ── Issue #326 P3 / R1 Major 11: snapshot tests at 3 widths ──

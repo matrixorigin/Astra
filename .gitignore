@@ -99,3 +99,8 @@ rust/budget-app/
 # Local cargo config lives here; only audit policy is tracked for CI.
 rust/.cargo/*
 !rust/.cargo/audit.toml
+
+
+# insta-rs runtime artifacts (only the canonical .snap is tracked)
+*.snap.new
+.insta/
