@@ -1980,6 +1980,45 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         _ => astra_turn_core::permission_engine::RiskTag::BashExecute,
                     };
                     metadata.risk_tags = vec![risk_tag];
+                    // Issue #326 P5f / R2 Major 3: for file-mutating
+                    // tools, snapshot the target file's SHA-256
+                    // here (host-side, NOT from LLM args). The
+                    // executor's pre-execution stale-check in
+                    // ApprovalQueue::focused_stale_check compares
+                    // this against a fresh read; mismatch =
+                    // re-prompt with new diff. Skipping here
+                    // means no stale revalidation, which is
+                    // safe-fail — the user just doesn't get the
+                    // protection for this tool.
+                    if matches!(
+                        t.as_str(),
+                        "write_file" | "str_replace" | "edit_file"
+                    ) {
+                        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                            let path_buf = std::path::Path::new(path);
+                            match astra_turn_core::approval_base_digest::compute_file_digest(
+                                path_buf,
+                            ) {
+                                Ok(Some(digest)) => {
+                                    metadata.base_digest = Some(digest);
+                                }
+                                Ok(None) => {
+                                    // Brand-new write to a path
+                                    // that doesn't exist yet —
+                                    // base_digest stays None so
+                                    // the StaleCheck routes
+                                    // through StillAbsent.
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "stream_render: failed to compute base_digest for \
+                                         {tool}={path:?}: {e} — approval will lack stale revalidation",
+                                        tool = t,
+                                    );
+                                }
+                            }
+                        }
+                    }
                     let _ = tx.send(super::chat_stream::ApprovalRequest {
                         tool: t.clone(),
                         header,
