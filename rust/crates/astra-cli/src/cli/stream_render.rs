@@ -1954,15 +1954,39 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     // would call ApprovalRequest::bare instead.
                     let mut metadata =
                         crate::tui::approval::queue::ApprovalMetadata::default();
+
+                    // Issue #326 P3 / scenario #12: detect
+                    // compound shell commands so the renderer
+                    // can split them into per-step lines AND we
+                    // can suppress will_save_preview (a compound
+                    // command shouldn't ship as a persisted rule
+                    // — which subcommand would the rule allow?).
+                    let mut suppress_will_save = false;
+                    if t == "bash" {
+                        if let Some(cmd) = args
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                        {
+                            let parsed = astra_turn_core::permission_compound_command::tokenize_compound_command(cmd);
+                            if parsed.steps.len() > 1 || parsed.has_dynamic_eval {
+                                suppress_will_save = true;
+                            }
+                        }
+                    }
+
                     // Will-save: what would Always persist? We use
                     // the same make_allow_rule the post-resolve
                     // path uses, so the user sees an exact preview
-                    // of what permissions.json will gain.
-                    let will_save =
-                        crate::permission_manager::PermissionManager::make_allow_rule(
-                            &t, args,
-                        );
-                    metadata.will_save_preview = Some(will_save);
+                    // of what permissions.json will gain. Skip for
+                    // compound / dynamic-eval shell commands —
+                    // those have no sound rule shape.
+                    if !suppress_will_save {
+                        let will_save =
+                            crate::permission_manager::PermissionManager::make_allow_rule(
+                                &t, args,
+                            );
+                        metadata.will_save_preview = Some(will_save);
+                    }
                     // Risk classification: a coarse read-only ↔
                     // write ↔ execute decision driven by the
                     // tool's cloud_gated_kind. The full multi-tag
@@ -1980,6 +2004,26 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         _ => astra_turn_core::permission_engine::RiskTag::BashExecute,
                     };
                     metadata.risk_tags = vec![risk_tag];
+
+                    // Issue #326 P5 / scenario #8: when the tool
+                    // mutates a sensitive-path file, escalate the
+                    // risk tag. The renderer's existing redact
+                    // path covers content masking; the tag flips
+                    // the badge colour.
+                    if let Some(path) = args
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                    {
+                        if astra_turn_core::permission_redact::matches_sensitive_path(path)
+                            && !metadata.risk_tags.contains(
+                                &astra_turn_core::permission_engine::RiskTag::WritesSensitiveFile,
+                            )
+                        {
+                            metadata.risk_tags.push(
+                                astra_turn_core::permission_engine::RiskTag::WritesSensitiveFile,
+                            );
+                        }
+                    }
                     // Issue #326 P5 / R2 Major 5: MCP tools without
                     // a registered ToolCapabilityMetadata default to
                     // MCPUnknownCapability — this is the contract
