@@ -33,6 +33,26 @@ pub enum SideEffectClass {
     Unknown,
 }
 
+/// How `path_pattern` should be interpreted for file-shaped approvals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PathMatchKind {
+    /// Historical path pattern behavior: exact path, or directory `/**`.
+    #[default]
+    Pattern,
+    /// Exact path selected by an explicit Exact approval.
+    Exact,
+    /// Literal prefix selected by Custom prefix for a path-shaped tool.
+    Prefix,
+}
+
+impl PathMatchKind {
+    #[must_use]
+    pub fn is_pattern(&self) -> bool {
+        *self == Self::Pattern
+    }
+}
+
 /// Content-aware fingerprint for a tool approval decision.
 ///
 /// Two invocations with the same fingerprint are considered equivalent for
@@ -53,6 +73,9 @@ pub struct ApprovalFingerprint {
     /// Target path pattern for file tools (e.g., `"src/lib.rs"`, `"src/**"`).
     /// `None` for non-file tools or when path is not extractable.
     pub path_pattern: Option<String>,
+    /// Interpretation of `path_pattern`.
+    #[serde(default, skip_serializing_if = "PathMatchKind::is_pattern")]
+    pub path_match: PathMatchKind,
     /// Side-effect classification.
     pub side_effect: SideEffectClass,
 }
@@ -66,6 +89,7 @@ impl ApprovalFingerprint {
             command_exact: Some(normalize_command(command)),
             command_prefix: Some(prefix),
             path_pattern: None,
+            path_match: PathMatchKind::Pattern,
             side_effect: if is_read_only {
                 SideEffectClass::ReadOnly
             } else {
@@ -81,6 +105,7 @@ impl ApprovalFingerprint {
             command_exact: Some(normalize_command(command)),
             command_prefix: None,
             path_pattern: None,
+            path_match: PathMatchKind::Pattern,
             side_effect: if is_read_only {
                 SideEffectClass::ReadOnly
             } else {
@@ -96,6 +121,7 @@ impl ApprovalFingerprint {
             command_exact: None,
             command_prefix: Some(prefix.trim().to_string()),
             path_pattern: None,
+            path_match: PathMatchKind::Pattern,
             side_effect: if is_read_only {
                 SideEffectClass::ReadOnly
             } else {
@@ -111,6 +137,7 @@ impl ApprovalFingerprint {
             command_exact: None,
             command_prefix: None,
             path_pattern: path.map(normalize_path_pattern),
+            path_match: PathMatchKind::Pattern,
             side_effect: SideEffectClass::Write,
         }
     }
@@ -122,6 +149,7 @@ impl ApprovalFingerprint {
             command_exact: None,
             command_prefix: None,
             path_pattern: path.map(|p| p.trim().to_string()),
+            path_match: PathMatchKind::Exact,
             side_effect: SideEffectClass::Write,
         }
     }
@@ -133,6 +161,19 @@ impl ApprovalFingerprint {
             command_exact: None,
             command_prefix: None,
             path_pattern: pattern.map(|p| p.trim().to_string()),
+            path_match: PathMatchKind::Pattern,
+            side_effect: SideEffectClass::Write,
+        }
+    }
+
+    /// Create a literal path-prefix fingerprint.
+    pub fn file_op_prefix(tool_name: &str, prefix: &str) -> Self {
+        Self {
+            tool_name: tool_name.to_lowercase(),
+            command_exact: None,
+            command_prefix: None,
+            path_pattern: Some(prefix.trim().to_string()),
+            path_match: PathMatchKind::Prefix,
             side_effect: SideEffectClass::Write,
         }
     }
@@ -144,6 +185,7 @@ impl ApprovalFingerprint {
             command_exact: None,
             command_prefix: None,
             path_pattern: None,
+            path_match: PathMatchKind::Pattern,
             side_effect: SideEffectClass::Unknown,
         }
     }
@@ -190,7 +232,7 @@ impl ApprovalFingerprint {
         if let Some(ref my_path) = self.path_pattern {
             match &other.path_pattern {
                 Some(their_path) => {
-                    if !path_pattern_matches(my_path, their_path) {
+                    if !path_matches(self.path_match, my_path, their_path) {
                         return false;
                     }
                 }
@@ -211,7 +253,12 @@ impl ApprovalFingerprint {
             parts.push(format!("exact:{command}"));
         }
         if let Some(ref path) = self.path_pattern {
-            parts.push(format!("path:{path}"));
+            let label = match self.path_match {
+                PathMatchKind::Pattern => "path",
+                PathMatchKind::Exact => "path_exact",
+                PathMatchKind::Prefix => "path_prefix",
+            };
+            parts.push(format!("{label}:{path}"));
         }
         parts.join(" | ")
     }
@@ -299,6 +346,14 @@ fn path_pattern_matches(pattern: &str, candidate: &str) -> bool {
         return candidate.starts_with(prefix);
     }
     false
+}
+
+fn path_matches(kind: PathMatchKind, pattern: &str, candidate: &str) -> bool {
+    match kind {
+        PathMatchKind::Pattern => path_pattern_matches(pattern, candidate),
+        PathMatchKind::Exact => pattern == candidate,
+        PathMatchKind::Prefix => candidate.starts_with(pattern),
+    }
 }
 
 // ─── Denial Tracking ─────────────────────────────────────────────────────────
@@ -643,6 +698,25 @@ mod tests {
         let same_dir = ApprovalFingerprint::file_op("write_file", Some("src/turn/host.rs"));
         // Both normalize to "src/turn/**"
         assert!(broad.matches(&same_dir));
+    }
+
+    #[test]
+    fn path_prefix_fingerprint_matches_literal_prefix() {
+        let approved = ApprovalFingerprint::file_op_prefix("write_file", "zzz");
+        let zzz2 = ApprovalFingerprint::file_op_exact("write_file", Some("zzz2.md"));
+        let other = ApprovalFingerprint::file_op_exact("write_file", Some("abc.md"));
+
+        assert!(approved.matches(&zzz2));
+        assert!(!approved.matches(&other));
+    }
+
+    #[test]
+    fn exact_path_fingerprint_does_not_match_sibling_prefix() {
+        let exact = ApprovalFingerprint::file_op_exact("write_file", Some("zzz3.md"));
+        let sibling = ApprovalFingerprint::file_op_exact("write_file", Some("zzz3.md.bak"));
+
+        assert!(exact.matches(&exact));
+        assert!(!exact.matches(&sibling));
     }
 
     #[test]

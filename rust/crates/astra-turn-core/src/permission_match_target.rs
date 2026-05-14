@@ -133,7 +133,7 @@ pub fn fingerprint_for_match_target(
                 )
             }
             Some(CloudGatedToolKind::Write) if !prefix.is_empty() => {
-                ApprovalFingerprint::file_op_pattern(tool_name, Some(prefix))
+                ApprovalFingerprint::file_op_prefix(tool_name, prefix)
             }
             _ => ApprovalFingerprint::bare(tool_name),
         },
@@ -186,6 +186,7 @@ fn exact_rule(tool_name: &str, args: &Value) -> Option<String> {
                 argv_exact: Some(cmd.to_string()),
                 argv_prefix: None,
                 path_glob: None,
+                path_prefix: None,
                 op: Some("execute".to_string()),
                 cwd_root: None,
                 git_branch: None,
@@ -201,6 +202,7 @@ fn exact_rule(tool_name: &str, args: &Value) -> Option<String> {
                 argv_exact: None,
                 argv_prefix: None,
                 path_glob: Some(path),
+                path_prefix: None,
                 op: Some("write".to_string()),
                 cwd_root: None,
                 git_branch: None,
@@ -222,6 +224,7 @@ fn prefix_rule(tool_name: &str, _args: &Value, prefix: &str) -> Option<String> {
             argv_exact: None,
             argv_prefix: Some(prefix.to_string()),
             path_glob: None,
+            path_prefix: None,
             op: Some("execute".to_string()),
             cwd_root: None,
             git_branch: None,
@@ -233,7 +236,8 @@ fn prefix_rule(tool_name: &str, _args: &Value, prefix: &str) -> Option<String> {
             tool: tool_name.to_string(),
             argv_exact: None,
             argv_prefix: None,
-            path_glob: Some(prefix.to_string()),
+            path_glob: None,
+            path_prefix: Some(prefix.to_string()),
             op: Some("write".to_string()),
             cwd_root: None,
             git_branch: None,
@@ -296,6 +300,51 @@ mod tests {
             &AllowMatchTarget::Prefix("cargo test".to_string()),
         );
         assert_eq!(rule, r#"Bash(argv_prefix="cargo test", op="execute")"#);
+    }
+
+    #[test]
+    fn path_prefix_rule_uses_literal_path_prefix() {
+        let args = serde_json::json!({"path": "zzz1.md"});
+        let rule = allow_rule_for_match_target(
+            "write_file",
+            &args,
+            &AllowMatchTarget::Prefix("zzz".to_string()),
+        );
+        assert_eq!(rule, r#"write_file(path_prefix="zzz", op="write")"#);
+
+        let parsed = PermissionRule::parse(&rule);
+        assert!(parsed.matches_with_context(
+            "write_file",
+            &RuleMatchContext::from_tool_args(
+                "write_file",
+                &serde_json::json!({"path": "zzz2.md"})
+            )
+        ));
+        assert!(!parsed.matches_with_context(
+            "write_file",
+            &RuleMatchContext::from_tool_args("write_file", &serde_json::json!({"path": "abc.md"}))
+        ));
+    }
+
+    #[test]
+    fn path_prefix_match_target_covers_later_write_paths() {
+        let args = serde_json::json!({"path": "zzz1.md"});
+        let approved = fingerprint_for_match_target(
+            "write_file",
+            &args,
+            &AllowMatchTarget::Prefix("zzz".into()),
+        );
+        let later = crate::approval_fingerprint::ApprovalFingerprint::file_op(
+            "write_file",
+            Some("zzz2.md"),
+        );
+        let other =
+            crate::approval_fingerprint::ApprovalFingerprint::file_op("write_file", Some("abc.md"));
+        let mut overrides = crate::approval_fingerprint::FingerprintedOverrides::default();
+        overrides.insert(approved, true);
+
+        assert_eq!(overrides.check(&later), Some(true));
+        assert_eq!(overrides.check(&other), None);
     }
 
     #[test]

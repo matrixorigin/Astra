@@ -5143,7 +5143,9 @@ mod tests {
         // let it run `Bash(rm -rf …)`); it must reconstruct the same
         // command-prefix-level fingerprint and only allow `cargo test`.
         use astra_runtime::orchestration::PermissionMode as RuntimeMode;
-        use astra_turn_core::approval_fingerprint::{ApprovalFingerprint, SideEffectClass};
+        use astra_turn_core::approval_fingerprint::{
+            ApprovalFingerprint, PathMatchKind, SideEffectClass,
+        };
 
         let dir = tempfile::tempdir().unwrap();
         let mut parent = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
@@ -5154,6 +5156,7 @@ mod tests {
             command_exact: None,
             command_prefix: Some("cargo test".to_string()),
             path_pattern: None,
+            path_match: PathMatchKind::Pattern,
             side_effect: SideEffectClass::Execute,
         };
         parent.session_overrides.insert(cargo_test_fp.clone(), true);
@@ -5181,6 +5184,7 @@ mod tests {
             command_exact: None,
             command_prefix: Some("rm -rf".to_string()),
             path_pattern: None,
+            path_match: PathMatchKind::Pattern,
             side_effect: SideEffectClass::Execute,
         };
         let rm_match = child.session_overrides.check(&rm_fp);

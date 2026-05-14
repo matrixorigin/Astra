@@ -41,6 +41,7 @@
 //! Bash(argv_exact="npm test -- --watch")
 //! Bash(argv_prefix="npm test", cwd_root="packages/web")
 //! Bash(argv_prefix="cargo test")
+//! Edit(path_prefix="src/generated/", op="write")
 //! Edit(path_glob="src/**/*.rs", op="write")
 //! Edit(path_glob="src/auth/*.ts", op="read")
 //! Network(tool="web_fetch", domain="api.github.com")
@@ -87,6 +88,11 @@ pub struct PermissionRuleV2 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_glob: Option<String>,
 
+    /// Edit/Read class: literal path prefix. Unlike `path_glob`, this
+    /// does not interpret `*`, `?`, or braces as metacharacters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+
     /// Edit class: operation kind (`"read"` / `"write"`). For Read
     /// this is implicit but P5 will allow restricting writes
     /// independently of reads.
@@ -131,6 +137,7 @@ impl PermissionRuleV2 {
             argv_exact: None,
             argv_prefix: Some(argv_prefix.into()),
             path_glob: None,
+            path_prefix: None,
             op: None,
             cwd_root: None,
             git_branch: None,
@@ -148,6 +155,7 @@ impl PermissionRuleV2 {
             argv_exact: None,
             argv_prefix: None,
             path_glob: Some(path_glob.into()),
+            path_prefix: None,
             op: Some(op.into()),
             cwd_root: None,
             git_branch: None,
@@ -165,6 +173,7 @@ impl PermissionRuleV2 {
             argv_exact: None,
             argv_prefix: None,
             path_glob: None,
+            path_prefix: None,
             op: None,
             cwd_root: None,
             git_branch: None,
@@ -197,6 +206,11 @@ pub enum RuleParseError {
     UnknownField { tool: String, key: String },
     /// A required field (e.g. tool name) was empty.
     MissingTool,
+    /// Two fields that describe the same dimension were set together.
+    ConflictingFields {
+        first: &'static str,
+        second: &'static str,
+    },
 }
 
 impl std::fmt::Display for RuleParseError {
@@ -212,6 +226,9 @@ impl std::fmt::Display for RuleParseError {
                 write!(f, "unknown key `{key}` for tool `{tool}`")
             }
             Self::MissingTool => write!(f, "rule has no tool name"),
+            Self::ConflictingFields { first, second } => {
+                write!(f, "`{first}` and `{second}` cannot be set together")
+            }
         }
     }
 }
@@ -241,6 +258,7 @@ pub fn parse_rule_v2(s: &str) -> Result<PermissionRuleV2, RuleParseError> {
             argv_exact: None,
             argv_prefix: None,
             path_glob: None,
+            path_prefix: None,
             op: None,
             cwd_root: None,
             git_branch: None,
@@ -272,6 +290,7 @@ pub fn parse_rule_v2(s: &str) -> Result<PermissionRuleV2, RuleParseError> {
             argv_exact: None,
             argv_prefix: None,
             path_glob: None,
+            path_prefix: None,
             op: None,
             cwd_root: None,
             git_branch: None,
@@ -303,6 +322,7 @@ pub fn parse_rule_v2(s: &str) -> Result<PermissionRuleV2, RuleParseError> {
         argv_exact: None,
         argv_prefix: None,
         path_glob: None,
+        path_prefix: None,
         op: None,
         cwd_root: None,
         git_branch: None,
@@ -333,6 +353,7 @@ pub fn parse_rule_v2(s: &str) -> Result<PermissionRuleV2, RuleParseError> {
             "argv_exact" => rule.argv_exact.is_some(),
             "argv_prefix" => rule.argv_prefix.is_some(),
             "path_glob" => rule.path_glob.is_some(),
+            "path_prefix" => rule.path_prefix.is_some(),
             "op" => rule.op.is_some(),
             "cwd_root" => rule.cwd_root.is_some(),
             "git_branch" => rule.git_branch.is_some(),
@@ -348,6 +369,7 @@ pub fn parse_rule_v2(s: &str) -> Result<PermissionRuleV2, RuleParseError> {
             "argv_exact" => rule.argv_exact = Some(value.to_string()),
             "argv_prefix" => rule.argv_prefix = Some(value.to_string()),
             "path_glob" => rule.path_glob = Some(value.to_string()),
+            "path_prefix" => rule.path_prefix = Some(value.to_string()),
             "op" => rule.op = Some(value.to_string()),
             "cwd_root" => rule.cwd_root = Some(value.to_string()),
             "git_branch" => rule.git_branch = Some(value.to_string()),
@@ -370,6 +392,13 @@ pub fn parse_rule_v2(s: &str) -> Result<PermissionRuleV2, RuleParseError> {
         }
     }
 
+    if rule.path_glob.is_some() && rule.path_prefix.is_some() {
+        return Err(RuleParseError::ConflictingFields {
+            first: "path_glob",
+            second: "path_prefix",
+        });
+    }
+
     Ok(rule)
 }
 
@@ -386,6 +415,9 @@ pub fn serialize_rule_v2(rule: &PermissionRuleV2) -> String {
     }
     if let Some(v) = &rule.path_glob {
         fields.push(("path_glob".into(), v.clone()));
+    }
+    if let Some(v) = &rule.path_prefix {
+        fields.push(("path_prefix".into(), v.clone()));
     }
     if let Some(v) = &rule.op {
         fields.push(("op".into(), v.clone()));
@@ -504,12 +536,34 @@ mod tests {
     }
 
     #[test]
+    fn v2_edit_path_prefix_op_roundtrip() {
+        let rule = PermissionRuleV2 {
+            tool: "write_file".to_string(),
+            argv_exact: None,
+            argv_prefix: None,
+            path_glob: None,
+            path_prefix: Some("zzz".to_string()),
+            op: Some("write".to_string()),
+            cwd_root: None,
+            git_branch: None,
+            domain: None,
+            capability: None,
+            extra: BTreeMap::new(),
+        };
+        let s = serialize_rule_v2(&rule);
+        assert_eq!(s, r#"write_file(path_prefix="zzz", op="write")"#);
+        let parsed = parse_rule_v2(&s).unwrap();
+        assert_eq!(parsed, rule);
+    }
+
+    #[test]
     fn v2_full_field_roundtrip() {
         let rule = PermissionRuleV2 {
             tool: "Bash".to_string(),
             argv_exact: None,
             argv_prefix: Some("cargo test".to_string()),
             path_glob: None,
+            path_prefix: None,
             op: None,
             cwd_root: Some("packages/web".to_string()),
             git_branch: Some("main".to_string()),
@@ -612,6 +666,14 @@ mod tests {
     fn duplicate_field_errors_loudly() {
         let err = parse_rule_v2(r#"Bash(argv_prefix="a", argv_prefix="b")"#).unwrap_err();
         assert!(matches!(err, RuleParseError::DuplicateKey { .. }));
+    }
+
+    #[test]
+    fn path_glob_and_path_prefix_conflict_loudly() {
+        let err =
+            parse_rule_v2(r#"write_file(path_glob="src/**/*.rs", path_prefix="src/", op="write")"#)
+                .unwrap_err();
+        assert!(matches!(err, RuleParseError::ConflictingFields { .. }));
     }
 
     #[test]

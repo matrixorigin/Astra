@@ -64,6 +64,7 @@ pub enum PermissionPatternMatch {
     #[default]
     Prefix,
     Exact,
+    PathPrefix,
 }
 
 impl PermissionPatternMatch {
@@ -157,16 +158,23 @@ impl PermissionRule {
                 (rule.argv_prefix.clone(), PermissionPatternMatch::Prefix)
             }
         } else if matches!(lower_family.as_str(), "edit" | "read" | "view") {
-            (rule.path_glob.clone(), PermissionPatternMatch::Prefix)
+            if let Some(path_prefix) = rule.path_prefix.clone() {
+                (Some(path_prefix), PermissionPatternMatch::PathPrefix)
+            } else {
+                (rule.path_glob.clone(), PermissionPatternMatch::Prefix)
+            }
         } else {
             (
                 rule.argv_exact
                     .clone()
                     .or_else(|| rule.argv_prefix.clone())
+                    .or_else(|| rule.path_prefix.clone())
                     .or_else(|| rule.path_glob.clone())
                     .or_else(|| rule.extra.get("pattern").cloned()),
                 if rule.argv_exact.is_some() {
                     PermissionPatternMatch::Exact
+                } else if rule.path_prefix.is_some() {
+                    PermissionPatternMatch::PathPrefix
                 } else {
                     PermissionPatternMatch::Prefix
                 },
@@ -289,10 +297,17 @@ impl PermissionRule {
                 }
 
                 if target_is_constrained_path {
+                    if self.pattern_match == PermissionPatternMatch::PathPrefix {
+                        return cmd.starts_with(pattern);
+                    }
                     if pattern_contains_glob_metachars(pattern) {
                         return crate::permission_path_glob::glob_match(pattern, cmd);
                     }
                     return pattern == cmd;
+                }
+
+                if self.pattern_match == PermissionPatternMatch::PathPrefix {
+                    return cmd.starts_with(pattern);
                 }
 
                 if pattern_contains_glob_metachars(pattern) {
@@ -512,6 +527,7 @@ impl std::fmt::Display for PermissionRule {
                 argv_exact: None,
                 argv_prefix: None,
                 path_glob: None,
+                path_prefix: None,
                 op: self.op.clone(),
                 cwd_root: self.cwd_root.clone(),
                 git_branch: self.git_branch.clone(),
@@ -525,6 +541,8 @@ impl std::fmt::Display for PermissionRule {
                 } else {
                     rule.argv_prefix = self.pattern.clone();
                 }
+            } else if self.pattern_match == PermissionPatternMatch::PathPrefix {
+                rule.path_prefix = self.pattern.clone();
             } else {
                 rule.path_glob = self.pattern.clone();
             }
@@ -1196,6 +1214,24 @@ mod tests {
 
         assert!(rule.matches_with_context("write_file", &approved));
         assert!(!rule.matches_with_context("write_file", &sibling));
+    }
+
+    #[test]
+    fn v2_path_prefix_rule_matches_sibling_prefixes() {
+        let rule = PermissionRule::parse(r#"write_file(path_prefix="zzz", op="write")"#);
+        let approved = RuleMatchContext {
+            path: Some("zzz2.md".into()),
+            op: Some("write".into()),
+            ..Default::default()
+        };
+        let other = RuleMatchContext {
+            path: Some("abc.md".into()),
+            op: Some("write".into()),
+            ..Default::default()
+        };
+
+        assert!(rule.matches_with_context("write_file", &approved));
+        assert!(!rule.matches_with_context("write_file", &other));
     }
 
     #[test]
