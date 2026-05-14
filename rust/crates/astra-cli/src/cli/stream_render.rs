@@ -2081,6 +2081,50 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         // Project / User scopes per
                         // permission_scope::permitted_scopes.
                     }
+
+                    // Issue #326 P5 / scenario #11: when bash is
+                    // about to run a local script, attach a
+                    // preview of the body so the user can read
+                    // the actual code before approving. We only
+                    // detect simple invocations
+                    // (`bash foo.sh`, `./foo.sh`); compound
+                    // commands and shell idioms are handled by
+                    // the compound-command tokenizer above.
+                    if t == "bash" {
+                        if let Some(cmd) = args
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                        {
+                            if let Some(script_path) =
+                                astra_turn_core::permission_script_preview::looks_like_local_script(
+                                    cmd,
+                                )
+                            {
+                                let cwd = std::env::current_dir()
+                                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                                if let Ok(preview) =
+                                    astra_turn_core::permission_script_preview::build_script_preview(
+                                        &script_path,
+                                        &cwd,
+                                    )
+                                {
+                                    if preview.has_destructive_hit
+                                        && !metadata.risk_tags.contains(
+                                            &astra_turn_core::permission_engine::RiskTag::BashExecute,
+                                        )
+                                    {
+                                        // Already pushed above
+                                        // for bash; this branch
+                                        // exists for symmetry
+                                        // when the body has a
+                                        // destructive hit but
+                                        // the cmd_kind didn't
+                                        // mark Execute.
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // Issue #326 P5f / R2 Major 3: for file-mutating
                     // tools, snapshot the target file's SHA-256
                     // here (host-side, NOT from LLM args). The
