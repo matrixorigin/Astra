@@ -25,12 +25,23 @@ pub(super) struct CloudPullResult {
     pub cloud_reachable: bool,
 }
 
-/// Resolve the cloud REST base URL from env. Returns `None` when
-/// no cloud is configured (CLI will degrade to no-op sync).
+/// Parse a boolean preference value. Accepts "true"/"1"/"yes"/"on" as true,
+/// "false"/"0"/"no"/"off" as false, anything else returns the default.
+fn parse_bool_pref(value: &str, default: bool) -> bool {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => true,
+        "false" | "0" | "no" | "off" => false,
+        _ => default,
+    }
+}
+
+/// Resolve the astra server base URL. Returns `None` when no server
+/// is configured (offline mode). Reads `ASTRA_API_URL`.
 fn resolve_cloud_base() -> Option<String> {
-    std::env::var("ASTRA_CLOUD_BASE")
+    std::env::var("ASTRA_API_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
 }
 
 /// Check whether the cloud preference endpoint is reachable.
@@ -107,6 +118,17 @@ pub(super) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<
                     }
                 }
             }
+            pref_keys::AUTO_MEMORY_ENABLED => {
+                state.auto_memory_enabled = parse_bool_pref(value, true);
+            }
+            pref_keys::NOTIFICATIONS_ENABLED => {
+                state.notifications_enabled = parse_bool_pref(value, true);
+            }
+            pref_keys::NOTIFICATION_THRESHOLD_SECS => {
+                if let Ok(n) = value.parse::<u64>() {
+                    state.notification_threshold_secs = n;
+                }
+            }
             _ => {}
         }
     }
@@ -136,6 +158,18 @@ pub(super) async fn try_cloud_push_preferences(state: &SessionState) {
     let prefs = [
         (pref_keys::EXPLAIN_MODE, state.explain.to_string()),
         (pref_keys::BLOCKED_TOOLS, blocked_json),
+        (
+            pref_keys::AUTO_MEMORY_ENABLED,
+            state.auto_memory_enabled.to_string(),
+        ),
+        (
+            pref_keys::NOTIFICATIONS_ENABLED,
+            state.notifications_enabled.to_string(),
+        ),
+        (
+            pref_keys::NOTIFICATION_THRESHOLD_SECS,
+            state.notification_threshold_secs.to_string(),
+        ),
     ];
     for (key, value) in &prefs {
         if let Err(e) = crate::preferences_client::push_preference(

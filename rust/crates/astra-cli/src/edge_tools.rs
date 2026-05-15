@@ -518,6 +518,11 @@ pub struct ToolExecutor {
     worktree_session: std::sync::Mutex<Option<WorktreeSession>>,
     /// In-memory task manager for the current session.
     task_manager: std::sync::Arc<task_mgmt::TaskManager>,
+    /// Broadcast sender that signals the TaskBoardObserver after a
+    /// successful cloud `route_task_action`. Payload is the session_id
+    /// that changed. `None` when offline (in-memory store handles its
+    /// own notifications via `InMemoryTaskStore::subscribe`).
+    pub(crate) task_notify_tx: Option<tokio::sync::broadcast::Sender<String>>,
     /// Command queue for background task operations. Drained by the
     /// TUI event loop each tick. Allows the tool executor (which runs
     /// inside the agentic loop) to spawn/kill background tasks without
@@ -648,6 +653,7 @@ impl ToolExecutor {
             journal_turn_index: std::sync::atomic::AtomicU32::new(0),
             worktree_session: std::sync::Mutex::new(None),
             task_manager: std::sync::Arc::new(task_mgmt::TaskManager::in_memory()),
+            task_notify_tx: None,
             bg_task_commands: None,
             bash_detach_slot: None,
             spawn_context: None,
@@ -1025,6 +1031,14 @@ impl ToolExecutor {
         self
     }
 
+    pub fn with_task_notify_tx(
+        mut self,
+        tx: tokio::sync::broadcast::Sender<String>,
+    ) -> Self {
+        self.task_notify_tx = Some(tx);
+        self
+    }
+
     pub fn with_bg_task_commands(
         mut self,
         commands: std::sync::Arc<std::sync::Mutex<Vec<BgTaskCommand>>>,
@@ -1114,7 +1128,7 @@ impl ToolExecutor {
             .unwrap_or("(pending)");
         let Some(cloud_base) = self.cloud_base.clone() else {
             return "Error: plan mode requires a cloud connection (no cloud_base configured). \
-                    Set ASTRA_CLOUD_BASE or sign in with `astra login`, then retry. Plan state \
+                    Set ASTRA_API_URL or sign in with `astra login`, then retry. Plan state \
                     is authoritative in the cloud DB — without it the plan would be a local \
                     ghost that desyncs across devices."
                 .to_string();
@@ -1225,7 +1239,12 @@ impl ToolExecutor {
         )
         .await
         {
-            Ok(output) => Some(output),
+            Ok(output) => {
+                if let Some(tx) = &self.task_notify_tx {
+                    let _ = tx.send(session_id);
+                }
+                Some(output)
+            }
             Err(err) => Some(format!("Error: cloud todo {action} failed: {err}")),
         }
     }
@@ -1305,7 +1324,7 @@ impl ToolExecutor {
     async fn task_list_user(&self, args: &Value) -> String {
         let Some(cloud_base) = self.cloud_base.clone() else {
             return "Error: task(action='list_user') requires a cloud connection. \
-                    The cross-session view is server-side only — set ASTRA_CLOUD_BASE \
+                    The cross-session view is server-side only — set ASTRA_API_URL \
                     or sign in with `astra login` to enable it."
                 .to_string();
         };

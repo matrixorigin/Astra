@@ -165,3 +165,62 @@ pub async fn load_todos(
         .map_err(|e| format!("decode response: {e}"))?;
     Ok(parsed.tasks)
 }
+
+// ─── HttpTaskStore ─────────────────────────────────────────────────
+
+use async_trait::async_trait;
+use astra_tools::task_mgmt::{SessionTask, TaskStore, TaskMutation};
+use std::sync::Arc;
+
+/// A read-only `TaskStore` backed by the server's REST API. The
+/// observer polls `load()` → `GET /sessions/{sid}/todos`; mutations
+/// are signalled via a broadcast channel that `route_task_action`
+/// fires after every successful write so the observer refetches
+/// immediately (≤50ms dirty window).
+pub struct HttpTaskStore {
+    cloud_base: String,
+    token: Option<String>,
+    notify_tx: tokio::sync::broadcast::Sender<String>,
+}
+
+impl HttpTaskStore {
+    pub fn new(
+        cloud_base: impl Into<String>,
+        token: Option<String>,
+    ) -> (Arc<Self>, tokio::sync::broadcast::Sender<String>) {
+        let (tx, _) = tokio::sync::broadcast::channel(32);
+        let store = Arc::new(Self {
+            cloud_base: cloud_base.into(),
+            token,
+            notify_tx: tx.clone(),
+        });
+        (store, tx)
+    }
+}
+
+#[async_trait]
+impl TaskStore for HttpTaskStore {
+    async fn load(&self, session_id: &str) -> Result<Vec<SessionTask>, String> {
+        load_todos(&self.cloud_base, self.token.as_deref(), session_id).await
+    }
+
+    async fn save(&self, _session_id: &str, _tasks: Vec<SessionTask>) -> Result<(), String> {
+        Err("HttpTaskStore is read-only; mutations go through route_task_action".into())
+    }
+
+    async fn mutate(&self, _session_id: &str, _mutation: TaskMutation) -> Result<String, String> {
+        Err("HttpTaskStore is read-only; mutations go through route_task_action".into())
+    }
+
+    async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+        Err("HttpTaskStore: id allocation is server-side".into())
+    }
+
+    async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+        Err("HttpTaskStore: id allocation is server-side".into())
+    }
+
+    fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<String>> {
+        Some(self.notify_tx.subscribe())
+    }
+}

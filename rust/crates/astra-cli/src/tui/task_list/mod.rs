@@ -155,6 +155,24 @@ fn counts(tasks: &[SessionTask]) -> (usize, usize, usize) {
     (completed, in_progress, pending)
 }
 
+/// Aggregate (done, total) over every subtask across `tasks`. Used by
+/// the standalone header to surface the real progress when one task
+/// fans out into many subtasks — otherwise the top-level "1 task in
+/// progress" hides the fact that 2/5 subtasks already shipped.
+fn subtask_counts(tasks: &[SessionTask]) -> (usize, usize) {
+    let mut done = 0usize;
+    let mut total = 0usize;
+    for task in tasks {
+        for sub in &task.subtasks {
+            total += 1;
+            if sub.status == "completed" {
+                done += 1;
+            }
+        }
+    }
+    (done, total)
+}
+
 /// Stable id-asc sort that falls back to string order when ids aren't
 /// `task-<n>` shaped.
 fn sort_by_id_asc(mut tasks: Vec<&SessionTask>) -> Vec<&SessionTask> {
@@ -255,6 +273,68 @@ fn render_task_line(
     }
 
     Line::from(spans)
+}
+
+/// Render one indented line per subtask under its parent. Mirrors
+/// the parent's `render_task_line` styling but uses 4-col indent and a
+/// slightly dimmer subject so the eye scans subtask groups together.
+fn render_subtask_lines(
+    parent: &SessionTask,
+    columns: u16,
+    colors: TaskBoardColors,
+) -> Vec<Line<'static>> {
+    if parent.subtasks.is_empty() {
+        return Vec::new();
+    }
+    // Resolve which subtask ids are still open so depends_on chains
+    // can grey out blocked siblings — same logic as parent-level
+    // blockers, just scoped to this task's subtasks.
+    let unresolved: HashSet<String> = parent
+        .subtasks
+        .iter()
+        .filter(|s| s.status != "completed")
+        .map(|s| s.id.clone())
+        .collect();
+
+    let mut out = Vec::with_capacity(parent.subtasks.len());
+    let indent = "    ";
+    let subject_w = (columns as usize).saturating_sub(indent.len() + 4).max(10);
+    for sub in &parent.subtasks {
+        let (icon, color) = status_icon_and_color(&sub.status, colors);
+        let is_completed = sub.status == "completed";
+        let is_in_progress = sub.status == "in_progress";
+        let blocked = sub
+            .depends_on
+            .iter()
+            .any(|id| unresolved.contains(id));
+
+        let icon_style = match sub.status.as_str() {
+            "in_progress" | "completed" => {
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            }
+            _ => Style::default().fg(color).add_modifier(Modifier::DIM),
+        };
+        let mut subject_style = Style::default().add_modifier(Modifier::DIM);
+        if is_in_progress {
+            subject_style = subject_style.add_modifier(Modifier::BOLD);
+        }
+        if is_completed {
+            subject_style = subject_style.add_modifier(Modifier::CROSSED_OUT);
+        }
+        let subject = truncate_to_width(&sub.title, subject_w);
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
+        spans.push(Span::raw(indent.to_string()));
+        spans.push(Span::styled(format!("{} ", icon), icon_style));
+        spans.push(Span::styled(subject, subject_style));
+        if blocked {
+            spans.push(Span::styled(
+                " · waiting".to_string(),
+                Style::default().fg(colors.dim).add_modifier(Modifier::DIM),
+            ));
+        }
+        out.push(Line::from(spans));
+    }
+    out
 }
 
 fn render_hidden_summary(hidden: &[&SessionTask]) -> Option<Line<'static>> {
@@ -582,6 +662,16 @@ pub fn render_with_colors(
             " open)".to_string(),
             Style::default().add_modifier(Modifier::DIM),
         ));
+        // Subtask roll-up: when any task fans out into subtasks, show
+        // aggregate progress so a "1 task in progress" header doesn't
+        // hide the 2/5 subtasks that already shipped.
+        let (sub_done, sub_total) = subtask_counts(tasks);
+        if sub_total > 0 {
+            header_spans.push(Span::styled(
+                format!(" · {sub_done}/{sub_total} subtasks done"),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
         // Ctrl+T collapse hint. Reference TUI appends this to the
         // standalone header so new users discover the toggle without
         // hunting help. Drop when columns are too narrow to fit it.
@@ -596,6 +686,12 @@ pub fn render_with_colors(
         out.push(Line::from(header_spans));
     }
 
+    // Total board lines stay bounded: parent task lines + a global
+    // subtask budget. Without this, a 10-parent × 5-subtask board
+    // would push 60+ rows and starve the streaming region.
+    let max_total_subtask_rows: usize = (cap * 2).max(8);
+    let mut subtask_rows_emitted = 0usize;
+    let mut hidden_subtask_total = 0usize;
     for task in &visible {
         let open_blockers: Vec<String> = task
             .blocked_by
@@ -604,12 +700,132 @@ pub fn render_with_colors(
             .cloned()
             .collect();
         out.push(render_task_line(task, &open_blockers, columns, colors));
+        // Per-parent cap (keeps one runaway parent from monopolising
+        // the global budget) plus the global cap above. claude-code
+        // shows every subtask inline; we cap to keep terminal layout
+        // sane on tight rows.
+        let max_subs_per_parent = 8usize;
+        let remaining_global = max_total_subtask_rows.saturating_sub(subtask_rows_emitted);
+        let local_budget = max_subs_per_parent.min(remaining_global);
+        let sub_lines = render_subtask_lines(task, columns, colors);
+        let n = sub_lines.len();
+        let take = n.min(local_budget);
+        for line in sub_lines.into_iter().take(take) {
+            out.push(line);
+            subtask_rows_emitted += 1;
+        }
+        if n > take {
+            hidden_subtask_total += n - take;
+        }
+    }
+    if hidden_subtask_total > 0 {
+        out.push(Line::from(Span::styled(
+            format!("    … +{hidden_subtask_total} more subtasks"),
+            Style::default().fg(colors.dim).add_modifier(Modifier::DIM),
+        )));
     }
 
     if let Some(summary) = render_hidden_summary(&hidden) {
         out.push(summary);
     }
     out
+}
+
+/// One-line "compact" summary used as the default board view while the
+/// user hasn't pressed Ctrl+T. Replaces the full panel during running
+/// turns so the spinner / streaming region stays uncluttered.
+///
+/// Format: `⠋ N tasks · current: <title> · K/M subtasks · Ctrl+T expand`
+/// (the "current" segment shows the in-progress task title, falling
+/// back to "next" when nothing is in progress yet; subtask roll-up
+/// only appears when any subtask exists).
+///
+/// Returns `None` for empty task lists — caller renders nothing in
+/// that case.
+pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<Line<'static>> {
+    if tasks.is_empty() {
+        return None;
+    }
+    let (completed, in_progress, _pending) = counts(tasks);
+    let total = tasks.len();
+    let current_task = tasks
+        .iter()
+        .find(|t| t.status == "in_progress")
+        .or_else(|| tasks.iter().find(|t| t.status == "pending"));
+    let (sub_done, sub_total) = subtask_counts(tasks);
+
+    let theme = crate::tui::theme::current();
+    let icon = if in_progress > 0 {
+        spinner_frame()
+    } else if completed == total {
+        "✔"
+    } else {
+        "·"
+    };
+    let icon_color = if in_progress > 0 {
+        theme.accent
+    } else if completed == total {
+        theme.success
+    } else {
+        theme.dim
+    };
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled(
+        format!("{icon} "),
+        Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        format!("{total} task{}", if total == 1 { "" } else { "s" }),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        format!(" ({completed} done"),
+        Style::default().add_modifier(Modifier::DIM),
+    ));
+    if in_progress > 0 {
+        spans.push(Span::styled(
+            format!(", {in_progress} running"),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    spans.push(Span::styled(
+        ")".to_string(),
+        Style::default().add_modifier(Modifier::DIM),
+    ));
+
+    if sub_total > 0 {
+        spans.push(Span::styled(
+            format!(" · {sub_done}/{sub_total} subtasks"),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+
+    if let Some(task) = current_task {
+        // Trim the title to whatever space is left after the rest of
+        // the line so we don't blow past `columns`.
+        let used: usize = spans.iter().map(|s| s.content.width()).sum();
+        let hint = "  Ctrl+T expand";
+        let reserved = used + " · ".width() + hint.width();
+        let title_budget = (columns as usize).saturating_sub(reserved).max(8);
+        let title = truncate_to_width(&task.title, title_budget);
+        spans.push(Span::styled(
+            " · ".to_string(),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        spans.push(Span::styled(title, Style::default()));
+    }
+
+    let hint = "  Ctrl+T expand";
+    let used: usize = spans.iter().map(|s| s.content.width()).sum();
+    if used + hint.width() < columns as usize {
+        spans.push(Span::styled(
+            hint.to_string(),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+
+    Some(Line::from(spans))
 }
 
 /// One-line "Next: <subject>" nudge for use when `expanded_view` is not
@@ -799,6 +1015,162 @@ mod tests {
     fn next_hint_returns_none_when_all_completed() {
         let tasks = vec![mk_task("task-1", "done", "completed")];
         assert!(render_next_hint(&tasks, 80).is_none());
+    }
+
+    #[test]
+    fn collapsed_summary_shows_counts_current_and_hint() {
+        let tasks = vec![
+            mk_task("task-1", "alpha-done", "completed"),
+            mk_task("task-2", "beta-running", "in_progress"),
+            mk_task("task-3", "gamma-pending", "pending"),
+        ];
+        let line = render_collapsed_summary(&tasks, 100).expect("non-empty");
+        let text = spans_text(&line);
+        assert!(text.contains("3 tasks"), "{text}");
+        assert!(text.contains("1 done"), "{text}");
+        assert!(text.contains("1 running"), "{text}");
+        // The current-task title should be the in_progress one, not
+        // the completed one.
+        assert!(text.contains("beta-running"), "{text}");
+        assert!(!text.contains("alpha-done"), "{text}");
+        assert!(text.contains("Ctrl+T expand"), "{text}");
+    }
+
+    #[test]
+    fn collapsed_summary_includes_subtask_rollup_when_present() {
+        use astra_tools::task_mgmt::SessionSubtask;
+        let mut parent = mk_task("task-1", "parent", "in_progress");
+        parent.subtasks = vec![
+            SessionSubtask {
+                id: "s1".into(),
+                title: "first".into(),
+                description: None,
+                status: "completed".into(),
+                depends_on: vec![],
+                owner: None,
+            },
+            SessionSubtask {
+                id: "s2".into(),
+                title: "second".into(),
+                description: None,
+                status: "in_progress".into(),
+                depends_on: vec![],
+                owner: None,
+            },
+        ];
+        let line = render_collapsed_summary(&[parent], 100).expect("non-empty");
+        let text = spans_text(&line);
+        assert!(text.contains("1/2 subtasks"), "{text}");
+    }
+
+    #[test]
+    fn collapsed_summary_is_none_for_empty_list() {
+        assert!(render_collapsed_summary(&[], 80).is_none());
+    }
+
+    /// REGRESSION: model emits one parent task with 5 subtasks via
+    /// `task.create({subtasks: [...]})`, but the dashboard only ever
+    /// rendered the parent line — subtasks were invisible. This test
+    /// pins inline rendering: parent line first, then one indented
+    /// row per subtask, with status icons reflecting each subtask's
+    /// state.
+    #[test]
+    fn subtasks_render_indented_under_parent() {
+        use astra_tools::task_mgmt::SessionSubtask;
+        let mut parent = mk_task("task-1", "Build expense report system", "in_progress");
+        parent.subtasks = vec![
+            SessionSubtask {
+                id: "exp-1".into(),
+                title: "Create project structure".into(),
+                description: None,
+                status: "completed".into(),
+                depends_on: vec![],
+                owner: None,
+            },
+            SessionSubtask {
+                id: "exp-2".into(),
+                title: "Implement database layer".into(),
+                description: None,
+                status: "in_progress".into(),
+                depends_on: vec!["exp-1".into()],
+                owner: None,
+            },
+            SessionSubtask {
+                id: "exp-3".into(),
+                title: "Create REST API".into(),
+                description: None,
+                status: "pending".into(),
+                depends_on: vec!["exp-2".into()],
+                owner: None,
+            },
+        ];
+        let lines = render(&[parent], 80, 40, true);
+        let texts: Vec<String> = lines.iter().map(spans_text).collect();
+        // Header carries the subtask roll-up.
+        assert!(
+            texts[0].contains("1/3 subtasks done"),
+            "header missing subtask aggregate: {}",
+            texts[0]
+        );
+        // Parent first, then 3 subtasks (4-col indent).
+        assert!(
+            texts[1].contains("Build expense report system"),
+            "parent line: {}",
+            texts[1]
+        );
+        let subtask_lines: Vec<&String> = texts
+            .iter()
+            .filter(|t| t.starts_with("    "))
+            .collect();
+        assert_eq!(
+            subtask_lines.len(),
+            3,
+            "expected 3 indented subtask rows, got: {texts:#?}"
+        );
+        assert!(subtask_lines.iter().any(|t| t.contains("Create project structure")));
+        assert!(subtask_lines.iter().any(|t| t.contains("Implement database layer")));
+        // Subtasks waiting on an unfinished dep get a "· waiting"
+        // suffix so the user sees why exp-3 isn't running.
+        let waiting = subtask_lines
+            .iter()
+            .find(|t| t.contains("Create REST API"))
+            .expect("REST API subtask must render");
+        assert!(
+            waiting.contains("waiting"),
+            "exp-3 depends on exp-2 (in_progress) — expected `waiting` marker: {waiting}"
+        );
+    }
+
+    #[test]
+    fn subtask_global_budget_caps_total_rows() {
+        // Many subtasks across multiple parents must be bounded.
+        use astra_tools::task_mgmt::SessionSubtask;
+        let mut parents: Vec<SessionTask> = (1..=3)
+            .map(|i| mk_task(&format!("task-{i}"), &format!("parent-{i}"), "in_progress"))
+            .collect();
+        for (idx, parent) in parents.iter_mut().enumerate() {
+            parent.subtasks = (0..10)
+                .map(|s| SessionSubtask {
+                    id: format!("p{idx}-s{s}"),
+                    title: format!("sub p{idx}-{s}"),
+                    description: None,
+                    status: "pending".into(),
+                    depends_on: vec![],
+                    owner: None,
+                })
+                .collect();
+        }
+        let lines = render(&parents, 80, 40, true);
+        // Sanity: there must be a roll-up footer summarising hidden subtasks.
+        let footer = lines
+            .iter()
+            .map(spans_text)
+            .find(|t| t.contains("more subtasks"));
+        assert!(
+            footer.is_some(),
+            "30 total subtasks should overflow and emit a footer: {:#?}",
+            lines.iter().map(spans_text).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -1755,6 +1755,7 @@ async fn plan_executor_task(
                     git_worktree_journal: Some(ctx.git_worktree_journal.clone()),
                     session_state_journal: Some(ctx.session_state_journal.clone()),
                     task_manager: Some(ctx.task_manager.clone()),
+                    task_notify_tx: None,
                     bg_task_commands: ctx.bg_task_commands.clone(),
                     bash_detach_slot: ctx.bash_detach_slot.clone(),
                     turn_index: ctx.turn,

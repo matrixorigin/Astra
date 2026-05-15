@@ -348,8 +348,10 @@ pub(crate) async fn run_tui_repl(
     let mut state = initialize_session_state(profile, initial_model);
     let task_service = resolve_task_service(profile).await;
     install_task_service(&mut state, task_service);
-    let task_store = resolve_task_store().await;
+    let (task_store, task_notify_tx) =
+        resolve_task_store(profile, Some(&api.api_origin())).await;
     install_task_store(&mut state, task_store);
+    state.task_notify_tx = task_notify_tx.clone();
     if max_budget > 0.0 {
         state.max_budget_limit = max_budget;
     }
@@ -695,9 +697,11 @@ pub(crate) async fn run_tui_repl(
                                             &status_indicator,
                                             Some(&*task_board),
                                             board_expanded,
+                                            board_user_pin,
                                             w,
                                             guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                         );
+                                        board_expanded = frame.resolved_board_expanded;
                                         do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board)?;
                                     }
                                 }
@@ -1080,9 +1084,11 @@ pub(crate) async fn run_tui_repl(
                                         &status_indicator,
                                         Some(&*task_board),
                                         board_expanded,
+                                        board_user_pin,
                                         w,
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
+                                    board_expanded = frame.resolved_board_expanded;
                                     let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                 }
                                                         }
@@ -1094,9 +1100,11 @@ pub(crate) async fn run_tui_repl(
                                         &status_indicator,
                                         Some(&*task_board),
                                         board_expanded,
+                                        board_user_pin,
                                         w,
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
+                                    board_expanded = frame.resolved_board_expanded;
                                     let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                 }
                                                         }
@@ -1139,9 +1147,11 @@ pub(crate) async fn run_tui_repl(
                                         &status_indicator,
                                         Some(&*task_board),
                                         board_expanded,
+                                        board_user_pin,
                                         w,
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
+                                    board_expanded = frame.resolved_board_expanded;
                                     let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                 }
                                                 }
@@ -1176,9 +1186,11 @@ pub(crate) async fn run_tui_repl(
                                         &status_indicator,
                                         Some(&*task_board),
                                         board_expanded,
+                                        board_user_pin,
                                         w,
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
+                                    board_expanded = frame.resolved_board_expanded;
                                     let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                 }
                                                 }
@@ -1189,9 +1201,11 @@ pub(crate) async fn run_tui_repl(
                                         &status_indicator,
                                         Some(&*task_board),
                                         board_expanded,
+                                        board_user_pin,
                                         w,
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
+                                                    board_expanded = frame.resolved_board_expanded;
                                                     let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                                 }
                                             }
@@ -1758,9 +1772,11 @@ pub(crate) async fn run_tui_repl(
                                         &status_indicator,
                                         Some(&*task_board),
                                         board_expanded,
+                                        board_user_pin,
                                         w,
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
+                                    board_expanded = frame.resolved_board_expanded;
                                     do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board)?;
                                 }
                     }
@@ -1772,9 +1788,11 @@ pub(crate) async fn run_tui_repl(
                                         &status_indicator,
                                         Some(&*task_board),
                                         board_expanded,
+                                        board_user_pin,
                                         w,
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
+                                    board_expanded = frame.resolved_board_expanded;
                                     do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board)?;
                                 }
                     }

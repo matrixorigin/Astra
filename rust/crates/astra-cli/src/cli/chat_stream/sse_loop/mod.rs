@@ -238,6 +238,11 @@ pub(crate) async fn stream_chat_sse(
         } else {
             ex
         };
+        let ex = if let Some(ref tx) = p.task_notify_tx {
+            ex.with_task_notify_tx(tx.clone())
+        } else {
+            ex
+        };
         let ex = if let Some(ref cmds) = p.bg_task_commands {
             ex.with_bg_task_commands(cmds.clone())
         } else {

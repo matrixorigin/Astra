@@ -520,7 +520,10 @@ async fn execute_headless_task_body(
     };
     // Headless single-shot path: use the MO-backed task store when available
     // so session_todos is authoritative here the same way it is in the REPL.
-    let task_store = crate::session_runtime::resolve_task_store().await;
+    let task_store =
+        crate::session_runtime::resolve_task_store(profile, Some(&api.api_origin()))
+            .await
+            .0;
     let task_manager = std::sync::Arc::new(crate::edge_tools::TaskManager::new(
         session_id
             .clone()
@@ -543,6 +546,7 @@ async fn execute_headless_task_body(
         agent_spawner: Some(spawner),
         root_agent_id: Some(&root_agent_id),
         task_manager: Some(task_manager),
+        task_notify_tx: None,
         bg_task_commands: None,
         bash_detach_slot: None,
         stream_event_tx,
@@ -1621,8 +1625,10 @@ async fn execute_repl_bridge_command(
     }
     let task_service = session_runtime::resolve_task_service(profile).await;
     session_runtime::install_task_service(&mut state, task_service);
-    let task_store = session_runtime::resolve_task_store().await;
+    let (task_store, task_notify_tx) =
+        session_runtime::resolve_task_store(profile, Some(&api.api_origin())).await;
     session_runtime::install_task_store(&mut state, task_store);
+    state.task_notify_tx = task_notify_tx;
     maybe_load_project_instructions(&mut state);
 
     let pipeline_modules = create_pipeline_modules(api, profile);
@@ -1841,6 +1847,7 @@ pub(super) async fn execute_cli_command(
                 agent_spawner: None,
                 root_agent_id: None,
                 task_manager: None,
+                task_notify_tx: None,
                 bg_task_commands: None,
                 bash_detach_slot: None,
                 stream_event_tx: None,
@@ -2379,7 +2386,9 @@ pub(super) async fn execute_cli_command(
             // to `session_todos`. Without this the tool runs against a
             // throwaway in-memory manager and the Tier 1 board is invisible
             // across edge/cloud boundaries.
-            let chat_task_store = super::session_runtime::resolve_task_store().await;
+            let (chat_task_store, _chat_task_notify_tx) =
+                super::session_runtime::resolve_task_store(profile.as_deref(), Some(&api.api_origin()))
+                    .await;
             let chat_task_manager = std::sync::Arc::new(crate::edge_tools::TaskManager::new(
                 session_id
                     .clone()
@@ -2401,6 +2410,7 @@ pub(super) async fn execute_cli_command(
                 agent_spawner: Some(one_shot_spawner),
                 root_agent_id: Some(&root_agent_id),
                 task_manager: Some(chat_task_manager),
+                task_notify_tx: None,
                 bg_task_commands: None,
                 bash_detach_slot: None,
                 stream_event_tx,
@@ -3169,7 +3179,10 @@ pub(super) async fn run_print_mode(
     // path handles them. Without this, single-shot runs silently drop to
     // in-memory scratchpad and the Tier 1 board is invisible across turns
     // that reuse the same `session_id`.
-    let task_store = crate::session_runtime::resolve_task_store().await;
+    let task_store =
+        crate::session_runtime::resolve_task_store(profile, Some(&api.api_origin()))
+            .await
+            .0;
     let print_task_manager = std::sync::Arc::new(crate::edge_tools::TaskManager::new(
         session_id
             .clone()
@@ -3192,6 +3205,7 @@ pub(super) async fn run_print_mode(
         agent_spawner: None,
         root_agent_id: None,
         task_manager: Some(print_task_manager),
+        task_notify_tx: None,
         bg_task_commands: None,
         bash_detach_slot: None,
         stream_event_tx: None,

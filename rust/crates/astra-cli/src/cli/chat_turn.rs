@@ -1230,6 +1230,7 @@ async fn run_chat_turn(
             git_worktree_journal: Some(state.git_worktree_journal.clone()),
             session_state_journal: Some(state.session_state_journal.clone()),
             task_manager: Some(state.task_manager.clone()),
+            task_notify_tx: state.task_notify_tx.clone(),
             bg_task_commands: Some(state.bg_task_commands.clone()),
             bash_detach_slot: Some(state.bash_detach_slot.clone()),
             turn_index: state.turn,
@@ -1995,6 +1996,9 @@ async fn apply_turn_success_async(
                 .and_then(|rid| store.get_prefix(rid))
         });
 
+    state
+        .memory_extractor
+        .set_enabled(state.auto_memory_enabled);
     let outcome =
         state
             .memory_extractor
@@ -2034,7 +2038,10 @@ async fn apply_turn_success_async(
 
     // ── Desktop notification (fire-and-forget) ──────────────────────────
     let elapsed = turn_start.elapsed();
-    let notif_config = super::notifications::NotificationConfig::from_env();
+    let notif_config = super::notifications::NotificationConfig {
+        enabled: state.notifications_enabled,
+        min_duration_secs: state.notification_threshold_secs,
+    };
     if notif_config.enabled && notif_config.exceeds_threshold(elapsed) {
         tokio::spawn(async move {
             super::notifications::notify_completion(

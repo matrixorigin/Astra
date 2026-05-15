@@ -15,9 +15,13 @@ const NOTIFICATION_COOLDOWN_SECS: u64 = 30;
 static LAST_NOTIFICATION_AT: AtomicU64 = AtomicU64::new(0);
 
 /// Configuration for the desktop notification system.
+///
+/// Driven by user preferences (`pref_keys::NOTIFICATIONS_ENABLED` /
+/// `NOTIFICATION_THRESHOLD_SECS`), synced from the cloud preferences
+/// endpoint at session start.
 #[derive(Debug, Clone)]
 pub struct NotificationConfig {
-    /// Whether notifications are enabled. Controlled by `ASTRA_NOTIFICATIONS` env var.
+    /// Whether notifications are enabled.
     pub enabled: bool,
     /// Minimum task duration (in seconds) before a notification is sent.
     pub min_duration_secs: u64,
@@ -33,27 +37,6 @@ impl Default for NotificationConfig {
 }
 
 impl NotificationConfig {
-    /// Load configuration from environment variables.
-    ///
-    /// - `ASTRA_NOTIFICATIONS`: "0" or "false" disables notifications.
-    /// - `ASTRA_NOTIFICATION_THRESHOLD`: override the minimum duration in seconds.
-    pub fn from_env() -> Self {
-        let enabled = match std::env::var("ASTRA_NOTIFICATIONS") {
-            Ok(val) => !matches!(val.as_str(), "0" | "false" | "off" | "no"),
-            Err(_) => true,
-        };
-
-        let min_duration_secs = std::env::var("ASTRA_NOTIFICATION_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(10);
-
-        Self {
-            enabled,
-            min_duration_secs,
-        }
-    }
-
     /// Returns true if the given elapsed duration exceeds the configured threshold.
     pub fn exceeds_threshold(&self, elapsed: Duration) -> bool {
         elapsed.as_secs() >= self.min_duration_secs
@@ -257,119 +240,6 @@ mod tests {
         let config = NotificationConfig::default();
         assert!(config.enabled);
         assert_eq!(config.min_duration_secs, 10);
-    }
-
-    #[test]
-    fn test_config_from_env_disabled_zero() {
-        temp_env::with_vars(
-            [
-                ("ASTRA_NOTIFICATIONS", Some("0")),
-                ("ASTRA_NOTIFICATION_THRESHOLD", None::<&str>),
-            ],
-            || {
-                let config = NotificationConfig::from_env();
-                assert!(!config.enabled);
-            },
-        );
-    }
-
-    #[test]
-    fn test_config_from_env_disabled_false() {
-        temp_env::with_vars(
-            [
-                ("ASTRA_NOTIFICATIONS", Some("false")),
-                ("ASTRA_NOTIFICATION_THRESHOLD", None::<&str>),
-            ],
-            || {
-                let config = NotificationConfig::from_env();
-                assert!(!config.enabled);
-            },
-        );
-    }
-
-    #[test]
-    fn test_config_from_env_disabled_off() {
-        temp_env::with_vars(
-            [
-                ("ASTRA_NOTIFICATIONS", Some("off")),
-                ("ASTRA_NOTIFICATION_THRESHOLD", None::<&str>),
-            ],
-            || {
-                let config = NotificationConfig::from_env();
-                assert!(!config.enabled);
-            },
-        );
-    }
-
-    #[test]
-    fn test_config_from_env_disabled_no() {
-        temp_env::with_vars(
-            [
-                ("ASTRA_NOTIFICATIONS", Some("no")),
-                ("ASTRA_NOTIFICATION_THRESHOLD", None::<&str>),
-            ],
-            || {
-                let config = NotificationConfig::from_env();
-                assert!(!config.enabled);
-            },
-        );
-    }
-
-    #[test]
-    fn test_config_from_env_enabled_explicitly() {
-        temp_env::with_vars(
-            [
-                ("ASTRA_NOTIFICATIONS", Some("1")),
-                ("ASTRA_NOTIFICATION_THRESHOLD", None::<&str>),
-            ],
-            || {
-                let config = NotificationConfig::from_env();
-                assert!(config.enabled);
-            },
-        );
-    }
-
-    #[test]
-    fn test_config_from_env_enabled_by_default() {
-        temp_env::with_vars(
-            [
-                ("ASTRA_NOTIFICATIONS", None::<&str>),
-                ("ASTRA_NOTIFICATION_THRESHOLD", None::<&str>),
-            ],
-            || {
-                let config = NotificationConfig::from_env();
-                assert!(config.enabled);
-                assert_eq!(config.min_duration_secs, 10);
-            },
-        );
-    }
-
-    #[test]
-    fn test_config_from_env_custom_threshold() {
-        temp_env::with_vars(
-            [
-                ("ASTRA_NOTIFICATIONS", None::<&str>),
-                ("ASTRA_NOTIFICATION_THRESHOLD", Some("30")),
-            ],
-            || {
-                let config = NotificationConfig::from_env();
-                assert_eq!(config.min_duration_secs, 30);
-            },
-        );
-    }
-
-    #[test]
-    fn test_config_from_env_invalid_threshold_uses_default() {
-        temp_env::with_vars(
-            [
-                ("ASTRA_NOTIFICATIONS", None::<&str>),
-                ("ASTRA_NOTIFICATION_THRESHOLD", Some("not_a_number")),
-            ],
-            || {
-                let config = NotificationConfig::from_env();
-                assert_eq!(config.min_duration_secs, 10);
-            },
-        );
     }
 
     // ── Duration threshold ──────────────────────────────────────────────

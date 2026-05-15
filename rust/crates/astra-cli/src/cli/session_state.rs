@@ -95,6 +95,10 @@ pub(crate) struct SessionState {
         std::sync::Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>,
     /// Session-scoped task manager so task mutations survive across turns.
     pub task_manager: std::sync::Arc<crate::edge_tools::TaskManager>,
+    /// Broadcast sender for the HttpTaskStore. Fired after each
+    /// successful `route_task_action` so the observer refetches.
+    /// `None` when offline (in-memory store has its own notifications).
+    pub task_notify_tx: Option<tokio::sync::broadcast::Sender<String>>,
     /// Sticky task/thread summary used to anchor ultra-short follow-ups like
     /// "继续" even after history compaction prunes earlier turns.
     pub continuation_anchor: Option<String>,
@@ -109,6 +113,15 @@ pub(crate) struct SessionState {
     pub pending_followup_suggestion: Option<crate::followup_suggestion::FollowupSuggestion>,
     pub explain: ExplainMode,
     pub verbose_mode: bool,
+    /// User preference: enable background memory-extraction agent.
+    /// Synced via `pref_keys::AUTO_MEMORY_ENABLED`.
+    pub auto_memory_enabled: bool,
+    /// User preference: send desktop notifications when turns complete.
+    /// Synced via `pref_keys::NOTIFICATIONS_ENABLED`.
+    pub notifications_enabled: bool,
+    /// User preference: minimum elapsed seconds before a notification fires.
+    /// Synced via `pref_keys::NOTIFICATION_THRESHOLD_SECS`.
+    pub notification_threshold_secs: u64,
     pub history: Vec<(String, String)>, // (user_msg, assistant_msg)
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
@@ -429,12 +442,16 @@ impl Default for SessionState {
                 crate::edge_tools::SessionStateRollbackJournal::default(),
             )),
             task_manager: std::sync::Arc::new(crate::edge_tools::TaskManager::in_memory()),
+            task_notify_tx: None,
             continuation_anchor: None,
             diagnostics_context: None,
             queued_message: None,
             pending_followup_suggestion: None,
             explain: ExplainMode::Off,
             verbose_mode: true,
+            auto_memory_enabled: true,
+            notifications_enabled: true,
+            notification_threshold_secs: 10,
             history: Vec::new(),
             total_prompt_tokens: 0,
             total_completion_tokens: 0,

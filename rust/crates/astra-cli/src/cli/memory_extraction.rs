@@ -404,15 +404,20 @@ impl Default for MemoryExtractor {
 }
 
 impl MemoryExtractor {
+    /// Construct an extractor that defers to the `enabled` flag passed in at
+    /// each `maybe_extract` call (driven by `SessionState::auto_memory_enabled`,
+    /// which is synced via `pref_keys::AUTO_MEMORY_ENABLED`).
     pub fn new() -> Self {
-        let enabled = std::env::var("ASTRA_DISABLE_AUTO_MEMORY")
-            .map(|v| v != "1" && v != "true")
-            .unwrap_or(true);
         Self {
             last_processed_turn: 0,
             in_flight: None,
-            enabled,
+            enabled: true,
         }
+    }
+
+    /// Update the enabled flag (used after a preference pull / `/config` change).
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
     }
 
     /// Check if extraction is in progress.

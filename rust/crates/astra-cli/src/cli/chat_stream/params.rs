@@ -357,6 +357,8 @@ pub(crate) struct ChatTurnParams<'a> {
         Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>>,
     /// Session-scoped task manager so task mutations survive across turns.
     pub(crate) task_manager: Option<std::sync::Arc<crate::edge_tools::TaskManager>>,
+    /// Broadcast sender for the HttpTaskStore observer notification.
+    pub(crate) task_notify_tx: Option<tokio::sync::broadcast::Sender<String>>,
     /// Shared command queue for the TUI's BackgroundTaskRegistry.
     /// When present, tool executor pushes spawn/kill/output commands here.
     pub(crate) bg_task_commands:
@@ -422,6 +424,8 @@ pub(crate) struct BasicCliChatContext<'a> {
     /// Session-scoped task manager used by one-shot/headless paths that still
     /// need the model-visible task board.
     pub task_manager: Option<std::sync::Arc<crate::edge_tools::TaskManager>>,
+    /// Broadcast sender for the HttpTaskStore observer notification.
+    pub task_notify_tx: Option<tokio::sync::broadcast::Sender<String>>,
     /// Shared command queue for the TUI's BackgroundTaskRegistry.
     pub bg_task_commands:
         Option<std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
@@ -498,6 +502,7 @@ impl<'a> ChatTurnParams<'a> {
             git_worktree_journal: None,
             session_state_journal: None,
             task_manager: ctx.task_manager.clone(),
+            task_notify_tx: ctx.task_notify_tx.clone(),
             bg_task_commands: ctx.bg_task_commands.clone(),
             bash_detach_slot: ctx.bash_detach_slot.clone(),
             turn_index: 0,

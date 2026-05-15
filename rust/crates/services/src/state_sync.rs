@@ -1175,6 +1175,12 @@ pub mod pref_keys {
     pub const LANGUAGE: &str = "language";
     /// JSON array of persistently blocked tool names (survives across sessions).
     pub const BLOCKED_TOOLS: &str = "blocked_tools";
+    /// Background memory-extraction agent. "true"/"false". Default: true.
+    pub const AUTO_MEMORY_ENABLED: &str = "auto_memory_enabled";
+    /// Desktop notifications on turn completion. "true"/"false". Default: true.
+    pub const NOTIFICATIONS_ENABLED: &str = "notifications_enabled";
+    /// Minimum elapsed seconds before a desktop notification is sent. Default: 10.
+    pub const NOTIFICATION_THRESHOLD_SECS: &str = "notification_threshold_secs";
 }
 
 // ─── File-based Preference Store ────────────────────────────────────────────

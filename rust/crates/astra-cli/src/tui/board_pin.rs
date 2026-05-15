@@ -57,11 +57,11 @@ pub(crate) fn resolve_board_visibility(
     if board_hidden {
         return (false, false);
     }
-    // Auto-open when the list becomes non-empty and the user hasn't
-    // expressed a closed-pin opinion.
-    if !prev_expanded {
-        return (true, false);
-    }
+    // Default = collapsed (one-line summary). Earlier behaviour
+    // auto-expanded the full panel as soon as a task appeared, which
+    // ate ~8 rows of streaming space on every multi-step turn. Now
+    // the user opts in via Ctrl+T (which sets `user_pin = Some(true)`
+    // and short-circuits above) — the auto path stays compact.
     (prev_expanded, false)
 }
 
@@ -105,10 +105,15 @@ mod tests {
     }
 
     #[test]
-    fn auto_open_on_first_tasks_appearing() {
-        // Unpinned, previously empty, now tasks arrived.
+    fn first_tasks_appearing_stays_collapsed_until_user_pins() {
+        // Default behaviour: a brand-new task list does NOT auto-expand
+        // the full panel — it stays as a one-line summary above the
+        // composer. The user opts in via Ctrl+T (Some(true) pin).
         let (expanded, reset) = resolve_board_visibility(false, None, true, false);
-        assert!(expanded, "auto-open on first rows");
+        assert!(
+            !expanded,
+            "default should stay collapsed; full-panel mode is opt-in"
+        );
         assert!(!reset);
     }
 
@@ -128,11 +133,12 @@ mod tests {
     }
 
     #[test]
-    fn unpinned_closed_without_hide_flag_autopops_on_new_tasks() {
-        // Collapsed but not by the hide timer — just "haven't opened
-        // yet". Auto-open should fire as usual.
+    fn unpinned_closed_without_hide_flag_stays_collapsed_for_new_tasks() {
+        // Inverted from the prior auto-open default: collapsed boards
+        // stay collapsed when new tasks land. The user explicitly
+        // expands via Ctrl+T → user_pin = Some(true).
         let (expanded, _) = resolve_board_visibility(false, None, true, false);
-        assert!(expanded);
+        assert!(!expanded);
     }
 
     #[test]

@@ -45,31 +45,58 @@ pub(crate) async fn resolve_task_service(
     local_task_service()
 }
 
-/// Resolve the cloud REST base URL from env. Returns `None` when
-/// no cloud is configured (offline mode); callers fall back to the
-/// local on-disk task store.
+/// Resolve the astra server base URL. Returns `None` when no server
+/// is configured (offline mode).
 fn resolve_cloud_base() -> Option<String> {
-    std::env::var("ASTRA_CLOUD_BASE")
+    std::env::var("ASTRA_API_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
 }
 
 /// Task store for the Tier 1 session scratchpad (`session_todos`).
 ///
-/// **CLI never connects to MatrixOne directly.** The previous
-/// implementation built a `MatrixOneTaskStore` from a sqlx pool when
-/// `MATRIXONE_HOST` was set — that violated the edge-cloud contract
-/// (DB writes must be server-mediated). The cloud path now routes
-/// every `task` action through the server's
-/// `POST /sessions/{sid}/todos:execute` endpoint via
-/// [`crate::session_todo_client`]; this `resolve_task_store` only
-/// returns the in-memory fallback used for offline CLI and headless
-/// tests. The HTTP routing is wired at the dispatcher level
-/// (`edge_tools::ToolExecutor::route_task_action`), so the in-memory
-/// store here just keeps the local TaskManager API alive when no
-/// cloud is reachable.
-pub(crate) async fn resolve_task_store() -> std::sync::Arc<dyn astra_tools::task_mgmt::TaskStore> {
-    std::sync::Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new())
+/// When cloud is configured, returns an [`crate::session_todo_client::HttpTaskStore`]
+/// that polls the server's `GET /sessions/{sid}/todos` endpoint and
+/// receives broadcast notifications from `route_task_action` after
+/// every successful mutation. The observer sees tasks within one poll
+/// cycle (~50ms after the dirty flag fires).
+///
+/// Offline / headless falls back to the in-memory store (no server).
+///
+/// Returns `(store, Option<notify_tx>)`. Callers wire `notify_tx`
+/// into the tool executor so `route_task_action` can signal the
+/// observer after each cloud write.
+///
+/// `cloud_base` selection: prefers the explicit caller-supplied URL
+/// (typically `ThinClient::api_origin()` — the same source the tool
+/// executor uses), falling back to the `ASTRA_API_URL` env var so
+/// scripted callers without a thin client still hit the right server.
+/// Never reads the env var when an explicit base is provided — having
+/// two sources of truth was the root cause of the "TUI dashboard
+/// never appears" bug: the executor used `api_origin()` while the
+/// task store used the env var, so the in-memory store handed to
+/// the observer never saw the cloud writes.
+pub(crate) async fn resolve_task_store(
+    profile: Option<&str>,
+    cloud_base_override: Option<&str>,
+) -> (
+    std::sync::Arc<dyn astra_tools::task_mgmt::TaskStore>,
+    Option<tokio::sync::broadcast::Sender<String>>,
+) {
+    let cloud_base = cloud_base_override
+        .map(|s| s.trim_end_matches('/').to_string())
+        .or_else(resolve_cloud_base);
+    if let Some(cloud_base) = cloud_base {
+        let token = current_access_token(profile);
+        let (store, notify_tx) =
+            crate::session_todo_client::HttpTaskStore::new(cloud_base, token);
+        return (store, Some(notify_tx));
+    }
+    (
+        std::sync::Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new()),
+        None,
+    )
 }
 
 pub(crate) fn install_task_service(
@@ -121,7 +148,7 @@ pub(crate) async fn resolve_matrixone_task_runtime(
     String,
 > {
     let cloud_base = resolve_cloud_base().ok_or_else(|| {
-        "Cloud task runtime requires ASTRA_CLOUD_BASE; CLI no longer connects to MatrixOne directly"
+        "Cloud task runtime requires ASTRA_API_URL; CLI does not connect to MatrixOne directly"
             .to_string()
     })?;
     let token = current_access_token(profile);

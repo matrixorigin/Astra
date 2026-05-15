@@ -113,6 +113,14 @@ pub(crate) struct TimedTaskBoardEvent {
 pub(crate) const EVENT_FRESH_WINDOW: Duration = Duration::from_millis(1500);
 /// Max events to retain. Oldest are trimmed when we exceed this.
 const EVENT_RING_CAP: usize = 32;
+/// How long a `completed` task lingers on the board after the
+/// transition. Beyond this, the renderer drops the row from the
+/// expanded panel — counts in the header still reflect it. Picked
+/// to be long enough that the user can glance and verify the
+/// completion landed (claudecode uses ~30s for the same purpose),
+/// short enough that a long agentic run doesn't accumulate dozens of
+/// completed rows above the spinner.
+pub(crate) const COMPLETED_TASK_TTL: Duration = Duration::from_secs(30);
 
 struct ObserverState {
     session_id: String,
@@ -143,6 +151,12 @@ struct ObserverState {
     /// newly-created / newly-completed rows. Trimmed to
     /// `EVENT_RING_CAP` entries.
     event_ring: Vec<TimedTaskBoardEvent>,
+    /// When each task transitioned to `completed`. Renderer treats
+    /// entries older than [`COMPLETED_TASK_TTL`] as eligible for the
+    /// "fade out" rule — they stay in counts but stop occupying rows.
+    /// Keys for tasks that re-open (in_progress again) are dropped so
+    /// the timer restarts on the next completion.
+    completed_at: std::collections::HashMap<String, Instant>,
 }
 
 fn lock_state<'a>(
@@ -190,6 +204,7 @@ impl TaskBoardObserver {
                     .unwrap_or_else(Instant::now),
                 fetch_in_flight: false,
                 event_ring: Vec::new(),
+                completed_at: std::collections::HashMap::new(),
             }),
             dirty: AtomicBool::new(true),
         });
@@ -209,12 +224,32 @@ impl TaskBoardObserver {
                 loop {
                     match rx.recv().await {
                         Ok(changed_sid) => {
+                            // Self-heal during the first turn of a brand-new
+                            // session: the observer is constructed with an
+                            // empty `session_id` (TUI starts before the
+                            // server allocates one), so without this branch
+                            // every broadcast during the first turn is
+                            // dropped by the strict `==` filter and the
+                            // task board never opens until the turn ends.
+                            // When `current` is empty, adopt whatever sid
+                            // arrives — `route_task_action` only ever
+                            // broadcasts for the executor's active session.
+                            let mut adopted = false;
+                            if let Ok(mut st) = inner2.state.lock() {
+                                if st.session_id.is_empty() && !changed_sid.is_empty() {
+                                    st.session_id = changed_sid.clone();
+                                    st.snapshot = TaskBoardSnapshot::default();
+                                    st.hide_at = None;
+                                    st.manual_review_visible = false;
+                                    adopted = true;
+                                }
+                            }
                             let current = inner2
                                 .state
                                 .lock()
                                 .map(|s| s.session_id.clone())
                                 .unwrap_or_default();
-                            if changed_sid == current {
+                            if adopted || changed_sid == current {
                                 inner2.dirty.store(true, Ordering::Relaxed);
                             }
                         }
@@ -248,6 +283,27 @@ impl TaskBoardObserver {
     pub fn snapshot(&self) -> TaskBoardSnapshot {
         let (st, _) = lock_state(&self.inner, "snapshot");
         st.snapshot.clone()
+    }
+
+    /// Snapshot with completed tasks past [`COMPLETED_TASK_TTL`]
+    /// removed. Header counts (rendered from [`Self::counts`]) still
+    /// reflect the full set so the user can audit "12 done" without
+    /// the rows monopolising scrollback. Use this in the renderer's
+    /// row loop; use [`Self::snapshot`] when you need the truth.
+    pub fn snapshot_for_render(&self) -> TaskBoardSnapshot {
+        let (st, _) = lock_state(&self.inner, "snapshot_for_render");
+        let now = Instant::now();
+        let mut snap = st.snapshot.clone();
+        snap.tasks.retain(|task| {
+            if task.status != "completed" {
+                return true;
+            }
+            match st.completed_at.get(&task.id) {
+                Some(at) => now.saturating_duration_since(*at) < COMPLETED_TASK_TTL,
+                None => true, // unseen completion → safer to keep until next tick
+            }
+        });
+        snap
     }
 
     /// Cheap summary counts for the footer chip: `(open, total,
@@ -484,9 +540,38 @@ impl TaskBoardObserver {
                         // Diff BEFORE replacing the snapshot — events
                         // carry id+title from the pair (prev, new)
                         // so the renderer can flash the affected row
-                        // for EVENT_FRESH_WINDOW.
+                        // for EVENT_FRESH_WINDOW. Same diff feeds the
+                        // per-task TTL map so a `completed` transition
+                        // arms the 30s linger window; a re-open clears
+                        // the timer so the next completion restarts it.
                         let events = super::task_board_events::diff(&st.snapshot.tasks, &tasks);
                         let at = Instant::now();
+                        for event in &events {
+                            if let super::task_board_events::TaskBoardEvent::StatusChanged {
+                                task_id,
+                                to,
+                                ..
+                            } = event
+                            {
+                                if to == "completed" {
+                                    st.completed_at.insert(task_id.clone(), at);
+                                } else {
+                                    st.completed_at.remove(task_id);
+                                }
+                            }
+                        }
+                        // Garbage-collect entries for tasks that
+                        // disappeared (Removed event) so the map
+                        // doesn't grow without bound across long
+                        // sessions.
+                        for event in &events {
+                            if let super::task_board_events::TaskBoardEvent::Removed {
+                                task_id, ..
+                            } = event
+                            {
+                                st.completed_at.remove(task_id);
+                            }
+                        }
                         for event in events {
                             st.event_ring.push(TimedTaskBoardEvent { event, at });
                         }
@@ -495,6 +580,26 @@ impl TaskBoardObserver {
                             st.event_ring.drain(0..excess);
                         }
                         st.snapshot.tasks = tasks;
+                        // Backfill the TTL map for tasks that arrived
+                        // already-completed (e.g. resume into a session
+                        // whose work finished long ago). Without this,
+                        // those rows would never expire because no
+                        // StatusChanged transition exists. We treat
+                        // them as "freshly completed" relative to this
+                        // observer's lifetime — fine, they age out 30s
+                        // later just like any other.
+                        let backfill_ids: Vec<String> = st
+                            .snapshot
+                            .tasks
+                            .iter()
+                            .filter(|t| {
+                                t.status == "completed" && !st.completed_at.contains_key(&t.id)
+                            })
+                            .map(|t| t.id.clone())
+                            .collect();
+                        for id in backfill_ids {
+                            st.completed_at.insert(id, at);
+                        }
                     }
                     let has_incomplete = st.snapshot.has_incomplete();
                     let empty = st.snapshot.tasks.is_empty();
@@ -598,6 +703,97 @@ mod tests {
             "task should land within 150ms of create; took {:?}",
             elapsed
         );
+    }
+
+    /// REGRESSION: completed tasks used to linger on the board until
+    /// the user opened a new session. With per-task TTL, a task that
+    /// has been `completed` for longer than `COMPLETED_TASK_TTL` drops
+    /// out of `snapshot_for_render`'s task list — header counts stay
+    /// honest via `snapshot()`.
+    #[tokio::test]
+    async fn completed_tasks_age_out_of_render_snapshot_after_ttl() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let store_dyn: Arc<dyn TaskStore> = store.clone();
+        let obs = TaskBoardObserver::new(store_dyn, "sess-ttl");
+        let m = mgr(store, "sess-ttl");
+
+        m.create(&json!({"title": "shipping work"})).await;
+        m.update(&json!({"task_id": "task-1", "status": "completed"}))
+            .await;
+        wait_until(
+            || {
+                let s = obs.snapshot();
+                s.tasks.len() == 1 && !s.has_incomplete()
+            },
+            500,
+            || obs.maybe_refresh(),
+        )
+        .await;
+
+        // Immediately after completion the row stays — user wants to
+        // see the ✔ land.
+        assert_eq!(
+            obs.snapshot_for_render().tasks.len(),
+            1,
+            "freshly completed task must still render"
+        );
+
+        // Force the TTL clock backwards so the row is older than the
+        // window without a 30s sleep in unit tests.
+        {
+            let mut st = obs.inner.state.lock().unwrap();
+            st.completed_at.insert(
+                "task-1".to_string(),
+                Instant::now()
+                    .checked_sub(COMPLETED_TASK_TTL + Duration::from_secs(1))
+                    .unwrap_or_else(Instant::now),
+            );
+        }
+
+        let render = obs.snapshot_for_render();
+        assert!(
+            render.tasks.is_empty(),
+            "completed task aged past TTL must drop from render snapshot: {:?}",
+            render.tasks
+        );
+        // Truth snapshot still reports the row so /task list and counts
+        // remain accurate.
+        let truth = obs.snapshot();
+        assert_eq!(truth.tasks.len(), 1, "snapshot() must keep aged rows");
+    }
+
+    /// REGRESSION: TUI used to start with an empty `state.session_id`
+    /// because the server allocates the id mid-turn; the observer was
+    /// then bound to `""` and filtered every broadcast that didn't
+    /// match `""`. The task board only opened *after* the turn ended,
+    /// when the post-turn block called `rebind_session(sid)`.
+    /// Fix: observer auto-adopts the first non-empty broadcast sid.
+    #[tokio::test]
+    async fn empty_observer_adopts_first_broadcast_session_id() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let store_dyn: Arc<dyn TaskStore> = store.clone();
+        // Construct observer with an empty session_id, mimicking the
+        // TUI startup path before the server hands out a session.
+        let obs = TaskBoardObserver::new(store_dyn, "");
+
+        // Writing under a *real* session_id should still surface in
+        // the observer because the broadcast adoption rebinds it.
+        let m = mgr(store, "sess-mid-turn");
+        m.create(&json!({"title": "first turn task"})).await;
+
+        wait_until(
+            || !obs.snapshot().tasks.is_empty(),
+            500,
+            || obs.maybe_refresh(),
+        )
+        .await;
+        assert_eq!(
+            obs.snapshot().tasks.len(),
+            1,
+            "observer must adopt the broadcast sid and surface mid-turn writes"
+        );
+        let st = obs.inner.state.lock().unwrap();
+        assert_eq!(st.session_id, "sess-mid-turn");
     }
 
     #[tokio::test]

@@ -50,6 +50,10 @@ fn catalog_schemas() -> Vec<Value> {
             "tool_search",
             "Search and activate deferred tools. select:NAME returns full schema.",
         ),
+        (
+            "task",
+            "Manage session todos: create / update / list / get / stop / archive.",
+        ),
     ] {
         schemas.push(json!({
             "type": "function",
@@ -88,7 +92,7 @@ fn names(schemas: &[Value]) -> Vec<String> {
 
 // ── 1. Defaults ─────────────────────────────────────────────────────────────
 
-/// The default pinned set is the 11-member core.
+/// The default pinned set is the 12-member core.
 /// See `DEFAULT_PINNED` comment for rationale per-entry.
 #[test]
 fn pinned_default_members_are_the_core_set() {
@@ -108,6 +112,7 @@ fn pinned_default_members_are_the_core_set() {
         "introspect", // runtime diagnostics
         "tool_search",
         "skill",
+        "task", // session_todos surface — TUI dashboard depends on it
     ]
     .into_iter()
     .collect();

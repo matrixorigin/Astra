@@ -94,6 +94,11 @@ pub(crate) struct ViewportFrame {
     /// Pre-rendered task board. `None` when the board should not
     /// draw (collapsed, hidden by idle timer, empty, etc.).
     pub task_board: Option<Vec<Line<'static>>>,
+    /// The resolved board visibility state after evaluating the
+    /// snapshot. Callers MUST write this back to their local
+    /// `board_expanded` so that in-turn draws self-correct when
+    /// tasks appear mid-turn (rather than waiting for the outer tick).
+    pub resolved_board_expanded: bool,
 }
 
 pub(crate) fn active_viewport(
@@ -101,6 +106,7 @@ pub(crate) fn active_viewport(
     status: &status_indicator::StatusIndicator,
     board: Option<&TaskBoardObserver>,
     board_expanded: bool,
+    board_user_pin: Option<bool>,
     width: u16,
     rows: u16,
 ) -> ViewportFrame {
@@ -182,12 +188,40 @@ pub(crate) fn active_viewport(
     if let Some(b) = board {
         b.maybe_refresh();
     }
-    let snap = board.map(|b| b.snapshot()).unwrap_or_default();
-    // In multi-session mode the standard `snap.tasks` is empty by
-    // design (observer populates `multi_snapshot` instead). Pick
-    // the right render path so the expanded board honors whichever
-    // view mode the user toggled via Ctrl+Shift+T.
-    let task_board = if board_expanded && !snap.hidden {
+    // `snap_for_render` drops completed tasks older than
+    // `COMPLETED_TASK_TTL` (~30s) so a long agentic run doesn't pile
+    // up dozens of ✔ rows above the spinner. The footer chip /
+    // header counts still pull from `counts()` (full truth) — only
+    // row rendering cares about the TTL filter.
+    let snap = board
+        .map(|b| b.snapshot_for_render())
+        .unwrap_or_default();
+
+    // Resolve board visibility from the FRESH snapshot every frame.
+    // This is the critical fix: previously, resolve_board_visibility
+    // only ran in the outer-tick, so in-turn draws always saw the
+    // stale `board_expanded = false` from turn start. Now every draw
+    // self-corrects — if task.create lands mid-turn, the board opens
+    // on the very next frame (≤50ms).
+    let has_tasks = !snap.tasks.is_empty();
+    let (resolved_expanded, _reset_pin) = super::board_pin::resolve_board_visibility(
+        board_expanded,
+        board_user_pin,
+        has_tasks,
+        snap.hidden,
+    );
+
+    // Three-mode board:
+    //   - hidden                       → render nothing
+    //   - !expanded, has tasks         → one-line collapsed summary
+    //   - expanded                     → full panel (single or multi-session)
+    //
+    // Earlier flow tied "no board" to "render Next: hint into the
+    // active region". With bottom-anchor + always-on collapsed
+    // summary, the hint is now redundant — the summary IS the hint.
+    let task_board = if snap.hidden {
+        None
+    } else if resolved_expanded {
         let mode = board
             .map(|b| b.view_mode())
             .unwrap_or(super::task_board_observer::ViewMode::SingleSession);
@@ -219,13 +253,15 @@ pub(crate) fn active_viewport(
                 }
             }
         }
+    } else if !snap.tasks.is_empty() {
+        task_list::render_collapsed_summary(&snap.tasks, width).map(|line| vec![line])
     } else {
         None
     };
     let status_line = status.render();
-    // Hint fallback still runs — but ONLY when we have no board to
-    // render (collapsed or empty). When the board IS visible, the
-    // hint is redundant noise.
+    // Hint suppressed once the collapsed summary covers the same
+    // ground (current/next + status icon). Only fall back to the
+    // hint when we genuinely have no board slot to fill.
     let next_hint = if task_board.is_none() && !snap.hidden {
         task_list::render_next_hint(&snap.tasks, width)
     } else {
@@ -236,6 +272,7 @@ pub(crate) fn active_viewport(
         active,
         multi_agent: multi_agent_active,
         task_board,
+        resolved_board_expanded: resolved_expanded,
     }
 }
 
@@ -422,25 +459,31 @@ pub(crate) fn do_draw(
     let bp_item = RenderableItem::Owned(Box::new(bp_renderable) as Box<dyn Renderable>);
 
     let mut flex = FlexRenderable::new();
-    // Task board FIRST so it sits above the active cell — claude-code
-    // stacks its live-panels-as-static on top of the streaming region.
-    // Flex weight 0 = "take only what you need"; the board has a
-    // deterministic row count so weight 0 is correct, stream content
-    // gets the remainder.
+    // Layout (top → bottom):
+    //   active cell + scrollback   (weight=1, soaks remaining space)
+    //   multi-agent strip          (weight=0, only if any sub-agents are live)
+    //   separator                  (weight=0)
+    //   task board                 (weight=0, pinned just above composer)
+    //   bottom pane / composer     (weight=0)
+    //
+    // Earlier iterations stacked the board ABOVE the active cell to
+    // mirror claude-code's "static panels on top". That broke down for
+    // long agentic turns: streaming text kept pushing the board further
+    // from the composer until it was off-screen entirely. Bottom-anchor
+    // keeps the board adjacent to the composer — the user's eye only
+    // moves between two adjacent regions (composer ↔ board) instead of
+    // hunting for the panel up the scrollback.
+    flex.push(1, ac_renderable);
+    if let Some(item) = multi_agent_renderable {
+        flex.push(0, item);
+    }
+    flex.push(0, sep_renderable);
     if let Some(lines) = task_board_lines
         && !lines.is_empty()
     {
         let para = Paragraph::new(ratatui::text::Text::from(lines));
         flex.push(0, RenderableItem::Owned(Box::new(para)));
     }
-    // Multi-agent strip BETWEEN task board and active cell. So the
-    // user sees: board (Tier 1 todos) → parallel agents (Tier 2 sub
-    // -agents) → active cell (assistant streaming) → composer.
-    if let Some(item) = multi_agent_renderable {
-        flex.push(0, item);
-    }
-    flex.push(1, ac_renderable);
-    flex.push(0, sep_renderable);
     flex.push(0, bp_item);
 
     let total_h = flex.desired_height(width);
@@ -757,6 +800,7 @@ mod task_board_draw_tests {
             &status_indicator::StatusIndicator::new(),
             Some(&obs),
             true,
+            None,
             80,
             10,
         );
@@ -821,6 +865,7 @@ mod task_board_draw_tests {
             &status_indicator::StatusIndicator::new(),
             Some(&obs),
             true,
+            None,
             80,
             40,
         );
@@ -863,6 +908,7 @@ mod task_board_draw_tests {
             &status_indicator::StatusIndicator::new(),
             None,
             false,
+            None,
             80,
             24,
         );

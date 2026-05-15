@@ -101,21 +101,19 @@ async fn slash_health_offline_shows_cloud_section() {
 
 // ── Cloud sync regression tests ─────────────────────────────────────
 // These tests verify the async cloud sync functions don't panic when
-// called from within a tokio runtime. We unset ASTRA_CLOUD_BASE so they
-// take the graceful-fallback path (CLI is now HTTP-only — the legacy
-// `try_connect_matrixone` direct-sqlx fallback was removed when the
-// edge-cloud architecture was tightened).
+// called from within a tokio runtime. We unset ASTRA_API_URL so they
+// take the graceful-fallback path (CLI is now HTTP-only).
 
 #[tokio::test]
-async fn try_cloud_pull_returns_unreachable_without_cloud_base() {
+async fn try_cloud_pull_returns_unreachable_without_api_url() {
     // Safety: test-only, single-threaded tokio runtime
     unsafe {
-        std::env::remove_var("ASTRA_CLOUD_BASE");
+        std::env::remove_var("ASTRA_API_URL");
     }
     let result = cloud_sync::try_cloud_pull("default").await;
     assert!(
         !result.cloud_reachable,
-        "Without ASTRA_CLOUD_BASE, cloud should be unreachable"
+        "Without ASTRA_API_URL, cloud should be unreachable"
     );
 }
 

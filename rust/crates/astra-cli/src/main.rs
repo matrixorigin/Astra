@@ -1706,22 +1706,19 @@ total_tokens_out: 500
     // inside an existing runtime). We unset MATRIXONE_HOST so they take
     // the graceful-fallback path.
 
-    /// Without `ASTRA_CLOUD_BASE`, the cloud-pull path returns
-    /// `cloud_reachable: false` instead of attempting any HTTP. The
-    /// pre-architecture-fix counterpart of this test verified that
-    /// `try_connect_matrixone` returned `None` without MO env vars
-    /// — same intent (CLI degrades gracefully when no cloud is
-    /// configured) but the new path proves it via the HTTP probe.
+    /// Without `ASTRA_API_URL`, the cloud-pull path returns
+    /// `cloud_reachable: false` instead of attempting any HTTP.
+    /// Verifies graceful offline degradation.
     #[tokio::test]
     async fn try_cloud_pull_returns_unreachable_without_cloud_base() {
         // Safety: test-only, single-threaded tokio runtime
         unsafe {
-            std::env::remove_var("ASTRA_CLOUD_BASE");
+            std::env::remove_var("ASTRA_API_URL");
         }
         let result = cloud_sync::try_cloud_pull("default").await;
         assert!(
             !result.cloud_reachable,
-            "Without ASTRA_CLOUD_BASE, cloud should be unreachable"
+            "Without ASTRA_API_URL, cloud should be unreachable"
         );
     }
 
