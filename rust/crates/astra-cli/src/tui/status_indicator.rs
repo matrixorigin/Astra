@@ -78,10 +78,17 @@ pub(crate) struct StatusIndicator {
     /// Thinking ↔ Tool ↔ Thinking transitions so the `(Ns)` elapsed
     /// counter grows monotonically across the whole turn instead of
     /// flashing back to 0 every time a tool fires. Set by
-    /// [`Self::begin_turn`] at turn start; cleared by [`Self::end_turn`]
-    /// (or implicitly by the next `begin_turn`).
+    /// [`Self::begin_turn`] at turn start; cleared by transitioning
+    /// to `Idle` (or implicitly by the next `begin_turn`).
     turn_started_at: Option<Instant>,
 }
+
+/// How long the model can be silent in `Thinking` state before the
+/// spinner shows the `· thought for Ns` chip. Tuned to match the
+/// "this is taking longer than usual" expectation: short enough to
+/// reassure the user during Bedrock extended-thinking pauses,
+/// long enough to avoid flickering in/out for a normal prompt.
+const SILENT_WINDOW_BEFORE_THOUGHT_CHIP: Duration = Duration::from_secs(5);
 
 impl StatusIndicator {
     pub fn new() -> Self {
@@ -184,20 +191,56 @@ fn render_for(
         IndicatorState::Idle => return None,
     };
 
+    // Surface a `· thought for Ns` chip during long silent stretches
+    // in Thinking state. Bedrock extended-thinking can churn 60-120s
+    // without any SSE delta — this chip is the only signal the user
+    // has that the model is alive on the other end.
+    let thought_for = thought_for_duration(state, stream_chars, elapsed);
+
     Some(Line::from(vec![
         Span::styled(format!("{} ", star_frame(now)), star_style),
         Span::styled(label, label_style),
-        Span::styled(suffix(elapsed, stream_chars), dim),
+        Span::styled(suffix(elapsed, stream_chars, thought_for), dim),
     ]))
 }
 
-/// Parenthesised suffix: `(elapsed · ↓ N tokens · esc to interrupt)`.
+/// Returns `Some(elapsed)` when the spinner should display the
+/// `· thought for Ns` chip. Conditions:
+/// 1. State is Thinking (chip is meaningless for tool execution etc.)
+/// 2. No tokens have streamed yet (token counter takes over once any
+///    have arrived — the counter itself proves the model is active)
+/// 3. We've been silent past the [`SILENT_WINDOW_BEFORE_THOUGHT_CHIP`]
+///    threshold
+fn thought_for_duration(
+    state: &IndicatorState,
+    stream_chars: u64,
+    elapsed: Option<Duration>,
+) -> Option<Duration> {
+    if !matches!(state, IndicatorState::Thinking { .. }) {
+        return None;
+    }
+    if stream_chars > 0 {
+        return None;
+    }
+    let d = elapsed?;
+    if d >= SILENT_WINDOW_BEFORE_THOUGHT_CHIP {
+        Some(d)
+    } else {
+        None
+    }
+}
+
+/// Parenthesised suffix: `(elapsed · thought for Ns · ↓ N tokens · esc to interrupt)`.
 /// Sections elide when they'd be meaningless (token counter
-/// before first delta, no-yet elapsed at state flip).
-fn suffix(elapsed: Option<Duration>, stream_chars: u64) -> String {
+/// before first delta, no-yet elapsed at state flip, thought-for
+/// chip during normal streaming).
+fn suffix(elapsed: Option<Duration>, stream_chars: u64, thought_for: Option<Duration>) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(d) = elapsed {
         parts.push(fmt_duration_coarse(d));
+    }
+    if let Some(d) = thought_for {
+        parts.push(format!("thought for {}", fmt_duration_coarse(d)));
     }
     if stream_chars > 0 {
         parts.push(format!(
@@ -431,6 +474,86 @@ mod tests {
         // Starting a fresh turn does reset.
         s.begin_turn(t0 + Duration::from_secs(60));
         assert_eq!(s.stream_chars, 0, "new turn must zero the counter");
+    }
+
+    /// Bedrock extended-thinking can churn for 60-120s with zero
+    /// SSE deltas. Pre-fix the user saw `✶ Thinking (Ns · esc to
+    /// interrupt)` with N climbing but no other signal that the
+    /// model was actually working — indistinguishable from a
+    /// hung UI. Surface a `thought for Ns` chip after a short
+    /// silence window so the user can tell the difference.
+    #[test]
+    fn thought_for_suffix_appears_after_silent_window() {
+        let mut s = StatusIndicator::new();
+        let t0 = Instant::now();
+        s.set_state(IndicatorState::Thinking { started_at: t0 });
+
+        // Just after start: no thought-for chip yet (well within
+        // the silent-window threshold).
+        let line = s.render_at(t0 + Duration::from_secs(1)).unwrap();
+        assert!(
+            !text_of(&line).contains("thought for"),
+            "fresh thinking shouldn't show thought-for: {}",
+            text_of(&line)
+        );
+
+        // Past the window with still no token streamed — chip lights up.
+        let line = s.render_at(t0 + Duration::from_secs(7)).unwrap();
+        let text = text_of(&line);
+        assert!(
+            text.contains("thought for") && text.contains("7s"),
+            "after 7s of silence the chip should show: {text}"
+        );
+    }
+
+    #[test]
+    fn thought_for_suffix_clears_when_token_arrives() {
+        // Once any tokens have streamed, we know the model is
+        // actively producing — the silent-window chip would be
+        // misleading. The token counter takes over as the activity
+        // signal.
+        let mut s = StatusIndicator::new();
+        let t0 = Instant::now();
+        s.set_state(IndicatorState::Thinking { started_at: t0 });
+
+        // 7s in with no tokens — chip is showing.
+        let line = s.render_at(t0 + Duration::from_secs(7)).unwrap();
+        assert!(text_of(&line).contains("thought for"));
+
+        // First token streams.
+        s.bump_stream_chars(40); // ~10 tokens
+        let line = s.render_at(t0 + Duration::from_secs(8)).unwrap();
+        let text = text_of(&line);
+        assert!(
+            !text.contains("thought for"),
+            "thought-for chip should hide once tokens stream: {text}"
+        );
+        assert!(
+            text.contains("↓"),
+            "token counter takes over: {text}"
+        );
+    }
+
+    #[test]
+    fn thought_for_suffix_only_in_thinking_state() {
+        // Tool / Waiting / AwaitingApproval already have their own
+        // semantics — adding a "thought for Ns" chip would be
+        // nonsense.
+        let t0 = Instant::now();
+        let line = render_for(
+            &IndicatorState::Tool {
+                name: "bash".into(),
+                started_at: t0,
+            },
+            0,
+            None,
+            t0 + Duration::from_secs(15),
+        )
+        .unwrap();
+        assert!(
+            !text_of(&line).contains("thought for"),
+            "thought-for chip is Thinking-only"
+        );
     }
 
     #[test]
