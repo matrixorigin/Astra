@@ -109,8 +109,6 @@ mod mock_llm;
 mod notifications;
 #[path = "cli/permission_manager.rs"]
 mod permission_manager;
-#[path = "cli/plan_auto_suggest.rs"]
-mod plan_auto_suggest;
 #[path = "cli/plan_executor.rs"]
 mod plan_executor;
 #[path = "cli/plan_interaction.rs"]

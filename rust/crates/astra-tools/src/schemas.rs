@@ -850,17 +850,20 @@ fn all_tool_schemas_core() -> Vec<Value> {
         \n\
         For background processes (long-running shell jobs, durable sub-agents) use `agent_job` instead — `task` is the checklist, not the runner.\n\
         \n\
-        ## ACTIVATION RULE (must hold ALL):\n\
-        1. The user's request implies 3 or more distinct outcomes (features, files, steps, deliverables) — explicitly numbered, comma-separated, or implied by conjunctions like \"and\", \"then\", \"also\", \"plus run/build/test\".\n\
-        2. The work cannot finish in ONE tool call (e.g. one file edit, one bash command).\n\
-        3. You haven't already created tasks for this request.\n\
+        ## When to Use This Tool\n\
+        Use `task` when progress tracking will make the work clearer to the user:\n\
+        - Complex multi-step coding work with 3 or more distinct outcomes, files, phases, or deliverables.\n\
+        - Plan-mode execution, where approved plan items should become visible progress.\n\
+        - Work delegated to sub-agents or background jobs that still needs user-visible ownership and completion state.\n\
+        - New requirements discovered while implementing, where the task board should show the expanded scope.\n\
         \n\
-        WHEN ACTIVATED, your FIRST action this turn MUST be:\n\
-        a. `task(action='create')` once per outcome (3+ calls in parallel is fine — they batch).\n\
-        b. Mark the first item as `in_progress` BEFORE beginning work via `task(action='update', task_id='task-1', new_status='in_progress')`.\n\
-        c. THEN start the actual work.\n\
+        When you decide tracking is useful, your FIRST action this turn MUST be:\n\
+        1. Create one task per meaningful outcome or phase. Use subtasks for ordered internal steps.\n\
+        2. Mark the first actionable task as `in_progress` BEFORE beginning work.\n\
+        3. THEN start the actual work.\n\
         \n\
-        ## DO NOT activate if:\n\
+        ## When NOT to Use This Tool\n\
+        Skip task tracking when it would add noise rather than clarity:\n\
         - Single edit / single command / single answer.\n\
         - Pure information request (\"what does X do?\").\n\
         - Triviality (\"add a comment\", \"fix this typo\").\n\
@@ -870,14 +873,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
         - Mark `completed` IMMEDIATELY after finishing — do not batch closures.\n\
         - Discovered new work mid-flight? Create a new task rather than expanding an existing one.\n\
         - Failed? Mark `failed` with `error_message` so the user sees what blocked it; don't silently abandon.\n\
-        \n\
-        ## When NOT to Use This Tool\n\
-        Skip when the activation rule above does not hold. Specifically:\n\
-        1. Single, straightforward task.\n\
-        2. Trivial task where tracking adds noise.\n\
-        3. Less than 3 distinct steps in total.\n\
-        4. Purely conversational or informational.\n\
-        \n\
         \n\
         ## Examples of When to Use the Task Tool\n\
         \n\
@@ -905,7 +900,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
         User: I need to implement these features for my e-commerce site: user registration, product catalog, shopping cart, and checkout flow.\n\
         Assistant: *Creates four parent tasks, one per feature, each with subtasks for db model + API + frontend.* Let's start with user registration.\n\
         \n\
-        <reasoning>The user gave a comma-separated list of four large features — exactly the 'multiple tasks' trigger. Subtasks encode the sub-steps each feature needs.</reasoning>\n\
+        <reasoning>The user asked for four large features. Separate parent tasks make the scope and progress visible; subtasks encode the implementation steps each feature needs.</reasoning>\n\
         </example>\n\
         \n\
         ## Examples of When NOT to Use the Task Tool\n\
@@ -1103,19 +1098,21 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "name": "enter_plan_mode",
                 "description": "Enter plan mode for non-trivial work that needs design before code. While in plan mode you can ONLY read the codebase (read_file, grep, glob, list_dir, symbols, web_fetch). Edits, shell commands, and git mutations are blocked at the permission gate — author the plan, then call `exit_plan_mode` with the markdown for user approval.\n\
         \n\
-        ## ACTIVATION RULE (call this tool when ANY hold):\n\
-        1. The user's request has architectural ambiguity (\"X vs Y\", \"should we use\", \"what's the best way to\", \"redesign\", \"migrate\").\n\
-        2. The change is high-impact: 4+ files, new architecture element, public API surface change, schema migration, security/auth/permission changes.\n\
-        3. Requirements unclear enough that you'd be tempted to ask a clarifying question — plan mode is the more thorough alternative (explore first, then surface a concrete plan).\n\
-        4. The user explicitly asks to plan / discuss approach before implementing (\"plan first\", \"think about\", \"design\").\n\
+        ## When to Use This Tool\n\
+        Use plan mode when user alignment before edits materially reduces risk:\n\
+        - Multiple reasonable implementation approaches exist and the choice affects architecture, data flow, permissions, public API, or persistence.\n\
+        - Requirements are unclear enough that exploration should precede a concrete implementation proposal.\n\
+        - The work is high-impact or hard to unwind, such as schema changes, auth/security behavior, cross-cutting refactors, or large migrations.\n\
+        - The user explicitly wants a plan, design review, or approval before implementation.\n\
         \n\
-        WHEN ACTIVATED:\n\
-        a. Call `enter_plan_mode()`. Edits are now blocked.\n\
-        b. Explore with read tools; identify existing patterns to follow.\n\
-        c. Consider multiple approaches; pick one with clear trade-offs.\n\
-        d. Call `exit_plan_mode(plan='<markdown>', approved=true)` to surface the plan for user approval — this unlocks edits AND auto-seeds the plan items into the task list.\n\
+        When you enter plan mode:\n\
+        1. Edits are blocked by design.\n\
+        2. Explore with read tools and identify existing patterns to follow.\n\
+        3. Consider trade-offs, choose an approach, and write a concrete plan.\n\
+        4. Call `exit_plan_mode(plan='<markdown>', approved=true)` to surface the plan for user approval. Approval unlocks edits and seeds executable plan items.\n\
         \n\
-        ## DO NOT activate if:\n\
+        ## When NOT to Use This Tool\n\
+        Do not enter plan mode when normal execution is clearer:\n\
         - Single-line / few-line fixes (typos, obvious bugs).\n\
         - User gave specific step-by-step instructions — just do them.\n\
         - Pure research / read-only exploration with no implementation step (use `agent` with explore type instead).\n\
@@ -1313,6 +1310,35 @@ mod tests {
             "task description must enforce single-active to prevent the model from \
              flipping every task to in_progress at once"
         );
+    }
+
+    #[test]
+    fn plan_and_task_schemas_use_semantic_guidance_not_lexical_triggers() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let task = find_schema(&schemas, "task").expect("task schema must exist");
+        let enter =
+            find_schema(&schemas, "enter_plan_mode").expect("enter_plan_mode schema must exist");
+        let task_desc = task["function"]["description"].as_str().unwrap();
+        let plan_desc = enter["function"]["description"].as_str().unwrap();
+
+        for desc in [task_desc, plan_desc] {
+            assert!(
+                desc.contains("## When to Use") && desc.contains("## When NOT to Use"),
+                "tool UX guidance should be semantic and example-driven, not an activation-rule matcher: {desc}"
+            );
+            assert!(
+                !desc.contains("ACTIVATION RULE"),
+                "tool schema must not expose matcher-style activation rules: {desc}"
+            );
+            assert!(
+                !desc.contains("conjunctions like"),
+                "task schema must not teach lexical trigger matching: {desc}"
+            );
+            assert!(
+                !desc.contains("\"what's the best way to\"") && !desc.contains("\"redesign\""),
+                "plan schema must not encode phrase-list triggers: {desc}"
+            );
+        }
     }
 
     #[test]

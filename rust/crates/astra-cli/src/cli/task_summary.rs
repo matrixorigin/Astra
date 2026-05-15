@@ -50,11 +50,42 @@ pub(crate) fn format_summary(tasks: &[SessionTask]) -> Option<String> {
             "pending" => "·",
             _ => "·",
         };
-        let title = t.title.chars().take(80).collect::<String>();
-        lines.push(format!("{marker} {}", title));
+        lines.push(format!("{marker} {}", task_line(t)));
     }
 
     Some(lines.join("\n"))
+}
+
+fn task_line(task: &SessionTask) -> String {
+    let title = task.title.chars().take(80).collect::<String>();
+    if task.subtasks.is_empty() {
+        return title;
+    }
+
+    let completed = task
+        .subtasks
+        .iter()
+        .filter(|s| s.status == "completed")
+        .count();
+    let total = task.subtasks.len();
+    let current = task
+        .subtasks
+        .iter()
+        .find(|s| s.status == "in_progress")
+        .map(|s| ("now", s))
+        .or_else(|| {
+            task.subtasks
+                .iter()
+                .find(|s| s.status == "pending")
+                .map(|s| ("next", s))
+        });
+
+    let mut line = format!("{title} — {completed}/{total} subtasks complete");
+    if let Some((label, subtask)) = current {
+        let subtask_title = subtask.title.chars().take(60).collect::<String>();
+        line.push_str(&format!("; {label}: {subtask_title}"));
+    }
+    line
 }
 
 fn counts(tasks: &[SessionTask]) -> (usize, usize, usize, usize) {
@@ -76,6 +107,7 @@ fn counts(tasks: &[SessionTask]) -> (usize, usize, usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_tools::task_mgmt::SessionSubtask;
 
     fn task(id: &str, title: &str, status: &str) -> SessionTask {
         SessionTask {
@@ -91,6 +123,17 @@ mod tests {
             metadata: None,
             blocks: Vec::new(),
             blocked_by: Vec::new(),
+        }
+    }
+
+    fn subtask(id: &str, title: &str, status: &str) -> SessionSubtask {
+        SessionSubtask {
+            id: id.into(),
+            title: title.into(),
+            description: None,
+            status: status.into(),
+            depends_on: Vec::new(),
+            owner: None,
         }
     }
 
@@ -135,6 +178,31 @@ mod tests {
             in_prog < pend,
             "in_progress must come before pending so the model focuses on active work"
         );
+    }
+
+    #[test]
+    fn summary_shows_subtask_progress_and_next_action() {
+        let mut parent = task("task-1", "Implement checkout", "in_progress");
+        parent.subtasks = vec![
+            subtask("sub-1", "Model cart state", "completed"),
+            subtask("sub-2", "Wire checkout API", "in_progress"),
+            subtask("sub-3", "Verify payment errors", "pending"),
+        ];
+        let out = format_summary(&[parent]).unwrap();
+        assert!(out.contains("1/3 subtasks complete"), "{out}");
+        assert!(out.contains("now: Wire checkout API"), "{out}");
+    }
+
+    #[test]
+    fn summary_shows_next_pending_subtask_when_parent_not_started() {
+        let mut parent = task("task-1", "Implement checkout", "pending");
+        parent.subtasks = vec![
+            subtask("sub-1", "Model cart state", "pending"),
+            subtask("sub-2", "Wire checkout API", "pending"),
+        ];
+        let out = format_summary(&[parent]).unwrap();
+        assert!(out.contains("0/2 subtasks complete"), "{out}");
+        assert!(out.contains("next: Model cart state"), "{out}");
     }
 
     #[test]

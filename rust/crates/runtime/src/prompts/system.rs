@@ -770,36 +770,6 @@ pub(crate) fn tool_conditional_section(
     String::new()
 }
 
-fn task_lifecycle_section(tool_names: &[&str]) -> Option<String> {
-    if !tool_names.contains(&"task") {
-        return None;
-    }
-    Some(
-        "\n## Task Lifecycle\n\
-         Use the `task` tool automatically for multi-step work, just like a durable task board:\n\
-         - Create a task before substantial implementation, debugging, refactoring, testing, or cloud/agent work.\n\
-         - Keep it current: mark `in_progress` before execution, update subtasks/dependencies when the plan changes, and mark terminal status when done.\n\
-         - Do not create tasks for simple Q&A, one-file lookups, or work that will finish in a single direct response.\n\
-         - If work is delegated or queued for another agent, record ownership and blocking dependencies so the TUI/CLI can show real status.\n"
-            .to_string(),
-    )
-}
-
-fn plan_lifecycle_section(tool_names: &[&str]) -> Option<String> {
-    if !tool_names.contains(&"enter_plan_mode") || !tool_names.contains(&"exit_plan_mode") {
-        return None;
-    }
-    Some(
-        "\n## Plan Mode Lifecycle\n\
-         Use `enter_plan_mode` when the user wants architecture exploration, a phased plan, or approval before edits:\n\
-         - Enter plan mode before write work when the task is design-heavy, ambiguous, or likely to churn without a written plan.\n\
-         - While plan mode is active, use read/exploration tools to author the plan; write tools stay blocked until the plan is approved.\n\
-         - Finish with `exit_plan_mode(plan='<markdown>', approved=true)` once the plan is ready. Use `approved=false` only if the user rejected the plan or wants to keep iterating.\n\
-         - Do not enter plan mode for simple single-step fixes, direct Q&A, or work that can be completed in one straightforward pass.\n"
-            .to_string(),
-    )
-}
-
 /// Per-turn advisory for tool-selector uncertainty.
 ///
 /// This must stay out of Session-scoped prompt blocks: confidence is computed
@@ -1090,23 +1060,6 @@ pub fn build_system_prompt_sections_with_style(
         // budget alerts.
         sections.push(PromptSection::dynamic(
             tool_cond,
-            PromptTokenBucket::Environment,
-        ));
-    }
-
-    if let Some(task_lifecycle) = task_lifecycle_section(tool_names) {
-        // Task-lifecycle guidance is conditional on the active tool set
-        // (e.g. whether plan/task tools are exposed) and is per-turn —
-        // belongs in `Environment`, not `BasePersona`.
-        sections.push(PromptSection::dynamic(
-            task_lifecycle,
-            PromptTokenBucket::Environment,
-        ));
-    }
-
-    if let Some(plan_lifecycle) = plan_lifecycle_section(tool_names) {
-        sections.push(PromptSection::dynamic(
-            plan_lifecycle,
             PromptTokenBucket::Environment,
         ));
     }
@@ -2128,11 +2081,14 @@ mod tests {
     }
 
     #[test]
-    fn task_tool_adds_lifecycle_guidance() {
+    fn task_tool_lifecycle_guidance_stays_in_tool_schema_not_global_prompt() {
         let p = build_main_system_prompt(&["task", "bash"], "", 1.0, None);
-        assert!(p.contains("Task Lifecycle"));
-        assert!(p.contains("Use the `task` tool automatically"));
-        assert!(p.contains("mark `in_progress`"));
+        assert!(!p.contains("Task Lifecycle"));
+        assert!(!p.contains("Use the `task` tool automatically"));
+        assert!(
+            !p.contains("mark `in_progress`"),
+            "task lifecycle belongs in the task tool schema, not duplicated in the global prompt"
+        );
     }
 
     #[test]
@@ -2143,17 +2099,19 @@ mod tests {
     }
 
     #[test]
-    fn plan_tools_add_lifecycle_guidance() {
+    fn plan_tool_lifecycle_guidance_stays_in_tool_schema_not_global_prompt() {
         let p = build_main_system_prompt(
             &["enter_plan_mode", "exit_plan_mode", "bash"],
             "",
             1.0,
             None,
         );
-        assert!(p.contains("Plan Mode Lifecycle"));
-        assert!(p.contains("Use `enter_plan_mode`"));
-        assert!(p.contains("approved=true"));
-        assert!(p.contains("write tools stay blocked"));
+        assert!(!p.contains("Plan Mode Lifecycle"));
+        assert!(!p.contains("Use `enter_plan_mode`"));
+        assert!(
+            !p.contains("write tools stay blocked"),
+            "plan lifecycle belongs in the enter/exit plan tool schemas, not duplicated globally"
+        );
     }
 
     #[test]
