@@ -296,3 +296,90 @@ fn pending_chip_is_yellow_bold() {
             .contains(ratatui::style::Modifier::BOLD)
     );
 }
+
+// ── Phase 3b.2: background task chip ────────────────────────────────
+//
+// When the BackgroundTaskRegistry has any non-terminal tasks, the
+// status line shows a `BG: N running` (and `· M stalled` if any) chip
+// so the user can see at a glance how many fire-and-poll jobs are in
+// flight without opening a separate view. Hidden when all bg tasks
+// are terminal (or none exist) so the chip doesn't waste space.
+
+#[test]
+fn no_bg_tasks_renders_no_chip() {
+    let s = StatusLine::from_context(&ctx());
+    let plain = s.plain();
+    assert!(
+        !plain.contains("BG:"),
+        "no bg tasks must render no chip; got {plain:?}"
+    );
+}
+
+#[test]
+fn bg_running_only_renders_count() {
+    let c = StatusContext {
+        bg_task_counts: Some((2, 0)),
+        ..ctx()
+    };
+    let plain = StatusLine::from_context(&c).plain();
+    assert!(
+        plain.contains("BG: 2 running"),
+        "running-only chip must show count; got {plain:?}"
+    );
+    assert!(
+        !plain.contains("stalled"),
+        "stalled segment must hide when 0; got {plain:?}"
+    );
+}
+
+#[test]
+fn bg_running_and_stalled_appends_stalled_segment() {
+    let c = StatusContext {
+        bg_task_counts: Some((3, 1)),
+        ..ctx()
+    };
+    let plain = StatusLine::from_context(&c).plain();
+    assert!(
+        plain.contains("BG: 3 running"),
+        "must show running count; got {plain:?}"
+    );
+    assert!(
+        plain.contains("1 stalled"),
+        "must show stalled count when > 0; got {plain:?}"
+    );
+}
+
+#[test]
+fn bg_zero_running_zero_stalled_hides_chip() {
+    // (0, 0) — registry exists but no live tasks. Hide the chip
+    // rather than render `BG: 0 running` noise.
+    let c = StatusContext {
+        bg_task_counts: Some((0, 0)),
+        ..ctx()
+    };
+    let plain = StatusLine::from_context(&c).plain();
+    assert!(
+        !plain.contains("BG:"),
+        "zero counts must hide the chip; got {plain:?}"
+    );
+}
+
+#[test]
+fn bg_stalled_only_chip_uses_yellow_for_attention() {
+    // Stalled is the alarm signal — yellow so the user notices.
+    let c = StatusContext {
+        bg_task_counts: Some((0, 2)),
+        ..ctx()
+    };
+    let s = StatusLine::from_context(&c);
+    let chip = s
+        .left
+        .iter()
+        .find(|seg| seg.text.contains("BG:"))
+        .expect("bg chip must render even when only stalled (the model needs to know)");
+    assert_eq!(
+        chip.style.fg,
+        Some(ratatui::style::Color::Yellow),
+        "stalled-only state must surface in yellow so the user notices"
+    );
+}

@@ -20,6 +20,7 @@ pub mod build_test;
 // builds cross-platform.
 pub mod code_intel;
 pub mod config_tool;
+pub mod detach;
 pub mod env_tools;
 pub mod executor;
 pub mod fs_ops;
@@ -200,6 +201,15 @@ pub struct ToolContext {
     pub logger: std::sync::Arc<dyn ToolLogger>,
     /// Optional cooperative cancellation for long-running async tools.
     pub cancel_token: Option<Arc<CancellationToken>>,
+    /// Optional renewable detach slot for the bash tool. When set,
+    /// the runner takes the contained
+    /// [`crate::detach::DetachShellHandle`] on entry; on the
+    /// signal it transfers child + streams through the embedded
+    /// one-shot channel. The TUI refills the slot before each tool
+    /// call so each bash invocation gets a fresh one-shot.
+    /// `None` (the default) keeps the legacy cancel-on-Ctrl+B
+    /// behaviour where Ctrl+B kills the bash command.
+    pub detach_shell_handle: Option<crate::detach::DetachShellSlot>,
 }
 
 impl ToolContext {
@@ -215,6 +225,7 @@ impl ToolContext {
             http_client: None,
             logger: std::sync::Arc::new(TracingLogger),
             cancel_token: None,
+            detach_shell_handle: None,
         }
     }
 }

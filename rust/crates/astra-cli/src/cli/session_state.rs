@@ -383,6 +383,12 @@ pub(crate) struct SessionState {
     /// Shared command queue for background task operations.
     /// The tool executor pushes spawn/kill/output commands; the TUI drains them.
     pub bg_task_commands: std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>,
+    /// Shared detach slot for bash Ctrl+B promotion. Always present
+    /// (cheap to construct); when the TUI is attached it's wired
+    /// into the executor's ToolContext so each bash invocation can
+    /// observe the signal. Headless paths still see it but never
+    /// fire the signal so behaviour is unchanged.
+    pub bash_detach_slot: astra_tools::detach::DetachShellSlot,
 
     // ── Harness (observation + verification layer) ──
     #[cfg(feature = "harness")]
@@ -554,6 +560,7 @@ impl Default for SessionState {
             turns_since_task_use: 0,
             turns_since_task_reminder: 0,
             bg_task_commands: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            bash_detach_slot: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(feature = "harness")]
             harness_sink: astra_harness::InMemorySnapshotSink::arc(),
             #[cfg(feature = "harness")]

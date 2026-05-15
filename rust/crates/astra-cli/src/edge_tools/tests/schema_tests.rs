@@ -62,6 +62,7 @@ fn tool_schemas_include_core_tools() {
         "session",
         "mo",
         "agent",
+        "agent_job",
         "introspect",
         "lsp",
         "web_fetch",
@@ -428,4 +429,206 @@ fn task_schema_requires_title_and_task_id() {
         conditional_required_for(task, "stop"),
         vec!["task_id".to_string()]
     );
+}
+
+/// Phase 1 split: `task` is the durable checklist surface (claudecode v2
+/// alignment). All background-execution actions live on a separate
+/// `agent_job` tool (codex agent_jobs alignment). The `task` schema must
+/// no longer advertise background_shell/background_agent/output/kill —
+/// otherwise the model gets two equally-valid paths and picks the wrong
+/// one for ordinary checklist work.
+#[test]
+fn task_schema_does_not_advertise_background_actions() {
+    let schemas = all_tool_schemas();
+    let task = tool_schema(&schemas, "task");
+    let actions: Vec<&str> = task["function"]["parameters"]["properties"]["action"]["enum"]
+        .as_array()
+        .expect("task.action must be an enum")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    for banned in &["background_shell", "background_agent", "output", "kill"] {
+        assert!(
+            !actions.contains(banned),
+            "task.action enum still advertises `{banned}` — it must move to \
+             the `agent_job` tool. Got: {actions:?}"
+        );
+    }
+    // Sanity: the checklist verbs are still there.
+    for kept in &["create", "update", "list", "get", "stop"] {
+        assert!(
+            actions.contains(kept),
+            "task.action must still include `{kept}` — got: {actions:?}"
+        );
+    }
+}
+
+/// `agent_job` is the new home for background execution: shell processes
+/// and durable agent runs. The actions mirror what was on `task` before
+/// the split (background_shell/background_agent/output/kill) but with the
+/// `background_` prefix dropped — there's no other kind of agent_job.
+#[test]
+fn agent_job_schema_exists_with_expected_actions() {
+    let schemas = all_tool_schemas();
+    let agent_job = schemas
+        .iter()
+        .find(|s| s["function"]["name"].as_str() == Some("agent_job"))
+        .expect(
+            "agent_job schema must exist — it's the new tool that owns \
+             background_shell/background_agent/output/kill after the Phase 1 split",
+        );
+    let actions: Vec<&str> = agent_job["function"]["parameters"]["properties"]["action"]["enum"]
+        .as_array()
+        .expect("agent_job.action must be an enum")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    for expected in &["shell", "agent", "output", "kill"] {
+        assert!(
+            actions.contains(expected),
+            "agent_job.action must include `{expected}`. Got: {actions:?}"
+        );
+    }
+}
+
+#[test]
+fn agent_job_schema_per_action_required_fields() {
+    let schemas = all_tool_schemas();
+    let agent_job = tool_schema(&schemas, "agent_job");
+    assert_eq!(
+        conditional_required_for(agent_job, "shell"),
+        vec!["command".to_string()],
+        "agent_job.shell must require `command` — without it the executor \
+         has no command to run and the model would silently no-op"
+    );
+    assert_eq!(
+        conditional_required_for(agent_job, "agent"),
+        vec!["prompt".to_string()],
+        "agent_job.agent must require `prompt`"
+    );
+    assert_eq!(
+        conditional_required_for(agent_job, "output"),
+        vec!["task_id".to_string()],
+        "agent_job.output must require `task_id` — there's no implicit \
+         most-recent-job; the model must name the job it's reading from"
+    );
+    assert_eq!(
+        conditional_required_for(agent_job, "kill"),
+        vec!["task_id".to_string()],
+        "agent_job.kill must require `task_id` — never bulk-kill all jobs"
+    );
+}
+
+// ── Phase 2: plan-mode top-level tools (claudecode parity) ──────────────
+//
+// Astra previously exposed plan-mode entry/exit only via `session.enter_plan`
+// and `session.exit_plan` — buried in a 15-action enum with no permission
+// gate plumbing. The model rarely picked them. claudecode promotes them to
+// dedicated top-level tools (`EnterPlanMode`, `ExitPlanMode`) with strong
+// prose so the model self-triggers plan mode for non-trivial work.
+//
+// These tests pin the schema-side contract: the new tools exist, they
+// take the right shape, and the legacy `session.enter_plan/exit_plan`
+// actions are gone (replaced by an Error: redirect at the dispatcher,
+// see executor_core_tests).
+
+#[test]
+fn enter_plan_mode_tool_exists_with_no_required_args() {
+    let schemas = all_tool_schemas();
+    let tool = schemas
+        .iter()
+        .find(|s| s["function"]["name"].as_str() == Some("enter_plan_mode"))
+        .expect(
+            "enter_plan_mode must be a top-level tool (claudecode parity). \
+             Promoting it from a buried `session` action is the whole point \
+             of Phase 2 — the model never picked it as a sub-action.",
+        );
+    let params = &tool["function"]["parameters"];
+    let required = params
+        .get("required")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        required.is_empty(),
+        "enter_plan_mode must take no required args — claudecode's \
+         EnterPlanMode is a pure sentinel ('flip mode and tell me how to \
+         author the plan'). Optional `goal` is fine. Got required: {required:?}"
+    );
+    let desc = tool["function"]["description"]
+        .as_str()
+        .expect("description");
+    assert!(
+        desc.to_lowercase().contains("plan") && desc.to_lowercase().contains("read"),
+        "enter_plan_mode description must explain the plan-mode contract \
+         (read-only exploration, no edits) so the model picks it correctly. \
+         Got: {desc}"
+    );
+}
+
+#[test]
+fn exit_plan_mode_tool_exists_with_plan_arg() {
+    let schemas = all_tool_schemas();
+    let tool = schemas
+        .iter()
+        .find(|s| s["function"]["name"].as_str() == Some("exit_plan_mode"))
+        .expect(
+            "exit_plan_mode must be a top-level tool. It's the plan-of-record \
+             handoff — the markdown the user approves becomes the next turn's \
+             execution input.",
+        );
+    let props = &tool["function"]["parameters"]["properties"];
+    assert!(
+        props.get("plan").is_some(),
+        "exit_plan_mode must accept a `plan` parameter (the markdown to \
+         present to the user for approval). Without it the model has no way \
+         to surface the plan it just wrote. Got props: {props}"
+    );
+    assert!(
+        props.get("approved").is_some(),
+        "exit_plan_mode must accept an `approved` boolean — server-side \
+         tool_exit_plan_mode already takes it and gates the write-tool \
+         unlock on it. The schema must mirror."
+    );
+}
+
+#[test]
+fn enter_plan_mode_and_exit_plan_mode_listed_in_executor_tool_names() {
+    // SERVER_EXECUTOR_TOOL_NAMES is the source of truth for which tools the
+    // server-side executor will dispatch. Without these entries, the server
+    // sees the tool name and routes to the unknown-tool fallback.
+    use astra_tools::schemas::SERVER_EXECUTOR_TOOL_NAMES;
+    assert!(
+        SERVER_EXECUTOR_TOOL_NAMES.contains(&"enter_plan_mode"),
+        "SERVER_EXECUTOR_TOOL_NAMES must include `enter_plan_mode` so the \
+         server dispatcher routes the call. Got: {SERVER_EXECUTOR_TOOL_NAMES:?}"
+    );
+    assert!(
+        SERVER_EXECUTOR_TOOL_NAMES.contains(&"exit_plan_mode"),
+        "SERVER_EXECUTOR_TOOL_NAMES must include `exit_plan_mode`."
+    );
+}
+
+#[test]
+fn session_schema_no_longer_advertises_enter_plan_or_exit_plan() {
+    // After the Phase 2 promotion to top-level tools, the legacy
+    // `session.enter_plan` / `session.exit_plan` actions must be removed
+    // from the action enum. Otherwise the model has TWO valid paths to
+    // enter plan mode, picks the buried one, and bypasses the new prose
+    // that explains the plan-mode contract.
+    let schemas = all_tool_schemas();
+    let session = tool_schema(&schemas, "session");
+    let actions: Vec<&str> = session["function"]["parameters"]["properties"]["action"]["enum"]
+        .as_array()
+        .expect("session.action must be an enum")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    for banned in &["enter_plan", "exit_plan"] {
+        assert!(
+            !actions.contains(banned),
+            "session.action enum still advertises `{banned}` — it must move \
+             to the top-level `{banned}_mode` tool. Got: {actions:?}"
+        );
+    }
 }

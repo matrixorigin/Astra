@@ -304,6 +304,19 @@ fn cli_chat_permission_mode() {
 }
 
 #[test]
+fn cli_chat_permission_mode_legacy_aliases() {
+    for mode in ["yolo", "bypass-safety", "bypass_safety"] {
+        let cli = Cli::try_parse_from(["astra", "chat", "--permission-mode", mode]).unwrap();
+        match cli.command {
+            Some(Command::Chat(ref args)) => {
+                assert_eq!(args.permission_mode.as_deref(), Some(mode));
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+}
+
+#[test]
 fn cli_external_subcommand_message() {
     let cli = Cli::try_parse_from(["astra", "what", "is", "rust"]).unwrap();
     match cli.command {

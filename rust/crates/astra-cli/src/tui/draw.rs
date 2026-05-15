@@ -113,11 +113,11 @@ pub(crate) fn active_viewport(
     // sub-agents run shows both).
     //
     // Visibility rule: show the strip while ANY agent is still live
-    // (running). Once all agents are terminal (completed OR failed),
-    // linger for `STRIP_LINGER` so the user can glance at the final
-    // state, then dismiss. Failed entries no longer pin the strip
-    // permanently — they participate in the same linger window.
-    // Beyond linger the user can still drill in via Ctrl+G.
+    // (running). Completed-only strips linger for `STRIP_LINGER` so
+    // the user can glance at the final state, then dismiss. Failed
+    // entries stay visible until a new turn state replaces them, so
+    // failures are not silently missed after a short linger timeout.
+    // Users can still drill in via Ctrl+G.
     const STRIP_LINGER: std::time::Duration = std::time::Duration::from_secs(5);
     let _ = inner_w; // retained for future per-row layout decisions
     let agent_ids = chat_widget.agent_run_ids();
@@ -145,6 +145,7 @@ pub(crate) fn active_viewport(
             .collect();
 
         let any_live = cells.iter().any(|entry| entry.live);
+        let any_failed = cells.iter().any(|entry| entry.failed);
         let any_recently_terminal = !any_live
             && agent_ids.iter().any(|id| {
                 chat_widget.agent_run_cell(id).is_some_and(|tc| {
@@ -152,7 +153,7 @@ pub(crate) fn active_viewport(
                         .is_some_and(|completed_at| completed_at.elapsed() < STRIP_LINGER)
                 })
             });
-        if any_live || any_recently_terminal {
+        if any_live || any_failed || any_recently_terminal {
             Some(cells)
         } else {
             None
@@ -171,6 +172,16 @@ pub(crate) fn active_viewport(
             Some((lines, live, freeze_phase))
         }
     });
+    // Pump the observer before reading its snapshot. Without this,
+    // mid-turn `task.create` / `task.update` calls land in
+    // `session_todos` but never propagate into the snapshot until
+    // the outer-tick branch fires `maybe_refresh()` — which can
+    // be 30+ seconds for a long agentic loop. The observer's own
+    // dirty/window gating makes per-frame calls cheap (no fetch
+    // unless something actually changed).
+    if let Some(b) = board {
+        b.maybe_refresh();
+    }
     let snap = board.map(|b| b.snapshot()).unwrap_or_default();
     // In multi-session mode the standard `snap.tasks` is empty by
     // design (observer populates `multi_snapshot` instead). Pick

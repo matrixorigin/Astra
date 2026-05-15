@@ -330,6 +330,7 @@ pub(super) async fn handle_task_command(
                     session_state_journal: None,
                     task_manager: None,
                     bg_task_commands: None,
+                    bash_detach_slot: None,
                     turn_index: 0,
                     pipeline_state: None,
                     pre_loaded_messages: None,

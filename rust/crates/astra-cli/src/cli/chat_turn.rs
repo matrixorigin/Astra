@@ -253,6 +253,56 @@ pub(super) async fn handle_chat_input_with_ui(
         );
     }
 
+    // ── First-message activation reminder (Phase 4 / problems 2+3) ──
+    // On the very first user message of a session, if the message
+    // looks multi-step or design-ambiguous, inject a stronger
+    // reminder than the lazy 10-turn nudge below. Catches the case
+    // where a user opens with "implement X, Y, Z, then run tests"
+    // and the model would otherwise just start coding without
+    // calling `task.create` or `enter_plan_mode`.
+    //
+    // Heuristic-only: false positives are tolerable (the reminder
+    // is hint-shaped, not forced); false negatives are the bigger
+    // UX harm. Fires only when neither task nor plan tools have
+    // been used yet so we don't double-nudge a model that already
+    // chose the right path.
+    if state.turn == 0
+        && !state
+            .recent_tools
+            .iter()
+            .any(|t| t == "task" || t.starts_with("task_") || t == "enter_plan_mode")
+    {
+        let multi_step = looks_like_multi_step(&line);
+        let design = looks_like_design_question(&line);
+        if multi_step || design {
+            let mut hints: Vec<&str> = Vec::with_capacity(2);
+            if multi_step {
+                hints.push(
+                    "This message implies multiple distinct outcomes. \
+                     Strongly prefer calling `task(action='create')` once per outcome \
+                     BEFORE starting work, then `task(action='update', new_status='in_progress')` \
+                     for the first item. The user will see real-time progress on the task board.",
+                );
+            }
+            if design {
+                hints.push(
+                    "This message has architectural ambiguity. \
+                     Strongly prefer `enter_plan_mode()` first to explore the codebase, \
+                     then `exit_plan_mode(plan='<markdown>', approved=true)` to surface the plan \
+                     for user approval — this is more thorough than asking clarifying questions.",
+                );
+            }
+            let body = hints.join("\n\n");
+            effective_line = format!(
+                "<system-reminder>\n\
+                {body}\n\
+                \n\
+                Make sure you NEVER mention this reminder to the user.\n\
+                </system-reminder>\n\n{effective_line}"
+            );
+        }
+    }
+
     // Task tool usage nudge: if 10+ turns without task tool use and 10+ turns
     // since last reminder, inject a gentle nudge with the current task list.
     const TURNS_SINCE_TASK_USE_THRESHOLD: u32 = 10;
@@ -730,6 +780,147 @@ fn is_low_information_followup(line: &str) -> bool {
     has_deictic_reference || has_question_shape || short_ascii_action
 }
 
+/// Phase 4 / problem 2 — heuristic detector for "this user request
+/// implies multi-step work". Used to inject a stronger nudge to use
+/// `task.create` / `enter_plan_mode` on the FIRST message of a
+/// session, matching claudecode's stronger initial-message
+/// triggering. False positives are tolerable (model can ignore the
+/// nudge); false negatives are the bigger UX problem.
+///
+/// Heuristics (ANY positive):
+/// - Numbered list (`1. ...`, `1) ...`).
+/// - Bullet list (`- ...`, `* ...`).
+/// - 3+ imperative verbs in mixed CJK/ASCII.
+/// - 2+ conjunctions linking outcomes ("and then", "and also", "顺便", "另外", "还有").
+/// - Long message (>120 chars) with a verb.
+pub(super) fn looks_like_multi_step(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // Numbered or bullet list — strongest signal.
+    let lines: Vec<&str> = trimmed.lines().map(str::trim).collect();
+    let numbered = lines
+        .iter()
+        .filter(|l| {
+            let mut chars = l.chars();
+            chars
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+                && matches!(
+                    chars.next(),
+                    // ASCII period and paren, plus 中文版本: ideographic
+                    // full stop, full-width period, full-width paren.
+                    Some('.') | Some(')') | Some('、') | Some('。') | Some('．') | Some('）')
+                )
+        })
+        .count();
+    if numbered >= 2 {
+        return true;
+    }
+    let bulleted = lines
+        .iter()
+        .filter(|l| l.starts_with("- ") || l.starts_with("* ") || l.starts_with("• "))
+        .count();
+    if bulleted >= 2 {
+        return true;
+    }
+
+    // Conjunction count — "X and Y and Z" or 中文版本.
+    let lower = trimmed.to_ascii_lowercase();
+    let conjunctions = [
+        " and then ",
+        " and also ",
+        " then ",
+        ", and ",
+        " plus ",
+        ", plus ",
+        "顺便",
+        "另外",
+        "还有",
+        "并且",
+        "再",
+    ];
+    let conjunction_hits = conjunctions
+        .iter()
+        .filter(|c| lower.contains(*c) || trimmed.contains(*c))
+        .count();
+    if conjunction_hits >= 2 {
+        return true;
+    }
+
+    // Multiple imperative verbs (English + 中文 common ones).
+    let imperatives = [
+        "implement",
+        "add",
+        "create",
+        "build",
+        "fix",
+        "refactor",
+        "migrate",
+        "test",
+        "deploy",
+        "review",
+        "实现",
+        "添加",
+        "创建",
+        "构建",
+        "修复",
+        "重构",
+        "迁移",
+        "测试",
+        "部署",
+        "审查",
+    ];
+    let imperative_hits = imperatives
+        .iter()
+        .filter(|w| lower.contains(*w) || trimmed.contains(*w))
+        .count();
+    if imperative_hits >= 3 {
+        return true;
+    }
+
+    // Long message + at least one imperative (long requests usually
+    // have multiple parts even if conjunctions are written informally).
+    if trimmed.chars().count() > 120 && imperative_hits >= 1 && conjunction_hits >= 1 {
+        return true;
+    }
+
+    false
+}
+
+/// Companion to `looks_like_multi_step` — detects messages that
+/// suggest plan-mode authorship rather than a checklist. Architectural
+/// ambiguity, redesign signals, "best way to" questions.
+pub(super) fn looks_like_design_question(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let phrases = [
+        "best way to",
+        "what's the right",
+        " vs ",
+        "should we use",
+        "how should i",
+        "redesign",
+        "rearchitect",
+        "architecture for",
+        "approach for",
+        "迁移",
+        "重新设计",
+        "架构",
+        "怎么设计",
+        "用哪个",
+        "该不该",
+    ];
+    phrases
+        .iter()
+        .any(|p| lower.contains(*p) || trimmed.contains(*p))
+}
+
 fn is_greeting_like_message(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -1040,6 +1231,7 @@ async fn run_chat_turn(
             session_state_journal: Some(state.session_state_journal.clone()),
             task_manager: Some(state.task_manager.clone()),
             bg_task_commands: Some(state.bg_task_commands.clone()),
+            bash_detach_slot: Some(state.bash_detach_slot.clone()),
             turn_index: state.turn,
             pipeline_state: None,
             pre_loaded_messages: None,
@@ -4083,6 +4275,57 @@ mod tests {
         assert!(effective.contains("review commit aa1f419b"));
         assert!(effective.contains("fix / patch / test / continue"));
         assert!(effective.contains("[User follow-up]\n修复?"));
+    }
+
+    // ── Phase 4 / problem 2+3: triggering classifiers ──────────────
+
+    #[test]
+    fn looks_like_multi_step_catches_obvious_request_patterns() {
+        // Numbered list — strongest signal.
+        assert!(looks_like_multi_step(
+            "Please:\n1. Add dark mode toggle\n2. Add tests\n3. Run build"
+        ));
+        // Bullet list.
+        assert!(looks_like_multi_step(
+            "- migrate auth to JWT\n- update tests\n- redeploy"
+        ));
+        // Multiple imperatives in CN.
+        assert!(looks_like_multi_step(
+            "实现 dark mode,添加测试,然后构建项目"
+        ));
+        // English conjunctions chaining outcomes.
+        assert!(looks_like_multi_step(
+            "implement login flow and then add tests and also wire up the metrics"
+        ));
+    }
+
+    #[test]
+    fn looks_like_multi_step_ignores_simple_requests() {
+        assert!(!looks_like_multi_step("fix this typo"));
+        assert!(!looks_like_multi_step("add a comment to calculateTotal"));
+        assert!(!looks_like_multi_step("how do I print hello world?"));
+        assert!(!looks_like_multi_step("修一下这个 bug"));
+    }
+
+    #[test]
+    fn looks_like_design_question_catches_architecture_signals() {
+        assert!(looks_like_design_question(
+            "what's the best way to do caching here?"
+        ));
+        assert!(looks_like_design_question(
+            "should we use Redis vs in-memory for the rate limiter?"
+        ));
+        assert!(looks_like_design_question("redesign the auth flow"));
+        assert!(looks_like_design_question(
+            "重新设计一下数据流的架构"
+        ));
+    }
+
+    #[test]
+    fn looks_like_design_question_ignores_implementation_requests() {
+        assert!(!looks_like_design_question("fix the bug"));
+        assert!(!looks_like_design_question("add a new endpoint"));
+        assert!(!looks_like_design_question("run the tests"));
     }
 
     #[test]

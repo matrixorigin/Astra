@@ -36,8 +36,14 @@ use std::time::{Duration, Instant};
 /// board has no in-flight work, ticks skip the fetch entirely.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Faster poll right after a broadcast/rebind so the user sees writes
-/// land within UI-perceptible latency.
-const FAST_POLL: Duration = Duration::from_millis(250);
+/// land within UI-perceptible latency. Gated by the `dirty` atomic
+/// so a quiet board never re-reads the store; only fires when there
+/// IS a known change to chase. Phase 4 dropped this from 250ms to
+/// 50ms after user feedback that the task board appeared blank
+/// during long turns — the in-turn `do_draw` path now also pumps
+/// `maybe_refresh`, so per-frame latency at 60fps stays under 17ms
+/// of the cap.
+const FAST_POLL: Duration = Duration::from_millis(50);
 /// How long the board stays painted after the last incomplete task
 /// closes out before `hidden` flips.
 const HIDE_DELAY: Duration = Duration::from_secs(5);
@@ -542,6 +548,56 @@ mod tests {
             pump();
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// REGRESSION (Phase 4 / problem 1): the in-turn `do_draw` path
+    /// must observe a task.create within UI-perceptible latency.
+    /// Pre-fix `FAST_POLL` was 250ms; user-reported behaviour was
+    /// "task board never appears until the turn ends" because the
+    /// outer-tick branch was the only place `maybe_refresh` ran.
+    /// We tightened FAST_POLL to 50ms so when callers DO start
+    /// pumping `maybe_refresh` per-frame, the latency is invisible.
+    /// Pin: ≤100ms covers an aggressive UI tick budget and keeps
+    /// test wall-time tight.
+    #[tokio::test]
+    async fn dirty_refresh_lands_within_100ms_of_create() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let store_dyn: Arc<dyn TaskStore> = store.clone();
+        let obs = TaskBoardObserver::new(store_dyn, "sess-fast");
+        // Seed `last_fetch` to a value old enough that the first
+        // `maybe_refresh` will fire — without this, the constructor
+        // sets `last_fetch = Instant::now()` and the FAST_POLL
+        // window suppresses the first poll for 50ms even with dirty.
+        // The fix path must respect both the dirty flag and the
+        // window so this seeding still gates on FAST_POLL elapsing.
+        {
+            let mut st = obs.inner.state.lock().unwrap();
+            st.last_fetch = Instant::now()
+                .checked_sub(Duration::from_millis(60))
+                .unwrap_or_else(Instant::now);
+        }
+        let m = mgr(store, "sess-fast");
+
+        let started = Instant::now();
+        m.create(&json!({"title": "fast-task"})).await;
+
+        wait_until(
+            || !obs.snapshot().tasks.is_empty(),
+            150, // tight: must land well before the legacy 250ms FAST_POLL
+            || obs.maybe_refresh(),
+        )
+        .await;
+
+        let elapsed = started.elapsed();
+        assert!(
+            !obs.snapshot().tasks.is_empty(),
+            "task did not land in snapshot within 150ms"
+        );
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "task should land within 150ms of create; took {:?}",
+            elapsed
+        );
     }
 
     #[tokio::test]

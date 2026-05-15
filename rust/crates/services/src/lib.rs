@@ -218,9 +218,10 @@ pub use skills::{
     SkillService, UnconfiguredSkillService,
 };
 pub use state_projection::{
-    BubbleUpTarget, COMPACTION_INVARIANT_SQL, CompactionInvariant, DatabaseStateProjectionStore,
-    DelegationProjectionUpsert, PROTECTED_COMPACTION_CATEGORIES, SkillActivationLlmProbe,
-    StateItemUpsert, StateProjectionError, UserAnchorMemoryItem, validate_state_mutation,
+    BubbleUpTarget, COMPACTION_INVARIANT_SQL, CompactionInvariant, DatabasePlanTodoSink,
+    DatabaseStateProjectionStore, DelegationProjectionUpsert, PROTECTED_COMPACTION_CATEGORIES,
+    PlanTodoSeed, PlanTodoSink, SkillActivationLlmProbe, StateItemUpsert, StateProjectionError,
+    UserAnchorMemoryItem, validate_state_mutation,
 };
 pub use state_sync::{
     LocalOnlySyncService, MatrixOneSyncService, PlanTemplateSyncRow, StateSyncService,

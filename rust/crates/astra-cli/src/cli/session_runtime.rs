@@ -22,30 +22,53 @@ pub(crate) fn local_task_service() -> std::sync::Arc<dyn astra_services::TaskSer
     std::sync::Arc::new(astra_services::LocalTaskService::new(tasks_dir))
 }
 
-pub(crate) async fn resolve_task_service() -> std::sync::Arc<dyn astra_services::TaskService> {
-    if std::env::var("MATRIXONE_HOST").is_ok() {
-        let settings = astra_core::MatrixOneSettings::from_env();
-        let catalog =
-            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
-        let _ = astra_services::storage::ensure_core_schema(&settings, &catalog).await;
-        if let Some(pool) = cloud_sync::try_connect_matrixone().await {
-            return std::sync::Arc::new(astra_services::MatrixOneTaskService::new(pool));
-        }
+/// Resolve a `TaskService` impl for this CLI invocation.
+///
+/// Edge-cloud contract: the CLI never connects to MatrixOne
+/// directly. When `cloud_base` is configured (via env or the
+/// authenticated session), we return [`crate::http_task_service::HttpTaskService`]
+/// which proxies trait calls through `POST /tasks:rpc`. Otherwise
+/// we fall back to the local on-disk store so offline / one-shot
+/// CLI and headless tests stay functional.
+///
+/// `profile` is forwarded to the access-token lookup so the same
+/// cloud session can be used for both the SSE stream and task RPC.
+pub(crate) async fn resolve_task_service(
+    profile: Option<&str>,
+) -> std::sync::Arc<dyn astra_services::TaskService> {
+    if let Some(cloud_base) = resolve_cloud_base() {
+        let token = current_access_token(profile);
+        return std::sync::Arc::new(crate::http_task_service::HttpTaskService::new(
+            cloud_base, token,
+        ));
     }
     local_task_service()
 }
 
-/// Task store for the Tier 1 session scratchpad (`session_todos`). MO-backed
-/// when a pool is configured so edge/cloud see the same rows; in-memory
-/// fallback for offline CLI.
+/// Resolve the cloud REST base URL from env. Returns `None` when
+/// no cloud is configured (offline mode); callers fall back to the
+/// local on-disk task store.
+fn resolve_cloud_base() -> Option<String> {
+    std::env::var("ASTRA_CLOUD_BASE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Task store for the Tier 1 session scratchpad (`session_todos`).
+///
+/// **CLI never connects to MatrixOne directly.** The previous
+/// implementation built a `MatrixOneTaskStore` from a sqlx pool when
+/// `MATRIXONE_HOST` was set — that violated the edge-cloud contract
+/// (DB writes must be server-mediated). The cloud path now routes
+/// every `task` action through the server's
+/// `POST /sessions/{sid}/todos:execute` endpoint via
+/// [`crate::session_todo_client`]; this `resolve_task_store` only
+/// returns the in-memory fallback used for offline CLI and headless
+/// tests. The HTTP routing is wired at the dispatcher level
+/// (`edge_tools::ToolExecutor::route_task_action`), so the in-memory
+/// store here just keeps the local TaskManager API alive when no
+/// cloud is reachable.
 pub(crate) async fn resolve_task_store() -> std::sync::Arc<dyn astra_tools::task_mgmt::TaskStore> {
-    if std::env::var("MATRIXONE_HOST").is_ok()
-        && let Some(pool) = cloud_sync::try_connect_matrixone().await
-    {
-        return std::sync::Arc::new(astra_tools::task_mgmt_matrixone::MatrixOneTaskStore::new(
-            pool,
-        ));
-    }
     std::sync::Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new())
 }
 
@@ -79,35 +102,35 @@ pub(crate) fn rebind_task_session(state: &SessionState, session_id: &str) {
     state.task_manager.rebind(session_id);
 }
 
-pub(crate) async fn resolve_matrixone_task_runtime() -> Result<
+/// Resolve the durable cloud task runtime (TaskService + lease).
+///
+/// Edge-cloud contract: no direct MO connection from the CLI. Both
+/// services proxy through their REST surfaces:
+/// - TaskService → `POST /tasks:rpc`
+/// - TaskLeaseService → `/tasks/{id}/lease/*`
+///
+/// `profile` is forwarded to the access-token resolver so a logged-in
+/// CLI invocation gets bearer auth.
+pub(crate) async fn resolve_matrixone_task_runtime(
+    profile: Option<&str>,
+) -> Result<
     (
         std::sync::Arc<dyn astra_services::TaskService>,
         std::sync::Arc<dyn astra_services::TaskLeaseService>,
     ),
     String,
 > {
-    if std::env::var("MATRIXONE_HOST").is_err() {
-        return Err(
-            "MatrixOne task runtime is not configured; set MATRIXONE_HOST and related MatrixOne env vars"
-                .to_string(),
-        );
-    }
-    let settings = astra_core::MatrixOneSettings::from_env();
-    let catalog =
-        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
-    astra_services::storage::ensure_core_schema(&settings, &catalog)
-        .await
-        .map_err(|e| format!("initialize MatrixOne task schema: {e}"))?;
-    let pool = cloud_sync::try_connect_matrixone()
-        .await
-        .ok_or_else(|| "connect MatrixOne task runtime".to_string())?;
-    let task_service: std::sync::Arc<dyn astra_services::TaskService> =
-        std::sync::Arc::new(astra_services::MatrixOneTaskService::new(pool.clone()));
-    let lease_service: std::sync::Arc<dyn astra_services::TaskLeaseService> =
-        std::sync::Arc::new(astra_services::DatabaseTaskLeaseService::new(
-            pool,
-            std::sync::Arc::new(astra_services::TaskLeaseHoldCache::default()),
-        ));
+    let cloud_base = resolve_cloud_base().ok_or_else(|| {
+        "Cloud task runtime requires ASTRA_CLOUD_BASE; CLI no longer connects to MatrixOne directly"
+            .to_string()
+    })?;
+    let token = current_access_token(profile);
+    let task_service: std::sync::Arc<dyn astra_services::TaskService> = std::sync::Arc::new(
+        crate::http_task_service::HttpTaskService::new(cloud_base.clone(), token.clone()),
+    );
+    let lease_service: std::sync::Arc<dyn astra_services::TaskLeaseService> = std::sync::Arc::new(
+        crate::http_task_service::HttpTaskLeaseService::new(cloud_base, token),
+    );
     Ok((task_service, lease_service))
 }
 
@@ -139,12 +162,17 @@ fn create_pipeline_modules_inner(
     // (server HOME skills + database skills visible to this user). That keeps
     // CLI and Web aligned for shared server capabilities without pretending
     // that project-local CLI skills are available to Web sessions.
-    let remote_catalog = current_access_token(profile).map(|_| {
-        let profile_owned = profile.map(str::to_string);
-        let token_provider: astra_runtime::capabilities::TokenProvider =
-            std::sync::Arc::new(move || current_access_token(profile_owned.as_deref()));
-        astra_runtime::capabilities::RemoteSkillCatalogProvider::new(api.clone(), token_provider)
-    });
+    // Always install the remote catalog provider. It reads tokens at
+    // call time, so sessions can recover after env-token expiry/login
+    // without requiring a full CLI restart to rebuild pipeline modules.
+    let profile_owned = profile.map(str::to_string);
+    let token_provider: astra_runtime::capabilities::TokenProvider =
+        std::sync::Arc::new(move || current_access_token(profile_owned.as_deref()));
+    let remote_catalog =
+        Some(astra_runtime::capabilities::RemoteSkillCatalogProvider::new(
+            api.clone(),
+            token_provider,
+        ));
     let unified_skill_registry =
         astra_runtime::capabilities::build_cli_local_skill_registry(remote_catalog);
     let handle = tokio::runtime::Handle::current();

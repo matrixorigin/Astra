@@ -2003,10 +2003,42 @@ pub async fn ensure_core_schema(
     // for rationale; CLAUDE.md §3 compliance: primary key matches the only
     // access pattern (filter by session_id); single secondary index covers
     // the "open todos ordered by recency" query.
+    //
+    // U-3 drift defense: per the no-compat directive, if an existing
+    // `session_todos` table predates the user_id column we DROP it
+    // and let CREATE TABLE rebuild fresh. Production starts on the
+    // new shape; dev/test envs that ran an older migration would
+    // otherwise hit "unknown column user_id" on next write since
+    // CREATE TABLE IF NOT EXISTS is a no-op when the table exists.
+    let has_user_id_col: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS \
+         WHERE TABLE_SCHEMA = DATABASE() \
+           AND TABLE_NAME = 'session_todos' \
+           AND COLUMN_NAME = 'user_id'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(1);
+    let table_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES \
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'session_todos'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(0);
+    if table_exists > 0 && has_user_id_col == 0 {
+        tracing::warn!(
+            "session_todos table predates user_id column; dropping and recreating per no-compat directive"
+        );
+        if let Err(e) = query("DROP TABLE session_todos").execute(&pool).await {
+            tracing::warn!("failed to drop legacy session_todos: {e}; CREATE TABLE will likely error");
+        }
+    }
     query(
         "CREATE TABLE IF NOT EXISTS session_todos (
             session_id VARCHAR(64) NOT NULL,
             todo_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
             ordinal INT NOT NULL,
             title VARCHAR(512) NOT NULL,
             description TEXT NULL,
@@ -2017,10 +2049,12 @@ pub async fn ensure_core_schema(
             blocks JSON NULL,
             blocked_by JSON NULL,
             subtasks JSON NULL,
+            archived_at DATETIME(6) NULL,
             created_at DATETIME(6) NOT NULL,
             updated_at DATETIME(6) NOT NULL,
             PRIMARY KEY (session_id, todo_id),
-            INDEX idx_session_todos_session_status_updated (session_id, status, updated_at)
+            INDEX idx_session_todos_session_status_updated (session_id, status, updated_at),
+            INDEX idx_session_todos_user_status_updated (user_id, status, updated_at)
         )",
     )
     .execute(&pool)

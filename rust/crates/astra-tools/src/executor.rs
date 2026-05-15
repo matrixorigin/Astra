@@ -165,6 +165,7 @@ impl DefaultToolExecutor {
             http_client: Some(http_client.clone()),
             logger: Arc::new(crate::TracingLogger),
             cancel_token: None,
+            detach_shell_handle: None,
         };
 
         let mut executor = Self::new(ctx);
@@ -183,6 +184,27 @@ impl DefaultToolExecutor {
     pub fn with_cancel_token(mut self, token: Option<Arc<CancellationToken>>) -> Self {
         self.ctx.cancel_token = token;
         self
+    }
+
+    /// Install the host's detach slot so the bash runner can hand
+    /// off live children to the BackgroundTaskRegistry on Ctrl+B.
+    /// `None` is the default (no detach plumbing — bash runs through
+    /// the legacy reader). The slot itself is renewable: the host
+    /// refills it before each tool call so each bash invocation
+    /// gets a fresh one-shot.
+    pub fn with_detach_shell_slot(
+        mut self,
+        slot: Option<crate::detach::DetachShellSlot>,
+    ) -> Self {
+        self.ctx.detach_shell_handle = slot;
+        self
+    }
+
+    /// Mutable setter for the detach slot. Used by the TUI/CLI host
+    /// when it constructs the executor first and wires the slot
+    /// later (after the BackgroundTaskRegistry is available).
+    pub fn set_detach_shell_slot(&mut self, slot: Option<crate::detach::DetachShellSlot>) {
+        self.ctx.detach_shell_handle = slot;
     }
 
     /// Access the underlying context.
@@ -1036,6 +1058,7 @@ mod tests {
             http_client: None,
             logger: std::sync::Arc::new(crate::TracingLogger),
             cancel_token: None,
+            detach_shell_handle: None,
         })
         .with_bash_cache_ttl(std::time::Duration::from_millis(30));
 

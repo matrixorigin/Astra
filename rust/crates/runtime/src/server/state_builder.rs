@@ -399,6 +399,12 @@ pub async fn build_server_state(
 
     super::device_lease_sweeper::spawn_device_lease_expiry_sweeper(shared_pool.clone());
     super::artifact_retention_sweeper::spawn_artifact_retention_sweeper(shared_pool.clone());
+    // U-16/U-17: lifecycle sweepers for `session_todos`.
+    // Stale `in_progress` rows auto-paused after 24h; `archived`
+    // rows GC'd after 90 days. Both are idle when the table has
+    // no qualifying rows, so cost stays near-zero.
+    super::session_todo_sweeper::spawn_session_todo_stale_sweeper(shared_pool.clone());
+    super::session_todo_sweeper::spawn_session_todo_archive_gc(shared_pool.clone());
 
     let state = state.with_matrix_cloud_runtime(Some(matrix_rt));
     Ok(state)

@@ -215,6 +215,85 @@ impl BackgroundTaskRegistry {
         id
     }
 
+    /// Adopt a child process detached from a foreground bash tool
+    /// invocation (Ctrl+B promotion). Unlike [`spawn_shell`], the
+    /// child is already running with piped stdio that the foreground
+    /// runner has been consuming. This method:
+    ///   - registers a fresh `bg-shell-N` handle
+    ///   - seeds the `<id>.stdout` / `<id>.stderr` files with the
+    ///     output already consumed before detach (so the LLM sees a
+    ///     continuous output, not just post-detach bytes)
+    ///   - spawns a JoinSet future that drains the live stdout/stderr
+    ///     streams to the same files until child exit, then emits
+    ///     `BgTaskEvent::Completed` exactly like `spawn_shell` does.
+    ///
+    /// `command_label` is rendered as the task description. Cancel
+    /// behaviour matches `spawn_shell`: `kill(id)` will SIGKILL the
+    /// process group via the existing kill_on_drop guard.
+    pub fn adopt_detached_shell(
+        &mut self,
+        child: tokio::process::Child,
+        stdout: tokio::process::ChildStdout,
+        stderr: tokio::process::ChildStderr,
+        command_label: &str,
+        partial_stdout: String,
+        partial_stderr: String,
+    ) -> String {
+        let id = format!("bg-shell-{}", NEXT_BG_ID.fetch_add(1, Ordering::Relaxed));
+        let cancel = CancellationToken::new();
+        let stdout_path = self.output_dir.join(format!("{id}.stdout"));
+        let stderr_path = self.output_dir.join(format!("{id}.stderr"));
+        let status = Arc::new(AtomicU8::new(BgTaskStatus::Running as u8));
+
+        // Seed output files with partial bytes the foreground runner
+        // already showed. The LLM and user must see one continuous
+        // stream, not a jump-cut at the detach point. Errors are
+        // non-fatal: the streamer will append regardless.
+        if !partial_stdout.is_empty() {
+            let _ = std::fs::write(&stdout_path, &partial_stdout);
+        } else {
+            // Touch the file so get_output() on a not-yet-flushed
+            // adopted task doesn't return ENOENT.
+            let _ = std::fs::File::create(&stdout_path);
+        }
+        if !partial_stderr.is_empty() {
+            let _ = std::fs::write(&stderr_path, &partial_stderr);
+        } else {
+            let _ = std::fs::File::create(&stderr_path);
+        }
+
+        let handle = BackgroundTaskHandle {
+            id: id.clone(),
+            description: command_label.to_string(),
+            status: status.clone(),
+            started_at: Instant::now(),
+            cancel_token: cancel.clone(),
+            stdout_path: stdout_path.clone(),
+            stderr_path: stderr_path.clone(),
+            last_output_size: partial_stdout.len() as u64 + partial_stderr.len() as u64,
+            last_activity: Instant::now(),
+            last_tail_probe_at: None,
+        };
+        self.tasks.insert(id.clone(), handle);
+
+        self.pending_completions.push(BgTaskEvent::Started {
+            id: id.clone(),
+            description: command_label.to_string(),
+        });
+
+        let task_id = id.clone();
+        self.join_set.spawn(async move {
+            run_adopted_shell(child, stdout, stderr, &stdout_path, &stderr_path, cancel, &task_id)
+                .await
+        });
+        // Status reference is kept on the handle; the runner CAS-sets
+        // terminal status via the same path as spawn_shell. Discarded
+        // local copy to silence dead-code lint.
+        let _ = &status;
+
+        id
+    }
+
     /// Kill a background task by ID.
     pub fn kill(&mut self, id: &str) -> Result<(), String> {
         // Drain any completed futures into pending_completions so we
@@ -401,11 +480,26 @@ impl BackgroundTaskRegistry {
         }
     }
 
-    /// Number of currently running (non-terminal) tasks.
+    /// Number of currently running (non-terminal, non-stalled) tasks.
+    /// Stalled is excluded so the status-line "BG: N running"
+    /// represents only forward-progress jobs; stalled is reported
+    /// separately via [`stalled_count`].
     pub fn running_count(&self) -> usize {
         self.tasks
             .values()
-            .filter(|h| !h.status().is_terminal())
+            .filter(|h| {
+                let s = h.status();
+                !s.is_terminal() && s != BgTaskStatus::Stalled
+            })
+            .count()
+    }
+
+    /// Number of stalled tasks — surfaced separately on the status
+    /// line so the user notices an interactive prompt blocking work.
+    pub fn stalled_count(&self) -> usize {
+        self.tasks
+            .values()
+            .filter(|h| h.status() == BgTaskStatus::Stalled)
             .count()
     }
 
@@ -539,6 +633,130 @@ async fn run_shell_task(
             kill_child_tree(&mut child).await;
             // Status is set by poll_completions via CAS — single writer.
             let _ = &status;
+            TaskCompletion {
+                id: task_id.to_string(),
+                status: BgTaskStatus::Killed,
+                exit_code: None,
+                summary: String::new(),
+                error: None,
+            }
+        }
+    };
+
+    result
+}
+
+/// Reader for an adopted detached shell. Streams remaining bytes
+/// from a live `ChildStdout` (or stderr) into the registry's per-task
+/// file, appending after any partial-output prefix that
+/// `adopt_detached_shell` already wrote. Stops on stream EOF or
+/// channel error. Cap-handling: the file may pass `MAX_OUTPUT_BYTES`
+/// here; `stall_check` is the enforcement point for size cap because
+/// the streamer can't synchronously kill the child without racing
+/// with `wait()`.
+async fn drain_stream_to_file<R>(mut reader: R, path: std::path::PathBuf)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use std::io::Write;
+    use tokio::io::AsyncReadExt;
+
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                "adopted shell stream: failed to open {}: {e}",
+                path.display()
+            );
+            return;
+        }
+    };
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Err(e) = file.write_all(&buf[..n]) {
+                    tracing::warn!("adopted shell stream: write error: {e}");
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// Adopted-shell runner: drains both streams concurrently and waits
+/// for child exit. Mirrors `run_shell_task`'s exit-code → status
+/// mapping so an adopted job's `Completed` / `Failed` events match
+/// what a freshly-spawned job emits — the LLM downstream can't tell
+/// the difference.
+async fn run_adopted_shell(
+    mut child: tokio::process::Child,
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
+    stdout_path: &std::path::Path,
+    stderr_path: &std::path::Path,
+    cancel: CancellationToken,
+    task_id: &str,
+) -> TaskCompletion {
+    let stdout_drain = tokio::spawn(drain_stream_to_file(stdout, stdout_path.to_path_buf()));
+    let stderr_drain = tokio::spawn(drain_stream_to_file(stderr, stderr_path.to_path_buf()));
+
+    let result = tokio::select! {
+        exit = child.wait() => {
+            // Drain remaining buffered output before reporting status.
+            let _ = stdout_drain.await;
+            let _ = stderr_drain.await;
+            match exit {
+                Ok(exit_status) => {
+                    let code = exit_status.code();
+                    let success = exit_status.success();
+                    let summary = make_summary(stdout_path, code);
+                    if success {
+                        TaskCompletion {
+                            id: task_id.to_string(),
+                            status: BgTaskStatus::Completed,
+                            exit_code: code,
+                            summary,
+                            error: None,
+                        }
+                    } else {
+                        let err_tail = read_tail_str(stderr_path, 512)
+                            .map(|(s, _)| s)
+                            .unwrap_or_default();
+                        let error_msg = if code == Some(137) {
+                            "process killed (OOM or signal 9)".to_string()
+                        } else {
+                            format!("exit code {}: {}", code.unwrap_or(-1), err_tail.trim())
+                        };
+                        TaskCompletion {
+                            id: task_id.to_string(),
+                            status: BgTaskStatus::Failed,
+                            exit_code: code,
+                            summary: String::new(),
+                            error: Some(error_msg),
+                        }
+                    }
+                }
+                Err(e) => TaskCompletion {
+                    id: task_id.to_string(),
+                    status: BgTaskStatus::Failed,
+                    exit_code: None,
+                    summary: String::new(),
+                    error: Some(format!("wait error: {e}")),
+                },
+            }
+        }
+        _ = cancel.cancelled() => {
+            kill_child_tree(&mut child).await;
+            // Reader tasks complete on stream-close after kill.
+            let _ = stdout_drain.await;
+            let _ = stderr_drain.await;
             TaskCompletion {
                 id: task_id.to_string(),
                 status: BgTaskStatus::Killed,
@@ -1161,6 +1379,90 @@ mod tests {
             ),
             "task should be terminal after drain, got {:?}",
             handle.status()
+        );
+    }
+
+    // ── Phase 3b.3: adopt_detached_shell ─────────────────────────
+    //
+    // Ctrl+B true promotion: bash tool detaches its child + streams
+    // mid-execution, transfers ownership to the registry, and the
+    // job keeps running without restart. The contract:
+    //
+    //   - registry receives a live `tokio::process::Child` plus its
+    //     `ChildStdout` / `ChildStderr` streams (already taken from
+    //     the child by the bash runner) plus partial output already
+    //     consumed before the detach signal.
+    //   - registry returns a fresh `bg-shell-N` task_id.
+    //   - registry seeds `<id>.stdout` / `<id>.stderr` files with
+    //     the partial output, then spawns a reader task that
+    //     appends remaining stream bytes until EOF.
+    //   - on child exit, emits `BgTaskEvent::Completed` exactly
+    //     like a `spawn_shell` task would.
+
+    #[tokio::test]
+    async fn adopt_detached_shell_takes_over_running_child() {
+        // Manually spawn a child the way the bash tool would have:
+        // file-less stdio so we can take stdout/stderr.
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("printf 'before-detach\\n'; sleep 0.1; printf 'after-detach\\n'")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn detached child");
+
+        let stdout = child.stdout.take().expect("take child stdout");
+        let stderr = child.stderr.take().expect("take child stderr");
+
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+
+        // Pretend the bash runner already consumed the first chunk.
+        let partial_stdout = "before-detach\n".to_string();
+        let partial_stderr = String::new();
+
+        let id = reg.adopt_detached_shell(
+            child,
+            stdout,
+            stderr,
+            "printf 'before-detach\\n'; sleep 0.1; printf 'after-detach\\n'",
+            partial_stdout,
+            partial_stderr,
+        );
+        assert!(
+            id.starts_with("bg-shell-"),
+            "adopted task must get a bg-shell-N id; got {id}"
+        );
+
+        // Wait for the child to finish.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let events = reg.poll_completions();
+        let completed = events
+            .iter()
+            .find_map(|ev| match ev {
+                BgTaskEvent::Completed { id: eid, .. } if *eid == id => Some(()),
+                _ => None,
+            });
+        assert!(
+            completed.is_some(),
+            "adopted task must emit Completed; got {events:?}"
+        );
+
+        // The output file must contain BOTH the partial prefix the
+        // foreground bash already showed AND the remainder produced
+        // after detach. Without the prefix the LLM sees only post-
+        // detach output and can't reason about what was already
+        // displayed; without the remainder the adoption is useless.
+        let (out, _bytes) = reg.get_output(&id, 1024).expect("output");
+        assert!(
+            out.contains("before-detach"),
+            "adopted output must include partial prefix: {out:?}"
+        );
+        assert!(
+            out.contains("after-detach"),
+            "adopted output must capture post-detach stream: {out:?}"
         );
     }
 

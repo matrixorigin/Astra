@@ -21,6 +21,10 @@ pub(crate) struct Footer {
     pub pending_approvals: usize,
     pub task_counts: Option<(usize, usize)>,
     pub task_board_expanded: bool,
+    /// `(running, stalled)` snapshot of the BackgroundTaskRegistry.
+    /// Updated by the TUI event-loop tick; rendered as the `BG: …`
+    /// chip on the status line. `None` keeps the chip hidden.
+    pub bg_task_counts: Option<(usize, usize)>,
 }
 
 impl Footer {
@@ -38,6 +42,7 @@ impl Footer {
             pending_approvals: 0,
             task_counts: None,
             task_board_expanded: false,
+            bg_task_counts: None,
         }
     }
 
@@ -70,6 +75,7 @@ impl Footer {
             pending_approvals: self.pending_approvals,
             task_counts: self.task_counts,
             task_board_expanded: self.task_board_expanded,
+            bg_task_counts: self.bg_task_counts,
         }
     }
 

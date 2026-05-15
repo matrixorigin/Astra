@@ -359,7 +359,7 @@ impl EdgeRegistryService for UnconfiguredEdgeRegistryService {
 
 // ─── Task leases ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskLeaseView {
     pub task_id: String,
     pub holder_agent_id: String,
@@ -368,7 +368,7 @@ pub struct TaskLeaseView {
     pub lease_version: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum LeaseClaimResult {
     Granted {

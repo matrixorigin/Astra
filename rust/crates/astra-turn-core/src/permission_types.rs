@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
     /// Auto-approve all tools (except bypass-immune safety checks).
+    #[serde(alias = "yolo", alias = "bypass-safety", alias = "bypass_safety")]
     Auto,
     /// Prompt the user for write/execute tools (default interactive mode).
     #[default]
@@ -46,7 +47,7 @@ impl std::str::FromStr for PermissionMode {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
+            "auto" | "yolo" | "bypass-safety" | "bypass_safety" => Ok(Self::Auto),
             "prompt" => Ok(Self::Prompt),
             "deny" => Ok(Self::Deny),
             _ => Err(format!(
@@ -1066,6 +1067,19 @@ mod tests {
         let rule = PermissionRule::parse("Bash(git commit:*)");
         assert_eq!(rule.tool, "bash");
         assert_eq!(rule.pattern, Some("git commit".to_string()));
+    }
+
+    #[test]
+    fn permission_mode_legacy_aliases_map_to_auto() {
+        assert_eq!("yolo".parse::<PermissionMode>().unwrap(), PermissionMode::Auto);
+        assert_eq!(
+            "bypass-safety".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Auto
+        );
+        assert_eq!(
+            "bypass_safety".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Auto
+        );
     }
 
     #[test]

@@ -171,6 +171,78 @@ pub fn permission_denied_error_result(tool_name: &str, reason: &str) -> String {
     )
 }
 
+/// Tools that are unconditionally read-only — safe to call in plan mode.
+///
+/// This list mirrors the tools that claudecode's plan-mode workflow
+/// instructions explicitly allow ("Thoroughly explore the codebase
+/// using Glob, Grep, and Read tools"). The `enter_plan_mode` /
+/// `exit_plan_mode` tools themselves must also pass — otherwise plan
+/// mode is a trap (model enters but can't exit).
+///
+/// Tools NOT on this list are treated as potentially-mutating in plan
+/// mode and denied. The list is conservative: it's safer to deny a
+/// surprising read-only tool than to allow a surprising write tool.
+fn is_read_only_in_plan_mode(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read_file"
+            | "grep"
+            | "glob"
+            | "list_dir"
+            | "symbols"
+            | "introspect"
+            | "lsp"
+            | "web_fetch"
+            | "web_search"
+            | "memory"
+            | "session"
+            | "task"
+            | "tool_search"
+            | "ask_user"
+            | "notify"
+            | "view_image"
+            | "exit_plan_mode"
+            // Read-only sub-actions of `git` tool. The full git tool also
+            // has stash/commit/revert which mutate, but the model picks
+            // those by `action` — we'd need argument-aware filtering to
+            // be safe, so deny the whole git tool in plan mode for now
+            // and let the model use individual git read tools through
+            // bash if it really must (which is itself denied — the
+            // intent is "read the code, don't mutate state").
+    )
+}
+
+/// Plan-mode-aware wrapper around [`check_tool_permission`]. When
+/// `plan_mode_active` is true, mutating tools are denied at the gate
+/// with a redirect to `exit_plan_mode`; read-only tools fall through
+/// to the normal permission flow.
+///
+/// The two callsites — the test suite and `headless_tool_pipeline` —
+/// pass `plan_mode_active` from the session's active_plan_id flag.
+/// When no flag is wired (legacy code paths, tests that don't care
+/// about plan mode), use [`check_tool_permission`] directly.
+pub async fn check_tool_permission_in_plan_mode(
+    tool_name: &str,
+    args: Option<&str>,
+    permission_context: Option<&Arc<RwLock<PermissionSyncContext>>>,
+    mailbox: Option<&mut AgentMailbox>,
+    timeout: Duration,
+    plan_mode_active: bool,
+) -> PermissionCheckResult {
+    if plan_mode_active && !is_read_only_in_plan_mode(tool_name) {
+        return PermissionCheckResult::Denied {
+            reason: format!(
+                "tool '{tool_name}' is blocked while plan mode is active. \
+                 Plan mode is a read-only authoring phase — explore the codebase \
+                 with read tools (read_file, grep, glob, list_dir, symbols), then \
+                 call `exit_plan_mode(plan='...', approved=true)` to exit and \
+                 unlock writes."
+            ),
+        };
+    }
+    check_tool_permission(tool_name, args, permission_context, mailbox, timeout).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,6 +773,164 @@ mod tests {
         assert_eq!(telemetry.permission_requests, 1);
         assert_eq!(telemetry.permission_requests_approved, 1);
         assert_eq!(telemetry.tools_blocked, 0);
+    }
+
+    // ── Phase 2: plan-mode write-tool gate ──────────────────────────────
+    //
+    // While the session is in plan mode (active_plan_id != None), all
+    // mutating tools (str_replace, write_file, bash, git commit, etc.)
+    // must be denied at the gate with a redirect to `exit_plan_mode`.
+    // Read-only tools (read_file, grep, glob, list_dir) stay allowed so
+    // the model can still explore the codebase to write a good plan.
+    //
+    // claudecode references: plan-mode write block enforces "DO NOT
+    // write or edit any files yet. This is a read-only exploration and
+    // planning phase." Without this gate, the model can call write
+    // tools while in plan mode and silently bypass the workflow.
+
+    #[tokio::test]
+    async fn plan_mode_blocks_write_tool_calls() {
+        // Auto mode + no allowlist = would normally allow `bash`. Plan
+        // mode flag must override and deny.
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Auto,
+            allow_rules: vec![],
+            deny_rules: vec![],
+            ask_rules: vec![],
+            allowed_tools: None,
+            is_background: false,
+            ..Default::default()
+        };
+        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+
+        // Pretend the session is mid-plan with active plan id present.
+        let result = check_tool_permission_in_plan_mode(
+            "bash",
+            Some(r#"{"command":"echo hi"}"#),
+            Some(&ctx),
+            None,
+            Duration::from_secs(1),
+            true, // plan_mode_active
+        )
+        .await;
+        match result {
+            PermissionCheckResult::Denied { reason } => {
+                assert!(
+                    reason.to_lowercase().contains("plan mode")
+                        || reason.contains("exit_plan_mode"),
+                    "plan-mode denial must point the model at exit_plan_mode \
+                     so it can recover. Got: {reason}"
+                );
+            }
+            other => panic!(
+                "bash in plan mode must be denied (it's a write/exec tool). \
+                 Got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_mode_blocks_str_replace_and_write_file() {
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Auto,
+            ..Default::default()
+        };
+        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+
+        for tool in &["str_replace", "write_file", "multi_edit"] {
+            let result = check_tool_permission_in_plan_mode(
+                tool,
+                None,
+                Some(&ctx),
+                None,
+                Duration::from_secs(1),
+                true,
+            )
+            .await;
+            assert!(
+                matches!(result, PermissionCheckResult::Denied { .. }),
+                "`{tool}` is a write tool — plan mode must deny it. Got: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_mode_allows_read_only_tools() {
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Auto,
+            ..Default::default()
+        };
+        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+
+        for tool in &["read_file", "grep", "glob", "list_dir", "symbols"] {
+            let result = check_tool_permission_in_plan_mode(
+                tool,
+                None,
+                Some(&ctx),
+                None,
+                Duration::from_secs(1),
+                true,
+            )
+            .await;
+            assert!(
+                is_allowed(&result),
+                "`{tool}` is read-only — plan mode must allow it so the model \
+                 can explore the codebase before writing the plan. Got: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_mode_inactive_does_not_block_writes() {
+        // When plan_mode is NOT active, the existing permission rules
+        // apply unchanged — Auto mode + no allowlist would normally allow
+        // bash, and the new gate must not regress that path.
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Auto,
+            ..Default::default()
+        };
+        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+
+        let result = check_tool_permission_in_plan_mode(
+            "bash",
+            Some(r#"{"command":"echo hi"}"#),
+            Some(&ctx),
+            None,
+            Duration::from_secs(1),
+            false, // plan_mode_active
+        )
+        .await;
+        assert!(
+            is_allowed(&result),
+            "bash must not be blocked when plan_mode is inactive. Got: {result:?}"
+        );
+    }
+
+    /// `exit_plan_mode` itself must always be allowed in plan mode —
+    /// otherwise it's a trap (model enters plan mode but can't exit
+    /// because the gate denies the only escape tool).
+    #[tokio::test]
+    async fn plan_mode_always_allows_exit_plan_mode() {
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Auto,
+            ..Default::default()
+        };
+        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+
+        let result = check_tool_permission_in_plan_mode(
+            "exit_plan_mode",
+            Some(r#"{"plan":"1. step","approved":true}"#),
+            Some(&ctx),
+            None,
+            Duration::from_secs(1),
+            true,
+        )
+        .await;
+        assert!(
+            is_allowed(&result),
+            "exit_plan_mode must always be allowed in plan mode — \
+             without this the model is trapped. Got: {result:?}"
+        );
     }
 
     #[tokio::test]

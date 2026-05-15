@@ -78,6 +78,7 @@ fn encode_task_json_fields(task: &SessionTask) -> EncodedTaskJsonFields {
 async fn insert_session_tasks(
     executor: &mut MySqlConnection,
     session_id: &str,
+    user_id: &str,
     tasks: &[SessionTask],
 ) -> Result<(), String> {
     if tasks.is_empty() {
@@ -87,7 +88,7 @@ async fn insert_session_tasks(
     for (start, end) in task_insert_batch_ranges(tasks.len()) {
         let mut builder = QueryBuilder::<MySql>::new(
             "INSERT INTO session_todos (\
-                session_id, todo_id, ordinal, title, description, active_form, \
+                session_id, todo_id, user_id, ordinal, title, description, active_form, \
                 status, owner, metadata, blocks, blocked_by, subtasks, \
                 created_at, updated_at) ",
         );
@@ -97,6 +98,7 @@ async fn insert_session_tasks(
                 let encoded = encode_task_json_fields(task);
                 row.push_bind(session_id)
                     .push_bind(&task.id)
+                    .push_bind(user_id)
                     .push_bind((start + offset) as i32)
                     .push_bind(&task.title)
                     .push_bind(&task.description)
@@ -186,6 +188,12 @@ pub fn select_task_store(
 pub struct MatrixOneTaskStore {
     pool: Pool<MySql>,
     changed_tx: tokio::sync::broadcast::Sender<String>,
+    /// User who owns rows written through this store. Threaded into
+    /// every INSERT so cross-session user-scoped queries
+    /// (`idx_session_todos_user_status_updated`) can find them
+    /// without a join. Empty string means the store is
+    /// "anonymous" — only test paths should construct that shape.
+    user_id: String,
 }
 
 impl MatrixOneTaskStore {
@@ -193,14 +201,20 @@ impl MatrixOneTaskStore {
         Self {
             pool,
             changed_tx: tokio::sync::broadcast::channel(16).0,
+            user_id: String::new(),
         }
     }
 
     pub fn from_shared(shared: &astra_core::SharedPool) -> Self {
-        Self {
-            pool: shared.get().clone(),
-            changed_tx: tokio::sync::broadcast::channel(16).0,
-        }
+        Self::new(shared.get().clone())
+    }
+
+    /// Bind the user that owns subsequent writes. Must be set before
+    /// any `save()` / `mutate()` so the user_id column has a real
+    /// owner for cross-session queries.
+    pub fn with_user_id(mut self, user_id: impl Into<String>) -> Self {
+        self.user_id = user_id.into();
+        self
     }
 
     async fn load_rows(&self, session_id: &str) -> Result<Vec<SessionTask>, sqlx::Error> {
@@ -289,6 +303,31 @@ impl TaskStore for MatrixOneTaskStore {
         self.load_rows(session_id).await.map_err(|e| e.to_string())
     }
 
+    /// U-8: SQL-pushdown path for active-only queries.
+    /// Uses `idx_session_todos_session_status_updated` so only matching
+    /// rows are returned instead of shipping the whole table to Rust.
+    async fn load_active(&self, session_id: &str) -> Result<Vec<SessionTask>, String> {
+        let rows = sqlx::query(
+            "SELECT todo_id, title, description, active_form, status, owner, \
+                    metadata, blocks, blocked_by, subtasks, \
+                    CAST(created_at AS CHAR) AS created_at, \
+                    CAST(updated_at AS CHAR) AS updated_at \
+             FROM session_todos \
+             WHERE session_id = ? AND status IN ('pending', 'in_progress') \
+             ORDER BY ordinal ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in rows {
+            tasks.push(row_to_task(&row).map_err(|e| e.to_string())?);
+        }
+        Ok(tasks)
+    }
+
     async fn save(&self, session_id: &str, tasks: Vec<SessionTask>) -> Result<(), String> {
         // Full replace semantics: the caller computed the next state; we
         // atomically make the table match it. Transaction ensures readers
@@ -317,7 +356,7 @@ impl TaskStore for MatrixOneTaskStore {
             tasks.len()
         );
 
-        if let Err(e) = insert_session_tasks(&mut tx, session_id, &tasks).await {
+        if let Err(e) = insert_session_tasks(&mut tx, session_id, &self.user_id, &tasks).await {
             if let Err(rollback_err) = tx.rollback().await {
                 return Err(format!("{e}; rollback failed: {rollback_err}"));
             }
@@ -454,7 +493,7 @@ impl TaskStore for MatrixOneTaskStore {
             return Err(e);
         }
 
-        if let Err(e) = insert_session_tasks(&mut tx, session_id, &result.tasks).await {
+        if let Err(e) = insert_session_tasks(&mut tx, session_id, &self.user_id, &result.tasks).await {
             if let Err(rollback_err) = tx.rollback().await {
                 return Err(format!("{e}; rollback failed: {rollback_err}"));
             }
@@ -715,6 +754,7 @@ mod tests {
                 description: None,
                 status: "pending".into(),
                 depends_on: vec!["sub-0".into()],
+                owner: None,
             }],
             created_at: "2025-01-01T00:00:00Z".into(),
             updated_at: "2025-01-01T00:00:01Z".into(),

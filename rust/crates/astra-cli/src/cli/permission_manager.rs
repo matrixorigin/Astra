@@ -4183,6 +4183,14 @@ mod tests {
             PermissionMode::Auto
         );
         assert_eq!(
+            "yolo".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Auto
+        );
+        assert_eq!(
+            "bypass-safety".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Auto
+        );
+        assert_eq!(
             "prompt".parse::<PermissionMode>().unwrap(),
             PermissionMode::Prompt
         );

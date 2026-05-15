@@ -346,7 +346,7 @@ pub(crate) async fn run_tui_repl(
     crate::session_runtime::try_silent_auth(api, profile).await;
     tracer.phase("auth");
     let mut state = initialize_session_state(profile, initial_model);
-    let task_service = resolve_task_service().await;
+    let task_service = resolve_task_service(profile).await;
     install_task_service(&mut state, task_service);
     let task_store = resolve_task_store().await;
     install_task_store(&mut state, task_store);
@@ -778,6 +778,20 @@ pub(crate) async fn run_tui_repl(
                                     let mut turn_tool_count: u32 = 0;
                                     let mut turn_ttft: Option<std::time::Instant> = None;
                                     let mut ctrl_b_pressed = false;
+                                    // Phase 3b.3c: prime the bash detach slot for this
+                                    // turn. The bash runner takes the handle on entry;
+                                    // we keep the listener so a Ctrl+B keypress can
+                                    // fire the signal and await the live child + streams
+                                    // payload back. Replaces any stale handle from a
+                                    // prior turn that was never consumed (e.g. the model
+                                    // didn't run bash last turn).
+                                    let mut bash_detach_listener = {
+                                        let (handle, listener) = astra_tools::detach::new_detach_pair();
+                                        if let Ok(mut slot) = state.bash_detach_slot.try_lock() {
+                                            *slot = Some(handle);
+                                        }
+                                        Some(listener)
+                                    };
 
                                     let turn_tx = stream_bridge::create_per_turn_bridge(tui_tx.clone());
                                     let live_sink = stream_bridge::create_agent_live_sink(tui_tx.clone());
@@ -811,15 +825,76 @@ pub(crate) async fn run_tui_repl(
                                                 Some(tev) = event_stream.next() => {
                                                     match tev {
                                                         TuiEvent::Key(k) => {
-                                                            // Ctrl+B: background the current turn.
-                                                            // Cancels the turn gracefully and advises the model
-                                                            // to re-issue the command as a background task.
+                                                            // Ctrl+B: foreground bash → background promotion.
+                                                            // If a bash invocation is currently in flight and
+                                                            // listening on the detach signal, fire it: the
+                                                            // runner transfers child + live streams to the
+                                                            // BackgroundTaskRegistry without kill, output
+                                                            // continues uninterrupted, the turn ends with a
+                                                            // <bash_detached> marker the LLM can reason
+                                                            // about. Falls back to legacy cancel-and-advise
+                                                            // when no listener (no bash, or already detached).
                                                             if k.code == crossterm::event::KeyCode::Char('b')
                                                                 && k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                                                             {
+                                                                let listener = bash_detach_listener.take();
+                                                                if let Some(listener) = listener {
+                                                                    listener.signal.notify_one();
+                                                                    // Wait briefly for the runner to ship
+                                                                    // the live child + streams payload.
+                                                                    // 500ms is comfortably more than the
+                                                                    // bash runner's 25ms idle-poll tick;
+                                                                    // longer waits indicate bash wasn't
+                                                                    // actually running when the user hit
+                                                                    // Ctrl+B and we should fall back to
+                                                                    // legacy cancel.
+                                                                    let payload = tokio::time::timeout(
+                                                                        std::time::Duration::from_millis(500),
+                                                                        listener.payload_rx,
+                                                                    )
+                                                                    .await;
+                                                                    match payload {
+                                                                        Ok(Ok(p)) => {
+                                                                            // Drop the bash runner straight
+                                                                            // into the registry. The
+                                                                            // adopt_detached_shell API
+                                                                            // takes the live child + streams
+                                                                            // and emits Started/Completed
+                                                                            // events like a normal bg job.
+                                                                            let id = background_registry.adopt_detached_shell(
+                                                                                p.child,
+                                                                                p.stdout,
+                                                                                p.stderr,
+                                                                                &p.command,
+                                                                                p.partial_stdout,
+                                                                                p.partial_stderr,
+                                                                            );
+                                                                            chat_widget.commit_system(
+                                                                                history_cell::system::SystemCell::info(
+                                                                                    format!("⏎ Backgrounded as {id} — output continues; poll with agent_job(action='output')")
+                                                                                ),
+                                                                            );
+                                                                            // The turn is over from the
+                                                                            // model's perspective; cancel
+                                                                            // gracefully so it sees the
+                                                                            // <bash_detached> marker
+                                                                            // already returned by the bash
+                                                                            // tool and ends cleanly.
+                                                                            tui_cancel_token.cancel();
+                                                                            ctrl_b_pressed = true;
+                                                                            frame_requester.schedule_frame();
+                                                                            continue;
+                                                                        }
+                                                                        // No payload — bash wasn't running,
+                                                                        // or completed normally before
+                                                                        // detach landed. Fall through to
+                                                                        // legacy cancel-and-advise.
+                                                                        _ => {}
+                                                                    }
+                                                                }
                                                                 chat_widget.commit_system(
                                                                     history_cell::system::SystemCell::info(
-                                                                        "⏎ Backgrounding: cancelling current turn. Re-issue the command with task(action='background_shell') to run it in the background."
+                                                                        "⏎ Backgrounding: cancelling current turn. Re-issue the command with agent_job(action='shell') to run it in the background."
                                                                     ),
                                                                 );
                                                                 tui_cancel_token.cancel();
@@ -1190,7 +1265,7 @@ pub(crate) async fn run_tui_repl(
                                     // Ctrl+B notification: inject hint for the next turn.
                                     if ctrl_b_pressed {
                                         state.pending_bg_notifications.push(
-                                            "<background_task_notification>\n<status>user_backgrounded</status>\n<hint>The user pressed Ctrl+B to background the current operation. If it was long-running (build, test, server), re-run it with task(action='background_shell', command='...').</hint>\n</background_task_notification>".to_string()
+                                            "<background_task_notification>\n<status>user_backgrounded</status>\n<hint>The user pressed Ctrl+B to background the current operation. If it was long-running (build, test, server), re-run it with agent_job(action='shell', command='...').</hint>\n</background_task_notification>".to_string()
                                         );
                                     }
 
@@ -1820,6 +1895,18 @@ pub(crate) async fn run_tui_repl(
                 }
                 // Stall check every tick (internal timer gates at 5s intervals).
                 background_registry.stall_check();
+
+                // Surface bg task counts on the status line. `(0, 0)` keeps
+                // the chip hidden so a long-lived idle registry doesn't
+                // waste status-line width. Cheap snapshot — both counters
+                // are O(N) over a small N (registries hold ≤ a few jobs).
+                let bg_running = background_registry.running_count();
+                let bg_stalled = background_registry.stalled_count();
+                bottom_pane.footer.bg_task_counts = if bg_running == 0 && bg_stalled == 0 {
+                    None
+                } else {
+                    Some((bg_running, bg_stalled))
+                };
 
                 task_board.maybe_refresh();
                 let snap = task_board.snapshot();

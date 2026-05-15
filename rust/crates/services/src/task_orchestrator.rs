@@ -256,7 +256,7 @@ impl TaskOutcome {
 }
 
 /// Request to create a new task.
-#[derive(Default)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct TaskCreateRequest {
     pub title: String,
     pub description: Option<String>,

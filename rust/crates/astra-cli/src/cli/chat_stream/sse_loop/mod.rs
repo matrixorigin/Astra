@@ -243,6 +243,11 @@ pub(crate) async fn stream_chat_sse(
         } else {
             ex
         };
+        let ex = if let Some(ref slot) = p.bash_detach_slot {
+            ex.with_bash_detach_slot(slot.clone())
+        } else {
+            ex
+        };
         // Set turn index so journal entries are tagged for undo
         ex.journal_turn_index
             .store(p.turn_index, std::sync::atomic::Ordering::Release);

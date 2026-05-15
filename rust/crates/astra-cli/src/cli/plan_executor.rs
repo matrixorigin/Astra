@@ -1134,9 +1134,13 @@ pub(super) struct BackgroundPlanContext {
     pub task_manager: Arc<crate::edge_tools::TaskManager>,
     /// Shared command queue for the TUI's BackgroundTaskRegistry.
     /// Threaded from `SessionState.bg_task_commands` so plan subtasks
-    /// can also use `task(action='background_shell')`. `None` for
+    /// can also use `agent_job(action='shell')`. `None` for
     /// non-TUI plan executions (headless test paths).
     pub bg_task_commands: Option<Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
+    /// Detach slot for bash Ctrl+B promotion in plan subtasks.
+    /// Threaded the same way as `bg_task_commands`. `None` for
+    /// headless plan executions.
+    pub bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
 
     // ─── Harness (test observability) ────────────────────────────────────
     /// Shared harness snapshot sink for /inspect command.
@@ -1752,6 +1756,7 @@ async fn plan_executor_task(
                     session_state_journal: Some(ctx.session_state_journal.clone()),
                     task_manager: Some(ctx.task_manager.clone()),
                     bg_task_commands: ctx.bg_task_commands.clone(),
+                    bash_detach_slot: ctx.bash_detach_slot.clone(),
                     turn_index: ctx.turn,
                     pipeline_state: None,
                     pre_loaded_messages: None,
@@ -2315,6 +2320,7 @@ mod tests {
             )),
             task_manager: Arc::new(crate::edge_tools::TaskManager::in_memory()),
             bg_task_commands: None,
+            bash_detach_slot: None,
             #[cfg(feature = "harness")]
             harness_sink: None,
             #[cfg(feature = "harness")]

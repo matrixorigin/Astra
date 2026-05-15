@@ -171,6 +171,29 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/sessions/{session_id}/resume",
             post(session_handlers::resume_session_handler),
         )
+        // Session todos: scratchpad checklist persisted in `session_todos`.
+        // CLI/edge clients MUST NOT touch the table directly — they call
+        // these endpoints so the server is the single source of truth
+        // for ownership and concurrency. `:execute` is a single-action
+        // RPC over the TaskManager surface (create/update/list/get/stop);
+        // GET returns the raw list for the task board.
+        .route(
+            "/sessions/{session_id}/todos:execute",
+            post(session_todo_handlers::execute_todo_handler),
+        )
+        .route(
+            "/sessions/{session_id}/todos",
+            get(session_todo_handlers::load_todos_handler),
+        )
+        // Cross-session view: "what am I still working on across
+        // all my sessions". Backed by
+        // `idx_session_todos_user_status_updated`. LLM can call
+        // this to find paused work after a session restart instead
+        // of duplicating it.
+        .route(
+            "/users/me/todos",
+            get(session_todo_handlers::list_user_todos_handler),
+        )
         .route(
             "/sessions/{session_id}/cancel",
             post(session_handlers::cancel_session_handler),
@@ -679,6 +702,16 @@ pub(super) fn build_router(state: AppState) -> Router {
             get(task_handlers::list_tasks_handler).post(task_handlers::create_task_handler),
         )
         .route("/tasks/{task_id}", get(task_handlers::get_task_handler))
+        .route("/tasks:rpc", post(task_handlers::task_rpc_handler))
+        // User preference sync — replaces direct MO sqlx access from CLI.
+        .route(
+            "/preferences",
+            get(preferences_handlers::list_preferences_handler),
+        )
+        .route(
+            "/preferences/{key}",
+            axum::routing::put(preferences_handlers::put_preference_handler),
+        )
         .route(
             "/tasks/{task_id}/lease/claim",
             post(task_handlers::post_task_lease_claim_handler),

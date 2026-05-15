@@ -183,6 +183,12 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     pub turn_start: Option<std::time::Instant>,
     /// Current LLM round index (0-based) within this turn.
     pub llm_round: u32,
+    /// Plan mode active for this turn — set by the runtime when the
+    /// session has a non-null `active_plan_id`. When true, the
+    /// permission gate denies write/exec tools at evaluation time
+    /// with a redirect to `exit_plan_mode`. See
+    /// [`crate::turn::permission_gate::check_tool_permission_in_plan_mode`].
+    pub plan_mode_active: bool,
 }
 
 pub(crate) struct HeadlessToolExecutionPipeline<'a, E: EdgeToolRoundRow> {
@@ -560,6 +566,7 @@ mod tests {
                     server_tool_executor,
                     turn_start: None,
                     llm_round: 0,
+                    plan_mode_active: false,
                 },
                 vec![false; self.edge_tool_round.len()],
             )

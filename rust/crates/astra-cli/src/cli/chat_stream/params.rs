@@ -361,6 +361,10 @@ pub(crate) struct ChatTurnParams<'a> {
     /// When present, tool executor pushes spawn/kill/output commands here.
     pub(crate) bg_task_commands:
         Option<std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
+    /// Detach slot for bash Ctrl+B promotion. When present, the
+    /// executor pulls a fresh handle from this slot per tool call;
+    /// the TUI refills between calls.
+    pub(crate) bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
     /// Current REPL turn number — used to tag journal entries for undo.
     pub(crate) turn_index: u32,
     /// Pre-loaded CSL messages (from CslManager.load() in chat_turn).
@@ -421,6 +425,10 @@ pub(crate) struct BasicCliChatContext<'a> {
     /// Shared command queue for the TUI's BackgroundTaskRegistry.
     pub bg_task_commands:
         Option<std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
+    /// Shared detach slot for bash Ctrl+B promotion. The TUI refills
+    /// this between tool calls; the bash runner takes from it on
+    /// entry. `None` for headless paths.
+    pub bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
     /// Optional channel for forwarding stream events (used by --stream-events).
     pub stream_event_tx: Option<StreamEventTx>,
     /// Shared harness snapshot sink for /inspect command (non-REPL one-shot paths).
@@ -491,6 +499,7 @@ impl<'a> ChatTurnParams<'a> {
             session_state_journal: None,
             task_manager: ctx.task_manager.clone(),
             bg_task_commands: ctx.bg_task_commands.clone(),
+            bash_detach_slot: ctx.bash_detach_slot.clone(),
             turn_index: 0,
             pipeline_state: None,
             pre_loaded_messages: None,

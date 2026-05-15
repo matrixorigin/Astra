@@ -334,14 +334,31 @@ enum StreamKind {
     Stderr,
 }
 
-struct ReadOnlyCommandOutput {
-    stdout: String,
-    stderr: String,
-    exit_code: i32,
-    timed_out: bool,
-    cancelled: bool,
-    stdout_capped: bool,
-    stderr_capped: bool,
+/// Outcome of a detach-aware bash invocation.
+///
+/// `Completed(...)` is the normal path — the command ran to exit
+/// (success, failure, timeout, or cancel) and produced an output
+/// payload exactly like [`run_readonly_command_with_partial`] would.
+/// `Detached(...)` means the user pressed Ctrl+B mid-run; the bash
+/// runner stopped reading and handed the live child + streams +
+/// already-consumed bytes back to the caller, who is expected to
+/// transfer them into the BackgroundTaskRegistry.
+pub(crate) enum BashRunOutcome {
+    Completed(ReadOnlyCommandOutput),
+    // The detached variant carries a live `tokio::process::Child` plus
+    // two `ChildStdout`/`ChildStderr` handles that are large; box it
+    // so the enum stays small for the dominant `Completed` path.
+    Detached(Box<crate::detach::DetachedShellPayload>),
+}
+
+pub(crate) struct ReadOnlyCommandOutput {
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    pub(crate) exit_code: i32,
+    pub(crate) timed_out: bool,
+    pub(crate) cancelled: bool,
+    pub(crate) stdout_capped: bool,
+    pub(crate) stderr_capped: bool,
 }
 
 struct EnumeratedSearchFiles {
@@ -561,18 +578,76 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
     let output_limit = per_tool_output_limit("bash");
     let raw_stdout_limit = output_limit.saturating_mul(2).max(16_384);
     let raw_stderr_limit = output_limit.clamp(8_192, 32_768);
-    let output = match run_readonly_command_with_partial(
-        &mut cmd,
-        timeout,
-        raw_stdout_limit,
-        raw_stderr_limit,
-        ctx.cancel_token.as_deref(),
-        "bash command",
-    )
-    .await
-    {
-        Ok(output) => output,
-        Err(e) => return ToolResult::error(e),
+
+    // Detach-aware path: when the host wired a detach slot on
+    // ToolContext AND it currently holds a handle, run via the
+    // sibling runner so Ctrl+B can transfer child + streams to the
+    // BackgroundTaskRegistry. Without a slot OR with an empty slot
+    // we fall through to the legacy reader (zero hot-path overhead).
+    let detach_handle = if let Some(slot) = ctx.detach_shell_handle.as_ref() {
+        slot.lock().await.take()
+    } else {
+        None
+    };
+
+    let output = if let Some(detach_handle) = detach_handle {
+        match run_bash_with_detach(
+            &mut cmd,
+            timeout,
+            raw_stdout_limit,
+            raw_stderr_limit,
+            ctx.cancel_token.as_deref(),
+            &detach_handle,
+            command,
+        )
+        .await
+        {
+            Ok(BashRunOutcome::Completed(output)) => output,
+            Ok(BashRunOutcome::Detached(payload)) => {
+                // Hand the live child + streams back to the host
+                // through the one-shot reply channel. The host drains
+                // it in its event-loop tick and calls
+                // BackgroundTaskRegistry::adopt_detached_shell.
+                if let Some(sender) = detach_handle.payload_tx.lock().await.take() {
+                    let send_failed = sender.send(*payload).is_err();
+                    if send_failed {
+                        return ToolResult::error(
+                            "Error: bash detach: TUI listener dropped before payload arrived"
+                                .to_string(),
+                        );
+                    }
+                }
+                let mut result = ToolResult::text(
+                    "<bash_detached>The bash command was promoted to a background task. \
+                     The host will resume reading its output via the BackgroundTaskRegistry; \
+                     poll progress with `agent_job(action='output', task_id=<bg-shell-N>)`.\
+                     </bash_detached>"
+                        .to_string(),
+                );
+                let mut metadata = serde_json::Map::new();
+                metadata.insert(
+                    "bash_detached".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+                result.metadata = Some(metadata);
+                return result;
+            }
+            Err(e) => return ToolResult::error(e),
+        }
+    } else {
+        match run_readonly_command_with_partial(
+            &mut cmd,
+            timeout,
+            raw_stdout_limit,
+            raw_stderr_limit,
+            ctx.cancel_token.as_deref(),
+            "bash command",
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(e) => return ToolResult::error(e),
+        }
     };
 
     let mut result = String::new();
@@ -2605,6 +2680,203 @@ async fn run_readonly_command_with_partial(
     })
 }
 
+/// Detach-aware bash runner. Same shape as
+/// [`run_readonly_command_with_partial`] but the readers can yield
+/// the streams back when `detach.signal.notified()` fires. Detach
+/// wins over normal completion only while the child is still running
+/// — a child that exits before the user presses Ctrl+B still flows
+/// through the `Completed` path.
+///
+/// Returns `Detached(payload)` when the signal fires during reading;
+/// `Completed(output)` otherwise. The caller (bash tool) must
+/// observe the variant and emit the right ToolResult shape.
+pub(crate) async fn run_bash_with_detach(
+    cmd: &mut Command,
+    timeout: Duration,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+    cancel_token: Option<&CancellationToken>,
+    detach: &crate::detach::DetachShellHandle,
+    command_label: &str,
+) -> Result<BashRunOutcome, String> {
+    use std::sync::Arc;
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Error: failed to start bash command: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Error: failed to capture bash command stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Error: failed to capture bash command stderr".to_string())?;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(StreamKind, String)>();
+    // Two private notify halves so the outer detach signal fans out
+    // to both reader tasks without losing notifications. Cloning the
+    // shared Notify directly works because notify_one wakes one
+    // waiter; we want both to stop, so we trip both manually after
+    // observing the shared signal.
+    let stdout_detach = Arc::new(tokio::sync::Notify::new());
+    let stderr_detach = Arc::new(tokio::sync::Notify::new());
+    let stdout_task = tokio::spawn(read_stream_until_detach(
+        stdout,
+        StreamKind::Stdout,
+        tx.clone(),
+        stdout_detach.clone(),
+    ));
+    let stderr_task = tokio::spawn(read_stream_until_detach(
+        stderr,
+        StreamKind::Stderr,
+        tx,
+        stderr_detach.clone(),
+    ));
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut stdout_text = String::new();
+    let mut stderr_text = String::new();
+    let mut stdout_capped = false;
+    let mut stderr_capped = false;
+    let mut exit_code = None;
+    let mut timed_out = false;
+    let mut cancelled = false;
+    let mut detached = false;
+
+    loop {
+        drain_command_chunks(
+            &mut rx,
+            &mut stdout_text,
+            &mut stderr_text,
+            max_stdout_bytes,
+            &mut stdout_capped,
+            max_stderr_bytes,
+            &mut stderr_capped,
+        );
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_code = Some(status.code().unwrap_or(-1));
+                break;
+            }
+            Ok(None) => {
+                if tokio::time::Instant::now() >= deadline {
+                    timed_out = true;
+                    sigkill_process_group(&mut child).await;
+                    break;
+                }
+                // Race: detach signal vs cancel vs idle tick.
+                let detach_signal = detach.signal.clone();
+                if let Some(token) = cancel_token {
+                    tokio::select! {
+                        _ = token.cancelled() => {
+                            cancelled = true;
+                            sigkill_process_group(&mut child).await;
+                            break;
+                        }
+                        _ = detach_signal.notified() => {
+                            detached = true;
+                            // Trip both reader notifies so they yield streams.
+                            stdout_detach.notify_one();
+                            stderr_detach.notify_one();
+                            break;
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                    }
+                } else {
+                    tokio::select! {
+                        _ = detach_signal.notified() => {
+                            detached = true;
+                            stdout_detach.notify_one();
+                            stderr_detach.notify_one();
+                            break;
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                    }
+                }
+            }
+            Err(e) => return Err(format!("Error: bash command failed: {e}")),
+        }
+    }
+
+    if detached {
+        // Recover the live streams from the reader tasks. If a task
+        // observed EOF before the detach notify (i.e. the stream
+        // ended right at the signal moment) the stream is gone and
+        // we can't include it in the payload — drop back to
+        // Completed for that branch.
+        let stdout_back = stdout_task.await.ok().flatten();
+        let stderr_back = stderr_task.await.ok().flatten();
+        // Final drain so partial state is accurate.
+        drain_command_chunks(
+            &mut rx,
+            &mut stdout_text,
+            &mut stderr_text,
+            max_stdout_bytes,
+            &mut stdout_capped,
+            max_stderr_bytes,
+            &mut stderr_capped,
+        );
+
+        if let (Some(stdout), Some(stderr)) = (stdout_back, stderr_back) {
+            let payload = Box::new(crate::detach::DetachedShellPayload {
+                child,
+                stdout,
+                stderr,
+                command: command_label.to_string(),
+                partial_stdout: stdout_text,
+                partial_stderr: stderr_text,
+            });
+            return Ok(BashRunOutcome::Detached(payload));
+        }
+        // Streams already drained — fall back to Completed shape.
+        let _ = child.wait().await;
+        return Ok(BashRunOutcome::Completed(ReadOnlyCommandOutput {
+            stdout: stdout_text,
+            stderr: stderr_text,
+            exit_code: -1,
+            timed_out: false,
+            cancelled: false,
+            stdout_capped,
+            stderr_capped,
+        }));
+    }
+
+    // Normal completion path: drain remaining bytes and assemble
+    // output exactly like the legacy runner.
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+    drain_command_chunks(
+        &mut rx,
+        &mut stdout_text,
+        &mut stderr_text,
+        max_stdout_bytes,
+        &mut stdout_capped,
+        max_stderr_bytes,
+        &mut stderr_capped,
+    );
+
+    if timed_out || cancelled {
+        truncate_partial_line(&mut stdout_text);
+        truncate_partial_line(&mut stderr_text);
+    }
+
+    Ok(BashRunOutcome::Completed(ReadOnlyCommandOutput {
+        stdout: stdout_text,
+        stderr: stderr_text,
+        exit_code: exit_code.unwrap_or(-1),
+        timed_out,
+        cancelled,
+        stdout_capped,
+        stderr_capped,
+    }))
+}
+
 async fn read_stream<R>(
     mut stream: R,
     kind: StreamKind,
@@ -2621,6 +2893,51 @@ async fn read_stream<R>(
                 let _ = tx.send((kind, text));
             }
             Err(_) => break,
+        }
+    }
+}
+
+/// Detach-aware variant of [`read_stream`] used by the bash tool when
+/// a `DetachShellHandle` is wired in `ToolContext`. On normal stream
+/// EOF returns `None` (legacy behaviour); when the embedded
+/// `Notify::notified()` fires it returns `Some(stream)` so the caller
+/// can hand the live stream off to the BackgroundTaskRegistry without
+/// reading further bytes (preserving exact byte-stream continuity for
+/// the adopted task).
+///
+/// This is a sibling rather than a parameterized version because:
+///   1. Adding the notify branch to the hot-path `read_stream` would
+///      compile in `tokio::select!` overhead for every bash call
+///      whether or not detach is wired.
+///   2. The return type changes (`()` → `Option<R>`), and changing
+///      `read_stream`'s signature would touch every caller.
+async fn read_stream_until_detach<R>(
+    mut stream: R,
+    kind: StreamKind,
+    tx: tokio::sync::mpsc::UnboundedSender<(StreamKind, String)>,
+    detach: std::sync::Arc<tokio::sync::Notify>,
+) -> Option<R>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buffer = [0u8; 8192];
+    loop {
+        tokio::select! {
+            // Bias toward the read so a fast EOF doesn't lose data
+            // to a stale detach notification. The detach branch only
+            // wins when the read is actually pending.
+            biased;
+            res = stream.read(&mut buffer) => match res {
+                Ok(0) => return None,
+                Ok(read) => {
+                    let text = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                    let _ = tx.send((kind, text));
+                }
+                Err(_) => return None,
+            },
+            _ = detach.notified() => {
+                return Some(stream);
+            }
         }
     }
 }
@@ -4308,6 +4625,110 @@ printf 'probe.txt:1:needle\n'
         assert!(
             result.output.contains("done"),
             "command should complete under default timeout, got: {}",
+            result.output
+        );
+    }
+
+    // ── Phase 3b.3b: bash detach path ─────────────────────────────────────
+    //
+    // When the host wires a `DetachShellHandle` on `ToolContext` and
+    // fires the signal mid-execution, the bash runner must NOT kill
+    // the child. It transfers child + live streams + already-consumed
+    // bytes through the handle's one-shot reply channel and returns
+    // a `<bash_detached>` marker ToolResult so the LLM sees the
+    // invocation ended via background promotion.
+
+    #[tokio::test]
+    async fn bash_detach_signal_transfers_live_child_to_listener() {
+        let dir = tempdir().unwrap();
+        let mut ctx = crate::ToolContext::test(dir.path());
+        let (slot, listener) = crate::detach::new_slot_with_handle();
+        ctx.detach_shell_handle = Some(slot);
+
+        // Long-running command — gives the test a window to fire
+        // the detach signal mid-stream. printf+sleep produces some
+        // bytes the runner consumes before signal so we can verify
+        // partial-output capture.
+        let bash_fut = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                execute_bash(
+                    &ctx,
+                    &serde_json::json!({
+                        "command": "printf 'before\\n'; sleep 1; printf 'after\\n'"
+                    }),
+                )
+                .await
+            }
+        });
+
+        // Wait for the runner to consume the initial 'before' bytes
+        // and reach its idle-poll branch where the detach select is
+        // armed. 200ms is comfortably more than the 25ms tick
+        // without entering the post-sleep `after` window.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        listener.signal.notify_one();
+
+        let payload = listener
+            .payload_rx
+            .await
+            .expect("listener must receive detached payload");
+        assert_eq!(payload.command, "printf 'before\\n'; sleep 1; printf 'after\\n'");
+        assert!(
+            payload.partial_stdout.contains("before"),
+            "partial stdout must include the bytes consumed before detach: {:?}",
+            payload.partial_stdout
+        );
+
+        // The bash invocation must have returned a marker result
+        // (not killed, not a normal output) so the LLM sees the
+        // detach path explicitly.
+        let result = bash_fut.await.expect("bash future");
+        assert!(
+            result.output.contains("bash_detached"),
+            "result must announce detach to the LLM: {}",
+            result.output
+        );
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("bash_detached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "metadata.bash_detached flag must be set so downstream wiring can route correctly"
+        );
+
+        // The child is still alive in the payload; clean up so the
+        // test doesn't leak a sleeping shell.
+        drop(payload);
+    }
+
+    /// Sanity: when no detach handle is wired, the bash tool falls
+    /// through the legacy code path and returns normally. Without
+    /// this guard, a regression in the new detach branch could
+    /// silently break ordinary bash commands.
+    #[tokio::test]
+    async fn bash_without_detach_handle_uses_legacy_path() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        assert!(
+            ctx.detach_shell_handle.is_none(),
+            "default ToolContext::test must not wire a detach handle"
+        );
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "echo legacy-path-still-works"}),
+        )
+        .await;
+        assert!(
+            result.output.contains("legacy-path-still-works"),
+            "unhandled-detach bash must run normally: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("bash_detached"),
+            "no detach handle means no marker output: {}",
             result.output
         );
     }

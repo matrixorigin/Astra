@@ -1,15 +1,18 @@
-//! Cloud preference sync with MatrixOne.
+//! Cloud preference sync via server REST.
 //!
-//! Tool-health and pattern sync has been removed. What remains is
-//! user-preference sync.
+//! Edge-cloud contract: the CLI MUST NOT connect to MatrixOne
+//! directly. This module previously built a `sqlx::Pool` and
+//! invoked `MatrixOneSyncService` in-process; both moved to the
+//! server (`/preferences` endpoints) so the only way the CLI
+//! reaches the preference store is through HTTP.
 //!
 //! ## Sync Flow
 //!
 //! - **Preferences**: [`try_cloud_pull_preferences`] / [`try_cloud_push_preferences`].
+//!   Both go through [`crate::preferences_client`] now.
 
-use astra_core::resolve_database_name_or;
 use astra_services::session_journal;
-use astra_services::state_sync::{MatrixOneSyncService, StateSyncService, pref_keys};
+use astra_services::state_sync::pref_keys;
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 
 use super::chat_turn::enqueue_ingestion_pub;
@@ -17,132 +20,110 @@ use super::{ExplainMode, SessionState};
 
 /// Result from cloud pull attempt at session start.
 pub(super) struct CloudPullResult {
-    /// True when MatrixOne was reachable.
+    /// True when the server's preferences endpoint responded
+    /// successfully (regardless of whether it returned data).
     pub cloud_reachable: bool,
 }
 
-/// Best-effort MatrixOne pool creation for sync operations.
-pub(super) async fn try_connect_matrixone() -> Option<sqlx::Pool<sqlx::MySql>> {
-    let host = std::env::var("MATRIXONE_HOST").ok()?;
-    let port: u16 = std::env::var("MATRIXONE_PORT")
+/// Resolve the cloud REST base URL from env. Returns `None` when
+/// no cloud is configured (CLI will degrade to no-op sync).
+fn resolve_cloud_base() -> Option<String> {
+    std::env::var("ASTRA_CLOUD_BASE")
         .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(6001);
-    let user = std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".to_string());
-    let password = std::env::var("MATRIXONE_PASSWORD").unwrap_or_default();
-    let database = resolve_database_name_or(&|k| std::env::var(k).ok(), "astra");
-    let url = format!("mysql://{user}:{password}@{host}:{port}/{database}");
-    sqlx::mysql::MySqlPoolOptions::new()
-        .max_connections(2)
-        .acquire_timeout(std::time::Duration::from_secs(3))
-        .idle_timeout(std::time::Duration::from_secs(60))
-        .test_before_acquire(true)
-        .connect(&url)
-        .await
-        .ok()
+        .filter(|s| !s.trim().is_empty())
 }
 
-/// Check whether MatrixOne is reachable for downstream preference sync.
-/// Best-effort: silently returns unreachable when cloud is unavailable.
-pub(super) async fn try_cloud_pull(_profile_name: &str) -> CloudPullResult {
-    let cloud_reachable = try_connect_matrixone().await.is_some();
+/// Check whether the cloud preference endpoint is reachable.
+/// Best-effort: returns `cloud_reachable: false` when cloud is
+/// unconfigured or unreachable.
+pub(super) async fn try_cloud_pull(profile_name: &str) -> CloudPullResult {
+    let Some(cloud_base) = resolve_cloud_base() else {
+        return CloudPullResult { cloud_reachable: false };
+    };
+    let token = super::session_runtime::current_access_token(Some(profile_name));
+    let cloud_reachable =
+        crate::preferences_client::probe_cloud_reachable(&cloud_base, token.as_deref()).await;
     CloudPullResult { cloud_reachable }
 }
 
-/// Shut down an ephemeral audit flusher: drop all senders, cancel the token,
-/// and await the flusher task so the final batch is flushed to DB.
-async fn drain_ephemeral_audit(
-    svc: MatrixOneSyncService,
-    flusher: astra_services::state_sync::AuditFlusherHandle,
-) {
-    drop(svc);
-    drop(flusher.writer);
-    flusher.shutdown.cancel();
-    match tokio::time::timeout(std::time::Duration::from_secs(5), flusher.join_handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::error!(target: "cloud_sync", "audit flusher panicked: {e}"),
-        Err(_) => {
-            tracing::warn!(target: "cloud_sync", "audit flusher drain timed out (5s), some entries may be lost")
-        }
-    }
-}
-
 /// Pull user preferences from cloud at session start.
-/// Merges cloud preferences into local state (cloud-wins). Returns keys merged (for journal audit).
+/// Merges cloud preferences into local state (cloud-wins). Returns
+/// keys merged (for journal audit).
 pub(super) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<String> {
-    let pool = match try_connect_matrixone().await {
-        Some(p) => p,
-        None => return Vec::new(),
+    let Some(cloud_base) = resolve_cloud_base() else {
+        return Vec::new();
     };
-    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-    let svc = MatrixOneSyncService::new(pool, flusher.writer.clone());
-    let user_id = astra_core::cli_user_id();
-    let out = StateSyncService::pull_all_preferences(&svc, &user_id).await;
-    drain_ephemeral_audit(svc, flusher).await;
-    match out {
-        Ok(prefs) if !prefs.is_empty() => {
-            let keys: Vec<String> = prefs.iter().map(|(k, _)| k.clone()).collect();
-            for (key, value) in &prefs {
-                match key.as_str() {
-                    pref_keys::EXPLAIN_MODE => {
-                        state.explain = match value.as_str() {
-                            "on" => ExplainMode::On,
-                            "verbose" => ExplainMode::Verbose,
-                            _ => ExplainMode::Off,
-                        };
-                    }
-                    pref_keys::BLOCKED_TOOLS => {
-                        if let Ok(tools) = serde_json::from_str::<Vec<String>>(value) {
-                            let existing: std::collections::HashSet<String> = state
-                                .tool_health_entries
-                                .iter()
-                                .map(|e| e.name.clone())
-                                .collect();
-                            for tool_name in tools {
-                                if !existing.contains(&tool_name) {
-                                    state.tool_health_entries.push(ToolHealthEntry {
-                                        name: tool_name,
-                                        total_calls: 0,
-                                        total_failures: 0,
-                                        failure_rate: 0.0,
-                                        last_updated_epoch: 0,
-                                        recent_outcomes: vec![],
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // Status is recorded in the journal (`append_cloud_pull_sync_journal`)
-            // and reflected in `/state` / `/account`. We intentionally do not
-            // write to stderr here: this path runs after `/login` while the
-            // TUI owns the terminal, and a stray "✓ Pulled N preferences"
-            // line would scribble across the rendered viewport.
-            keys
-        }
-        Ok(_) => Vec::new(),
+    // Best-effort: pick token from whichever profile the session
+    // currently holds. Empty token still works for local dev
+    // servers without auth; the server's auth_service decides.
+    let token = super::session_runtime::current_access_token(None);
+    let prefs = match crate::preferences_client::pull_all_preferences(
+        &cloud_base,
+        token.as_deref(),
+    )
+    .await
+    {
+        Ok(prefs) => prefs,
         Err(e) => {
             tracing::warn!(
                 target: "astra_cli::cloud_sync",
                 error = %e,
                 "preference pull skipped"
             );
-            Vec::new()
+            return Vec::new();
+        }
+    };
+    if prefs.is_empty() {
+        return Vec::new();
+    }
+    let keys: Vec<String> = prefs.iter().map(|(k, _)| k.clone()).collect();
+    for (key, value) in &prefs {
+        match key.as_str() {
+            pref_keys::EXPLAIN_MODE => {
+                state.explain = match value.as_str() {
+                    "on" => ExplainMode::On,
+                    "verbose" => ExplainMode::Verbose,
+                    _ => ExplainMode::Off,
+                };
+            }
+            pref_keys::BLOCKED_TOOLS => {
+                if let Ok(tools) = serde_json::from_str::<Vec<String>>(value) {
+                    let existing: std::collections::HashSet<String> = state
+                        .tool_health_entries
+                        .iter()
+                        .map(|e| e.name.clone())
+                        .collect();
+                    for tool_name in tools {
+                        if !existing.contains(&tool_name) {
+                            state.tool_health_entries.push(ToolHealthEntry {
+                                name: tool_name,
+                                total_calls: 0,
+                                total_failures: 0,
+                                failure_rate: 0.0,
+                                last_updated_epoch: 0,
+                                recent_outcomes: vec![],
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
+    // Status is recorded in the journal (`append_cloud_pull_sync_journal`)
+    // and reflected in `/state` / `/account`. We intentionally do not
+    // write to stderr here: this path runs after `/login` while the
+    // TUI owns the terminal, and a stray "✓ Pulled N preferences"
+    // line would scribble across the rendered viewport.
+    keys
 }
 
 /// Push user preferences to cloud at session end.
 pub(super) async fn try_cloud_push_preferences(state: &SessionState) {
-    let pool = match try_connect_matrixone().await {
-        Some(p) => p,
-        None => return,
+    let Some(cloud_base) = resolve_cloud_base() else {
+        return;
     };
-    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-    let svc = MatrixOneSyncService::new(pool, flusher.writer.clone());
-    let user_id = astra_core::cli_user_id();
+    let token = super::session_runtime::current_access_token(None);
 
     let blocked: Vec<String> = state
         .tool_health_entries
@@ -157,9 +138,22 @@ pub(super) async fn try_cloud_push_preferences(state: &SessionState) {
         (pref_keys::BLOCKED_TOOLS, blocked_json),
     ];
     for (key, value) in &prefs {
-        let _ = svc.push_preference(&user_id, key, value).await;
+        if let Err(e) = crate::preferences_client::push_preference(
+            &cloud_base,
+            token.as_deref(),
+            key,
+            value,
+        )
+        .await
+        {
+            tracing::warn!(
+                target: "astra_cli::cloud_sync",
+                error = %e,
+                key = %key,
+                "preference push failed"
+            );
+        }
     }
-    drain_ephemeral_audit(svc, flusher).await;
 }
 
 // ═══════════════════════════════════════════ Journal Helpers ═══════════════════════

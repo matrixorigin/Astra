@@ -320,7 +320,11 @@ pub(crate) struct ChatArgs {
     #[arg(short = 'y', long = "auto-approve", default_value_t = false)]
     pub auto_approve: bool,
     /// Permission mode: auto (approve all), prompt (interactive, default), deny (reject all writes)
-    #[arg(long = "permission-mode", value_parser = ["auto", "prompt", "deny"])]
+    /// Legacy aliases yolo/bypass-safety map to auto for backward compatibility.
+    #[arg(
+        long = "permission-mode",
+        value_parser = ["auto", "prompt", "deny", "yolo", "bypass-safety", "bypass_safety"]
+    )]
     pub permission_mode: Option<String>,
     /// Suppress spinner and progress output (result still printed)
     #[arg(long, default_value_t = false)]

@@ -419,8 +419,8 @@ pub(crate) enum BgTaskCommand {
         reply: tokio::sync::oneshot::Sender<Result<(String, u64), String>>,
     },
     /// Returns whether the task has reached terminal status. Used by
-    /// `task(action='output', block=true)` so an empty-output task that
-    /// completed doesn't spin until the timeout.
+    /// `agent_job(action='output', block=true)` so an empty-output job
+    /// that completed doesn't spin until the timeout.
     IsTerminal {
         task_id: String,
         reply: tokio::sync::oneshot::Sender<Result<bool, String>>,
@@ -527,6 +527,12 @@ pub struct ToolExecutor {
     /// task actions fail fast with a clear error rather than pushing
     /// to a queue nobody drains (which would hang the LLM turn forever).
     pub(crate) bg_task_commands: Option<std::sync::Arc<std::sync::Mutex<Vec<BgTaskCommand>>>>,
+    /// Detach slot for the bash tool. Renewed before each tool call
+    /// by the TUI event loop so a fresh one-shot reply channel is
+    /// available for every bash invocation. `None` outside the TUI
+    /// (server mode, headless tests) — bash there runs through the
+    /// legacy reader.
+    pub(crate) bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
     /// Optional agent spawning context for the `spawn_agent` tool.
     pub spawn_context: Option<agent_spawning::SpawnAgentContext>,
     /// Optional shared context cache for cross-agent knowledge sharing.
@@ -643,6 +649,7 @@ impl ToolExecutor {
             worktree_session: std::sync::Mutex::new(None),
             task_manager: std::sync::Arc::new(task_mgmt::TaskManager::in_memory()),
             bg_task_commands: None,
+            bash_detach_slot: None,
             spawn_context: None,
             context_cache: None,
             agent_id: None,
@@ -666,6 +673,7 @@ impl ToolExecutor {
                     http_client: None,
                     logger: std::sync::Arc::new(astra_tools::TracingLogger),
                     cancel_token: None,
+                    detach_shell_handle: None,
                 },
             ),
         }
@@ -1025,6 +1033,21 @@ impl ToolExecutor {
         self
     }
 
+    /// Install the host-owned detach slot so the bash tool can
+    /// observe Ctrl+B and transfer its child to the background
+    /// registry. The slot is shared (`Arc`) — both the executor and
+    /// the TUI hold the same instance so the TUI can refill it
+    /// between tool calls without rebuilding the executor.
+    pub fn with_bash_detach_slot(
+        mut self,
+        slot: astra_tools::detach::DetachShellSlot,
+    ) -> Self {
+        self.default_executor
+            .set_detach_shell_slot(Some(slot.clone()));
+        self.bash_detach_slot = Some(slot);
+        self
+    }
+
     /// Configure cloud proxy for memory tool calls.
     pub fn with_cloud(mut self, base: impl Into<String>, token: impl Into<String>) -> Self {
         self.cloud_base = Some(base.into());
@@ -1044,6 +1067,120 @@ impl ToolExecutor {
     }
 
     // ─── Task management methods (delegated to task_mgmt module) ────────────
+
+    /// Phase 1 split (2026-05): the four background actions moved off
+    /// `task` onto the dedicated `agent_job` tool. When a stale model
+    /// (or a hallucination) calls the old path, return an actionable
+    /// Error: redirect — same shape as the `agent.delegate` rejection
+    /// — so `tool_result_semantics::is_tool_error` flags it red and
+    /// the model corrects on the next turn instead of silently
+    /// no-op'ing.
+    fn redirect_to_agent_job(old_action: &str, new_action: &str) -> String {
+        format!(
+            "Error: `task(action='{old_action}')` was removed in the agent_job split. \
+             Use `agent_job(action='{new_action}')` instead — same arguments, \
+             new tool name. The `task` tool is now exclusively for the durable \
+             session checklist (create/update/list/get/stop)."
+        )
+    }
+
+    /// Phase 2 split (2026-05): plan-mode actions promoted from buried
+    /// `session` sub-actions to dedicated top-level tools (claudecode
+    /// parity). The model picked the buried sub-actions only ~rarely,
+    /// missing the plan-authoring discipline. Stale callers get an
+    /// Error: redirect — same shape as the agent.delegate fix and the
+    /// Phase 1 task→agent_job split.
+    fn redirect_to_plan_mode_tool(old_action: &str, new_tool: &str) -> String {
+        format!(
+            "Error: `session(action='{old_action}')` was promoted to the \
+             top-level `{new_tool}` tool in the Phase 2 plan-mode split. \
+             Call `{new_tool}` directly — see its description for the \
+             plan-authoring contract. The buried sub-action no longer exists."
+        )
+    }
+
+    /// CLI entry point for the top-level `enter_plan_mode` tool. Posts
+    /// to the cloud `/plans` endpoint to mint or relink a plan, sets the
+    /// session's active plan id, and returns workflow instructions.
+    /// Falls back to a clear Error: when no cloud is wired (offline / no
+    /// auth) — astra is edge-cloud and plan state is authoritative in
+    /// the cloud DB; we don't keep a local-only ghost plan.
+    async fn cli_enter_plan_mode(&self, args: &Value) -> String {
+        let goal = args
+            .get("goal")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("(pending)");
+        let Some(cloud_base) = self.cloud_base.clone() else {
+            return "Error: plan mode requires a cloud connection (no cloud_base configured). \
+                    Set ASTRA_CLOUD_BASE or sign in with `astra login`, then retry. Plan state \
+                    is authoritative in the cloud DB — without it the plan would be a local \
+                    ghost that desyncs across devices."
+                .to_string();
+        };
+        let Some(session_id) = self.active_session_id() else {
+            return "Error: plan mode requires an active session id. \
+                    Call `enter_plan_mode` from inside an interactive REPL session, not \
+                    a one-shot CLI invocation."
+                .to_string();
+        };
+        let token = self.cloud_token();
+        match crate::plan_mode_client::enter_plan_mode(&cloud_base, token.as_deref(), &session_id, goal).await {
+            Ok(plan_id) => format!(
+                "Entered plan mode. plan_id={plan_id} goal=\"{goal}\". Write tools are now \
+                 blocked — explore the codebase with read tools (read_file/grep/glob/list_dir/symbols), \
+                 author the plan, then call `exit_plan_mode(plan='...', approved=true)` to \
+                 surface it for user approval."
+            ),
+            Err(err) => format!("Error: enter_plan_mode failed: {err}"),
+        }
+    }
+
+    /// CLI entry point for the top-level `exit_plan_mode` tool. POSTs
+    /// to `/plans/{id}/exit-plan-mode` so the server-side handler runs
+    /// the same code path as the web agent (plan_md persistence,
+    /// session_plan_todos seed, write-tool unlock).
+    async fn cli_exit_plan_mode(&self, args: &Value) -> String {
+        let plan = match args.get("plan").and_then(Value::as_str) {
+            Some(p) if !p.trim().is_empty() => p.to_string(),
+            _ => return "Error: `plan` is required for exit_plan_mode (markdown for user approval)".to_string(),
+        };
+        let approved = args.get("approved").and_then(Value::as_bool).unwrap_or(true);
+        let Some(cloud_base) = self.cloud_base.clone() else {
+            return "Error: plan mode requires a cloud connection (no cloud_base configured)".to_string();
+        };
+        let Some(session_id) = self.active_session_id() else {
+            return "Error: plan mode requires an active session id".to_string();
+        };
+        let token = self.cloud_token();
+        match crate::plan_mode_client::exit_plan_mode(
+            &cloud_base,
+            token.as_deref(),
+            &session_id,
+            &plan,
+            approved,
+        )
+        .await
+        {
+            Ok(plan_id) => {
+                if approved {
+                    format!(
+                        "Exited plan mode. plan_id={plan_id} approved; write tools unlocked. \
+                         Plan items have been seeded to the session task list — start with the \
+                         first item."
+                    )
+                } else {
+                    format!(
+                        "Plan {plan_id} left open for another authoring pass. Write tools \
+                         remain blocked. Refine the plan and call exit_plan_mode again with \
+                         approved=true when ready."
+                    )
+                }
+            }
+            Err(err) => format!("Error: exit_plan_mode failed: {err}"),
+        }
+    }
 
     fn task_output_success(output: &str) -> bool {
         if output.starts_with("Error:") {
@@ -1065,7 +1202,38 @@ impl ToolExecutor {
             .unwrap_or(false)
     }
 
+    /// Route a `task` action either to the cloud (production) or the
+    /// local in-memory TaskManager (offline/tests). Cloud is the
+    /// preferred path: when `cloud_base` and `active_session_id` are
+    /// both set, the call goes to `POST /sessions/{sid}/todos:execute`
+    /// so the server is the single source of truth — CLI never
+    /// touches MO directly. Falls back to the in-memory manager only
+    /// when no cloud is wired (one-shot CLI, headless tests).
+    async fn route_task_action(&self, action: &str, args: &Value) -> Option<String> {
+        let cloud_base = self.cloud_base.clone()?;
+        let session_id = self.active_session_id()?;
+        if session_id.is_empty() {
+            return None;
+        }
+        let token = self.cloud_token();
+        match crate::session_todo_client::execute_todo_action(
+            &cloud_base,
+            token.as_deref(),
+            &session_id,
+            action,
+            args,
+        )
+        .await
+        {
+            Ok(output) => Some(output),
+            Err(err) => Some(format!("Error: cloud todo {action} failed: {err}")),
+        }
+    }
+
     async fn task_create(&self, args: &Value) -> String {
+        if let Some(output) = self.route_task_action("create", args).await {
+            return output;
+        }
         let snapshot = self.task_manager.snapshot_state().await;
         let output = self.task_manager.create(args).await;
         if Self::task_output_success(&output) {
@@ -1080,12 +1248,21 @@ impl ToolExecutor {
         output
     }
     async fn task_list(&self, args: &Value) -> String {
+        if let Some(output) = self.route_task_action("list", args).await {
+            return output;
+        }
         self.task_manager.list(args).await
     }
     async fn task_get(&self, args: &Value) -> String {
+        if let Some(output) = self.route_task_action("get", args).await {
+            return output;
+        }
         self.task_manager.get(args).await
     }
     async fn task_update(&self, args: &Value) -> String {
+        if let Some(output) = self.route_task_action("update", args).await {
+            return output;
+        }
         let snapshot = self.task_manager.snapshot_state().await;
         let output = self.task_manager.update(args).await;
         if Self::task_output_success(&output) {
@@ -1102,6 +1279,9 @@ impl ToolExecutor {
         output
     }
     async fn task_stop(&self, args: &Value) -> String {
+        if let Some(output) = self.route_task_action("stop", args).await {
+            return output;
+        }
         let snapshot = self.task_manager.snapshot_state().await;
         let output = self.task_manager.stop(args).await;
         if Self::task_output_success(&output) {
@@ -1116,6 +1296,66 @@ impl ToolExecutor {
             );
         }
         output
+    }
+
+    /// `task(action='list_user')` — cross-session active list. Cloud
+    /// only: in-memory mode by definition has only one session, so
+    /// the cross-session question is meaningless without a backing
+    /// store that aggregates across users.
+    async fn task_list_user(&self, args: &Value) -> String {
+        let Some(cloud_base) = self.cloud_base.clone() else {
+            return "Error: task(action='list_user') requires a cloud connection. \
+                    The cross-session view is server-side only — set ASTRA_CLOUD_BASE \
+                    or sign in with `astra login` to enable it."
+                .to_string();
+        };
+        let status = args
+            .get("user_status")
+            .and_then(Value::as_str)
+            .unwrap_or("active");
+        let token = self.cloud_token();
+        match crate::session_todo_client::list_user_todos(
+            &cloud_base,
+            token.as_deref(),
+            status,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(err) => format!("Error: list_user todos failed: {err}"),
+        }
+    }
+
+    /// `task(action='adopt', source_session_id, task_id)` — bring a
+    /// task from another of the user's sessions into the current
+    /// session. Server-side it copies the row's title/description/
+    /// metadata into a fresh todo here and marks the source migrated
+    /// so the user doesn't see it twice. Cloud-only.
+    async fn task_adopt(&self, args: &Value) -> String {
+        if self.cloud_base.is_none() {
+            return "Error: task(action='adopt') requires a cloud connection.".to_string();
+        }
+        // Adopt is a write — route through the same execute endpoint.
+        // Server-side dispatch will reject if source isn't owned by
+        // the same user (auth check via SessionService).
+        match self.route_task_action("adopt", args).await {
+            Some(output) => output,
+            None => "Error: cannot adopt task without an active session id".to_string(),
+        }
+    }
+
+    /// `task(action='archive', older_than_days?)` — mark completed
+    /// tasks older than N days as archived (hidden from default list).
+    /// Server-side bulk update by user_id + status='completed' +
+    /// updated_at older than threshold.
+    async fn task_archive(&self, args: &Value) -> String {
+        if self.cloud_base.is_none() {
+            return "Error: task(action='archive') requires a cloud connection.".to_string();
+        }
+        match self.route_task_action("archive", args).await {
+            Some(output) => output,
+            None => "Error: cannot archive without an active session id".to_string(),
+        }
     }
 
     async fn task_background_shell(&self, args: &Value) -> String {
@@ -1146,7 +1386,7 @@ impl ToolExecutor {
         }
         match rx.await {
             Ok(id) => format!(
-                "Background task started: {id}\nUse task(action='output', task_id='{id}') to check progress or task(action='kill', task_id='{id}') to stop."
+                "Background task started: {id}\nUse agent_job(action='output', task_id='{id}') to check progress or agent_job(action='kill', task_id='{id}') to stop."
             ),
             Err(_) => "Error: background task registry not available".to_string(),
         }
@@ -1186,7 +1426,7 @@ impl ToolExecutor {
     async fn task_output(&self, args: &Value) -> String {
         let Some(ref bg_commands) = self.bg_task_commands else {
             return "Error: background task subsystem not active in this session (no TUI/REPL attached). \
-                    `task(action='output')` only works for tasks spawned via `task(action='background_shell')` \
+                    `agent_job(action='output')` only works for jobs spawned via `agent_job(action='shell')` \
                     inside the interactive REPL."
                 .to_string();
         };
@@ -2524,10 +2764,18 @@ impl ToolExecutor {
                         "list_suppressed" => self.list_suppressed_memories(),
                         "release_context" => self.release_context(args),
                         "list_released" => self.list_released_context(),
-                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, compact, rollback_edits, ask_user, sleep, timeline, summary, history, suppress_memory(memory_id, reason?), unsuppress_memory(memory_id), list_suppressed, release_context(tool_call_id|string[]), list_released".to_string(),
-                        other => format!("Unknown session action: '{other}'"),
+                        // Phase 2 split: plan-mode actions promoted to top-level
+                        // tools (claudecode parity). Stale callers get an
+                        // Error: with redirect — same shape as the Phase 1
+                        // task→agent_job split.
+                        "enter_plan" => Self::redirect_to_plan_mode_tool("enter_plan", "enter_plan_mode"),
+                        "exit_plan" => Self::redirect_to_plan_mode_tool("exit_plan", "exit_plan_mode"),
+                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, compact, rollback_edits, ask_user, sleep, timeline, summary, history, suppress_memory(memory_id, reason?), unsuppress_memory(memory_id), list_suppressed, release_context(tool_call_id|string[]), list_released. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools.".to_string(),
+                        other => format!("Error: unknown `session` action '{other}'. Valid: config, prioritize, deprioritize, compact, rollback_edits, ask_user, sleep, timeline, summary, history, suppress_memory, unsuppress_memory, list_suppressed, release_context, list_released. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools."),
                     }
                 }
+                "enter_plan_mode" => self.cli_enter_plan_mode(args).await,
+                "exit_plan_mode" => self.cli_exit_plan_mode(args).await,
                 // Task management (unified tool with action param)
                 "task" => {
                     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
@@ -2537,12 +2785,35 @@ impl ToolExecutor {
                         "get" => self.task_get(args).await,
                         "update" => self.task_update(args).await,
                         "stop" => self.task_stop(args).await,
-                        "background_shell" => self.task_background_shell(args).await,
-                        "background_agent" => self.task_background_agent(args).await,
+                        // Cross-session views (Phase 7): user_id-indexed
+                        // queries served by the server. Cloud-only;
+                        // offline mode returns an error since there's
+                        // nothing to aggregate across sessions.
+                        "list_user" => self.task_list_user(args).await,
+                        "adopt" => self.task_adopt(args).await,
+                        "archive" => self.task_archive(args).await,
+                        // Background actions moved to the dedicated `agent_job`
+                        // tool in the Phase 1 split (2026-05). The model may
+                        // still emit `task.background_*` from a stale schema
+                        // or hallucination — surface an Error: with the new
+                        // path so it self-corrects on the next turn.
+                        "background_shell" => Self::redirect_to_agent_job("background_shell", "shell"),
+                        "background_agent" => Self::redirect_to_agent_job("background_agent", "agent"),
+                        "output" => Self::redirect_to_agent_job("output", "output"),
+                        "kill" => Self::redirect_to_agent_job("kill", "kill"),
+                        "" => "Error: missing required parameter `action` for `task`. Use one of: create, update, list, get, stop, list_user, adopt, archive. For background processes use the `agent_job` tool instead.".to_string(),
+                        other => format!("Error: unknown `task` action '{other}'. Valid: create, update, list, get, stop, list_user, adopt, archive. For background processes use the `agent_job` tool (actions: shell, agent, output, kill)."),
+                    }
+                }
+                "agent_job" => {
+                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    match action {
+                        "shell" => self.task_background_shell(args).await,
+                        "agent" => self.task_background_agent(args).await,
                         "output" => self.task_output(args).await,
                         "kill" => self.task_kill_bg(args).await,
-                        "" => "Missing required parameter: action. Use: create, update, list, get, stop, background_shell, output, kill".to_string(),
-                        other => format!("Unknown task action: '{other}'. Use: create, update, list, get, stop, background_shell, output, kill"),
+                        "" => "Error: missing required parameter `action` for `agent_job`. Use one of: shell, agent, output, kill.".to_string(),
+                        other => format!("Error: unknown `agent_job` action '{other}'. Valid: shell, agent, output, kill."),
                     }
                 }
                 // Legacy separate task_* names (backward compat)

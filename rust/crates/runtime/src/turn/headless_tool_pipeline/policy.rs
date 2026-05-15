@@ -1,9 +1,7 @@
 use astra_core::agent_warn;
 
 use super::super::agentic_headless_round::HeadlessStderrStyle;
-use super::super::permission_gate::{
-    PermissionCheckResult, check_tool_permission, permission_denied_error_result,
-};
+use super::super::permission_gate::{PermissionCheckResult, permission_denied_error_result};
 use super::*;
 use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::headless_tool_assembly::{
@@ -550,12 +548,14 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let permission_context = self.ctx.permission_context;
         let effective_permission_timeout = self.ctx.effective_permission_timeout;
         let mailbox = self.ctx.mailbox.as_deref_mut();
-        match check_tool_permission(
+        let plan_mode_active = self.ctx.plan_mode_active;
+        match crate::turn::permission_gate::check_tool_permission_in_plan_mode(
             &execution.name,
             args_str.as_deref(),
             permission_context,
             mailbox,
             effective_permission_timeout,
+            plan_mode_active,
         )
         .await
         {

@@ -52,6 +52,11 @@ pub(crate) struct StatusContext {
     /// the chip glyph (`▼` expanded, `▶` collapsed) so the key's
     /// target state is visible.
     pub task_board_expanded: bool,
+    /// `(running, stalled)` counts of the BackgroundTaskRegistry.
+    /// `None` when the registry has no live state to surface; the
+    /// chip also hides on `Some((0, 0))` so a long-lived registry
+    /// with no live tasks doesn't waste status-line width.
+    pub bg_task_counts: Option<(usize, usize)>,
 }
 
 /// A styled text fragment that appears on either side of the line.
@@ -162,6 +167,29 @@ impl StatusLine {
                     )
                 } else {
                     (format!("{glyph} {open}/{total}"), dim)
+                };
+                out.left.push(Segment::styled(text, style));
+            }
+        }
+
+        // BackgroundTaskRegistry chip. Surfaces fire-and-poll work
+        // (agent_job.shell / agent_job.agent) so the user knows how
+        // many bg jobs are live without opening a separate view.
+        // Style:
+        //   - any stalled → yellow (alarm: process likely waiting on
+        //     interactive input; user should kill or acknowledge)
+        //   - running only → dim (informational)
+        //   - both 0 → chip hidden (registry exists but is idle)
+        if let Some((running, stalled)) = ctx.bg_task_counts {
+            if running > 0 || stalled > 0 {
+                let mut text = format!("BG: {running} running");
+                if stalled > 0 {
+                    text.push_str(&format!(" · {stalled} stalled"));
+                }
+                let style = if stalled > 0 {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    dim
                 };
                 out.left.push(Segment::styled(text, style));
             }

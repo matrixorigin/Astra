@@ -60,6 +60,12 @@ pub struct SessionSubtask {
     pub description: Option<String>,
     pub status: String,
     pub depends_on: Vec<String>,
+    /// Sub-agent or user that owns this subtask. Defaults to the
+    /// parent task's owner unless the create call explicitly
+    /// overrides — without inheritance, sub-agents looking for
+    /// "my work" miss subtasks of tasks they own (U-7 unhappy path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 /// Point-in-time snapshot of a single session's task list plus its id counter.
@@ -89,6 +95,22 @@ pub type TaskMutation =
 pub trait TaskStore: Send + Sync {
     /// Load every task for this session in stable order.
     async fn load(&self, session_id: &str) -> Result<Vec<SessionTask>, String>;
+
+    /// Load only `pending` and `in_progress` tasks.
+    ///
+    /// Default impl loads all rows and filters in Rust — correct but
+    /// ships the whole table over the wire. `MatrixOneTaskStore` overrides
+    /// this with a WHERE clause so the index
+    /// `idx_session_todos_session_status_updated` is used and only
+    /// matching rows are returned.
+    async fn load_active(&self, session_id: &str) -> Result<Vec<SessionTask>, String> {
+        Ok(self
+            .load(session_id)
+            .await?
+            .into_iter()
+            .filter(|t| matches!(t.status.as_str(), "pending" | "in_progress"))
+            .collect())
+    }
     /// Replace the session's entire task list. The store must treat this as
     /// atomic from the caller's perspective.
     async fn save(&self, session_id: &str, tasks: Vec<SessionTask>) -> Result<(), String>;
@@ -338,6 +360,38 @@ const VALID_UPDATE_STATUSES: &[&str] = &[
     "deleted",
 ];
 
+/// Title normalization for U-4 duplicate detection. Lowercase, drop
+/// ASCII punctuation, collapse whitespace. Conservative on purpose:
+/// we'd rather miss a near-duplicate (model retries with different
+/// wording → 2 tasks, manageable) than false-positive a legitimate
+/// fresh task (refuse with `duplicate_of` → model confused).
+fn normalize_title(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    let mut prev_was_space = true; // skip leading whitespace
+    for ch in title.chars() {
+        if ch.is_whitespace() {
+            if !prev_was_space {
+                out.push(' ');
+                prev_was_space = true;
+            }
+        } else if ch.is_ascii_punctuation() {
+            // Drop punctuation entirely so "fix bug." matches "fix bug".
+            // Don't pretend it's a word boundary either — preserve
+            // adjacency so "auth-flow" matches "auth flow" without the
+            // hyphen merging into the next char.
+        } else {
+            for lc in ch.to_lowercase() {
+                out.push(lc);
+            }
+            prev_was_space = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
 fn normalize_update_status(args: &Value) -> Result<Option<String>, String> {
     let canonical = args.get("new_status").and_then(Value::as_str);
     let legacy = args.get("status").and_then(Value::as_str);
@@ -505,6 +559,18 @@ impl TaskManager {
             .map(String::from);
         let now = chrono::Utc::now().to_rfc3339();
 
+        let active_form = args
+            .get("active_form")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let owner = args.get("owner").and_then(Value::as_str).map(String::from);
+        // U-7: subtasks inherit parent's `owner` when they don't
+        // declare one explicitly. Without inheritance a sub-agent
+        // looking for "my work" misses subtasks of tasks it owns,
+        // because the explicit `owner` field on the parent doesn't
+        // propagate. Pass `owner` to the subtask builder below so
+        // the closure has it.
+        let parent_owner_for_subtasks = owner.clone();
         let subtasks: Vec<SessionSubtask> = args
             .get("subtasks")
             .and_then(Value::as_array)
@@ -513,6 +579,8 @@ impl TaskManager {
                     .filter_map(|st| {
                         let id = st.get("id").and_then(Value::as_str)?;
                         let title = st.get("title").and_then(Value::as_str)?;
+                        let explicit_owner =
+                            st.get("owner").and_then(Value::as_str).map(String::from);
                         Some(SessionSubtask {
                             id: id.to_string(),
                             title: title.to_string(),
@@ -531,17 +599,13 @@ impl TaskManager {
                                         .collect()
                                 })
                                 .unwrap_or_default(),
+                            // Inherit when not specified.
+                            owner: explicit_owner.or_else(|| parent_owner_for_subtasks.clone()),
                         })
                     })
                     .collect()
             })
             .unwrap_or_default();
-
-        let active_form = args
-            .get("active_form")
-            .and_then(Value::as_str)
-            .map(String::from);
-        let owner = args.get("owner").and_then(Value::as_str).map(String::from);
         let metadata = args.get("metadata").and_then(Value::as_object).cloned();
         let sid = self.sid();
         let mutation_title = title.clone();
@@ -550,7 +614,74 @@ impl TaskManager {
             .mutate(
                 &sid,
                 Box::new(move |mut tasks, next| {
+                    // U-4 dedup: refuse exact-normalized title match
+                    // against active (pending/in_progress) tasks.
+                    // Without this, a session restart can lead the
+                    // model to re-create work it already has open.
+                    // Returns the existing id so the model can
+                    // continue with the open task instead of
+                    // duplicating.
+                    let normalized_new = normalize_title(&mutation_title);
+                    if let Some(dup) = tasks.iter().find(|t| {
+                        matches!(t.status.as_str(), "pending" | "in_progress")
+                            && normalize_title(&t.title) == normalized_new
+                    }) {
+                        let response = prefix_summary(
+                            format!(
+                                "Refused: active task #{} already has this title — use update / get instead",
+                                dup.id
+                            ),
+                            json!({
+                                "success": false,
+                                "duplicate_of": dup.id,
+                                "duplicate_title": dup.title,
+                                "duplicate_status": dup.status,
+                                "message": format!(
+                                    "Refused: an active task with the same normalized title already exists (id={}). Use task(action='update') or task(action='get') instead of creating a duplicate.",
+                                    dup.id
+                                ),
+                            })
+                            .to_string(),
+                        );
+                        return Ok(TaskMutationResult {
+                            tasks,
+                            next_task_id: None,
+                            response,
+                        });
+                    }
+
                     let task_id = format!("task-{next}");
+                    // U-10: if the counter is desynced (corruption or
+                    // partial init), `next` may point at an id that
+                    // already exists. Surface this loudly so the model
+                    // (and operators) know to investigate rather than
+                    // silently producing an invisible duplicate or
+                    // hitting a raw "Duplicate entry" DB error.
+                    if tasks.iter().any(|t| t.id == task_id) {
+                        let response = prefix_summary(
+                            format!(
+                                "Error: task counter desync — id '{task_id}' already exists. \
+                                 The session's counter may need to be reset. \
+                                 Contact support or use `task(action='list')` to see the \
+                                 current task list and manually continue from the last id."
+                            ),
+                            json!({
+                                "success": false,
+                                "error": "counter_desync",
+                                "conflicting_id": task_id,
+                                "message": format!(
+                                    "Task id '{task_id}' already exists in this session; \
+                                     counter is out of sync with the task list."
+                                ),
+                            })
+                            .to_string(),
+                        );
+                        return Ok(TaskMutationResult {
+                            tasks,
+                            next_task_id: None,
+                            response,
+                        });
+                    }
                     let task = SessionTask {
                         id: task_id.clone(),
                         title: mutation_title.clone(),
@@ -600,7 +731,14 @@ impl TaskManager {
             .and_then(Value::as_str)
             .unwrap_or("all");
 
-        let tasks = match self.store.load(&self.sid()).await {
+        // U-8: route active-filter through load_active so SQL stores
+        // can push the WHERE clause down to the index instead of
+        // shipping the full table to Rust then filtering.
+        let tasks = match status_filter {
+            "active" => self.store.load_active(&self.sid()).await,
+            _ => self.store.load(&self.sid()).await,
+        };
+        let tasks = match tasks {
             Ok(t) => t,
             Err(e) => return format!("Error: {e}"),
         };
@@ -608,8 +746,7 @@ impl TaskManager {
         let filtered: Vec<_> = tasks
             .iter()
             .filter(|t| match status_filter {
-                "all" => true,
-                "active" => t.status == "pending" || t.status == "in_progress",
+                "all" | "active" => true, // already filtered by load path
                 s => t.status == s,
             })
             .map(|t| {
@@ -635,6 +772,30 @@ impl TaskManager {
                 }
                 if !t.blocked_by.is_empty() {
                     entry["blocked_by"] = json!(t.blocked_by);
+                }
+                // U-5: surface the failure reason inline so the model
+                // sees "why" without a follow-up `task.get`. Only on
+                // failed rows; other statuses don't have an
+                // error_message so the field would be confusing noise.
+                if t.status == "failed" {
+                    let preview = t
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("error_message"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| {
+                            const PREVIEW_MAX: usize = 80;
+                            if s.chars().count() <= PREVIEW_MAX {
+                                s.to_string()
+                            } else {
+                                let truncated: String =
+                                    s.chars().take(PREVIEW_MAX.saturating_sub(1)).collect();
+                                format!("{truncated}…")
+                            }
+                        });
+                    if let Some(p) = preview {
+                        entry["error_preview"] = json!(p);
+                    }
                 }
                 entry
             })
@@ -908,11 +1069,18 @@ impl TaskManager {
                         }
                     }
                     if let Some(err) = error_message.as_deref() {
+                        // Stash structured error in metadata so `list`
+                        // can surface a preview without parsing
+                        // description prose. We also keep the legacy
+                        // description-append for back-compat with any
+                        // reader that grep'd description for "Error:".
                         task.description = Some(format!(
                             "{}\n\nError: {}",
                             task.description.as_deref().unwrap_or(""),
                             err
                         ));
+                        let meta = task.metadata.get_or_insert_with(Default::default);
+                        meta.insert("error_message".to_string(), json!(err));
                     }
                     if let Some(title) = title_update.as_deref() {
                         task.title = title.to_string();
@@ -1089,6 +1257,166 @@ mod tests {
         assert!(out.contains("\"success\":true"), "create: {out}");
         let list = m.list(&json!({"status": "all"})).await;
         assert!(list.contains("\"count\":1"), "list: {list}");
+    }
+
+    /// U-5 (unhappy path): when a task is marked `failed` with an
+    /// `error_message`, `task.list` must surface that reason as
+    /// `error_preview` (truncated to ~80 chars). Pre-fix the model
+    /// had to call `task.get(id)` to see why something failed —
+    /// most models don't, so the failure context was lost.
+    #[tokio::test]
+    async fn list_surfaces_failure_reason_for_failed_tasks() {
+        let m = mgr();
+        m.create(&json!({"title": "do the thing"})).await;
+        m.update(&json!({
+            "task_id": "task-1",
+            "new_status": "failed",
+            "error_message": "compilation error in src/lib.rs: cannot find type `Foo`"
+        }))
+        .await;
+
+        let list = m.list(&json!({"status": "failed"})).await;
+        assert!(
+            list.contains("error_preview"),
+            "failed list output must include error_preview: {list}"
+        );
+        assert!(
+            list.contains("compilation error"),
+            "error_preview must carry the failure message: {list}"
+        );
+    }
+
+    /// U-4 (unhappy path): refuse to create an exact-normalized
+    /// duplicate of an active task. The model after a session
+    /// restore frequently re-creates work it already has open;
+    /// returning the existing id steers it to update/get instead.
+    #[tokio::test]
+    async fn create_refuses_exact_normalized_duplicate_of_active_task() {
+        let m = mgr();
+        m.create(&json!({"title": "Implement dark mode toggle"}))
+            .await;
+        // Same intent, different punctuation/spacing.
+        let dup = m.create(&json!({"title": "  Implement DARK mode toggle. "})).await;
+        assert!(
+            dup.contains("Refused"),
+            "second create should be refused with duplicate notice; got {dup}"
+        );
+        assert!(
+            dup.contains("duplicate_of"),
+            "response must name the existing task id; got {dup}"
+        );
+        assert!(
+            dup.contains("task-1"),
+            "duplicate_of must point at the original; got {dup}"
+        );
+        // The store should still hold exactly one task (no second
+        // row appended even though the closure ran).
+        let list = m.list(&json!({"status": "all"})).await;
+        assert!(
+            list.contains("\"count\":1"),
+            "duplicate must not be persisted; got {list}"
+        );
+    }
+
+    /// Dedup must NOT block creating a task whose normalized title
+    /// matches a *completed* (non-active) task — the user is
+    /// resurrecting work intentionally.
+    #[tokio::test]
+    async fn create_allows_duplicate_of_completed_task() {
+        let m = mgr();
+        m.create(&json!({"title": "fix bug"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        // Same title now should be allowed since the prior is closed.
+        let dup = m.create(&json!({"title": "fix bug"})).await;
+        assert!(
+            dup.contains("\"success\":true"),
+            "create after completion must succeed; got {dup}"
+        );
+        let list = m.list(&json!({"status": "all"})).await;
+        assert!(
+            list.contains("\"count\":2"),
+            "second instance must persist when prior is completed; got {list}"
+        );
+    }
+
+    /// U-7 (unhappy path): a subtask should inherit its parent's
+    /// `owner` when the subtask doesn't declare one explicitly.
+    /// Sub-agents looking for "my tasks" rely on the owner field;
+    /// without inheritance, subtasks of tasks they own slip
+    /// through.
+    #[tokio::test]
+    async fn subtask_inherits_parent_owner_unless_overridden() {
+        let m = mgr();
+        let _ = m
+            .create(&json!({
+                "title": "ship feature",
+                "owner": "code-reviewer",
+                "subtasks": [
+                    { "id": "s1", "title": "wire schema" },
+                    { "id": "s2", "title": "implement" },
+                    { "id": "s3", "title": "review", "owner": "specific-reviewer" },
+                ],
+            }))
+            .await;
+        let body = m.get(&json!({"task_id": "task-1"})).await;
+        // The first two subtasks should carry the parent's owner.
+        // Match relaxed for whitespace because pretty-printing
+        // varies between serde versions / config.
+        assert!(
+            body.contains("code-reviewer"),
+            "subtasks should inherit parent owner; got {body}"
+        );
+        assert!(
+            body.contains("specific-reviewer"),
+            "explicit subtask owner must override the inherited one; got {body}"
+        );
+        // Verify count: parent owner appears 3 times (parent + 2 inherited subtasks),
+        // override appears once.
+        assert_eq!(
+            body.matches("code-reviewer").count(),
+            3,
+            "expected parent owner on parent + 2 subtasks; got {body}"
+        );
+        assert_eq!(
+            body.matches("specific-reviewer").count(),
+            1,
+            "expected override owner on exactly the s3 subtask; got {body}"
+        );
+    }
+
+    /// Subtask without parent owner: keep `owner` absent rather
+    /// than putting an empty string. Otherwise downstream filters
+    /// like `owner == "alice"` accidentally match the empty case.
+    #[tokio::test]
+    async fn subtask_owner_stays_none_when_parent_has_none() {
+        let m = mgr();
+        let _ = m
+            .create(&json!({
+                "title": "no owner anywhere",
+                "subtasks": [{ "id": "s1", "title": "step 1" }],
+            }))
+            .await;
+        let body = m.get(&json!({"task_id": "task-1"})).await;
+        assert!(
+            !body.contains("\"owner\""),
+            "without parent owner, subtask owner must stay absent; got {body}"
+        );
+    }
+
+    /// Companion: non-failed tasks must NOT carry an error_preview
+    /// field — it'd be confusing noise on completed/in_progress rows.
+    #[tokio::test]
+    async fn list_omits_error_preview_for_non_failed_tasks() {
+        let m = mgr();
+        m.create(&json!({"title": "ok task"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        let list = m.list(&json!({"status": "all"})).await;
+        assert!(
+            !list.contains("error_preview"),
+            "completed tasks must not show error_preview: {list}"
+        );
     }
 
     #[tokio::test]
@@ -1725,5 +2053,239 @@ mod tests {
                 assert!(!titles.contains(&"x"), "sess-2 must not leak sess-1 data");
             }
         }
+    }
+
+    // ── U-8: status_filter SQL pushdown ──────────────────────────────
+    //
+    // Pre-fix: `task.list(status_filter='active')` called
+    // `store.load()` (all rows) then filtered in Rust. With 5 000
+    // tasks and the index `idx_session_todos_session_status_updated`,
+    // the DB can answer "active only" in a single index scan instead
+    // of shipping all rows to Rust. The `TaskStore::load_active`
+    // default impl is a Rust-level fallback for in-memory stores;
+    // `MatrixOneTaskStore` overrides it with a WHERE clause so
+    // production uses the index.
+    //
+    // These tests pin:
+    //   (a) `task.list(status_filter='active')` returns only
+    //       pending/in_progress rows, even on the in-memory store
+    //       (correctness — same before and after, but now via a
+    //       dedicated path that the MO impl overrides).
+    //   (b) `task.list(status_filter='completed')` still works
+    //       after the refactor.
+    //   (c) `task.list` with no filter still returns all rows.
+
+    // ── U-8 spy test pin ──────────────────────────────────────────────
+    // When status_filter='active', the store's load_active is used, not
+    // load (full table) + Rust filter. InMemory uses the default-impl
+    // fallback; MatrixOneTaskStore overrides with a WHERE clause. The
+    // spy store below tracks which method is called.
+
+    // ── U-10: counter desync loud failure ────────────────────────────
+    //
+    // If `session_todo_counters` is corrupted / reset, create() would
+    // attempt to INSERT `task-1` when a `task-1` row already exists.
+    // The raw DB error ("Duplicate entry 'task-1' for key PRIMARY")
+    // is not actionable — the model can't tell if this is a transient
+    // network glitch or a persistent data issue.
+    //
+    // We use the in-memory store to simulate the invariant: if two
+    // creates somehow produce the same task id, the second must fail
+    // with a message that says "counter desync" rather than a raw
+    // internal error or — worse — silently succeeding.
+    //
+    // Production MO path: `insert_session_tasks` uses plain INSERT
+    // (no IGNORE). A dup-key SQLx error from the DB bubbles up
+    // through `mutate()` as `Err(e.to_string())` where `e` is the
+    // sqlx error. The fix is to intercept the error string and, when
+    // it contains key-constraint vocabulary, replace it with the
+    // actionable message pinned by this test.
+
+    /// A store that deliberately allocates the SAME task id twice by
+    /// returning a constant from `next_task_id`, so we can exercise
+    /// the dup-key surface without standing up MatrixOne.
+    struct ConstantIdStore {
+        inner: InMemoryTaskStore,
+    }
+    #[async_trait::async_trait]
+    impl TaskStore for ConstantIdStore {
+        async fn load(&self, sid: &str) -> Result<Vec<SessionTask>, String> {
+            self.inner.load(sid).await
+        }
+        async fn save(&self, sid: &str, tasks: Vec<SessionTask>) -> Result<(), String> {
+            self.inner.save(sid, tasks).await
+        }
+        // Always return 1 → ids will be task-1, task-1, … on repeated
+        // calls without the in-memory counter advancing.
+        async fn next_task_id(&self, _sid: &str) -> Result<u32, String> {
+            Ok(1)
+        }
+        async fn peek_next_task_id(&self, _sid: &str) -> Result<u32, String> {
+            Ok(1)
+        }
+    }
+
+    #[tokio::test]
+    async fn counter_desync_produces_actionable_error() {
+        let store = Arc::new(ConstantIdStore {
+            inner: InMemoryTaskStore::new(),
+        });
+        let mgr = TaskManager::new("desync-sess", store as Arc<dyn TaskStore>);
+        // First create: succeeds (task-1 inserted).
+        let first = mgr.create(&json!({"title": "first"})).await;
+        assert!(
+            first.contains("\"success\":true") || first.contains("task-1"),
+            "first create must succeed: {first}"
+        );
+        // Second create: same task-1 id → must fail with actionable message,
+        // not a raw DB error or the duplicate-detection path.
+        let second = mgr.create(&json!({"title": "second"})).await;
+        // The in-memory path returns "Refused: active task … already has this
+        // title" via the U-4 dedup. But this test also covers the other path
+        // (counter desync): the output must be Error: — not silent success.
+        assert!(
+            second.starts_with("Error") || second.contains("Refused"),
+            "duplicate task-id must produce an Error: or Refused message; \
+             silent success would hide counter desync from the model. Got: {second}"
+        );
+        // The duplicate must NOT appear in the task list (no ghost row).
+        let list = mgr.list(&json!({"status_filter": "all"})).await;
+        let count = list.matches("task-1").count();
+        assert_eq!(
+            count, 1,
+            "only one task-1 must exist in the store; got {count} occurrences: {list}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_active_uses_load_active_not_load_all() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct CountingStore {
+            inner: InMemoryTaskStore,
+            load_all_calls: Arc<AtomicUsize>,
+            load_active_calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl TaskStore for CountingStore {
+            async fn load(&self, sid: &str) -> Result<Vec<SessionTask>, String> {
+                self.load_all_calls.fetch_add(1, Ordering::Relaxed);
+                self.inner.load(sid).await
+            }
+            async fn load_active(&self, sid: &str) -> Result<Vec<SessionTask>, String> {
+                self.load_active_calls.fetch_add(1, Ordering::Relaxed);
+                self.inner.load_active(sid).await
+            }
+            async fn save(&self, sid: &str, tasks: Vec<SessionTask>) -> Result<(), String> {
+                self.inner.save(sid, tasks).await
+            }
+            async fn next_task_id(&self, sid: &str) -> Result<u32, String> {
+                self.inner.next_task_id(sid).await
+            }
+            async fn peek_next_task_id(&self, sid: &str) -> Result<u32, String> {
+                self.inner.peek_next_task_id(sid).await
+            }
+        }
+        let load_all = Arc::new(AtomicUsize::new(0));
+        let load_active = Arc::new(AtomicUsize::new(0));
+        let spy = Arc::new(CountingStore {
+            inner: InMemoryTaskStore::new(),
+            load_all_calls: load_all.clone(),
+            load_active_calls: load_active.clone(),
+        });
+        let mgr = TaskManager::new("spy-sess", spy as Arc<dyn TaskStore>);
+        mgr.create(&json!({"title": "t1"})).await;
+        // Reset after create: create itself calls load() internally
+        // as part of the mutate path, so we zero the counters before
+        // the list call we're testing.
+        load_all.store(0, Ordering::Relaxed);
+        load_active.store(0, Ordering::Relaxed);
+
+        // Filter = active → must call load_active, not load_all.
+        mgr.list(&json!({"status_filter": "active"})).await;
+        assert_eq!(
+            load_active.load(Ordering::Relaxed),
+            1,
+            "list(active) must go through load_active, not load_all"
+        );
+        assert_eq!(
+            load_all.load(Ordering::Relaxed),
+            0,
+            "list(active) must NOT call load() (full scan)"
+        );
+
+        // Reset counters; filter = all → uses load_all path.
+        load_all.store(0, Ordering::Relaxed);
+        load_active.store(0, Ordering::Relaxed);
+        mgr.list(&json!({"status_filter": "all"})).await;
+        assert_eq!(
+            load_all.load(Ordering::Relaxed),
+            1,
+            "list(all) must call load() (full table)"
+        );
+        assert_eq!(
+            load_active.load(Ordering::Relaxed),
+            0,
+            "list(all) must NOT call load_active"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_active_filter_returns_only_pending_and_in_progress() {
+        let m = mgr();
+        // Three tasks in different states.
+        m.create(&json!({"title": "pending-task"})).await;
+        m.create(&json!({"title": "active-task"})).await;
+        m.create(&json!({"title": "done-task"})).await;
+        m.update(&json!({"task_id": "task-2", "new_status": "in_progress"}))
+            .await;
+        m.update(&json!({"task_id": "task-3", "new_status": "completed"}))
+            .await;
+
+        let out = m.list(&json!({"status_filter": "active"})).await;
+        assert!(
+            out.contains("pending-task"),
+            "active filter must include pending tasks; got: {out}"
+        );
+        assert!(
+            out.contains("active-task"),
+            "active filter must include in_progress tasks; got: {out}"
+        );
+        assert!(
+            !out.contains("done-task"),
+            "active filter must exclude completed tasks; got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_completed_filter_returns_only_completed() {
+        let m = mgr();
+        m.create(&json!({"title": "stay-pending"})).await;
+        m.create(&json!({"title": "will-complete"})).await;
+        m.update(&json!({"task_id": "task-2", "new_status": "completed"}))
+            .await;
+
+        let out = m.list(&json!({"status_filter": "completed"})).await;
+        assert!(
+            out.contains("will-complete"),
+            "completed filter must include completed tasks; got: {out}"
+        );
+        assert!(
+            !out.contains("stay-pending"),
+            "completed filter must exclude pending tasks; got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_all_filter_returns_every_row() {
+        let m = mgr();
+        m.create(&json!({"title": "alpha"})).await;
+        m.create(&json!({"title": "beta"})).await;
+        m.update(&json!({"task_id": "task-2", "new_status": "completed"}))
+            .await;
+
+        let out = m.list(&json!({"status_filter": "all"})).await;
+        assert!(out.contains("alpha"), "all-filter must include pending; got: {out}");
+        assert!(out.contains("beta"), "all-filter must include completed; got: {out}");
     }
 }

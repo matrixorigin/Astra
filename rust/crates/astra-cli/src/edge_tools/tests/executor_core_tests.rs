@@ -146,6 +146,168 @@ async fn agent_missing_action_with_spawn_wrapper_redirects_to_action_field() {
     );
 }
 
+/// REGRESSION: after the Phase 1 split, `task.background_shell` and
+/// the other 3 background actions live on the new `agent_job` tool.
+/// Calling them on `task` is a sign the model is on a stale schema or
+/// hallucinating a path that no longer exists. The executor must
+/// surface this as an Error: with a redirect — same shape as the
+/// `agent.delegate` rejection — so the model self-corrects on the
+/// next turn instead of silently failing.
+#[tokio::test]
+async fn task_background_actions_are_rejected_with_redirect_to_agent_job() {
+    let executor = test_executor();
+    for (action, redirect_action) in &[
+        ("background_shell", "shell"),
+        ("background_agent", "agent"),
+        ("output", "output"),
+        ("kill", "kill"),
+    ] {
+        let result = executor
+            .execute(
+                "task",
+                &json!({
+                    "action": action,
+                    "command": "echo hi",
+                    "prompt": "hi",
+                    "task_id": "bg-shell-1",
+                }),
+            )
+            .await;
+        assert!(
+            result.starts_with("Error"),
+            "task.{action} must return an Error: prefix so the TUI renders \
+             a red banner — got: {result}"
+        );
+        assert!(
+            result.contains("agent_job"),
+            "task.{action} error must name `agent_job` as the new home — \
+             without that, the model has no path to recovery. Got: {result}"
+        );
+        assert!(
+            result.contains(&format!("agent_job(action='{redirect_action}')"))
+                || result.contains(redirect_action),
+            "task.{action} error must point at the specific replacement \
+             action `agent_job(action='{redirect_action}')`. Got: {result}"
+        );
+        assert!(
+            astra_turn_core::tool_result_semantics::is_tool_error(&result),
+            "task.{action} rejection must classify as an error so cloud \
+             reporting marks status='error' and the TUI shows red. \
+             Got: {result}"
+        );
+    }
+}
+
+/// Phase 2: `session.enter_plan` and `session.exit_plan` were
+/// promoted to top-level `enter_plan_mode` / `exit_plan_mode` tools
+/// for claudecode parity (the buried sub-actions never got picked).
+/// Calling them on `session` must fail with an Error: redirect to
+/// the new tool — same shape as `task.background_*` and
+/// `agent.delegate`. Without this guard, a stale model schema would
+/// silently no-op (session dispatch hits the `Unknown session action`
+/// branch with a generic message that doesn't name the new tool).
+#[tokio::test]
+async fn session_enter_exit_plan_actions_redirect_to_top_level_tools() {
+    let executor = test_executor();
+    for (action, redirect_tool) in &[
+        ("enter_plan", "enter_plan_mode"),
+        ("exit_plan", "exit_plan_mode"),
+    ] {
+        let result = executor
+            .execute("session", &json!({"action": action}))
+            .await;
+        assert!(
+            result.starts_with("Error"),
+            "session.{action} must return an Error: prefix — got: {result}"
+        );
+        assert!(
+            result.contains(redirect_tool),
+            "session.{action} error must name the top-level `{redirect_tool}` tool \
+             so the model self-corrects on the next turn. Got: {result}"
+        );
+        assert!(
+            astra_turn_core::tool_result_semantics::is_tool_error(&result),
+            "session.{action} rejection must classify as an error so the \
+             TUI shows red. Got: {result}"
+        );
+    }
+}
+
+/// CLI executor must dispatch the new top-level `enter_plan_mode` /
+/// `exit_plan_mode` calls. Without a wired plan repository (CLI mode
+/// uses cloud REST through ThinClient — see Phase 2.2), we expect a
+/// fail-fast Error: that explicitly names the missing dependency, NOT
+/// silent success or a generic "unknown tool".
+#[tokio::test]
+async fn enter_plan_mode_dispatches_through_executor() {
+    let executor = test_executor();
+    let result = executor.execute("enter_plan_mode", &json!({})).await;
+    // Without a cloud-backed plan_repo wired, the CLI must surface a
+    // clear failure instead of silently no-op'ing. The exact message
+    // is up to Phase 2.2; this test only pins that the dispatcher
+    // routes the call (not the unknown-tool fallback).
+    assert!(
+        !result.contains("not available")
+            || result.to_lowercase().contains("plan"),
+        "enter_plan_mode must reach a plan-mode-aware code path. \
+         A generic 'tool not available' means the dispatcher missed \
+         the route entirely. Got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn exit_plan_mode_dispatches_through_executor() {
+    let executor = test_executor();
+    let result = executor
+        .execute(
+            "exit_plan_mode",
+            &json!({"plan": "1. Write tests\n2. Implement", "approved": true}),
+        )
+        .await;
+    assert!(
+        !result.contains("not available")
+            || result.to_lowercase().contains("plan"),
+        "exit_plan_mode must reach a plan-mode-aware code path. Got: {result}"
+    );
+}
+
+/// `agent_job` is the new entry point. It must dispatch the four
+/// background actions to the same handlers that previously sat on
+/// `task` — verified here with the cheapest possible smoke: an
+/// unwired CLI executor returns a known fail-fast string for each
+/// action (the BackgroundTaskRegistry is wired only inside the TUI
+/// REPL — see `task_background_shell_fails_fast_when_unwired`).
+#[tokio::test]
+async fn agent_job_actions_dispatch_through_executor() {
+    let executor = test_executor();
+    // shell — needs `command`; without the registry wired we expect
+    // the unwired-fast-fail path, not the missing-arg path.
+    let result = executor
+        .execute("agent_job", &json!({"action": "shell", "command": "echo hi"}))
+        .await;
+    assert!(
+        result.contains("background_shell")
+            || result.contains("interactive REPL")
+            || result.contains("not available"),
+        "agent_job.shell should reach the same fail-fast path that \
+         task.background_shell used to hit (registry only wired inside \
+         the TUI). Got: {result}"
+    );
+
+    // output — must reach the same handler that returns the unwired
+    // message; both kill and output share the registry dependency.
+    let result = executor
+        .execute("agent_job", &json!({"action": "kill", "task_id": "bg-shell-1"}))
+        .await;
+    assert!(
+        result.contains("background")
+            || result.contains("interactive REPL")
+            || result.contains("Nothing to kill"),
+        "agent_job.kill should reach the registry-unwired fail-fast path. \
+         Got: {result}"
+    );
+}
+
 /// The `agent` tool's action enum must NOT advertise "delegate" to
 /// the model. Schema-level removal is the strongest signal — the
 /// model cannot even shape-validly emit a call the runtime would

@@ -1,7 +1,6 @@
 use super::*;
 use cloud_sync::{
     CloudPullResult, cloud_pull_warrants_sync_marker, should_append_cloud_pull_journal,
-    try_connect_matrixone,
 };
 
 // ── slash_health::format_sync_age tests ────────────────────────────────────────────
@@ -102,19 +101,21 @@ async fn slash_health_offline_shows_cloud_section() {
 
 // ── Cloud sync regression tests ─────────────────────────────────────
 // These tests verify the async cloud sync functions don't panic when
-// called from within a tokio runtime. We unset MATRIXONE_HOST so they
-// take the graceful-fallback path.
+// called from within a tokio runtime. We unset ASTRA_CLOUD_BASE so they
+// take the graceful-fallback path (CLI is now HTTP-only — the legacy
+// `try_connect_matrixone` direct-sqlx fallback was removed when the
+// edge-cloud architecture was tightened).
 
 #[tokio::test]
-async fn try_connect_matrixone_returns_none_without_env_vars() {
+async fn try_cloud_pull_returns_unreachable_without_cloud_base() {
     // Safety: test-only, single-threaded tokio runtime
     unsafe {
-        std::env::remove_var("MATRIXONE_HOST");
+        std::env::remove_var("ASTRA_CLOUD_BASE");
     }
-    let pool = try_connect_matrixone().await;
+    let result = cloud_sync::try_cloud_pull("default").await;
     assert!(
-        pool.is_none(),
-        "Without MATRIXONE_HOST, pool should be None"
+        !result.cloud_reachable,
+        "Without ASTRA_CLOUD_BASE, cloud should be unreachable"
     );
 }
 
