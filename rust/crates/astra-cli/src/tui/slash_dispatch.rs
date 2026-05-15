@@ -1408,17 +1408,12 @@ pub(crate) const MODEL_THINKING_SENTINEL: &str = "__model_thinking__\n";
 /// the picker.  The picker emits `MODEL_PICK_SENTINEL + <name>`; the
 /// outer loop then checks the model's `thinking_capability` and
 /// either commits or pushes a thinking-mode picker.
-/// True when an error string came from an HTTP 401 response.
-/// Mirrors `chat_turn::is_auth_error` minus the LLM-provider escape — kept
-/// local because slash dispatch only sees `fetch_model_list` errors which
-/// never come from upstream model providers.
-fn is_http_401(msg: &str) -> bool {
-    let lower = msg.to_lowercase();
-    lower.contains("401 unauthorized")
-        || lower.contains("status: 401")
-        || lower.contains("status code: 401")
-        || lower.contains("http 401")
-        || lower.contains("unauthorized")
+/// True when an error string represents an Astra session auth failure.
+/// Matches both session-specific error patterns (via `is_astra_session_auth_error`)
+/// and Astra's own HTTP 401 format (`"request failed (401): ..."`).
+/// Generic upstream `401 Unauthorized` text must NOT trigger `/login`.
+fn is_astra_auth_error(msg: &str) -> bool {
+    crate::cli_utils::is_astra_session_auth_error(msg) || msg.contains("request failed (401)")
 }
 
 /// Build the model picker view from a fetched model list and push it.
@@ -1463,7 +1458,7 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
         }
         Err(e) => {
             let msg = e.to_string();
-            if is_http_401(&msg) {
+            if is_astra_auth_error(&msg) {
                 // Attempt silent token refresh + retry once. If the retry
                 // itself fails with a non-auth error (e.g. 5xx after refresh),
                 // surface that real error instead of the generic /login hint.
@@ -1478,7 +1473,7 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
                         }
                         Err(retry_err) => {
                             let retry_msg = retry_err.to_string();
-                            if !is_http_401(&retry_msg) {
+                            if !is_astra_auth_error(&retry_msg) {
                                 ctx.show_error(format!(
                                     "Failed to fetch models: {}",
                                     retry_msg.lines().next().unwrap_or(&retry_msg)
@@ -2516,5 +2511,35 @@ mod truncate_rows_tests {
     #[test]
     fn truncate_rows_empty_input_produces_empty_output() {
         assert!(truncate_rows("", 5).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod auth_error_tests {
+    use super::is_astra_auth_error;
+
+    #[test]
+    fn matches_astra_session_auth_failures() {
+        let msg =
+            "request failed (401): invalid token\n  Hint: Authentication required — try /login";
+        assert!(is_astra_auth_error(msg));
+    }
+
+    #[test]
+    fn matches_bare_astra_401_without_known_body() {
+        // Astra API returns "request failed (401): <anything>" — must trigger /login
+        assert!(is_astra_auth_error(
+            "request failed (401): unexpected auth state"
+        ));
+    }
+
+    #[test]
+    fn matches_authentication_failed() {
+        assert!(is_astra_auth_error("Authentication failed"));
+    }
+
+    #[test]
+    fn ignores_generic_upstream_401s() {
+        assert!(!is_astra_auth_error("GitHub API Error: 401 Unauthorized"));
     }
 }

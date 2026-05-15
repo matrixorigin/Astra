@@ -32,18 +32,8 @@ use super::skill_subrun::SubRunHost;
 
 // ─── CliSpawnAgentExecutor ──────────────────────────────────────────────────
 
-/// Read-the-current-token closure passed to [`CliSpawnAgentExecutor`].
-/// Implementations must be cheap (typically a credential-store lookup
-/// keyed by profile). Returns `None` when the user is logged out — the
-/// executor then falls back to the `token` field captured at construction
-/// time and lets the spawn fail with a clear "credentials" error.
-///
-/// Why this exists: sub-agent spawns failed with 401 in long-running
-/// interactive sessions because the executor froze the access token at
-/// startup time and never refreshed it. The parent turn flow retries on
-/// 401 after refreshing credentials; sub-agents must read the freshest
-/// token at the moment of spawn so they follow the same lifecycle.
-pub type TokenProvider = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+/// Re-export from runtime so all CLI components share one type.
+pub type TokenProvider = astra_runtime::capabilities::TokenProvider;
 
 /// CLI implementation of [`SpawnAgentExecutor`].
 ///

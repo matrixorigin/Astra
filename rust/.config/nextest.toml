@@ -34,16 +34,25 @@ failure-output = "immediate"
 fail-fast = false
 failure-output = "immediate"
 slow-timeout = { period = "30s", terminate-after = 1 }
+# When invoked via `make test-offline`, the Makefile overrides this
+# with `--test-threads N` computed from the live inotify headroom.
+# Direct `cargo nextest run --profile strict` uses num-cpus (fast on
+# tuned hosts; may ENOSPC on default-kernel boxes without the
+# Makefile wrapper — use `make test-offline` instead).
+test-threads = "num-cpus"
 
 [profile.strict-online]
 fail-fast = false
 failure-output = "immediate"
 slow-timeout = { period = "30s", terminate-after = 1 }
+test-threads = "num-cpus"
 
 [profile.strict-online-ci]
 fail-fast = false
 failure-output = "immediate"
 slow-timeout = { period = "30s", terminate-after = 1 }
+# CI hosts should have tuned kernel limits; use full parallelism.
+test-threads = "num-cpus"
 
 # ── Parallelism caps for heavy integration suites ────────────────────────
 # Group membership is set via `[[profile.X.overrides]]` below. These test
@@ -54,6 +63,10 @@ slow-timeout = { period = "30s", terminate-after = 1 }
 integration_e2e = { max-threads = 2 }
 plan_executor_e2e = { max-threads = 1 }
 db_scoped_trim = { max-threads = 1 }
+# Tests that create tempfiles/dirs heavily; inotify-sensitive on
+# default-kernel boxes (max_user_instances=128). Cap at 4 so these
+# packages never exhaust inotify even when the rest runs at num-cpus.
+fs_heavy = { max-threads = 2 }
 
 # Every test that runs the production agentic loop / SSE handler /
 # delegation engine end-to-end belongs here (2-wide cap).
@@ -74,6 +87,12 @@ test(/stress_multi_turn_state_continuity_50_turns/)
  or package(astra-runtime) and binary(phase_f_nested_cancel)
  or package(astra-runtime) and binary(web_agent_e2e)
  or package(astra-runtime) and binary(bridge_e2e_comprehensive)
+ or package(astra-runtime) and binary(edge_5_5_http_e2e)
+ or package(astra-services) and binary(phase_g_crash_recovery)
+ or package(astra-services) and binary(phase_i_approval_journaling)
+ or package(astra-server-types) and test(/worktree_isolation/)
+ or package(astra-runtime) and test(server_fallback_preserves_tool_result_fields)
+ or package(astra-cli) and test(cooperative_cancel_and_await_has_no_late_renew)
 """
 test-group = "integration_e2e"
 
@@ -81,6 +100,22 @@ test-group = "integration_e2e"
 [[profile.strict.overrides]]
 filter = "test(/spawn_plan_executor_/)"
 test-group = "plan_executor_e2e"
+
+# Packages that create tempfiles/dirs — inotify-sensitive on default
+# kernels (max_user_instances=128). Cap their parallelism to 4 so
+# the rest of the workspace can still run at full speed.
+[[profile.strict.overrides]]
+filter = """
+package(astra-tools)
+ or package(astra-skills)
+ or package(astra-services)
+ or package(astra-server-types)
+ or package(astra-test-harness)
+ or package(astra-runtime)
+ or package(astra-turn-core)
+ or package(astra-cli)
+"""
+test-group = "fs_heavy"
 
 # Heavy online integration binaries share a 2-wide cap.
 [[profile.strict-online.overrides]]

@@ -488,16 +488,10 @@ pub struct PlanExecutorHandle {
 /// code to appear in an HTTP-shaped phrase.
 fn is_credential_error(msg: &str) -> bool {
     let lower = msg.to_lowercase();
-    lower.contains("could not validate credentials")
+    let upstream_github_auth = lower.contains("github api error");
+    crate::cli_utils::is_astra_session_auth_error(msg)
         || lower.contains("invalid credentials")
-        || lower.contains("authentication failed")
-        || lower.contains("token expired")
-        || lower.contains("session expired")
-        || lower.contains("invalid token")
-        || lower.contains("invalid token type")
-        || lower.contains("authentication required — try /login")
-        || lower.contains("hint: session expired — try /login")
-        || lower.contains("hint: authentication required — try /login")
+        || (!upstream_github_auth && lower.contains("bad credentials"))
 }
 
 /// Pick the `plan_progress` action for end-of-plan emission.
@@ -3747,6 +3741,7 @@ All acceptance checks pass:
         assert!(!is_credential_error("network timeout"));
         assert!(!is_credential_error("tool execution failed"));
         assert!(!is_credential_error("GitHub API Error: 401 Unauthorized"));
+        assert!(!is_credential_error("GitHub API Error: Bad credentials"));
     }
 
     // ── Bug #3 regression: plan_completion_action must reflect verification

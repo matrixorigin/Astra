@@ -139,8 +139,11 @@ fn create_pipeline_modules_inner(
     // (server HOME skills + database skills visible to this user). That keeps
     // CLI and Web aligned for shared server capabilities without pretending
     // that project-local CLI skills are available to Web sessions.
-    let remote_catalog = current_access_token(profile).map(|token| {
-        astra_runtime::capabilities::RemoteSkillCatalogProvider::new(api.clone(), token)
+    let remote_catalog = current_access_token(profile).map(|_| {
+        let profile_owned = profile.map(str::to_string);
+        let token_provider: astra_runtime::capabilities::TokenProvider =
+            std::sync::Arc::new(move || current_access_token(profile_owned.as_deref()));
+        astra_runtime::capabilities::RemoteSkillCatalogProvider::new(api.clone(), token_provider)
     });
     let unified_skill_registry =
         astra_runtime::capabilities::build_cli_local_skill_registry(remote_catalog);
@@ -498,13 +501,19 @@ fn access_token_needs_refresh(token: &str, now_epoch: i64) -> bool {
         .unwrap_or(false)
 }
 
+fn active_env_access_token(now_epoch: i64) -> Option<String> {
+    let token = std::env::var("ASTRA_ACCESS_TOKEN").ok()?;
+    if token.is_empty() || access_token_needs_refresh(&token, now_epoch) {
+        return None;
+    }
+    Some(token)
+}
+
 pub(super) async fn fresh_access_token(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> Option<String> {
-    if let Ok(token) = std::env::var("ASTRA_ACCESS_TOKEN")
-        && !token.is_empty()
-    {
+    if let Some(token) = active_env_access_token(chrono::Utc::now().timestamp()) {
         return Some(token);
     }
 
@@ -1045,11 +1054,9 @@ fn banner_session_display(state: &SessionState) -> String {
 }
 
 pub(super) fn current_access_token(profile: Option<&str>) -> Option<String> {
-    // Gateway injects a pre-validated token — skip file I/O and auth check
-    if let Ok(token) = std::env::var("ASTRA_ACCESS_TOKEN") {
-        if !token.is_empty() {
-            return Some(token);
-        }
+    // Gateway-injected env tokens still win, but only while locally usable.
+    if let Some(token) = active_env_access_token(chrono::Utc::now().timestamp()) {
+        return Some(token);
     }
     let creds = load_credentials();
     let name = profile_name(profile, &creds);
@@ -1102,6 +1109,16 @@ mod tests {
         std::fs::create_dir_all(&sessions).unwrap();
         let guard = session_journal::JournalDirGuard::new(&sessions);
         (tmp, guard)
+    }
+
+    fn jwt_with_exp(exp: i64) -> String {
+        use base64::Engine;
+
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#));
+        format!("{header}.{payload}.sig")
     }
 
     #[test]
@@ -1892,17 +1909,34 @@ mod tests {
     }
 
     #[test]
+    fn current_access_token_falls_back_to_file_when_env_token_expired() {
+        let _g = isolate_credentials();
+        let _env = EnvGuard::set("ASTRA_ACCESS_TOKEN", &jwt_with_exp(1));
+
+        let mut creds = CredentialsFile {
+            current_profile: Some("default".to_string()),
+            ..Default::default()
+        };
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                username: Some("user".into()),
+                access_token: Some("file-token-abc".into()),
+                refresh_token: Some("refresh-token".into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        assert_eq!(
+            current_access_token(None),
+            Some("file-token-abc".to_string()),
+            "expired env token must not mask usable file credentials"
+        );
+    }
+
+    #[test]
     fn access_token_needs_refresh_only_when_expired_or_near_expiry() {
-        fn jwt_with_exp(exp: i64) -> String {
-            use base64::Engine;
-
-            let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(br#"{"alg":"none","typ":"JWT"}"#);
-            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(format!(r#"{{"exp":{exp}}}"#));
-            format!("{header}.{payload}.sig")
-        }
-
         let now = 1_700_000_000_i64;
         assert!(access_token_needs_refresh(
             &jwt_with_exp(now + ACCESS_TOKEN_REFRESH_SKEW_SECS - 1),
@@ -1982,5 +2016,40 @@ mod tests {
         let profile = creds.profiles.get("default").unwrap();
         assert_eq!(profile.access_token.as_deref(), Some(token.as_str()));
         assert_eq!(profile.refresh_token.as_deref(), Some("refresh-old"));
+    }
+
+    #[tokio::test]
+    async fn fresh_access_token_refreshes_profile_when_env_token_is_expired() {
+        let _g = isolate_credentials();
+        let _env = EnvGuard::set("ASTRA_ACCESS_TOKEN", &jwt_with_exp(1));
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                access_token: Some(jwt_with_exp(1)),
+                refresh_token: Some("refresh-old".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh-access",
+                "refresh_token": "fresh-refresh"
+            })))
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+
+        let token = fresh_access_token(&api, None).await;
+
+        assert_eq!(token.as_deref(), Some("fresh-access"));
+        let creds = load_credentials();
+        let profile = creds.profiles.get("default").unwrap();
+        assert_eq!(profile.access_token.as_deref(), Some("fresh-access"));
+        assert_eq!(profile.refresh_token.as_deref(), Some("fresh-refresh"));
     }
 }

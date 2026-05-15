@@ -233,22 +233,41 @@ pub fn build_cli_local_skill_registry(
 ///
 /// This provider is read-only. Publishing/importing still goes through the
 /// existing `/skill publish` flow so visibility changes stay explicit.
+/// Reads the current access token at call time. The token may have
+/// been refreshed since the provider was constructed (login, 401-retry,
+/// background refresh). Returning `None` means "not authenticated" —
+/// the provider will fail requests with a clear credentials error
+/// rather than using a stale token that always 401s.
+pub type TokenProvider = std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct RemoteSkillCatalogProvider {
     api: astra_thin_client::ThinClient,
-    token: String,
+    token_provider: TokenProvider,
 }
 
 impl RemoteSkillCatalogProvider {
-    pub fn new(api: astra_thin_client::ThinClient, token: String) -> Self {
-        Self { api, token }
+    pub fn new(api: astra_thin_client::ThinClient, token_provider: TokenProvider) -> Self {
+        Self {
+            api,
+            token_provider,
+        }
+    }
+
+    fn current_token(&self) -> Result<String, SkillError> {
+        (self.token_provider)().ok_or_else(|| {
+            SkillError::LoadFailed(
+                "no valid access token available; run /login to authenticate".into(),
+            )
+        })
     }
 
     async fn list_page(&self, limit: u32, offset: u32) -> Result<SkillListRecord, SkillError> {
+        let token = self.current_token()?;
         let body = self
             .api
             .get_skills_query_text(
-                &self.token,
+                &token,
                 &[("limit", limit.to_string()), ("offset", offset.to_string())],
             )
             .await
@@ -265,9 +284,10 @@ impl RemoteSkillCatalogProvider {
     }
 
     async fn load_record(&self, name: &str) -> Result<SkillRecord, SkillError> {
+        let token = self.current_token()?;
         let body = self
             .api
-            .get_skill_query_text(&self.token, name, &[])
+            .get_skill_query_text(&token, name, &[])
             .await
             .map_err(|source| {
                 SkillError::LoadFailed(format!("failed to load remote skill '{name}': {source}"))
@@ -531,6 +551,21 @@ mod tests {
         assert!(
             matches!(err, SkillError::LoadFailed(message) if message.contains("metadata.instructions")),
             "remote provider must not synthesize empty skill bodies"
+        );
+    }
+
+    #[test]
+    fn remote_skill_provider_requires_a_live_token() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
+            .expect("test api origin");
+        let provider = RemoteSkillCatalogProvider::new(api, std::sync::Arc::new(|| None));
+
+        let err = provider
+            .current_token()
+            .expect_err("missing token must be surfaced as a load failure");
+        assert!(
+            matches!(err, SkillError::LoadFailed(message) if message.contains("no valid access token available")),
+            "provider should emit an auth-shaped error when the token provider returns None"
         );
     }
 }

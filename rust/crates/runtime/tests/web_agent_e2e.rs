@@ -125,7 +125,10 @@ impl SessionService for StubSession {
             agent_id: None,
             title: None,
             status: "active".into(),
-            metadata: Default::default(),
+            metadata: serde_json::Map::from_iter([(
+                "full_llm_capture".into(),
+                serde_json::Value::Bool(false),
+            )]),
             event_count: 0,
             created_at: String::new(),
             updated_at: None,
@@ -143,7 +146,10 @@ impl SessionService for StubSession {
             agent_id: None,
             title: None,
             status: "active".into(),
-            metadata: Default::default(),
+            metadata: serde_json::Map::from_iter([(
+                "full_llm_capture".into(),
+                serde_json::Value::Bool(false),
+            )]),
             event_count: 0,
             created_at: String::new(),
             updated_at: None,
