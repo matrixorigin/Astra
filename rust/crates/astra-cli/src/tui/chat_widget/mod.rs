@@ -206,6 +206,10 @@ impl AgentRunRegistry {
             .collect()
     }
 
+    fn bound_tool_use_ids(&self) -> Vec<String> {
+        self.tool_use_to_key.keys().cloned().collect()
+    }
+
     /// Ensure a row exists for `id` and bind `tool_use_id` to it so
     /// follow-up events can find the same row.
     fn ensure_running_for_tool_use(
@@ -394,6 +398,12 @@ pub(crate) struct ChatWidget {
     /// Logical agent ids that ended via cancellation. TaskCell has only
     /// Completed/Failed, so keep this alongside the cell for row status.
     cancelled_task_ids: std::collections::HashSet<String>,
+    /// Agent ids cleared at a turn boundary. Late terminal events for
+    /// these prior-turn agents must not resurrect rows in the next turn.
+    cleared_agent_run_ids: std::collections::HashSet<String>,
+    /// Control tool ids cleared at a turn boundary. Used to detect
+    /// late `AgentControlCompleted` arrivals after the row was dropped.
+    cleared_agent_tool_use_ids: std::collections::HashSet<String>,
 }
 
 impl ChatWidget {
@@ -410,6 +420,8 @@ impl ChatWidget {
             in_flight_task_ids: Vec::new(),
             cancelling_task_ids: std::collections::HashSet::new(),
             cancelled_task_ids: std::collections::HashSet::new(),
+            cleared_agent_run_ids: std::collections::HashSet::new(),
+            cleared_agent_tool_use_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -890,7 +902,21 @@ impl ChatWidget {
         self.cancelling_task_ids.clear();
     }
 
+    fn forget_cleared_agent_markers(&mut self, agent_keys: &[&str], tool_use_id: Option<&str>) {
+        for key in agent_keys {
+            if !key.is_empty() {
+                self.cleared_agent_run_ids.remove(*key);
+            }
+        }
+        if let Some(tool_use_id) = tool_use_id {
+            self.cleared_agent_tool_use_ids.remove(tool_use_id);
+        }
+    }
+
     fn clear_turn_scoped_agent_state(&mut self) {
+        self.cleared_agent_run_ids.extend(self.agent_runs.ids());
+        self.cleared_agent_tool_use_ids
+            .extend(self.agent_runs.bound_tool_use_ids());
         self.agent_runs = AgentRunRegistry::default();
         self.cancelled_task_ids.clear();
     }
@@ -1103,6 +1129,7 @@ impl ChatWidget {
         // ToolStarted whose agent_id binding has already been promoted
         // to a real id can't clobber the canonical row.
         let provisional = provisional_agent_key(&tool_use_id);
+        self.forget_cleared_agent_markers(&[&key, &provisional], Some(&tool_use_id));
         if let Some(existing) = self
             .agent_runs
             .key_for_tool_use(&tool_use_id)
@@ -1142,6 +1169,16 @@ impl ChatWidget {
             provisional.clone()
         };
         let key = agent_id.clone().unwrap_or(fallback_key);
+        let late_after_turn_boundary = !self.agent_runs.contains_key(&key)
+            && !self.agent_runs.contains_key(&provisional)
+            && self.agent_runs.key_for_tool_use(&tool_use_id).is_none()
+            && (self.cleared_agent_run_ids.contains(&key)
+                || self.cleared_agent_run_ids.contains(&provisional)
+                || self.cleared_agent_tool_use_ids.contains(&tool_use_id));
+        if late_after_turn_boundary {
+            return;
+        }
+        self.forget_cleared_agent_markers(&[&key, &provisional], Some(&tool_use_id));
         if key != provisional && self.agent_runs.contains_key(&provisional) {
             if self.cancelled_task_ids.remove(&provisional) {
                 self.cancelled_task_ids.insert(key.clone());
@@ -1257,6 +1294,13 @@ impl ChatWidget {
 
     fn on_agent_live_event(&mut self, event: astra_turn_core::agent_live_event::AgentLiveEvent) {
         use astra_turn_core::agent_live_event::AgentLiveEventKind;
+
+        if !self.agent_runs.contains_key(&event.agent_id)
+            && self.cleared_agent_run_ids.contains(&event.agent_id)
+        {
+            return;
+        }
+        self.forget_cleared_agent_markers(&[event.agent_id.as_str()], None);
 
         let is_terminal_event = matches!(event.kind, AgentLiveEventKind::AgentTerminated { .. });
         if !is_terminal_event
@@ -3142,6 +3186,81 @@ mod tests {
         assert_eq!(
             history_len_after_late_event, history_len_after_turn_complete,
             "late ToolCompleted must NOT add a new cell to history"
+        );
+    }
+
+    #[test]
+    fn late_agent_control_completed_after_turn_complete_is_noop() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+            action: "spawn".into(),
+            label: "reviewer-A".into(),
+            tool_use_id: "spawn-tu-late".into(),
+            agent_id: Some("reviewer-A@late".into()),
+        }));
+        w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
+        assert!(
+            w.agent_run_ids().is_empty(),
+            "turn boundary should clear the prior-turn agent row first"
+        );
+
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+            action: "spawn".into(),
+            label: "reviewer-A".into(),
+            status: "success".into(),
+            duration_ms: 10,
+            output: Some(r#"{"status":"cancelled","agent_id":"reviewer-A@late"}"#.into()),
+            tool_use_id: "spawn-tu-late".into(),
+            agent_id: Some("reviewer-A@late".into()),
+        }));
+
+        assert!(
+            w.agent_run_ids().is_empty(),
+            "late AgentControlCompleted must not resurrect a cleared prior-turn row: {:?}",
+            w.agent_run_ids()
+        );
+        assert!(
+            w.cancelled_task_ids.is_empty(),
+            "late AgentControlCompleted must not restore cancelled state from the prior turn: {:?}",
+            w.cancelled_task_ids
+        );
+    }
+
+    #[test]
+    fn late_agent_terminated_after_turn_complete_is_noop() {
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveTermination,
+        };
+
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+            agent_id: "reviewer@late-term".into(),
+            kind: AgentLiveEventKind::OutputDelta("running".into()),
+        })));
+        w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
+        assert!(
+            w.agent_run_ids().is_empty(),
+            "turn boundary should clear the prior-turn live row first"
+        );
+
+        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+            agent_id: "reviewer@late-term".into(),
+            kind: AgentLiveEventKind::AgentTerminated {
+                termination: AgentLiveTermination::Cancelled,
+                duration_ms: 20,
+                reason: Some("late termination".into()),
+            },
+        })));
+
+        assert!(
+            w.agent_run_ids().is_empty(),
+            "late AgentTerminated must not resurrect a cleared prior-turn row: {:?}",
+            w.agent_run_ids()
+        );
+        assert!(
+            w.cancelled_task_ids.is_empty(),
+            "late AgentTerminated must not restore cancelled state from the prior turn: {:?}",
+            w.cancelled_task_ids
         );
     }
 

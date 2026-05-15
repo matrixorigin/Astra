@@ -42,7 +42,6 @@ pub struct SpawnAgentInput {
     pub description: String,
 
     /// Detailed task prompt for the agent.
-    #[serde(alias = "task")]
     pub prompt: String,
 
     /// Agent type: "explore", "code-review", "task", "general-purpose".
@@ -566,11 +565,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_task_field_remaps_to_prompt() {
+    fn legacy_task_field_is_rejected() {
         let json = r#"{"description":"D","task":"Use the old field"}"#;
-        let input: SpawnAgentInput = serde_json::from_str(json)
-            .expect("legacy `task` field must deserialize as alias for `prompt`");
-        assert_eq!(input.prompt, "Use the old field");
+        let err = serde_json::from_str::<SpawnAgentInput>(json)
+            .expect_err("deprecated task field must not deserialize");
+        assert!(
+            err.to_string().contains("missing field `prompt`"),
+            "legacy task payloads should fail because prompt is the only canonical field: {err}"
+        );
     }
 
     #[test]
