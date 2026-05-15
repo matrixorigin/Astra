@@ -1204,13 +1204,22 @@ impl ToolExecutor {
 
     /// Route a `task` action either to the cloud (production) or the
     /// local in-memory TaskManager (offline/tests). Cloud is the
-    /// preferred path: when `cloud_base` and `active_session_id` are
-    /// both set, the call goes to `POST /sessions/{sid}/todos:execute`
-    /// so the server is the single source of truth — CLI never
-    /// touches MO directly. Falls back to the in-memory manager only
-    /// when no cloud is wired (one-shot CLI, headless tests).
+    /// preferred path: when `ASTRA_CLOUD_BASE` env is set **and**
+    /// `active_session_id` is non-empty, the call goes to
+    /// `POST /sessions/{sid}/todos:execute` so the server is the
+    /// single source of truth — CLI never touches MO directly.
+    ///
+    /// IMPORTANT: we read from `ASTRA_CLOUD_BASE` (the astra server
+    /// endpoint), NOT from `self.cloud_base` which carries the LLM
+    /// provider endpoint (Bedrock / Anthropic). Mixing them up caused
+    /// 503s because task REST calls landed on the LLM API URL.
     async fn route_task_action(&self, action: &str, args: &Value) -> Option<String> {
-        let cloud_base = self.cloud_base.clone()?;
+        // Only route through the astra server when ASTRA_CLOUD_BASE is
+        // explicitly configured. `self.cloud_base` is the LLM endpoint
+        // and must NOT be used here.
+        let cloud_base = std::env::var("ASTRA_CLOUD_BASE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
         let session_id = self.active_session_id()?;
         if session_id.is_empty() {
             return None;
