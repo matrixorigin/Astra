@@ -224,26 +224,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
-                        "content": {"type": "string", "description": "File content. Required for writes."},
-                        "delete": {"type": "boolean", "description": "Set to true to delete the file instead of writing content."}
+                        "content": {"type": "string", "description": "File content. Required when delete is absent or false."},
+                        "delete": {"type": "boolean", "description": "Set to true to delete the file instead of writing. When true, content must be omitted."}
                     },
-                    "oneOf": [
-                        {
-                            "required": ["path", "content"],
-                            "not": {
-                                "required": ["delete"]
-                            }
-                        },
-                        {
-                            "properties": {
-                                "delete": {"const": true}
-                            },
-                            "required": ["path", "delete"],
-                            "not": {
-                                "required": ["content"]
-                            }
-                        }
-                    ]
+                    "required": ["path"],
+                    "x-astra-per-action-required": {
+                        "write": ["path", "content"],
+                        "delete": ["path"]
+                    }
                 }
             }
         }),
@@ -1301,83 +1289,52 @@ mod tests {
         let params = func
             .get("parameters")
             .expect("write_file schema must include parameters");
-        let variants = params
-            .get("oneOf")
-            .and_then(Value::as_array)
-            .expect("write_file schema must express write vs delete with oneOf");
-        assert_eq!(
-            variants.len(),
-            2,
-            "write_file schema should expose exactly two valid argument shapes"
-        );
 
-        // Outer required must not undermine oneOf by claiming only path is needed.
-        let outer_required = params.get("required").and_then(Value::as_array);
+        // Anthropic/Bedrock reject oneOf/allOf/anyOf at the top level of input_schema.
+        // The write vs delete distinction is expressed via description prose and the
+        // x-astra-per-action-required extension, not via composition keywords.
         assert!(
-            outer_required.is_none_or(|r| r.is_empty()),
-            "outer 'required' must be absent or empty so oneOf is the sole constraint; \
-             having required:[\"path\"] contradicts the oneOf variants"
+            params.get("oneOf").is_none(),
+            "write_file parameters must not use top-level oneOf (Anthropic/Bedrock HTTP 400)"
+        );
+        assert!(
+            params.get("allOf").is_none(),
+            "write_file parameters must not use top-level allOf (Anthropic/Bedrock HTTP 400)"
+        );
+        assert!(
+            params.get("anyOf").is_none(),
+            "write_file parameters must not use top-level anyOf (Anthropic/Bedrock HTTP 400)"
         );
 
-        let write_variant = variants
-            .iter()
-            .find(|variant| {
-                variant
-                    .get("required")
-                    .and_then(Value::as_array)
-                    .map(|required| {
-                        required.iter().any(|item| item == "content")
-                            && required.iter().any(|item| item == "path")
-                    })
-                    .unwrap_or(false)
-            })
-            .expect("write variant must require both path and content");
-
-        // Write variant must exclude delete to ensure oneOf variants are mutually exclusive.
-        let write_not = write_variant
-            .get("not")
-            .expect("write variant must exclude delete via 'not' constraint");
-        let write_not_required = write_not
+        // path must be the sole top-level required field.
+        let required = params
             .get("required")
             .and_then(Value::as_array)
-            .expect("write variant 'not' must list excluded fields");
+            .expect("write_file parameters must include a required array");
         assert!(
-            write_not_required.iter().any(|item| item == "delete"),
-            "write variant must exclude 'delete' so {{path,content,delete:true}} is rejected"
+            required.iter().any(|v| v == "path"),
+            "write_file must require path: {required:?}"
         );
 
-        let delete_variant = variants
-            .iter()
-            .find(|variant| {
-                variant
-                    .get("properties")
-                    .and_then(|props| props.get("delete"))
-                    .and_then(|delete| delete.get("const"))
-                    .and_then(Value::as_bool)
-                    == Some(true)
-            })
-            .expect("delete variant must pin delete=true");
-        let delete_required = delete_variant
-            .get("required")
-            .and_then(Value::as_array)
-            .expect("delete variant must list required fields");
-        assert!(
-            delete_required.iter().any(|item| item == "path")
-                && delete_required.iter().any(|item| item == "delete"),
-            "delete variant must require path and delete=true"
+        // Per-action required fields must be encoded in the vendor extension.
+        let per_action = params.get("x-astra-per-action-required").expect(
+            "write_file must use x-astra-per-action-required to encode per-mode requirements",
         );
-
-        // Delete variant must exclude content for mutual exclusivity.
-        let delete_not = delete_variant
-            .get("not")
-            .expect("delete variant must exclude content via 'not' constraint");
-        let delete_not_required = delete_not
-            .get("required")
+        let write_req = per_action
+            .get("write")
             .and_then(Value::as_array)
-            .expect("delete variant 'not' must list excluded fields");
+            .expect("x-astra-per-action-required must list fields required for write");
         assert!(
-            delete_not_required.iter().any(|item| item == "content"),
-            "delete variant must exclude 'content' so {{path,content,delete:true}} is rejected"
+            write_req.iter().any(|v| v == "path") && write_req.iter().any(|v| v == "content"),
+            "write action must require both path and content: {write_req:?}"
+        );
+        let delete_req = per_action
+            .get("delete")
+            .and_then(Value::as_array)
+            .expect("x-astra-per-action-required must list fields required for delete");
+        assert!(
+            delete_req.iter().any(|v| v == "path"),
+            "delete action must require path: {delete_req:?}"
         );
     }
 

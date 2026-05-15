@@ -4362,6 +4362,10 @@ mod tests {
     fn sandbox_expand_prompt_mode_needs_approval() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        // Clear user settings so that ~/.astra/permissions.json allow rules (e.g.
+        // `sandbox_expand:bash` granted in a previous interactive session) do not
+        // bypass the prompt in this isolated unit test.
+        pm.replace_user_settings(PermissionSettings::default());
         let args = serde_json::json!({"reason": "path outside project"});
         let decision = pm.check_nonblocking("sandbox_expand:bash", &args);
         match decision {
