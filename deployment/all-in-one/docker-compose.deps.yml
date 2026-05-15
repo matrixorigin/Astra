@@ -13,7 +13,7 @@ services:
     user: root
     entrypoint: ["sh", "-c", "chown -R ${UID:-1000}:${GID:-1000} /mo-data && mkdir -p /mo-logs && chown -R ${UID:-1000}:${GID:-1000} /mo-logs"]
     volumes:
-      - ${MATRIXONE_DATA_DIR:-./data/matrixone}:/mo-data
+      - matrixone-data:/mo-data
       - ${MATRIXONE_LOG_DIR:-./data/matrixone/logs}:/mo-logs
     networks:
       - mo-net
@@ -31,7 +31,7 @@ services:
       - "${MATRIXONE_PORT:-6001}:6001"
       - "${MATRIXONE_DEBUG_HTTP_PORT:-6060}:6060"
     volumes:
-      - ${MATRIXONE_DATA_DIR:-./data/matrixone}:/mo-data
+      - matrixone-data:/mo-data
       - ${MATRIXONE_LOG_DIR:-./data/matrixone/logs}:/mo-logs
       - ./matrixone-entrypoint.sh:/entrypoint.sh:ro
     environment:
@@ -92,3 +92,18 @@ services:
 networks:
   mo-net:
     driver: bridge
+
+volumes:
+  # /mo-data lives in a Docker-managed named volume rather than a host bind
+  # mount. On macOS, bind mounts go through Docker's file-sharing layer which
+  # doesn't fully support the fsync/locking syscalls dragonboat/pebble use,
+  # causing the logservice to panic with "operation not supported" at startup.
+  #
+  # Override ${MATRIXONE_DATA_VOLUME} (default: matrixone-data) to point at a
+  # pre-existing Docker volume — e.g., to share state across compose projects.
+  # The `name:` field sets the literal Docker volume name (no project prefix).
+  #
+  # NOTE: the legacy ${MATRIXONE_DATA_DIR} env var no longer affects this
+  # stack. It is still honored by docker-compose.yml and docker-compose.memoria.yml.
+  matrixone-data:
+    name: ${MATRIXONE_DATA_VOLUME:-matrixone-data}
