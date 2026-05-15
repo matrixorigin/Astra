@@ -905,17 +905,51 @@ fn first_turn_has_task_or_plan_tool_history(recent_tools: &[String]) -> bool {
         .any(|t| t == "task" || t.starts_with("task_") || t == "enter_plan_mode")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FirstTurnActivationSignals {
+    multi_step: bool,
+    design: bool,
+}
+
+fn first_turn_activation_signals(
+    turn: u32,
+    recent_tools: &[String],
+    line: &str,
+) -> Option<FirstTurnActivationSignals> {
+    use astra_turn_core::routing_engine::{RoutingEngine, TaskType};
+
+    if turn != 0 || first_turn_has_task_or_plan_tool_history(recent_tools) {
+        return None;
+    }
+
+    let heuristic_multi_step = looks_like_multi_step(line);
+    let heuristic_design = looks_like_design_question(line);
+    let routing = RoutingEngine::analyze(line, turn, recent_tools, &[], vec![]);
+
+    // Prefer the shared routing analysis over ad-hoc phrase matching for
+    // mixed reasoning+mutation requests. Keep the lexical detectors only as
+    // a backstop for architecture questions the router does not model yet.
+    let routing_multi_step = matches!(routing.task_type, TaskType::Compound)
+        || (routing.conversation_state.is_analytical && routing.conversation_state.is_mutate);
+    let routing_design = routing.conversation_state.is_analytical
+        && (matches!(routing.task_type, TaskType::Compound)
+            || routing.conversation_state.is_mutate);
+
+    let signals = FirstTurnActivationSignals {
+        multi_step: heuristic_multi_step || routing_multi_step,
+        design: heuristic_design || routing_design,
+    };
+
+    (signals.multi_step || signals.design).then_some(signals)
+}
+
 fn first_turn_plan_auto_suggest_reason(
     turn: u32,
     recent_tools: &[String],
     line: &str,
 ) -> Option<String> {
-    if turn != 0 || first_turn_has_task_or_plan_tool_history(recent_tools) {
-        return None;
-    }
-    let multi_step = looks_like_multi_step(line);
-    let design = looks_like_design_question(line);
-    match (multi_step, design) {
+    let signals = first_turn_activation_signals(turn, recent_tools, line)?;
+    match (signals.multi_step, signals.design) {
         (true, true) => Some(
             "This looks like multi-step work with architectural ambiguity. A structured plan may avoid churn."
                 .to_string(),
@@ -938,14 +972,7 @@ fn first_turn_activation_reminder(
     line: &str,
     plan_prompt_accepted: bool,
 ) -> Option<String> {
-    if turn != 0 || first_turn_has_task_or_plan_tool_history(recent_tools) {
-        return None;
-    }
-    let multi_step = looks_like_multi_step(line);
-    let design = looks_like_design_question(line);
-    if !(multi_step || design) {
-        return None;
-    }
+    let signals = first_turn_activation_signals(turn, recent_tools, line)?;
 
     if plan_prompt_accepted {
         return Some(
@@ -958,7 +985,7 @@ fn first_turn_activation_reminder(
     }
 
     let mut hints: Vec<&str> = Vec::with_capacity(2);
-    if multi_step {
+    if signals.multi_step {
         hints.push(
             "This message implies multiple distinct outcomes. \
              Strongly prefer calling `task(action='create')` once per outcome \
@@ -966,7 +993,7 @@ fn first_turn_activation_reminder(
              for the first item. The user will see real-time progress on the task board.",
         );
     }
-    if design {
+    if signals.design {
         hints.push(
             "This message has architectural ambiguity. \
              Strongly prefer `enter_plan_mode()` first to explore the codebase, \
@@ -4488,6 +4515,21 @@ mod tests {
         assert!(
             first_turn_plan_auto_suggest_reason(0, &["enter_plan_mode".to_string()], msg).is_none()
         );
+    }
+
+    #[test]
+    fn first_turn_activation_signals_use_routing_for_compound_requests() {
+        let msg = "analyze the current auth flow, fix the race, validate the migration";
+        let signals =
+            first_turn_activation_signals(0, &[], msg).expect("compound request should trigger");
+        assert!(signals.multi_step, "{signals:?}");
+        assert!(signals.design, "{signals:?}");
+    }
+
+    #[test]
+    fn first_turn_activation_signals_do_not_promote_simple_debug_questions() {
+        let msg = "why is this test failing?";
+        assert!(first_turn_activation_signals(0, &[], msg).is_none());
     }
 
     #[test]
