@@ -746,11 +746,11 @@ fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[V
 }
 
 // ── Prompt caching — delegated through turn::llm_context ─────────────────────
+#[cfg(test)]
+pub(crate) use super::llm_context::annotate_tool_schemas_for_cache as annotate_tool_schemas_for_caching;
 pub use super::prompt_cache::PromptCacheConfig;
 #[cfg(test)]
 pub(crate) use super::prompt_cache::add_message_cache_breakpoint;
-#[cfg(test)]
-pub(crate) use super::llm_context::annotate_tool_schemas_for_cache as annotate_tool_schemas_for_caching;
 
 #[derive(Clone)]
 pub struct InProcessChatTurnBridge {

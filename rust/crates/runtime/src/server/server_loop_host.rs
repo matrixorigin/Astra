@@ -1877,6 +1877,7 @@ impl ServerAgenticLoopHost {
             "visible_tool_count": visible_tools.len(),
             "restricted_tool_count": restricted_snapshot.len(),
         }));
+        let cache_cfg = PromptCacheConfig::latch(provider, model_name);
         crate::turn::llm_context::assemble_context_pipeline(
             crate::turn::llm_context::LlmContextAssemblyInput {
                 state,
@@ -1892,6 +1893,7 @@ impl ServerAgenticLoopHost {
                     self.selection_confidence,
                 )
                 .with_extra_sections(&[], &[]),
+                cache_cfg: &cache_cfg,
                 provider,
                 model_name,
                 user_content,
@@ -1968,17 +1970,19 @@ impl ServerAgenticLoopHost {
         // pipeline as an `extra_dynamic_sections` entry (RuntimeVolatile,
         // None scope). See `context_pipeline_adapter` — post-hoc injection
         // here would double up the content on the wire.
-        crate::turn::llm_context::assemble_wire_messages(crate::turn::llm_context::LlmWireAssemblyInput {
-            system_messages,
-            volatile_preamble,
-            compacted_messages,
-            state,
-            edge_profile: &self.edge_profile,
-            session_id: &self.session_id,
-            provider: &llm_cfg.provider,
-            model_name: &llm_cfg.model_name,
-            cache_cfg,
-        })
+        crate::turn::llm_context::assemble_wire_messages(
+            crate::turn::llm_context::LlmWireAssemblyInput {
+                system_messages,
+                volatile_preamble,
+                compacted_messages,
+                state,
+                edge_profile: &self.edge_profile,
+                session_id: &self.session_id,
+                provider: &llm_cfg.provider,
+                model_name: &llm_cfg.model_name,
+                cache_cfg,
+            },
+        )
     }
 
     /// Convert an [`LlmCallResult`] into a [`ChatTurnSseAccum`].

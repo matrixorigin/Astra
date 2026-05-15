@@ -3002,11 +3002,15 @@ async fn sse_full_sequence_text_only_turn() {
         .filter_map(|e| e.get("type").and_then(Value::as_str))
         .collect();
 
-    // context_meta is only emitted in the real LLM path, not the e2e mock path.
     assert_eq!(
         types,
-        vec!["session_info", "text_delta", "turn_complete"],
-        "text-only turn SSE sequence should be: session_info → text_delta → turn_complete, got: {types:?}"
+        vec![
+            "session_info",
+            "context_meta",
+            "text_delta",
+            "turn_complete"
+        ],
+        "text-only turn SSE sequence should be: session_info → context_meta → text_delta → turn_complete, got: {types:?}"
     );
 }
 
@@ -3039,8 +3043,14 @@ async fn sse_full_sequence_tool_call_turn() {
     // tool_call so the CLI can update accum.tool_calls and execute tools locally.
     assert_eq!(
         types,
-        vec!["session_info", "tool_call", "tool_request", "turn_complete"],
-        "tool-call turn SSE sequence should be: session_info → tool_call → tool_request → turn_complete, got: {types:?}"
+        vec![
+            "session_info",
+            "context_meta",
+            "tool_call",
+            "tool_request",
+            "turn_complete"
+        ],
+        "tool-call turn SSE sequence should be: session_info → context_meta → tool_call → tool_request → turn_complete, got: {types:?}"
     );
 
     // Explicitly verify no text_delta.
@@ -3051,10 +3061,11 @@ async fn sse_full_sequence_tool_call_turn() {
     );
 }
 
-// Test: context_meta is NOT emitted in e2e mock path (only in real LLM path)
-// This documents current behavior — context_meta requires real prompt assembly.
+// Test: context_meta is emitted in e2e mock path.
+// Mock replay now runs the same shared prompt/context assembly as the real LLM
+// path, so it must expose the same manifest/debug event.
 #[tokio::test]
-async fn sse_context_meta_not_emitted_in_mock_path() {
+async fn sse_context_meta_emitted_in_mock_path() {
     init_env();
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());
@@ -3071,9 +3082,14 @@ async fn sse_context_meta_not_emitted_in_mock_path() {
     let events = parse_sse_events(&raw);
 
     let cm = events_of_type(&events, "context_meta");
+    assert_eq!(
+        cm.len(),
+        1,
+        "context_meta should be emitted exactly once in e2e mock path"
+    );
     assert!(
-        cm.is_empty(),
-        "context_meta should NOT be emitted in e2e mock path (emitted only in real LLM path)"
+        cm[0].get("context_manifest_trace").is_some(),
+        "context_meta should include the shared context manifest trace"
     );
 }
 

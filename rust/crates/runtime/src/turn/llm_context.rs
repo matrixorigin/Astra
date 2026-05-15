@@ -27,6 +27,7 @@ pub(crate) struct LlmContextAssemblyInput<'a> {
     pub session_id: &'a str,
     pub tool_surface: ToolSurfacePlan<'a>,
     pub runtime_signals: RuntimeSignals<'a>,
+    pub cache_cfg: &'a PromptCacheConfig,
     pub provider: &'a str,
     pub model_name: &'a str,
     pub user_content: &'a str,
@@ -579,8 +580,10 @@ pub(crate) fn assemble_bridge_context(
     input: BridgeContextAssemblyInput<'_>,
 ) -> BridgeContextAssemblyOutput {
     let effective_tool_schemas = input.tool_surface.effective_tool_schemas();
-    let effective_tool_names: Vec<&str> =
-        effective_tool_schemas.iter().filter_map(tool_name).collect();
+    let effective_tool_names: Vec<&str> = effective_tool_schemas
+        .iter()
+        .filter_map(tool_name)
+        .collect();
     let _tool_surface_metadata = (
         input.tool_surface.tool_names.len(),
         input.tool_surface.pinned_tools.len(),
@@ -607,14 +610,13 @@ pub(crate) fn assemble_bridge_context(
         input.tool_surface.deferred_tools_block,
         input.session.skill_listing_block,
     );
-    let system_prompt_tokens = estimate_json_tokens(&outcome.primary_system)
-        .saturating_add(
-            outcome
-                .dynamic_system
-                .as_ref()
-                .map(estimate_json_tokens)
-                .unwrap_or(0),
-        );
+    let system_prompt_tokens = estimate_json_tokens(&outcome.primary_system).saturating_add(
+        outcome
+            .dynamic_system
+            .as_ref()
+            .map(estimate_json_tokens)
+            .unwrap_or(0),
+    );
     let stable_system_message_count = 1;
     let volatile_preamble_count = usize::from(outcome.dynamic_system.is_some());
     let tool_schema_count = outcome.tool_schemas.len();
@@ -683,15 +685,26 @@ pub(crate) fn assemble_context_pipeline(
     external
         .extra_stable_sections
         .extend(input.runtime_signals.extra_stable_sections.iter().cloned());
-    external
-        .extra_dynamic_sections
-        .extend(input.runtime_signals.extra_volatile_sections.iter().cloned());
+    external.extra_dynamic_sections.extend(
+        input
+            .runtime_signals
+            .extra_volatile_sections
+            .iter()
+            .cloned(),
+    );
     let turn_state = build_turn_state(state, input.user_content);
+    // `AgenticLoopState::max_turn_input_tokens` is an input-budget/wind-down
+    // cap, and `0` is its legacy "unlimited" sentinel. The pipeline's
+    // `SessionContext::model_limit` is different: it must be the concrete
+    // model context window used for section budgeting and pressure planning.
+    let model_context_limit =
+        u64::try_from(crate::prompts::budget_for_model(Some(input.model_name)).model_limit)
+            .unwrap_or(u64::MAX);
     let mut session_ctx = build_session_context(
         input.session_id,
         state.current_run_id.as_deref(),
         input.model_name,
-        state.max_turn_input_tokens,
+        model_context_limit,
         input.runtime_signals.edge_profile,
         input.provider,
         state.project_context.as_deref(),
@@ -755,7 +768,9 @@ pub(crate) fn assemble_context_pipeline(
                         "type": "text",
                         "text": block.text,
                     });
-                    if let Some(ref cc) = block.cache_control {
+                    if input.cache_cfg.should_annotate()
+                        && let Some(ref cc) = block.cache_control
+                    {
                         v["cache_control"] = cc.clone();
                     }
                     v
@@ -1023,7 +1038,13 @@ mod context_cache_contract_tests {
 
         assert_eq!(
             tool_names(&merged),
-            vec!["pinned_a", "pinned_b", "required_a", "dynamic_a", "visible_a"]
+            vec![
+                "pinned_a",
+                "pinned_b",
+                "required_a",
+                "dynamic_a",
+                "visible_a"
+            ]
         );
     }
 

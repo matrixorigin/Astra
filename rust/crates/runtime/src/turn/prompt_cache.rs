@@ -386,7 +386,9 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
                 dynamic_text.push_str(&block.text);
             } else {
                 let mut b = json!({"type": "text", "text": block.text});
-                if let Some(ref cc) = block.cache_control {
+                if cache_cfg.should_annotate()
+                    && let Some(ref cc) = block.cache_control
+                {
                     b["cache_control"] = cc.clone();
                 }
                 stable_blocks.push(b);
