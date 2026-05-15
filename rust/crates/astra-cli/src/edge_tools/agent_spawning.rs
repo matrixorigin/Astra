@@ -153,11 +153,10 @@ fn normalize_spawn_agent_args(args: &Value) -> Result<Value, String> {
             .to_string());
     }
 
-    if obj.contains_key("task") {
-        return Err("unsupported deprecated `task` field for agent.spawn. \
-             Use top-level `prompt` for the full child task brief and \
-             `description` for the short UI summary."
-            .to_string());
+    if let Some(task_val) = obj.remove("task") {
+        if !obj.contains_key("prompt") {
+            obj.insert("prompt".to_string(), task_val);
+        }
     }
 
     let description = non_empty_string(obj.get("description")).map(str::to_string);
