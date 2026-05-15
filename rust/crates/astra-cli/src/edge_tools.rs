@@ -2472,7 +2472,7 @@ impl ToolExecutor {
             error
         } else {
             match name {
-                "bash" => self.bash(args),
+                "bash" => self.bash_async(args).await,
                 #[cfg(windows)]
                 "powershell" => self.powershell(args),
                 // Activation primitive for the deferred tool layer.
@@ -3417,6 +3417,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         (dir, executor)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bash_execute_does_not_block_runtime_worker() {
+        let (_dir, executor) = temp_executor();
+        let start = std::time::Instant::now();
+
+        let args = serde_json::json!({
+            "command": "sleep 0.2; echo done",
+            "timeout": 1.0
+        });
+        let bash = executor.execute("bash", &args);
+        let spinner_tick = async {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            std::time::Instant::now()
+        };
+
+        let (output, ticked_at) = tokio::join!(bash, spinner_tick);
+        let tick_latency = ticked_at.duration_since(start);
+        assert!(
+            tick_latency < std::time::Duration::from_millis(100),
+            "bash execution blocked the runtime worker for {tick_latency:?}"
+        );
+        assert!(output.contains("done"), "unexpected bash output: {output}");
     }
 
     // ── tool_search dispatch: CLI must route to the full catalog ───────

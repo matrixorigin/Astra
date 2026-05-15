@@ -16,9 +16,11 @@
 //!   ephemeral — if a user scrolls back they see the result
 //!   (tool cell, assistant cell, turn summary), not a stale
 //!   status header.
-//! - Label is static bold-accent. A previous iteration ran the
-//!   shimmer per-char and it looked like the word was melting at
-//!   12 fps; Codex doesn't shimmer either.
+//! - The primary label is turn-stable. Tool activity can appear as
+//!   secondary context, but the main verb must not flip between
+//!   Thinking / Writing / Reading mid-turn.
+//! - Truecolor terminals get a slow shimmer over the primary label;
+//!   non-truecolor terminals keep a static bold-accent label.
 //! - Star rotates on a 500 ms wall-clock tick. Slow heartbeat
 //!   beats strobing.
 //! - Elapsed time rounds to whole seconds so the counter ticks
@@ -81,6 +83,7 @@ pub(crate) struct StatusIndicator {
     /// [`Self::begin_turn`] at turn start; cleared by transitioning
     /// to `Idle` (or implicitly by the next `begin_turn`).
     turn_started_at: Option<Instant>,
+    turn_label: Option<&'static str>,
 }
 
 /// How long the model can be silent in `Thinking` state before the
@@ -89,6 +92,7 @@ pub(crate) struct StatusIndicator {
 /// reassure the user during Bedrock extended-thinking pauses,
 /// long enough to avoid flickering in/out for a normal prompt.
 const SILENT_WINDOW_BEFORE_THOUGHT_CHIP: Duration = Duration::from_secs(5);
+const DEFAULT_TURN_LABEL: &str = "Thinking";
 
 impl StatusIndicator {
     pub fn new() -> Self {
@@ -108,6 +112,7 @@ impl StatusIndicator {
         if matches!(state, IndicatorState::Idle) {
             self.stream_chars = 0;
             self.turn_started_at = None;
+            self.turn_label = None;
         } else if self.turn_started_at.is_none() {
             // Auto-start a turn when transitioning out of Idle. Lets
             // existing callers that drive `set_state(Thinking{...})`
@@ -118,6 +123,7 @@ impl StatusIndicator {
             // this transition.
             if let Some(t) = state.started_at() {
                 self.turn_started_at = Some(t);
+                self.turn_label = Some(DEFAULT_TURN_LABEL);
                 self.stream_chars = 0;
             }
         }
@@ -131,6 +137,7 @@ impl StatusIndicator {
     /// `set_state(WaitingModel { ... })`.
     pub fn begin_turn(&mut self, at: Instant) {
         self.turn_started_at = Some(at);
+        self.turn_label = Some(DEFAULT_TURN_LABEL);
         self.stream_chars = 0;
     }
 
@@ -152,6 +159,7 @@ impl StatusIndicator {
             &self.state,
             self.stream_chars,
             self.turn_started_at,
+            self.turn_label,
             now,
         )
     }
@@ -165,6 +173,7 @@ fn render_for(
     state: &IndicatorState,
     stream_chars: u64,
     turn_started_at: Option<Instant>,
+    turn_label: Option<&'static str>,
     now: Instant,
 ) -> Option<Line<'static>> {
     if !state.is_active() {
@@ -183,13 +192,15 @@ fn render_for(
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Color::DarkGray);
 
-    let label: String = match state {
+    let state_label: String = match state {
         IndicatorState::Thinking { .. } => "Thinking".into(),
         IndicatorState::Tool { name, .. } => label_for_tool(name),
         IndicatorState::WaitingModel { .. } => "Waiting for model".into(),
         IndicatorState::AwaitingApproval { .. } => "Awaiting approval".into(),
         IndicatorState::Idle => return None,
     };
+    let label = turn_label.unwrap_or(&state_label);
+    let activity = (state_label != label).then_some(state_label.as_str());
 
     // Surface a `· thought for Ns` chip during long silent stretches
     // in Thinking state. Bedrock extended-thinking can churn 60-120s
@@ -197,11 +208,13 @@ fn render_for(
     // has that the model is alive on the other end.
     let thought_for = thought_for_duration(state, stream_chars, elapsed);
 
-    Some(Line::from(vec![
-        Span::styled(format!("{} ", star_frame(now)), star_style),
-        Span::styled(label, label_style),
-        Span::styled(suffix(elapsed, stream_chars, thought_for), dim),
-    ]))
+    let mut spans = vec![Span::styled(format!("{} ", star_frame(now)), star_style)];
+    spans.extend(label_spans(label, label_style, now));
+    spans.push(Span::styled(
+        suffix(elapsed, stream_chars, thought_for, activity),
+        dim,
+    ));
+    Some(Line::from(spans))
 }
 
 /// Map an in-progress tool name to the spinner verb the user sees.
@@ -259,10 +272,18 @@ fn thought_for_duration(
 /// Sections elide when they'd be meaningless (token counter
 /// before first delta, no-yet elapsed at state flip, thought-for
 /// chip during normal streaming).
-fn suffix(elapsed: Option<Duration>, stream_chars: u64, thought_for: Option<Duration>) -> String {
+fn suffix(
+    elapsed: Option<Duration>,
+    stream_chars: u64,
+    thought_for: Option<Duration>,
+    activity: Option<&str>,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(d) = elapsed {
         parts.push(fmt_duration_coarse(d));
+    }
+    if let Some(activity) = activity {
+        parts.push(activity.to_string());
     }
     if let Some(d) = thought_for {
         parts.push(format!("thought for {}", fmt_duration_coarse(d)));
@@ -298,6 +319,59 @@ fn fmt_tokens(n: u64) -> String {
 
 fn approx_tokens(chars: u64) -> u64 {
     chars.div_ceil(4)
+}
+
+fn label_spans(label: &str, style: Style, now: Instant) -> Vec<Span<'static>> {
+    let truecolor = supports_color::on_cached(supports_color::Stream::Stdout)
+        .map(|level| level.has_16m)
+        .unwrap_or(false);
+    label_spans_for_mode(label, style, now, truecolor)
+}
+
+fn label_spans_for_mode(
+    label: &str,
+    style: Style,
+    now: Instant,
+    truecolor: bool,
+) -> Vec<Span<'static>> {
+    if !truecolor {
+        return vec![Span::styled(label.to_string(), style)];
+    }
+
+    let chars: Vec<char> = label.chars().collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+
+    let base = match style.fg {
+        Some(Color::Rgb(r, g, b)) => (r, g, b),
+        _ => (150, 120, 255),
+    };
+    let highlight = crate::tui::terminal_palette::default_fg().unwrap_or((255, 255, 255));
+    let padding = 2usize;
+    let period = chars.len() + padding * 2;
+    let phase = ((crate::tui::shimmer::time_at(now).max(0.0) * 1000.0) as u64 / 200) as usize;
+    let center = (phase % period) as isize - padding as isize;
+    let band_half_width = 1.5_f32;
+
+    chars
+        .into_iter()
+        .enumerate()
+        .map(|(i, ch)| {
+            let dist = (i as isize - center).unsigned_abs() as f32;
+            let intensity = if dist <= band_half_width {
+                let x = std::f32::consts::PI * (dist / band_half_width);
+                0.5 * (1.0 + x.cos())
+            } else {
+                0.0
+            };
+            let (r, g, b) = crate::tui::color::blend(highlight, base, intensity * 0.85);
+            Span::styled(
+                ch.to_string(),
+                style.fg(Color::Rgb(r, g, b)).add_modifier(Modifier::BOLD),
+            )
+        })
+        .collect()
 }
 
 /// Rotating star glyph. Time-keyed to a 500 ms window — slow
@@ -384,8 +458,14 @@ mod tests {
         let mut s = StatusIndicator::new();
         let t0 = Instant::now();
         s.set_state(IndicatorState::Thinking { started_at: t0 });
-        let line =
-            render_for(&s.state, s.stream_chars, None, t0 + Duration::from_secs(3)).unwrap();
+        let line = render_for(
+            &s.state,
+            s.stream_chars,
+            None,
+            None,
+            t0 + Duration::from_secs(3),
+        )
+        .unwrap();
         let text = text_of(&line);
         assert!(any_star(&text), "star missing: {text}");
         assert!(text.contains("Thinking"));
@@ -400,8 +480,101 @@ mod tests {
             name: "bash".into(),
             started_at: t0,
         };
-        let line = render_for(&state, 0, None, t0 + Duration::from_secs(1)).unwrap();
+        let line = render_for(&state, 0, None, None, t0 + Duration::from_secs(1)).unwrap();
         assert!(text_of(&line).contains("Running bash"));
+    }
+
+    #[test]
+    fn primary_label_stays_turn_stable_during_tool_state() {
+        let mut s = StatusIndicator::new();
+        let t0 = Instant::now();
+        s.begin_turn(t0);
+        s.set_state(IndicatorState::Thinking { started_at: t0 });
+
+        let thinking = text_of(&s.render_at(t0 + Duration::from_secs(1)).unwrap());
+        assert!(
+            thinking.contains("Thinking"),
+            "initial turn label should be Thinking: {thinking}"
+        );
+
+        s.set_state(IndicatorState::Tool {
+            name: "bash".into(),
+            started_at: t0 + Duration::from_secs(2),
+        });
+        let tool = text_of(&s.render_at(t0 + Duration::from_secs(3)).unwrap());
+        assert!(
+            tool.contains("Thinking"),
+            "primary label must not switch away from the turn verb: {tool}"
+        );
+        assert!(
+            tool.contains("Running bash"),
+            "tool activity should remain visible as secondary context: {tool}"
+        );
+    }
+
+    #[test]
+    fn truecolor_shimmer_splits_label_into_character_spans() {
+        let t0 = Instant::now();
+        let spans = label_spans_for_mode(
+            "Thinking",
+            Style::default().fg(Color::Rgb(120, 80, 220)),
+            t0 + Duration::from_millis(200),
+            true,
+        );
+        assert_eq!(spans.len(), "Thinking".chars().count());
+        assert!(
+            spans
+                .iter()
+                .any(|span| matches!(span.style.fg, Some(Color::Rgb(_, _, _)))),
+            "truecolor shimmer should paint per-character RGB spans: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn shimmer_is_disabled_without_truecolor() {
+        let t0 = Instant::now();
+        let spans = label_spans_for_mode("Thinking", Style::default(), t0, false);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), "Thinking");
+    }
+
+    #[test]
+    fn truecolor_shimmer_phase_is_quantized_to_200ms() {
+        fn fg_colors(spans: &[Span<'_>]) -> Vec<Option<Color>> {
+            spans.iter().map(|span| span.style.fg).collect()
+        }
+
+        let origin = crate::tui::shimmer::process_start();
+        let style = Style::default().fg(Color::Rgb(120, 80, 220));
+        let at_10ms = label_spans_for_mode(
+            "Thinking",
+            style,
+            origin + Duration::from_millis(10),
+            true,
+        );
+        let at_199ms = label_spans_for_mode(
+            "Thinking",
+            style,
+            origin + Duration::from_millis(199),
+            true,
+        );
+        let at_200ms = label_spans_for_mode(
+            "Thinking",
+            style,
+            origin + Duration::from_millis(200),
+            true,
+        );
+
+        assert_eq!(
+            fg_colors(&at_10ms),
+            fg_colors(&at_199ms),
+            "shimmer must not advance inside a 200ms phase"
+        );
+        assert_ne!(
+            fg_colors(&at_10ms),
+            fg_colors(&at_200ms),
+            "shimmer should advance on the next 200ms phase"
+        );
     }
 
     /// Pure spinner verbs — replaces the `Running <name>` fallback
@@ -433,7 +606,7 @@ mod tests {
                 name: (*name).into(),
                 started_at: t0,
             };
-            let line = render_for(&state, 0, None, t0 + Duration::from_secs(1)).unwrap();
+            let line = render_for(&state, 0, None, None, t0 + Duration::from_secs(1)).unwrap();
             let text = text_of(&line);
             assert!(
                 text.contains(expected),
@@ -449,6 +622,7 @@ mod tests {
             &IndicatorState::WaitingModel { started_at: t0 },
             0,
             None,
+            None,
             t0 + Duration::from_secs(0),
         )
         .unwrap();
@@ -457,6 +631,7 @@ mod tests {
         let a = render_for(
             &IndicatorState::AwaitingApproval { started_at: t0 },
             0,
+            None,
             None,
             t0 + Duration::from_secs(0),
         )
@@ -472,6 +647,7 @@ mod tests {
         let line = render_for(
             &IndicatorState::Thinking { started_at: t0 },
             0,
+            None,
             None,
             t0 + Duration::from_secs(1),
         )
@@ -489,6 +665,7 @@ mod tests {
         let line = render_for(
             &IndicatorState::Thinking { started_at: t0 },
             20_000, // ~5k tokens at 4 chars/token
+            None,
             None,
             t0 + Duration::from_secs(5),
         )
@@ -609,6 +786,7 @@ mod tests {
                 started_at: t0,
             },
             0,
+            None,
             None,
             t0 + Duration::from_secs(15),
         )

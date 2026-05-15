@@ -2918,6 +2918,129 @@ pub(crate) fn apply_build_test_outcome_to_session(
     }
 }
 
+struct ShellRunConfig {
+    program: String,
+    shell_flag: String,
+    command: String,
+    timeout_secs: f64,
+    harden_command: bool,
+    effective_project_root: PathBuf,
+    sandbox_policy: Option<SandboxPolicy>,
+    progress_sink: Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>>,
+}
+
+fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::Output, String> {
+    let effective_command = if config.harden_command {
+        if let Some(ref policy) = config.sandbox_policy {
+            if !matches!(policy.mode, SandboxMode::Permissive) {
+                wrap_command_with_limits(policy, &config.command)
+            } else {
+                config.command.clone()
+            }
+        } else {
+            config.command.clone()
+        }
+    } else {
+        config.command.clone()
+    };
+
+    let mut child_cmd = Command::new(&config.program);
+    child_cmd
+        .arg(&config.shell_flag)
+        .arg(&effective_command)
+        .current_dir(&config.effective_project_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // Pass env overlay vars to child process so env_set values are visible.
+    super::apply_env_overlay(&mut child_cmd);
+
+    // Create a new process group so we can kill the entire tree on timeout.
+    // This prevents orphaned git/curl/etc. child processes.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        child_cmd.process_group(0); // child becomes its own process group leader
+    }
+
+    // Apply sandbox environment filtering.
+    if let Some(ref policy) = config.sandbox_policy
+        && !matches!(policy.mode, SandboxMode::Permissive)
+        && let Err(e) = sandbox_command(policy, &mut child_cmd)
+    {
+        eprintln!("[sandbox] failed to apply policy: {e}");
+        return Err(format!("Error: sandbox policy application failed: {e}"));
+    }
+
+    let mut child = child_cmd.spawn().map_err(|e| format!("Error: {e}"))?;
+
+    // Take ownership of stdout/stderr handles before the wait loop.
+    // This allows us to read available output even if background processes keep pipes open.
+    let mut stdout_handle = child.stdout.take();
+    let mut stderr_handle = child.stderr.take();
+
+    // Switch pipes to non-blocking up front so the wait loop can
+    // drain them progressively — that lets us (a) bump the
+    // `bash_progress_sink` counters as bytes arrive and (b)
+    // avoid the classic "child blocks on write once pipe buffer
+    // fills" hang for commands whose output exceeds the pipe
+    // buffer (~64 KiB on Linux).
+    set_pipe_nonblocking_stdout(stdout_handle.as_mut());
+    set_pipe_nonblocking_stderr(stderr_handle.as_mut());
+
+    let progress_sink = config.progress_sink;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs_f64(config.timeout_secs);
+    let exit_status;
+    let mut stdout_buf: Vec<u8> = Vec::new();
+    let mut stderr_buf: Vec<u8> = Vec::new();
+    loop {
+        // Drain whatever's currently available on each pipe
+        // without blocking. Updates the progress sink so the
+        // TUI can show real counters mid-flight.
+        drain_pipe_nonblocking(stdout_handle.as_mut(), &mut stdout_buf, &progress_sink);
+        drain_pipe_nonblocking_stderr(stderr_handle.as_mut(), &mut stderr_buf, &progress_sink);
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_status = status;
+                break;
+            }
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    // Kill entire process group (bash + all children)
+                    sigkill_process_group(&mut child);
+                    // Reap the zombie process to prevent resource leak
+                    let _ = child.wait();
+                    return Err(format!(
+                        "Error: command timed out after {}s",
+                        config.timeout_secs
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("Error: {e}")),
+        }
+    }
+
+    // Final drain: post-exit pipes may still have a trailing
+    // chunk not yet read. Use the same `read_timeout` budget as
+    // before (drains until EOF or timeout).
+    let read_timeout = bash_pipe_read_timeout();
+    if let Some(h) = stdout_handle.as_mut() {
+        final_drain_stdout(h, &mut stdout_buf, read_timeout, &progress_sink);
+    }
+    if let Some(h) = stderr_handle.as_mut() {
+        final_drain_stderr(h, &mut stderr_buf, read_timeout, &progress_sink);
+    }
+
+    Ok(std::process::Output {
+        status: exit_status,
+        stdout: stdout_buf,
+        stderr: stderr_buf,
+    })
+}
+
 /// Adaptive default bash timeout by command kind. Used when the caller
 /// omits the `timeout` field. Session 0e37eb46 regression: cargo builds
 /// on this workspace routinely take 40-90s and the previous
@@ -3552,6 +3675,31 @@ fn is_private_172(host: &str) -> bool {
 }
 
 impl ToolExecutor {
+    fn shell_run_config(
+        &self,
+        program: &str,
+        shell_flag: &str,
+        command: &str,
+        timeout_secs: f64,
+        harden_command: bool,
+    ) -> ShellRunConfig {
+        let sandbox_policy = self
+            .sandbox_policy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        ShellRunConfig {
+            program: program.to_string(),
+            shell_flag: shell_flag.to_string(),
+            command: command.to_string(),
+            timeout_secs,
+            harden_command,
+            effective_project_root: self.effective_project_root(),
+            sandbox_policy,
+            progress_sink: self.current_bash_progress_sink(),
+        }
+    }
+
     fn run_shell_output_with_program(
         &self,
         program: &str,
@@ -3560,122 +3708,9 @@ impl ToolExecutor {
         timeout_secs: f64,
         harden_command: bool,
     ) -> Result<std::process::Output, String> {
-        let effective_command = if harden_command {
-            let sp_guard = self
-                .sandbox_policy
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(ref policy) = *sp_guard {
-                if !matches!(policy.mode, SandboxMode::Permissive) {
-                    wrap_command_with_limits(policy, command)
-                } else {
-                    command.to_string()
-                }
-            } else {
-                command.to_string()
-            }
-        } else {
-            command.to_string()
-        };
-
-        let mut child_cmd = Command::new(program);
-        child_cmd
-            .arg(shell_flag)
-            .arg(&effective_command)
-            .current_dir(self.effective_project_root())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        // Pass env overlay vars to child process so env_set values are visible.
-        super::apply_env_overlay(&mut child_cmd);
-
-        // Create a new process group so we can kill the entire tree on timeout.
-        // This prevents orphaned git/curl/etc. child processes.
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            child_cmd.process_group(0); // child becomes its own process group leader
-        }
-
-        // Apply sandbox environment filtering
-        {
-            let sp_guard = self
-                .sandbox_policy
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(ref policy) = *sp_guard
-                && !matches!(policy.mode, SandboxMode::Permissive)
-                && let Err(e) = sandbox_command(policy, &mut child_cmd)
-            {
-                eprintln!("[sandbox] failed to apply policy: {e}");
-                return Err(format!("Error: sandbox policy application failed: {e}"));
-            }
-        }
-
-        let mut child = child_cmd.spawn().map_err(|e| format!("Error: {e}"))?;
-
-        // Take ownership of stdout/stderr handles before the wait loop.
-        // This allows us to read available output even if background processes keep pipes open.
-        let mut stdout_handle = child.stdout.take();
-        let mut stderr_handle = child.stderr.take();
-
-        // Switch pipes to non-blocking up front so the wait loop can
-        // drain them progressively — that lets us (a) bump the
-        // `bash_progress_sink` counters as bytes arrive and (b)
-        // avoid the classic "child blocks on write once pipe buffer
-        // fills" hang for commands whose output exceeds the pipe
-        // buffer (~64 KiB on Linux).
-        set_pipe_nonblocking_stdout(stdout_handle.as_mut());
-        set_pipe_nonblocking_stderr(stderr_handle.as_mut());
-
-        let progress_sink = self.current_bash_progress_sink();
-
-        let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout_secs);
-        let exit_status;
-        let mut stdout_buf: Vec<u8> = Vec::new();
-        let mut stderr_buf: Vec<u8> = Vec::new();
-        loop {
-            // Drain whatever's currently available on each pipe
-            // without blocking. Updates the progress sink so the
-            // TUI can show real counters mid-flight.
-            drain_pipe_nonblocking(stdout_handle.as_mut(), &mut stdout_buf, &progress_sink);
-            drain_pipe_nonblocking_stderr(stderr_handle.as_mut(), &mut stderr_buf, &progress_sink);
-
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    exit_status = status;
-                    break;
-                }
-                Ok(None) => {
-                    if std::time::Instant::now() > deadline {
-                        // Kill entire process group (bash + all children)
-                        sigkill_process_group(&mut child);
-                        // Reap the zombie process to prevent resource leak
-                        let _ = child.wait();
-                        return Err(format!("Error: command timed out after {timeout_secs}s"));
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(e) => return Err(format!("Error: {e}")),
-            }
-        }
-
-        // Final drain: post-exit pipes may still have a trailing
-        // chunk not yet read. Use the same `read_timeout` budget as
-        // before (drains until EOF or timeout).
-        let read_timeout = bash_pipe_read_timeout();
-        if let Some(h) = stdout_handle.as_mut() {
-            final_drain_stdout(h, &mut stdout_buf, read_timeout, &progress_sink);
-        }
-        if let Some(h) = stderr_handle.as_mut() {
-            final_drain_stderr(h, &mut stderr_buf, read_timeout, &progress_sink);
-        }
-
-        Ok(std::process::Output {
-            status: exit_status,
-            stdout: stdout_buf,
-            stderr: stderr_buf,
-        })
+        let config =
+            self.shell_run_config(program, shell_flag, command, timeout_secs, harden_command);
+        run_shell_output_with_config(config)
     }
 
     pub(crate) fn run_shell_output(
@@ -3720,10 +3755,10 @@ impl ToolExecutor {
         }
     }
 
-    pub(crate) fn bash(&self, args: &Value) -> String {
+    fn prepare_bash_invocation(&self, args: &Value) -> Result<(String, f64), String> {
         let command = match args.get("command").and_then(Value::as_str) {
             Some(c) => c,
-            None => return "Error: missing 'command'".to_string(),
+            None => return Err("Error: missing 'command'".to_string()),
         };
 
         // Block pure sleep commands — they waste time with no useful output.
@@ -3737,9 +3772,11 @@ impl ToolExecutor {
                 && !trimmed.contains(';')
                 && !trimmed.contains('|')
             {
-                return "⚠ sleep commands are not useful — they waste time without producing output. \
-                        Remove the sleep and proceed with your next action."
-                    .to_string();
+                return Err(
+                    "⚠ sleep commands are not useful — they waste time without producing output. \
+                     Remove the sleep and proceed with your next action."
+                        .to_string(),
+                );
             }
         }
 
@@ -3756,7 +3793,7 @@ impl ToolExecutor {
                 .is_some_and(|p| !matches!(p.mode, SandboxMode::Permissive));
             drop(sp_guard);
             if is_restrictive {
-                return warning;
+                return Err(warning);
             }
             // Permissive: let it through but log the warning to stderr
             eprintln!("  {}", warning);
@@ -3778,18 +3815,17 @@ impl ToolExecutor {
             {
                 // Auto-truncate to prevent pipe stall; append a hint so the agent
                 // knows the output may be incomplete and can use built-in tools.
-                std::borrow::Cow::Owned(format!("{trimmed} | head -c 30000"))
+                format!("{trimmed} | head -c 30000")
             } else {
-                std::borrow::Cow::Borrowed(command)
+                command.to_string()
             }
         };
-        let command: &str = &command;
 
         // Use explicit timeout if provided, otherwise pick an adaptive default.
         let timeout_secs = args
             .get("timeout")
             .and_then(Value::as_f64)
-            .unwrap_or_else(|| default_bash_timeout_secs(command));
+            .unwrap_or_else(|| default_bash_timeout_secs(&command));
 
         // Sandbox path boundary check for bash commands.
         // If the sandbox is active, extract file path arguments from the command
@@ -3804,129 +3840,152 @@ impl ToolExecutor {
             if let Some(ref policy) = *sp_guard
                 && !matches!(policy.mode, SandboxMode::Permissive)
             {
-                if let Some(msg) = check_bash_path_boundary(policy, command) {
-                    return msg;
+                if let Some(msg) = check_bash_path_boundary(policy, &command) {
+                    return Err(msg);
                 }
             }
         }
 
-        if let Some(msg) = forbidden_name_based_process_kill(command) {
-            return msg.to_string();
+        if let Some(msg) = forbidden_name_based_process_kill(&command) {
+            return Err(msg.to_string());
         }
 
-        match self.run_shell_output(command, timeout_secs) {
+        Ok((command, timeout_secs))
+    }
+
+    fn render_bash_output(&self, command: &str, out: std::process::Output) -> String {
+        // Register any files read by this bash invocation so the
+        // read-before-edit gate accepts subsequent writes. Without
+        // this, `bash cat path` inspection creates a deadlock:
+        // model reads via bash, tries to edit, gate rejects with
+        // "has not been read yet", model reads again via bash, …
+        if out.status.success() {
+            self.register_bash_read_targets(command);
+        }
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let mut result = String::new();
+
+        // Prepend destructive command warning if applicable
+        if let Some(warning) = destructive_command_warning(command) {
+            result.push_str(warning);
+            result.push('\n');
+        }
+
+        if !stdout.is_empty() {
+            result.push_str(&stdout);
+        }
+        if !stderr.is_empty() {
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(&stderr);
+        }
+
+        let exit_code = out.status.code().unwrap_or(-1);
+
+        if result.is_empty() || (result.trim().is_empty() && !result.contains("⚠️")) {
+            return if out.status.success() {
+                "(no output)".to_string()
+            } else {
+                // Use command semantics to interpret exit code
+                let sem = interpret_exit_code(command, exit_code);
+                if let Some(note) = sem.note {
+                    note.to_string()
+                } else if sem.is_error {
+                    format!("Error: command failed (exit code {exit_code})")
+                } else {
+                    format!("(exit code {exit_code})")
+                }
+            };
+        }
+
+        // Budget-pressure-aware truncation (was hardcoded 20KB)
+        let limit = self.scaled_output_limit();
+        if result.len() > limit {
+            // Prefer cutting at newline boundary
+            let end = result.floor_char_boundary(limit);
+            let cut = result[..end]
+                .rfind('\n')
+                .filter(|&pos| pos > end / 2)
+                .map(|pos| pos + 1)
+                .unwrap_or(end);
+            result.truncate(cut);
+            result.push_str("\n[truncated]");
+        }
+
+        // For build/test commands, provide structured output with iteration tracking
+        if super::build_test::is_build_test_command(command) {
+            let mut parsed =
+                super::build_test::parse_build_test_output(&result, out.status.code());
+            if !parsed.error_locations.is_empty() {
+                parsed.enrich_with_scope(&self.project_root);
+            }
+            // Gap 2 + Tier 1 expiry: apply the parsed build/test
+            // outcome to the observability session so the
+            // SelfModel surface stays current on the next turn.
+            // See `apply_build_test_outcome_to_session` for the
+            // full publish/expire semantics and the f85a02bb
+            // regression context.
+            if let Some(session_lock) = &self.observability_session
+                && let Ok(mut session) = session_lock.write()
+            {
+                apply_build_test_outcome_to_session(&mut session, &parsed);
+            }
+            let delta = {
+                let mut tracker = self
+                    .build_test_tracker
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if tracker.command_changed(command) {
+                    tracker.reset();
+                }
+                tracker.record(&parsed, command)
+            };
+            let delta_summary = delta.to_summary();
+            if delta_summary.is_empty() {
+                return parsed.to_enhanced_output(&result);
+            }
+            return format!(
+                "{}\n\n{}",
+                delta_summary,
+                parsed.to_enhanced_output(&result)
+            );
+        }
+
+        // Append exit code context for non-zero, non-build commands
+        if !out.status.success() {
+            let sem = interpret_exit_code(command, exit_code);
+            if sem.is_error {
+                result.push_str(&format!("\n(exit code {exit_code})"));
+            }
+        }
+
+        result
+    }
+
+    pub(crate) async fn bash_async(&self, args: &Value) -> String {
+        let (command, timeout_secs) = match self.prepare_bash_invocation(args) {
+            Ok(invocation) => invocation,
+            Err(message) => return message,
+        };
+        let config = self.shell_run_config("bash", "-c", &command, timeout_secs, true);
+        match tokio::task::spawn_blocking(move || run_shell_output_with_config(config)).await {
+            Ok(Ok(out)) => self.render_bash_output(&command, out),
+            Ok(Err(error)) => error,
+            Err(error) => format!("Error: bash worker failed: {error}"),
+        }
+    }
+
+    pub(crate) fn bash(&self, args: &Value) -> String {
+        let (command, timeout_secs) = match self.prepare_bash_invocation(args) {
+            Ok(invocation) => invocation,
+            Err(message) => return message,
+        };
+        match self.run_shell_output(&command, timeout_secs) {
+            Ok(out) => self.render_bash_output(&command, out),
             Err(error) => error,
-            Ok(out) => {
-                // Register any files read by this bash invocation so the
-                // read-before-edit gate accepts subsequent writes. Without
-                // this, `bash cat path` inspection creates a deadlock:
-                // model reads via bash, tries to edit, gate rejects with
-                // "has not been read yet", model reads again via bash, …
-                if out.status.success() {
-                    self.register_bash_read_targets(command);
-                }
-
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let mut result = String::new();
-
-                // Prepend destructive command warning if applicable
-                if let Some(warning) = destructive_command_warning(command) {
-                    result.push_str(warning);
-                    result.push('\n');
-                }
-
-                if !stdout.is_empty() {
-                    result.push_str(&stdout);
-                }
-                if !stderr.is_empty() {
-                    if !result.is_empty() {
-                        result.push('\n');
-                    }
-                    result.push_str(&stderr);
-                }
-
-                let exit_code = out.status.code().unwrap_or(-1);
-
-                if result.is_empty() || (result.trim().is_empty() && !result.contains("⚠️")) {
-                    return if out.status.success() {
-                        "(no output)".to_string()
-                    } else {
-                        // Use command semantics to interpret exit code
-                        let sem = interpret_exit_code(command, exit_code);
-                        if let Some(note) = sem.note {
-                            note.to_string()
-                        } else if sem.is_error {
-                            format!("Error: command failed (exit code {exit_code})")
-                        } else {
-                            format!("(exit code {exit_code})")
-                        }
-                    };
-                }
-
-                // Budget-pressure-aware truncation (was hardcoded 20KB)
-                let limit = self.scaled_output_limit();
-                if result.len() > limit {
-                    // Prefer cutting at newline boundary
-                    let end = result.floor_char_boundary(limit);
-                    let cut = result[..end]
-                        .rfind('\n')
-                        .filter(|&pos| pos > end / 2)
-                        .map(|pos| pos + 1)
-                        .unwrap_or(end);
-                    result.truncate(cut);
-                    result.push_str("\n[truncated]");
-                }
-
-                // For build/test commands, provide structured output with iteration tracking
-                if super::build_test::is_build_test_command(command) {
-                    let mut parsed =
-                        super::build_test::parse_build_test_output(&result, out.status.code());
-                    if !parsed.error_locations.is_empty() {
-                        parsed.enrich_with_scope(&self.project_root);
-                    }
-                    // Gap 2 + Tier 1 expiry: apply the parsed build/test
-                    // outcome to the observability session so the
-                    // SelfModel surface stays current on the next turn.
-                    // See `apply_build_test_outcome_to_session` for the
-                    // full publish/expire semantics and the f85a02bb
-                    // regression context.
-                    if let Some(session_lock) = &self.observability_session
-                        && let Ok(mut session) = session_lock.write()
-                    {
-                        apply_build_test_outcome_to_session(&mut session, &parsed);
-                    }
-                    let delta = {
-                        let mut tracker = self
-                            .build_test_tracker
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        if tracker.command_changed(command) {
-                            tracker.reset();
-                        }
-                        tracker.record(&parsed, command)
-                    };
-                    let delta_summary = delta.to_summary();
-                    if delta_summary.is_empty() {
-                        return parsed.to_enhanced_output(&result);
-                    }
-                    return format!(
-                        "{}\n\n{}",
-                        delta_summary,
-                        parsed.to_enhanced_output(&result)
-                    );
-                }
-
-                // Append exit code context for non-zero, non-build commands
-                if !out.status.success() {
-                    let sem = interpret_exit_code(command, exit_code);
-                    if sem.is_error {
-                        result.push_str(&format!("\n(exit code {exit_code})"));
-                    }
-                }
-
-                result
-            }
         }
     }
 
