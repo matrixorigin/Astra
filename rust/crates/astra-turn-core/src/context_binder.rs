@@ -237,7 +237,7 @@ fn bind_working_memory(sources: &ContextSources<'_>) -> String {
 
 /// Bind the **session-stable** runtime identity fragments.
 ///
-/// Includes typed Model/CWD/Branch header plus fragments that only
+/// Includes typed CWD/Branch header plus fragments that only
 /// change at session boundaries: `system_override` and opt-in
 /// `extra_stable_sections` (environment_static from the bridge / adapter
 /// edge_profile, output style, etc.). Turn-volatile content —
@@ -251,14 +251,16 @@ fn bind_working_memory(sources: &ContextSources<'_>) -> String {
 /// (`bind_runtime_volatile`) rather than here. Placing a per-session UUID
 /// in the Session-scoped (cacheable) block breaks cross-session prefix
 /// sharing — every new session would invalidate the cached prefix even
-/// though the model/cwd/branch/tools are identical.
+/// though the cwd/branch/tools are identical.
 fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
     let ep = &sources.session.edge_profile;
     let ext = &sources.external;
     let mut parts = Vec::new();
 
-    // Core identity (always present). Session UUID moved to volatile block.
-    parts.push(format!("Model: {}", sources.session.model_id));
+    // Core identity. Exact model id is request metadata, not prompt content:
+    // putting it in the Session-scoped prefix churns prompt caches when a
+    // session switches between models in the same provider family.
+    let _model_id_is_transport_metadata = &sources.session.model_id;
     if let Some(cwd) = &ep.cwd {
         parts.push(format!("CWD: {cwd}"));
     }
@@ -587,7 +589,10 @@ mod tests {
         let fixture = test_sources();
         let sources = fixture.context();
         let content = bind_runtime_identity(&sources);
-        assert!(content.contains("test-model"));
+        assert!(
+            !content.contains("test-model"),
+            "exact model id must stay out of cacheable RuntimeIdentity: {content}"
+        );
         assert!(content.contains("main")); // git branch
     }
 
@@ -678,7 +683,7 @@ mod tests {
         let sources = fixture.context();
         let content = bind_runtime_identity(&sources);
         // Core identity still intact; no spurious trailing content.
-        assert!(content.contains("test-model"));
+        assert!(content.contains("main"));
         assert!(
             !content.ends_with("\n\n"),
             "no orphan blank lines from empty extras"

@@ -62,7 +62,7 @@ pub(crate) fn build_external_sources(
     //    Volatile (git branch dirty / diff / commits) → RuntimeVolatile.
     //    The legacy `# Project Profile\ncwd:/git_branch:` Markdown block
     //    has been dropped: bind_runtime_identity already emits typed
-    //    `Model: / CWD: / Branch:` lines from SessionContext, so
+    //    `CWD: / Branch:` lines from SessionContext, so
     //    re-emitting cwd/branch as a second header was pure duplicate.
     let env_static = edge_profile
         .get("environment_static")

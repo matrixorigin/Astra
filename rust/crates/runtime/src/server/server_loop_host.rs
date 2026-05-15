@@ -3221,25 +3221,34 @@ mod tests {
     /// persistence with no runtime error. This test pins both anchors.
     #[test]
     fn post_compaction_reinjects_invoked_skills() {
-        // Cross-file anchor: production code lives here (extraction + ordering)
-        // while the actual attachment build has moved to the shared
-        // `wire_assembly` module. Both pieces must be present for the
-        // re-injection pipeline to work; a silent refactor that drops either
-        // is a cross-turn skill-loss bug waiting to happen.
+        // Cross-file anchor: production code now lives in the shared
+        // `llm_context` + `wire_assembly` path. Both pieces must be present
+        // for the re-injection pipeline to work; a silent refactor that drops
+        // either is a cross-turn skill-loss bug waiting to happen.
         let host_src = include_str!("server_loop_host.rs");
         let host_tests_start = host_src
             .find("\n#[cfg(test)]\nmod tests {")
             .expect("cfg(test) + mod tests marker");
         let host_production = &host_src[..host_tests_start];
         assert!(
-            host_production.contains("state.skills.invoked"),
-            "production code must consult state.skills.invoked to decide re-injection"
+            host_production.contains("assemble_llm_messages("),
+            "server host must route final wire assembly through the shared helper"
+        );
+
+        let llm_context_src = include_str!("../turn/llm_context.rs");
+        let llm_context_tests_start = llm_context_src
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("llm_context cfg(test) + mod marker");
+        let llm_context_production = &llm_context_src[..llm_context_tests_start];
+        assert!(
+            llm_context_production.contains("input.state.skills.invoked"),
+            "shared LLM assembly must consult state.skills.invoked to decide re-injection"
         );
         // Ordering guard: most-recently invoked skill first (so the oldest
         // content sits closest to the model's current turn after to_messages
         // reverses). If this sort key flips, cross-turn ordering will break.
         assert!(
-            host_production.contains("std::cmp::Reverse(b.invoked_at_turn)"),
+            llm_context_production.contains("std::cmp::Reverse(skill.invoked_at_turn)"),
             "invoked skills must be sorted most-recent-first before re-injection"
         );
 
