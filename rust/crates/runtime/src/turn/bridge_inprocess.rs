@@ -745,13 +745,12 @@ fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[V
     Value::Object(event)
 }
 
-// ── Prompt caching — delegated to turn::prompt_cache ─────────────────────────
+// ── Prompt caching — delegated through turn::llm_context ─────────────────────
 pub use super::prompt_cache::PromptCacheConfig;
 #[cfg(test)]
 pub(crate) use super::prompt_cache::add_message_cache_breakpoint;
-pub(crate) use super::prompt_cache::{
-    annotate_tool_schemas_for_caching, apply_anthropic_cache_metadata,
-};
+#[cfg(test)]
+pub(crate) use super::llm_context::annotate_tool_schemas_for_cache as annotate_tool_schemas_for_caching;
 
 #[derive(Clone)]
 pub struct InProcessChatTurnBridge {
@@ -1749,23 +1748,36 @@ impl InProcessChatTurnBridge {
                 .and_then(|text| deferred_tools_section_for_edge_profile(Some(text)))
                 .map(|section| section.text)
                 .unwrap_or_default();
-            let pipeline_outcome = crate::turn::prompt_cache::assemble_bridge_pipeline_outcome(
-                &tool_names,
-                &edge_tools,
-                &stable_sections,
-                &effective_dynamic_sections,
-                &memoria_prefetch_entries,
-                selection_confidence,
-                task_type,
-                &cache_cfg,
-                &session_id,
-                &model_name,
-                &provider,
-                edge_profile.get("cwd").and_then(Value::as_str),
-                edge_profile.get("git_branch").and_then(Value::as_str),
-                project_context,
-                &deferred_block_str,
-                "",
+            let bridge_selection_trace = edge_profile.get("recommended_tools").cloned();
+            let bridge_restricted_snapshot = HashSet::new();
+            let pipeline_outcome = crate::turn::llm_context::assemble_bridge_context(
+                crate::turn::llm_context::BridgeContextAssemblyInput {
+                    tool_surface:
+                        crate::turn::llm_context::BridgeToolSurfacePlan::from_visible_tools(
+                            &tool_names,
+                            &edge_tools,
+                            &bridge_restricted_snapshot,
+                        )
+                        .with_deferred_tools_block(&deferred_block_str)
+                        .with_selection_trace(bridge_selection_trace),
+                    runtime_signals: crate::turn::llm_context::BridgeRuntimeSignals::new(
+                        &stable_sections,
+                        &effective_dynamic_sections,
+                        &memoria_prefetch_entries,
+                        selection_confidence,
+                        task_type,
+                    ),
+                    session: crate::turn::llm_context::BridgeSessionContextInput::new(
+                        &cache_cfg,
+                        &session_id,
+                        &model_name,
+                        &provider,
+                        edge_profile.get("cwd").and_then(Value::as_str),
+                        edge_profile.get("git_branch").and_then(Value::as_str),
+                        project_context,
+                    )
+                    .with_skill_listing_block(skill_listing_hint_text.as_deref().unwrap_or("")),
+                },
             );
             let system_msg = pipeline_outcome.primary_system;
             let dynamic_msg = pipeline_outcome.dynamic_system;
@@ -1775,6 +1787,8 @@ impl InProcessChatTurnBridge {
             // instead of re-deriving a tier.
             let pipeline_tier = pipeline_outcome.tier;
             let pipeline_tool_schemas = pipeline_outcome.tool_schemas;
+            let bridge_manifest_trace = pipeline_outcome.manifest_trace;
+            let mut bridge_manifest_trace_json = bridge_manifest_trace.to_json();
             // Debug: dump system prompt for cache analysis (env-gated).
             // Enable with ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT=1. Writes to
             // $TMPDIR/astra-bridge-prompt-<sid>-<ts>.json so `diff` between
@@ -1904,32 +1918,12 @@ impl InProcessChatTurnBridge {
                 }
             }
 
-            // Strip old reasoning_content from history messages to reduce token
-            // usage. Keeps the field (as empty string) for thinking-model API
-            // compat; only the most recent assistant reasoning is preserved.
-            // Heavy checkpoints and persisted events retain full reasoning.
-            astra_turn_core::edge_ledger::strip_stale_reasoning(&mut llm_messages, &provider, &model_name);
-
-            // Prepend volatile content to the last user message (same strategy
-            // as wire_assembly::assemble_llm_messages) so the stable prefix
-            // (system + history) stays byte-identical for prefix cache hits.
-            if let Some(vol_text) = bridge_volatile_text.take() {
-                if !vol_text.is_empty() {
-                    if let Some(last_user) = llm_messages
-                        .iter_mut()
-                        .rev()
-                        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-                    {
-                        let existing = last_user
-                            .get("content")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        last_user["content"] = Value::String(format!(
-                            "<system-reminder>\n{vol_text}</system-reminder>\n\n{existing}"
-                        ));
-                    }
-                }
-            }
+            crate::turn::llm_context::finalize_bridge_wire_messages(
+                &mut llm_messages,
+                bridge_volatile_text.take(),
+                &provider,
+                &model_name,
+            );
 
             // Cloud loop: every tool round waits on §5.5 ledger (`POST /tools/result`) then continues LLM.
             let merged_tool_results: Vec<Value> = tool_results.clone();
@@ -1976,7 +1970,10 @@ impl InProcessChatTurnBridge {
                 // into the planner; until then rely on pipeline output.
                 let _ = last_measured_prompt; // referenced for future wiring
                 let mut pruned_tools = pipeline_tool_schemas.clone();
-                annotate_tool_schemas_for_caching(&mut pruned_tools, &cache_cfg);
+                crate::turn::llm_context::annotate_tool_schemas_for_cache(
+                    &mut pruned_tools,
+                    &cache_cfg,
+                );
 
                 let loop_started = Instant::now();
                 let mut loop_tool_calls: Vec<Value> = Vec::new();
@@ -2041,6 +2038,50 @@ impl InProcessChatTurnBridge {
                     );
                 };
 
+                // Emit system prompt breakdown so CLI can record precise per-component trace.
+                let skill_injections: Vec<astra_turn_core::context_assembly_trace::SkillInjection> =
+                    edge_profile
+                        .get("active_skills")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            let names: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
+                            if names.is_empty() {
+                                vec![]
+                            } else {
+                                // Total tokens for the skill hint section, split evenly.
+                                let hint_tokens = prompts::estimate_str_tokens(&skill_hint) as u32;
+                                let per = hint_tokens / names.len().max(1) as u32;
+                                names
+                                    .iter()
+                                    .map(|name| {
+                                        astra_turn_core::context_assembly_trace::SkillInjection {
+                                            skill_name: name.to_string(),
+                                            skill_version: None,
+                                            tokens: per,
+                                            selection_reason: "active_output_skill".into(),
+                                        }
+                                    })
+                                    .collect()
+                            }
+                        })
+                        .unwrap_or_default();
+                let memory_injections: Vec<astra_turn_core::context_assembly_trace::MemoryInjection> =
+                    memory_preview
+                        .iter()
+                        .enumerate()
+                        .map(|(i, line)| {
+                            astra_turn_core::context_assembly_trace::MemoryInjection {
+                                memory_id: format!("prefetch-{i}"),
+                                memory_type: "hybrid_retrieval".into(),
+                                tokens: prompts::estimate_str_tokens(line) as u32,
+                                relevance_score: 0.0,
+                                content_preview: line.chars().take(100).collect(),
+                            }
+                        })
+                        .collect();
+                let breakdown =
+                    prompts::build_system_prompt_trace(&prompt_sections, skill_injections, memory_injections);
+
                 if let Some(round_val) = e2e_round {
                     // E2E fixture path: apply cache annotations first so the
                     // captured wire state matches the real-LLM branch below.
@@ -2048,8 +2089,21 @@ impl InProcessChatTurnBridge {
                     // even though the request shape sent to the real API
                     // would be post-mutation. Traces from E2E tests must be
                     // comparable to traces from real runs.
-                    apply_anthropic_cache_metadata(&mut llm_messages, &cache_cfg, &session_id);
+                    crate::turn::llm_context::apply_message_cache_metadata(
+                        &mut llm_messages,
+                        &cache_cfg,
+                        &session_id,
+                    );
+                    crate::turn::llm_context::augment_manifest_trace_with_wire(
+                        &mut bridge_manifest_trace_json,
+                        &llm_messages,
+                        &pruned_tools,
+                    );
                     capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
+                    yield render_sse(&crate::turn::llm_context::context_meta_event(
+                        &breakdown,
+                        Some(&bridge_manifest_trace_json),
+                    ));
                     #[cfg(feature = "bridge-e2e-hooks")]
                     {
                         let (t, r, tc, u_delta) =
@@ -2077,50 +2131,22 @@ impl InProcessChatTurnBridge {
                     }
                 } else {
                     // Add Anthropic protocol-level prompt-cache metadata on the request clone.
-                    apply_anthropic_cache_metadata(&mut llm_messages, &cache_cfg, &session_id);
+                    crate::turn::llm_context::apply_message_cache_metadata(
+                        &mut llm_messages,
+                        &cache_cfg,
+                        &session_id,
+                    );
+                    crate::turn::llm_context::augment_manifest_trace_with_wire(
+                        &mut bridge_manifest_trace_json,
+                        &llm_messages,
+                        &pruned_tools,
+                    );
 
                     // Capture the final post-mutation request state (see the
                     // long note ~60 lines up for why this is here and not
                     // before the mutations).
                     capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
 
-                    // Emit system prompt breakdown so CLI can record precise per-component trace.
-                    let skill_injections: Vec<astra_turn_core::context_assembly_trace::SkillInjection> =
-                        edge_profile
-                            .get("active_skills")
-                            .and_then(Value::as_array)
-                            .map(|arr| {
-                                let names: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
-                                if names.is_empty() {
-                                    vec![]
-                                } else {
-                                    // Total tokens for the skill hint section, split evenly
-                                    let hint_tokens = prompts::estimate_str_tokens(&skill_hint) as u32;
-                                    let per = hint_tokens / names.len().max(1) as u32;
-                                    names.iter().map(|name| astra_turn_core::context_assembly_trace::SkillInjection {
-                                        skill_name: name.to_string(),
-                                        skill_version: None,
-                                        tokens: per,
-                                        selection_reason: "active_output_skill".into(),
-                                    }).collect()
-                                }
-                            })
-                            .unwrap_or_default();
-                    let memory_injections: Vec<astra_turn_core::context_assembly_trace::MemoryInjection> =
-                        memory_preview.iter().enumerate().map(|(i, line)| {
-                            astra_turn_core::context_assembly_trace::MemoryInjection {
-                                memory_id: format!("prefetch-{i}"),
-                                memory_type: "hybrid_retrieval".into(),
-                                tokens: prompts::estimate_str_tokens(line) as u32,
-                                relevance_score: 0.0,
-                                content_preview: line.chars().take(100).collect(),
-                            }
-                        }).collect();
-                    let breakdown = prompts::build_system_prompt_trace(
-                        &prompt_sections,
-                        skill_injections,
-                        memory_injections,
-                    );
                     // wip-7: emit per-channel fingerprints ONLY — no raw
                     // text crosses the HTTP boundary. Raw channel content
                     // (learned feedback rules, memoria recall digests,
@@ -2231,20 +2257,10 @@ impl InProcessChatTurnBridge {
                         "type": "injection_freshness",
                         "channels": channels_payload,
                     }));
-                    yield render_sse(&json!({
-                        "type": "context_meta",
-                        "system_prompt_tokens": breakdown.total_tokens,
-                        "system_prompt_breakdown": {
-                            "base_persona_tokens": breakdown.base_persona_tokens,
-                            "environment_tokens": breakdown.environment_tokens,
-                            "user_preferences_tokens": breakdown.user_preferences_tokens,
-                            "context_signals": breakdown.context_signals,
-                            "guidance_signals": breakdown.guidance_signals,
-                            "skills_injected": breakdown.skills_injected,
-                            "repository_memories": breakdown.repository_memories,
-                            "total_tokens": breakdown.total_tokens,
-                        },
-                    }));
+                    yield render_sse(&crate::turn::llm_context::context_meta_event(
+                        &breakdown,
+                        Some(&bridge_manifest_trace_json),
+                    ));
                     let mut client_stopped = false;
                     let llm_stream = if let Some(blocks) = bridge_e2e_stream_blocks
                         .clone()
@@ -2290,7 +2306,7 @@ impl InProcessChatTurnBridge {
                                 "bridge",
                                 "context window exceeded — forcing aggressive compaction and retrying"
                             );
-                            // Emergency retry: re-route through the shared
+                            // Aggressive retry: re-route through the shared
                             // `MemoriaContext` with tighter budget overrides so
                             // the aggressive path and the main path share one
                             // compaction + summary-client construction flow.
@@ -2362,7 +2378,19 @@ impl InProcessChatTurnBridge {
                                 &round_edge_tools,
                                 crate::prompts::CompactionTier::AggressivePrune,
                             );
-                            annotate_tool_schemas_for_caching(&mut pruned_tools, &cache_cfg);
+                            crate::turn::llm_context::annotate_tool_schemas_for_cache(
+                                &mut pruned_tools,
+                                &cache_cfg,
+                            );
+                            crate::turn::llm_context::augment_manifest_trace_with_wire(
+                                &mut bridge_manifest_trace_json,
+                                &llm_messages,
+                                &pruned_tools,
+                            );
+                            yield render_sse(&crate::turn::llm_context::context_meta_event(
+                                &breakdown,
+                                Some(&bridge_manifest_trace_json),
+                            ));
                             attempt_in_round = attempt_in_round.saturating_add(1);
                             record_full_llm_request_event(
                                 &mut turn_event_buffer,

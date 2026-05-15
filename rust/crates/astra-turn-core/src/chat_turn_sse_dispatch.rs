@@ -66,6 +66,8 @@ pub struct ChatTurnSseAccum {
     pub system_prompt_tokens: Option<u32>,
     /// Detailed system prompt breakdown from runtime (via `context_meta` SSE event).
     pub system_prompt_breakdown: Option<Value>,
+    /// Lightweight manifest trace from the shared LLM context assembler.
+    pub context_manifest_trace: Option<Value>,
     /// Per-turn injection-channel fingerprints captured from the
     /// bridge's `injection_freshness` SSE event. `None` until the
     /// event fires. wip-7 contract: the CLI MUST NOT default this to
@@ -423,6 +425,9 @@ fn apply_one_event(
             }
             if let Some(b) = event.get("system_prompt_breakdown") {
                 accum.system_prompt_breakdown = Some(b.clone());
+            }
+            if let Some(trace) = event.get("context_manifest_trace") {
+                accum.context_manifest_trace = Some(trace.clone());
             }
         }
         "injection_freshness" => {
@@ -1895,5 +1900,32 @@ mod tests {
         assert_eq!(a.tool_calls[0]["id"].as_str(), Some("classic-1"));
         assert_eq!(a.tool_calls[0]["function"]["name"].as_str(), Some("bash"));
         assert_eq!(a.tool_call_id_index.get("classic-1"), Some(&0));
+    }
+}
+
+#[cfg(test)]
+mod context_manifest_trace_sse_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn context_meta_sse_parses_context_manifest_trace() {
+        let mut accum = ChatTurnSseAccum::default();
+        let mut effects = Vec::new();
+        let trace = json!({
+            "source": "llm_context",
+            "wire": {
+                "message_count": 3,
+                "total_cache_control_count": 2
+            }
+        });
+        let block = format!(
+            "data: {{\"type\":\"context_meta\",\"system_prompt_tokens\":42,\"context_manifest_trace\":{trace}}}\n\n"
+        );
+
+        dispatch_chat_turn_sse_event_block(&block, &mut accum, &mut effects);
+
+        assert_eq!(accum.system_prompt_tokens, Some(42));
+        assert_eq!(accum.context_manifest_trace, Some(trace));
     }
 }

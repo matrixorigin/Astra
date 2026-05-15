@@ -1765,6 +1765,15 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             }
             out
         }
+        "context_meta" => {
+            let mut out = serde_json::json!({ "type": "context_meta" });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
         "run_paused" => {
             // Pause/resume lifecycle events had been falling through
             // the `_` catch-all in pre-wip-7 code, which relied on
@@ -2313,5 +2322,46 @@ mod tests {
             "store has {} runs, expected ≤ {max}",
             runs.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod context_meta_transform_contract_tests {
+    use super::transform_run_event_for_client;
+    use serde_json::json;
+
+    #[test]
+    fn context_meta_journal_event_preserves_manifest_trace_for_clients() {
+        let trace = json!({
+            "source": "llm_context",
+            "wire": {"total_cache_control_count": 2}
+        });
+        let out = transform_run_event_for_client(json!({
+            "event_type": "context_meta",
+            "data": {
+                "system_prompt_tokens": 99,
+                "context_manifest_trace": trace
+            }
+        }));
+
+        assert_eq!(out["type"], "context_meta");
+        assert_eq!(out["system_prompt_tokens"], 99);
+        assert_eq!(out["context_manifest_trace"], trace);
+    }
+
+    #[test]
+    fn already_shaped_context_meta_preserves_manifest_trace_for_clients() {
+        let event = json!({
+            "type": "context_meta",
+            "system_prompt_tokens": 88,
+            "context_manifest_trace": {
+                "source": "llm_context_bridge",
+                "wire": {"message_cache_control_count": 1}
+            }
+        });
+
+        let out = transform_run_event_for_client(event.clone());
+
+        assert_eq!(out, event);
     }
 }

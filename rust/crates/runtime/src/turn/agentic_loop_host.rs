@@ -986,6 +986,11 @@ pub struct AgenticLoopState {
     /// When the gate returns `false`, the loop aborts with `Cancelled`.
     pub checkpoint_gate: Option<Arc<dyn crate::server::delegation_engine::CheckpointGate>>,
 
+    /// Last context assembly trace produced by the shared LLM context assembler.
+    /// The per-call context manifest writer uses this to describe the actual
+    /// prompt/cache assembly path instead of reconstructing it independently.
+    pub last_llm_context_manifest_trace: Option<serde_json::Value>,
+
     // ── Rate Limit Cooldown ──
     /// Cross-turn rate-limit cooldown tracker.  When the loop detects a
     /// rate-limit error (429 / TPM / RPM), it records it here so subsequent
@@ -1789,7 +1794,8 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         delegations_this_turn: 0,
         project_context: None,
         checkpoint_gate: None,
-        rate_limit_cooldown: Default::default(),
+            last_llm_context_manifest_trace: None,
+            rate_limit_cooldown: Default::default(),
         data_snapshot_provider: None,
         last_composite_snapshot: None,
         last_measured_prompt_tokens: None,
@@ -2134,6 +2140,7 @@ pub(crate) mod tests {
             delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: None,
+            last_llm_context_manifest_trace: None,
             rate_limit_cooldown: Default::default(),
             data_snapshot_provider: None,
             last_composite_snapshot: None,

@@ -113,19 +113,6 @@ pub(crate) fn provider_uses_bedrock_converse(provider: &str) -> bool {
     llm_provider_protocol(provider) == LlmProviderProtocol::BedrockConverse
 }
 
-/// Single source of truth: does this provider use explicit cache_control
-/// markers (Anthropic/Bedrock) vs prefix-only caching (everyone else)?
-///
-/// Use this everywhere instead of ad-hoc `provider == "anthropic"` checks.
-/// Adding a new Anthropic-family provider here automatically propagates to
-/// all cache-splitting, annotation, and volatile-routing decisions.
-pub(crate) fn provider_uses_explicit_cache_control(provider: &str) -> bool {
-    matches!(
-        llm_provider_protocol(provider),
-        LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::BedrockConverse
-    )
-}
-
 /// Returns true only when the *provider* is known to be DashScope / Aliyun / Alibaba.
 ///
 /// We intentionally do NOT match on model name here: Qwen models are also served

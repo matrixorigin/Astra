@@ -201,6 +201,7 @@ mod tests {
             delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: None,
+            last_llm_context_manifest_trace: None,
             rate_limit_cooldown: Default::default(),
             data_snapshot_provider: None,
             last_composite_snapshot: None,
