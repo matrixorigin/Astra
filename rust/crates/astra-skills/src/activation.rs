@@ -117,7 +117,6 @@ impl ConditionalSkillTracker {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

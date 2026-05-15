@@ -2015,7 +2015,6 @@ Skill auto-generated from session {session_short}.
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
