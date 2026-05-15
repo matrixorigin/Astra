@@ -610,7 +610,7 @@ async fn l2_38_same_root_tree_allows_sibling_artifact_access() {
         &pool,
         &format!(
             "EXPLAIN ANALYZE SELECT grant_id FROM session_artifacts_grants FORCE INDEX (idx_artifacts_grants_target) \
-             WHERE target_run_id = '{}' AND artifact_id = '{}' LIMIT 5",
+             WHERE target_run_id = '{}' AND artifact_id = '{}' AND (expires_at IS NULL OR expires_at > NOW(6)) LIMIT 5",
             be_run, artifact_id
         ),
     )

@@ -472,6 +472,28 @@ async fn phase4_state_projection_schema_contract() {
             "session_artifacts_grants missing {expected}"
         );
     }
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "session_artifacts_grants",
+            "idx_artifacts_grants_target"
+        )
+        .await,
+        ["target_run_id", "artifact_id", "expires_at"],
+        "run artifact grants must use a target/artifact/expiry index"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "session_artifacts_grants",
+            "idx_artifacts_grants_delegation_target"
+        )
+        .await,
+        ["target_delegation_id", "artifact_id", "expires_at"],
+        "delegation artifact grants must use a target/artifact/expiry index"
+    );
 
     let check_text = include_str!("../src/storage.rs");
     for expected in [

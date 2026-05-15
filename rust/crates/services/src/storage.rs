@@ -1302,7 +1302,8 @@ pub async fn ensure_core_schema(
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             UNIQUE KEY uq_artifacts_grant_target (artifact_id, grant_scope, target_run_id, target_delegation_id),
             INDEX idx_artifacts_grants_root (root_run_id, grant_scope, created_at),
-            INDEX idx_artifacts_grants_target (target_run_id, target_delegation_id, created_at)
+            INDEX idx_artifacts_grants_target (target_run_id, artifact_id, expires_at),
+            INDEX idx_artifacts_grants_delegation_target (target_delegation_id, artifact_id, expires_at)
         )",
     )
     .execute(&pool)

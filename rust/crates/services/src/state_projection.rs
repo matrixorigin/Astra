@@ -1094,23 +1094,67 @@ impl DatabaseStateProjectionStore {
         requester_run_id: &str,
         requester_delegation_id: Option<&str>,
     ) -> Result<bool, StateProjectionError> {
+        if self
+            .has_artifact_run_grant(artifact_id, requester_run_id)
+            .await?
+        {
+            return Ok(true);
+        }
+
+        let Some(requester_delegation_id) = requester_delegation_id else {
+            return Ok(false);
+        };
+
+        self.has_artifact_delegation_grant(artifact_id, requester_delegation_id)
+            .await
+    }
+
+    async fn has_artifact_run_grant(
+        &self,
+        artifact_id: &str,
+        requester_run_id: &str,
+    ) -> Result<bool, StateProjectionError> {
         let row = sqlx::query(
-            "SELECT COUNT(*) AS count FROM session_artifacts_grants
-             WHERE artifact_id = ?
-               AND (target_run_id = ? OR (target_delegation_id IS NOT NULL AND target_delegation_id = ?))
-               AND (expires_at IS NULL OR expires_at > NOW(6))",
+            "SELECT grant_id FROM session_artifacts_grants FORCE INDEX (idx_artifacts_grants_target)
+             WHERE target_run_id = ?
+               AND artifact_id = ?
+               AND (expires_at IS NULL OR expires_at > NOW(6))
+             LIMIT 1",
         )
-        .bind(artifact_id)
         .bind(requester_run_id)
-        .bind(requester_delegation_id)
-        .fetch_one(self.pool.get())
+        .bind(artifact_id)
+        .fetch_optional(self.pool.get())
         .await
         .map_err(|source| StateProjectionError::Database {
-            operation: "load_artifact_grant",
+            operation: "load_artifact_run_grant",
             entity: artifact_id.to_string(),
             source,
         })?;
-        Ok(row.try_get::<i64, _>("count").unwrap_or(0) > 0)
+        Ok(row.is_some())
+    }
+
+    async fn has_artifact_delegation_grant(
+        &self,
+        artifact_id: &str,
+        requester_delegation_id: &str,
+    ) -> Result<bool, StateProjectionError> {
+        let row = sqlx::query(
+            "SELECT grant_id FROM session_artifacts_grants FORCE INDEX (idx_artifacts_grants_delegation_target)
+             WHERE target_delegation_id = ?
+               AND artifact_id = ?
+               AND (expires_at IS NULL OR expires_at > NOW(6))
+             LIMIT 1",
+        )
+        .bind(requester_delegation_id)
+        .bind(artifact_id)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| StateProjectionError::Database {
+            operation: "load_artifact_delegation_grant",
+            entity: artifact_id.to_string(),
+            source,
+        })?;
+        Ok(row.is_some())
     }
 
     async fn load_run_acl(&self, run_id: &str) -> Result<Option<RunAclRow>, StateProjectionError> {
