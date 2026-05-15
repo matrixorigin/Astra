@@ -4727,7 +4727,10 @@ mod tests {
         assert_eq!(persisted.tool_count, Some(1));
         assert_eq!(persisted.tools_used, Some(vec!["read_file".into()]));
         assert_eq!(persisted.tool_calls.as_ref().map(Vec::len), Some(2));
-        assert_eq!(persisted.metadata.as_ref().unwrap()["run_id"], "run-failure-1");
+        assert_eq!(
+            persisted.metadata.as_ref().unwrap()["run_id"],
+            "run-failure-1"
+        );
     }
 
     /// Regression: pressing Ctrl+C while the model was streaming used to drop
@@ -5045,7 +5048,10 @@ mod tests {
             .find(|event| event.event_type == session_journal::JournalEventType::Turn)
             .expect("persisted turn event");
         assert_eq!(persisted.metadata.as_ref().unwrap()["partial"], true);
-        assert_eq!(persisted.metadata.as_ref().unwrap()["run_id"], "run-budget-1");
+        assert_eq!(
+            persisted.metadata.as_ref().unwrap()["run_id"],
+            "run-budget-1"
+        );
     }
 
     #[test]

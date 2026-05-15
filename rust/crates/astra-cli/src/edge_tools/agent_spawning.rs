@@ -145,23 +145,19 @@ fn normalize_spawn_agent_args(args: &Value) -> Result<Value, String> {
         .ok_or_else(|| "spawn input must be a JSON object".to_string())?;
 
     if obj.contains_key("agents") {
-        return Err(
-            "unsupported `agents` payload for agent.spawn: each \
+        return Err("unsupported `agents` payload for agent.spawn: each \
              `agent(action='spawn', ...)` call launches exactly one child. \
              To fan out N sub-agents in parallel, emit N separate `agent` \
              tool calls in a single assistant message, each with \
              `action='spawn'` and `run_in_background: true`."
-                .to_string(),
-        );
+            .to_string());
     }
 
     if obj.contains_key("task") {
-        return Err(
-            "unsupported deprecated `task` field for agent.spawn. \
+        return Err("unsupported deprecated `task` field for agent.spawn. \
              Use top-level `prompt` for the full child task brief and \
              `description` for the short UI summary."
-                .to_string(),
-        );
+            .to_string());
     }
 
     let description = non_empty_string(obj.get("description")).map(str::to_string);
