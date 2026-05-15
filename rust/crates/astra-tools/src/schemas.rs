@@ -701,6 +701,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "function": {
                 "name": "agent",
                 "description": "Multi-agent operations. Actions: spawn, get_result, run_chain, send_message.\n\n\
+        ## Required fields per action\n\
+        - `spawn`: REQUIRES `action`, `description`, `prompt`. (Optional: `agent_type`, `run_in_background`, `model`, `max_turns`, `complexity`, `isolated`, `allowed_tools`, `name`.)\n\
+        - `get_result`: REQUIRES `action`, `agent_id`.\n\
+        - `run_chain`: REQUIRES `action`, `steps`.\n\
+        - `send_message`: REQUIRES `action`, `to`, `message`.\n\n\
+        Calling `agent(action='spawn')` WITHOUT `prompt` fails validation. The `description` is a one-line summary the user sees in the UI; `prompt` is the full task brief the sub-agent receives. Both are required — they are not interchangeable.\n\n\
+        ## Spawn example\n\
+        `agent(action='spawn', description='Audit auth flow', prompt='Read src/auth/* and report any token-handling bugs. Focus on session expiry and refresh logic. Return findings as a numbered list.', agent_type='general-purpose')`\n\n\
         ## Execution mode\n\
         - **Default (synchronous)**: `spawn` blocks until the sub-agent's final result is ready. Use this for work you depend on in the current turn. The sub-agent's tool calls stream back inline — the TUI renders them inside the parent Task card so the user sees progress live.\n\
         - **Background**: pass `run_in_background: true` (alias: legacy `background: true`) to return immediately with `{agent_id}`. Use this for fire-and-forget or long-running work you don't need to await; follow up with `get_result` later. Durable-task store persists the run across session death so it survives `astra` restarts.\n\n\
@@ -710,21 +718,21 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["spawn","get_result","run_chain","send_message"]},
-                        "steps": {"type": "array", "description": "Chain steps (run_chain)"},
-                        "description": {"type": "string", "description": "Short task description (spawn)"},
-                        "prompt": {"type": "string", "description": "Detailed prompt (spawn)"},
-                        "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"]},
-                        "model": {"type": "string", "description": "Model override (spawn)"},
+                        "steps": {"type": "array", "description": "REQUIRED for action='run_chain'. Sequence of chain steps to execute."},
+                        "description": {"type": "string", "description": "REQUIRED for action='spawn'. One-line task summary shown in the UI Task card. Distinct from `prompt` — both are required for spawn."},
+                        "prompt": {"type": "string", "description": "REQUIRED for action='spawn'. Full task brief sent to the sub-agent. This is the prompt the child sees, not the UI label. Without this field, spawn fails validation."},
+                        "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Sub-agent persona (spawn). Default: general-purpose."},
+                        "model": {"type": "string", "description": "Model override (spawn). Default: parent's model."},
                         "run_in_background": {"type": "boolean", "description": "If true, return immediately with agent_id instead of blocking on the sub-agent's final result. Default false (sync). Applies to spawn."},
                         "background": {"type": "boolean", "description": "(Deprecated alias for run_in_background.) If true, return immediately with agent_id (spawn)."},
-                        "name": {"type": "string", "description": "Addressable name (spawn)"},
+                        "name": {"type": "string", "description": "Addressable name (spawn). Optional; auto-generated if omitted."},
                         "max_turns": {"type": "integer", "description": "Max turns (spawn). Explicit value wins over `complexity`."},
                         "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Task-complexity hint scaling the default budget when `max_turns` is absent. `light`≈10 turns, `normal`=agent default, `deep`=2× default. Use `deep` for review/refactor/multi-file tasks that routinely exhaust the default."},
                         "isolated": {"type": "boolean", "description": "Use isolated worktree (spawn)"},
                         "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
-                        "agent_id": {"type": "string", "description": "Agent ID (get_result)"},
-                        "to": {"type": "string", "description": "Recipient agent_id or '*' (send_message)"},
-                        "message": {"description": "Message content (send_message)"},
+                        "agent_id": {"type": "string", "description": "REQUIRED for action='get_result'. The agent_id returned by a prior spawn."},
+                        "to": {"type": "string", "description": "REQUIRED for action='send_message'. Recipient agent_id, or '*' for broadcast."},
+                        "message": {"description": "REQUIRED for action='send_message'. Message content."},
                         "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"]},
                         "priority": {"type": "string", "enum": ["low","normal","high"]}
                     },
