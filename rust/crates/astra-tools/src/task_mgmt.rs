@@ -433,10 +433,14 @@ fn max_task_id(tasks: &[SessionTask]) -> u32 {
 /// Bidirectional subtask ↔ parent status reconciliation. Called after
 /// any subtask mutation that might flip the all-completed state.
 ///
-/// Forward arm (all subtasks completed → parent completed): only fires
-/// when the parent is in an *active* state (pending / in_progress).
-/// Terminal non-success states (failed / cancelled) stay as-is, since
-/// promoting them to completed would silently erase a failure signal.
+/// Forward arms:
+/// - any started subtask (`in_progress` / `completed`) promotes a still-pending
+///   parent to `in_progress`, so the task board stops reading the parent as
+///   untouched work once execution has clearly begun.
+/// - all subtasks completed → parent completed, but only when the parent is in
+///   an *active* state (pending / in_progress). Terminal non-success states
+///   (failed / cancelled) stay as-is, since promoting them to completed would
+///   silently erase a failure signal.
 ///
 /// Reverse arm (a subtask flipped back from completed → parent reopens):
 /// only fires when the parent is currently exactly "completed". If the
@@ -455,6 +459,15 @@ fn reconcile_subtask_completion(task: &mut SessionTask) {
         if matches!(task.status.as_str(), "pending" | "in_progress") {
             task.status = "completed".to_string();
         }
+        return;
+    }
+
+    let any_started = task
+        .subtasks
+        .iter()
+        .any(|st| matches!(st.status.as_str(), "in_progress" | "completed"));
+    if any_started && task.status == "pending" {
+        task.status = "in_progress".to_string();
     } else if task.status == "completed" {
         task.status = "in_progress".to_string();
     }
@@ -1568,8 +1581,8 @@ mod tests {
         let after_first: SessionTask =
             serde_json::from_str(&after_first).expect("task json after first subtask");
         assert!(
-            after_first.status == "pending",
-            "parent should stay pending until every subtask completes: {after_first:?}"
+            after_first.status == "in_progress",
+            "once a subtask completes, the parent should stop reading as untouched pending work: {after_first:?}"
         );
 
         let second = m
@@ -1586,6 +1599,38 @@ mod tests {
         assert!(
             after_second.status == "completed",
             "parent should auto-complete after the last subtask completes: {after_second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn starting_a_subtask_promotes_pending_parent_to_in_progress() {
+        let m = mgr();
+        let create = m
+            .create(&json!({
+                "title": "parent",
+                "subtasks": [
+                    {"id": "s1", "title": "first"},
+                    {"id": "s2", "title": "second"}
+                ]
+            }))
+            .await;
+        assert!(create.contains("\"success\":true"), "{create}");
+
+        let start = m
+            .update(&json!({
+                "task_id": "task-1",
+                "subtask_id": "s1",
+                "status": "in_progress"
+            }))
+            .await;
+        assert!(start.contains("\"success\":true"), "{start}");
+
+        let after = m.get(&json!({"task_id": "task-1"})).await;
+        let after: SessionTask =
+            serde_json::from_str(&after).expect("task json after starting subtask");
+        assert_eq!(
+            after.status, "in_progress",
+            "an active subtask should make the parent read as in-progress so the task board doesn't show it as merely open"
         );
     }
 

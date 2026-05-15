@@ -6326,6 +6326,35 @@ esac
         }
     }
 
+    #[derive(Debug, Default)]
+    struct FailingPlanTodoSink {
+        fail_seed: bool,
+        fail_supersede: bool,
+    }
+
+    #[async_trait]
+    impl astra_services::PlanTodoSink for FailingPlanTodoSink {
+        async fn seed(&self, _todos: Vec<astra_services::PlanTodoSeed>) -> Result<(), String> {
+            if self.fail_seed {
+                Err("synthetic seed failure".to_string())
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn supersede_other_plans(
+            &self,
+            _session_id: &str,
+            _keep_plan_id: &str,
+        ) -> Result<u64, String> {
+            if self.fail_supersede {
+                Err("synthetic supersede failure".to_string())
+            } else {
+                Ok(0)
+            }
+        }
+    }
+
     /// U-6 (unhappy path): when the user re-enters plan mode with a
     /// new plan, the prior plan's seeded `session_plan_todos` rows
     /// must be marked `superseded` so `task.list` doesn't show
@@ -6366,6 +6395,170 @@ esac
         assert!(
             !keep_id.is_empty(),
             "keep_plan_id must be the new plan's id, not empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_plan_mode_without_plan_repo_fails_fast() {
+        let (mut exec, _dir) = test_executor();
+        exec.session_id = "planless-session".to_string();
+
+        let result = exec
+            .execute("enter_plan_mode", &json!({"goal": "ship feature"}))
+            .await;
+        assert!(
+            result.contains("plan repository not configured"),
+            "missing repo must fail fast with an actionable message, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_without_plan_repo_fails_fast() {
+        let (mut exec, _dir) = test_executor();
+        exec.session_id = "planless-session".to_string();
+
+        let result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            result.contains("plan repository not configured"),
+            "missing repo must fail fast with an actionable message, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_without_active_plan_returns_note() {
+        let repo = Arc::new(InMemoryPlanRepo::new());
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo as Arc<dyn astra_plan::PlanRepository>);
+        exec.session_id = "no-active-plan".to_string();
+
+        let result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            result.contains("nothing to exit"),
+            "no-active-plan path should return a soft note, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_rejected_keeps_write_guard_blocking() {
+        let repo = Arc::new(InMemoryPlanRepo::new());
+        let mut state = astra_plan::PlanModeState::new_with_owner(
+            "draft plan".into(),
+            astra_plan::ProjectContext::default(),
+            "alice".into(),
+        );
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "s1".into(),
+                title: "step 1".into(),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        repo.save("plan-reject-lock-test", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("reject-lock-session", Some("plan-reject-lock-test"))
+            .await
+            .unwrap();
+
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo as Arc<dyn astra_plan::PlanRepository>);
+        exec.session_id = "reject-lock-session".to_string();
+        exec.user_id = "alice".to_string();
+
+        let exit = exec
+            .execute("exit_plan_mode", &json!({"approved": false}))
+            .await;
+        assert!(
+            exit.contains("remain blocked"),
+            "rejected plan should stay in authoring mode, got: {exit}"
+        );
+
+        let bash = exec
+            .execute("bash", &json!({"command": "echo hello"}))
+            .await;
+        assert!(
+            bash.contains("blocked while plan mode is active"),
+            "write guard must still block after rejection, got: {bash}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_seed_failure_is_non_fatal_and_unlocks_writes() {
+        let repo = Arc::new(InMemoryPlanRepo::new());
+        let mut state = astra_plan::PlanModeState::new_with_owner(
+            "seed failure plan".into(),
+            astra_plan::ProjectContext::default(),
+            "alice".into(),
+        );
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "s1".into(),
+                title: "step 1".into(),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        repo.save("plan-seed-fail-test", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("seed-fail-session", Some("plan-seed-fail-test"))
+            .await
+            .unwrap();
+
+        let sink = Arc::new(FailingPlanTodoSink {
+            fail_seed: true,
+            fail_supersede: false,
+        });
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo as Arc<dyn astra_plan::PlanRepository>);
+        exec.set_plan_todo_sink(sink as Arc<dyn astra_services::PlanTodoSink>);
+        exec.session_id = "seed-fail-session".to_string();
+        exec.user_id = "alice".to_string();
+
+        let exit = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            exit.contains("unlocked"),
+            "seed failure must not roll back approval, got: {exit}"
+        );
+
+        let bash = exec
+            .execute("bash", &json!({"command": "echo hello"}))
+            .await;
+        assert!(
+            !bash.contains("blocked while plan mode is active"),
+            "writes should still unlock even when seeding fails, got: {bash}"
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_plan_mode_supersede_failure_is_non_fatal() {
+        let repo = Arc::new(InMemoryPlanRepo::new());
+        let sink = Arc::new(FailingPlanTodoSink {
+            fail_seed: false,
+            fail_supersede: true,
+        });
+
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo as Arc<dyn astra_plan::PlanRepository>);
+        exec.set_plan_todo_sink(sink as Arc<dyn astra_services::PlanTodoSink>);
+        exec.session_id = "supersede-fail-session".to_string();
+        exec.user_id = "alice".to_string();
+
+        let result = exec
+            .execute("enter_plan_mode", &json!({"goal": "ship feature Y"}))
+            .await;
+        assert!(
+            result.contains("Entered plan mode"),
+            "supersede failure must not abort plan entry, got: {result}"
         );
     }
 

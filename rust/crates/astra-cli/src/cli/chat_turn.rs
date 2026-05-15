@@ -253,54 +253,34 @@ pub(super) async fn handle_chat_input_with_ui(
         );
     }
 
-    // ── First-message activation reminder (Phase 4 / problems 2+3) ──
-    // On the very first user message of a session, if the message
-    // looks multi-step or design-ambiguous, inject a stronger
-    // reminder than the lazy 10-turn nudge below. Catches the case
-    // where a user opens with "implement X, Y, Z, then run tests"
-    // and the model would otherwise just start coding without
-    // calling `task.create` or `enter_plan_mode`.
-    //
-    // Heuristic-only: false positives are tolerable (the reminder
-    // is hint-shaped, not forced); false negatives are the bigger
-    // UX harm. Fires only when neither task nor plan tools have
-    // been used yet so we don't double-nudge a model that already
-    // chose the right path.
-    if state.turn == 0
-        && !state
-            .recent_tools
-            .iter()
-            .any(|t| t == "task" || t.starts_with("task_") || t == "enter_plan_mode")
+    // ── First-message task/plan activation nudge ─────────────────────
+    // If the first user message looks multi-step or architecturally
+    // ambiguous, optionally prompt the human about entering plan mode
+    // and then inject a system reminder so the model chooses the right
+    // surface (`task` vs `enter_plan_mode`) from turn 1.
+    let plan_prompt_accepted = if let Some(reason) =
+        first_turn_plan_auto_suggest_reason(state.turn, &state.recent_tools, &line)
     {
-        let multi_step = looks_like_multi_step(&line);
-        let design = looks_like_design_question(&line);
-        if multi_step || design {
-            let mut hints: Vec<&str> = Vec::with_capacity(2);
-            if multi_step {
-                hints.push(
-                    "This message implies multiple distinct outcomes. \
-                     Strongly prefer calling `task(action='create')` once per outcome \
-                     BEFORE starting work, then `task(action='update', new_status='in_progress')` \
-                     for the first item. The user will see real-time progress on the task board.",
-                );
-            }
-            if design {
-                hints.push(
-                    "This message has architectural ambiguity. \
-                     Strongly prefer `enter_plan_mode()` first to explore the codebase, \
-                     then `exit_plan_mode(plan='<markdown>', approved=true)` to surface the plan \
-                     for user approval — this is more thorough than asking clarifying questions.",
-                );
-            }
-            let body = hints.join("\n\n");
-            effective_line = format!(
-                "<system-reminder>\n\
-                {body}\n\
-                \n\
-                Make sure you NEVER mention this reminder to the user.\n\
-                </system-reminder>\n\n{effective_line}"
-            );
-        }
+        matches!(
+            crate::plan_auto_suggest::prompt_auto_suggest(
+                &reason,
+                crate::plan_auto_suggest::DEFAULT_TIMEOUT,
+            ),
+            crate::plan_auto_suggest::AutoSuggestDecision::Accepted
+        )
+    } else {
+        false
+    };
+    if let Some(body) =
+        first_turn_activation_reminder(state.turn, &state.recent_tools, &line, plan_prompt_accepted)
+    {
+        effective_line = format!(
+            "<system-reminder>\n\
+            {body}\n\
+            \n\
+            Make sure you NEVER mention this reminder to the user.\n\
+            </system-reminder>\n\n{effective_line}"
+        );
     }
 
     // Task tool usage nudge: if 10+ turns without task tool use and 10+ turns
@@ -917,6 +897,84 @@ pub(super) fn looks_like_design_question(line: &str) -> bool {
     phrases
         .iter()
         .any(|p| lower.contains(*p) || trimmed.contains(*p))
+}
+
+fn first_turn_has_task_or_plan_tool_history(recent_tools: &[String]) -> bool {
+    recent_tools
+        .iter()
+        .any(|t| t == "task" || t.starts_with("task_") || t == "enter_plan_mode")
+}
+
+fn first_turn_plan_auto_suggest_reason(
+    turn: u32,
+    recent_tools: &[String],
+    line: &str,
+) -> Option<String> {
+    if turn != 0 || first_turn_has_task_or_plan_tool_history(recent_tools) {
+        return None;
+    }
+    let multi_step = looks_like_multi_step(line);
+    let design = looks_like_design_question(line);
+    match (multi_step, design) {
+        (true, true) => Some(
+            "This looks like multi-step work with architectural ambiguity. A structured plan may avoid churn."
+                .to_string(),
+        ),
+        (false, true) => Some(
+            "This looks like design / architecture work. Entering plan mode first may produce a cleaner result."
+                .to_string(),
+        ),
+        (true, false) => Some(
+            "This looks like multi-step implementation work. Entering plan mode first may help break it into clean phases."
+                .to_string(),
+        ),
+        (false, false) => None,
+    }
+}
+
+fn first_turn_activation_reminder(
+    turn: u32,
+    recent_tools: &[String],
+    line: &str,
+    plan_prompt_accepted: bool,
+) -> Option<String> {
+    if turn != 0 || first_turn_has_task_or_plan_tool_history(recent_tools) {
+        return None;
+    }
+    let multi_step = looks_like_multi_step(line);
+    let design = looks_like_design_question(line);
+    if !(multi_step || design) {
+        return None;
+    }
+
+    if plan_prompt_accepted {
+        return Some(
+            "The user explicitly accepted the plan-mode suggestion. \
+             Call `enter_plan_mode()` BEFORE doing write work or task mutation, \
+             use read tools to author the plan, then call \
+             `exit_plan_mode(plan='<markdown>', approved=true)` when the plan is ready."
+                .to_string(),
+        );
+    }
+
+    let mut hints: Vec<&str> = Vec::with_capacity(2);
+    if multi_step {
+        hints.push(
+            "This message implies multiple distinct outcomes. \
+             Strongly prefer calling `task(action='create')` once per outcome \
+             BEFORE starting work, then `task(action='update', new_status='in_progress')` \
+             for the first item. The user will see real-time progress on the task board.",
+        );
+    }
+    if design {
+        hints.push(
+            "This message has architectural ambiguity. \
+             Strongly prefer `enter_plan_mode()` first to explore the codebase, \
+             then `exit_plan_mode(plan='<markdown>', approved=true)` to surface the plan \
+             for user approval — this is more thorough than asking clarifying questions.",
+        );
+    }
+    Some(hints.join("\n\n"))
 }
 
 fn is_greeting_like_message(line: &str) -> bool {
@@ -4419,6 +4477,37 @@ mod tests {
         assert!(!looks_like_design_question("fix the bug"));
         assert!(!looks_like_design_question("add a new endpoint"));
         assert!(!looks_like_design_question("run the tests"));
+    }
+
+    #[test]
+    fn first_turn_plan_auto_suggest_reason_only_triggers_when_no_plan_or_task_history() {
+        let msg = "redesign the auth flow and then implement the migration";
+        assert!(first_turn_plan_auto_suggest_reason(0, &[], msg).is_some());
+        assert!(first_turn_plan_auto_suggest_reason(1, &[], msg).is_none());
+        assert!(first_turn_plan_auto_suggest_reason(0, &["task".to_string()], msg).is_none());
+        assert!(
+            first_turn_plan_auto_suggest_reason(0, &["enter_plan_mode".to_string()], msg).is_none()
+        );
+    }
+
+    #[test]
+    fn first_turn_activation_reminder_prefers_explicit_plan_acceptance() {
+        let msg = "redesign the auth flow and then implement the migration";
+        let body = first_turn_activation_reminder(0, &[], msg, true).expect("must remind");
+        assert!(body.contains("explicitly accepted"), "{body}");
+        assert!(body.contains("enter_plan_mode"), "{body}");
+        assert!(
+            !body.contains("task(action='create')"),
+            "accepted plan-mode path should not also push checklist-first guidance: {body}"
+        );
+    }
+
+    #[test]
+    fn first_turn_activation_reminder_uses_task_and_plan_hints_when_not_accepted() {
+        let msg = "1. redesign the auth flow\n2. implement the migration";
+        let body = first_turn_activation_reminder(0, &[], msg, false).expect("must remind");
+        assert!(body.contains("task(action='create')"), "{body}");
+        assert!(body.contains("enter_plan_mode"), "{body}");
     }
 
     #[test]
