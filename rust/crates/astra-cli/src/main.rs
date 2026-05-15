@@ -91,6 +91,8 @@ mod effects;
 mod file_history;
 #[path = "cli/followup_suggestion.rs"]
 mod followup_suggestion;
+#[path = "cli/http_task_service.rs"]
+mod http_task_service;
 #[path = "cli/idle_agent_messages.rs"]
 mod idle_agent_messages;
 #[path = "cli/journal_diff.rs"]
@@ -113,14 +115,10 @@ mod plan_auto_suggest;
 mod plan_executor;
 #[path = "cli/plan_interaction.rs"]
 mod plan_interaction;
-#[path = "cli/http_task_service.rs"]
-mod http_task_service;
 #[path = "cli/plan_mode_client.rs"]
 mod plan_mode_client;
 #[path = "cli/plan_monitor.rs"]
 mod plan_monitor;
-#[path = "cli/session_todo_client.rs"]
-mod session_todo_client;
 #[path = "cli/plan_runtime.rs"]
 mod plan_runtime;
 #[path = "cli/preferences_client.rs"]
@@ -140,6 +138,8 @@ mod session_runtime;
 mod session_startup;
 #[path = "cli/session_state.rs"]
 mod session_state;
+#[path = "cli/session_todo_client.rs"]
+mod session_todo_client;
 #[path = "cli/skill_subrun.rs"]
 mod skill_subrun;
 #[path = "cli/slash_account.rs"]

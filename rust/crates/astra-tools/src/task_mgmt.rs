@@ -1296,7 +1296,9 @@ mod tests {
         m.create(&json!({"title": "Implement dark mode toggle"}))
             .await;
         // Same intent, different punctuation/spacing.
-        let dup = m.create(&json!({"title": "  Implement DARK mode toggle. "})).await;
+        let dup = m
+            .create(&json!({"title": "  Implement DARK mode toggle. "}))
+            .await;
         assert!(
             dup.contains("Refused"),
             "second create should be refused with duplicate notice; got {dup}"
@@ -2159,8 +2161,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_active_uses_load_active_not_load_all() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         struct CountingStore {
             inner: InMemoryTaskStore,
             load_all_calls: Arc<AtomicUsize>,
@@ -2285,7 +2287,13 @@ mod tests {
             .await;
 
         let out = m.list(&json!({"status_filter": "all"})).await;
-        assert!(out.contains("alpha"), "all-filter must include pending; got: {out}");
-        assert!(out.contains("beta"), "all-filter must include completed; got: {out}");
+        assert!(
+            out.contains("alpha"),
+            "all-filter must include pending; got: {out}"
+        );
+        assert!(
+            out.contains("beta"),
+            "all-filter must include completed; got: {out}"
+        );
     }
 }

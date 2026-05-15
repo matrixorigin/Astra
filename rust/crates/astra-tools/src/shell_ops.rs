@@ -625,10 +625,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
                         .to_string(),
                 );
                 let mut metadata = serde_json::Map::new();
-                metadata.insert(
-                    "bash_detached".to_string(),
-                    serde_json::Value::Bool(true),
-                );
+                metadata.insert("bash_detached".to_string(), serde_json::Value::Bool(true));
                 result.metadata = Some(metadata);
                 return result;
             }
@@ -4673,7 +4670,10 @@ printf 'probe.txt:1:needle\n'
             .payload_rx
             .await
             .expect("listener must receive detached payload");
-        assert_eq!(payload.command, "printf 'before\\n'; sleep 1; printf 'after\\n'");
+        assert_eq!(
+            payload.command,
+            "printf 'before\\n'; sleep 1; printf 'after\\n'"
+        );
         assert!(
             payload.partial_stdout.contains("before"),
             "partial stdout must include the bytes consumed before detach: {:?}",

@@ -805,9 +805,7 @@ pub(super) fn looks_like_multi_step(line: &str) -> bool {
         .iter()
         .filter(|l| {
             let mut chars = l.chars();
-            chars
-                .next()
-                .is_some_and(|c| c.is_ascii_digit())
+            chars.next().is_some_and(|c| c.is_ascii_digit())
                 && matches!(
                     chars.next(),
                     // ASCII period and paren, plus 中文版本: ideographic
@@ -1202,6 +1200,7 @@ async fn run_chat_turn(
             tool_health_entries: &state.tool_health_entries,
             session_lessons: &state.session_lessons,
             latest_skill_diagnosis: state.latest_skill_diagnosis.as_ref(),
+            latest_turn_quality_feedback: state.latest_turn_quality_feedback.as_ref(),
             unified_skill_registry: &state.unified_skill_registry,
             plan_only_chat: state.chat_plan_only && state.current_plan_subtask_id.is_none(),
             is_plan_subtask: state.current_plan_subtask_id.is_some(),
@@ -1931,6 +1930,93 @@ pub(super) fn analyze_chat_turn_learning(
     TurnLearningSnapshot { routing, eval }
 }
 
+fn turn_quality_feedback_from_eval(
+    turn: u32,
+    eval: &astra_runtime::pipeline::evaluation::TurnEvaluation,
+) -> Option<astra_runtime::self_model::TurnQualityFeedback> {
+    use astra_runtime::pipeline::evaluation::EvalSignal;
+    use std::collections::BTreeSet;
+
+    let mut findings = Vec::new();
+    let mut repeated_tools = BTreeSet::new();
+    let mut saw_batching_issue = false;
+    let mut saw_stall_issue = false;
+
+    for signal in &eval.signals {
+        match signal {
+            EvalSignal::SequentialReadChurn(streak) => {
+                saw_batching_issue = true;
+                findings.push(format!(
+                    "Detected {streak} consecutive single-tool rounds; independent reads/searches should be batched in one round."
+                ));
+            }
+            EvalSignal::RepeatToolCall(tool) => {
+                repeated_tools.insert(tool.clone());
+            }
+            EvalSignal::StallDetected => {
+                saw_stall_issue = true;
+                findings.push(
+                    "TurnGuard detected a stall/divergence; stop broad exploration and take a concrete next action."
+                        .to_string(),
+                );
+            }
+            EvalSignal::VerdictWarning => {
+                saw_stall_issue = true;
+                findings.push(
+                    "TurnGuard emitted a warning-or-higher verdict; follow that warning instead of continuing the same pattern."
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    if !repeated_tools.is_empty() {
+        let rendered = repeated_tools
+            .iter()
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        findings.push(format!(
+            "Repeated tool calls detected for {rendered}; inspect prior results before retrying the same tool/arguments."
+        ));
+    }
+
+    if findings.is_empty() {
+        return None;
+    }
+
+    let recommended_action = match (
+        saw_batching_issue,
+        !repeated_tools.is_empty(),
+        saw_stall_issue,
+    ) {
+        (true, true, true) => {
+            "Batch independent reads/searches, reuse previous tool output before repeating calls, then choose one concrete recovery action."
+        }
+        (true, true, false) => {
+            "Batch independent reads/searches in one round and reuse previous output before repeating a tool call."
+        }
+        (true, false, _) => {
+            "Before the next tool round, group independent reads/searches into a parallel batch."
+        }
+        (false, true, _) => {
+            "Before retrying a tool, compare against prior output and change arguments only when new evidence requires it."
+        }
+        (false, false, true) => {
+            "Summarize current evidence, stop broad exploration, and take one concrete next action."
+        }
+        (false, false, false) => unreachable!("findings would be empty without a tracked issue"),
+    };
+
+    Some(astra_runtime::self_model::TurnQualityFeedback {
+        turn,
+        findings,
+        recommended_action: recommended_action.to_string(),
+    })
+}
+
 // record_selector_turn_outcome removed — tool selector no longer exists.
 
 /// Test-only sync variant of `apply_turn_success`. Production code paths must
@@ -2140,6 +2226,8 @@ fn apply_turn_success_sync(
     }
 
     let learning_snap = analyze_chat_turn_learning(line, state.turn, &state.recent_tools, &result);
+    state.latest_turn_quality_feedback =
+        turn_quality_feedback_from_eval(state.turn, &learning_snap.eval);
     let mut result = result;
     let routing_domain = learning_snap
         .routing
@@ -4323,9 +4411,7 @@ mod tests {
             "should we use Redis vs in-memory for the rate limiter?"
         ));
         assert!(looks_like_design_question("redesign the auth flow"));
-        assert!(looks_like_design_question(
-            "重新设计一下数据流的架构"
-        ));
+        assert!(looks_like_design_question("重新设计一下数据流的架构"));
     }
 
     #[test]
@@ -4897,6 +4983,69 @@ mod tests {
             "llm-round churn must revoke all_tools_healthy: {:?}",
             learning.eval.signals
         );
+    }
+
+    #[test]
+    fn turn_quality_feedback_mentions_batching_repeats_and_stalls() {
+        use astra_runtime::pipeline::evaluation::{
+            EvalSignal, EvaluationThresholds, TurnEvaluation,
+        };
+
+        let eval = TurnEvaluation {
+            success: false,
+            quality: 0.2,
+            confidence: 0.8,
+            signals: vec![
+                EvalSignal::SequentialReadChurn(13),
+                EvalSignal::RepeatToolCall("bash".to_string()),
+                EvalSignal::RepeatToolCall("read_file".to_string()),
+                EvalSignal::StallDetected,
+                EvalSignal::VerdictWarning,
+            ],
+            thresholds: EvaluationThresholds::default(),
+        };
+
+        let feedback = turn_quality_feedback_from_eval(9, &eval).expect("feedback");
+        assert_eq!(feedback.turn, 9);
+        assert!(
+            feedback
+                .findings
+                .iter()
+                .any(|f| f.contains("13 consecutive single-tool rounds")),
+            "{feedback:?}"
+        );
+        assert!(
+            feedback
+                .findings
+                .iter()
+                .any(|f| f.contains("bash") && f.contains("read_file")),
+            "{feedback:?}"
+        );
+        assert!(
+            feedback.recommended_action.contains("Batch independent"),
+            "{feedback:?}"
+        );
+    }
+
+    #[test]
+    fn turn_quality_feedback_ignores_untracked_or_empty_signals() {
+        use astra_runtime::pipeline::evaluation::{
+            EvalSignal, EvaluationThresholds, TurnEvaluation,
+        };
+
+        let eval = TurnEvaluation {
+            success: true,
+            quality: 0.8,
+            confidence: 0.7,
+            signals: vec![
+                EvalSignal::ToolErrorRate(0.0),
+                EvalSignal::AllToolsHealthy,
+                EvalSignal::EmptyToolOutput,
+            ],
+            thresholds: EvaluationThresholds::default(),
+        };
+
+        assert!(turn_quality_feedback_from_eval(3, &eval).is_none());
     }
 
     #[test]

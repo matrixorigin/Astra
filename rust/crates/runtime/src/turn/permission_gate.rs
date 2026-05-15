@@ -201,14 +201,13 @@ fn is_read_only_in_plan_mode(tool_name: &str) -> bool {
             | "ask_user"
             | "notify"
             | "view_image"
-            | "exit_plan_mode"
-            // Read-only sub-actions of `git` tool. The full git tool also
-            // has stash/commit/revert which mutate, but the model picks
-            // those by `action` — we'd need argument-aware filtering to
-            // be safe, so deny the whole git tool in plan mode for now
-            // and let the model use individual git read tools through
-            // bash if it really must (which is itself denied — the
-            // intent is "read the code, don't mutate state").
+            | "exit_plan_mode" // Read-only sub-actions of `git` tool. The full git tool also
+                               // has stash/commit/revert which mutate, but the model picks
+                               // those by `action` — we'd need argument-aware filtering to
+                               // be safe, so deny the whole git tool in plan mode for now
+                               // and let the model use individual git read tools through
+                               // bash if it really must (which is itself denied — the
+                               // intent is "read the code, don't mutate state").
     )
 }
 

@@ -584,6 +584,11 @@ pub struct ToolExecutor {
     /// `set_latest_skill_diagnosis(None)` clears it once the triggering
     /// condition has resolved.
     latest_skill_diagnosis: std::sync::Mutex<Option<astra_skills::auto_invoke::SkillDiagnosis>>,
+    /// Latest passive evaluator feedback from the previous turn. Kept separate
+    /// from auto-invoked skill diagnoses so evaluator hints are not lost to
+    /// diagnosis cooldown/clear behavior.
+    latest_turn_quality_feedback:
+        std::sync::Mutex<Option<astra_runtime::self_model::TurnQualityFeedback>>,
     /// Per-turn mutation accounting for adjust_config governor.
     /// (turn_number, mutations_applied_on_turn)
     self_mod_mutation_counter: std::sync::Mutex<(u32, u32)>,
@@ -668,6 +673,7 @@ impl ToolExecutor {
             self_mod_deprioritized_tools: std::sync::Mutex::new(Vec::new()),
             session_lessons: std::sync::Mutex::new(Vec::new()),
             latest_skill_diagnosis: std::sync::Mutex::new(None),
+            latest_turn_quality_feedback: std::sync::Mutex::new(None),
             self_mod_mutation_counter: std::sync::Mutex::new((0, 0)),
             default_executor: astra_tools::executor::DefaultToolExecutor::new(
                 astra_tools::ToolContext {
@@ -914,6 +920,15 @@ impl ToolExecutor {
         }
     }
 
+    pub fn set_latest_turn_quality_feedback(
+        &self,
+        feedback: Option<astra_runtime::self_model::TurnQualityFeedback>,
+    ) {
+        if let Ok(mut g) = self.latest_turn_quality_feedback.lock() {
+            *g = feedback;
+        }
+    }
+
     /// Use a shared file edit journal (session-scoped) instead of the default.
     ///
     /// If an `active_session_id` is already set when this is called, the
@@ -1031,10 +1046,7 @@ impl ToolExecutor {
         self
     }
 
-    pub fn with_task_notify_tx(
-        mut self,
-        tx: tokio::sync::broadcast::Sender<String>,
-    ) -> Self {
+    pub fn with_task_notify_tx(mut self, tx: tokio::sync::broadcast::Sender<String>) -> Self {
         self.task_notify_tx = Some(tx);
         self
     }
@@ -1052,10 +1064,7 @@ impl ToolExecutor {
     /// registry. The slot is shared (`Arc`) — both the executor and
     /// the TUI hold the same instance so the TUI can refill it
     /// between tool calls without rebuilding the executor.
-    pub fn with_bash_detach_slot(
-        mut self,
-        slot: astra_tools::detach::DetachShellSlot,
-    ) -> Self {
+    pub fn with_bash_detach_slot(mut self, slot: astra_tools::detach::DetachShellSlot) -> Self {
         self.default_executor
             .set_detach_shell_slot(Some(slot.clone()));
         self.bash_detach_slot = Some(slot);
@@ -1140,7 +1149,14 @@ impl ToolExecutor {
                 .to_string();
         };
         let token = self.cloud_token();
-        match crate::plan_mode_client::enter_plan_mode(&cloud_base, token.as_deref(), &session_id, goal).await {
+        match crate::plan_mode_client::enter_plan_mode(
+            &cloud_base,
+            token.as_deref(),
+            &session_id,
+            goal,
+        )
+        .await
+        {
             Ok(plan_id) => format!(
                 "Entered plan mode. plan_id={plan_id} goal=\"{goal}\". Write tools are now \
                  blocked — explore the codebase with read tools (read_file/grep/glob/list_dir/symbols), \
@@ -1158,11 +1174,18 @@ impl ToolExecutor {
     async fn cli_exit_plan_mode(&self, args: &Value) -> String {
         let plan = match args.get("plan").and_then(Value::as_str) {
             Some(p) if !p.trim().is_empty() => p.to_string(),
-            _ => return "Error: `plan` is required for exit_plan_mode (markdown for user approval)".to_string(),
+            _ => {
+                return "Error: `plan` is required for exit_plan_mode (markdown for user approval)"
+                    .to_string();
+            }
         };
-        let approved = args.get("approved").and_then(Value::as_bool).unwrap_or(true);
+        let approved = args
+            .get("approved")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let Some(cloud_base) = self.cloud_base.clone() else {
-            return "Error: plan mode requires a cloud connection (no cloud_base configured)".to_string();
+            return "Error: plan mode requires a cloud connection (no cloud_base configured)"
+                .to_string();
         };
         let Some(session_id) = self.active_session_id() else {
             return "Error: plan mode requires an active session id".to_string();
@@ -1333,12 +1356,8 @@ impl ToolExecutor {
             .and_then(Value::as_str)
             .unwrap_or("active");
         let token = self.cloud_token();
-        match crate::session_todo_client::list_user_todos(
-            &cloud_base,
-            token.as_deref(),
-            status,
-        )
-        .await
+        match crate::session_todo_client::list_user_todos(&cloud_base, token.as_deref(), status)
+            .await
         {
             Ok(output) => output,
             Err(err) => format!("Error: list_user todos failed: {err}"),
@@ -3396,6 +3415,12 @@ impl ToolExecutor {
             && let Some(ref diag) = *diag_guard
         {
             snapshot = snapshot.with_skill_diagnosis(Some(diag.clone()));
+        }
+
+        if let Ok(feedback_guard) = self.latest_turn_quality_feedback.lock()
+            && let Some(ref feedback) = *feedback_guard
+        {
+            snapshot = snapshot.with_turn_quality_feedback(Some(feedback.clone()));
         }
 
         Some(snapshot)

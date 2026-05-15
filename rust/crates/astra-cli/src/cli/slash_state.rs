@@ -337,6 +337,7 @@ pub(super) async fn handle_state_command(
                     tool_health_entries: &[],
                     session_lessons: &[],
                     latest_skill_diagnosis: None,
+                    latest_turn_quality_feedback: None,
                     unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                     plan_only_chat: false,
                     is_plan_subtask: false,
@@ -462,6 +463,7 @@ pub(super) async fn handle_state_command(
                             tool_health_entries: &[],
                             session_lessons: &[],
                             latest_skill_diagnosis: None,
+                            latest_turn_quality_feedback: None,
                             unified_skill_registry: astra_runtime::skills::default_unified_registry(
                             ),
                             plan_only_chat: false,
@@ -565,6 +567,7 @@ pub(super) async fn handle_state_command(
                                     tool_health_entries: &[],
                                     session_lessons: &[],
                                     latest_skill_diagnosis: None,
+                                    latest_turn_quality_feedback: None,
                                     unified_skill_registry:
                                         astra_runtime::skills::default_unified_registry(),
                                     plan_only_chat: false,

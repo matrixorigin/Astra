@@ -283,8 +283,16 @@ impl BackgroundTaskRegistry {
 
         let task_id = id.clone();
         self.join_set.spawn(async move {
-            run_adopted_shell(child, stdout, stderr, &stdout_path, &stderr_path, cancel, &task_id)
-                .await
+            run_adopted_shell(
+                child,
+                stdout,
+                stderr,
+                &stdout_path,
+                &stderr_path,
+                cancel,
+                &task_id,
+            )
+            .await
         });
         // Status reference is kept on the handle; the runner CAS-sets
         // terminal status via the same path as spawn_shell. Discarded
@@ -658,13 +666,13 @@ async fn drain_stream_to_file<R>(mut reader: R, path: std::path::PathBuf)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    use std::io::Write;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 
-    let mut file = match std::fs::OpenOptions::new()
+    let file = match tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
+        .await
     {
         Ok(f) => f,
         Err(e) => {
@@ -675,18 +683,22 @@ where
             return;
         }
     };
+    let mut file = BufWriter::new(file);
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
-                if let Err(e) = file.write_all(&buf[..n]) {
+                if let Err(e) = file.write_all(&buf[..n]).await {
                     tracing::warn!("adopted shell stream: write error: {e}");
                     return;
                 }
             }
             Err(_) => return,
         }
+    }
+    if let Err(e) = file.flush().await {
+        tracing::warn!("adopted shell stream: flush error: {e}");
     }
 }
 
@@ -1439,12 +1451,10 @@ mod tests {
         // Wait for the child to finish.
         tokio::time::sleep(Duration::from_millis(500)).await;
         let events = reg.poll_completions();
-        let completed = events
-            .iter()
-            .find_map(|ev| match ev {
-                BgTaskEvent::Completed { id: eid, .. } if *eid == id => Some(()),
-                _ => None,
-            });
+        let completed = events.iter().find_map(|ev| match ev {
+            BgTaskEvent::Completed { id: eid, .. } if *eid == id => Some(()),
+            _ => None,
+        });
         assert!(
             completed.is_some(),
             "adopted task must emit Completed; got {events:?}"
@@ -1464,6 +1474,24 @@ mod tests {
             out.contains("after-detach"),
             "adopted output must capture post-detach stream: {out:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn drain_stream_to_file_appends_to_existing_output_without_sync_io() {
+        use tokio::io::AsyncWriteExt;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("adopted.stdout");
+        std::fs::write(&path, "before-detach\n").expect("seed output");
+
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let drain = tokio::spawn(drain_stream_to_file(rx, path.clone()));
+        tx.write_all(b"after-detach\n").await.expect("write stream");
+        drop(tx);
+        drain.await.expect("drain join");
+
+        let output = std::fs::read_to_string(&path).expect("read appended output");
+        assert_eq!(output, "before-detach\nafter-detach\n");
     }
 
     /// C4 regression: a fast-completing task that races with kill

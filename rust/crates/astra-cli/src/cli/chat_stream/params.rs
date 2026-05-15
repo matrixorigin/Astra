@@ -273,6 +273,11 @@ pub(crate) struct ChatTurnParams<'a> {
     /// noticed X" in the self-awareness section. `None` → no diagnosis
     /// pending; the ToolExecutor state is untouched.
     pub(crate) latest_skill_diagnosis: Option<&'a astra_skills::auto_invoke::SkillDiagnosis>,
+    /// Evaluator-derived feedback from the previous turn. This is injected
+    /// alongside self-awareness on the next turn and cleared by the caller
+    /// once a healthy turn completes.
+    pub(crate) latest_turn_quality_feedback:
+        Option<&'a astra_runtime::self_model::TurnQualityFeedback>,
     /// Unified skill registry (single source of truth for all skill resolution).
     pub(crate) unified_skill_registry:
         &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
@@ -474,6 +479,7 @@ impl<'a> ChatTurnParams<'a> {
             tool_health_entries: &[],
             session_lessons: &[],
             latest_skill_diagnosis: None,
+            latest_turn_quality_feedback: None,
             unified_skill_registry: ctx.unified_skill_registry,
             plan_only_chat: false,
             is_plan_subtask: false,

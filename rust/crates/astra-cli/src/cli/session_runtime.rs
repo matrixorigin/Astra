@@ -89,8 +89,7 @@ pub(crate) async fn resolve_task_store(
         .or_else(resolve_cloud_base);
     if let Some(cloud_base) = cloud_base {
         let token = current_access_token(profile);
-        let (store, notify_tx) =
-            crate::session_todo_client::HttpTaskStore::new(cloud_base, token);
+        let (store, notify_tx) = crate::session_todo_client::HttpTaskStore::new(cloud_base, token);
         return (store, Some(notify_tx));
     }
     (
@@ -195,11 +194,9 @@ fn create_pipeline_modules_inner(
     let profile_owned = profile.map(str::to_string);
     let token_provider: astra_runtime::capabilities::TokenProvider =
         std::sync::Arc::new(move || current_access_token(profile_owned.as_deref()));
-    let remote_catalog =
-        Some(astra_runtime::capabilities::RemoteSkillCatalogProvider::new(
-            api.clone(),
-            token_provider,
-        ));
+    let remote_catalog = Some(
+        astra_runtime::capabilities::RemoteSkillCatalogProvider::new(api.clone(), token_provider),
+    );
     let unified_skill_registry =
         astra_runtime::capabilities::build_cli_local_skill_registry(remote_catalog);
     let handle = tokio::runtime::Handle::current();

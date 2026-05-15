@@ -348,8 +348,7 @@ pub(crate) async fn run_tui_repl(
     let mut state = initialize_session_state(profile, initial_model);
     let task_service = resolve_task_service(profile).await;
     install_task_service(&mut state, task_service);
-    let (task_store, task_notify_tx) =
-        resolve_task_store(profile, Some(&api.api_origin())).await;
+    let (task_store, task_notify_tx) = resolve_task_store(profile, Some(&api.api_origin())).await;
     install_task_store(&mut state, task_store);
     state.task_notify_tx = task_notify_tx.clone();
     if max_budget > 0.0 {

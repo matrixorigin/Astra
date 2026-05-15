@@ -49,10 +49,7 @@ pub async fn pull_all_preferences(
     cloud_base: &str,
     token: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
-    let url = format!(
-        "{}/preferences",
-        cloud_base.trim_end_matches('/')
-    );
+    let url = format!("{}/preferences", cloud_base.trim_end_matches('/'));
     let resp = build_request(reqwest::Method::GET, &url, token)?
         .send()
         .await

@@ -2031,7 +2031,9 @@ pub async fn ensure_core_schema(
             "session_todos table predates user_id column; dropping and recreating per no-compat directive"
         );
         if let Err(e) = query("DROP TABLE session_todos").execute(&pool).await {
-            tracing::warn!("failed to drop legacy session_todos: {e}; CREATE TABLE will likely error");
+            tracing::warn!(
+                "failed to drop legacy session_todos: {e}; CREATE TABLE will likely error"
+            );
         }
     }
     query(

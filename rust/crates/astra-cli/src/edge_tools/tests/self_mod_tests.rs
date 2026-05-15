@@ -354,6 +354,27 @@ async fn set_skill_diagnosis_feeds_build_self_model_snapshot() {
 }
 
 #[tokio::test]
+async fn set_turn_quality_feedback_feeds_build_self_model_snapshot() {
+    let (exe, _session) = executor_with_session();
+    let feedback = astra_runtime::self_model::TurnQualityFeedback {
+        turn: 4,
+        findings: vec!["Detected 10 consecutive single-tool rounds".into()],
+        recommended_action: "Batch independent reads before the next tool call.".into(),
+    };
+    exe.set_latest_turn_quality_feedback(Some(feedback.clone()));
+
+    let model = exe.build_self_model_snapshot().unwrap();
+    assert_eq!(model.turn_quality_feedback.as_ref(), Some(&feedback));
+
+    let rendered = model.to_system_prompt_section();
+    assert!(
+        rendered.contains("Previous turn quality feedback (turn 4)")
+            && rendered.contains("Batch independent reads"),
+        "feedback must reach the prompt, got:\n{rendered}"
+    );
+}
+
+#[tokio::test]
 async fn clearing_skill_diagnosis_removes_it_from_subsequent_snapshots() {
     // Once the triggering condition has cleared, the stale diagnosis must
     // stop showing up. This proves the setter is idempotent and None

@@ -475,11 +475,10 @@ pub(super) async fn task_rpc_handler(
                 .get("session_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let create_req: astra_services::TaskCreateRequest =
-                serde_json::from_value(req.args.get("req").cloned().unwrap_or_default())
-                    .map_err(|e| {
-                        error_response(StatusCode::BAD_REQUEST, format!("decode req: {e}"))
-                    })?;
+            let create_req: astra_services::TaskCreateRequest = serde_json::from_value(
+                req.args.get("req").cloned().unwrap_or_default(),
+            )
+            .map_err(|e| error_response(StatusCode::BAD_REQUEST, format!("decode req: {e}")))?;
             let id = state
                 .task_service
                 .create_task(&user.user_id, session_id, create_req)
@@ -492,9 +491,7 @@ pub(super) async fn task_rpc_handler(
                 .args
                 .get("task_id")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    error_response(StatusCode::BAD_REQUEST, "missing 'task_id'")
-                })?;
+                .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "missing 'task_id'"))?;
             let task = state
                 .task_service
                 .get_task(task_id)
@@ -504,7 +501,9 @@ pub(super) async fn task_rpc_handler(
             // (avoid leaking existence). Wrap as JSON value so client
             // can deserialize into Option<TaskRecord>.
             match task {
-                Some(t) if t.user_id == user.user_id => serde_json::to_value(&t).unwrap_or(serde_json::Value::Null),
+                Some(t) if t.user_id == user.user_id => {
+                    serde_json::to_value(&t).unwrap_or(serde_json::Value::Null)
+                }
                 _ => serde_json::Value::Null,
             }
         }
@@ -527,11 +526,12 @@ pub(super) async fn task_rpc_handler(
                 .args
                 .get("status")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    error_response(StatusCode::BAD_REQUEST, "missing 'status'")
-                })?;
+                .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "missing 'status'"))?;
             let status = parse_task_status(status_str).ok_or_else(|| {
-                error_response(StatusCode::BAD_REQUEST, format!("invalid status: {status_str}"))
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid status: {status_str}"),
+                )
             })?;
             state
                 .task_service
@@ -542,9 +542,21 @@ pub(super) async fn task_rpc_handler(
         }
         "update_progress" => {
             let task_id = require_owned_task(&state, &user.user_id, &req.args).await?;
-            let pct = req.args.get("progress_pct").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let done = req.args.get("items_done").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let total = req.args.get("items_total").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let pct = req
+                .args
+                .get("progress_pct")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let done = req
+                .args
+                .get("items_done")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let total = req
+                .args
+                .get("items_total")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
             state
                 .task_service
                 .update_progress(&task_id, pct, done, total)
@@ -568,11 +580,10 @@ pub(super) async fn task_rpc_handler(
         }
         "update_plan" => {
             let task_id = require_owned_task(&state, &user.user_id, &req.args).await?;
-            let plan: TaskPlan =
-                serde_json::from_value(req.args.get("plan").cloned().unwrap_or_default())
-                    .map_err(|e| {
-                        error_response(StatusCode::BAD_REQUEST, format!("decode plan: {e}"))
-                    })?;
+            let plan: TaskPlan = serde_json::from_value(
+                req.args.get("plan").cloned().unwrap_or_default(),
+            )
+            .map_err(|e| error_response(StatusCode::BAD_REQUEST, format!("decode plan: {e}")))?;
             state
                 .task_service
                 .update_plan(&task_id, &plan)
@@ -605,9 +616,21 @@ pub(super) async fn task_rpc_handler(
         }
         "complete_plan_run" => {
             let task_id = require_owned_task(&state, &user.user_id, &req.args).await?;
-            let pct = req.args.get("progress_pct").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let done = req.args.get("items_done").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let total = req.args.get("items_total").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let pct = req
+                .args
+                .get("progress_pct")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let done = req
+                .args
+                .get("items_done")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let total = req
+                .args
+                .get("items_total")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
             let outcome: TaskOutcome =
                 serde_json::from_value(req.args.get("outcome").cloned().unwrap_or_default())
                     .map_err(|e| {
@@ -673,11 +696,7 @@ pub(super) async fn task_rpc_handler(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "missing 'goal'"))?;
             let project_type = req.args.get("project_type").and_then(|v| v.as_str());
-            let limit = req
-                .args
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(5) as usize;
+            let limit = req.args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
             let recs = state
                 .task_service
                 .recommend_templates(&user.user_id, goal, project_type, limit)
@@ -690,9 +709,7 @@ pub(super) async fn task_rpc_handler(
                 .args
                 .get("goal_pattern")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    error_response(StatusCode::BAD_REQUEST, "missing 'goal_pattern'")
-                })?;
+                .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "missing 'goal_pattern'"))?;
             let stats = state
                 .task_service
                 .get_learning_stats(&user.user_id, goal_pattern)
@@ -708,9 +725,7 @@ pub(super) async fn task_rpc_handler(
                 .args
                 .get("template_id")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    error_response(StatusCode::BAD_REQUEST, "missing 'template_id'")
-                })?;
+                .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "missing 'template_id'"))?;
             state
                 .task_service
                 .record_template_usage(template_id)

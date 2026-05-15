@@ -105,6 +105,12 @@ pub struct SelfModel {
     /// already looked at this and noticed X".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_diagnosis: Option<astra_skills::auto_invoke::SkillDiagnosis>,
+    /// Post-turn evaluator feedback from the immediately previous turn.
+    /// Unlike auto-invoked skill diagnoses, this is derived synchronously from
+    /// `TurnEvaluation` signals and is meant to correct next-turn tool
+    /// behavior (batching, repeat calls, stall recovery).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_quality_feedback: Option<TurnQualityFeedback>,
     /// Cross-session lessons carried over from prior sessions with the same
     /// `(user_id, persona, workload_tag)` scope (see
     /// `astra_services::agent_lessons`). Bounded projection of the DAO's
@@ -126,6 +132,14 @@ pub struct UnmetPostCondition {
     /// renderer and any downstream tooling can grow new cases without a
     /// lossy `Debug` round-trip.
     pub kind: String,
+}
+
+/// Actionable feedback derived from the previous turn's passive evaluator.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnQualityFeedback {
+    pub turn: u32,
+    pub findings: Vec<String>,
+    pub recommended_action: String,
 }
 
 impl From<&astra_plan::action_plan::PostCondition> for UnmetPostCondition {
@@ -531,6 +545,7 @@ impl SelfModel {
             low_confidence_tools: Vec::new(),
             unmet_postconditions: Vec::new(),
             skill_diagnosis: None,
+            turn_quality_feedback: None,
             lessons: Vec::new(),
         }
     }
@@ -648,6 +663,13 @@ impl SelfModel {
         diag: Option<astra_skills::auto_invoke::SkillDiagnosis>,
     ) -> Self {
         self.skill_diagnosis = diag;
+        self
+    }
+
+    /// Attach evaluator-derived feedback from the previous turn. Passing
+    /// `None` clears stale feedback once a healthy turn completes.
+    pub fn with_turn_quality_feedback(mut self, feedback: Option<TurnQualityFeedback>) -> Self {
+        self.turn_quality_feedback = feedback;
         self
     }
 
@@ -1012,6 +1034,22 @@ impl SelfModel {
             s.push_str(&diag.render_prompt_block());
         }
 
+        if let Some(ref feedback) = self.turn_quality_feedback {
+            let _ = writeln!(
+                s,
+                "⚠ Previous turn quality feedback (turn {}):",
+                feedback.turn
+            );
+            for finding in feedback.findings.iter().take(5) {
+                let _ = writeln!(s, "  - {}", astra_services::sanitize_for_prompt(finding));
+            }
+            let _ = writeln!(
+                s,
+                "  → {}",
+                astra_services::sanitize_for_prompt(&feedback.recommended_action)
+            );
+        }
+
         // ── Cross-session lessons (from Memoria L3) ──
         // Pressure-adaptive: under high pressure, show fewer lessons with
         // compact text. Under low pressure, show more with full detail.
@@ -1151,6 +1189,9 @@ impl SelfModel {
             return true;
         }
         if self.skill_diagnosis.is_some() {
+            return true;
+        }
+        if self.turn_quality_feedback.is_some() {
             return true;
         }
         if !self.lessons.is_empty() {
@@ -2298,6 +2339,27 @@ mod tests {
             compact: None,
             workload_tag: None,
         }]);
+        assert!(model.has_meaningful_self_awareness());
+    }
+
+    #[test]
+    fn system_prompt_section_surfaces_turn_quality_feedback() {
+        let model = minimal_model().with_turn_quality_feedback(Some(TurnQualityFeedback {
+            turn: 7,
+            findings: vec![
+                "Detected 13 consecutive single-tool rounds; batch independent reads.".to_string(),
+                "Repeated bash with the same arguments; inspect prior output before retrying."
+                    .to_string(),
+            ],
+            recommended_action:
+                "Before calling tools, group independent reads/searches into one parallel batch."
+                    .to_string(),
+        }));
+
+        let rendered = model.to_system_prompt_section();
+        assert!(rendered.contains("Previous turn quality feedback (turn 7)"));
+        assert!(rendered.contains("13 consecutive single-tool rounds"));
+        assert!(rendered.contains("group independent reads/searches"));
         assert!(model.has_meaningful_self_awareness());
     }
 

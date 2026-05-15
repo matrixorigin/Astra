@@ -301,6 +301,7 @@ pub(super) async fn handle_task_command(
                     tool_health_entries: &[],
                     session_lessons: &[],
                     latest_skill_diagnosis: None,
+                    latest_turn_quality_feedback: None,
                     unified_skill_registry: &bg_unified_skill_registry,
                     plan_only_chat: false,
                     is_plan_subtask: false,

@@ -192,10 +192,7 @@ impl DefaultToolExecutor {
     /// the legacy reader). The slot itself is renewable: the host
     /// refills it before each tool call so each bash invocation
     /// gets a fresh one-shot.
-    pub fn with_detach_shell_slot(
-        mut self,
-        slot: Option<crate::detach::DetachShellSlot>,
-    ) -> Self {
+    pub fn with_detach_shell_slot(mut self, slot: Option<crate::detach::DetachShellSlot>) -> Self {
         self.ctx.detach_shell_handle = slot;
         self
     }

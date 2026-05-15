@@ -140,7 +140,8 @@ async fn adopt_task_into_session(
         return "Error: 'task_id' is required for adopt".to_string();
     };
     if source_session == target_session {
-        return "Error: source_session_id matches the current session — nothing to adopt".to_string();
+        return "Error: source_session_id matches the current session — nothing to adopt"
+            .to_string();
     }
     let Some(pool) = state.shared_pool.as_ref() else {
         return "Error: session_todos store not configured on this server".to_string();
@@ -426,8 +427,15 @@ pub(super) async fn list_user_todos_handler(
         Option<String>,
         Option<String>,
     );
-    let row_to_entry = |(session_id, todo_id, title, status, updated_at,
-                         session_started_at, session_title): Row| UserTodoEntry {
+    let row_to_entry = |(
+        session_id,
+        todo_id,
+        title,
+        status,
+        updated_at,
+        session_started_at,
+        session_title,
+    ): Row| UserTodoEntry {
         session_id,
         todo_id,
         title,

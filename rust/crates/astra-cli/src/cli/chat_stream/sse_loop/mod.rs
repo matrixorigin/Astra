@@ -304,6 +304,9 @@ pub(crate) async fn stream_chat_sse(
     if let Some(diag) = p.latest_skill_diagnosis {
         executor.set_latest_skill_diagnosis(Some(diag.clone()));
     }
+    if let Some(feedback) = p.latest_turn_quality_feedback {
+        executor.set_latest_turn_quality_feedback(Some(feedback.clone()));
+    }
     let root_send_message_context = p.agent_spawner.as_ref().map(|spawner| {
         edge_tools::agent_messaging::SendMessageRuntimeContext {
             agent_id: root_agent_id.to_string(),

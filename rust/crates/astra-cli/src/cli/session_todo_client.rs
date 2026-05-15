@@ -168,8 +168,8 @@ pub async fn load_todos(
 
 // ─── HttpTaskStore ─────────────────────────────────────────────────
 
+use astra_tools::task_mgmt::{SessionTask, TaskMutation, TaskStore};
 use async_trait::async_trait;
-use astra_tools::task_mgmt::{SessionTask, TaskStore, TaskMutation};
 use std::sync::Arc;
 
 /// A read-only `TaskStore` backed by the server's REST API. The
@@ -268,7 +268,8 @@ mod wiring_e2e {
     /// State is shared via Arc<Mutex<Vec<SessionTask>>>.
     async fn spawn_mock_server() -> (MockServer, Arc<std::sync::Mutex<Vec<SessionTask>>>) {
         let server = MockServer::start().await;
-        let state: Arc<std::sync::Mutex<Vec<SessionTask>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state: Arc<std::sync::Mutex<Vec<SessionTask>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
         let counter = Arc::new(AtomicU64::new(0));
 
         // GET /sessions/.../todos — return whatever's in `state`.
@@ -286,7 +287,9 @@ mod wiring_e2e {
         let state_exec = state.clone();
         let counter_exec = counter.clone();
         Mock::given(method("POST"))
-            .and(wiremock::matchers::path_regex(r"^/sessions/[^/]+/todos:execute$"))
+            .and(wiremock::matchers::path_regex(
+                r"^/sessions/[^/]+/todos:execute$",
+            ))
             .respond_with(move |req: &Request| {
                 let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
                 let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("");
@@ -331,8 +334,7 @@ mod wiring_e2e {
                     }
                     other => format!("Error: unsupported action {other}"),
                 };
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({ "output": output }))
+                ResponseTemplate::new(200).set_body_json(json!({ "output": output }))
             })
             .mount(&server)
             .await;
@@ -354,11 +356,7 @@ mod wiring_e2e {
             pump();
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        if cond() {
-            Ok(start.elapsed())
-        } else {
-            Err(())
-        }
+        if cond() { Ok(start.elapsed()) } else { Err(()) }
     }
 
     /// REGRESSION: `route_task_action` POSTs to the cloud on a `task.create`,
@@ -491,7 +489,13 @@ mod wiring_e2e {
         .unwrap();
         let _ = notify_tx.send(sid.to_string());
         wait_until(
-            || observer.snapshot().tasks.iter().any(|t| t.status == "completed"),
+            || {
+                observer
+                    .snapshot()
+                    .tasks
+                    .iter()
+                    .any(|t| t.status == "completed")
+            },
             500,
             || observer.maybe_refresh(),
         )
@@ -507,7 +511,8 @@ mod wiring_e2e {
         );
 
         // Force the TTL into the past — equivalent to 31s having passed.
-        observer.testing_force_completed_at_past("task-1", COMPLETED_TASK_TTL + Duration::from_secs(1));
+        observer
+            .testing_force_completed_at_past("task-1", COMPLETED_TASK_TTL + Duration::from_secs(1));
         assert!(
             observer.snapshot_for_render().tasks.is_empty(),
             "completed row past TTL must drop from render snapshot"

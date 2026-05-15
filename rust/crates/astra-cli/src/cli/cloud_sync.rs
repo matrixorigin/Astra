@@ -49,7 +49,9 @@ fn resolve_cloud_base() -> Option<String> {
 /// unconfigured or unreachable.
 pub(super) async fn try_cloud_pull(profile_name: &str) -> CloudPullResult {
     let Some(cloud_base) = resolve_cloud_base() else {
-        return CloudPullResult { cloud_reachable: false };
+        return CloudPullResult {
+            cloud_reachable: false,
+        };
     };
     let token = super::session_runtime::current_access_token(Some(profile_name));
     let cloud_reachable =
@@ -68,11 +70,8 @@ pub(super) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<
     // currently holds. Empty token still works for local dev
     // servers without auth; the server's auth_service decides.
     let token = super::session_runtime::current_access_token(None);
-    let prefs = match crate::preferences_client::pull_all_preferences(
-        &cloud_base,
-        token.as_deref(),
-    )
-    .await
+    let prefs = match crate::preferences_client::pull_all_preferences(&cloud_base, token.as_deref())
+        .await
     {
         Ok(prefs) => prefs,
         Err(e) => {
@@ -172,13 +171,9 @@ pub(super) async fn try_cloud_push_preferences(state: &SessionState) {
         ),
     ];
     for (key, value) in &prefs {
-        if let Err(e) = crate::preferences_client::push_preference(
-            &cloud_base,
-            token.as_deref(),
-            key,
-            value,
-        )
-        .await
+        if let Err(e) =
+            crate::preferences_client::push_preference(&cloud_base, token.as_deref(), key, value)
+                .await
         {
             tracing::warn!(
                 target: "astra_cli::cloud_sync",

@@ -578,7 +578,8 @@ impl TaskBoardObserver {
                         // sessions.
                         for event in &events {
                             if let super::task_board_events::TaskBoardEvent::Removed {
-                                task_id, ..
+                                task_id,
+                                ..
                             } = event
                             {
                                 st.completed_at.remove(task_id);

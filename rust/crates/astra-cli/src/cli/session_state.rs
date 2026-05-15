@@ -329,6 +329,11 @@ pub(crate) struct SessionState {
     /// Cleared when no diagnosis is produced.
     pub latest_skill_diagnosis: Option<astra_skills::auto_invoke::SkillDiagnosis>,
 
+    /// P3/P4: evaluator-derived feedback from the previous turn. Passed to
+    /// the next turn's ToolExecutor so the prompt can correct tool behavior
+    /// such as sequential read churn, repeated calls, and stalls.
+    pub latest_turn_quality_feedback: Option<astra_runtime::self_model::TurnQualityFeedback>,
+
     /// R1: tracks active diagnosis postconditions across turns. When a
     /// diagnosis fires, its success_criteria are registered here. On each
     /// subsequent turn, evaluate_turn checks whether the criteria are met.
@@ -546,6 +551,7 @@ impl Default for SessionState {
             session_memory_extractor: None,
             auto_invoke_handler: None,
             latest_skill_diagnosis: None,
+            latest_turn_quality_feedback: None,
             diagnosis_outcome_tracker:
                 astra_runtime::auto_invoke_handler::DiagnosisOutcomeTracker::new(),
             diagnosis_criteria_met: 0,

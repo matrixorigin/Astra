@@ -193,9 +193,7 @@ pub(crate) fn active_viewport(
     // up dozens of ✔ rows above the spinner. The footer chip /
     // header counts still pull from `counts()` (full truth) — only
     // row rendering cares about the TTL filter.
-    let snap = board
-        .map(|b| b.snapshot_for_render())
-        .unwrap_or_default();
+    let snap = board.map(|b| b.snapshot_for_render()).unwrap_or_default();
 
     // Resolve board visibility from the FRESH snapshot every frame.
     // This is the critical fix: previously, resolve_board_visibility

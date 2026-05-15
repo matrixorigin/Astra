@@ -303,15 +303,10 @@ fn render_subtask_lines(
         let (icon, color) = status_icon_and_color(&sub.status, colors);
         let is_completed = sub.status == "completed";
         let is_in_progress = sub.status == "in_progress";
-        let blocked = sub
-            .depends_on
-            .iter()
-            .any(|id| unresolved.contains(id));
+        let blocked = sub.depends_on.iter().any(|id| unresolved.contains(id));
 
         let icon_style = match sub.status.as_str() {
-            "in_progress" | "completed" => {
-                Style::default().fg(color).add_modifier(Modifier::BOLD)
-            }
+            "in_progress" | "completed" => Style::default().fg(color).add_modifier(Modifier::BOLD),
             _ => Style::default().fg(color).add_modifier(Modifier::DIM),
         };
         let mut subject_style = Style::default().add_modifier(Modifier::DIM);
@@ -1118,17 +1113,22 @@ mod tests {
             "parent line: {}",
             texts[1]
         );
-        let subtask_lines: Vec<&String> = texts
-            .iter()
-            .filter(|t| t.starts_with("    "))
-            .collect();
+        let subtask_lines: Vec<&String> = texts.iter().filter(|t| t.starts_with("    ")).collect();
         assert_eq!(
             subtask_lines.len(),
             3,
             "expected 3 indented subtask rows, got: {texts:#?}"
         );
-        assert!(subtask_lines.iter().any(|t| t.contains("Create project structure")));
-        assert!(subtask_lines.iter().any(|t| t.contains("Implement database layer")));
+        assert!(
+            subtask_lines
+                .iter()
+                .any(|t| t.contains("Create project structure"))
+        );
+        assert!(
+            subtask_lines
+                .iter()
+                .any(|t| t.contains("Implement database layer"))
+        );
         // Subtasks waiting on an unfinished dep get a "· waiting"
         // suffix so the user sees why exp-3 isn't running.
         let waiting = subtask_lines

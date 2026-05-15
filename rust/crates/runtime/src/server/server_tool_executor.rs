@@ -1824,9 +1824,7 @@ impl ServerToolExecutor {
             "enter_plan_mode" => {
                 astra_tools::ToolResult::text(self.tool_enter_plan_mode(args).await)
             }
-            "exit_plan_mode" => {
-                astra_tools::ToolResult::text(self.tool_exit_plan_mode(args).await)
-            }
+            "exit_plan_mode" => astra_tools::ToolResult::text(self.tool_exit_plan_mode(args).await),
             // ── Consolidated session tool ──────────────────────────────
             "session" => {
                 let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
@@ -3677,9 +3675,7 @@ impl ServerToolExecutor {
         // active row in the prior plan only causes UI noise, not
         // correctness loss).
         if let Some(sink) = self.plan_todo_sink.clone()
-            && let Err(e) = sink
-                .supersede_other_plans(&self.session_id, &plan_id)
-                .await
+            && let Err(e) = sink.supersede_other_plans(&self.session_id, &plan_id).await
         {
             tracing::warn!(
                 session_id = %self.session_id,
@@ -6144,9 +6140,7 @@ esac
                     ..Default::default()
                 });
         }
-        repo.save("plan-seed-test", &mut state, None)
-            .await
-            .unwrap();
+        repo.save("plan-seed-test", &mut state, None).await.unwrap();
         repo.set_active_plan("seed-session", Some("plan-seed-test"))
             .await
             .unwrap();
@@ -6313,10 +6307,7 @@ esac
 
     #[async_trait]
     impl astra_services::PlanTodoSink for InMemoryPlanTodoSink {
-        async fn seed(
-            &self,
-            todos: Vec<astra_services::PlanTodoSeed>,
-        ) -> Result<(), String> {
+        async fn seed(&self, todos: Vec<astra_services::PlanTodoSeed>) -> Result<(), String> {
             self.captured.lock().await.extend(todos);
             Ok(())
         }

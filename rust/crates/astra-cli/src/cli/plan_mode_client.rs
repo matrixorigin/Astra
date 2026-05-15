@@ -121,10 +121,11 @@ pub async fn exit_plan_mode(
     let plan_id = plans_value
         .get("plans")
         .and_then(|v| v.as_array())
-        .and_then(|arr| arr.iter().find_map(|p| p.get("plan_id").and_then(|v| v.as_str())))
-        .ok_or_else(|| {
-            "no active plan for this session — call enter_plan_mode first".to_string()
-        })?
+        .and_then(|arr| {
+            arr.iter()
+                .find_map(|p| p.get("plan_id").and_then(|v| v.as_str()))
+        })
+        .ok_or_else(|| "no active plan for this session — call enter_plan_mode first".to_string())?
         .to_string();
 
     let exit_url = format!("{base}/plans/{plan_id}/exit-plan-mode");

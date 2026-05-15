@@ -1727,6 +1727,7 @@ async fn plan_executor_task(
                     tool_health_entries: &ctx.tool_health_entries,
                     session_lessons: &[],
                     latest_skill_diagnosis: None,
+                    latest_turn_quality_feedback: None,
                     unified_skill_registry: &ctx.unified_skill_registry,
                     plan_only_chat: false,
                     is_plan_subtask: true,

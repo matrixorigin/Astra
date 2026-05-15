@@ -520,10 +520,9 @@ async fn execute_headless_task_body(
     };
     // Headless single-shot path: use the MO-backed task store when available
     // so session_todos is authoritative here the same way it is in the REPL.
-    let task_store =
-        crate::session_runtime::resolve_task_store(profile, Some(&api.api_origin()))
-            .await
-            .0;
+    let task_store = crate::session_runtime::resolve_task_store(profile, Some(&api.api_origin()))
+        .await
+        .0;
     let task_manager = std::sync::Arc::new(crate::edge_tools::TaskManager::new(
         session_id
             .clone()
@@ -2387,8 +2386,11 @@ pub(super) async fn execute_cli_command(
             // throwaway in-memory manager and the Tier 1 board is invisible
             // across edge/cloud boundaries.
             let (chat_task_store, _chat_task_notify_tx) =
-                super::session_runtime::resolve_task_store(profile.as_deref(), Some(&api.api_origin()))
-                    .await;
+                super::session_runtime::resolve_task_store(
+                    profile.as_deref(),
+                    Some(&api.api_origin()),
+                )
+                .await;
             let chat_task_manager = std::sync::Arc::new(crate::edge_tools::TaskManager::new(
                 session_id
                     .clone()
@@ -3179,10 +3181,9 @@ pub(super) async fn run_print_mode(
     // path handles them. Without this, single-shot runs silently drop to
     // in-memory scratchpad and the Tier 1 board is invisible across turns
     // that reuse the same `session_id`.
-    let task_store =
-        crate::session_runtime::resolve_task_store(profile, Some(&api.api_origin()))
-            .await
-            .0;
+    let task_store = crate::session_runtime::resolve_task_store(profile, Some(&api.api_origin()))
+        .await
+        .0;
     let print_task_manager = std::sync::Arc::new(crate::edge_tools::TaskManager::new(
         session_id
             .clone()

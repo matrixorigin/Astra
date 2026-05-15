@@ -135,9 +135,8 @@ pub(crate) async fn run_archive_gc_once(pool: SharedPool) -> Result<u64, String>
 /// cause a ticker burst on resume.
 pub(crate) fn spawn_session_todo_stale_sweeper(pool: SharedPool) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-            STALE_SWEEP_INTERVAL_SECS,
-        ));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(STALE_SWEEP_INTERVAL_SECS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Skip the immediate first tick — give the server a chance
         // to finish startup before the first sweep.
@@ -244,10 +243,7 @@ mod tests {
         }
         assert_eq!(archive_retention_days(), ARCHIVE_RETENTION_DAYS_DEFAULT);
         unsafe {
-            std::env::set_var(
-                "ASTRA_SESSION_TODO_ARCHIVE_RETENTION_DAYS",
-                "not-a-number",
-            );
+            std::env::set_var("ASTRA_SESSION_TODO_ARCHIVE_RETENTION_DAYS", "not-a-number");
         }
         assert_eq!(archive_retention_days(), ARCHIVE_RETENTION_DAYS_DEFAULT);
         unsafe {

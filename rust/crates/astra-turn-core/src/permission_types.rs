@@ -1071,7 +1071,10 @@ mod tests {
 
     #[test]
     fn permission_mode_legacy_aliases_map_to_auto() {
-        assert_eq!("yolo".parse::<PermissionMode>().unwrap(), PermissionMode::Auto);
+        assert_eq!(
+            "yolo".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Auto
+        );
         assert_eq!(
             "bypass-safety".parse::<PermissionMode>().unwrap(),
             PermissionMode::Auto

@@ -546,24 +546,12 @@ mod tests {
 
         let origin = crate::tui::shimmer::process_start();
         let style = Style::default().fg(Color::Rgb(120, 80, 220));
-        let at_10ms = label_spans_for_mode(
-            "Thinking",
-            style,
-            origin + Duration::from_millis(10),
-            true,
-        );
-        let at_199ms = label_spans_for_mode(
-            "Thinking",
-            style,
-            origin + Duration::from_millis(199),
-            true,
-        );
-        let at_200ms = label_spans_for_mode(
-            "Thinking",
-            style,
-            origin + Duration::from_millis(200),
-            true,
-        );
+        let at_10ms =
+            label_spans_for_mode("Thinking", style, origin + Duration::from_millis(10), true);
+        let at_199ms =
+            label_spans_for_mode("Thinking", style, origin + Duration::from_millis(199), true);
+        let at_200ms =
+            label_spans_for_mode("Thinking", style, origin + Duration::from_millis(200), true);
 
         assert_eq!(
             fg_colors(&at_10ms),
@@ -768,10 +756,7 @@ mod tests {
             !text.contains("thought for"),
             "thought-for chip should hide once tokens stream: {text}"
         );
-        assert!(
-            text.contains("↓"),
-            "token counter takes over: {text}"
-        );
+        assert!(text.contains("↓"), "token counter takes over: {text}");
     }
 
     #[test]

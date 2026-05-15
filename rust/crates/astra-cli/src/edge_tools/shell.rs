@@ -3917,8 +3917,7 @@ impl ToolExecutor {
 
         // For build/test commands, provide structured output with iteration tracking
         if super::build_test::is_build_test_command(command) {
-            let mut parsed =
-                super::build_test::parse_build_test_output(&result, out.status.code());
+            let mut parsed = super::build_test::parse_build_test_output(&result, out.status.code());
             if !parsed.error_locations.is_empty() {
                 parsed.enrich_with_scope(&self.project_root);
             }

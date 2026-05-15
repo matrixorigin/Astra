@@ -493,7 +493,9 @@ impl TaskStore for MatrixOneTaskStore {
             return Err(e);
         }
 
-        if let Err(e) = insert_session_tasks(&mut tx, session_id, &self.user_id, &result.tasks).await {
+        if let Err(e) =
+            insert_session_tasks(&mut tx, session_id, &self.user_id, &result.tasks).await
+        {
             if let Err(rollback_err) = tx.rollback().await {
                 return Err(format!("{e}; rollback failed: {rollback_err}"));
             }

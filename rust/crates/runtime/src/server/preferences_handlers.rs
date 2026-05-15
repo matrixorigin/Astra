@@ -60,11 +60,8 @@ async fn drain_flusher(
     drop(svc);
     drop(flusher.writer);
     flusher.shutdown.cancel();
-    if let Err(e) = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        flusher.join_handle,
-    )
-    .await
+    if let Err(e) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), flusher.join_handle).await
     {
         tracing::warn!(
             "preferences audit flusher drain timed out (5s): {e}; some entries may be lost"

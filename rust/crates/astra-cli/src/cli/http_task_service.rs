@@ -55,7 +55,9 @@ impl HttpTaskService {
             .timeout(std::time::Duration::from_secs(TASK_HTTP_TIMEOUT_SECS))
             .build()
             .map_err(|e| format!("http client init: {e}"))?;
-        let mut req = client.post(&url).json(&json!({ "method": method, "args": args }));
+        let mut req = client
+            .post(&url)
+            .json(&json!({ "method": method, "args": args }));
         if let Some(tok) = self.token.as_deref() {
             req = req.bearer_auth(tok);
         }
@@ -126,8 +128,8 @@ impl TaskService for HttpTaskService {
             args["status_filter"] = json!(s);
         }
         let result = self.rpc("list_tasks", args).await?;
-        let tasks: Vec<TaskListItem> = serde_json::from_value(result)
-            .map_err(|e| format!("decode Vec<TaskListItem>: {e}"))?;
+        let tasks: Vec<TaskListItem> =
+            serde_json::from_value(result).map_err(|e| format!("decode Vec<TaskListItem>: {e}"))?;
         Ok(tasks)
     }
 
@@ -190,7 +192,8 @@ impl TaskService for HttpTaskService {
     }
 
     async fn complete_task(&self, task_id: &str) -> Result<(), String> {
-        self.rpc("complete_task", json!({ "task_id": task_id })).await?;
+        self.rpc("complete_task", json!({ "task_id": task_id }))
+            .await?;
         Ok(())
     }
 
@@ -253,7 +256,10 @@ impl TaskService for HttpTaskService {
                 json!({ "task_id": task_id, "goal_pattern": goal_pattern }),
             )
             .await?;
-        Ok(result.get("template_id").and_then(|v| v.as_str()).map(String::from))
+        Ok(result
+            .get("template_id")
+            .and_then(|v| v.as_str())
+            .map(String::from))
     }
 
     async fn recommend_templates(
@@ -279,7 +285,10 @@ impl TaskService for HttpTaskService {
         goal_pattern: &str,
     ) -> Result<LearningStats, String> {
         let result = self
-            .rpc("get_learning_stats", json!({ "goal_pattern": goal_pattern }))
+            .rpc(
+                "get_learning_stats",
+                json!({ "goal_pattern": goal_pattern }),
+            )
             .await?;
         let stats: LearningStats =
             serde_json::from_value(result).map_err(|e| format!("decode LearningStats: {e}"))?;
@@ -328,7 +337,10 @@ impl HttpTaskLeaseService {
         if let Some(tok) = self.token.as_deref() {
             req = req.bearer_auth(tok);
         }
-        let resp = req.send().await.map_err(|e| format!("network ({path}): {e}"))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("network ({path}): {e}"))?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -349,7 +361,10 @@ impl HttpTaskLeaseService {
         if let Some(tok) = self.token.as_deref() {
             req = req.bearer_auth(tok);
         }
-        let resp = req.send().await.map_err(|e| format!("network ({path}): {e}"))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("network ({path}): {e}"))?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -397,7 +412,10 @@ impl TaskLeaseService for HttpTaskLeaseService {
                 json!({ "edge_agent_id": agent_id }),
             )
             .await?;
-        Ok(result.get("released").and_then(|v| v.as_bool()).unwrap_or(false))
+        Ok(result
+            .get("released")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
     }
 
     async fn get_lease(

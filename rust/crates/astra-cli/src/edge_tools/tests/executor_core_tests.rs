@@ -247,8 +247,7 @@ async fn enter_plan_mode_dispatches_through_executor() {
     // is up to Phase 2.2; this test only pins that the dispatcher
     // routes the call (not the unknown-tool fallback).
     assert!(
-        !result.contains("not available")
-            || result.to_lowercase().contains("plan"),
+        !result.contains("not available") || result.to_lowercase().contains("plan"),
         "enter_plan_mode must reach a plan-mode-aware code path. \
          A generic 'tool not available' means the dispatcher missed \
          the route entirely. Got: {result}"
@@ -265,8 +264,7 @@ async fn exit_plan_mode_dispatches_through_executor() {
         )
         .await;
     assert!(
-        !result.contains("not available")
-            || result.to_lowercase().contains("plan"),
+        !result.contains("not available") || result.to_lowercase().contains("plan"),
         "exit_plan_mode must reach a plan-mode-aware code path. Got: {result}"
     );
 }
@@ -283,7 +281,10 @@ async fn agent_job_actions_dispatch_through_executor() {
     // shell — needs `command`; without the registry wired we expect
     // the unwired-fast-fail path, not the missing-arg path.
     let result = executor
-        .execute("agent_job", &json!({"action": "shell", "command": "echo hi"}))
+        .execute(
+            "agent_job",
+            &json!({"action": "shell", "command": "echo hi"}),
+        )
         .await;
     assert!(
         result.contains("background_shell")
@@ -297,7 +298,10 @@ async fn agent_job_actions_dispatch_through_executor() {
     // output — must reach the same handler that returns the unwired
     // message; both kill and output share the registry dependency.
     let result = executor
-        .execute("agent_job", &json!({"action": "kill", "task_id": "bg-shell-1"}))
+        .execute(
+            "agent_job",
+            &json!({"action": "kill", "task_id": "bg-shell-1"}),
+        )
         .await;
     assert!(
         result.contains("background")
