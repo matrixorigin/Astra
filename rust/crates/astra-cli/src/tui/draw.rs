@@ -462,8 +462,9 @@ pub(crate) fn do_draw(
     // Layout (top → bottom):
     //   active cell + scrollback   (weight=1, soaks remaining space)
     //   multi-agent strip          (weight=0, only if any sub-agents are live)
-    //   separator                  (weight=0)
+    //   separator                  (weight=0)  ← visual break above board
     //   task board                 (weight=0, pinned just above composer)
+    //   blank spacer               (weight=0)  ← only when board renders
     //   bottom pane / composer     (weight=0)
     //
     // Earlier iterations stacked the board ABOVE the active cell to
@@ -471,18 +472,32 @@ pub(crate) fn do_draw(
     // long agentic turns: streaming text kept pushing the board further
     // from the composer until it was off-screen entirely. Bottom-anchor
     // keeps the board adjacent to the composer — the user's eye only
-    // moves between two adjacent regions (composer ↔ board) instead of
-    // hunting for the panel up the scrollback.
+    // moves between two adjacent regions (composer ↔ board).
+    //
+    // The blank spacer between board and composer prevents the
+    // collapsed summary from clinging to the input prompt — without
+    // it the eye reads `⠋ N tasks ...› Ask astra ...` as one cramped
+    // strip. Only inserted when the board actually renders so an
+    // empty-task session doesn't waste a row.
     flex.push(1, ac_renderable);
     if let Some(item) = multi_agent_renderable {
         flex.push(0, item);
     }
     flex.push(0, sep_renderable);
+    let board_rendered = task_board_lines
+        .as_ref()
+        .is_some_and(|lines| !lines.is_empty());
     if let Some(lines) = task_board_lines
         && !lines.is_empty()
     {
         let para = Paragraph::new(ratatui::text::Text::from(lines));
         flex.push(0, RenderableItem::Owned(Box::new(para)));
+    }
+    if board_rendered {
+        let spacer = Paragraph::new(ratatui::text::Text::from(vec![Line::from(
+            ratatui::text::Span::raw(""),
+        )]));
+        flex.push(0, RenderableItem::Owned(Box::new(spacer)));
     }
     flex.push(0, bp_item);
 

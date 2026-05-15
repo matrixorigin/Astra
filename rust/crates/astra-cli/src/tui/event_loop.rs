@@ -936,6 +936,40 @@ pub(crate) async fn run_tui_repl(
                                                                 frame_requester.schedule_frame();
                                                                 continue;
                                                             }
+                                                            // Ctrl+T mid-turn: same toggle semantics as the
+                                                            // outer-loop handler. Without this branch the
+                                                            // inner select's match-arm fell through into
+                                                            // bottom_pane.handle_key, which silently
+                                                            // ignored Ctrl+T — so the user saw "no
+                                                            // response" any time the board was busy.
+                                                            // Mirrors the outer handler's INVARIANT:
+                                                            // pair board_expanded flips with
+                                                            // reveal/hide_completed_after_review so the
+                                                            // hide-after-all-done flag doesn't render
+                                                            // the expanded panel as empty.
+                                                            if k.code == crossterm::event::KeyCode::Char('t')
+                                                                && k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                                                            {
+                                                                if k
+                                                                    .modifiers
+                                                                    .contains(crossterm::event::KeyModifiers::SHIFT)
+                                                                    && !bottom_pane.has_active_view()
+                                                                {
+                                                                    task_board.toggle_view_mode();
+                                                                    frame_requester.schedule_frame();
+                                                                    continue;
+                                                                }
+                                                                let new_pin = !board_expanded;
+                                                                board_user_pin = Some(new_pin);
+                                                                board_expanded = new_pin;
+                                                                if new_pin {
+                                                                    task_board.reveal_completed_for_review();
+                                                                } else {
+                                                                    task_board.hide_completed_after_review();
+                                                                }
+                                                                frame_requester.schedule_frame();
+                                                                continue;
+                                                            }
                                                             // During turn: composer stays usable.
                                                             // Enter queues message (shown as preview, not in scrollback).
                                                             // Up edits last queued. Ctrl+C interrupts.
