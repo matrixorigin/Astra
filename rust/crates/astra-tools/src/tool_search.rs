@@ -38,8 +38,14 @@ impl Scoreable for ToolSchemaAdapter<'_> {
 /// - Otherwise — keyword search with scoring
 pub fn tool_search(schemas: &[Value], args: &Value) -> String {
     let query = match args.get("query").and_then(Value::as_str) {
-        Some(q) if !q.is_empty() => q.trim(),
-        _ => return "Error: 'query' is required".to_string(),
+        Some(q) => {
+            let trimmed = q.trim();
+            if trimmed.is_empty() {
+                return "Error: 'query' is required".to_string();
+            }
+            trimmed
+        }
+        None => return "Error: 'query' is required".to_string(),
     };
 
     let max_results = args
@@ -235,6 +241,22 @@ mod tests {
         let schemas = sample_schemas();
         let result = tool_search(&schemas, &json!({"query": ""}));
         assert!(result.contains("Error"));
+    }
+
+    #[test]
+    fn whitespace_only_query_returns_error() {
+        // Previously: `!q.is_empty()` passed for "   ", then q.trim() handed
+        // an empty string to the keyword scorer, which returned an empty
+        // matches array — not an error. The contract is "missing query =
+        // error", so whitespace-only must take the same error path.
+        let schemas = sample_schemas();
+        for q in ["   ", "\t", "\n\n", " \t \n "] {
+            let result = tool_search(&schemas, &json!({"query": q}));
+            assert!(
+                result.contains("Error"),
+                "whitespace-only query {q:?} must error, got: {result}"
+            );
+        }
     }
 
     // ── select: mode must return FULL schema (parameters included) ────────
