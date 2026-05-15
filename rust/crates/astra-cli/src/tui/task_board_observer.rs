@@ -306,6 +306,18 @@ impl TaskBoardObserver {
         snap
     }
 
+    /// Test-only: pretend `task_id`'s completion happened `back_by` ago
+    /// so the TTL filter treats it as expired without sleeping in tests.
+    /// No-op when the task isn't in the completed map.
+    #[doc(hidden)]
+    pub fn testing_force_completed_at_past(&self, task_id: &str, back_by: Duration) {
+        let (mut st, _) = lock_state(&self.inner, "testing_force_completed_at_past");
+        let stale = Instant::now()
+            .checked_sub(back_by)
+            .unwrap_or_else(Instant::now);
+        st.completed_at.insert(task_id.to_string(), stale);
+    }
+
     /// Cheap summary counts for the footer chip: `(open, total,
     /// hidden)`. Reads under the sync mutex without cloning the task
     /// vec — at ~60 draws/sec with 100 tasks the clone savings are

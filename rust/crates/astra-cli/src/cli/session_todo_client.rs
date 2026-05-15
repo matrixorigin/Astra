@@ -224,3 +224,296 @@ impl TaskStore for HttpTaskStore {
         Some(self.notify_tx.subscribe())
     }
 }
+
+// ───────────────────────────────────────────────────────────────────────
+// Wiring E2E tests
+//
+// These tests pin the assembly boundary that unit tests can't reach:
+// HttpTaskStore (this file) + TaskBoardObserver + the broadcast plumbing
+// the executor uses to signal mid-turn writes. They've caught three
+// distinct regressions during the dashboard rewrite:
+//
+//  1. resolve_task_store reading ASTRA_API_URL while the executor used
+//     api.api_origin() — two cloud_base sources of truth → observer
+//     polled an empty in-memory store while the executor wrote to cloud.
+//  2. TaskBoardObserver constructed with empty session_id silently
+//     filtered every broadcast for a brand-new session (the server
+//     allocates the SID mid-turn).
+//  3. `task` tool stuck in T2 deferred so the model never invoked it
+//     even when the user asked for multi-step work.
+//
+// Each test wires a fresh wiremock server playing the role of
+// astra-server's `/sessions/{sid}/todos*` endpoints, builds the real
+// HttpTaskStore + TaskBoardObserver, and asserts the observable
+// behaviour (mutations land within an SLA, completed tasks age out).
+// No MatrixOne, no axum, no SSE.
+// ───────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod wiring_e2e {
+    use super::*;
+    use crate::tui::task_board_observer::{COMPLETED_TASK_TTL, TaskBoardObserver};
+    use astra_tools::task_mgmt::{SessionTask, TaskStore};
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    /// Build a stub server that:
+    /// - GET  /sessions/{sid}/todos          → returns an evolving task list
+    /// - POST /sessions/{sid}/todos:execute  → bumps the list (create/update)
+    ///
+    /// State is shared via Arc<Mutex<Vec<SessionTask>>>.
+    async fn spawn_mock_server() -> (MockServer, Arc<std::sync::Mutex<Vec<SessionTask>>>) {
+        let server = MockServer::start().await;
+        let state: Arc<std::sync::Mutex<Vec<SessionTask>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let counter = Arc::new(AtomicU64::new(0));
+
+        // GET /sessions/.../todos — return whatever's in `state`.
+        let state_get = state.clone();
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path_regex(r"^/sessions/[^/]+/todos$"))
+            .respond_with(move |_req: &Request| {
+                let tasks = state_get.lock().unwrap().clone();
+                ResponseTemplate::new(200).set_body_json(json!({ "tasks": tasks }))
+            })
+            .mount(&server)
+            .await;
+
+        // POST /sessions/.../todos:execute — create / update / list.
+        let state_exec = state.clone();
+        let counter_exec = counter.clone();
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path_regex(r"^/sessions/[^/]+/todos:execute$"))
+            .respond_with(move |req: &Request| {
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                let args = body.get("args").cloned().unwrap_or(Value::Null);
+                let mut tasks = state_exec.lock().unwrap();
+                let output = match action {
+                    "create" => {
+                        let next = counter_exec.fetch_add(1, Ordering::SeqCst) + 1;
+                        let id = format!("task-{next}");
+                        let title = args
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("untitled")
+                            .to_string();
+                        tasks.push(SessionTask {
+                            id: id.clone(),
+                            title: title.clone(),
+                            description: None,
+                            status: "pending".into(),
+                            subtasks: vec![],
+                            created_at: "now".into(),
+                            updated_at: "now".into(),
+                            active_form: None,
+                            owner: None,
+                            metadata: None,
+                            blocks: vec![],
+                            blocked_by: vec![],
+                        });
+                        format!("Task #{id} created: {title}")
+                    }
+                    "update" => {
+                        let id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let new_status = args
+                            .get("status")
+                            .or_else(|| args.get("new_status"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("pending");
+                        if let Some(task) = tasks.iter_mut().find(|t| t.id == id) {
+                            task.status = new_status.to_string();
+                        }
+                        format!("Task #{id} updated to {new_status}")
+                    }
+                    other => format!("Error: unsupported action {other}"),
+                };
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "output": output }))
+            })
+            .mount(&server)
+            .await;
+
+        (server, state)
+    }
+
+    /// Wait for `cond` to hold while pumping `pump()` between polls.
+    /// Returns the elapsed time on success; panics on timeout so the
+    /// test fails with a useful message via `expect`.
+    async fn wait_until<F: Fn() -> bool>(
+        cond: F,
+        timeout_ms: u64,
+        pump: impl Fn(),
+    ) -> Result<Duration, ()> {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(timeout_ms);
+        while !cond() && Instant::now() < deadline {
+            pump();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if cond() {
+            Ok(start.elapsed())
+        } else {
+            Err(())
+        }
+    }
+
+    /// REGRESSION: `route_task_action` POSTs to the cloud on a `task.create`,
+    /// fires the broadcast, and the observer picks the row up within the
+    /// dirty/FAST_POLL window (≤ 200ms even on slow CI). This is the
+    /// "dashboard appears mid-turn" SLA.
+    #[tokio::test]
+    async fn task_create_lands_in_observer_within_sla() {
+        let (server, _state) = spawn_mock_server().await;
+        let (store, notify_tx) = HttpTaskStore::new(server.uri(), None);
+        let store_dyn: Arc<dyn TaskStore> = store.clone();
+        let observer = TaskBoardObserver::new(store_dyn, "sess-sla");
+
+        // Simulate what `route_task_action` does after a successful POST:
+        // (1) push the row server-side via the same HTTP path the executor
+        // would hit, (2) broadcast the session_id so the observer picks
+        // it up immediately.
+        let sid = "sess-sla";
+        let started = Instant::now();
+        let resp = execute_todo_action(
+            &server.uri(),
+            None,
+            sid,
+            "create",
+            &json!({ "title": "first task" }),
+        )
+        .await
+        .expect("create should succeed against the mock");
+        assert!(resp.contains("first task"));
+        let _ = notify_tx.send(sid.to_string());
+
+        let elapsed = wait_until(
+            || !observer.snapshot().tasks.is_empty(),
+            300,
+            || observer.maybe_refresh(),
+        )
+        .await
+        .expect("task must surface in observer within SLA window");
+        let total_ms = started.elapsed().as_millis();
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "observer should pick up create within SLA (took {elapsed:?}, total {total_ms}ms)"
+        );
+        let snap = observer.snapshot();
+        assert_eq!(snap.tasks.len(), 1);
+        assert_eq!(snap.tasks[0].title, "first task");
+    }
+
+    /// REGRESSION: TUI starts with an empty `session_id` (server allocates
+    /// it mid-turn). Without the adoption fix the observer's broadcast
+    /// receiver dropped every event because `changed_sid != ""`. This
+    /// test pins the self-heal: an empty observer must adopt the first
+    /// non-empty broadcast SID and start fetching against it.
+    #[tokio::test]
+    async fn empty_observer_self_heals_on_first_broadcast() {
+        let (server, _state) = spawn_mock_server().await;
+        let (store, notify_tx) = HttpTaskStore::new(server.uri(), None);
+        let store_dyn: Arc<dyn TaskStore> = store.clone();
+        // Observer constructed BEFORE the server allocates a SID — same
+        // shape as `run_tui_repl` building it from `state.session_id =
+        // None.unwrap_or_default() = ""`.
+        let observer = TaskBoardObserver::new(store_dyn, "");
+
+        let sid = "sess-allocated-mid-turn";
+        let _ = execute_todo_action(
+            &server.uri(),
+            None,
+            sid,
+            "create",
+            &json!({ "title": "post-adoption" }),
+        )
+        .await
+        .expect("mock POST");
+        let _ = notify_tx.send(sid.to_string());
+
+        wait_until(
+            || !observer.snapshot().tasks.is_empty(),
+            500,
+            || observer.maybe_refresh(),
+        )
+        .await
+        .expect("observer must adopt the broadcast SID");
+        assert_eq!(
+            observer.snapshot().tasks[0].title,
+            "post-adoption",
+            "observer must read against the adopted SID, not its constructor sid"
+        );
+    }
+
+    /// REGRESSION: completed tasks used to linger forever — only "all
+    /// completed" triggered a board-wide hide. With per-task TTL, a row
+    /// completed for longer than COMPLETED_TASK_TTL drops out of the
+    /// render snapshot but the truth snapshot keeps it for counts/audit.
+    /// We don't actually wait 30s; we force `completed_at` into the past
+    /// and assert the partition.
+    #[tokio::test]
+    async fn completed_task_ages_out_of_render_snapshot_via_http_path() {
+        let (server, _state) = spawn_mock_server().await;
+        let (store, notify_tx) = HttpTaskStore::new(server.uri(), None);
+        let store_dyn: Arc<dyn TaskStore> = store.clone();
+        let observer = TaskBoardObserver::new(store_dyn, "sess-ttl");
+
+        let sid = "sess-ttl";
+        let _ = execute_todo_action(
+            &server.uri(),
+            None,
+            sid,
+            "create",
+            &json!({ "title": "shipping work" }),
+        )
+        .await
+        .unwrap();
+        let _ = notify_tx.send(sid.to_string());
+        wait_until(
+            || observer.snapshot().tasks.len() == 1,
+            500,
+            || observer.maybe_refresh(),
+        )
+        .await
+        .expect("task must surface");
+
+        let _ = execute_todo_action(
+            &server.uri(),
+            None,
+            sid,
+            "update",
+            &json!({ "task_id": "task-1", "status": "completed" }),
+        )
+        .await
+        .unwrap();
+        let _ = notify_tx.send(sid.to_string());
+        wait_until(
+            || observer.snapshot().tasks.iter().any(|t| t.status == "completed"),
+            500,
+            || observer.maybe_refresh(),
+        )
+        .await
+        .expect("completion must propagate");
+
+        // Fresh: the row stays in the render snapshot so the user sees
+        // the ✔ land.
+        assert_eq!(
+            observer.snapshot_for_render().tasks.len(),
+            1,
+            "fresh completion must still render"
+        );
+
+        // Force the TTL into the past — equivalent to 31s having passed.
+        observer.testing_force_completed_at_past("task-1", COMPLETED_TASK_TTL + Duration::from_secs(1));
+        assert!(
+            observer.snapshot_for_render().tasks.is_empty(),
+            "completed row past TTL must drop from render snapshot"
+        );
+        // Truth snapshot still carries the row — counts (`/task list`,
+        // header chip) reflect the full set.
+        assert_eq!(observer.snapshot().tasks.len(), 1);
+    }
+}

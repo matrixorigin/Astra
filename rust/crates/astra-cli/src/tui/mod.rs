@@ -52,7 +52,7 @@ mod style;
 mod table_view;
 mod task_board_events;
 mod task_board_multi;
-mod task_board_observer;
+pub(crate) mod task_board_observer;
 mod task_list;
 mod task_status;
 mod terminal;
