@@ -73,6 +73,21 @@ pub(crate) fn is_dangerous_write_target(rel_path: &str) -> Option<&'static str> 
         ),
     ];
     let filename = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    // Public-template variants of `.env` are explicitly NOT secrets —
+    // they ship in the repo as documentation of what env vars are
+    // needed and carry placeholder values. Refusing to write them
+    // blocked the common `cp .env.example .env && edit` workflow
+    // without buying any safety, so whitelist them up front.
+    const ENV_TEMPLATE_FILENAMES: &[&str] = &[
+        ".env.example",
+        ".env.sample",
+        ".env.template",
+        ".env.dist",
+        ".env.default",
+    ];
+    if ENV_TEMPLATE_FILENAMES.contains(&filename) {
+        return None;
+    }
     for (name, reason) in DANGEROUS_FILES {
         if filename == *name || rel_path.ends_with(name) {
             return Some(reason);
@@ -82,7 +97,9 @@ pub(crate) fn is_dangerous_write_target(rel_path: &str) -> Option<&'static str> 
     if rel_path.starts_with(".git/") || rel_path.contains("/.git/") {
         return Some("Git internals — corruption risk");
     }
-    // .env.* variants (e.g. .env.production, .env.staging)
+    // .env.* variants (e.g. .env.production, .env.staging). The
+    // template forms above already returned `None`, so anything that
+    // reaches here is a real secrets-bearing variant.
     if filename.starts_with(".env.") {
         return Some("Environment variables — may contain secrets");
     }
@@ -4640,6 +4657,36 @@ type Handler interface {
         // Still safe
         assert!(is_dangerous_write_target("package.json").is_none());
         assert!(is_dangerous_write_target("Cargo.toml").is_none());
+    }
+
+    /// REGRESSION: `.env.example` and friends are templates checked
+    /// into the repo with placeholder values — they're documentation,
+    /// not secrets. Treating them like real `.env` files refuses
+    /// the common `cp .env.example .env` workflow with a hard error
+    /// and zero safety upside.
+    #[test]
+    fn dotenv_template_variants_are_not_dangerous() {
+        for safe in [
+            ".env.example",
+            ".env.sample",
+            ".env.template",
+            ".env.dist",
+            ".env.default",
+            "/tmp/expense_system/.env.example",
+            "deeply/nested/dir/.env.sample",
+        ] {
+            assert!(
+                is_dangerous_write_target(safe).is_none(),
+                "{safe} must NOT be flagged — it's a template, not a secret"
+            );
+        }
+        // Sanity: real secrets-bearing variants still blocked.
+        for unsafe_path in [".env", ".env.local", ".env.production", ".env.staging"] {
+            assert!(
+                is_dangerous_write_target(unsafe_path).is_some(),
+                "{unsafe_path} must stay flagged"
+            );
+        }
     }
 
     #[test]
