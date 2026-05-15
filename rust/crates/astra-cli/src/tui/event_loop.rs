@@ -949,7 +949,17 @@ pub(crate) async fn run_tui_repl(
                                                                             .in_flight_task_ids()
                                                                             .to_vec();
                                                                         chat_widget.mark_agent_controls_cancelling(&ids);
-                                                                        let mut cancelled_count = 0usize;
+                                                                        // Report the count of tasks the user
+                                                                        // *targeted* with Ctrl+C, not just the
+                                                                        // ones the durable-task service acked.
+                                                                        // Service errors are logged separately;
+                                                                        // a non-acked task is usually a
+                                                                        // synchronous-spawn child the worker
+                                                                        // never persisted, but the user's
+                                                                        // intent was to interrupt all six
+                                                                        // running children, so the banner
+                                                                        // should say "Cancelled 6", not "1".
+                                                                        let cancelled_count = ids.len();
                                                                         if !ids.is_empty()
                                                                             && let Some(ref svc) = task_service_for_cancel
                                                                         {
@@ -968,7 +978,6 @@ pub(crate) async fn run_tui_repl(
                                                                                 },
                                                                             )
                                                                             .await;
-                                                                            cancelled_count = ids.len().saturating_sub(errs.len());
                                                                             for (id, e) in &errs {
                                                                                 tracing::warn!(
                                                                                     target: "astra_cli::tui",
