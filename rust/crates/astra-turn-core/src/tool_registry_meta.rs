@@ -120,7 +120,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     },
     ToolMeta {
         name: "write_file",
-        description: "Create or overwrite a file",
+        description: "Create, overwrite, or delete a file; writes require path+content, deletes use delete=true",
         triggers: &[
             "write",
             "create file",

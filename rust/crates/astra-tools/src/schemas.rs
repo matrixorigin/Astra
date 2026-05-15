@@ -219,15 +219,19 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create or overwrite a file. Set delete=true to delete instead.",
+                "description": "Create, overwrite, or delete a file. For writes, provide both path and content. For deletes, provide path with delete=true instead of content. Retry write_file with corrected arguments; do not switch to bash or python just to write a file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
-                        "content": {"type": "string", "description": "File content (not required when delete=true)"},
-                        "delete": {"type": "boolean", "description": "If true, delete the file instead of writing"}
+                        "content": {"type": "string", "description": "File content. Required when delete is absent or false."},
+                        "delete": {"type": "boolean", "description": "Set to true to delete the file instead of writing. When true, content must be omitted."}
                     },
-                    "required": ["path"]
+                    "required": ["path"],
+                    "x-astra-per-action-required": {
+                        "write": ["path", "content"],
+                        "delete": ["path"]
+                    }
                 }
             }
         }),
@@ -1261,6 +1265,77 @@ mod tests {
                 "default executor exposes `{name}` but server_executor_tool_schemas() omits it"
             );
         }
+    }
+
+    #[test]
+    fn write_file_schema_requires_content_or_delete_contract() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let write_file = find_schema(&schemas, "write_file").expect("write_file schema must exist");
+        let func = write_file
+            .get("function")
+            .expect("write_file schema must include function block");
+        let desc = func
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            desc.contains("path")
+                && desc.contains("content")
+                && desc.contains("delete=true")
+                && desc.contains("do not switch to bash"),
+            "write_file description must spell out the path+content contract and discourage shell fallback: {desc}"
+        );
+
+        let params = func
+            .get("parameters")
+            .expect("write_file schema must include parameters");
+
+        // Anthropic/Bedrock reject oneOf/allOf/anyOf at the top level of input_schema.
+        // The write vs delete distinction is expressed via description prose and the
+        // x-astra-per-action-required extension, not via composition keywords.
+        assert!(
+            params.get("oneOf").is_none(),
+            "write_file parameters must not use top-level oneOf (Anthropic/Bedrock HTTP 400)"
+        );
+        assert!(
+            params.get("allOf").is_none(),
+            "write_file parameters must not use top-level allOf (Anthropic/Bedrock HTTP 400)"
+        );
+        assert!(
+            params.get("anyOf").is_none(),
+            "write_file parameters must not use top-level anyOf (Anthropic/Bedrock HTTP 400)"
+        );
+
+        // path must be the sole top-level required field.
+        let required = params
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("write_file parameters must include a required array");
+        assert!(
+            required.iter().any(|v| v == "path"),
+            "write_file must require path: {required:?}"
+        );
+
+        // Per-action required fields must be encoded in the vendor extension.
+        let per_action = params.get("x-astra-per-action-required").expect(
+            "write_file must use x-astra-per-action-required to encode per-mode requirements",
+        );
+        let write_req = per_action
+            .get("write")
+            .and_then(Value::as_array)
+            .expect("x-astra-per-action-required must list fields required for write");
+        assert!(
+            write_req.iter().any(|v| v == "path") && write_req.iter().any(|v| v == "content"),
+            "write action must require both path and content: {write_req:?}"
+        );
+        let delete_req = per_action
+            .get("delete")
+            .and_then(Value::as_array)
+            .expect("x-astra-per-action-required must list fields required for delete");
+        assert!(
+            delete_req.iter().any(|v| v == "path"),
+            "delete action must require path: {delete_req:?}"
+        );
     }
 
     // ── Session 0e37eb46 regression: bash/powershell schema-advertised

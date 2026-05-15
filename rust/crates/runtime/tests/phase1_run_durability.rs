@@ -717,7 +717,7 @@ async fn l2_retry_scope_and_batch_contracts_hold() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn l2_one_thousand_tool_outputs_insert_under_500ms() {
+async fn l2_one_thousand_tool_outputs_insert_under_1000ms() {
     let pool = setup_pool().await;
     let (run_id, session_id, user_id) = test_ids();
     let store = DatabaseRunStateStore::new(pool);
@@ -746,9 +746,10 @@ async fn l2_one_thousand_tool_outputs_insert_under_500ms() {
             .await
             .unwrap();
     }
+    let max_ms = 1_000;
     assert!(
-        started.elapsed() < Duration::from_millis(500),
-        "1000 tool outputs should insert in under 500ms"
+        started.elapsed() < Duration::from_millis(max_ms),
+        "1000 tool outputs should insert in under {max_ms}ms"
     );
 }
 

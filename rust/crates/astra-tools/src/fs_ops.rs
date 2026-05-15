@@ -660,13 +660,17 @@ pub fn prepare_write_file(
 ) -> Result<PreparedWriteFile, ToolResult> {
     let path_str = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
-        None => return Err(ToolResult::error("Error: Missing 'path' parameter".into())),
+        None => {
+            return Err(ToolResult::error(
+                "Error: Missing 'path' parameter. Retry write_file with both path and content. Do not switch to bash or python just to write this file.".into(),
+            ));
+        }
     };
     let content = match args.get("content").and_then(|v| v.as_str()) {
         Some(c) => c,
         None => {
             return Err(ToolResult::error(
-                "Error: Missing 'content' parameter".into(),
+                "Error: Missing 'content' parameter. Retry write_file with both path and content. Do not switch to bash or python just to write this file.".into(),
             ));
         }
     };
@@ -2236,6 +2240,41 @@ mod tests {
         );
         let content = std::fs::read_to_string(target).unwrap();
         assert_eq!(content, "fn main() {}\n");
+    }
+
+    #[test]
+    fn prepare_write_file_missing_path_guides_retry_same_tool() {
+        let tmp = TempDir::new().unwrap();
+        let err = prepare_write_file(tmp.path(), &serde_json::json!({"content": "hello"}))
+            .expect_err("missing path should fail");
+        assert!(err.is_error);
+        assert!(err.output.contains("Missing 'path' parameter"));
+        assert!(err.output.contains("Retry write_file"));
+        assert!(err.output.contains("path and content"));
+        assert!(
+            !err.output.contains("delete=true"),
+            "path-missing error must not suggest delete=true (write-only path)"
+        );
+        assert!(err.output.contains("Do not switch to bash"));
+    }
+
+    #[test]
+    fn prepare_write_file_missing_content_guides_retry_same_tool() {
+        let tmp = TempDir::new().unwrap();
+        let err = prepare_write_file(tmp.path(), &serde_json::json!({"path": "note.txt"}))
+            .expect_err("missing content should fail");
+        assert!(err.is_error);
+        assert!(err.output.contains("Missing 'content' parameter"));
+        assert!(err.output.contains("Retry write_file"));
+        assert!(err.output.contains("path and content"));
+        // The delete=true hint is intentionally absent: if delete=true is present,
+        // the executor routes to delete_file before prepare_write_file is called,
+        // so this error only fires when delete is definitely NOT true.
+        assert!(
+            !err.output.contains("set delete=true"),
+            "content-missing error must not suggest delete=true (unreachable path)"
+        );
+        assert!(err.output.contains("Do not switch to bash"));
     }
 
     #[test]
