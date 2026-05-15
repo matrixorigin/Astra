@@ -122,10 +122,15 @@ fn xml_escape_text(s: &str) -> std::borrow::Cow<'_, str> {
 /// Per-entry hard cap prevents verbose `when_to_use` strings from bloating the listing.
 /// `BUDGET_NUM/BUDGET_DEN = 1/25 = 4 chars/token × 1%` — kept as integers so the budget
 /// math is exact regardless of f64 rounding.
+///
+/// `MAX_ENTRY_CHARS = 1024` aligns roughly with Claude Code's 1,536-char per-skill cap,
+/// but tighter because our overall listing budget is ~1% (vs Claude Code's larger budget).
+/// Set high enough to fit `description + WHEN: when_to_use` for typical skills without
+/// truncation; per-listing budget (above) still bounds the total surface.
 const SKILL_LISTING_BUDGET_NUM: u64 = 1;
 const SKILL_LISTING_BUDGET_DEN: u64 = 25;
 const SKILL_LISTING_DEFAULT_CHAR_BUDGET: usize = 8_000;
-const SKILL_LISTING_MAX_ENTRY_CHARS: usize = 250;
+const SKILL_LISTING_MAX_ENTRY_CHARS: usize = 1024;
 
 /// Render the `<available_skills>` section of the system prompt.
 ///
@@ -239,19 +244,48 @@ pub fn build_skill_listing_section_with_budget(
     Some(PromptSection::stable(body, CacheScope::Session))
 }
 
+/// Collapse internal whitespace runs (incl. newlines/tabs) to a single space,
+/// then trim ends. Defends the listing against multi-line YAML scalars and
+/// other free-form text in user-authored SKILL.md frontmatter.
+fn flatten_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = true; // skip leading ws
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
 /// Combine description + when_to_use into a single line, capped at entry limit.
+/// Inputs are flattened (multi-line scalars → single line) so user-authored
+/// SKILL.md text cannot inject newlines into the rendered XML.
 fn format_skill_description(description: &str, when_to_use: Option<&str>) -> String {
-    let combined = match when_to_use {
-        Some(wtu) if !wtu.is_empty() && !description.is_empty() => {
-            let sep = if description.ends_with('.') {
+    let desc = flatten_whitespace(description);
+    let wtu = when_to_use.map(flatten_whitespace).unwrap_or_default();
+
+    let combined = match (desc.is_empty(), wtu.is_empty()) {
+        (false, false) => {
+            let sep = if desc.ends_with(['.', '!', '?']) {
                 " "
             } else {
                 ". "
             };
-            format!("{description}{sep}WHEN: {wtu}")
+            format!("{desc}{sep}WHEN: {wtu}")
         }
-        Some(wtu) if !wtu.is_empty() => format!("WHEN: {wtu}"),
-        _ => description.to_string(),
+        (true, false) => format!("WHEN: {wtu}"),
+        (false, true) => desc,
+        (true, true) => String::new(),
     };
     if combined.len() <= SKILL_LISTING_MAX_ENTRY_CHARS {
         combined
@@ -3311,6 +3345,44 @@ mod tests {
         let with_empty = format_skill_description("Runs tests", Some(""));
         assert_eq!(with_none, with_empty);
         assert_eq!(with_none, "Runs tests");
+    }
+
+    #[test]
+    fn format_skill_description_flattens_multiline_yaml_scalars() {
+        // User-authored SKILL.md may use YAML block scalars (`description: |`)
+        // — the listing must not leak newlines into the rendered XML.
+        let multiline_desc = "Line one\n  Line two\n\tLine three";
+        let multiline_wtu = "When\n  user\n  asks";
+        let formatted = format_skill_description(multiline_desc, Some(multiline_wtu));
+        assert!(!formatted.contains('\n'), "newlines must be flattened");
+        assert!(!formatted.contains('\t'), "tabs must be flattened");
+        assert!(formatted.contains("Line one Line two Line three"));
+        assert!(formatted.contains("WHEN: When user asks"));
+    }
+
+    #[test]
+    fn format_skill_description_trims_and_collapses_whitespace() {
+        let formatted =
+            format_skill_description("   leading   and    inner   ", Some("  trailing  "));
+        // No leading/trailing space, single internal spaces.
+        assert!(formatted.starts_with("leading and inner"));
+        assert!(!formatted.contains("  "), "no double spaces: {formatted}");
+    }
+
+    #[test]
+    fn format_skill_description_handles_unicode_punctuation_terminators() {
+        // Description ending with `!` should not get an extra `. ` separator.
+        let formatted = format_skill_description("Stop the world!", Some("user wants halt"));
+        assert!(formatted.contains("world! WHEN:"));
+        assert!(!formatted.contains("world!. WHEN:"));
+    }
+
+    #[test]
+    fn format_skill_description_pure_whitespace_inputs_are_empty() {
+        // After flatten_whitespace, "   \n  " becomes "" — should match the
+        // empty-input branch.
+        assert_eq!(format_skill_description("   ", Some("\n\t  ")), "");
+        assert_eq!(format_skill_description("   ", None), "");
     }
 
     #[test]

@@ -7,7 +7,7 @@ description: "Run project tests, linters, and type checks to verify code correct
 version: "1.0.0"
 allowed_tools:
   - bash
-when_to_use: "When the user wants to verify recent changes or run a quality check — say 'verify', 'validate', 'run tests', '验证', '跑测试'"
+when_to_use: "User wants to confirm recent changes are correct: run the project's tests, linters, type checks, or formatter against the current state of the code"
 category: quality
 tags:
   - testing

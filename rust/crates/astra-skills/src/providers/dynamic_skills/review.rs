@@ -10,7 +10,7 @@ allowed_tools:
   - bash
   - read_file
   - write_file
-when_to_use: "When the user wants code changes reviewed for complexity or quality — say 'review', 'simplify', 'clean up', '审查', '代码review'"
+when_to_use: "User wants recently changed code reviewed for reuse, quality, or efficiency — typically before commit or after a feature lands"
 category: code-review
 tags:
   - review

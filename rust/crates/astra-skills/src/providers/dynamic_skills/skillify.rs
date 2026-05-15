@@ -98,7 +98,7 @@ allowed_tools:
   - read_file
   - write_file
   - delegate
-when_to_use: <detailed description including trigger phrases>
+when_to_use: <user-intent description: what kind of request should route here>
 arguments:
   - name: <arg_name>
     description: <arg description>
@@ -126,7 +126,7 @@ What to do. Be specific and actionable. Include commands when appropriate.
 **Frontmatter rules:**
 - `allowed_tools`: list the specific tools needed (e.g., `bash`, `read_file`, `write_file`, `delegate` for sub-agents, or MCP tool names)
 - `context`: only set `fork` for self-contained skills that don't need mid-process user input
-- `when_to_use`: start with "Use when..." and include trigger phrases
+- `when_to_use`: describe the *user intent* that should route here ("User wants to ..."). Do not list trigger keywords — the model routes semantically, not by substring match
 
 ## Step 4: Confirm and Save
 

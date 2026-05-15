@@ -10,7 +10,7 @@ allowed_tools:
   - read_file
   - write_file
   - delegate
-when_to_use: "When the user reports a bug, test failure, or unexpected behavior — say 'debug', 'diagnose', 'troubleshoot', '调试', '排查', '为什么失败'. Not for general error-handling questions"
+when_to_use: "User reports something is broken: a failing test, a crash, a bug, output that doesn't match expectations. Not for hypothetical 'how should I handle errors' design questions"
 category: diagnostics
 arguments:
   - name: ISSUE
