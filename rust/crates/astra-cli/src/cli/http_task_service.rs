@@ -51,6 +51,7 @@ impl HttpTaskService {
     async fn rpc(&self, method: &str, args: Value) -> Result<Value, String> {
         let url = format!("{}/tasks:rpc", self.cloud_base.trim_end_matches('/'));
         let client = reqwest::Client::builder()
+            .no_proxy() // astra server is local/intranet; bypass http_proxy env
             .timeout(std::time::Duration::from_secs(TASK_HTTP_TIMEOUT_SECS))
             .build()
             .map_err(|e| format!("http client init: {e}"))?;
@@ -319,6 +320,7 @@ impl HttpTaskLeaseService {
 
     async fn post(&self, path: &str, body: Value) -> Result<Value, String> {
         let client = reqwest::Client::builder()
+            .no_proxy() // astra server is local/intranet; bypass http_proxy env
             .timeout(std::time::Duration::from_secs(TASK_HTTP_TIMEOUT_SECS))
             .build()
             .map_err(|e| format!("http client init: {e}"))?;
@@ -339,6 +341,7 @@ impl HttpTaskLeaseService {
 
     async fn get(&self, path: &str) -> Result<Value, String> {
         let client = reqwest::Client::builder()
+            .no_proxy() // astra server is local/intranet; bypass http_proxy env
             .timeout(std::time::Duration::from_secs(TASK_HTTP_TIMEOUT_SECS))
             .build()
             .map_err(|e| format!("http client init: {e}"))?;
