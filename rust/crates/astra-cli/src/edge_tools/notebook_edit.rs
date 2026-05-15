@@ -44,22 +44,16 @@ impl ToolExecutor {
             .and_then(|v| v.as_str())
             .unwrap_or("code");
 
-        let rel = file_path
-            .strip_prefix(&self.project_root)
-            .unwrap_or(&file_path);
-        let rel_str = rel.to_string_lossy();
-        if let Some(warning) = super::fs_tools::is_dangerous_write_target(&rel_str) {
-            return json!({
-                "error": format!("⚠️ Warning: writing to sensitive file '{}' — {}. If intentional, use bash to bypass this guard.", rel_str, warning)
-            }).to_string();
-        }
-
         // Check staleness and read-before-write requirements only for existing files
         if file_path.exists() {
             if let Err(e) = self.check_staleness(&file_path) {
                 return json!({ "error": e }).to_string();
             }
             if !self.was_fully_read(&file_path) {
+                let rel = file_path
+                    .strip_prefix(&self.project_root)
+                    .unwrap_or(&file_path);
+                let rel_str = rel.to_string_lossy();
                 return json!({
                     "error": format!(
                         "File was only partially read (outline or line range). Read the full file before editing.\n\

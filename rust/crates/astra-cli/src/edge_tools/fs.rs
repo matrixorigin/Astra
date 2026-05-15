@@ -16,100 +16,40 @@ fn edit_type_label(edit_type: astra_turn_core::file_edit_journal::EditType) -> &
     }
 }
 
-/// Check if a path is a dangerous/sensitive file that should warn the user.
-pub(crate) fn is_dangerous_write_target(rel_path: &str) -> Option<&'static str> {
-    const DANGEROUS_FILES: &[(&str, &str)] = &[
-        (
-            ".gitconfig",
-            "Git configuration — changes affect all git operations",
-        ),
-        (
-            ".gitmodules",
-            "Git submodule config — can change repository references",
-        ),
-        (
-            ".bashrc",
-            "Bash startup — changes affect all future shell sessions",
-        ),
-        (
-            ".bash_profile",
-            "Bash login — changes affect all future login sessions",
-        ),
-        (
-            ".zshrc",
-            "Zsh startup — changes affect all future shell sessions",
-        ),
-        (
-            ".zprofile",
-            "Zsh login — changes affect all future login sessions",
-        ),
-        (
-            ".profile",
-            "Shell profile — changes affect all future sessions",
-        ),
-        (
-            ".ssh/config",
-            "SSH config — changes affect all SSH connections",
-        ),
-        (
-            ".ssh/authorized_keys",
-            "SSH keys — changes affect server access",
-        ),
-        (".npmrc", "NPM config — can change registry or auth tokens"),
-        (".env", "Environment variables — may contain secrets"),
-        (".env.local", "Local env variables — may contain secrets"),
-        (
-            ".aws/credentials",
-            "AWS credentials — changes affect cloud access",
-        ),
-        (".aws/config", "AWS config — changes affect cloud access"),
-        (
-            ".kube/config",
-            "Kubernetes config — changes affect cluster access",
-        ),
-        (
-            ".docker/config.json",
-            "Docker config — may contain registry auth tokens",
-        ),
-    ];
-    let filename = rel_path.rsplit('/').next().unwrap_or(rel_path);
-    // Public-template variants of `.env` are explicitly NOT secrets —
-    // they ship in the repo as documentation of what env vars are
-    // needed and carry placeholder values. Refusing to write them
-    // blocked the common `cp .env.example .env && edit` workflow
-    // without buying any safety, so whitelist them up front.
-    const ENV_TEMPLATE_FILENAMES: &[&str] = &[
-        ".env.example",
-        ".env.sample",
-        ".env.template",
-        ".env.dist",
-        ".env.default",
-    ];
-    if ENV_TEMPLATE_FILENAMES.contains(&filename) {
-        return None;
-    }
-    for (name, reason) in DANGEROUS_FILES {
-        if filename == *name || rel_path.ends_with(name) {
-            return Some(reason);
-        }
-    }
-    // Check dangerous directories
-    if rel_path.starts_with(".git/") || rel_path.contains("/.git/") {
-        return Some("Git internals — corruption risk");
-    }
-    // .env.* variants (e.g. .env.production, .env.staging). The
-    // template forms above already returned `None`, so anything that
-    // reaches here is a real secrets-bearing variant.
-    if filename.starts_with(".env.") {
-        return Some("Environment variables — may contain secrets");
-    }
-    // .ssh key files
-    if rel_path.contains(".ssh/") && (filename.starts_with("id_") || filename == "authorized_keys2")
-    {
-        return Some("SSH key file — changes affect authentication");
-    }
-    None
-}
+// NOTE on removed `is_dangerous_write_target`:
+//
+// An earlier version of this file maintained a hard-block list of
+// "dangerous" filenames (`.env`, `.bashrc`, `.aws/credentials`, …) and
+// refused write_file/str_replace/notebook_edit to any matching path,
+// telling the model "use bash to bypass". That guard was deleted on
+// 2026-05-15 because:
+//
+//   1. It's bypassable in one tool-call. The model just routes through
+//      bash. The error message even told it how. So it stops zero
+//      malicious or buggy paths.
+//   2. It has a high false-positive rate. `.env.example` (a public
+//      template, the opposite of a secret) was flagged identically to
+//      `.env`, refusing the standard `cp .env.example .env` workflow.
+//   3. It's filename-based, never content-based. It cannot detect a
+//      secret pasted into `notes.txt` and it wrongly flags an empty
+//      `.env`.
+//   4. The real protections are elsewhere and still in force:
+//        - `validate_path` (sandbox) blocks paths outside the project.
+//        - `permission_redact::matches_sensitive_path` redacts secret
+//          *display* in approval cards.
+//        - `safety_middleware::redact_credentials_in_text` runs on
+//          tool *output* before it reaches the LLM, masking real
+//          API keys / tokens / PEMs by content pattern.
+//
+// claudecode follows the same philosophy (`tools/FileWriteTool` has
+// no filename-based block; the only content guard is
+// `checkTeamMemSecrets`, which is path-and-content-scoped to a
+// shared team-memory directory we don't have).
+//
+// If a content-based scan ever lands here, it should match
+// claudecode's shape: scan content, not name; warn or redact, not
+// hard-block; and only when writing to a path that's actually
+// shared/synced.
 
 impl ToolExecutor {
     fn record_fuzzy_match_event(
@@ -689,15 +629,6 @@ impl ToolExecutor {
             }).to_string();
         }
 
-        // Dangerous file guard
-        let rel_str = self.project_relative_display(&path);
-        if let Some(warning) = is_dangerous_write_target(&rel_str) {
-            return json!({
-                "success": false,
-                "error": format!("⚠️ Warning: writing to sensitive file '{}' — {}. If intentional, use bash 'echo ... > file' to bypass this guard.", rel_str, warning)
-            }).to_string();
-        }
-
         // Staleness check: if file exists, it must have been read first and not modified since
         if path.exists() {
             if let Err(e) = self.check_staleness(&path) {
@@ -822,15 +753,6 @@ impl ToolExecutor {
             .get("replace_all")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-
-        // Dangerous file guard
-        let rel_str = self.project_relative_display(&path);
-        if let Some(warning) = is_dangerous_write_target(&rel_str) {
-            return format!(
-                "⚠️ Warning: writing to sensitive file '{}' — {}. If intentional, use bash 'echo ... > file' to bypass this guard.",
-                rel_str, warning
-            );
-        }
 
         // Staleness check
         if let Err(e) = self.check_staleness(&path) {
@@ -4630,63 +4552,6 @@ type Handler interface {
             !result.contains("top_level"),
             "scope must not fall back to the beginning of the file: {result}"
         );
-    }
-
-    #[test]
-    fn test_is_dangerous_write_target() {
-        assert!(is_dangerous_write_target(".bashrc").is_some());
-        assert!(is_dangerous_write_target(".git/config").is_some());
-        assert!(is_dangerous_write_target(".env").is_some());
-        assert!(is_dangerous_write_target("src/main.rs").is_none());
-        assert!(is_dangerous_write_target("README.md").is_none());
-    }
-
-    #[test]
-    fn test_dangerous_write_target_expanded_list() {
-        // New entries
-        assert!(is_dangerous_write_target(".env.local").is_some());
-        assert!(is_dangerous_write_target(".env.production").is_some());
-        assert!(is_dangerous_write_target(".env.staging").is_some());
-        assert!(is_dangerous_write_target(".aws/credentials").is_some());
-        assert!(is_dangerous_write_target(".aws/config").is_some());
-        assert!(is_dangerous_write_target(".kube/config").is_some());
-        assert!(is_dangerous_write_target(".docker/config.json").is_some());
-        assert!(is_dangerous_write_target(".ssh/id_rsa").is_some());
-        assert!(is_dangerous_write_target(".ssh/id_ed25519").is_some());
-        assert!(is_dangerous_write_target(".ssh/authorized_keys2").is_some());
-        // Still safe
-        assert!(is_dangerous_write_target("package.json").is_none());
-        assert!(is_dangerous_write_target("Cargo.toml").is_none());
-    }
-
-    /// REGRESSION: `.env.example` and friends are templates checked
-    /// into the repo with placeholder values — they're documentation,
-    /// not secrets. Treating them like real `.env` files refuses
-    /// the common `cp .env.example .env` workflow with a hard error
-    /// and zero safety upside.
-    #[test]
-    fn dotenv_template_variants_are_not_dangerous() {
-        for safe in [
-            ".env.example",
-            ".env.sample",
-            ".env.template",
-            ".env.dist",
-            ".env.default",
-            "/tmp/expense_system/.env.example",
-            "deeply/nested/dir/.env.sample",
-        ] {
-            assert!(
-                is_dangerous_write_target(safe).is_none(),
-                "{safe} must NOT be flagged — it's a template, not a secret"
-            );
-        }
-        // Sanity: real secrets-bearing variants still blocked.
-        for unsafe_path in [".env", ".env.local", ".env.production", ".env.staging"] {
-            assert!(
-                is_dangerous_write_target(unsafe_path).is_some(),
-                "{unsafe_path} must stay flagged"
-            );
-        }
     }
 
     #[test]
