@@ -1305,6 +1305,7 @@ fn commit_turn_journal_workspace_and_sidecars(
             result.tools_used.clone(),
             result.budget_used,
         )
+        .with_run_id(result.run_id.as_deref())
         .with_tool_calls(result.tool_call_records.clone())
         .with_budget_pressure(result.budget_pressure)
         .with_plan_subtask(state.current_plan_subtask_id.as_deref())
@@ -3032,6 +3033,7 @@ fn report_turn_failure(
                 "partial_tool_calls": failure.partial.tool_calls_count,
             }));
         }
+        err_event = err_event.with_run_id(failure.partial.run_id.as_deref());
 
         let _ = journal.append(&err_event);
         enqueue_ingestion(state, &err_event);
@@ -4693,6 +4695,7 @@ mod tests {
                     tool_call_record("read_file", true, Some("contents")),
                 ],
                 tools_used: vec!["read_file".into()],
+                run_id: Some("run-failure-1".into()),
                 prompt_tokens: 13,
                 completion_tokens: 7,
                 tool_calls_count: 1,
@@ -4724,6 +4727,7 @@ mod tests {
         assert_eq!(persisted.tool_count, Some(1));
         assert_eq!(persisted.tools_used, Some(vec!["read_file".into()]));
         assert_eq!(persisted.tool_calls.as_ref().map(Vec::len), Some(2));
+        assert_eq!(persisted.metadata.as_ref().unwrap()["run_id"], "run-failure-1");
     }
 
     /// Regression: pressing Ctrl+C while the model was streaming used to drop
@@ -5009,6 +5013,7 @@ mod tests {
         let mut result = stub_stream_result(
             "[budget_exhausted] 3 tool call(s) completed. You can continue in the next message.",
         );
+        result.run_id = Some("run-budget-1".into());
         result.interruption = Some(serde_json::json!({
             "kind": "budget_exhausted",
             "resumable": true,
@@ -5032,6 +5037,7 @@ mod tests {
         assert_eq!(metadata["interrupted"], true);
         assert_eq!(metadata["interruption_kind"], "budget_exhausted");
         assert_eq!(metadata["interruption"]["resumable"], true);
+        assert_eq!(metadata["run_id"], "run-budget-1");
 
         let events = session_journal::read_journal(&sid).unwrap();
         let persisted = events
@@ -5039,6 +5045,7 @@ mod tests {
             .find(|event| event.event_type == session_journal::JournalEventType::Turn)
             .expect("persisted turn event");
         assert_eq!(persisted.metadata.as_ref().unwrap()["partial"], true);
+        assert_eq!(persisted.metadata.as_ref().unwrap()["run_id"], "run-budget-1");
     }
 
     #[test]

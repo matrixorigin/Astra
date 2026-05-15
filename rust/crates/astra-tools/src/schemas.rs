@@ -713,7 +713,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
         - **Default (synchronous)**: `spawn` blocks until the sub-agent's final result is ready. Use this for work you depend on in the current turn. The sub-agent's tool calls stream back inline — the TUI renders them inside the parent Task card so the user sees progress live.\n\
         - **Background**: pass `run_in_background: true` (alias: legacy `background: true`) to return immediately with `{agent_id}`. Use this for fire-and-forget or long-running work you don't need to await; follow up with `get_result` later. Durable-task store persists the run across session death so it survives `astra` restarts.\n\n\
         ## Parallel sub-agent fan-out\n\
-        To run N sub-agents in parallel (e.g. multi-angle code review), emit N `agent` tool calls **in a single assistant message**, each with `action='spawn'` and `run_in_background: true`. They run concurrently. After all are spawned, call `agent(action='get_result', agent_id=...)` for each one — `get_result` blocks until that child finishes. This is the ONLY way to fan out parallel agents; do not use `action='delegate'` (removed: it had no execution backend).",
+        To run N sub-agents in parallel (e.g. multi-angle code review), emit N `agent` tool calls **in a single assistant message**, each with `action='spawn'` and `run_in_background: true`. They run concurrently. After all are spawned, call `agent(action='get_result', agent_id=...)` for each one — `get_result` blocks until that child finishes. This is the ONLY way to fan out parallel agents; do not use `action='delegate'` (removed: it had no execution backend).\n\
+        Do NOT pass an `agents:[...]` payload and do NOT wrap spawn arguments under a `spawn` field. Each child must be its own `agent(...)` tool call.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1070,6 +1071,25 @@ mod tests {
         assert!(
             desc.contains("run_in_background"),
             "agent description must name `run_in_background` so the model learns the opt-out"
+        );
+    }
+
+    #[test]
+    fn agent_schema_parallel_fanout_warns_against_agents_payloads() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
+        let desc = agent
+            .get("function")
+            .and_then(|f| f.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            desc.contains("Do NOT pass") || desc.contains("do not pass"),
+            "agent description must explicitly forbid the common unsupported wrapper/payload shapes"
+        );
+        assert!(
+            desc.contains("agents"),
+            "agent description must name the unsupported `agents` payload so the model stops retrying it"
         );
     }
 

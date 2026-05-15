@@ -565,6 +565,17 @@ mod tests {
     }
 
     #[test]
+    fn legacy_task_field_is_rejected() {
+        let json = r#"{"description":"D","task":"Use the old field"}"#;
+        let err = serde_json::from_str::<SpawnAgentInput>(json)
+            .expect_err("deprecated task field must not deserialize");
+        assert!(
+            err.to_string().contains("missing field `prompt`"),
+            "legacy task payloads should fail because prompt is the only canonical field: {err}"
+        );
+    }
+
+    #[test]
     fn test_deserialize_inherit_prefix_defaults() {
         let json = r#"{
             "description": "D",

@@ -2483,6 +2483,23 @@ impl ToolExecutor {
                                 .and_then(|g| g.clone());
                             agent_messaging::handle_send_message_tool(args, ctx.as_ref()).await
                         }
+                        _ if action.is_empty() && args.get("spawn").is_some() => {
+                            "Error: invalid agent call shape. Use the top-level \
+                             `action='spawn'` field, not a `spawn` wrapper key. \
+                             Example: agent(action='spawn', description='...', \
+                             prompt='...', run_in_background: true). For parallel \
+                             fan-out, emit N separate agent(...) calls in a single \
+                             assistant message; do not pass `agents:[...]`."
+                                .to_string()
+                        }
+                        _ if action.is_empty() && args.get("agents").is_some() => {
+                            "Error: unsupported `agents` batch payload for `agent`. \
+                             Each `agent(action='spawn', ...)` call launches exactly \
+                             one child. To fan out in parallel, emit N separate spawn \
+                             calls in a single assistant message, each with \
+                             `run_in_background: true`."
+                                .to_string()
+                        }
                         _ => format!(
                             "Error: unknown agent action '{action}'. Use one of: spawn, get_result, run_chain, send_message"
                         ),

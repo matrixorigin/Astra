@@ -2456,6 +2456,23 @@ impl JournalEvent {
         self
     }
 
+    /// Attach the terminal run id to a journal event for attempt provenance.
+    pub fn with_run_id(mut self, run_id: Option<&str>) -> Self {
+        let Some(run_id) = run_id.filter(|value| !value.is_empty()) else {
+            return self;
+        };
+        let metadata = self.metadata.get_or_insert_with(|| serde_json::json!({}));
+        if !metadata.is_object() {
+            *metadata = serde_json::json!({
+                "previous_metadata": metadata.clone(),
+            });
+        }
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert("run_id".into(), serde_json::json!(run_id));
+        }
+        self
+    }
+
     /// Turn error event.
     pub fn turn_error(
         session_id: Option<&str>,
@@ -4641,6 +4658,16 @@ mod tests {
         assert_eq!(turn.tools_used.as_ref().unwrap(), &["github_list_prs"]);
         assert_eq!(turn.budget_used, Some(35));
         assert_eq!(turn.budget_pressure, Some(0.3));
+    }
+
+    #[test]
+    fn with_run_id_preserves_existing_metadata() {
+        let evt = JournalEvent::turn(Some("s2"), 1, None, "hello", "world", 0, 10, 5, 100)
+            .with_budget_pressure(0.4)
+            .with_run_id(Some("run-22"));
+        let metadata = evt.metadata.as_ref().expect("metadata");
+        assert_eq!(metadata["run_id"], "run-22");
+        assert_eq!(evt.budget_pressure, Some(0.4));
     }
 
     #[test]

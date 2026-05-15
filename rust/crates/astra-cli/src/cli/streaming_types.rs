@@ -20,6 +20,7 @@ pub(crate) struct PartialTurnData {
     #[allow(dead_code)]
     pub tool_health_export: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     pub session_id: Option<String>,
+    pub run_id: Option<String>,
     pub last_heavy_checkpoint: Option<astra_pipeline::step_protocol::StepCheckpoint>,
     /// Partial text the model generated before the turn was interrupted.
     /// Preserved in conversation history so the next turn has context.
@@ -43,6 +44,7 @@ pub(crate) fn apply_partial_turn_data_to_error_event(
     event: &mut astra_services::session_journal::JournalEvent,
     partial: &PartialTurnData,
 ) {
+    *event = event.clone().with_run_id(partial.run_id.as_deref());
     if !partial.tool_call_records.is_empty() {
         event.tool_calls = Some(partial.tool_call_records.clone());
     }
@@ -165,6 +167,7 @@ mod tests {
                 tool_record("read_file", Some("contents")),
             ],
             tools_used: vec!["read_file".into()],
+            run_id: Some("run-123".into()),
             prompt_tokens: 42,
             completion_tokens: 21,
             tool_calls_count: 1,
@@ -182,5 +185,6 @@ mod tests {
         assert_eq!(event.tokens_in, Some(42));
         assert_eq!(event.tokens_out, Some(21));
         assert_eq!(event.tool_calls.as_ref().map(Vec::len), Some(2));
+        assert_eq!(event.metadata.as_ref().unwrap()["run_id"], "run-123");
     }
 }

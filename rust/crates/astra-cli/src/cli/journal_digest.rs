@@ -117,6 +117,8 @@ pub struct TurnRow {
     pub seq: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_run_id: Option<String>,
     pub ts: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -227,6 +229,8 @@ pub struct TurnErrRow {
     pub ts: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_run_id: Option<String>,
     pub error: String,
 }
 
@@ -487,6 +491,10 @@ fn build_tool_group_rows(calls: &[session_journal::ToolCallRecord]) -> Vec<ToolG
         .collect()
 }
 
+fn attempt_run_id(rounds: &[LlmRoundRow]) -> Option<String> {
+    rounds.iter().rev().find_map(|round| round.run_id.clone())
+}
+
 pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDigest, String> {
     let (events, journal_lines_non_empty, journal_lines_malformed) =
         session_journal::read_journal_for_digest(session_id).map_err(|e| e.to_string())?;
@@ -515,7 +523,9 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
     let mut session_end_count = 0usize;
     let mut failed_tool_calls: Vec<FailedToolCall> = Vec::new();
 
-    // Prefetch data extracted from ContextAssemblyRecorded events, keyed by turn number.
+    // Buffer llm_rounds until the current turn attempt terminates. A TurnError
+    // closes the current attempt, so later successful Turn rows for the same
+    // turn number must not inherit cancelled rounds from earlier attempts.
     let mut llm_rounds_by_turn: std::collections::HashMap<u32, Vec<LlmRoundRow>> =
         std::collections::HashMap::new();
 
@@ -524,6 +534,14 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
         match ev.event_type {
             JournalEventType::Turn => {
                 seq += 1;
+                let pending_rounds = if matches!(focus, DigestFocus::All) {
+                    ev.turn
+                        .and_then(|turn| llm_rounds_by_turn.remove(&turn))
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let pending_attempt_run_id = attempt_run_id(&pending_rounds);
                 let (ok_c, fail_c) = tool_call_counts(ev.tool_calls.as_ref());
                 let (reentry_c, locked_out_c) = skill_reentry_counts(ev.tool_calls.as_ref());
                 // Fallback: if tool_calls Vec is absent, use tool_count scalar.
@@ -591,6 +609,11 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                 let row = TurnRow {
                     seq,
                     turn_id: ev.turn,
+                    attempt_run_id: if matches!(focus, DigestFocus::All) {
+                        pending_attempt_run_id
+                    } else {
+                        None
+                    },
                     ts: ev.ts.clone(),
                     model: ev.model.clone(),
                     tokens_in: ev.tokens_in,
@@ -637,7 +660,11 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     llm_rounds: ev.llm_rounds,
                     total_llm_ms: ev.total_llm_ms,
                     total_tool_ms: ev.total_tool_ms,
-                    llm_round_details: Vec::new(),
+                    llm_round_details: if matches!(focus, DigestFocus::All) {
+                        pending_rounds
+                    } else {
+                        Vec::new()
+                    },
                     tool_groups: if matches!(focus, DigestFocus::All) {
                         ev.tool_calls
                             .as_ref()
@@ -651,9 +678,18 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             }
             JournalEventType::TurnError => {
                 turn_error_count += 1;
+                let pending_attempt_run_id = if matches!(focus, DigestFocus::All) {
+                    ev.turn
+                        .and_then(|turn| llm_rounds_by_turn.remove(&turn))
+                        .as_deref()
+                        .and_then(attempt_run_id)
+                } else {
+                    None
+                };
                 turn_errors.push(TurnErrRow {
                     ts: ev.ts.clone(),
                     turn: ev.turn,
+                    attempt_run_id: pending_attempt_run_id,
                     error: ev.error.clone().unwrap_or_default(),
                 });
             }
@@ -735,16 +771,6 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                 }
             }
             _ => {}
-        }
-    }
-
-    for turn in &mut turns_out {
-        if let Some(turn_id) = turn.turn_id {
-            if matches!(focus, DigestFocus::All)
-                && let Some(rounds) = llm_rounds_by_turn.remove(&turn_id)
-            {
-                turn.llm_round_details = rounds;
-            }
         }
     }
 
@@ -1178,6 +1204,56 @@ mod tests {
         assert_eq!(round.source.as_deref(), Some("bridge_inprocess"));
         assert_eq!(round.run_id.as_deref(), Some("run-1"));
         assert_eq!(round.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn digest_does_not_merge_cancelled_attempt_rounds_into_later_successful_turn() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+
+        let sid = "test-digest-turn-attempts-00000000-0000-0000-0000-000000000011";
+        fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            concat!(
+                r#"{"type":"llm_round","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":2,"round":0,"tokens_in":57,"tokens_out":351,"duration_ms":6075,"metadata":{"source":"agentic_loop","run_id":"run-cancel-1","finish_reason":"tool_calls"}}"#,
+                "\n",
+                r#"{"type":"turn_error","ts":"2026-01-01T00:00:06Z","session_id":"S","turn":2,"error":"[cancelled] user_interrupted (Ctrl+C)"}"#,
+                "\n",
+                r#"{"type":"llm_round","ts":"2026-01-01T00:00:07Z","session_id":"S","turn":2,"round":0,"tokens_in":340,"tokens_out":396,"duration_ms":13497,"metadata":{"source":"agentic_loop","run_id":"run-cancel-2","finish_reason":"tool_calls"}}"#,
+                "\n",
+                r#"{"type":"turn_error","ts":"2026-01-01T00:00:20Z","session_id":"S","turn":2,"error":"[cancelled] user_interrupted (Ctrl+C)"}"#,
+                "\n",
+                r#"{"type":"llm_round","ts":"2026-01-01T00:00:21Z","session_id":"S","turn":2,"round":0,"tokens_in":9559,"tokens_out":34,"duration_ms":2496,"metadata":{"source":"agentic_loop","run_id":"run-success","finish_reason":"stop"}}"#,
+                "\n",
+                r#"{"type":"turn","ts":"2026-01-01T00:00:24Z","session_id":"S","turn":2,"user_input":"hi","assistant_output":"Hi! How can I help you today?","tool_count":0,"tokens_in":9559,"tokens_out":34,"duration_ms":2541,"llm_rounds":1}"#,
+                "\n",
+            ),
+        )
+        .expect("write journal");
+
+        let d = build_digest(sid, DigestFocus::All).expect("digest");
+        assert_eq!(d.turns.len(), 1);
+        assert_eq!(d.turn_errors.len(), 2);
+
+        let turn = &d.turns[0];
+        assert_eq!(turn.attempt_run_id.as_deref(), Some("run-success"));
+        assert_eq!(
+            turn.llm_round_details.len(),
+            1,
+            "successful turn row must keep only the successful attempt's rounds"
+        );
+        assert_eq!(
+            turn.llm_round_details[0].run_id.as_deref(),
+            Some("run-success")
+        );
+        assert_eq!(
+            d.turn_errors[0].attempt_run_id.as_deref(),
+            Some("run-cancel-1")
+        );
+        assert_eq!(
+            d.turn_errors[1].attempt_run_id.as_deref(),
+            Some("run-cancel-2")
+        );
     }
 
     #[test]

@@ -144,6 +144,26 @@ fn normalize_spawn_agent_args(args: &Value) -> Result<Value, String> {
         .as_object_mut()
         .ok_or_else(|| "spawn input must be a JSON object".to_string())?;
 
+    if obj.contains_key("agents") {
+        return Err(
+            "unsupported `agents` payload for agent.spawn: each \
+             `agent(action='spawn', ...)` call launches exactly one child. \
+             To fan out N sub-agents in parallel, emit N separate `agent` \
+             tool calls in a single assistant message, each with \
+             `action='spawn'` and `run_in_background: true`."
+                .to_string(),
+        );
+    }
+
+    if obj.contains_key("task") {
+        return Err(
+            "unsupported deprecated `task` field for agent.spawn. \
+             Use top-level `prompt` for the full child task brief and \
+             `description` for the short UI summary."
+                .to_string(),
+        );
+    }
+
     let description = non_empty_string(obj.get("description")).map(str::to_string);
     let prompt = non_empty_string(obj.get("prompt")).map(str::to_string);
     if description.is_none() && prompt.is_none() {
@@ -386,12 +406,56 @@ mod tests {
     }
 
     #[test]
+    fn spawn_arg_normalization_rejects_legacy_task_field() {
+        let err = normalize_spawn_agent_args(&json!({
+            "description": "Audit auth flow",
+            "task": "Read src/auth and report token refresh bugs."
+        }))
+        .expect_err("deprecated task field must be rejected");
+        assert!(
+            err.contains("deprecated `task` field") && err.contains("prompt"),
+            "migration error must tell callers to move to prompt. Got: {err}"
+        );
+    }
+
+    #[test]
+    fn spawn_arg_normalization_rejects_task_even_when_prompt_is_present() {
+        let err = normalize_spawn_agent_args(&json!({
+            "description": "Audit auth flow",
+            "prompt": "Use the new prompt field.",
+            "task": "Do not use this deprecated alias."
+        }))
+        .expect_err("deprecated task field must stay forbidden even when prompt exists");
+        assert!(
+            err.contains("deprecated `task` field"),
+            "mixed prompt/task payloads must still hard-fail. Got: {err}"
+        );
+    }
+
+    #[test]
     fn spawn_arg_normalization_never_fabricates_placeholder_prompt() {
         let err = normalize_spawn_agent_args(&json!({ "name": "reviewer-only" }))
             .expect_err("name alone is not enough to spawn a meaningful agent");
         assert!(
             err.contains("prompt") || err.contains("description"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn spawn_arg_normalization_rejects_agents_batch_payload_with_redirect() {
+        let err = normalize_spawn_agent_args(&json!({
+            "action": "spawn",
+            "agents": [
+                {"description": "Review one", "prompt": "p1"},
+                {"description": "Review two", "prompt": "p2"}
+            ]
+        }))
+        .expect_err("batch payloads must be rejected with an actionable redirect");
+        assert!(err.contains("agents"), "{err}");
+        assert!(
+            err.contains("single assistant message") || err.contains("separate"),
+            "error must explain the supported fan-out shape. Got: {err}"
         );
     }
 

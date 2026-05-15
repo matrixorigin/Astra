@@ -1954,6 +1954,23 @@ impl ServerToolExecutor {
                          the engine.".to_string(),
                     ),
                     "run_chain" => self.default_executor.execute("run_chain", args).await,
+                    other if other.is_empty() && args.get("spawn").is_some() => {
+                        tool_result_from_output(
+                            "Error: invalid agent call shape. Use the top-level \
+                             `action='spawn'` field, not a `spawn` wrapper key. \
+                             Example: agent(action='spawn', description='...', prompt='...')."
+                                .to_string(),
+                        )
+                    }
+                    other if other.is_empty() && args.get("agents").is_some() => {
+                        tool_result_from_output(
+                            "Error: unsupported `agents` batch payload for `agent`. \
+                             Each `agent(action='spawn', ...)` call launches exactly one \
+                             child. To fan out in parallel, emit N separate spawn calls \
+                             in a single assistant message."
+                                .to_string(),
+                        )
+                    }
                     other => tool_result_from_output(format!(
                         "Unknown agent action: '{other}'. Use: spawn, get_result, run_chain. \
                          (Server-side execution does not handle spawn/get_result here — \

@@ -115,6 +115,37 @@ async fn agent_action_delegate_is_rejected_with_redirect_to_spawn() {
     );
 }
 
+/// REGRESSION (session e15691e5): the model emitted
+/// `agent({ "spawn": { ... } })` / `agent({ "spawn": "..." })` instead of
+/// the consolidated `agent({ "action": "spawn", ... })` shape. The generic
+/// "unknown agent action ''" error was technically correct but not
+/// actionable enough — it didn't explain that `spawn` must be the VALUE of
+/// `action`, not a wrapper key.
+#[tokio::test]
+async fn agent_missing_action_with_spawn_wrapper_redirects_to_action_field() {
+    let executor = test_executor();
+    let result = executor
+        .execute(
+            "agent",
+            &json!({
+                "spawn": {
+                    "description": "Review latest commit",
+                    "prompt": "Inspect HEAD~1..HEAD for regressions"
+                }
+            }),
+        )
+        .await;
+    assert!(result.starts_with("Error:"), "got: {result}");
+    assert!(
+        result.contains("action='spawn'") || result.contains("\"action\":\"spawn\""),
+        "error must show the correct top-level action shape so the model can recover. Got: {result}"
+    );
+    assert!(
+        result.contains("top-level") || result.contains("wrapper"),
+        "error must explain that `spawn` is not a wrapper key. Got: {result}"
+    );
+}
+
 /// The `agent` tool's action enum must NOT advertise "delegate" to
 /// the model. Schema-level removal is the strongest signal — the
 /// model cannot even shape-validly emit a call the runtime would
