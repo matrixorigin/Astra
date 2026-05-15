@@ -219,15 +219,31 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create or overwrite a file. Set delete=true to delete instead.",
+                "description": "Create, overwrite, or delete a file. For writes, provide both path and content. For deletes, provide path with delete=true instead of content. Retry write_file with corrected arguments; do not switch to bash or python just to write a file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
-                        "content": {"type": "string", "description": "File content (not required when delete=true)"},
-                        "delete": {"type": "boolean", "description": "If true, delete the file instead of writing"}
+                        "content": {"type": "string", "description": "File content. Required for writes."},
+                        "delete": {"type": "boolean", "description": "Set to true to delete the file instead of writing content."}
                     },
-                    "required": ["path"]
+                    "oneOf": [
+                        {
+                            "required": ["path", "content"],
+                            "not": {
+                                "required": ["delete"]
+                            }
+                        },
+                        {
+                            "properties": {
+                                "delete": {"const": true}
+                            },
+                            "required": ["path", "delete"],
+                            "not": {
+                                "required": ["content"]
+                            }
+                        }
+                    ]
                 }
             }
         }),
@@ -1261,6 +1277,108 @@ mod tests {
                 "default executor exposes `{name}` but server_executor_tool_schemas() omits it"
             );
         }
+    }
+
+    #[test]
+    fn write_file_schema_requires_content_or_delete_contract() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let write_file = find_schema(&schemas, "write_file").expect("write_file schema must exist");
+        let func = write_file
+            .get("function")
+            .expect("write_file schema must include function block");
+        let desc = func
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            desc.contains("path")
+                && desc.contains("content")
+                && desc.contains("delete=true")
+                && desc.contains("do not switch to bash"),
+            "write_file description must spell out the path+content contract and discourage shell fallback: {desc}"
+        );
+
+        let params = func
+            .get("parameters")
+            .expect("write_file schema must include parameters");
+        let variants = params
+            .get("oneOf")
+            .and_then(Value::as_array)
+            .expect("write_file schema must express write vs delete with oneOf");
+        assert_eq!(
+            variants.len(),
+            2,
+            "write_file schema should expose exactly two valid argument shapes"
+        );
+
+        // Outer required must not undermine oneOf by claiming only path is needed.
+        let outer_required = params.get("required").and_then(Value::as_array);
+        assert!(
+            outer_required.is_none_or(|r| r.is_empty()),
+            "outer 'required' must be absent or empty so oneOf is the sole constraint; \
+             having required:[\"path\"] contradicts the oneOf variants"
+        );
+
+        let write_variant = variants
+            .iter()
+            .find(|variant| {
+                variant
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .map(|required| {
+                        required.iter().any(|item| item == "content")
+                            && required.iter().any(|item| item == "path")
+                    })
+                    .unwrap_or(false)
+            })
+            .expect("write variant must require both path and content");
+
+        // Write variant must exclude delete to ensure oneOf variants are mutually exclusive.
+        let write_not = write_variant
+            .get("not")
+            .expect("write variant must exclude delete via 'not' constraint");
+        let write_not_required = write_not
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("write variant 'not' must list excluded fields");
+        assert!(
+            write_not_required.iter().any(|item| item == "delete"),
+            "write variant must exclude 'delete' so {{path,content,delete:true}} is rejected"
+        );
+
+        let delete_variant = variants
+            .iter()
+            .find(|variant| {
+                variant
+                    .get("properties")
+                    .and_then(|props| props.get("delete"))
+                    .and_then(|delete| delete.get("const"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            })
+            .expect("delete variant must pin delete=true");
+        let delete_required = delete_variant
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("delete variant must list required fields");
+        assert!(
+            delete_required.iter().any(|item| item == "path")
+                && delete_required.iter().any(|item| item == "delete"),
+            "delete variant must require path and delete=true"
+        );
+
+        // Delete variant must exclude content for mutual exclusivity.
+        let delete_not = delete_variant
+            .get("not")
+            .expect("delete variant must exclude content via 'not' constraint");
+        let delete_not_required = delete_not
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("delete variant 'not' must list excluded fields");
+        assert!(
+            delete_not_required.iter().any(|item| item == "content"),
+            "delete variant must exclude 'content' so {{path,content,delete:true}} is rejected"
+        );
     }
 
     // ── Session 0e37eb46 regression: bash/powershell schema-advertised

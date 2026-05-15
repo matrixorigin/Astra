@@ -140,6 +140,10 @@ pub fn build_recovery_message(
 ) -> String {
     let alternatives = suggest_alternatives(tool_name, deprioritized);
     let error_lower = error_str.to_lowercase();
+    let write_file_missing_args = tool_name == "write_file"
+        && category == ErrorCategory::ToolInvalidArgs
+        && (error_lower.contains("missing 'path' parameter")
+            || error_lower.contains("missing 'content' parameter"));
 
     let mut msg = match category {
         ErrorCategory::Network
@@ -161,11 +165,17 @@ pub fn build_recovery_message(
              Verify the path/name is correct before retrying.",
             tool_name
         ),
-        ErrorCategory::ToolInvalidArgs | ErrorCategory::InvalidRequest => format!(
-            "⚠ {} failed: invalid arguments. \
-             Check the tool's expected parameters and fix the call.",
-            tool_name
-        ),
+        ErrorCategory::ToolInvalidArgs | ErrorCategory::InvalidRequest => {
+            if write_file_missing_args {
+                "⚠ write_file failed: invalid arguments. Retry the same tool with both `path` and `content` for writes, or `path` + `delete=true` for deletes. Do NOT switch to bash or python just to write or delete this file.".to_string()
+            } else {
+                format!(
+                    "⚠ {} failed: invalid arguments. \
+                     Check the tool's expected parameters, fix the call, and retry the same tool before switching approaches.",
+                    tool_name
+                )
+            }
+        }
         ErrorCategory::ToolUnavailable => format!(
             "⚠ {} is not available in this environment. \
              Do NOT retry — use an alternative tool.",
@@ -219,7 +229,22 @@ pub fn build_recovery_message(
     }
 
     if !alternatives.is_empty() {
-        msg.push_str(&format!(" Alternatives: [{}].", alternatives.join(", ")));
+        const SHELL_TOOLS: &[&str] = &["bash", "powershell"];
+        let filtered: Vec<&str> = if write_file_missing_args {
+            // Missing-args errors should steer the model to retry write_file, but legitimate
+            // editing alternatives (str_replace, multi_edit) must still be visible.
+            // Only suppress shell escalation paths.
+            alternatives
+                .iter()
+                .map(String::as_str)
+                .filter(|t| !SHELL_TOOLS.contains(t))
+                .collect()
+        } else {
+            alternatives.iter().map(String::as_str).collect()
+        };
+        if !filtered.is_empty() {
+            msg.push_str(&format!(" Alternatives: [{}].", filtered.join(", ")));
+        }
     }
     if tool_name == "read_file" && error_lower.contains("file is too large") {
         msg.push_str(
@@ -664,6 +689,38 @@ mod tests {
         assert!(msg.contains("do NOT switch to bash"));
         assert!(msg.contains("start_line/end_line"));
         assert!(msg.contains("outline=true"));
+    }
+
+    #[test]
+    fn recovery_message_write_file_missing_args_discourages_shell_fallback() {
+        let err = "Error: Missing 'path' parameter. Retry write_file with both path and content. Do not switch to bash or python just to write this file.";
+        let cat = classify_error(err);
+        assert_eq!(cat, ErrorCategory::ToolInvalidArgs);
+        let msg = build_recovery_message("write_file", err, cat, &[]);
+        assert!(msg.contains("Retry the same tool") || msg.contains("retry write_file"));
+        // The recovery message must explicitly warn against shell escalation.
+        assert!(msg.contains("bash"), "must warn against bash fallback");
+        assert!(msg.contains("python"), "must warn against python fallback");
+        // bash must not appear in the Alternatives list — only in the warning text.
+        // The alternatives for write_file are str_replace/multi_edit, never bash.
+        let alts_section = msg.find("Alternatives:").map(|i| &msg[i..]).unwrap_or("");
+        assert!(
+            !alts_section.to_lowercase().contains("bash"),
+            "bash must not appear as a suggested alternative: {alts_section}"
+        );
+    }
+
+    #[test]
+    fn recovery_message_write_file_missing_args_suggests_editing_alternatives() {
+        let err = "Error: Missing 'content' parameter. Retry write_file with both path and content. Do not switch to bash or python just to write this file.";
+        let cat = classify_error(err);
+        let msg = build_recovery_message("write_file", err, cat, &[]);
+        // str_replace and multi_edit are legitimate alternatives for file edits and must
+        // still be surfaced even when write_file is missing args.
+        assert!(
+            msg.contains("str_replace") || msg.contains("multi_edit"),
+            "editing alternatives must not be suppressed for missing-args errors: {msg}"
+        );
     }
 
     // ── Escalation ──

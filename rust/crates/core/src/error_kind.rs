@@ -187,7 +187,7 @@ impl ErrorKind {
             }
             Self::ToolInvalidArgs => {
                 "Invalid arguments for the tool. \
-                 Check the tool's expected parameters and fix the call."
+                 Fix the parameters and retry the same tool before switching tools."
             }
             Self::ToolTimeout => {
                 "Tool command timed out — the scope is too broad. \
@@ -267,8 +267,9 @@ impl ErrorKind {
                  Confirm the workspace context is accurate."
             }
             Self::ToolInvalidArgs => {
-                "Model is calling tools with wrong parameters. This may improve with \
-                 a better model, clearer system prompt, or stricter tool schemas."
+                "Model is calling tools with wrong parameters. Improve schema/description \
+                 clarity and steer the model to retry the same tool with corrected args \
+                 instead of escalating to bash or unrelated tools."
             }
             Self::ToolTimeout => {
                 "Tool scope is too broad. Break the operation into smaller chunks \

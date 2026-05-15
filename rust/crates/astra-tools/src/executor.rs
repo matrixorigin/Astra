@@ -405,7 +405,17 @@ impl DefaultToolExecutor {
         match name {
             // ── File operations ──────────────────────────────────────
             "read_file" => crate::fs_ops::read_file(ws, args),
-            "write_file" => crate::fs_ops::write_file(ws, args),
+            "write_file" => {
+                if args
+                    .get("delete")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    crate::fs_ops::delete_file(ws, args)
+                } else {
+                    crate::fs_ops::write_file(ws, args)
+                }
+            }
             "str_replace" => crate::fs_ops::str_replace(ws, args),
             "delete_file" => crate::fs_ops::delete_file(ws, args),
             "list_dir" => crate::fs_ops::list_dir(ws, args),
@@ -759,6 +769,101 @@ mod tests {
             .await;
         assert!(!result.is_error);
         assert!(tmp.path().join("out.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn dispatch_write_file_delete_flag_routes_to_delete() {
+        let (tmp, exec) = test_executor();
+        let target = tmp.path().join("gone.txt");
+        std::fs::write(&target, "data").unwrap();
+
+        let result = exec
+            .execute(
+                "write_file",
+                &serde_json::json!({"path": "gone.txt", "delete": true}),
+            )
+            .await;
+
+        assert!(!result.is_error, "got: {}", result.output);
+        assert!(
+            result.output.contains("Successfully deleted"),
+            "delete=true should route to delete semantics: {}",
+            result.output
+        );
+        assert!(
+            !target.exists(),
+            "delete=true should remove the target file"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_write_file_delete_false_routes_to_write() {
+        let (tmp, exec) = test_executor();
+        let result = exec
+            .execute(
+                "write_file",
+                &serde_json::json!({"path": "test.txt", "content": "hello", "delete": false}),
+            )
+            .await;
+        assert!(!result.is_error, "got: {}", result.output);
+        assert!(
+            tmp.path().join("test.txt").exists(),
+            "delete=false should write the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_write_file_delete_string_not_coerced() {
+        let (tmp, exec) = test_executor();
+        let result = exec
+            .execute(
+                "write_file",
+                &serde_json::json!({"path": "test.txt", "content": "hello", "delete": "true"}),
+            )
+            .await;
+        assert!(!result.is_error, "got: {}", result.output);
+        assert!(
+            tmp.path().join("test.txt").exists(),
+            "delete=\\\"true\\\" (string) must not be coerced to boolean — should write"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_write_file_content_and_delete_true_delete_wins() {
+        let (tmp, exec) = test_executor();
+        let target = tmp.path().join("exists.txt");
+        std::fs::write(&target, "original").unwrap();
+        let result = exec
+            .execute(
+                "write_file",
+                &serde_json::json!({"path": "exists.txt", "content": "new content", "delete": true}),
+            )
+            .await;
+        assert!(!result.is_error, "got: {}", result.output);
+        assert!(
+            !target.exists(),
+            "delete=true wins over content: file should be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_write_file_delete_path_traversal_blocked() {
+        let (_tmp, exec) = test_executor();
+        let result = exec
+            .execute(
+                "write_file",
+                &serde_json::json!({"path": "../../etc/passwd", "delete": true}),
+            )
+            .await;
+        assert!(
+            result.is_error,
+            "path traversal via write_file delete routing must be blocked"
+        );
+        assert!(
+            result.output.contains("SANDBOX_DENIED"),
+            "should report SANDBOX_DENIED: {}",
+            result.output
+        );
     }
 
     #[tokio::test]
