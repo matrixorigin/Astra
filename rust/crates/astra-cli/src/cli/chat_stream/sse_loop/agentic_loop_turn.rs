@@ -555,7 +555,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     let tool_surface =
         tool_registry::surface::ToolSurface::from_runtime_config(ctx.registry.all_tool_schemas());
-    if let Some(deferred_tools_text) = tool_surface.deferred_block_text() {
+    if let Some(deferred_tools_text) = tool_surface.deferred_block_text(ctx.model) {
         merge_edge_profile_extensions(
             &mut payload,
             &json!({ EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT: deferred_tools_text }),

@@ -1274,6 +1274,18 @@ impl AgenticLoopState {
             self.recent_rounds.drain(0..excess);
         }
     }
+
+    /// Best-effort model id for sizing per-turn budgets (e.g. skill listing
+    /// budget). Resolution order:
+    ///   1. `skills.model_override` — the active skill's pinned model
+    ///   2. The model used in the most recent LLM round
+    ///   3. `None` (caller should fall back to a sensible default)
+    pub fn current_model_hint(&self) -> Option<&str> {
+        self.skills
+            .model_override
+            .as_deref()
+            .or_else(|| self.recent_rounds.last().map(|r| r.model.as_str()))
+    }
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.

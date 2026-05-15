@@ -231,7 +231,7 @@ impl AgenticLoopHost for SubRunHost {
         let tool_surface = astra_runtime::tool_registry::surface::ToolSurface::from_runtime_config(
             &self.all_schemas,
         );
-        if let Some(deferred_tools_text) = tool_surface.deferred_block_text() {
+        if let Some(deferred_tools_text) = tool_surface.deferred_block_text(effective_model) {
             merge_edge_profile_extensions(
                 &mut payload,
                 &json!({

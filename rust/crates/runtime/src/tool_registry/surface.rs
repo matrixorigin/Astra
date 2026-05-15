@@ -161,8 +161,15 @@ impl ToolSurface {
     }
 
     /// Render the deferred manifest into the session-stable prompt block.
-    pub fn deferred_block_text(&self) -> Option<String> {
-        crate::prompts::build_deferred_tools_section(self).map(|section| section.text)
+    ///
+    /// `model` is the LLM model id (e.g. `"claude-sonnet-4"`, `"gpt-4o"`) — used
+    /// to resolve the per-provider context window and size the listing budget.
+    /// Pass `None` to use the default 16K-char fallback.
+    pub fn deferred_block_text(&self, model: Option<&str>) -> Option<String> {
+        let context_window =
+            u32::try_from(crate::prompts::budget_for_model(model).model_limit).ok();
+        crate::prompts::build_deferred_tools_section_with_budget(self, context_window)
+            .map(|section| section.text)
     }
 }
 

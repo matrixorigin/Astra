@@ -784,26 +784,29 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     if let Some(resolver) = &state.skills.resolver {
         // Phase-9: skill listing moves from per-turn volatile to
         // session-stable. The full skill catalog is rendered via
-        // `build_skill_listing_section` (CacheScope::Session) and hosted
-        // inside the ProjectContext binding. No per-turn reranking:
-        // the model reads the list and picks.
+        // `build_skill_listing_section_for_model` (CacheScope::Session)
+        // — the model id sizes the budget so smaller-context providers
+        // don't waste prompt space on full listings.
         //
         // We still populate `listing_message` as a rendered `role: system`
         // value for downstream adapters (introspect tooling, tests) so
         // they don't need to know about the cache-scope plumbing.
         let full = resolver.available_skills();
+        let model_hint = state.current_model_hint().map(str::to_string);
         state.skills.listing_message = if full.is_empty() {
             None
         } else {
             if state.telemetry.initial_skill_selector_shortlist.is_none() {
                 state.telemetry.initial_skill_selector_shortlist = Some(());
             }
-            crate::prompts::build_skill_listing_section(&full).map(|section| {
-                serde_json::json!({
-                    "role": "system",
-                    "content": section.text,
-                })
-            })
+            crate::prompts::build_skill_listing_section_for_model(&full, model_hint.as_deref()).map(
+                |section| {
+                    serde_json::json!({
+                        "role": "system",
+                        "content": section.text,
+                    })
+                },
+            )
         };
     }
 
