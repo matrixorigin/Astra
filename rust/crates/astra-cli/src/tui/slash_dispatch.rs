@@ -14,6 +14,7 @@ use crate::tui::terminal::TerminalGuard;
 
 pub(crate) enum SlashResult {
     Handled,
+    Deferred,
     Exit,
     Fallback,
 }
@@ -64,7 +65,30 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         Ok(name) => name,
         Err(candidates) => {
             if candidates.is_empty() {
-                ctx.show_error(format!("Unknown command: {cmd}"));
+                // No registry match → use the shared fuzzy scorer to surface
+                // the top-3 closest known commands as a "did you mean?" hint.
+                // Keeps the suggestion UX aligned with the slash popup.
+                let needle = cmd.trim_start_matches('/');
+                let mut scored: Vec<(u32, &'static str)> = crate::command_registry::COMMANDS
+                    .iter()
+                    .filter(|m| !m.is_alias && !m.name.contains(' '))
+                    .filter_map(|m| {
+                        let name = m.name.trim_start_matches('/');
+                        crate::tui::score_slash_token(needle, name).map(|s| (s, m.name))
+                    })
+                    .collect();
+                scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+                let hints: Vec<&'static str> = scored.into_iter().take(3).map(|(_, n)| n).collect();
+                if hints.is_empty() {
+                    ctx.show_error(format!(
+                        "Unknown command: {cmd}  ·  type / to browse all commands"
+                    ));
+                } else {
+                    ctx.show_error(format!(
+                        "Unknown command: {cmd}  ·  did you mean: {}?",
+                        hints.join(", ")
+                    ));
+                }
             } else {
                 ctx.show_error(format!(
                     "Ambiguous command: {cmd} (did you mean: {}?)",
@@ -92,13 +116,13 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             use crate::tui::bottom_pane::login_view::{LoginMode, LoginView};
             ctx.bottom_pane
                 .push_view(Box::new(LoginView::new(LoginMode::Login)));
-            SlashResult::Handled
+            SlashResult::Deferred
         }
         "/register" => {
             use crate::tui::bottom_pane::login_view::{LoginMode, LoginView};
             ctx.bottom_pane
                 .push_view(Box::new(LoginView::new(LoginMode::Register)));
-            SlashResult::Handled
+            SlashResult::Deferred
         }
 
         // ── Model ───────────────────────────────────────────────────
@@ -204,19 +228,14 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         }
 
         // ── Allow / permission mode ─────────────────────────────────
-        "/allow" | "/yolo" => {
+        "/allow" => {
             use crate::permission_manager::PermissionMode;
-            if resolved == "/yolo" {
-                ctx.state.perm_manager.set_mode(PermissionMode::Auto);
-                ctx.show_info(
-                    "⚡ YOLO mode! All tools auto-approved. Use /allow prompt to restore.".into(),
-                );
-                return SlashResult::Handled;
-            }
             match args {
                 "" => {
                     let current = ctx.state.perm_manager.mode();
                     let rules_count = ctx.state.perm_manager.rules_summary().lines().count();
+                    let audit_count = astra_turn_core::permission_audit::counts();
+                    let audit_total = audit_count.0 + audit_count.1 + audit_count.2;
                     let items = vec![
                         SelectionItem {
                             name: "Auto".into(),
@@ -237,6 +256,27 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                             name: "Rules".into(),
                             description: Some(format!(
                                 "View permission rules ({rules_count} lines)"
+                            )),
+                            is_current: false,
+                        },
+                        SelectionItem {
+                            name: "Trust Workspace".into(),
+                            description: Some(
+                                "Apply project allow rules after hash validation".into(),
+                            ),
+                            is_current: false,
+                        },
+                        SelectionItem {
+                            name: "Untrust Workspace".into(),
+                            description: Some(
+                                "Ignore project allow rules for this workspace".into(),
+                            ),
+                            is_current: false,
+                        },
+                        SelectionItem {
+                            name: "Trace".into(),
+                            description: Some(format!(
+                                "View permission audit events ({audit_total})"
                             )),
                             is_current: false,
                         },
@@ -271,9 +311,54 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     )));
                     SlashResult::Handled
                 }
+                "trust" => {
+                    match ctx.state.perm_manager.trust_workspace() {
+                        Ok(message) => ctx.show_response(message),
+                        Err(err) => {
+                            ctx.show_error(format!("Failed to trust workspace: {err}"));
+                        }
+                    }
+                    SlashResult::Handled
+                }
+                "untrust" => {
+                    match ctx.state.perm_manager.untrust_workspace() {
+                        Ok(message) => ctx.show_response(message),
+                        Err(err) => {
+                            ctx.show_error(format!("Failed to mark workspace untrusted: {err}"));
+                        }
+                    }
+                    SlashResult::Handled
+                }
+                "trace" => {
+                    use crate::tui::bottom_pane::info_view::InfoView;
+                    let lines = astra_turn_core::permission_audit::format_snapshot_lines(50);
+                    ctx.bottom_pane
+                        .push_view(Box::new(InfoView::from_plain("Permission Trace", lines)));
+                    SlashResult::Handled
+                }
+                arg if arg.starts_with("trace --export ") => {
+                    let path = arg.trim_start_matches("trace --export ").trim();
+                    if path.is_empty() {
+                        ctx.show_error("Missing export path".to_string());
+                        return SlashResult::Handled;
+                    }
+                    let lines = astra_turn_core::permission_audit::snapshot_redacted_jsonl_lines();
+                    let body = if lines.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}\n", lines.join("\n"))
+                    };
+                    match std::fs::write(path, body) {
+                        Ok(()) => ctx.show_response(format!("Permission trace exported to {path}")),
+                        Err(err) => {
+                            ctx.show_error(format!("Failed to export permission trace: {err}"));
+                        }
+                    }
+                    SlashResult::Handled
+                }
                 _ => {
                     ctx.show_error(format!(
-                        "Unknown mode '{args}'. Use: auto, prompt, deny, all, rules"
+                        "Unknown mode '{args}'. Use: auto, prompt, deny, all, rules, trust, untrust, trace"
                     ));
                     SlashResult::Handled
                 }
@@ -338,6 +423,12 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     description: s.description.clone(),
                 })
                 .collect();
+            snap.selected_skills = ctx
+                .state
+                .last_turn_event
+                .as_ref()
+                .and_then(|event| event.selected_skills.clone())
+                .unwrap_or_default();
 
             // Build the Session / Budget summary from SessionState.
             // All fields are cheap reads — no I/O, no extra locks.
@@ -434,7 +525,14 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             ctx.bottom_pane.push_view(Box::new(
                 BusyView::new("Running SQL query…").with_title(" /table "),
             ));
-            let _ = crate::tui::do_draw(ctx.guard, crate::tui::ActiveView::Empty, ctx.bottom_pane);
+            let _ = crate::tui::do_draw(
+                ctx.guard,
+                crate::tui::ActiveView::Empty,
+                None,
+                ctx.bottom_pane,
+                None,
+                None,
+            );
 
             // `mo_query` shells out to the mysql client (blocking IO) —
             // park it on a blocking thread so we don't freeze the async
@@ -934,6 +1032,32 @@ pub(crate) fn handle_view_result(
             ));
             return;
         }
+        "Trust Workspace" => {
+            match state.perm_manager.trust_workspace() {
+                Ok(message) => chat_widget.commit_system(SystemCell::response(message)),
+                Err(err) => chat_widget.commit_system(SystemCell::error(format!(
+                    "Failed to trust workspace: {err}"
+                ))),
+            }
+            return;
+        }
+        "Untrust Workspace" => {
+            match state.perm_manager.untrust_workspace() {
+                Ok(message) => chat_widget.commit_system(SystemCell::response(message)),
+                Err(err) => chat_widget.commit_system(SystemCell::error(format!(
+                    "Failed to mark workspace untrusted: {err}"
+                ))),
+            }
+            return;
+        }
+        "Trace" => {
+            use crate::tui::bottom_pane::info_view::InfoView;
+            let lines = astra_turn_core::permission_audit::format_snapshot_lines(50);
+            bottom_pane.push_view(Box::new(
+                InfoView::from_plain("Permission Trace", lines).with_reopen("/allow trace"),
+            ));
+            return;
+        }
         _ => {}
     }
 
@@ -1284,21 +1408,16 @@ pub(crate) const MODEL_THINKING_SENTINEL: &str = "__model_thinking__\n";
 /// the picker.  The picker emits `MODEL_PICK_SENTINEL + <name>`; the
 /// outer loop then checks the model's `thinking_capability` and
 /// either commits or pushes a thinking-mode picker.
-/// True when an error string came from an HTTP 401 response.
-/// Mirrors `chat_turn::is_auth_error` minus the LLM-provider escape — kept
-/// local because slash dispatch only sees `fetch_model_list` errors which
-/// never come from upstream model providers.
-fn is_http_401(msg: &str) -> bool {
-    let lower = msg.to_lowercase();
-    lower.contains("401 unauthorized")
-        || lower.contains("status: 401")
-        || lower.contains("status code: 401")
-        || lower.contains("http 401")
-        || lower.contains("unauthorized")
+/// True when an error string represents an Astra session auth failure.
+/// Matches both session-specific error patterns (via `is_astra_session_auth_error`)
+/// and Astra's own HTTP 401 format (`"request failed (401): ..."`).
+/// Generic upstream `401 Unauthorized` text must NOT trigger `/login`.
+fn is_astra_auth_error(msg: &str) -> bool {
+    crate::cli_utils::is_astra_session_auth_error(msg) || msg.contains("request failed (401)")
 }
 
 /// Build the model picker view from a fetched model list and push it.
-fn push_model_picker(ctx: &mut DispatchContext<'_>, models: Vec<String>) {
+fn push_model_picker(ctx: &mut DispatchContext<'_>, models: Vec<String>) -> bool {
     // Strip any `-thinking:*` suffix from the cached model when
     // highlighting the current row — the picker shows base names only,
     // and the suffix is re-applied by the thinking stage.
@@ -1320,20 +1439,26 @@ fn push_model_picker(ctx: &mut DispatchContext<'_>, models: Vec<String>) {
         .collect();
     if items.is_empty() {
         ctx.show_info("No models available".into());
+        false
     } else {
         let view = ListSelectionView::new(items, Some("Select model:".into()))
             .with_result_prefix(MODEL_PICK_SENTINEL);
         ctx.bottom_pane.push_view(Box::new(view));
+        true
     }
 }
 
 async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
-    let token = crate::session_runtime::current_access_token(ctx.profile);
+    let token = crate::session_runtime::fresh_access_token(ctx.api, ctx.profile).await;
     match crate::slash_router::fetch_model_list(ctx.api, token.as_deref()).await {
-        Ok(models) => push_model_picker(ctx, models),
+        Ok(models) => {
+            if push_model_picker(ctx, models) {
+                return SlashResult::Deferred;
+            }
+        }
         Err(e) => {
             let msg = e.to_string();
-            if is_http_401(&msg) {
+            if is_astra_auth_error(&msg) {
                 // Attempt silent token refresh + retry once. If the retry
                 // itself fails with a non-auth error (e.g. 5xx after refresh),
                 // surface that real error instead of the generic /login hint.
@@ -1341,12 +1466,14 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
                     let fresh = crate::session_runtime::current_access_token(ctx.profile);
                     match crate::slash_router::fetch_model_list(ctx.api, fresh.as_deref()).await {
                         Ok(models) => {
-                            push_model_picker(ctx, models);
+                            if push_model_picker(ctx, models) {
+                                return SlashResult::Deferred;
+                            }
                             return SlashResult::Handled;
                         }
                         Err(retry_err) => {
                             let retry_msg = retry_err.to_string();
-                            if !is_http_401(&retry_msg) {
+                            if !is_astra_auth_error(&retry_msg) {
                                 ctx.show_error(format!(
                                     "Failed to fetch models: {}",
                                     retry_msg.lines().next().unwrap_or(&retry_msg)
@@ -1985,12 +2112,11 @@ fn display_path(path: &std::path::Path) -> String {
 /// Detect current git branch via `gix`. Returns `None` when the cwd
 /// isn't a git repo, in detached HEAD, or on any I/O error — in any
 /// of those cases the Environment row falls back to just the cwd.
+///
+/// Cached process-wide so a flurry of slash commands doesn't spawn
+/// repeat `gix::discover` walks. See `crate::git_branch_cache`.
 fn detect_git_branch() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    let repo = gix::discover(cwd).ok()?;
-    let head = repo.head().ok()?;
-    let name = head.referent_name()?;
-    Some(name.shorten().to_string())
+    crate::git_branch_cache::detect_git_branch_cached()
 }
 
 /// Locate the user-rules directory under `~/.astra/rules/`, if
@@ -2385,5 +2511,35 @@ mod truncate_rows_tests {
     #[test]
     fn truncate_rows_empty_input_produces_empty_output() {
         assert!(truncate_rows("", 5).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod auth_error_tests {
+    use super::is_astra_auth_error;
+
+    #[test]
+    fn matches_astra_session_auth_failures() {
+        let msg =
+            "request failed (401): invalid token\n  Hint: Authentication required — try /login";
+        assert!(is_astra_auth_error(msg));
+    }
+
+    #[test]
+    fn matches_bare_astra_401_without_known_body() {
+        // Astra API returns "request failed (401): <anything>" — must trigger /login
+        assert!(is_astra_auth_error(
+            "request failed (401): unexpected auth state"
+        ));
+    }
+
+    #[test]
+    fn matches_authentication_failed() {
+        assert!(is_astra_auth_error("Authentication failed"));
+    }
+
+    #[test]
+    fn ignores_generic_upstream_401s() {
+        assert!(!is_astra_auth_error("GitHub API Error: 401 Unauthorized"));
     }
 }

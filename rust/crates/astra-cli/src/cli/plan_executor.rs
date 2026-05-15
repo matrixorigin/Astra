@@ -488,16 +488,10 @@ pub struct PlanExecutorHandle {
 /// code to appear in an HTTP-shaped phrase.
 fn is_credential_error(msg: &str) -> bool {
     let lower = msg.to_lowercase();
-    lower.contains("could not validate credentials")
+    let upstream_github_auth = lower.contains("github api error");
+    crate::cli_utils::is_astra_session_auth_error(msg)
         || lower.contains("invalid credentials")
-        || lower.contains("unauthorized")
-        || lower.contains("authentication failed")
-        || lower.contains("token expired")
-        || lower.contains("session expired")
-        || lower.contains("401 unauthorized")
-        || lower.contains("status: 401")
-        || lower.contains("status code: 401")
-        || lower.contains("http 401")
+        || (!upstream_github_auth && lower.contains("bad credentials"))
 }
 
 /// Pick the `plan_progress` action for end-of-plan emission.
@@ -1138,6 +1132,11 @@ pub(super) struct BackgroundPlanContext {
     pub session_state_journal:
         Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>,
     pub task_manager: Arc<crate::edge_tools::TaskManager>,
+    /// Shared command queue for the TUI's BackgroundTaskRegistry.
+    /// Threaded from `SessionState.bg_task_commands` so plan subtasks
+    /// can also use `task(action='background_shell')`. `None` for
+    /// non-TUI plan executions (headless test paths).
+    pub bg_task_commands: Option<Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
 
     // ─── Harness (test observability) ────────────────────────────────────
     /// Shared harness snapshot sink for /inspect command.
@@ -1250,7 +1249,16 @@ async fn plan_executor_task(
         );
         emit_event(&update_tx, &ctx, event);
     }
-    let mut perm_manager = PermissionManager::with_project(true, &ctx.workspace_root);
+    // Issue #326 P5b: plan_executor is a headless sub-run; project
+    // allow rules from .kiro/permissions.json must NOT escalate the
+    // sub-run's capabilities, but project deny rules are kept so the
+    // user's restrictions still bind. apply_load_policy(HeadlessSafe)
+    // strips allow_*/allow_sensitive_path_writes while preserving deny.
+    let mut perm_manager = PermissionManager::with_load_policy(
+        super::permission_manager::PermissionMode::Auto,
+        &ctx.workspace_root,
+        &super::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+    );
 
     loop {
         // ── Check for commands before starting next round ─────────────
@@ -1723,6 +1731,7 @@ async fn plan_executor_task(
                     cancel_token: Some(cancel_token),
                     plan_assemble_line_release: None,
                     stream_event_tx: Some(stream_tx),
+                    agent_live_event_sink: None,
                     approval_request_tx: Some(approval_tx),
                     mcp_manager: None,
                     skill_search: &ctx.skill_search,
@@ -1742,6 +1751,7 @@ async fn plan_executor_task(
                     git_worktree_journal: Some(ctx.git_worktree_journal.clone()),
                     session_state_journal: Some(ctx.session_state_journal.clone()),
                     task_manager: Some(ctx.task_manager.clone()),
+                    bg_task_commands: ctx.bg_task_commands.clone(),
                     turn_index: ctx.turn,
                     pipeline_state: None,
                     pre_loaded_messages: None,
@@ -2303,7 +2313,8 @@ mod tests {
             session_state_journal: Arc::new(std::sync::Mutex::new(
                 crate::edge_tools::SessionStateRollbackJournal::default(),
             )),
-            task_manager: Arc::new(crate::edge_tools::TaskManager::new()),
+            task_manager: Arc::new(crate::edge_tools::TaskManager::in_memory()),
+            bg_task_commands: None,
             #[cfg(feature = "harness")]
             harness_sink: None,
             #[cfg(feature = "harness")]
@@ -3723,10 +3734,14 @@ All acceptance checks pass:
     #[test]
     fn credential_error_detection() {
         assert!(is_credential_error("could not validate credentials"));
-        assert!(is_credential_error("401 Unauthorized"));
+        assert!(is_credential_error(
+            "request failed (401): invalid token\n  Hint: Authentication required — try /login"
+        ));
         assert!(is_credential_error("Authentication failed: token expired"));
         assert!(!is_credential_error("network timeout"));
         assert!(!is_credential_error("tool execution failed"));
+        assert!(!is_credential_error("GitHub API Error: 401 Unauthorized"));
+        assert!(!is_credential_error("GitHub API Error: Bad credentials"));
     }
 
     // ── Bug #3 regression: plan_completion_action must reflect verification

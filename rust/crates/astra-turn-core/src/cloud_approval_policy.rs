@@ -560,7 +560,7 @@ pub fn cloud_gated_tool_kind_with_args(
     if !classification.approval_required {
         return None;
     }
-    if is_cloud_execute_tool(name) {
+    if classification.category.is_shell() {
         Some(CloudGatedToolKind::Execute)
     } else {
         Some(CloudGatedToolKind::Write)
@@ -690,6 +690,27 @@ mod tests {
         assert_eq!(
             cloud_gated_tool_kind("github_create_issue"),
             Some(CloudGatedToolKind::Write)
+        );
+    }
+
+    #[test]
+    fn task_background_shell_is_execute_gated_with_args() {
+        let args = serde_json::json!({
+            "action": "background_shell",
+            "command": "npm run dev"
+        });
+        assert_eq!(
+            cloud_gated_tool_kind_with_args("task", Some(&args)),
+            Some(CloudGatedToolKind::Execute)
+        );
+
+        let read_only = serde_json::json!({
+            "action": "background_shell",
+            "command": "git status"
+        });
+        assert_eq!(
+            cloud_gated_tool_kind_with_args("task", Some(&read_only)),
+            None
         );
     }
 

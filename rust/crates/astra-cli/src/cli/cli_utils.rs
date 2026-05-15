@@ -214,7 +214,11 @@ fn session_trace_state_from_value(
     let enabled = metadata
         .get(FULL_LLM_CAPTURE_METADATA_KEY)
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(
+            astra_config::runtime_config::RuntimeConfig::load()
+                .telemetry
+                .capture_full_llm_exchanges,
+        );
     Ok(SessionTraceState {
         session_id,
         enabled,
@@ -342,6 +346,22 @@ pub(super) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
         }
         other => other.to_string(),
     }
+}
+
+/// Session-auth shaped errors that should trigger Astra credential recovery.
+///
+/// Intentionally excludes generic upstream `401 Unauthorized` text: external
+/// services and tools can emit that even when the Astra session is healthy.
+pub(crate) fn is_astra_session_auth_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("could not validate credentials")
+        || lower.contains("session expired")
+        || lower.contains("token expired")
+        || lower.contains("invalid token")
+        || lower.contains("authentication failed")
+        || lower.contains("authentication required — try /login")
+        || lower.contains("hint: session expired — try /login")
+        || lower.contains("hint: authentication required — try /login")
 }
 
 /// Print an LLM/API call failure message with optional hint
@@ -686,8 +706,31 @@ pub(crate) fn git_snapshot(cwd: Option<&str>) -> (Option<String>, Option<String>
 mod tests {
     use super::*;
     use astra_services::session_journal::{self, JournalDirGuard};
+    use std::sync::{Mutex, OnceLock};
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn runtime_config_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock poisoned")
+    }
+
+    struct CliOverlayGuard;
+
+    impl CliOverlayGuard {
+        fn install(overlay: astra_config::runtime_config::RuntimeConfig) -> Self {
+            astra_config::runtime_config::set_cli_overlay(Some(overlay));
+            Self
+        }
+    }
+
+    impl Drop for CliOverlayGuard {
+        fn drop(&mut self) {
+            astra_config::runtime_config::set_cli_overlay(None);
+        }
+    }
 
     fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
         let tmp = tempfile::tempdir().unwrap();
@@ -863,6 +906,20 @@ mod tests {
         let out = super::format_error_with_context(418, "I'm a teapot");
         assert!(out.contains("418"));
         assert!(!out.contains("Hint:"));
+    }
+
+    #[test]
+    fn astra_session_auth_error_matches_session_specific_failures() {
+        let msg =
+            "request failed (401): invalid token\n  Hint: Authentication required — try /login";
+        assert!(super::is_astra_session_auth_error(msg));
+    }
+
+    #[test]
+    fn astra_session_auth_error_ignores_generic_upstream_401s() {
+        assert!(!super::is_astra_session_auth_error(
+            "GitHub API Error: 401 Unauthorized"
+        ));
     }
 
     // ── profile_name ──────────────────────────────────────────────────────────
@@ -1077,8 +1134,22 @@ mod tests {
         );
     }
 
+    // Holding a std::sync::MutexGuard across `.await` is fine here:
+    // the lock serializes mutation of the process-wide RuntimeConfig
+    // overlay (a global), and the alternative — switching to async
+    // `tokio::Mutex` for a test-only serializer — would change the
+    // production type. The .await points inside this test never block
+    // on the lock itself (no recursion, no other holders that need to
+    // run), so the cross-await hold cannot deadlock or starve the
+    // executor in practice.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn fetch_session_trace_state_defaults_to_disabled() {
+    async fn fetch_session_trace_state_uses_global_default_when_metadata_is_missing() {
+        let _lock = runtime_config_test_lock();
+        let mut overlay = astra_config::runtime_config::RuntimeConfig::default();
+        overlay.telemetry.capture_full_llm_exchanges = true;
+        let _overlay = CliOverlayGuard::install(overlay);
+
         let session_id = format!("trace-status-{}", uuid::Uuid::new_v4());
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1101,7 +1172,7 @@ mod tests {
             state,
             SessionTraceState {
                 session_id,
-                enabled: false,
+                enabled: true,
             }
         );
     }

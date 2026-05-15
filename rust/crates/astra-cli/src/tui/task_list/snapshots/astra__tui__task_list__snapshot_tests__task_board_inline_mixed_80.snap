@@ -1,0 +1,7 @@
+---
+source: crates/astra-cli/src/tui/task_list/snapshot_tests.rs
+expression: "draw(&tasks, 80, 24, false)"
+---
+⠋ write unit tests
+◻ update the docs
+✔ refactor auth module

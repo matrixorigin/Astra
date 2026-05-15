@@ -1219,8 +1219,17 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
+    // PR #330 plan-driven todo tracking. NAMING: distinct from
+    // `session_todos` (Tier 1 task scratchpad created further below)
+    // because the two schemas are incompatible — earlier revisions
+    // shared the name, which caused the second `CREATE TABLE IF NOT
+    // EXISTS` to silently no-op and code that expected the other
+    // shape to fail with `column does not exist`. The two tables now
+    // co-exist with disjoint columns and disjoint consumers:
+    //   - `session_plan_todos`: `state_projection` + plan/backlog pool
+    //   - `session_todos`     : `astra_tools::task_mgmt` (TaskManager)
     query(
-        "CREATE TABLE IF NOT EXISTS session_todos (
+        "CREATE TABLE IF NOT EXISTS session_plan_todos (
             todo_id VARCHAR(128) PRIMARY KEY,
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(128) NOT NULL,
@@ -1235,9 +1244,9 @@ pub async fn ensure_core_schema(
             payload_json LONGTEXT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_session_todos_active (session_id, status, priority, updated_at),
-            INDEX idx_session_todos_pool (user_id, backlog_pool_id, status, updated_at),
-            INDEX idx_session_todos_tree (session_id, parent_todo_id, priority)
+            INDEX idx_session_plan_todos_active (session_id, status, priority, updated_at),
+            INDEX idx_session_plan_todos_pool (user_id, backlog_pool_id, status, updated_at),
+            INDEX idx_session_plan_todos_tree (session_id, parent_todo_id, priority)
         )",
     )
     .execute(&pool)
@@ -1967,6 +1976,49 @@ pub async fn ensure_core_schema(
             tracing::debug!("phase4 additive index migration skipped: {table}.{index}: {e}");
         }
     }
+
+    // Session task scratchpad (Tier 1 — ClaudeCode-style task board).
+    // Authoritative store for the live task board. Both edge and cloud read
+    // the same rows for a given session_id; per-host `TaskManager` instances
+    // are caches over this table. See `docs/plans/task-system-design.md` §2.1
+    // for rationale; CLAUDE.md §3 compliance: primary key matches the only
+    // access pattern (filter by session_id); single secondary index covers
+    // the "open todos ordered by recency" query.
+    query(
+        "CREATE TABLE IF NOT EXISTS session_todos (
+            session_id VARCHAR(64) NOT NULL,
+            todo_id VARCHAR(64) NOT NULL,
+            ordinal INT NOT NULL,
+            title VARCHAR(512) NOT NULL,
+            description TEXT NULL,
+            active_form VARCHAR(512) NULL,
+            status VARCHAR(16) NOT NULL,
+            owner VARCHAR(128) NULL,
+            metadata JSON NULL,
+            blocks JSON NULL,
+            blocked_by JSON NULL,
+            subtasks JSON NULL,
+            created_at DATETIME(6) NOT NULL,
+            updated_at DATETIME(6) NOT NULL,
+            PRIMARY KEY (session_id, todo_id),
+            INDEX idx_session_todos_session_status_updated (session_id, status, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Per-session monotonic counter used to mint `task-<n>` ids. Kept in a
+    // separate table (not on `session_todos`) because a todo can be deleted
+    // but its id must never be reused for the session.
+    query(
+        "CREATE TABLE IF NOT EXISTS session_todo_counters (
+            session_id VARCHAR(64) PRIMARY KEY,
+            next_id BIGINT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // Step Protocol idempotency cache
     query(
         "CREATE TABLE IF NOT EXISTS step_idempotency_cache (
@@ -2786,6 +2838,14 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
         "add config_version_id index on agent_sessions",
         "ALTER TABLE agent_sessions \
          ADD INDEX idx_agent_sessions_config_version (config_version_id)",
+    )
+    .await?;
+
+    run_migration(
+        pool,
+        13,
+        "widen session_todo_counters.next_id for exhausted task id sentinel",
+        "ALTER TABLE session_todo_counters MODIFY COLUMN next_id BIGINT NOT NULL",
     )
     .await?;
 

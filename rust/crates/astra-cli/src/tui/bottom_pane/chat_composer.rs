@@ -321,8 +321,17 @@ impl ChatComposer {
         self.prompt_prefix.width() as u16
     }
 
-    pub fn flush_paste_burst(&mut self) {
-        self.textarea.flush_paste_burst();
+    pub fn flush_paste_burst(&mut self) -> bool {
+        self.textarea.flush_paste_burst()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_pending_paste_burst_for_test(
+        &mut self,
+        text: &str,
+        now: std::time::Instant,
+    ) {
+        self.textarea.force_pending_paste_burst_for_test(text, now);
     }
 
     pub fn desired_height(&self, width: u16) -> u16 {

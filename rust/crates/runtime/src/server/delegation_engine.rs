@@ -6455,7 +6455,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn zero_timeout_means_no_timeout() {
         let slow = Arc::new(SlowExecutor {
             delay: std::time::Duration::from_millis(50),

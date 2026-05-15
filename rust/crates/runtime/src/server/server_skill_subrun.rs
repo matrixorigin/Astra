@@ -459,6 +459,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: self.memory_extraction_service.clone(),
+            session_memory_state: Default::default(),
+            session_memory_llm_params: None,
             compact_strategy,
             approval_overrides: None,
             confidence_trend: Default::default(),

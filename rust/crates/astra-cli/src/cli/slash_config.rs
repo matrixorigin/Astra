@@ -226,6 +226,19 @@ fn show_config() {
         config.telemetry.capture_context_traces.to_string().yellow()
     );
     println!(
+        "  capture_full_llm_exchanges: {}",
+        config
+            .telemetry
+            .capture_full_llm_exchanges
+            .to_string()
+            .yellow()
+    );
+    println!(
+        "{}",
+        "    Global default for full request/response capture; /session trace still overrides per session."
+            .dim()
+    );
+    println!(
         "  capture_explanations: {}",
         config.telemetry.capture_explanations.to_string().yellow()
     );
@@ -360,6 +373,21 @@ fn show_sources() {
             source_for("ASTRA_CAPTURE_TRACES")
         );
     }
+    if final_config.telemetry.capture_full_llm_exchanges
+        != defaults.telemetry.capture_full_llm_exchanges
+    {
+        shown_any = true;
+        println!(
+            "  • {} = {} [{}]",
+            "telemetry.capture_full_llm_exchanges".magenta(),
+            final_config
+                .telemetry
+                .capture_full_llm_exchanges
+                .to_string()
+                .yellow(),
+            source_for("ASTRA_CAPTURE_FULL_LLM")
+        );
+    }
 
     if !shown_any {
         println!("\n{}", "  All settings are at their default values.".dim());
@@ -420,6 +448,10 @@ fn show_paths() {
             "token_budget.max_turn_input_tokens",
         ),
         ("ASTRA_CAPTURE_TRACES", "telemetry.capture_context_traces"),
+        (
+            "ASTRA_CAPTURE_FULL_LLM",
+            "telemetry.capture_full_llm_exchanges",
+        ),
     ];
 
     for (var, config_path) in env_vars {
@@ -546,6 +578,23 @@ fn show_diff() {
             current
                 .telemetry
                 .capture_context_traces
+                .to_string()
+                .yellow()
+        );
+    }
+    if current.telemetry.capture_full_llm_exchanges != default.telemetry.capture_full_llm_exchanges
+    {
+        has_diff = true;
+        println!(
+            "  telemetry.capture_full_llm_exchanges: {} → {}",
+            default
+                .telemetry
+                .capture_full_llm_exchanges
+                .to_string()
+                .dim(),
+            current
+                .telemetry
+                .capture_full_llm_exchanges
                 .to_string()
                 .yellow()
         );

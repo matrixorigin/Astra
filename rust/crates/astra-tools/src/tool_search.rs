@@ -189,7 +189,7 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
 /// stale prompts still reference the old names via `tool_search`.
 fn resolve_legacy_tool_alias(name: &str) -> &str {
     match name.to_lowercase().as_str() {
-        "spawn_agent" | "agent_spawn" | "sub_agent" => "agent",
+        "spawn_agent" | "agent_spawn" | "agent.spawn" | "sub_agent" => "agent",
         "get_agent_result" => "agent",
         "send_message" => "agent",
         "git_status" | "git_diff" | "git_log" | "git_show" | "git_blame" | "git_commit"
@@ -380,6 +380,7 @@ mod tests {
     fn resolve_legacy_alias_agent_family() {
         assert_eq!(resolve_legacy_tool_alias("spawn_agent"), "agent");
         assert_eq!(resolve_legacy_tool_alias("agent_spawn"), "agent");
+        assert_eq!(resolve_legacy_tool_alias("agent.spawn"), "agent");
         assert_eq!(resolve_legacy_tool_alias("sub_agent"), "agent");
         assert_eq!(resolve_legacy_tool_alias("get_agent_result"), "agent");
         assert_eq!(resolve_legacy_tool_alias("send_message"), "agent");
@@ -456,19 +457,21 @@ mod tests {
     #[test]
     fn select_mode_resolves_legacy_alias_at_boundary() {
         let schemas = consolidated_schemas();
-        let result = tool_search(&schemas, &json!({"query": "select:spawn_agent"}));
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        // Matched the consolidated `agent` tool via alias — found, not missing.
-        assert_eq!(
-            parsed["matches"].as_array().unwrap().len(),
-            1,
-            "spawn_agent must resolve to agent: {result}"
-        );
-        assert_eq!(parsed["matches"][0]["name"], "agent");
-        assert!(
-            parsed["missing"].as_array().unwrap().is_empty(),
-            "spawn_agent must not be reported missing after alias resolution: {result}"
-        );
+        for alias in ["spawn_agent", "agent.spawn"] {
+            let result = tool_search(&schemas, &json!({"query": format!("select:{alias}")}));
+            let parsed: Value = serde_json::from_str(&result).unwrap();
+            // Matched the consolidated `agent` tool via alias — found, not missing.
+            assert_eq!(
+                parsed["matches"].as_array().unwrap().len(),
+                1,
+                "{alias} must resolve to agent: {result}"
+            );
+            assert_eq!(parsed["matches"][0]["name"], "agent");
+            assert!(
+                parsed["missing"].as_array().unwrap().is_empty(),
+                "{alias} must not be reported missing after alias resolution: {result}"
+            );
+        }
     }
 
     #[test]

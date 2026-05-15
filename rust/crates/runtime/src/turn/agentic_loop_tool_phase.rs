@@ -698,15 +698,20 @@ async fn finalize_server_rollback_boundary(
             rollback_server_git_mutations(executor, &git_mutation_targets).await;
         let session_state_rollback =
             if let Some(session_state_checkpoint) = active.session_state_checkpoint {
-                (session_state_entries_added > 0).then(|| {
-                    parse_server_rollback_output(
-                        "rollback_session_state",
-                        executor.rollback_session_state(&serde_json::json!({
+                if session_state_entries_added > 0 {
+                    let output = executor
+                        .rollback_session_state(&serde_json::json!({
                             "scope": "current_turn",
                             "session_state_after_sequence": session_state_checkpoint,
-                        })),
-                    )
-                })
+                        }))
+                        .await;
+                    Some(parse_server_rollback_output(
+                        "rollback_session_state",
+                        output,
+                    ))
+                } else {
+                    None
+                }
             } else {
                 None
             };

@@ -217,7 +217,7 @@ async fn initialize_multi_agent_runtime_wires_spawner_and_engine() {
         astra_thin_client::ThinClient::new("http://127.0.0.1:8000", None).expect("test API URL");
     let mut state = SessionState::default();
 
-    initialize_multi_agent_runtime(&mut state, &api, "fake-token".to_string()).await;
+    initialize_multi_agent_runtime(&mut state, &api, "fake-token".to_string(), None).await;
 
     assert!(state.delegation_engine.is_some());
     let spawner = state.agent_spawner.expect("agent spawner should be wired");

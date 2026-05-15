@@ -5,6 +5,8 @@
 
 mod fork_cache_probe;
 pub(crate) mod spawner;
+pub mod worktree_registry;
+pub mod worktree_sweep;
 
 pub use astra_turn_core::orchestration_context_cache::{
     AgentFindings, CacheStats, CachedFile, Finding, FindingCategory, Knowledge, SharedContextCache,

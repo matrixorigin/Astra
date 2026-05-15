@@ -124,7 +124,11 @@ impl SessionService for StubSession {
             user_id,
             agent_id: req.agent_id,
             title: Some("comp-test".into()),
-            metadata: req.metadata.unwrap_or_default(),
+            metadata: {
+                let mut m = req.metadata.unwrap_or_default();
+                m.insert("full_llm_capture".into(), serde_json::Value::Bool(false));
+                m
+            },
             status: "active".into(),
             event_count: 0,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -148,7 +152,10 @@ impl SessionService for StubSession {
             user_id,
             agent_id: None,
             title: None,
-            metadata: serde_json::Map::new(),
+            metadata: serde_json::Map::from_iter([(
+                "full_llm_capture".into(),
+                serde_json::Value::Bool(false),
+            )]),
             status: "active".into(),
             event_count: 0,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -184,6 +191,34 @@ impl SessionService for StubSession {
             total: 0,
         })
     }
+}
+
+#[tokio::test]
+async fn stub_session_forces_full_llm_capture_off() {
+    let session = StubSession;
+    let created = session
+        .create_session(
+            USER_ID.into(),
+            SessionCreateRequestData {
+                agent_id: Some("bridge-test-agent".into()),
+                title: None,
+                metadata: Some(serde_json::Map::from_iter([(
+                    "full_llm_capture".into(),
+                    serde_json::Value::Bool(true),
+                )])),
+            },
+        )
+        .await
+        .expect("stub create_session should succeed");
+
+    assert_eq!(
+        created
+            .metadata
+            .get("full_llm_capture")
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "bridge e2e stub must override full_llm_capture to false so tests do not accidentally enable the slow path"
+    );
 }
 
 // ── Capturing writers ────────────────────────────────────────────────────────

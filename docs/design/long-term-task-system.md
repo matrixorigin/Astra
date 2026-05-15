@@ -482,3 +482,90 @@ task_abandoned           → rollback snapshot, cleanup
 - Stage mount + DataLink columns
 - Artifact storage and fulltext search
 - Cross-task artifact discovery
+
+---
+
+## 10. ClaudeCode-Compatible UX Contract
+
+Astra has **two distinct task surfaces**, each with its own storage, lifecycle,
+and ownership. They are **not** mirrors of each other.
+
+| Surface | Authoritative store | Owner | Lifecycle |
+|---------|---------------------|-------|-----------|
+| **Session task board** (Tier 1, ClaudeCode-style scratchpad) | `session_todos` — see `docs/plans/task-system-design.md` §2.1 | the model, via the `task_*` tool family inside a turn | lives as long as the session; one row per todo |
+| **Durable agent task** (this document, §1–§9) | `agent_tasks` + `task_leases` + `task_contracts` | the user, via `astra task queue` / CLI / web | spans sessions; one row per "big task" with its own plan, verification, leases |
+
+### Rule 1 — session_todos is the source of truth for the live board
+
+The in-memory `TaskManager` is a per-host **cache** over `session_todos`, not
+an authoritative object that needs replication. Both edge and cloud loop hosts
+read/write the same rows for a given `session_id`. There is no `TaskMirror`,
+no "sync the task board into TaskService", no bidirectional reconciliation.
+If §10 previously implied otherwise, that framing is superseded by
+`task-system-design.md` §2.1 / §7.2.
+
+### Rule 2 — durable tasks project from session_todos, never into it
+
+When a session is executing a queued durable task (i.e., there is an
+`agent_tasks` row owned by this session), the durable worker **reads**
+`session_todos` for that `session_id` and projects a compact progress summary
+into its own `agent_tasks.plan_json` / `progress_pct` / `items_done`. This
+projection is **one-way** and only happens for sessions bound to a durable
+task. Normal chat sessions have no `agent_tasks` row and no projection.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ session_todos (MO)   ← read/write ──  TaskManager (cache)   │
+│        │                                                     │
+│        │ read-only projection (durable sessions only)        │
+│        ▼                                                     │
+│ agent_tasks.plan_json (MO)            — owned by worker      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Agent lifecycle (live board)
+
+```
+user asks for large work
+  -> model calls task_create with subtasks
+  -> write to session_todos (MO); update in-memory cache
+  -> TUI/CLI reads session_todos by session_id (consistent across edge/cloud)
+  -> model calls task_update as each step starts/completes
+```
+
+### Durable task lifecycle (cloud runner)
+
+```
+astra task queue "fix flaky auth test"
+  -> INSERT agent_tasks row (status=pending)
+
+astra task worker --once --agent-id edge-ci-1
+  -> list pending agent_tasks rows
+  -> try_claim_lease(...) → status=in_progress
+  -> stream_chat_sse(...)                 — model uses task_* on session_todos
+  -> worker polls session_todos for the session, projects progress into agent_tasks
+  -> on session end: save TaskCheckpoint, status=completed|failed
+  -> release_lease(...)
+```
+
+`task_leases` prevents duplicate execution across polling runners. Lease TTL
+is clamped by the service layer and renewable via existing runtime endpoints.
+
+### Parity targets (unchanged)
+
+1. The model creates and mutates tasks automatically for multi-step work.
+2. Task board is visible in CLI/TUI across edge and cloud via `session_todos`.
+3. Durable results (final text, token counts, tool-call counts, background-agent
+   results, output path) persist in `TaskCheckpoint` on the `agent_tasks` row.
+4. Optional cloud workers pick up queued work using leases.
+
+### Remaining hardening
+
+- Task artifact rows for non-local result files (replace reliance on
+  checkpoint JSON + `~/.astra/tasks/outputs`).
+- Cancellation polling in the worker loop so TUI/server stop requests can
+  interrupt long runs.
+- Renew leases during very long executions instead of relying on a large TTL.
+- Durable worker reconciles on reconnect by re-reading `session_todos` for its
+  bound session — no local-id ↔ durable-id mapping needed, since the two live
+  in different tables with different PKs.

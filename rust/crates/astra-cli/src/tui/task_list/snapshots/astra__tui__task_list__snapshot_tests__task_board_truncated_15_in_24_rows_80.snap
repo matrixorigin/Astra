@@ -1,0 +1,15 @@
+---
+source: crates/astra-cli/src/tui/task_list/snapshot_tests.rs
+expression: "draw(&tasks, 80, 24, false)"
+---
+◻ task number 1
+◻ task number 2
+◻ task number 3
+◻ task number 4
+◻ task number 5
+◻ task number 6
+◻ task number 7
+◻ task number 8
+◻ task number 9
+◻ task number 10
+ … +5 pending

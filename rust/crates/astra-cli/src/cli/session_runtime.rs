@@ -14,6 +14,103 @@ pub(crate) fn create_pipeline_modules_quiet(
     create_pipeline_modules_inner(api, profile, false)
 }
 
+pub(crate) fn local_task_service() -> std::sync::Arc<dyn astra_services::TaskService> {
+    let tasks_dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".astra")
+        .join("tasks");
+    std::sync::Arc::new(astra_services::LocalTaskService::new(tasks_dir))
+}
+
+pub(crate) async fn resolve_task_service() -> std::sync::Arc<dyn astra_services::TaskService> {
+    if std::env::var("MATRIXONE_HOST").is_ok() {
+        let settings = astra_core::MatrixOneSettings::from_env();
+        let catalog =
+            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        let _ = astra_services::storage::ensure_core_schema(&settings, &catalog).await;
+        if let Some(pool) = cloud_sync::try_connect_matrixone().await {
+            return std::sync::Arc::new(astra_services::MatrixOneTaskService::new(pool));
+        }
+    }
+    local_task_service()
+}
+
+/// Task store for the Tier 1 session scratchpad (`session_todos`). MO-backed
+/// when a pool is configured so edge/cloud see the same rows; in-memory
+/// fallback for offline CLI.
+pub(crate) async fn resolve_task_store() -> std::sync::Arc<dyn astra_tools::task_mgmt::TaskStore> {
+    if std::env::var("MATRIXONE_HOST").is_ok()
+        && let Some(pool) = cloud_sync::try_connect_matrixone().await
+    {
+        return std::sync::Arc::new(astra_tools::task_mgmt_matrixone::MatrixOneTaskStore::new(
+            pool,
+        ));
+    }
+    std::sync::Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new())
+}
+
+pub(crate) fn install_task_service(
+    state: &mut SessionState,
+    task_service: std::sync::Arc<dyn astra_services::TaskService>,
+) {
+    state.task_service = Some(task_service);
+}
+
+/// Replace the task manager's store (used once at startup when we upgrade
+/// from the synchronous in-memory fallback to a MatrixOne-backed store).
+/// The new manager inherits the current session_id; later `rebind_task_session`
+/// calls keep it current.
+pub(crate) fn install_task_store(
+    state: &mut SessionState,
+    store: std::sync::Arc<dyn astra_tools::task_mgmt::TaskStore>,
+) {
+    let session_id = state
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "no-session".to_string());
+    state.task_manager =
+        std::sync::Arc::new(astra_tools::task_mgmt::TaskManager::new(session_id, store));
+}
+
+/// Notify the task manager that the session id changed. Cheap — just a
+/// mutex swap inside the manager — so every `state.session_id = ...`
+/// touch-point should call this to keep the session_todos view consistent.
+pub(crate) fn rebind_task_session(state: &SessionState, session_id: &str) {
+    state.task_manager.rebind(session_id);
+}
+
+pub(crate) async fn resolve_matrixone_task_runtime() -> Result<
+    (
+        std::sync::Arc<dyn astra_services::TaskService>,
+        std::sync::Arc<dyn astra_services::TaskLeaseService>,
+    ),
+    String,
+> {
+    if std::env::var("MATRIXONE_HOST").is_err() {
+        return Err(
+            "MatrixOne task runtime is not configured; set MATRIXONE_HOST and related MatrixOne env vars"
+                .to_string(),
+        );
+    }
+    let settings = astra_core::MatrixOneSettings::from_env();
+    let catalog =
+        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+    astra_services::storage::ensure_core_schema(&settings, &catalog)
+        .await
+        .map_err(|e| format!("initialize MatrixOne task schema: {e}"))?;
+    let pool = cloud_sync::try_connect_matrixone()
+        .await
+        .ok_or_else(|| "connect MatrixOne task runtime".to_string())?;
+    let task_service: std::sync::Arc<dyn astra_services::TaskService> =
+        std::sync::Arc::new(astra_services::MatrixOneTaskService::new(pool.clone()));
+    let lease_service: std::sync::Arc<dyn astra_services::TaskLeaseService> =
+        std::sync::Arc::new(astra_services::DatabaseTaskLeaseService::new(
+            pool,
+            std::sync::Arc::new(astra_services::TaskLeaseHoldCache::default()),
+        ));
+    Ok((task_service, lease_service))
+}
+
 /// Shared runtime modules created during pipeline construction.
 ///
 /// Holds the unified skill registry, MCP client manager, and skill-watcher
@@ -42,8 +139,11 @@ fn create_pipeline_modules_inner(
     // (server HOME skills + database skills visible to this user). That keeps
     // CLI and Web aligned for shared server capabilities without pretending
     // that project-local CLI skills are available to Web sessions.
-    let remote_catalog = current_access_token(profile).map(|token| {
-        astra_runtime::capabilities::RemoteSkillCatalogProvider::new(api.clone(), token)
+    let remote_catalog = current_access_token(profile).map(|_| {
+        let profile_owned = profile.map(str::to_string);
+        let token_provider: astra_runtime::capabilities::TokenProvider =
+            std::sync::Arc::new(move || current_access_token(profile_owned.as_deref()));
+        astra_runtime::capabilities::RemoteSkillCatalogProvider::new(api.clone(), token_provider)
     });
     let unified_skill_registry =
         astra_runtime::capabilities::build_cli_local_skill_registry(remote_catalog);
@@ -378,6 +478,72 @@ pub(super) async fn attempt_token_refresh(
     }
 }
 
+const ACCESS_TOKEN_REFRESH_SKEW_SECS: i64 = 60;
+
+fn jwt_expiry_epoch(token: &str) -> Option<i64> {
+    use base64::Engine;
+
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    value.get("exp").and_then(|v| {
+        v.as_i64()
+            .or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
+    })
+}
+
+fn access_token_needs_refresh(token: &str, now_epoch: i64) -> bool {
+    jwt_expiry_epoch(token)
+        .map(|exp| exp <= now_epoch + ACCESS_TOKEN_REFRESH_SKEW_SECS)
+        .unwrap_or(false)
+}
+
+fn active_env_access_token(now_epoch: i64) -> Option<String> {
+    let token = std::env::var("ASTRA_ACCESS_TOKEN").ok()?;
+    if token.is_empty() || access_token_needs_refresh(&token, now_epoch) {
+        return None;
+    }
+    Some(token)
+}
+
+pub(super) async fn fresh_access_token(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+) -> Option<String> {
+    if let Some(token) = active_env_access_token(chrono::Utc::now().timestamp()) {
+        return Some(token);
+    }
+
+    let creds = load_credentials();
+    let name = profile_name(profile, &creds);
+    let profile_entry = creds.profiles.get(&name)?;
+    let access = profile_entry.access_token.clone();
+    let has_refresh = profile_entry.refresh_token.is_some();
+    drop(creds);
+
+    if let Some(token) = access {
+        if !has_refresh {
+            return Some(token);
+        }
+        if !access_token_needs_refresh(&token, chrono::Utc::now().timestamp()) {
+            return Some(token);
+        }
+        if attempt_token_refresh(api, profile).await {
+            return current_access_token(profile).or(Some(token));
+        }
+        return Some(token);
+    }
+
+    if has_refresh && attempt_token_refresh(api, profile).await {
+        return current_access_token(profile);
+    }
+
+    None
+}
+
 pub(crate) fn initialize_session_state(
     profile: Option<&str>,
     initial_model: Option<&str>,
@@ -389,14 +555,9 @@ pub(crate) fn initialize_session_state(
         state.model = Some(m.to_string());
     }
 
-    // Initialize local task service
-    let tasks_dir = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".astra")
-        .join("tasks");
-    state.task_service = Some(std::sync::Arc::new(astra_services::LocalTaskService::new(
-        tasks_dir,
-    )));
+    // Initialize a durable task service synchronously; startup paths that can
+    // await upgrade this to MatrixOne via `resolve_task_service`.
+    install_task_service(&mut state, local_task_service());
 
     // Initialize observability hub for M1-M6 integration
     // Use persistent storage under ~/.astra/observability for user profiles
@@ -893,11 +1054,9 @@ fn banner_session_display(state: &SessionState) -> String {
 }
 
 pub(super) fn current_access_token(profile: Option<&str>) -> Option<String> {
-    // Gateway injects a pre-validated token — skip file I/O and auth check
-    if let Ok(token) = std::env::var("ASTRA_ACCESS_TOKEN") {
-        if !token.is_empty() {
-            return Some(token);
-        }
+    // Gateway-injected env tokens still win, but only while locally usable.
+    if let Some(token) = active_env_access_token(chrono::Utc::now().timestamp()) {
+        return Some(token);
     }
     let creds = load_credentials();
     let name = profile_name(profile, &creds);
@@ -913,6 +1072,8 @@ mod tests {
     use crate::cli_utils::{CredentialsFile, Profile};
     use crate::tests::isolate_credentials;
     use tempfile::tempdir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     struct EnvGuard {
         key: &'static str,
@@ -948,6 +1109,16 @@ mod tests {
         std::fs::create_dir_all(&sessions).unwrap();
         let guard = session_journal::JournalDirGuard::new(&sessions);
         (tmp, guard)
+    }
+
+    fn jwt_with_exp(exp: i64) -> String {
+        use base64::Engine;
+
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#));
+        format!("{header}.{payload}.sig")
     }
 
     #[test]
@@ -1735,5 +1906,150 @@ mod tests {
             Some("file-token-abc".to_string()),
             "should fall back to credentials file when env var is empty"
         );
+    }
+
+    #[test]
+    fn current_access_token_falls_back_to_file_when_env_token_expired() {
+        let _g = isolate_credentials();
+        let _env = EnvGuard::set("ASTRA_ACCESS_TOKEN", &jwt_with_exp(1));
+
+        let mut creds = CredentialsFile {
+            current_profile: Some("default".to_string()),
+            ..Default::default()
+        };
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                username: Some("user".into()),
+                access_token: Some("file-token-abc".into()),
+                refresh_token: Some("refresh-token".into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        assert_eq!(
+            current_access_token(None),
+            Some("file-token-abc".to_string()),
+            "expired env token must not mask usable file credentials"
+        );
+    }
+
+    #[test]
+    fn access_token_needs_refresh_only_when_expired_or_near_expiry() {
+        let now = 1_700_000_000_i64;
+        assert!(access_token_needs_refresh(
+            &jwt_with_exp(now + ACCESS_TOKEN_REFRESH_SKEW_SECS - 1),
+            now
+        ));
+        assert!(access_token_needs_refresh(&jwt_with_exp(now - 1), now));
+        assert!(!access_token_needs_refresh(
+            &jwt_with_exp(now + ACCESS_TOKEN_REFRESH_SKEW_SECS + 120),
+            now
+        ));
+        assert!(!access_token_needs_refresh("not-a-jwt", now));
+    }
+
+    #[tokio::test]
+    async fn fresh_access_token_refreshes_expired_saved_token() {
+        let _g = isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                access_token: Some(
+                    "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjF9.sig".to_string(),
+                ),
+                refresh_token: Some("refresh-old".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh-access",
+                "refresh_token": "fresh-refresh"
+            })))
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+
+        let token = fresh_access_token(&api, None).await;
+
+        assert_eq!(token.as_deref(), Some("fresh-access"));
+        let creds = load_credentials();
+        let profile = creds.profiles.get("default").unwrap();
+        assert_eq!(profile.access_token.as_deref(), Some("fresh-access"));
+        assert_eq!(profile.refresh_token.as_deref(), Some("fresh-refresh"));
+    }
+
+    #[tokio::test]
+    async fn fresh_access_token_keeps_valid_saved_token_without_refresh() {
+        let _g = isolate_credentials();
+        let token = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjQxMDAwMDAwMDB9.sig".to_string();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                access_token: Some(token.clone()),
+                refresh_token: Some("refresh-old".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+
+        let fresh = fresh_access_token(&api, None).await;
+
+        assert_eq!(fresh.as_deref(), Some(token.as_str()));
+        let creds = load_credentials();
+        let profile = creds.profiles.get("default").unwrap();
+        assert_eq!(profile.access_token.as_deref(), Some(token.as_str()));
+        assert_eq!(profile.refresh_token.as_deref(), Some("refresh-old"));
+    }
+
+    #[tokio::test]
+    async fn fresh_access_token_refreshes_profile_when_env_token_is_expired() {
+        let _g = isolate_credentials();
+        let _env = EnvGuard::set("ASTRA_ACCESS_TOKEN", &jwt_with_exp(1));
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                access_token: Some(jwt_with_exp(1)),
+                refresh_token: Some("refresh-old".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh-access",
+                "refresh_token": "fresh-refresh"
+            })))
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+
+        let token = fresh_access_token(&api, None).await;
+
+        assert_eq!(token.as_deref(), Some("fresh-access"));
+        let creds = load_credentials();
+        let profile = creds.profiles.get("default").unwrap();
+        assert_eq!(profile.access_token.as_deref(), Some("fresh-access"));
+        assert_eq!(profile.refresh_token.as_deref(), Some("fresh-refresh"));
     }
 }

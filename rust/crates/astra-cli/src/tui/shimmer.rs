@@ -67,9 +67,20 @@ pub(crate) fn gradient_color_at_t(
     period_seconds: f32,
     t: f32,
 ) -> (u8, u8, u8) {
+    // Defensive against malformed inputs from future callers:
+    // - period == 0 / NaN / negative would make `t / period` NaN or ∞,
+    //   which then poisons `.fract()` and lands the hue in an undefined
+    //   slot. Clamp to a sane positive period.
+    // - NaN `t` from a clock anomaly must not propagate.
+    let period = if period_seconds.is_finite() && period_seconds > 0.0 {
+        period_seconds
+    } else {
+        LIVE_GUTTER_PERIOD_SECS
+    };
+    let t = if t.is_finite() { t } else { 0.0 };
     let len = len.max(1) as f32;
-    let phase = (t / period_seconds).fract();
-    let u = ((pos as f32 / len) + phase).fract();
+    let phase = (t / period).rem_euclid(1.0);
+    let u = ((pos as f32 / len) + phase).rem_euclid(1.0);
     hue_to_rgb(u)
 }
 
@@ -137,6 +148,28 @@ mod gradient_tests {
     #[test]
     fn gradient_handles_zero_len() {
         let _ = gradient_color_at_t(0, 0, 3.0, 1.23);
+    }
+
+    /// Malformed inputs (NaN / zero / negative period, NaN time) must
+    /// not panic and must produce a finite RGB triple. Guards against
+    /// future callers that compute period from a clock delta or user
+    /// config and forget to validate. Without the defensive normalisation
+    /// in `gradient_color_at_t`, `t / period` becomes NaN/∞ and
+    /// `.fract()` returns NaN, which then casts to an undefined `u8`.
+    #[test]
+    fn gradient_handles_malformed_inputs() {
+        let _ = gradient_color_at_t(0, 10, 0.0, 1.0);
+        let _ = gradient_color_at_t(0, 10, -3.0, 1.0);
+        let _ = gradient_color_at_t(0, 10, f32::NAN, 1.0);
+        let _ = gradient_color_at_t(0, 10, 3.0, f32::NAN);
+        let _ = gradient_color_at_t(0, 10, f32::INFINITY, 1.0);
+        // Negative `t` (clock anomaly / pre-origin instant) should fold
+        // back into [0, 1) phase rather than producing a negative hue.
+        let (r, g, b) = gradient_color_at_t(0, 10, 3.0, -1.5);
+        assert!(
+            r as u32 + g as u32 + b as u32 > 0,
+            "negative t must still yield a valid colour, got ({r},{g},{b})"
+        );
     }
 
     /// Adjacent positions at fixed `t` produce *different* colours —

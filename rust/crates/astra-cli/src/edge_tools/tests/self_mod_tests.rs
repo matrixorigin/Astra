@@ -1,6 +1,17 @@
 use super::*;
 use astra_services::{session_journal::JournalDirGuard, session_workspace};
 
+/// Parse a task-tool response into JSON, tolerating the human-readable
+/// summary line that `prefix_summary` prepends to success responses.
+fn parse_task_json(response: &str) -> Value {
+    let body = response
+        .find('{')
+        .map(|pos| &response[pos..])
+        .unwrap_or(response);
+    serde_json::from_str(body)
+        .unwrap_or_else(|e| panic!("task response not JSON: {e}; raw: {response}"))
+}
+
 fn executor_with_session() -> (
     ToolExecutor,
     std::sync::Arc<
@@ -232,7 +243,7 @@ async fn deprioritize_tool_preserves_existing_state_when_persist_fails() {
 
 #[tokio::test]
 async fn shared_task_manager_and_session_state_journal_survive_across_executors() {
-    let shared_tasks = std::sync::Arc::new(TaskManager::new());
+    let shared_tasks = std::sync::Arc::new(TaskManager::in_memory());
     let shared_journal =
         std::sync::Arc::new(std::sync::Mutex::new(SessionStateRollbackJournal::default()));
 
@@ -253,7 +264,7 @@ async fn shared_task_manager_and_session_state_journal_survive_across_executors(
     let create_out = exe_a
         .execute("task_create", &json!({"title": "shared task"}))
         .await;
-    let create_json: Value = serde_json::from_str(&create_out).unwrap();
+    let create_json = parse_task_json(&create_out);
     assert_eq!(create_json["success"], true);
 
     let listed_via_b = exe_b.execute("task_list", &json!({})).await;
@@ -261,7 +272,9 @@ async fn shared_task_manager_and_session_state_journal_survive_across_executors(
     assert_eq!(listed_via_b_json["count"], 1);
 
     let rollback_json: Value = serde_json::from_str(
-        &exe_b.rollback_session_state(&json!({"scope": "turn", "turn_index": 11})),
+        &exe_b
+            .rollback_session_state(&json!({"scope": "turn", "turn_index": 11}))
+            .await,
     )
     .unwrap();
     assert_eq!(rollback_json["success"], true);

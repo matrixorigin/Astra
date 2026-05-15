@@ -235,6 +235,54 @@ pub(super) async fn handle_chat_input_with_ui(
     let plan_resume_digest = consume_plan_resume_if_matches(state, &line);
     let mut effective_line = build_effective_line(&line, state, ui);
     state.diagnostics_context = None; // consumed after injection
+
+    // Drain background task notifications into this turn's context.
+    if !state.pending_bg_notifications.is_empty() {
+        let notifications = state
+            .pending_bg_notifications
+            .drain(..)
+            .collect::<Vec<_>>()
+            .join("\n");
+        effective_line = format!(
+            "<system-reminder>\nBackground task updates since your last turn:\n{notifications}\n</system-reminder>\n\n{effective_line}"
+        );
+    }
+
+    // Task tool usage nudge: if 10+ turns without task tool use and 10+ turns
+    // since last reminder, inject a gentle nudge with the current task list.
+    const TURNS_SINCE_TASK_USE_THRESHOLD: u32 = 10;
+    const TURNS_BETWEEN_REMINDERS: u32 = 10;
+    if state
+        .recent_tools
+        .iter()
+        .any(|t| t == "task" || t.starts_with("task_"))
+    {
+        state.turns_since_task_use = 0;
+    } else {
+        state.turns_since_task_use += 1;
+    }
+    state.turns_since_task_reminder += 1;
+    if state.turns_since_task_use >= TURNS_SINCE_TASK_USE_THRESHOLD
+        && state.turns_since_task_reminder >= TURNS_BETWEEN_REMINDERS
+    {
+        let task_list = state
+            .task_manager
+            .list(&serde_json::json!({"status_filter": "active"}))
+            .await;
+        let nudge = format!(
+            "<system-reminder>\n\
+            The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, \
+            consider using task(action='create') to add new tasks and task(action='update') to update task status \
+            (set to in_progress when starting, completed when done). Also consider cleaning up the task list if it has become stale. \
+            Only use these if relevant to the current work. This is just a gentle reminder - ignore if not applicable. \
+            Make sure that you NEVER mention this reminder to the user\n\
+            \n\
+            Here are the existing tasks:\n{task_list}\n\
+            </system-reminder>"
+        );
+        effective_line = format!("{nudge}\n\n{effective_line}");
+        state.turns_since_task_reminder = 0;
+    }
     effective_line = apply_resume_context(effective_line, resume_guidance, plan_resume_digest);
     let turn_start = Instant::now();
 
@@ -271,7 +319,7 @@ pub(super) async fn handle_chat_input_with_ui(
                     {
                         let _ = hub.end_session(old_sid);
                     }
-                    state.session_id = None;
+                    state.clear_session_id();
                     // Unregister stale mailbox to avoid agent_id collision on re-registration
                     state.unregister_root_mailbox().await;
                     state.observability_session = None;
@@ -931,6 +979,16 @@ async fn run_chat_turn(
     let obs_hub = state.observability_hub.clone();
     let obs_session = state.observability_session.clone();
 
+    // Task-state awareness: render a short summary of the session's
+    // task board and prepend it to the system prompt so the model
+    // can reason about "what am I supposed to be doing right now"
+    // without having to poll the task tool. Empty / all-completed
+    // boards return None so we save cache budget on the common case.
+    let task_summary_block = {
+        let tasks = state.task_manager.snapshot().await;
+        crate::task_summary::format_summary(&tasks)
+    };
+
     let attempt = tokio::select! {
         result = stream_chat_sse(ChatTurnParams {
             api: ctx.api,
@@ -958,6 +1016,7 @@ async fn run_chat_turn(
             cancel_token: Some(cancel_token),
             plan_assemble_line_release: None,
             stream_event_tx: state.tui_stream_event_tx.clone(),
+            agent_live_event_sink: state.tui_agent_live_event_sink.clone(),
             approval_request_tx: state.tui_approval_request_tx.clone(),
             mcp_manager: Some(state.mcp_manager.clone()),
             skill_search: &state.skill_search,
@@ -977,10 +1036,11 @@ async fn run_chat_turn(
             git_worktree_journal: Some(state.git_worktree_journal.clone()),
             session_state_journal: Some(state.session_state_journal.clone()),
             task_manager: Some(state.task_manager.clone()),
+            bg_task_commands: Some(state.bg_task_commands.clone()),
             turn_index: state.turn,
             pipeline_state: None,
             pre_loaded_messages: None,
-            append_system_prompt: None,
+            append_system_prompt: task_summary_block,
             session_memory_extractor: state.session_memory_extractor.clone(),
             #[cfg(feature = "harness")]
             harness_sink: Some(state.harness_sink.clone()),
@@ -1764,7 +1824,7 @@ fn apply_turn_success_sync(
     if let Some(session_id) = result.session_id.as_deref() {
         persist_last_session_id(profile, session_id);
         initialize_journal(state, session_id);
-        state.session_id = Some(session_id.to_string());
+        state.set_session_id(session_id.to_string());
         state.run_id = result.run_id.clone();
 
         if state.csl_manager.is_none() {
@@ -2687,15 +2747,7 @@ pub(super) fn is_auth_error(error: &str) -> bool {
     if is_llm_provider_auth_error(error) {
         return false;
     }
-    let lower = error.to_lowercase();
-    lower.contains("unauthorized")
-        || lower.contains("could not validate credentials")
-        || lower.contains("session expired")
-        || lower.contains("token expired")
-        || lower.contains("401 unauthorized")
-        || lower.contains("status: 401")
-        || lower.contains("status code: 401")
-        || lower.contains("http 401")
+    crate::cli_utils::is_astra_session_auth_error(error)
 }
 
 /// Detect LLM provider authentication failures — upstream Bedrock/Anthropic
@@ -2737,7 +2789,7 @@ fn report_turn_failure(
         {
             initialize_journal(state, sid);
             persist_last_session_id(profile, sid);
-            state.session_id = Some(sid.to_string());
+            state.set_session_id(sid.to_string());
         }
     }
 
@@ -3240,10 +3292,17 @@ mod tests {
         assert!(super::is_llm_provider_auth_error(prefixed));
         assert!(!super::is_auth_error(prefixed));
 
-        // Plain session 401 must still be detected by the generic predicate.
-        let session_msg = "HTTP 401 Unauthorized";
+        let session_msg =
+            "API Error (401): Could not validate credentials\n  Hint: Session expired — try /login";
         assert!(!super::is_llm_provider_auth_error(session_msg));
         assert!(super::is_auth_error(session_msg));
+
+        let unrelated_401 = "GitHub API Error: 401 Unauthorized";
+        assert!(!super::is_llm_provider_auth_error(unrelated_401));
+        assert!(
+            !super::is_auth_error(unrelated_401),
+            "generic upstream 401s must not be reported as Astra session expiry"
+        );
     }
 
     #[test]

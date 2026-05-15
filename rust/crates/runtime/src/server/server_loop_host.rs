@@ -1546,6 +1546,7 @@ impl ServerAgenticLoopHost {
                     item.approval_kind,
                     item.path.as_deref(),
                     item.detail.as_deref(),
+                    item.display_label.as_deref(),
                 )));
             } else {
                 let requests = batch
@@ -1557,6 +1558,7 @@ impl ServerAgenticLoopHost {
                         approval_kind: item.approval_kind,
                         path: item.path.as_deref(),
                         detail: item.detail.as_deref(),
+                        display_label: item.display_label.as_deref(),
                     })
                     .collect::<Vec<_>>();
                 self.emit_event(Value::Object(build_approval_batch_required_event(
@@ -4565,6 +4567,8 @@ mod tests {
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: None,
+            session_memory_state: Default::default(),
+            session_memory_llm_params: None,
             compact_strategy: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),

@@ -161,6 +161,12 @@ async fn e2e_matrix_tasks_lease_and_db_assertions() {
     journey_tasks_runs::run_tasks_lease_with_db_assertions().await;
 }
 
+// The real-LLM tool-chain path for `session_todos` lives in the harness
+// suite (`rust/crates/astra-test-harness/cases/session_todos_create_and_list.yaml`):
+// scripted `test_llm_rounds` here don't exercise server-side tool dispatch,
+// so a real model decision is the correct way to cover it. Direct MO
+// contract asserts live in `session_todos_cross_client_e2e.rs`.
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
 async fn e2e_matrix_chat_run_pause_resume_http() {

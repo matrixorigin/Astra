@@ -32,10 +32,22 @@ fn sanitize_component(raw: &str) -> String {
 pub(crate) fn session_full_llm_capture_enabled(
     metadata: Option<&serde_json::Map<String, Value>>,
 ) -> bool {
+    resolve_full_llm_capture_enabled(
+        metadata,
+        astra_config::runtime_config::RuntimeConfig::cached()
+            .telemetry
+            .capture_full_llm_exchanges,
+    )
+}
+
+fn resolve_full_llm_capture_enabled(
+    metadata: Option<&serde_json::Map<String, Value>>,
+    default_enabled: bool,
+) -> bool {
     metadata
         .and_then(|metadata| metadata.get(FULL_LLM_CAPTURE_METADATA_KEY))
         .and_then(Value::as_bool)
-        .unwrap_or(false)
+        .unwrap_or(default_enabled)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -524,10 +536,11 @@ mod tests {
             json!("true"),
         )]);
 
-        assert!(session_full_llm_capture_enabled(Some(&enabled)));
-        assert!(!session_full_llm_capture_enabled(Some(&disabled)));
-        assert!(!session_full_llm_capture_enabled(Some(&wrong_type)));
-        assert!(!session_full_llm_capture_enabled(None));
+        assert!(resolve_full_llm_capture_enabled(Some(&enabled), false));
+        assert!(!resolve_full_llm_capture_enabled(Some(&disabled), true));
+        assert!(!resolve_full_llm_capture_enabled(Some(&wrong_type), false));
+        assert!(!resolve_full_llm_capture_enabled(None, false));
+        assert!(resolve_full_llm_capture_enabled(None, true));
     }
 
     #[test]

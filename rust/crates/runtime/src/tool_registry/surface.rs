@@ -72,6 +72,14 @@ pub struct ToolSurface {
 }
 
 impl ToolSurface {
+    /// Build a `ToolSurface` using the process-wide runtime config.
+    pub fn from_runtime_config(all_schemas: &[Value]) -> Self {
+        let cfg = astra_config::runtime_config::RuntimeConfig::cached()
+            .tool_surface
+            .clone();
+        Self::build(all_schemas.to_vec(), &cfg, &[])
+    }
+
     /// Build a `ToolSurface` from a catalog snapshot, user config, and
     /// plugin schemas registered this session.
     ///
@@ -150,6 +158,11 @@ impl ToolSurface {
     /// tool, ready to render into the system-reminder block.
     pub fn deferred(&self) -> &[DeferredEntry] {
         &self.deferred
+    }
+
+    /// Render the deferred manifest into the session-stable prompt block.
+    pub fn deferred_block_text(&self) -> Option<String> {
+        crate::prompts::build_deferred_tools_section(self).map(|section| section.text)
     }
 }
 

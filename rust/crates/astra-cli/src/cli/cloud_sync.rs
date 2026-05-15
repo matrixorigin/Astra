@@ -11,7 +11,6 @@ use astra_core::resolve_database_name_or;
 use astra_services::session_journal;
 use astra_services::state_sync::{MatrixOneSyncService, StateSyncService, pref_keys};
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
-use crossterm::style::Stylize;
 
 use super::chat_turn::enqueue_ingestion_pub;
 use super::{ExplainMode, SessionState};
@@ -116,15 +115,20 @@ pub(super) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<
                     _ => {}
                 }
             }
-            eprintln!(
-                "{}",
-                format!("  ✓ Pulled {} preferences from cloud", prefs.len()).dim()
-            );
+            // Status is recorded in the journal (`append_cloud_pull_sync_journal`)
+            // and reflected in `/state` / `/account`. We intentionally do not
+            // write to stderr here: this path runs after `/login` while the
+            // TUI owns the terminal, and a stray "✓ Pulled N preferences"
+            // line would scribble across the rendered viewport.
             keys
         }
         Ok(_) => Vec::new(),
         Err(e) => {
-            eprintln!("{}", format!("  ⚠ Preference pull skipped: {e}").dim());
+            tracing::warn!(
+                target: "astra_cli::cloud_sync",
+                error = %e,
+                "preference pull skipped"
+            );
             Vec::new()
         }
     }

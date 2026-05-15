@@ -5,7 +5,7 @@ use crossterm::{
     event::{DisableBracketedPaste, EnableBracketedPaste},
     execute, queue,
     style::Print,
-    terminal::{disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled},
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::text::Line;
@@ -30,18 +30,6 @@ impl Drop for RawModeGuard {
 
 impl TerminalGuard {
     pub fn init() -> io::Result<Self> {
-        enable_raw_mode()?;
-        execute!(stdout(), EnableBracketedPaste)?;
-
-        let _early_guard = RawModeGuard;
-
-        let backend = CrosstermBackend::new(stdout());
-        let terminal = CustomTerminal::with_options(backend)?;
-
-        std::mem::forget(_early_guard);
-
-        let is_zellij = std::env::var("ZELLIJ_SESSION_NAME").is_ok();
-
         static PANIC_HOOK_INSTALLED: std::sync::Once = std::sync::Once::new();
         PANIC_HOOK_INSTALLED.call_once(|| {
             let original_hook = std::panic::take_hook();
@@ -52,11 +40,35 @@ impl TerminalGuard {
             }));
         });
 
-        Ok(Self {
+        enable_raw_mode()?;
+        execute!(stdout(), EnableBracketedPaste)?;
+
+        let early_guard = RawModeGuard;
+
+        let backend = CrosstermBackend::new(stdout());
+        let terminal = CustomTerminal::with_options(backend)?;
+
+        let is_zellij = std::env::var("ZELLIJ_SESSION_NAME").is_ok();
+        let guard = Self {
             terminal,
             pending_history: Vec::new(),
             is_zellij,
-        })
+        };
+        std::mem::forget(early_guard);
+        Ok(guard)
+    }
+
+    /// Restore the TUI input contract if a slash fallback, tool path, or
+    /// platform quirk left the terminal in cooked mode. Without this,
+    /// subsequent `/` and Ctrl-C keystrokes are echoed by the terminal
+    /// driver instead of reaching crossterm as key events.
+    pub fn ensure_tui_modes(&mut self) -> io::Result<()> {
+        let raw = is_raw_mode_enabled()?;
+        if !raw {
+            enable_raw_mode()?;
+            execute!(stdout(), EnableBracketedPaste)?;
+        }
+        Ok(())
     }
 
     pub fn queue_history_lines(&mut self, lines: Vec<Line<'static>>) {
@@ -193,15 +205,22 @@ impl TerminalGuard {
         let result = f().await;
 
         // Restore TUI modes
-        enable_raw_mode()?;
-        execute!(stdout(), EnableBracketedPaste)?;
+        self.ensure_tui_modes()?;
 
         // Flush stale terminal input
         #[cfg(unix)]
         {
+            use std::io::IsTerminal;
             use std::os::unix::io::AsRawFd;
-            unsafe {
-                nix::libc::tcflush(std::io::stdin().as_raw_fd(), nix::libc::TCIFLUSH);
+            let stdin = std::io::stdin();
+            if stdin.is_terminal() {
+                let rc = unsafe { nix::libc::tcflush(stdin.as_raw_fd(), nix::libc::TCIFLUSH) };
+                if rc != 0 {
+                    tracing::warn!(
+                        error = %std::io::Error::last_os_error(),
+                        "failed to flush stale terminal input"
+                    );
+                }
             }
         }
 

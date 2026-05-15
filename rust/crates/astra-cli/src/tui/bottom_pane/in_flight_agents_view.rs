@@ -1,0 +1,523 @@
+//! In-flight agents drill-in list.
+//!
+//! When multiple sub-agents are running in parallel (the model spawned
+//! N `agent.spawn` tools in one turn), the user presses `Ctrl+G` to
+//! open this view: a vertical list of every live TaskCell with its
+//! description, child count, and elapsed time. ↑↓ navigates, Enter
+//! drills into a `TaskDetailView` for the selected agent, Esc/← closes.
+//!
+//! Rows are a snapshot taken at push-time (when Ctrl+G is pressed)
+//! from `chat_widget.live_task_cell()`. They do NOT auto-refresh —
+//! the elapsed/child-count fields freeze at the moment the view
+//! opened. Close+reopen to see updated state. (Live re-rendering
+//! would require holding a reference to ChatWidget across frames,
+//! which would tangle the BottomPaneView lifetime.)
+//!
+//! Result-prefix sentinel: `__agent_drilldown__\n<agent_id>`. The
+//! outer event loop strips the prefix and pushes a `TaskDetailView`
+//! built from the matching live TaskCell.
+
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+};
+
+use super::view::{BottomPaneView, CancellationEvent};
+
+pub(crate) const AGENT_DRILLDOWN_SENTINEL: &str = "__agent_drilldown__\n";
+
+/// Strip the drill-in sentinel and return the agent_id, defensively
+/// trimming after the first newline so a malformed id can't carry
+/// trailing garbage. Returns `None` when the input doesn't match.
+///
+/// The runtime spawner's agent_ids follow the `<name>@<uuid_prefix>`
+/// format which is newline-free in practice, but this stays as a
+/// safety net so a future code path that builds the sentinel
+/// incorrectly can't silently dispatch a wrong id.
+pub(crate) fn parse_drilldown_sentinel(s: &str) -> Option<&str> {
+    s.strip_prefix(AGENT_DRILLDOWN_SENTINEL)
+        .map(|rest| {
+            let rest = rest.trim_start_matches('\n');
+            rest.split_once('\n').map(|(id, _)| id).unwrap_or(rest)
+        })
+        .filter(|id| !id.is_empty())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentRowStatus {
+    Live,
+    Cancelling,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl AgentRowStatus {
+    fn icon(self) -> &'static str {
+        match self {
+            AgentRowStatus::Live => "◦",
+            AgentRowStatus::Cancelling => "⊘",
+            AgentRowStatus::Completed => "✓",
+            AgentRowStatus::Failed => "✗",
+            AgentRowStatus::Cancelled => "■",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            AgentRowStatus::Live | AgentRowStatus::Cancelling => Color::Yellow,
+            AgentRowStatus::Completed => Color::Green,
+            AgentRowStatus::Failed => Color::Red,
+            AgentRowStatus::Cancelled => Color::DarkGray,
+        }
+    }
+
+    fn is_live(self) -> bool {
+        matches!(self, AgentRowStatus::Live | AgentRowStatus::Cancelling)
+    }
+
+    fn is_failed(self) -> bool {
+        matches!(self, AgentRowStatus::Failed)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AgentRow {
+    pub agent_id: String,
+    pub name: String,
+    pub child_count: usize,
+    pub elapsed_ms: u64,
+    pub status: AgentRowStatus,
+}
+
+pub(crate) struct InFlightAgentsView {
+    rows: Vec<AgentRow>,
+    live_count: usize,
+    failed_count: usize,
+    selected: usize,
+    completed: bool,
+    accepted_id: Option<String>,
+}
+
+impl InFlightAgentsView {
+    pub fn new(rows: Vec<AgentRow>) -> Self {
+        let (live_count, failed_count) = count_rows(&rows);
+        Self {
+            rows,
+            live_count,
+            failed_count,
+            selected: 0,
+            completed: false,
+            accepted_id: None,
+        }
+    }
+
+    fn replace_rows(&mut self, rows: Vec<AgentRow>) {
+        let selected_id = self.rows.get(self.selected).map(|row| row.agent_id.clone());
+        let (live_count, failed_count) = count_rows(&rows);
+        self.selected = selected_id
+            .and_then(|id| rows.iter().position(|row| row.agent_id == id))
+            .unwrap_or(0)
+            .min(rows.len().saturating_sub(1));
+        self.rows = rows;
+        self.live_count = live_count;
+        self.failed_count = failed_count;
+    }
+
+    fn move_up(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        self.selected = if self.selected == 0 {
+            self.rows.len() - 1
+        } else {
+            self.selected - 1
+        };
+    }
+
+    fn move_down(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + 1) % self.rows.len();
+    }
+
+    fn move_page_up(&mut self) {
+        self.selected = self.selected.saturating_sub(PAGE_STEP);
+    }
+
+    fn move_page_down(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        self.selected = self
+            .selected
+            .saturating_add(PAGE_STEP)
+            .min(self.rows.len().saturating_sub(1));
+    }
+
+    fn select_number(&mut self, n: u8) {
+        let idx = usize::from(n.saturating_sub(1));
+        if idx < self.rows.len() {
+            self.selected = idx;
+        }
+    }
+
+    fn accept(&mut self) {
+        if let Some(row) = self.rows.get(self.selected) {
+            self.accepted_id = Some(row.agent_id.clone());
+            self.completed = true;
+        }
+    }
+}
+
+fn count_rows(rows: &[AgentRow]) -> (usize, usize) {
+    let live_count = rows.iter().filter(|row| row.status.is_live()).count();
+    let failed_count = rows.iter().filter(|row| row.status.is_failed()).count();
+    (live_count, failed_count)
+}
+
+fn format_elapsed(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        let mins = ms / 60_000;
+        let secs = (ms % 60_000) / 1000;
+        format!("{mins}m{secs}s")
+    }
+}
+
+const PAGE_STEP: usize = 8;
+
+impl BottomPaneView for InFlightAgentsView {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+        let dim = Style::default().fg(Color::DarkGray);
+        let title_style = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+
+        // Header
+        let live = self.live_count;
+        let failed = self.failed_count;
+        let done = self.rows.len().saturating_sub(live + failed);
+        let header_text = if self.rows.is_empty() {
+            "  Agents (none)".to_string()
+        } else {
+            format!(
+                "  SUBAGENTS {}  · live {} · done {} · failed {}",
+                self.rows.len(),
+                live,
+                done,
+                failed
+            )
+        };
+        let header = Line::from(Span::styled(header_text, title_style));
+        buf.set_line(area.x, area.y, &header, area.width);
+
+        if self.rows.is_empty() {
+            let empty = Line::from(Span::styled("  No agents to inspect.".to_string(), dim));
+            if area.height >= 2 {
+                buf.set_line(area.x, area.y + 1, &empty, area.width);
+            }
+            return;
+        }
+
+        let body_y = area.y + 1;
+        let body_h = area.height.saturating_sub(1) as usize;
+        let window_start = self.selected.saturating_add(1).saturating_sub(body_h);
+        for (i, (row_idx, row)) in self
+            .rows
+            .iter()
+            .enumerate()
+            .skip(window_start)
+            .take(body_h)
+            .enumerate()
+        {
+            let selected = row_idx == self.selected;
+            let marker = if selected { "▶ " } else { "  " };
+            let status_icon = row.status.icon();
+            let status_color = row.status.color();
+            let line = Line::from(vec![
+                Span::styled(
+                    marker.to_string(),
+                    if selected {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        dim
+                    },
+                ),
+                Span::styled(status_icon.to_string(), Style::default().fg(status_color)),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{} {}", row_idx + 1, truncate(&row.name, 38)),
+                    if selected {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                ),
+                Span::styled(
+                    format!(
+                        "  · {} steps · {}{}",
+                        row.child_count,
+                        format_elapsed(row.elapsed_ms),
+                        if row.status == AgentRowStatus::Cancelling {
+                            " · Cancelling…"
+                        } else {
+                            ""
+                        }
+                    ),
+                    dim,
+                ),
+            ]);
+            buf.set_line(area.x, body_y + i as u16, &line, area.width);
+        }
+    }
+
+    fn desired_height(&self, _width: u16) -> u16 {
+        let rows = self.rows.len().max(1);
+        (rows as u16).saturating_add(1).min(10)
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.move_up(),
+            KeyCode::Down | KeyCode::Char('j') => self.move_down(),
+            KeyCode::PageUp => self.move_page_up(),
+            KeyCode::PageDown => self.move_page_down(),
+            KeyCode::Home => self.selected = 0,
+            KeyCode::End if !self.rows.is_empty() => self.selected = self.rows.len() - 1,
+            KeyCode::Char(ch) if ('1'..='9').contains(&ch) => self.select_number(ch as u8 - b'0'),
+            KeyCode::Enter => self.accept(),
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('q') => {
+                self.completed = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn cursor_pos(&self, _area: Rect) -> Option<(u16, u16)> {
+        None
+    }
+
+    fn is_complete(&self) -> bool {
+        self.completed
+    }
+
+    fn completion(&self) -> Option<super::view::ViewCompletion> {
+        if self.completed {
+            self.accepted_id
+                .as_ref()
+                .map(|id| super::view::ViewCompletion {
+                    result: Some(format!("{AGENT_DRILLDOWN_SENTINEL}{id}")),
+                    reopen: None,
+                })
+        } else {
+            None
+        }
+    }
+
+    fn on_ctrl_c(&mut self) -> CancellationEvent {
+        self.completed = true;
+        CancellationEvent::Consumed
+    }
+
+    fn refresh_agent_rows(&mut self, rows: Vec<AgentRow>) -> bool {
+        self.replace_rows(rows);
+        true
+    }
+
+    fn accepts_agent_rows(&self) -> bool {
+        true
+    }
+
+    fn hint_keys(&self) -> Option<String> {
+        Some("↑↓/Pg select · 1-9 jump · Enter open · Esc/←/q back".into())
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else if max == 0 {
+        String::new()
+    } else {
+        let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{truncated}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn rows(n: usize) -> Vec<AgentRow> {
+        (0..n)
+            .map(|i| AgentRow {
+                agent_id: format!("agent-{i}"),
+                name: format!("task {i}"),
+                child_count: i,
+                elapsed_ms: 1000 * (i as u64 + 1),
+                status: AgentRowStatus::Live,
+            })
+            .collect()
+    }
+
+    /// Empty agent list: must not panic, must not select anything.
+    #[test]
+    fn empty_list_is_inert() {
+        let mut v = InFlightAgentsView::new(vec![]);
+        v.handle_key(key(KeyCode::Down));
+        v.handle_key(key(KeyCode::Up));
+        v.handle_key(key(KeyCode::Enter));
+        // Enter on empty must not complete the view with a result.
+        assert!(v.completion().is_none());
+        // Esc completes without a result (just dismisses).
+        v.handle_key(key(KeyCode::Esc));
+        assert!(v.is_complete());
+        assert!(v.completion().is_none());
+    }
+
+    /// Down/Up arrow navigation wraps correctly in both directions.
+    #[test]
+    fn navigation_wraps() {
+        let mut v = InFlightAgentsView::new(rows(3));
+        assert_eq!(v.selected, 0);
+        v.handle_key(key(KeyCode::Down));
+        assert_eq!(v.selected, 1);
+        v.handle_key(key(KeyCode::Down));
+        v.handle_key(key(KeyCode::Down)); // wraps to 0
+        assert_eq!(v.selected, 0);
+        v.handle_key(key(KeyCode::Up)); // wraps to 2
+        assert_eq!(v.selected, 2);
+    }
+
+    /// Enter on a row produces the sentinel-prefixed agent_id.
+    #[test]
+    fn enter_emits_sentinel_with_agent_id() {
+        let mut v = InFlightAgentsView::new(rows(3));
+        v.handle_key(key(KeyCode::Down));
+        v.handle_key(key(KeyCode::Enter));
+        assert!(v.is_complete());
+        let completion = v.completion().unwrap();
+        assert_eq!(
+            completion.result.as_deref(),
+            Some("__agent_drilldown__\nagent-1")
+        );
+    }
+
+    /// Ctrl+C dismisses the view without producing a selection.
+    #[test]
+    fn ctrl_c_dismisses() {
+        let mut v = InFlightAgentsView::new(rows(2));
+        let ev = v.on_ctrl_c();
+        assert!(matches!(ev, CancellationEvent::Consumed));
+        assert!(v.is_complete());
+        // Dismissed: no result emitted.
+        assert!(v.completion().is_none());
+    }
+
+    /// hjkl vim-style nav also works (alias for arrow keys).
+    #[test]
+    fn vim_keys_navigate() {
+        let mut v = InFlightAgentsView::new(rows(3));
+        v.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(v.selected, 1);
+        v.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(v.selected, 0);
+    }
+
+    #[test]
+    fn paging_and_number_jump_navigate_long_agent_lists() {
+        let mut v = InFlightAgentsView::new(rows(12));
+        v.handle_key(key(KeyCode::PageDown));
+        assert_eq!(v.selected, 8);
+        v.handle_key(key(KeyCode::PageDown));
+        assert_eq!(v.selected, 11);
+        v.handle_key(key(KeyCode::PageUp));
+        assert_eq!(v.selected, 3);
+        v.handle_key(key(KeyCode::Char('7')));
+        assert_eq!(v.selected, 6);
+        v.handle_key(key(KeyCode::Char('9')));
+        assert_eq!(v.selected, 8);
+    }
+
+    #[test]
+    fn refresh_agent_rows_recomputes_counts_and_preserves_selection() {
+        let mut v = InFlightAgentsView::new(rows(3));
+        v.handle_key(key(KeyCode::Down));
+        assert_eq!(v.rows[v.selected].agent_id, "agent-1");
+
+        let mut updated = rows(3);
+        updated[0].status = AgentRowStatus::Completed;
+        updated[1].status = AgentRowStatus::Failed;
+        updated[2].status = AgentRowStatus::Cancelled;
+        assert!(v.refresh_agent_rows(updated));
+
+        assert_eq!(v.rows[v.selected].agent_id, "agent-1");
+        assert_eq!(v.live_count, 0);
+        assert_eq!(v.failed_count, 1);
+    }
+
+    /// Truncation: char-aware, multi-byte safe.
+    #[test]
+    fn truncate_handles_cjk() {
+        // Should not panic on multi-byte boundaries.
+        let s = "日本語のとても長いタスク説明".repeat(3);
+        let result = truncate(&s, 10);
+        assert!(result.chars().count() <= 10);
+    }
+
+    #[test]
+    fn parse_drilldown_sentinel_extracts_id() {
+        let s = format!("{AGENT_DRILLDOWN_SENTINEL}reviewer@abc12345");
+        assert_eq!(parse_drilldown_sentinel(&s), Some("reviewer@abc12345"));
+    }
+
+    #[test]
+    fn parse_drilldown_sentinel_rejects_unprefixed() {
+        assert_eq!(parse_drilldown_sentinel("not a sentinel"), None);
+    }
+
+    /// Defensive: if a malformed caller embeds a newline AFTER the
+    /// id (carrying trailing garbage), only the first segment is
+    /// dispatched. Prevents a hostile or buggy producer from feeding
+    /// the dispatcher unexpected payload.
+    #[test]
+    fn parse_drilldown_sentinel_strips_trailing_newline_garbage() {
+        let s = format!("{AGENT_DRILLDOWN_SENTINEL}reviewer@abc\nGARBAGE\nMORE");
+        assert_eq!(parse_drilldown_sentinel(&s), Some("reviewer@abc"));
+    }
+
+    #[test]
+    fn parse_drilldown_sentinel_tolerates_separator_newline() {
+        let s = format!("{AGENT_DRILLDOWN_SENTINEL}\nreviewer@abc\nGARBAGE");
+        assert_eq!(parse_drilldown_sentinel(&s), Some("reviewer@abc"));
+    }
+
+    #[test]
+    fn parse_drilldown_sentinel_rejects_empty_id() {
+        let s = AGENT_DRILLDOWN_SENTINEL.to_string();
+        assert_eq!(parse_drilldown_sentinel(&s), None);
+    }
+}

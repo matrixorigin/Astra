@@ -156,12 +156,27 @@ pub fn build_edge_tool_call_event(tool_call: &Map<String, Value>) -> Map<String,
 }
 
 /// §5.5 `approval_required` — `request_id` matches `POST /approval/respond` ledger keys.
+///
+/// Two preview fields travel together:
+/// - `detail`: RAW command/path string. Used by downstream classifiers
+///   (`ApprovalFingerprint::shell`, `bash_command_approval_reason`) to
+///   do `starts_with` matching against permission rules. Must stay
+///   raw — prepending `"$ "` would silently bypass deny rules like
+///   `bash(rm -rf:*)`.
+/// - `display_label`: RICH preview ("$ ls -la", "Writing: foo.rs").
+///   Used by the UI for the approval dialog header so cloud-gated
+///   approvals read the same as local ones.
+///
+/// Callers that don't care about the display label can pass `None`;
+/// the client will fall back to `detail` for display, matching the
+/// pre-split behaviour.
 pub fn build_approval_required_event(
     request_id: &str,
     tool_name: &str,
     approval_kind: ApprovalKind,
     path: Option<&str>,
     detail: Option<&str>,
+    display_label: Option<&str>,
 ) -> Map<String, Value> {
     let mut m = Map::from_iter([
         (
@@ -184,6 +199,9 @@ pub fn build_approval_required_event(
     if let Some(d) = detail.filter(|s| !s.is_empty()) {
         m.insert("detail".to_string(), Value::String(d.to_string()));
     }
+    if let Some(lbl) = display_label.filter(|s| !s.is_empty()) {
+        m.insert("display_label".to_string(), Value::String(lbl.to_string()));
+    }
     m
 }
 
@@ -194,6 +212,8 @@ pub struct ApprovalBatchRequestEvent<'a> {
     pub approval_kind: ApprovalKind,
     pub path: Option<&'a str>,
     pub detail: Option<&'a str>,
+    /// See [`build_approval_required_event`] for the raw-vs-display split.
+    pub display_label: Option<&'a str>,
 }
 
 /// Batch approval request for multiple gated tools in the same round.
@@ -223,6 +243,9 @@ pub fn build_approval_batch_required_event(
             }
             if let Some(detail) = request.detail.filter(|s| !s.is_empty()) {
                 item.insert("detail".to_string(), Value::String(detail.to_string()));
+            }
+            if let Some(lbl) = request.display_label.filter(|s| !s.is_empty()) {
+                item.insert("display_label".to_string(), Value::String(lbl.to_string()));
             }
             Value::Object(item)
         })
@@ -284,6 +307,7 @@ mod tests {
             ApprovalKind::Standard,
             Some("p/x.rs"),
             None,
+            None,
         );
         assert_eq!(
             ev.get("type").and_then(Value::as_str),
@@ -306,8 +330,26 @@ mod tests {
             ApprovalKind::Explicit,
             None,
             Some("git status"),
+            None,
         );
         assert_eq!(ev.get("detail").and_then(Value::as_str), Some("git status"));
+    }
+
+    #[test]
+    fn approval_required_carries_display_label() {
+        let ev = build_approval_required_event(
+            "a1",
+            "bash",
+            ApprovalKind::Explicit,
+            None,
+            Some("ls -la"),
+            Some("$ ls -la"),
+        );
+        assert_eq!(ev.get("detail").and_then(Value::as_str), Some("ls -la"));
+        assert_eq!(
+            ev.get("display_label").and_then(Value::as_str),
+            Some("$ ls -la")
+        );
     }
 
     #[test]
@@ -319,6 +361,7 @@ mod tests {
                 approval_kind: ApprovalKind::Standard,
                 path: Some("src/a.rs"),
                 detail: Some("src/a.rs"),
+                display_label: None,
             },
             ApprovalBatchRequestEvent {
                 request_id: "a2",
@@ -326,6 +369,7 @@ mod tests {
                 approval_kind: ApprovalKind::Standard,
                 path: Some("src/b.rs"),
                 detail: Some("src/b.rs"),
+                display_label: None,
             },
         ]);
         assert_eq!(
@@ -577,17 +621,26 @@ mod tests {
 
     #[test]
     fn approval_required_omits_empty_path() {
-        let ev =
-            build_approval_required_event("r1", "bash", ApprovalKind::Explicit, Some(""), Some(""));
+        let ev = build_approval_required_event(
+            "r1",
+            "bash",
+            ApprovalKind::Explicit,
+            Some(""),
+            Some(""),
+            Some(""),
+        );
         assert!(ev.get("path").is_none());
         assert!(ev.get("detail").is_none());
+        assert!(ev.get("display_label").is_none());
     }
 
     #[test]
     fn approval_required_omits_none_path() {
-        let ev = build_approval_required_event("r1", "bash", ApprovalKind::Explicit, None, None);
+        let ev =
+            build_approval_required_event("r1", "bash", ApprovalKind::Explicit, None, None, None);
         assert!(ev.get("path").is_none());
         assert!(ev.get("detail").is_none());
+        assert!(ev.get("display_label").is_none());
     }
 
     #[test]

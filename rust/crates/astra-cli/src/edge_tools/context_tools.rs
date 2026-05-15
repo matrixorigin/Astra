@@ -37,7 +37,7 @@ impl ToolExecutor {
     }
 
     /// Return a compact summary of the current session state.
-    pub(super) fn brief(&self, args: &Value) -> String {
+    pub(super) async fn brief(&self, args: &Value) -> String {
         let focus = args.get("focus").and_then(Value::as_str).unwrap_or("all");
         let max_items = args
             .get("max_items")
@@ -133,7 +133,7 @@ impl ToolExecutor {
         }
 
         if focus == "all" || focus == "tasks" {
-            let tasks = self.task_manager.snapshot();
+            let tasks = self.task_manager.snapshot().await;
             let mut task_summaries: Vec<Value> = tasks
                 .iter()
                 .take(max_items)

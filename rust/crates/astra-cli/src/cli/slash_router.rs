@@ -385,64 +385,93 @@ pub(crate) async fn handle_slash_command(
             handle_account_command(cmd, arg, api, profile, state).await?;
         }
 
-        "/allow" | "/yolo" => {
+        "/allow" => {
             use permission_manager::PermissionMode;
-            if cmd == "/yolo" {
-                state.perm_manager.set_mode(PermissionMode::Auto);
-                eprintln!(
-                    "  {} {} All tools auto-approved for this session.",
-                    "⚡".yellow(),
-                    "YOLO mode!".bold().yellow()
-                );
-                eprintln!(
-                    "  {}",
-                    "  Use /allow prompt to restore confirmation prompts.".dim()
-                );
-            } else {
-                match arg {
-                    "" => {
-                        let next = match state.perm_manager.mode() {
-                            PermissionMode::Prompt => PermissionMode::Auto,
-                            PermissionMode::Auto => PermissionMode::Deny,
-                            PermissionMode::Deny => PermissionMode::Prompt,
+            match arg {
+                "" => {
+                    let next = match state.perm_manager.mode() {
+                        PermissionMode::Prompt => PermissionMode::Auto,
+                        PermissionMode::Auto => PermissionMode::Deny,
+                        PermissionMode::Deny => PermissionMode::Prompt,
+                    };
+                    state.perm_manager.set_mode(next);
+                    eprintln!(
+                        "  {} Permission mode → {}",
+                        theme::icon_info(),
+                        next.to_string().magenta()
+                    );
+                }
+                "all" => {
+                    state.perm_manager.set_mode(PermissionMode::Auto);
+                    eprintln!(
+                        "  {} Permission mode → {} (all tools auto-approved)",
+                        "⚡".yellow(),
+                        "auto".magenta()
+                    );
+                }
+                "rules" | "status" => {
+                    let summary = state.perm_manager.rules_summary();
+                    eprint!("{summary}");
+                }
+                "trust" => match state.perm_manager.trust_workspace() {
+                    Ok(message) => eprintln!("  {} {message}", theme::icon_info()),
+                    Err(err) => {
+                        eprintln!("  {} Failed to trust workspace: {err}", theme::icon_warn())
+                    }
+                },
+                "untrust" => match state.perm_manager.untrust_workspace() {
+                    Ok(message) => eprintln!("  {} {message}", theme::icon_info()),
+                    Err(err) => eprintln!(
+                        "  {} Failed to mark workspace untrusted: {err}",
+                        theme::icon_warn()
+                    ),
+                },
+                "trace" => {
+                    for line in astra_turn_core::permission_audit::format_snapshot_lines(50) {
+                        eprintln!("{line}");
+                    }
+                }
+                arg if arg.starts_with("trace --export ") => {
+                    let path = arg.trim_start_matches("trace --export ").trim();
+                    if path.is_empty() {
+                        eprintln!("  {} Missing export path", theme::icon_warn());
+                    } else {
+                        let lines =
+                            astra_turn_core::permission_audit::snapshot_redacted_jsonl_lines();
+                        let body = if lines.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{}\n", lines.join("\n"))
                         };
-                        state.perm_manager.set_mode(next);
+                        match std::fs::write(path, body) {
+                            Ok(()) => eprintln!(
+                                "  {} Permission trace exported to {path}",
+                                theme::icon_info()
+                            ),
+                            Err(err) => eprintln!(
+                                "  {} Failed to export permission trace to {path}: {err}",
+                                theme::icon_warn()
+                            ),
+                        }
+                    }
+                }
+                _ => match arg.parse::<PermissionMode>() {
+                    Ok(mode) => {
+                        state.perm_manager.set_mode(mode);
                         eprintln!(
                             "  {} Permission mode → {}",
                             theme::icon_info(),
-                            next.to_string().magenta()
+                            mode.to_string().magenta()
                         );
                     }
-                    "all" => {
-                        state.perm_manager.set_mode(PermissionMode::Auto);
+                    Err(_) => {
                         eprintln!(
-                            "  {} Permission mode → {} (all tools auto-approved)",
-                            "⚡".yellow(),
-                            "auto".magenta()
+                            "  {} Unknown mode '{}'. Use: auto, prompt, deny, all, rules, trust, untrust, trace",
+                            theme::icon_warn(),
+                            arg
                         );
                     }
-                    "rules" | "status" => {
-                        let summary = state.perm_manager.rules_summary();
-                        eprint!("{summary}");
-                    }
-                    _ => match arg.parse::<PermissionMode>() {
-                        Ok(mode) => {
-                            state.perm_manager.set_mode(mode);
-                            eprintln!(
-                                "  {} Permission mode → {}",
-                                theme::icon_info(),
-                                mode.to_string().magenta()
-                            );
-                        }
-                        Err(_) => {
-                            eprintln!(
-                                "  {} Unknown mode '{}'. Use: auto, prompt, deny, all, rules",
-                                theme::icon_warn(),
-                                arg
-                            );
-                        }
-                    },
-                }
+                },
             }
         }
 

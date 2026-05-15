@@ -327,6 +327,17 @@ impl DatabaseAuthService {
             ChronoDuration::days(i64::from(self.jwt.refresh_token_expire_days)),
         )
     }
+
+    fn access_token_expires_in_seconds(&self) -> u32 {
+        self.jwt.access_token_expire_minutes.saturating_mul(60)
+    }
+
+    fn refresh_token_expires_at_string(&self, now: chrono::DateTime<Utc>) -> String {
+        (now + ChronoDuration::days(i64::from(self.jwt.refresh_token_expire_days)))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    }
+
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.pool = Some(pool);
         self
@@ -621,10 +632,7 @@ impl AuthService for DatabaseAuthService {
             .create_refresh_token(&user.user_id)
             .map_err(internal_error)?;
         let refresh_token_hash = sha256_hex(&refresh_token);
-        let expires_at = (Utc::now()
-            + ChronoDuration::days(i64::from(self.jwt.refresh_token_expire_days)))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
+        let expires_at = self.refresh_token_expires_at_string(Utc::now());
 
         let mut tx = pool
             .begin()
@@ -654,7 +662,7 @@ impl AuthService for DatabaseAuthService {
             access_token,
             refresh_token,
             token_type: "bearer".to_string(),
-            expires_in: 3600,
+            expires_in: self.access_token_expires_in_seconds(),
         })
     }
 
@@ -706,9 +714,7 @@ impl AuthService for DatabaseAuthService {
             .create_refresh_token(&user.user_id)
             .map_err(internal_error)?;
         let new_refresh_token_hash = sha256_hex(&new_refresh_token);
-        let expires_at = (Utc::now() + ChronoDuration::days(30))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
+        let expires_at = self.refresh_token_expires_at_string(Utc::now());
 
         let mut tx = pool
             .begin()
@@ -738,7 +744,7 @@ impl AuthService for DatabaseAuthService {
             access_token,
             refresh_token: new_refresh_token,
             token_type: "bearer".to_string(),
-            expires_in: 3600,
+            expires_in: self.access_token_expires_in_seconds(),
         })
     }
 
@@ -1031,6 +1037,42 @@ mod tests {
     fn now_exp_pair() -> (usize, usize) {
         let now = Utc::now().timestamp() as usize;
         (now, now + 3600)
+    }
+
+    #[test]
+    fn database_auth_service_expires_in_uses_configured_access_ttl() {
+        let service = DatabaseAuthService::new(
+            astra_core::MatrixOneSettings::mock(),
+            JwtSettings {
+                secret_key: "test-secret-key-for-unit-tests".into(),
+                algorithm: "HS256".into(),
+                access_token_expire_minutes: 90,
+                refresh_token_expire_days: 21,
+            },
+        );
+
+        assert_eq!(service.access_token_expires_in_seconds(), 5_400);
+    }
+
+    #[test]
+    fn database_auth_service_refresh_expiry_uses_configured_days() {
+        use chrono::TimeZone;
+
+        let service = DatabaseAuthService::new(
+            astra_core::MatrixOneSettings::mock(),
+            JwtSettings {
+                secret_key: "test-secret-key-for-unit-tests".into(),
+                algorithm: "HS256".into(),
+                access_token_expire_minutes: 60,
+                refresh_token_expire_days: 12,
+            },
+        );
+        let now = Utc.with_ymd_and_hms(2026, 5, 14, 10, 0, 0).unwrap();
+
+        assert_eq!(
+            service.refresh_token_expires_at_string(now),
+            "2026-05-26 10:00:00"
+        );
     }
 
     #[tokio::test]

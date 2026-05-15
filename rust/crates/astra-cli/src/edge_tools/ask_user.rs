@@ -12,7 +12,7 @@ impl ToolExecutor {
     pub(super) fn ask_user(&self, args: &Value) -> String {
         use crossterm::{
             event::{self, Event, KeyCode, KeyEvent},
-            terminal::{disable_raw_mode, enable_raw_mode},
+            terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled},
         };
         use std::io::{self, Write};
         use std::time::Duration;
@@ -37,6 +37,25 @@ impl ToolExecutor {
 
         let default = args.get("default").and_then(Value::as_str);
         let context = args.get("context").and_then(Value::as_str);
+
+        // The interactive raw-mode prompt below scribbles directly on stderr
+        // and toggles raw mode globally. Inside the TUI both are catastrophic:
+        // the prompt corrupts the rendered viewport, and the trailing
+        // disable_raw_mode() leaves the parent TUI in cooked mode so Ctrl+C
+        // and `/` stop reaching crossterm as key events. The TUI already has
+        // its own user-interaction surface (assistant messages + composer),
+        // so refuse instead of corrupting it. The model can still reach the
+        // user by emitting the question as normal output.
+        if is_raw_mode_enabled().unwrap_or(false) {
+            return serde_json::json!({
+                "error": "tui_active",
+                "message": "ask_user is unavailable inside the interactive TUI — emit the question as a normal assistant message and wait for the user's next turn.",
+                "question": question,
+                "choices": choices,
+                "default": default,
+            })
+            .to_string();
+        }
 
         // Display the question
         eprintln!();

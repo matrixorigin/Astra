@@ -35,6 +35,7 @@ pub mod rpc_bridge;
 pub mod run_script;
 pub mod shell_ops;
 pub mod task_mgmt;
+pub mod task_mgmt_matrixone;
 pub mod tool_search;
 
 use std::path::{Path, PathBuf};

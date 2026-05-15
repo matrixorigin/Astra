@@ -696,18 +696,23 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "agent",
-                "description": "Multi-agent operations. Actions: delegate, run_chain, spawn, get_result, send_message.",
+                "description": "Multi-agent operations. Actions: spawn, get_result, run_chain, send_message.\n\n\
+        ## Execution mode\n\
+        - **Default (synchronous)**: `spawn` blocks until the sub-agent's final result is ready. Use this for work you depend on in the current turn. The sub-agent's tool calls stream back inline — the TUI renders them inside the parent Task card so the user sees progress live.\n\
+        - **Background**: pass `run_in_background: true` (alias: legacy `background: true`) to return immediately with `{agent_id}`. Use this for fire-and-forget or long-running work you don't need to await; follow up with `get_result` later. Durable-task store persists the run across session death so it survives `astra` restarts.\n\n\
+        ## Parallel sub-agent fan-out\n\
+        To run N sub-agents in parallel (e.g. multi-angle code review), emit N `agent` tool calls **in a single assistant message**, each with `action='spawn'` and `run_in_background: true`. They run concurrently. After all are spawned, call `agent(action='get_result', agent_id=...)` for each one — `get_result` blocks until that child finishes. This is the ONLY way to fan out parallel agents; do not use `action='delegate'` (removed: it had no execution backend).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["delegate","run_chain","spawn","get_result","send_message"]},
-                        "task": {"type": "string", "description": "Task description (delegate)"},
+                        "action": {"type": "string", "enum": ["spawn","get_result","run_chain","send_message"]},
                         "steps": {"type": "array", "description": "Chain steps (run_chain)"},
                         "description": {"type": "string", "description": "Short task description (spawn)"},
                         "prompt": {"type": "string", "description": "Detailed prompt (spawn)"},
                         "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"]},
                         "model": {"type": "string", "description": "Model override (spawn)"},
-                        "background": {"type": "boolean", "description": "Return immediately with agent_id (spawn)"},
+                        "run_in_background": {"type": "boolean", "description": "If true, return immediately with agent_id instead of blocking on the sub-agent's final result. Default false (sync). Applies to spawn."},
+                        "background": {"type": "boolean", "description": "(Deprecated alias for run_in_background.) If true, return immediately with agent_id (spawn)."},
                         "name": {"type": "string", "description": "Addressable name (spawn)"},
                         "max_turns": {"type": "integer", "description": "Max turns (spawn). Explicit value wins over `complexity`."},
                         "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Task-complexity hint scaling the default budget when `max_turns` is absent. `light`≈10 turns, `normal`=agent default, `deep`=2× default. Use `deep` for review/refactor/multi-file tasks that routinely exhaust the default."},
@@ -722,7 +727,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "required": ["action"],
                     "x-astra-per-action-required": {
                         "spawn": ["description", "prompt"],
-                        "delegate": ["task"],
                         "run_chain": ["steps"],
                         "get_result": ["agent_id"],
                         "send_message": ["to", "message"]
@@ -808,19 +812,127 @@ fn all_tool_schemas_core() -> Vec<Value> {
             }
         }),
         // ── Task management (unified tool) ───────────────────────────────
+        //
+        // Note on description size (cache-aware):
+        // This tool is pinned (always in the static tool-prefix), so its
+        // description participates in the Anthropic cache breakpoint on
+        // the last pinned tool. Expanding the description costs tokens
+        // only on cache-miss turns (cache_write premium); on steady-state
+        // cache-hit turns the full text is free. Empirically the hit-rate
+        // runs 44–90% in interactive sessions, so a ~450-token expansion
+        // amortises to ~100 effective tokens per turn — materially less
+        // than the cost of the model re-deriving "when to use task" from
+        // a 45-token hint and backtracking.
         json!({
             "type": "function",
             "function": {
                 "name": "task",
-                "description": "Track work progress for multi-step tasks. Actions: create, update, list, get, stop. Supports blocking dependencies, ownership, and arbitrary metadata.",
+                "description": "Use this tool to create and manage a structured task list for your current coding session. This helps you track progress, organize complex tasks, and demonstrate thoroughness to the user. It also helps the user understand the progress of the task and overall progress of their requests.\n\
+        \n\
+        Actions: create, update, list, get, stop, background_shell, background_agent, output, kill. Supports subtasks, blocking dependencies (add_blocks / add_blocked_by), ownership, and arbitrary metadata.\n\
+        \n\
+        ## When to Use This Tool\n\
+        Use this tool proactively in these scenarios:\n\
+        \n\
+        1. Complex multi-step tasks - When a task requires 3 or more distinct steps or actions\n\
+        2. Non-trivial and complex tasks - Tasks that require careful planning or multiple operations\n\
+        3. User explicitly requests todo list - When the user directly asks you to use the todo list\n\
+        4. User provides multiple tasks - When users provide a list of things to be done (numbered or comma-separated)\n\
+        5. After receiving new instructions - Immediately capture user requirements as tasks\n\
+        6. When you start working on a task - Mark it as `in_progress` BEFORE beginning work. Ideally you should only have ONE task as `in_progress` at a time\n\
+        7. After completing a task - Mark it as `completed` and add any new follow-up tasks discovered during implementation\n\
+        \n\
+        ## When NOT to Use This Tool\n\
+        Skip using this tool when:\n\
+        1. There is only a single, straightforward task\n\
+        2. The task is trivial and tracking it provides no organizational benefit\n\
+        3. The task can be completed in less than 3 trivial steps\n\
+        4. The task is purely conversational or informational\n\
+        \n\
+        NOTE: if there is only one trivial task to do, just do it directly — do not call this tool.\n\
+        \n\
+        ## Examples of When to Use the Task Tool\n\
+        \n\
+        <example>\n\
+        User: I want to add a dark mode toggle to the application settings. Make sure you run the tests and build when you're done!\n\
+        Assistant: *Calls task(action='create') five times, one per step:*\n\
+          1. Create dark mode toggle component in Settings page\n\
+          2. Add dark mode state management (context/store)\n\
+          3. Implement CSS-in-JS styles for dark theme\n\
+          4. Update existing components to support theme switching\n\
+          5. Run tests and build, addressing any failures\n\
+        *Then calls task(action='update', task_id='task-1', new_status='in_progress') and starts on the first step.*\n\
+        \n\
+        <reasoning>The assistant created tasks because: (1) it's a multi-step feature spanning UI, state, and styling; (2) the user explicitly asked for tests + build; (3) tracking lets the user see progress across all five steps.</reasoning>\n\
+        </example>\n\
+        \n\
+        <example>\n\
+        User: Help me rename the function getCwd to getCurrentWorkingDirectory across my project.\n\
+        Assistant: *Uses grep to locate all occurrences first.* I found 15 instances across 8 files. *Creates one task per file plus a final 'verify with cargo check' task.*\n\
+        \n\
+        <reasoning>Search-then-plan: the assistant scoped the work first, then created tasks because the work crossed multiple files and needed systematic tracking to avoid missed instances.</reasoning>\n\
+        </example>\n\
+        \n\
+        <example>\n\
+        User: I need to implement these features for my e-commerce site: user registration, product catalog, shopping cart, and checkout flow.\n\
+        Assistant: *Creates four parent tasks, one per feature, each with subtasks for db model + API + frontend.* Let's start with user registration.\n\
+        \n\
+        <reasoning>The user gave a comma-separated list of four large features — exactly the 'multiple tasks' trigger. Subtasks encode the sub-steps each feature needs.</reasoning>\n\
+        </example>\n\
+        \n\
+        ## Examples of When NOT to Use the Task Tool\n\
+        \n\
+        <example>\n\
+        User: How do I print 'Hello World' in Python?\n\
+        Assistant: `print(\"Hello World\")`\n\
+        \n\
+        <reasoning>Single, trivial, informational. No tracking needed.</reasoning>\n\
+        </example>\n\
+        \n\
+        <example>\n\
+        User: Can you add a comment to the calculateTotal function?\n\
+        Assistant: *Uses str_replace once.* Done.\n\
+        \n\
+        <reasoning>Single edit in one location — tracking adds noise.</reasoning>\n\
+        </example>\n\
+        \n\
+        ## Task States and Management\n\
+        \n\
+        - **States**: `pending` → `in_progress` → `completed` (or `failed` / `cancelled`). The `deleted` action hard-removes a task.\n\
+        - **Exactly one in_progress at a time**: flip the next task to `in_progress` only after marking the current one `completed`.\n\
+        - **Mark complete IMMEDIATELY** after finishing — do not batch.\n\
+        - **Add follow-ups as they appear**: if you discover new work mid-implementation, create new tasks rather than expanding existing ones.\n\
+        \n\
+        ## Field Conventions\n\
+        - `title`: imperative, specific outcome (e.g. 'Fix auth redirect on Safari', not 'fix bug')\n\
+        - `active_form`: present-continuous shown on the spinner while in_progress (e.g. 'Fixing auth redirect'). Omit → spinner shows title.\n\
+        - `description`: what 'done' looks like. More detail helps if another agent might take over.\n\
+        - `subtasks`: pre-plan nested work at create time; use `depends_on` to encode subtask order.\n\
+        - `add_blocked_by [taskA, taskB]` → this task won't be next-actionable until A and B are done.\n\
+        - `metadata`: free-form; later `update` with `{key: null}` deletes a specific key.\n\
+        \n\
+        ## Background Execution\n\
+        - `background_shell`: run a shell command in the background while continuing to chat. Returns a task_id. Use for builds, tests, servers, long scripts.\n\
+        - `background_agent`: spawn a durable sub-agent through the structured agent spawner. Use `get_agent_result` with the returned agent_id to collect output.\n\
+        - `output`: read stdout/stderr from a background shell task. With `block: true` (default), waits up to `timeout_ms` for completion.\n\
+        - `kill`: terminate a background task immediately.\n\
+        - You will receive `<background_task_notification>` XML when background tasks complete, fail, or stall.\n\
+        - If a task stalls (no output for 45s + looks like an interactive prompt), kill it and re-run with non-interactive flags.\n\
+        \n\
+        ## Tips\n\
+        - Call `list` with `status_filter: 'active'` before creating new tasks to avoid dupes.\n\
+        - Auto-completion: completing the last remaining subtask auto-completes the parent (only if parent is still active).\n\
+        - Cascade: completing a parent cascades to pending/in_progress subtasks but preserves failed/cancelled.\n\
+        - Rollback: task state is journaled per-turn; a /rollback undoes the most recent mutation batch.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["create","update","list","get","stop"], "description": "Operation to perform"},
+                        "action": {"type": "string", "enum": ["create","update","list","get","stop","background_shell","background_agent","output","kill"], "description": "Operation to perform"},
                         "title": {"type": "string", "description": "(create/update) Brief imperative title"},
                         "description": {"type": "string", "description": "(create/update) What needs to be done"},
                         "task_id": {"type": "string", "description": "(update/get/stop) Task ID (e.g. 'task-1')"},
-                        "new_status": {"type": "string", "enum": ["pending","in_progress","completed","failed","deleted"], "description": "(update) New status to assign. 'deleted' permanently removes the task."},
+                        "new_status": {"type": "string", "enum": ["pending","in_progress","completed","failed","cancelled","deleted"], "description": "(update) New status to assign. 'deleted' permanently removes the task."},
+                        "status": {"type": "string", "enum": ["pending","in_progress","completed","failed","cancelled","deleted"], "description": "(update, legacy alias for new_status) New status to assign."},
                         "status_filter": {"type": "string", "enum": ["pending","in_progress","completed","failed","all","active"], "description": "(list) Restrict results. 'active' = pending+in_progress. Default 'all'."},
                         "subtask_id": {"type": "string", "description": "(update) Update a specific subtask"},
                         "active_form": {"type": "string", "description": "(create/update) Present-continuous form shown while in_progress (e.g. 'Running tests')"},
@@ -845,14 +957,24 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             }
                         },
                         "reason": {"type": "string", "description": "(stop) Why the task is being stopped"},
-                        "error_message": {"type": "string", "description": "(update) Reason for failure"}
+                        "error_message": {"type": "string", "description": "(update) Reason for failure"},
+                        "command": {"type": "string", "description": "(background_shell) Shell command to run in background"},
+                        "prompt": {"type": "string", "description": "(background_agent) Instruction for the background agent"},
+                        "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "(background_agent) Agent type. Default general-purpose."},
+                        "model": {"type": "string", "description": "(background_agent) Model override for the background agent"},
+                        "block": {"type": "boolean", "description": "(output) Wait for task to complete before returning. Default true."},
+                        "timeout_ms": {"type": "integer", "description": "(output) Max ms to wait when block=true. Default 30000, max 300000."}
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {
                         "create": ["title"],
                         "update": ["task_id"],
                         "get": ["task_id"],
-                        "stop": ["task_id"]
+                        "stop": ["task_id"],
+                        "background_shell": ["command"],
+                        "background_agent": ["prompt"],
+                        "output": ["task_id"],
+                        "kill": ["task_id"]
                     }
                 }
             }
@@ -883,6 +1005,107 @@ mod tests {
     // concern now is ensuring run_script is advertised on Unix, and that
     // `execute_code` is NOT in the schema list (so the model doesn't
     // hallucinate it).
+
+    // ── agent tool: sync-default + run_in_background contract ─────────────
+
+    #[test]
+    fn agent_schema_exposes_run_in_background_parameter() {
+        // The TUI's `TaskCell` UX relies on the model being able to
+        // opt out of the sync default when the user says "kick this
+        // off in the background". Schema must surface the param
+        // directly — a tool hint in the description is not enough
+        // (cache budget) nor discoverable.
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
+        let props = agent
+            .get("function")
+            .and_then(|f| f.get("parameters"))
+            .and_then(|p| p.get("properties"))
+            .expect("agent must expose parameters.properties");
+        assert!(
+            props.get("run_in_background").is_some(),
+            "agent must expose `run_in_background` param so background delegation is discoverable"
+        );
+        assert_eq!(
+            props
+                .get("run_in_background")
+                .and_then(|p| p.get("type"))
+                .and_then(Value::as_str),
+            Some("boolean"),
+            "run_in_background must be typed as a boolean flag"
+        );
+    }
+
+    #[test]
+    fn agent_schema_description_documents_sync_default() {
+        // Hard assertion that the tool description spells out the
+        // sync-default contract — this is the behaviour that
+        // separates astra's TaskCell UX from a fire-and-forget worker
+        // queue. If a future refactor collapses the description
+        // without the sync/async paragraph, the cache-safe short
+        // description would lose the load-bearing semantics.
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
+        let desc = agent
+            .get("function")
+            .and_then(|f| f.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            desc.contains("synchronous") || desc.contains("blocks until"),
+            "agent description must state that spawn is sync by default"
+        );
+        assert!(
+            desc.contains("run_in_background"),
+            "agent description must name `run_in_background` so the model learns the opt-out"
+        );
+    }
+
+    #[test]
+    fn task_schema_uses_proactive_imperative_wording() {
+        // The model only auto-decomposes a complex first-turn request
+        // when the task tool's description carries claudecode-style
+        // imperative language: "Use this tool proactively..." plus
+        // worked <example> blocks. Soft "consider using" wording does
+        // not fire reliably on turn 0.
+        //
+        // This test pins the load-bearing phrases so a future "let's
+        // shorten the description" refactor cannot silently regress
+        // the auto-decompose behaviour without tripping the test.
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let task = find_schema(&schemas, "task").expect("task schema must exist");
+        let desc = task
+            .get("function")
+            .and_then(|f| f.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            desc.contains("proactively"),
+            "task description must say 'proactively' — soft 'consider' wording does not \
+             trigger turn-0 decomposition. Got: {desc}"
+        );
+        assert!(
+            desc.contains("3 or more distinct steps") || desc.contains("3+ distinct"),
+            "task description must name the explicit '3+ steps' threshold so the model has \
+             a hard trigger, not a fuzzy heuristic"
+        );
+        assert!(
+            desc.contains("<example>"),
+            "task description must include worked <example> blocks — the model imitates \
+             demonstrated patterns far more reliably than abstract advice"
+        );
+        assert!(
+            desc.contains("BEFORE beginning work") || desc.contains("BEFORE you begin"),
+            "task description must enforce 'mark in_progress BEFORE work' or the spinner \
+             never shows real-time status"
+        );
+        assert!(
+            desc.contains("ONE task as `in_progress`")
+                || desc.contains("one in_progress at a time"),
+            "task description must enforce single-active to prevent the model from \
+             flipping every task to in_progress at once"
+        );
+    }
 
     #[test]
     fn execute_code_no_longer_present_in_schemas() {
