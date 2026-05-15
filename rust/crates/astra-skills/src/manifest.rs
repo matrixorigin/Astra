@@ -76,9 +76,6 @@ pub struct SkillManifest {
     /// Whether users can manually invoke this skill.
     #[serde(default = "default_true")]
     pub user_invocable: bool,
-    /// Keywords that trigger automatic skill selection.
-    #[serde(default)]
-    pub triggers: Vec<String>,
     /// Tools this skill is allowed to use (empty = all tools).
     #[serde(default)]
     pub allowed_tools: Vec<String>,
@@ -358,7 +355,6 @@ impl Default for SkillManifest {
             source: SkillSourceKind::default(),
             execution_context: ExecutionContext::default(),
             user_invocable: true,
-            triggers: Vec::new(),
             allowed_tools: Vec::new(),
             when_to_use: None,
             model: None,
@@ -389,9 +385,9 @@ impl Default for SkillManifest {
 }
 
 impl SkillManifest {
-    /// Estimated token count for metadata (name + description + triggers + when_to_use).
+    /// Estimated token count for metadata (name + description + when_to_use).
     pub fn metadata_tokens(&self) -> u32 {
-        let mut text = format!("{} {} {:?}", self.name, self.description, self.triggers);
+        let mut text = format!("{} {}", self.name, self.description);
         if let Some(ref wtu) = self.when_to_use {
             text.push(' ');
             text.push_str(wtu);
@@ -572,7 +568,6 @@ mod tests {
         let m = SkillManifest {
             name: "test-skill".into(),
             description: "A test skill for demonstration".into(),
-            triggers: vec!["test".into(), "demo".into()],
             when_to_use: Some("When testing the skill framework".into()),
             ..Default::default()
         };

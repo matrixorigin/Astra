@@ -588,7 +588,6 @@ impl super::traits::SkillResolver for UnifiedSkillResolver {
                 aliases: m.aliases,
                 category: m.category,
                 tags: m.tags,
-                triggers: m.triggers,
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1283,8 +1282,6 @@ mod tests {
         let skill_md = r#"---
 name: mcp-test
 description: "MCP test skill"
-triggers:
-  - test
 ---
 MCP test instructions.
 "#;

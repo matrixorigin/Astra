@@ -10,13 +10,7 @@ allowed_tools:
   - read_file
   - write_file
   - delegate
-triggers:
-  - debug
-  - diagnose
-  - troubleshoot
-  - "why does this fail"
-  - broken
-when_to_use: "When the user reports a specific bug, test failure, or unexpected behavior that needs systematic diagnosis — not for general questions about error handling"
+when_to_use: "When the user reports a bug, test failure, or unexpected behavior — say 'debug', 'diagnose', 'troubleshoot', '调试', '排查', '为什么失败'. Not for general error-handling questions"
 category: diagnostics
 arguments:
   - name: ISSUE

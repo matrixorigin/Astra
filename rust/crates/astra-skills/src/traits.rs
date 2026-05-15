@@ -88,7 +88,6 @@ pub struct SkillToolInfo {
     pub aliases: Vec<String>,
     pub category: Option<String>,
     pub tags: Vec<String>,
-    pub triggers: Vec<String>,
 }
 
 impl Default for SkillToolInfo {
@@ -101,7 +100,6 @@ impl Default for SkillToolInfo {
             aliases: Vec::new(),
             category: None,
             tags: Vec::new(),
-            triggers: Vec::new(),
         }
     }
 }

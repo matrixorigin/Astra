@@ -30,8 +30,6 @@ struct RawFrontmatter {
     #[serde(default = "default_true")]
     user_invocable: bool,
     #[serde(default)]
-    triggers: Vec<String>,
-    #[serde(default)]
     allowed_tools: Vec<String>,
     #[serde(default)]
     when_to_use: Option<String>,
@@ -156,7 +154,6 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillManifest, String), SkillErr
         source: SkillSourceKind::Local,
         execution_context,
         user_invocable: raw.user_invocable,
-        triggers: raw.triggers,
         allowed_tools: raw.allowed_tools,
         when_to_use: raw.when_to_use,
         model: raw.model,
@@ -617,9 +614,6 @@ mod tests {
         let content = r#"---
 name: test-skill
 description: "A test skill"
-triggers:
-  - test
-  - demo
 allowed_tools:
   - bash
 ---
@@ -631,7 +625,6 @@ Step 2: Done.
         let (manifest, instructions) = parse_skill_md(content).unwrap();
         assert_eq!(manifest.name, "test-skill");
         assert_eq!(manifest.description, "A test skill");
-        assert_eq!(manifest.triggers, vec!["test", "demo"]);
         assert_eq!(manifest.allowed_tools, vec!["bash"]);
         assert!(manifest.user_invocable);
         assert_eq!(manifest.execution_context, ExecutionContext::Inline);
@@ -650,9 +643,6 @@ context: fork
 model: "claude-sonnet-4-20250514"
 max_tokens: 16384
 when_to_use: "Use for thorough code reviews"
-triggers:
-  - review
-  - code-review
 allowed_tools:
   - bash
   - read_file

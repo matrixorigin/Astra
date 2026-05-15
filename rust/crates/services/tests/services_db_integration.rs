@@ -3073,7 +3073,6 @@ async fn it_publish_skill_idempotent_retry_returns_200() {
         name: name.clone(),
         version: "1.0.0".to_string(),
         description: "idempotency test".to_string(),
-        triggers: None,
         dependencies: None,
         manifest: None,
         skill_type: "local".to_string(),

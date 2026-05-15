@@ -1979,7 +1979,6 @@ mod tests {
                     aliases: Vec::new(),
                     category: None,
                     tags: Vec::new(),
-                    triggers: Vec::new(),
                 })
                 .collect()
         }
@@ -3506,7 +3505,6 @@ mod tests {
                 aliases: Vec::new(),
                 category: None,
                 tags: Vec::new(),
-                triggers: Vec::new(),
             })
             .collect();
         let (entries, names) = format_skills_within_budget(&skills, 10_000, None, None);
@@ -3532,7 +3530,6 @@ mod tests {
                 aliases: Vec::new(),
                 category: None,
                 tags: Vec::new(),
-                triggers: Vec::new(),
             })
             .collect();
         let (entries, names) = format_skills_within_budget(&skills, 500, None, None);
@@ -3554,7 +3551,6 @@ mod tests {
                 aliases: Vec::new(),
                 category: None,
                 tags: Vec::new(),
-                triggers: Vec::new(),
             })
             .collect();
         // Add many local skills
@@ -3567,7 +3563,6 @@ mod tests {
                 aliases: Vec::new(),
                 category: None,
                 tags: Vec::new(),
-                triggers: Vec::new(),
             });
         }
         let (entries, names) = format_skills_within_budget(&skills, 800, None, None);
@@ -3589,7 +3584,6 @@ mod tests {
                 aliases: Vec::new(),
                 category: None,
                 tags: Vec::new(),
-                triggers: Vec::new(),
             })
             .collect();
         // With 100 skills and 200 byte budget, names-only
@@ -3614,7 +3608,6 @@ mod tests {
             aliases: Vec::new(),
             category: None,
             tags: Vec::new(),
-            triggers: Vec::new(),
         }];
         let (entries, _) = format_skills_within_budget(&skills, 10_000, None, None);
         // Description should be capped at MAX_LISTING_DESC_CHARS
@@ -3642,7 +3635,6 @@ mod tests {
             aliases: Vec::new(),
             category: None,
             tags: Vec::new(),
-            triggers: Vec::new(),
         }];
         let (entries, _) = format_skills_within_budget(&skills, 10_000, None, None);
         // Entry = "- **name**: <desc>" — strip the prefix to measure desc only.
@@ -3669,7 +3661,6 @@ mod tests {
                 aliases: Vec::new(),
                 category: None,
                 tags: Vec::new(),
-                triggers: Vec::new(),
             },
             SkillToolInfo {
                 name: "high-quality".into(),
@@ -3679,7 +3670,6 @@ mod tests {
                 aliases: Vec::new(),
                 category: None,
                 tags: Vec::new(),
-                triggers: Vec::new(),
             },
         ];
 
@@ -3733,7 +3723,6 @@ mod tests {
                 aliases: Vec::new(),
                 category: None,
                 tags: Vec::new(),
-                triggers: Vec::new(),
             })
             .collect();
 
@@ -3774,7 +3763,6 @@ mod tests {
             aliases: Vec::new(),
             category: None,
             tags: Vec::new(),
-            triggers: Vec::new(),
         };
         // Should not panic even with CJK content exceeding MAX_LISTING_DESC_CHARS
         let desc = format_skill_description(&skill);
@@ -4468,7 +4456,6 @@ mod tests {
                         aliases: Vec::new(),
                         category: None,
                         tags: Vec::new(),
-                        triggers: Vec::new(),
                     },
                     SkillToolInfo {
                         name: "skill-b".into(),
@@ -4478,7 +4465,6 @@ mod tests {
                         aliases: Vec::new(),
                         category: None,
                         tags: Vec::new(),
-                        triggers: Vec::new(),
                     },
                 ]
             }
@@ -4908,7 +4894,6 @@ mod tests {
                 aliases: Vec::new(),
                 category: None,
                 tags: Vec::new(),
-                triggers: Vec::new(),
             })
             .collect();
 

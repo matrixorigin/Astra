@@ -11,10 +11,6 @@
 //! name: diagnose
 //! description: "Run a structured diagnostic on the current project"
 //! user_invocable: true
-//! triggers:
-//!   - diagnose
-//!   - debug
-//!   - troubleshoot
 //! allowed_tools:
 //!   - bash
 //!   - read_file
@@ -39,7 +35,7 @@
 //!
 //! # Three-Level Loading
 //!
-//! - **Level 1 (Metadata)**: ~100 tokens - name, description, triggers only
+//! - **Level 1 (Metadata)**: ~100 tokens - name, description, when_to_use only
 //! - **Level 2 (Instructions)**: Full SKILL.md content loaded on skill invocation
 //! - **Level 3 (Resources)**: Templates, scripts, references loaded on demand
 
@@ -85,9 +81,6 @@ pub struct SkillInstruction {
     /// Whether users can manually invoke this skill via `/skill-name`.
     #[serde(default = "default_true")]
     pub user_invocable: bool,
-    /// Keywords that trigger automatic skill selection.
-    #[serde(default)]
-    pub triggers: Vec<String>,
     /// Tools this skill is allowed to use (empty = all tools).
     #[serde(default)]
     pub allowed_tools: Vec<String>,
@@ -122,7 +115,6 @@ impl Default for SkillInstruction {
             name: String::new(),
             description: String::new(),
             user_invocable: true, // matches serde default_true
-            triggers: Vec::new(),
             allowed_tools: Vec::new(),
             when_to_use: None,
             model: None,
@@ -144,7 +136,6 @@ fn default_true() -> bool {
 pub struct SkillMetadata {
     pub name: String,
     pub description: String,
-    pub triggers: Vec<String>,
     pub user_invocable: bool,
     /// When this skill should be activated (from frontmatter `when_to_use`).
     pub when_to_use: Option<String>,
@@ -159,7 +150,7 @@ pub struct SkillMetadata {
 impl From<&SkillInstruction> for SkillMetadata {
     fn from(skill: &SkillInstruction) -> Self {
         // Estimate tokens: ~4 chars per token
-        let mut text = format!("{} {} {:?}", skill.name, skill.description, skill.triggers);
+        let mut text = format!("{} {}", skill.name, skill.description);
         if let Some(ref wtu) = skill.when_to_use {
             text.push(' ');
             text.push_str(wtu);
@@ -169,7 +160,6 @@ impl From<&SkillInstruction> for SkillMetadata {
         SkillMetadata {
             name: skill.name.clone(),
             description: skill.description.clone(),
-            triggers: skill.triggers.clone(),
             user_invocable: skill.user_invocable,
             when_to_use: skill.when_to_use.clone(),
             model: skill.model.clone(),

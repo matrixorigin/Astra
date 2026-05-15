@@ -81,7 +81,6 @@ pub async fn publish_skill_handler(
                 name: request.name,
                 version: request.version,
                 description: request.description,
-                triggers: request.triggers,
                 dependencies: request.dependencies,
                 manifest: request.manifest,
                 skill_type: request.skill_type,

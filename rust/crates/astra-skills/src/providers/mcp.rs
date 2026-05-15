@@ -160,8 +160,6 @@ mod tests {
     const MCP_SKILL: &str = r#"---
 name: mcp-analyze
 description: "Analyze data via MCP server"
-triggers:
-  - analyze
 ---
 # Analysis
 

@@ -178,7 +178,6 @@ impl SkillProvider for DatabaseSkillProvider {
             source: SkillSourceKind::Database,
             execution_context: Self::parse_execution_context(&metadata_obj),
             user_invocable,
-            triggers: Self::get_string_vec(&metadata_obj, "triggers"),
             when_to_use: Self::get_str(&metadata_obj, "when_to_use").map(str::to_string),
             category: Self::get_str(&metadata_obj, "category").map(str::to_string),
             tags: Self::get_string_vec(&metadata_obj, "tags"),

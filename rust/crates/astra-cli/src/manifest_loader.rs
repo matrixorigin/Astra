@@ -243,14 +243,6 @@ impl LoadedSkill {
             .unwrap_or(&self.manifest.description)
     }
 
-    /// Get triggers for skill selection.
-    pub fn triggers(&self) -> Vec<String> {
-        self.instructions
-            .as_ref()
-            .map(|i| i.triggers.clone())
-            .unwrap_or_default()
-    }
-
     /// Get allowed tools (from SKILL.md).
     pub fn allowed_tools(&self) -> Vec<String> {
         self.instructions
@@ -290,7 +282,6 @@ pub fn load_skill(skill_dir: &Path) -> Result<LoadedSkill, String> {
         SkillMetadata {
             name: manifest.name.clone(),
             description: manifest.description.clone(),
-            triggers: Vec::new(),
             user_invocable: true,
             metadata_tokens: (manifest.name.len() + manifest.description.len()) as u32 / 4,
             ..Default::default()
@@ -911,12 +902,10 @@ depends_on: []
 name: code-review
 description: "Perform a comprehensive code review"
 user_invocable: true
-triggers:
-  - review
-  - audit
 allowed_tools:
   - read_file
   - git_diff
+when_to_use: "Use for code review, audit, or PR feedback"
 ---
 # Code Review
 
@@ -950,7 +939,6 @@ tools: []
 
         let inst = skill.instructions.as_ref().unwrap();
         assert_eq!(inst.name, "code-review");
-        assert_eq!(inst.triggers, vec!["review", "audit"]);
         assert!(inst.user_invocable);
         assert!(inst.instructions.contains("Follow these steps"));
     }
@@ -1001,9 +989,6 @@ tools: []
 
         // description() returns SKILL.md description
         assert_eq!(skill.description(), "Perform a comprehensive code review");
-
-        // triggers() returns SKILL.md triggers
-        assert_eq!(skill.triggers(), vec!["review", "audit"]);
 
         // allowed_tools() returns SKILL.md allowed_tools
         assert_eq!(skill.allowed_tools(), vec!["read_file", "git_diff"]);
@@ -1148,13 +1133,11 @@ mcp_servers:
 name: complete-skill
 description: "A complete skill demonstrating all features"
 user_invocable: true
-triggers:
-  - complete
-  - all-features
 allowed_tools:
   - read_file
   - write_file
   - bash
+when_to_use: "Use when demonstrating all skill features"
 ---
 # Complete Skill Instructions
 
@@ -1198,8 +1181,6 @@ Apply the suggested changes carefully.
         // Verify SKILL.md instructions loaded
         assert!(skill.instructions.is_some());
         let inst = skill.instructions.as_ref().unwrap();
-        assert_eq!(inst.triggers.len(), 2);
-        assert!(inst.triggers.contains(&"complete".to_string()));
         assert_eq!(inst.allowed_tools.len(), 3);
         assert!(inst.instructions.contains("Complete Skill Instructions"));
     }
@@ -1232,8 +1213,6 @@ tools: []
             r#"---
 name: skill-md-only
 description: "Skill with SKILL.md only"
-triggers:
-  - simple
 ---
 Simple instructions.
 "#,
@@ -1258,8 +1237,6 @@ tools: []
             r#"---
 name: both
 description: "Skill with both files"
-triggers:
-  - combined
 ---
 Combined instructions.
 "#,

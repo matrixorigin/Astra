@@ -642,7 +642,6 @@ export type PublishSkillBody = {
   name: string;
   version: string;
   description: string;
-  triggers?: string[];
   dependencies?: string[];
   manifest?: unknown;
   skill_type?: string;

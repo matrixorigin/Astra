@@ -228,9 +228,6 @@ fn skill_record_from_loaded_skill(loaded: astra_skills::manifest::LoadedSkill) -
     if !manifest.tags.is_empty() {
         metadata.insert("tags".to_string(), serde_json::json!(manifest.tags));
     }
-    if !manifest.triggers.is_empty() {
-        metadata.insert("triggers".to_string(), serde_json::json!(manifest.triggers));
-    }
     if !manifest.allowed_tools.is_empty() {
         metadata.insert(
             "allowed_tools".to_string(),

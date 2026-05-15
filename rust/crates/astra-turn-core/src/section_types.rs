@@ -31,7 +31,7 @@ pub enum CacheScope {
     /// Stable within a session — tool-conditional guidance, task-type rules.
     /// Changes when tool set or task type changes (per turn, but usually stable).
     Session,
-    /// Changes every turn — project profile, skills, memory signals.
+    /// Changes every turn — project profile, memory signals, and other volatile context.
     None,
 }
 

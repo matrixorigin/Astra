@@ -354,6 +354,23 @@ async fn add_column_if_missing(
     Ok(())
 }
 
+async fn drop_column_if_exists(
+    pool: &Pool<MySql>,
+    schema: &str,
+    table: &str,
+    column: &str,
+) -> Result<(), sqlx::Error> {
+    debug_assert!(
+        !table.contains('`') && !column.contains('`'),
+        "identifiers must not contain backticks"
+    );
+    if column_exists(pool, schema, table, column).await? {
+        let ddl = format!("ALTER TABLE `{table}` DROP COLUMN `{column}`");
+        query(&ddl).execute(pool).await?;
+    }
+    Ok(())
+}
+
 async fn add_index_if_missing(
     pool: &Pool<MySql>,
     schema: &str,
@@ -1570,7 +1587,6 @@ pub async fn ensure_core_schema(
             description TEXT NULL,
             skill_definition JSON NULL,
             code_hash VARCHAR(128) NULL,
-            triggers JSON NULL,
             dependencies JSON NULL,
             manifest JSON NULL,
             publisher_id VARCHAR(255) NULL,
@@ -1608,6 +1624,8 @@ pub async fn ensure_core_schema(
         "ALTER TABLE skills_registry MODIFY COLUMN created_by VARCHAR(128) NULL",
     )
     .await?;
+    // Skill triggers were removed; drop the dead column from existing dev/CI databases.
+    drop_column_if_exists(&pool, &settings.database, "skills_registry", "triggers").await?;
 
     query(
         "CREATE TABLE IF NOT EXISTS skill_marketplace_stats (

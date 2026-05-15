@@ -117,87 +117,6 @@ impl ConditionalSkillTracker {
     }
 }
 
-// ── Trigger detection ────────────────────────────────────────────────────────
-
-/// Detect which skills are triggered by keywords in a message.
-///
-/// Performs word-level matching — triggers must appear as whole words
-/// (case-insensitive). Returns skill names sorted by trigger specificity
-/// (longer triggers first).
-pub fn detect_triggers(skills: &[SkillManifest], message: &str) -> Vec<String> {
-    let message_lower = message.to_lowercase();
-    let words: Vec<&str> = message_lower.split_whitespace().collect();
-
-    let mut matches: Vec<(String, usize)> = Vec::new();
-
-    for skill in skills {
-        for trigger in &skill.triggers {
-            let trigger_lower = trigger.to_lowercase();
-            if words.contains(&trigger_lower.as_str())
-                || is_word_boundary_match(&message_lower, &trigger_lower)
-            {
-                matches.push((skill.name.clone(), trigger.len()));
-                break;
-            }
-        }
-    }
-
-    matches.sort_by_key(|b| std::cmp::Reverse(b.1));
-    matches.into_iter().map(|(name, _)| name).collect()
-}
-
-fn is_word_boundary_match(text: &str, pattern: &str) -> bool {
-    if pattern.chars().any(is_cjk_char) {
-        return text.contains(pattern);
-    }
-
-    let mut search_start = 0;
-    while search_start < text.len() {
-        let search_slice = &text[search_start..];
-        let Some(pos) = search_slice.find(pattern) else {
-            break;
-        };
-
-        let abs_pos = search_start + pos;
-        let end_pos = abs_pos + pattern.len();
-
-        let start_ok = abs_pos == 0 || {
-            let prev_slice = &text[..abs_pos];
-            prev_slice
-                .chars()
-                .last()
-                .is_none_or(|c| !c.is_ascii_alphanumeric())
-        };
-
-        let end_ok = end_pos >= text.len() || {
-            let next_slice = &text[end_pos..];
-            next_slice
-                .chars()
-                .next()
-                .is_none_or(|c| !c.is_ascii_alphanumeric())
-        };
-
-        if start_ok && end_ok {
-            return true;
-        }
-
-        search_start = abs_pos + text[abs_pos..].chars().next().map_or(1, |c| c.len_utf8());
-    }
-    false
-}
-
-fn is_cjk_char(c: char) -> bool {
-    matches!(c,
-        '\u{4E00}'..='\u{9FFF}' |
-        '\u{3400}'..='\u{4DBF}' |
-        '\u{20000}'..='\u{2A6DF}' |
-        '\u{F900}'..='\u{FAFF}' |
-        '\u{3000}'..='\u{303F}' |
-        '\u{3040}'..='\u{309F}' |
-        '\u{30A0}'..='\u{30FF}' |
-        '\u{AC00}'..='\u{D7AF}'
-    )
-}
 
 #[cfg(test)]
 mod tests {
@@ -274,45 +193,6 @@ mod tests {
         // Different path activates docs skill
         let activated = tracker.record_path("docs/guide.md", &skills);
         assert_eq!(activated, vec!["docs-check"]);
-    }
-
-    #[test]
-    fn trigger_detection_word_match() {
-        let skills = vec![SkillManifest {
-            name: "review".into(),
-            triggers: vec!["review".into(), "code-review".into()],
-            ..Default::default()
-        }];
-
-        let matches = detect_triggers(&skills, "please review this PR");
-        assert_eq!(matches, vec!["review"]);
-
-        let matches = detect_triggers(&skills, "previewing the code");
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn trigger_detection_case_insensitive() {
-        let skills = vec![SkillManifest {
-            name: "debug".into(),
-            triggers: vec!["debug".into()],
-            ..Default::default()
-        }];
-
-        let matches = detect_triggers(&skills, "DEBUG this issue");
-        assert_eq!(matches, vec!["debug"]);
-    }
-
-    #[test]
-    fn trigger_detection_cjk() {
-        let skills = vec![SkillManifest {
-            name: "review-cn".into(),
-            triggers: vec!["审查".into()],
-            ..Default::default()
-        }];
-
-        let matches = detect_triggers(&skills, "审查一下代码");
-        assert_eq!(matches, vec!["review-cn"]);
     }
 
     #[test]

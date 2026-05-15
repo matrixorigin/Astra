@@ -30,7 +30,6 @@ pub struct SkillPublishRequestData {
     pub name: String,
     pub version: String,
     pub description: String,
-    pub triggers: Option<Vec<String>>,
     pub dependencies: Option<Vec<String>>,
     pub manifest: Option<serde_json::Value>,
     pub skill_type: String,
@@ -903,10 +902,6 @@ impl SkillService for DatabaseSkillService {
         }
 
         let skill_id = format!("{}@{}", request.name, request.version);
-        let triggers_json = request
-            .triggers
-            .as_ref()
-            .map(|t| serde_json::to_string(t).unwrap_or_else(|_| "[]".into()));
         let deps_json = request
             .dependencies
             .as_ref()
@@ -938,9 +933,6 @@ impl SkillService for DatabaseSkillService {
             );
         }
         manifest_map.insert("priority".to_string(), serde_json::json!(request.priority));
-        if let Some(triggers) = request.triggers.clone() {
-            manifest_map.insert("triggers".to_string(), serde_json::json!(triggers));
-        }
         if let Some(dependencies) = request.dependencies.clone() {
             manifest_map.insert("dependencies".to_string(), serde_json::json!(dependencies));
         }
@@ -952,17 +944,16 @@ impl SkillService for DatabaseSkillService {
 
         let insert_result = query(
             "INSERT INTO skills_registry \
-             (skill_id, skill_name, version, description, skill_definition, triggers, dependencies, manifest, \
-               category, priority, is_active, status, source, is_public, created_by, \
-               publisher_id, trust_tier, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', 'user', 1, ?, ?, ?, NOW(), NOW())",
+             (skill_id, skill_name, version, description, skill_definition, dependencies, manifest, \
+                category, priority, is_active, status, source, is_public, created_by, \
+                publisher_id, trust_tier, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', 'user', 1, ?, ?, ?, NOW(), NOW())",
         )
         .bind(&skill_id)
         .bind(&request.name)
         .bind(&request.version)
         .bind(&request.description)
         .bind(&skill_definition_json)
-        .bind(&triggers_json)
         .bind(&deps_json)
         .bind(&manifest_json)
         .bind(&request.category)
@@ -1162,7 +1153,6 @@ pub struct PublishSkillRequest {
     pub name: String,
     pub version: String,
     pub description: String,
-    pub triggers: Option<Vec<String>>,
     pub dependencies: Option<Vec<String>>,
     pub manifest: Option<serde_json::Value>,
     #[serde(default = "default_skill_type")]
@@ -1231,7 +1221,6 @@ mod tests {
         assert_eq!(req.priority, 5);
         assert_eq!(req.skill_type, "local");
         assert!(req.remote_url.is_none());
-        assert!(req.triggers.is_none());
         assert!(req.manifest.is_none());
     }
 

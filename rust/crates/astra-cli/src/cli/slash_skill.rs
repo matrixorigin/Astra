@@ -437,12 +437,6 @@ pub(super) async fn handle_skill_command(
                     {
                         matched.push("tags");
                     }
-                    if m.triggers
-                        .iter()
-                        .any(|t| t.to_lowercase().contains(&query_lower))
-                    {
-                        matched.push("triggers");
-                    }
                     if m.when_to_use
                         .as_ref()
                         .map(|w| w.to_lowercase().contains(&query_lower))
@@ -558,9 +552,6 @@ pub(super) async fn handle_skill_command(
                     if !m.tags.is_empty() {
                         eprintln!("  {:<16} {}", "Tags:".dim(), m.tags.join(", "));
                     }
-                    if !m.triggers.is_empty() {
-                        eprintln!("  {:<16} {}", "Triggers:".dim(), m.triggers.join(", "));
-                    }
                     if !m.allowed_tools.is_empty() {
                         eprintln!(
                             "  {:<16} {}",
@@ -642,8 +633,6 @@ name: {name}
 description: ""
 version: "0.1.0"
 user_invocable: true
-triggers:
-  - {name}
 allowed_tools: []
 when_to_use: ""
 # model: "claude-sonnet-4-20250514"
@@ -1738,14 +1727,6 @@ fn skill_relevance_score(m: &astra_skills::SkillManifest, query: &str) -> u32 {
         }
     }
 
-    // Trigger matching
-    for trigger in &m.triggers {
-        let trig_lower = trigger.to_lowercase();
-        if trig_lower.contains(query) || words.iter().any(|w| trig_lower.contains(w)) {
-            score += 3;
-        }
-    }
-
     // when_to_use matching
     if let Some(ref wtu) = m.when_to_use {
         let wtu_lower = wtu.to_lowercase();
@@ -1897,9 +1878,6 @@ async fn create_skill_from_session(
         )
     });
 
-    // 5. Derive triggers from common words
-    let triggers = derive_triggers(name, &user_intents);
-
     // ── Build steps from turn transcript ────────────────────────────────
 
     let mut steps = Vec::new();
@@ -1928,13 +1906,6 @@ async fn create_skill_from_session(
         format!("allowed_tools:\n{}", items.join("\n"))
     };
 
-    let triggers_yaml = if triggers.is_empty() {
-        "triggers: []".to_string()
-    } else {
-        let items: Vec<String> = triggers.iter().map(|t| format!("  - {t}")).collect();
-        format!("triggers:\n{}", items.join("\n"))
-    };
-
     let session_steps = if steps.is_empty() {
         "1. Understand the user's request\n2. Execute the task\n3. Report results".to_string()
     } else {
@@ -1947,7 +1918,6 @@ name: {name}
 description: "{description}"
 version: "0.1.0"
 user_invocable: true
-{triggers_yaml}
 {allowed_tools_yaml}
 when_to_use: "{description}"
 # arguments:
@@ -2045,44 +2015,6 @@ Skill auto-generated from session {session_short}.
     Ok(())
 }
 
-/// Derive trigger words from user intents and the skill name.
-pub(crate) fn derive_triggers(name: &str, intents: &[String]) -> Vec<String> {
-    use std::collections::HashMap;
-
-    let mut triggers = vec![name.to_string()];
-
-    // Count words across intents (skip very common words)
-    let stop_words: std::collections::HashSet<&str> = [
-        "the", "a", "an", "to", "in", "for", "of", "and", "or", "is", "it", "on", "at", "by",
-        "with", "this", "that", "from", "can", "do", "how", "what", "i", "me", "my", "we", "you",
-        "your", "please", "let", "make", "use", "get", "set", "put", "all", "not", "no", "so",
-        "if", "be", "as", "but", "are", "was", "were",
-    ]
-    .into_iter()
-    .collect();
-
-    let mut word_freq: HashMap<String, u32> = HashMap::new();
-    for intent in intents {
-        for word in intent.split_whitespace() {
-            let w = word.to_lowercase();
-            let w = w.trim_matches(|c: char| !c.is_alphanumeric());
-            if w.len() >= 3 && !stop_words.contains(w) {
-                *word_freq.entry(w.to_string()).or_insert(0) += 1;
-            }
-        }
-    }
-
-    // Take top 3 frequent words as triggers
-    let mut ranked: Vec<_> = word_freq.into_iter().collect();
-    ranked.sort_by_key(|x| std::cmp::Reverse(x.1));
-    for (word, _) in ranked.iter().take(3) {
-        if !triggers.contains(word) {
-            triggers.push(word.clone());
-        }
-    }
-
-    triggers
-}
 
 #[cfg(test)]
 mod tests {
@@ -2285,78 +2217,6 @@ mod tests {
         };
         let score = skill_relevance_score(&m, "code review");
         assert!(score > 0, "multi-word query should match description");
-    }
-
-    // ── derive_triggers tests ───────────────────────────────────────────
-
-    #[test]
-    fn derive_triggers_name_always_first() {
-        let triggers = super::derive_triggers("my-skill", &[]);
-        assert_eq!(triggers[0], "my-skill");
-    }
-
-    #[test]
-    fn derive_triggers_empty_intents() {
-        let triggers = super::derive_triggers("test", &[]);
-        assert_eq!(triggers, vec!["test"]);
-    }
-
-    #[test]
-    fn derive_triggers_extracts_frequent_words() {
-        let intents = vec![
-            "deploy the frontend app".to_string(),
-            "deploy the backend api".to_string(),
-            "deploy to production".to_string(),
-        ];
-        let triggers = super::derive_triggers("cleanup", &intents);
-        assert_eq!(triggers[0], "cleanup");
-        assert!(triggers.contains(&"deploy".to_string()));
-    }
-
-    #[test]
-    fn derive_triggers_skips_stop_words() {
-        let intents = vec![
-            "the quick brown fox".to_string(),
-            "the quick lazy dog".to_string(),
-        ];
-        let triggers = super::derive_triggers("x", &intents);
-        // "the" is a stop word, should not appear
-        assert!(!triggers.contains(&"the".to_string()));
-    }
-
-    #[test]
-    fn derive_triggers_skips_short_words() {
-        let intents = vec![
-            "do it as we go on by".to_string(),
-            "do it as we go on by".to_string(),
-        ];
-        let triggers = super::derive_triggers("x", &intents);
-        // all words < 3 chars, no extra triggers beyond the name
-        assert_eq!(triggers.len(), 1);
-    }
-
-    #[test]
-    fn derive_triggers_max_three_extras() {
-        let intents = vec![
-            "deploy frontend backend infrastructure monitoring alerting".to_string(),
-            "deploy frontend backend infrastructure monitoring alerting".to_string(),
-        ];
-        let triggers = super::derive_triggers("name", &intents);
-        // name + at most 3 extras = 4 max
-        assert!(
-            triggers.len() <= 4,
-            "got {}: {:?}",
-            triggers.len(),
-            triggers
-        );
-    }
-
-    #[test]
-    fn derive_triggers_no_duplicate_with_name() {
-        let intents = vec!["deploy deploy deploy".to_string()];
-        let triggers = super::derive_triggers("deploy", &intents);
-        let count = triggers.iter().filter(|t| *t == "deploy").count();
-        assert_eq!(count, 1, "name should not be duplicated");
     }
 
     // ── Skill name validation tests ─────────────────────────────────────
@@ -3346,7 +3206,6 @@ async fn publish_skill_to_marketplace(
         "name": manifest.name,
         "version": manifest.version.to_string(),
         "description": manifest.description,
-        "triggers": manifest.triggers,
         "dependencies": manifest.dependencies,
         "manifest": loaded.instructions,
         "category": category,

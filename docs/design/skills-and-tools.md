@@ -54,9 +54,6 @@ max_tokens: 8000       # optional budget
 paths:                 # conditional activation (glob patterns)
   - "**/*.rs"
   - "**/*.py"
-triggers:              # auto-activation keywords
-  - review
-  - code quality
 tags:
   - code-review
   - quality
@@ -76,8 +73,8 @@ $ARGUMENTS
 **Claude Code Compatibility**: Our SKILL.md format is a superset of Claude Code's.
 We support all CC frontmatter fields (`name`, `description`, `when-to-use`,
 `allowed-tools`, `arguments`, `argument-hint`, `model`, `effort`, `context`,
-`hooks`, `paths`) plus extensions: `version`, `category`, `tags`, `triggers`,
-`max_tokens`, `dependencies`.
+`hooks`, `paths`) plus extensions: `version`, `category`, `tags`, `max_tokens`,
+`dependencies`.
 
 ### 1.3 SkillManifest (Universal Descriptor)
 
@@ -90,7 +87,6 @@ pub struct SkillManifest {
     pub source: SkillSourceKind,       // Local | Bundled | Database | Mcp | Plugin
     pub execution_context: ExecutionContext,  // Inline | Fork
     pub user_invocable: bool,
-    pub triggers: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub when_to_use: Option<String>,
     pub model: Option<String>,
@@ -510,17 +506,13 @@ pub struct ConditionalSkillTracker {
 When a file is read/written during a turn, `registry.record_file_path()` checks
 all conditional skills and activates matches.
 
-### 6.3 Trigger-Based Activation
+### 6.3 Request-Based Selection
 
-Skills with `triggers` keywords are auto-detected from user messages:
-
-```rust
-pub fn detect_triggers(skills: &[SkillManifest], message: &str) -> Vec<String> {
-    // Word-level matching, case-insensitive
-    // Supports CJK character matching
-    // Sorted by trigger specificity (longer triggers first)
-}
-```
+Skills are no longer activated by a separate `triggers` keyword list. The
+runtime surfaces each user-invocable skill's `name`, `description`, and
+`when_to_use` hint in `<available_skills>` and asks the model to call the
+`skill` tool when the current request matches. Path-based conditional
+activation (`paths`) still gates skills until matching files are touched.
 
 ---
 
@@ -674,7 +666,6 @@ Multi-field fuzzy search across all skill metadata:
 | description   | —           | 6        | 2          |
 | category      | —           | 5        | —          |
 | when_to_use   | —           | 4        | 1          |
-| triggers      | —           | 3        | 3          |
 
 Results ranked by score with star ratings (★★★ ≥10, ★★ ≥5, ★ <5).
 

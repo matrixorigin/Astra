@@ -389,7 +389,6 @@ pub fn loaded_skill_from_record(record: SkillRecord) -> Result<LoadedSkill, Skil
         .and_then(Value::as_str)
         .map(str::to_string);
     let tags = string_array_field(&metadata_obj, "tags");
-    let triggers = string_array_field(&metadata_obj, "triggers");
     let allowed_tools = string_array_field(&metadata_obj, "allowed_tools");
     let metadata_map: HashMap<String, Value> = metadata_obj.into_iter().collect();
 
@@ -401,7 +400,6 @@ pub fn loaded_skill_from_record(record: SkillRecord) -> Result<LoadedSkill, Skil
             source: SkillSourceKind::Database,
             execution_context,
             user_invocable,
-            triggers,
             allowed_tools,
             category,
             tags,

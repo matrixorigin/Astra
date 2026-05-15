@@ -3804,7 +3804,6 @@ pub(crate) mod tests {
                     aliases: Vec::new(),
                     category: None,
                     tags: Vec::new(),
-                    triggers: Vec::new(),
                 })
                 .collect()
         }
