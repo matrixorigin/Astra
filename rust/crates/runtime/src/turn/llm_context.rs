@@ -923,7 +923,7 @@ pub(crate) fn annotate_tool_schemas_for_cache(
 
 /// Apply provider-specific message cache metadata.
 pub(crate) fn apply_message_cache_metadata(
-    messages: &mut Vec<Value>,
+    messages: &mut [Value],
     cache_cfg: &PromptCacheConfig,
     session_id: &str,
 ) {
@@ -939,7 +939,7 @@ pub(crate) fn apply_message_cache_metadata(
 /// final user message so the stable prefix remains byte-identical for prefix
 /// caches.
 pub(crate) fn finalize_bridge_wire_messages(
-    llm_messages: &mut Vec<Value>,
+    llm_messages: &mut [Value],
     volatile_text: Option<String>,
     provider: &str,
     model_name: &str,
