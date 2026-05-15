@@ -27,8 +27,8 @@ use astra_runtime::{
     },
     turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn,
     turn::chat_turn_edge_profile::{
-        EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT, detect_active_system_skills_in_message,
-        read_git_branch_abbrev,
+        EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW, EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT,
+        detect_active_system_skills_in_message, read_git_branch_abbrev,
     },
     turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
     turn::chat_turn_heuristics::extract_repos_from_memory,
@@ -556,9 +556,13 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let tool_surface =
         tool_registry::surface::ToolSurface::from_runtime_config(ctx.registry.all_tool_schemas());
     if let Some(deferred_tools_text) = tool_surface.deferred_block_text(ctx.model) {
+        let deferred_tools_context_window = prompts::budget_for_model(ctx.model).model_limit;
         merge_edge_profile_extensions(
             &mut payload,
-            &json!({ EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT: deferred_tools_text }),
+            &json!({
+                EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT: deferred_tools_text,
+                EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW: deferred_tools_context_window,
+            }),
         );
     }
 

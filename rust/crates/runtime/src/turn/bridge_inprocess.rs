@@ -101,6 +101,31 @@ fn deferred_tools_section_for_edge_profile(
     ))
 }
 
+fn deferred_tools_block_for_bridge_model(
+    edge_profile: &Map<String, Value>,
+    resolved_model_name: &str,
+) -> String {
+    let Some(source_budget) = edge_profile
+        .get(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW,
+        )
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+    else {
+        return String::new();
+    };
+    let resolved_budget = crate::prompts::budget_for_model(Some(resolved_model_name)).model_limit;
+    if source_budget != resolved_budget {
+        return String::new();
+    }
+    edge_profile
+        .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT)
+        .and_then(Value::as_str)
+        .and_then(|text| deferred_tools_section_for_edge_profile(Some(text)))
+        .map(|section| section.text)
+        .unwrap_or_default()
+}
+
 /// Decide whether the bridge should run its own `prefetch_memories` call.
 ///
 /// Returns `false` (= skip) when the CLI has already injected
@@ -1742,12 +1767,10 @@ impl InProcessChatTurnBridge {
             // TOML: pinned_tools additive over defaults; `-name` removes a
             // default. Loaded via the same `RuntimeConfig::load()` path as
             // `tool_selection` above (line 1451) for consistency.
-            let deferred_block_str = edge_profile
-                .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT)
-                .and_then(Value::as_str)
-                .and_then(|text| deferred_tools_section_for_edge_profile(Some(text)))
-                .map(|section| section.text)
-                .unwrap_or_default();
+            let deferred_block_str = deferred_tools_block_for_bridge_model(
+                &edge_profile,
+                &model_name,
+            );
             let bridge_selection_trace = edge_profile.get("recommended_tools").cloned();
             let bridge_restricted_snapshot = HashSet::new();
             let pipeline_outcome = crate::turn::llm_context::assemble_bridge_context(
@@ -6521,6 +6544,105 @@ mod tests {
             Value::Number(42.into()),
         );
         assert!(bridge_should_run_memoria_prefetch(&ep));
+    }
+
+    #[test]
+    fn deferred_tools_block_keeps_text_when_source_and_resolved_models_share_budget() {
+        let mut ep: Map<String, Value> = Map::new();
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
+                .to_string(),
+            Value::String(
+                "<deferred_tools><tool><name>github</name></tool></deferred_tools>".to_string(),
+            ),
+        );
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
+                .to_string(),
+            Value::Number(
+                crate::prompts::budget_for_model(Some("gpt-4o"))
+                    .model_limit
+                    .into(),
+            ),
+        );
+
+        let block = deferred_tools_block_for_bridge_model(&ep, "gpt-4o-2024-08-06");
+        assert!(
+            block.contains("<deferred_tools>"),
+            "same effective context budget should preserve the CLI-rendered deferred block"
+        );
+    }
+
+    #[test]
+    fn deferred_tools_block_drops_text_when_resolved_model_changes_budget() {
+        let mut ep: Map<String, Value> = Map::new();
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
+                .to_string(),
+            Value::String(
+                "<deferred_tools><tool><name>github</name></tool></deferred_tools>".to_string(),
+            ),
+        );
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
+                .to_string(),
+            Value::Number(
+                crate::prompts::budget_for_model(Some("gpt-3.5-turbo"))
+                    .model_limit
+                    .into(),
+            ),
+        );
+
+        let block = deferred_tools_block_for_bridge_model(&ep, "claude-sonnet-4");
+        assert!(
+            block.is_empty(),
+            "bridge must not reuse a deferred block sized for a smaller context window after final model resolution changes the budget"
+        );
+    }
+
+    #[test]
+    fn deferred_tools_block_drops_text_without_explicit_source_context_window() {
+        let mut ep: Map<String, Value> = Map::new();
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
+                .to_string(),
+            Value::String(
+                "<deferred_tools><tool><name>github</name></tool></deferred_tools>".to_string(),
+            ),
+        );
+
+        let block = deferred_tools_block_for_bridge_model(&ep, "gpt-4o");
+        assert!(
+            block.is_empty(),
+            "bridge must not guess the source budget when the edge_profile omits it"
+        );
+    }
+
+    #[test]
+    fn deferred_tools_block_uses_explicit_source_context_window_not_default_model_guess() {
+        let mut ep: Map<String, Value> = Map::new();
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
+                .to_string(),
+            Value::String(
+                "<deferred_tools><tool><name>github</name></tool></deferred_tools>".to_string(),
+            ),
+        );
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
+                .to_string(),
+            Value::Number(
+                crate::prompts::budget_for_model(Some("gpt-3.5-turbo"))
+                    .model_limit
+                    .into(),
+            ),
+        );
+
+        let block = deferred_tools_block_for_bridge_model(&ep, "gpt-4o");
+        assert!(
+            block.is_empty(),
+            "bridge must trust the explicit source context window instead of guessing from the default model budget"
+        );
     }
 
     // ── tool_result.output non-string coercion tests ──────────────────

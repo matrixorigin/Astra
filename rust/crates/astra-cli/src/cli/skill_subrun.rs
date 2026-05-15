@@ -14,6 +14,7 @@ use astra_core::SkillSearchSettings;
 use astra_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
+    prompts,
     semantic_dedup::SemanticDedup,
     turn::agentic_headless_round::HeadlessStderrStyle,
     turn::agentic_loop_finalization::run_agentic_loop_with_host,
@@ -232,11 +233,15 @@ impl AgenticLoopHost for SubRunHost {
             &self.all_schemas,
         );
         if let Some(deferred_tools_text) = tool_surface.deferred_block_text(effective_model) {
+            let deferred_tools_context_window =
+                prompts::budget_for_model(effective_model).model_limit;
             merge_edge_profile_extensions(
                 &mut payload,
                 &json!({
                     astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT:
-                        deferred_tools_text
+                        deferred_tools_text,
+                    astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW:
+                        deferred_tools_context_window
                 }),
             );
         }

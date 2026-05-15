@@ -12,6 +12,10 @@ pub const EDGE_PROFILE_KEY_SKILL_LISTING_TEXT: &str = "skill_listing_text";
 /// `edge_profile` from the CLI to the runtime bridge.
 pub const EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT: &str = "deferred_tools_text";
 
+/// Protocol key for the model context window used to render
+/// [`EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT`].
+pub const EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW: &str = "deferred_tools_context_window";
+
 /// `git rev-parse --abbrev-ref HEAD` for edge_profile (best-effort).
 pub fn read_git_branch_abbrev() -> Option<String> {
     std::process::Command::new("git")
