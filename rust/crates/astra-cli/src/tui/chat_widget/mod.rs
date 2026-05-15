@@ -867,8 +867,7 @@ impl ChatWidget {
         // agents still works via the legacy history-fallback path in
         // `agents_drilldown_rows` (TaskCells are committed to history
         // before this point).
-        self.agent_runs = AgentRunRegistry::default();
-        self.cancelled_task_ids.clear();
+        self.clear_turn_scoped_agent_state();
         let cell = UserCell::new(text);
         self.commit_cell(Box::new(cell));
     }
@@ -889,6 +888,11 @@ impl ChatWidget {
         debug_assert!(self.live_tasks.is_empty());
         self.in_flight_task_ids.clear();
         self.cancelling_task_ids.clear();
+    }
+
+    fn clear_turn_scoped_agent_state(&mut self) {
+        self.agent_runs = AgentRunRegistry::default();
+        self.cancelled_task_ids.clear();
     }
 
     fn on_answer_delta(&mut self, delta: &str) {
@@ -1546,6 +1550,7 @@ impl ChatWidget {
         // sequence (shared with on_user_submit).
         self.commit_active();
         self.drain_all_live_tasks();
+        self.clear_turn_scoped_agent_state();
 
         let summary = TurnSummaryCell {
             elapsed_ms: stats.elapsed_ms,
@@ -2270,6 +2275,44 @@ mod tests {
             w.in_flight_task_ids().is_empty(),
             "turn boundary must reset cancel bookkeeping: {:?}",
             w.in_flight_task_ids()
+        );
+    }
+
+    #[test]
+    fn turn_complete_clears_agent_runs_and_cancelled_ids() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+            action: "spawn".into(),
+            label: "reviewer-A".into(),
+            tool_use_id: "spawn-tu-1".into(),
+            agent_id: Some("reviewer-A@abc".into()),
+        }));
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+            action: "spawn".into(),
+            label: "reviewer-A".into(),
+            status: "success".into(),
+            duration_ms: 10,
+            output: Some(r#"{"status":"cancelled","agent_id":"reviewer-A@abc"}"#.into()),
+            tool_use_id: "spawn-tu-1".into(),
+            agent_id: Some("reviewer-A@abc".into()),
+        }));
+        assert_eq!(w.agent_run_ids(), vec!["reviewer-A@abc".to_string()]);
+        assert!(
+            w.cancelled_task_ids.contains("reviewer-A@abc"),
+            "terminal cancelled agent should be tracked before the turn boundary"
+        );
+
+        w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
+
+        assert!(
+            w.agent_run_ids().is_empty(),
+            "turn complete must clear prior-turn agent strip rows: {:?}",
+            w.agent_run_ids()
+        );
+        assert!(
+            w.cancelled_task_ids.is_empty(),
+            "turn complete must clear prior-turn cancelled ids: {:?}",
+            w.cancelled_task_ids
         );
     }
 
