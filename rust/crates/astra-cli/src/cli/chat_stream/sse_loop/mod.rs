@@ -264,6 +264,7 @@ pub(crate) async fn stream_chat_sse(
             let spawn_ctx = edge_tools::agent_spawning::SpawnAgentContext {
                 run_id: parent_turn_run_id.clone(),
                 agent_id: root_agent_id.to_string(),
+                current_model: p.model.map(str::to_string),
                 recursion_depth: 0,
                 working_dir: project_root.clone(),
                 spawner: spawner.clone(),

@@ -36,6 +36,9 @@ pub struct SpawnAgentContext {
     pub run_id: String,
     /// Current agent's ID
     pub agent_id: String,
+    /// Current active model for the parent turn. Used as the default
+    /// child model when the tool call omits an explicit override.
+    pub current_model: Option<String>,
     /// Current nested agent/sub-run depth of the agent.
     pub recursion_depth: u8,
     /// Working directory
@@ -57,7 +60,7 @@ pub struct SpawnAgentContext {
 /// This is called by the tool executor when the LLM invokes spawn_agent.
 pub async fn handle_spawn_agent_tool(args: &Value, ctx: Option<&SpawnAgentContext>) -> String {
     // Parse input
-    let input: SpawnAgentInput = match normalize_spawn_agent_args(args)
+    let mut input: SpawnAgentInput = match normalize_spawn_agent_args(args)
         .and_then(|patched_args| serde_json::from_value(patched_args).map_err(|e| e.to_string()))
     {
         Ok(i) => i,
@@ -81,6 +84,9 @@ pub async fn handle_spawn_agent_tool(args: &Value, ctx: Option<&SpawnAgentContex
             .to_string();
         }
     };
+    if input.model.is_none() {
+        input.model = ctx.current_model.clone();
+    }
 
     // Build spawn context
     let mut inherited_permissions = ctx.inherited_permissions.clone();
@@ -324,6 +330,13 @@ pub fn get_spawn_agent_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_runtime::orchestration::{
+        DynamicAgentSpawner, SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult,
+    };
+    use astra_runtime::server::delegation_engine::DelegationTracker;
+    use astra_turn_core::permission_types::InheritedPermissions;
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
     #[test]
     fn test_schema_structure() {
@@ -391,6 +404,109 @@ mod tests {
         let result = handle_spawn_agent_tool(&args, None).await;
         assert!(result.contains("not available"));
         assert!(result.contains("\"status\":\"failed\""), "{result}");
+    }
+
+    struct CapturingModelExecutor {
+        captured_model: std::sync::Mutex<Option<String>>,
+    }
+
+    impl CapturingModelExecutor {
+        fn new() -> Self {
+            Self {
+                captured_model: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn take_captured_model(&self) -> Option<String> {
+            self.captured_model.lock().unwrap().take()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SpawnAgentExecutor for CapturingModelExecutor {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            *self.captured_model.lock().unwrap() = Some(config.model.clone());
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "completed".into(),
+                finish_reason: "normal".into(),
+                output: Some("ok".into()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+    }
+
+    fn test_spawner(executor: Arc<dyn SpawnAgentExecutor>) -> Arc<DynamicAgentSpawner> {
+        let transport = Arc::new(astra_messaging::InProcessTransport::new());
+        let tracker = Arc::new(DelegationTracker::new());
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
+        Arc::new(DynamicAgentSpawner::new(router).with_executor(executor))
+    }
+
+    fn test_spawn_context(
+        spawner: Arc<DynamicAgentSpawner>,
+        current_model: Option<&str>,
+    ) -> SpawnAgentContext {
+        SpawnAgentContext {
+            run_id: "run-parent".into(),
+            agent_id: "root-agent".into(),
+            current_model: current_model.map(str::to_string),
+            recursion_depth: 0,
+            working_dir: PathBuf::from("."),
+            spawner,
+            inherited_permissions: InheritedPermissions::auto_approve(),
+            active_skills: Vec::new(),
+            live_event_sink: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_spawn_agent_tool_inherits_parent_model_when_omitted() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let args = json!({
+            "description": "Code quality review",
+            "prompt": "Review the latest commit",
+            "agent_type": "general-purpose"
+        });
+
+        let result = handle_spawn_agent_tool(&args, Some(&ctx)).await;
+
+        assert!(result.contains("\"status\":\"completed\""), "{result}");
+        assert_eq!(
+            executor.take_captured_model().as_deref(),
+            Some("MiniMax-M2.7")
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_spawn_agent_tool_preserves_explicit_model_override() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let args = json!({
+            "description": "Code quality review",
+            "prompt": "Review the latest commit",
+            "agent_type": "general-purpose",
+            "model": "claude-sonnet-4.6"
+        });
+
+        let result = handle_spawn_agent_tool(&args, Some(&ctx)).await;
+
+        assert!(result.contains("\"status\":\"completed\""), "{result}");
+        assert_eq!(
+            executor.take_captured_model().as_deref(),
+            Some("claude-sonnet-4.6")
+        );
     }
 
     #[tokio::test]
