@@ -3604,6 +3604,153 @@ mod tests {
         assert_eq!(names, sorted, "entries must be alphabetical");
     }
 
+    // ── Cache stability & token efficiency contracts ─────────────────────
+
+    #[test]
+    fn deferred_section_byte_stable_across_repeated_builds() {
+        // Prompt cache invariant: same input → same bytes. If the deferred
+        // listing were non-deterministic (HashMap iteration, random sort),
+        // the cache would bust every turn.
+        let surface = make_deferred_surface(30);
+        let a = build_deferred_tools_section_with_budget(&surface, Some(200_000))
+            .unwrap()
+            .text;
+        let b = build_deferred_tools_section_with_budget(&surface, Some(200_000))
+            .unwrap()
+            .text;
+        assert_eq!(a, b, "deferred section must be byte-stable across builds");
+    }
+
+    #[test]
+    fn skill_listing_byte_stable_across_repeated_builds() {
+        let skills: Vec<_> = (0..15)
+            .map(|i| astra_skills::traits::SkillToolInfo {
+                name: format!("skill-{i:02}"),
+                description: format!("Does thing {i}"),
+                when_to_use: Some(format!("When user wants {i}")),
+                ..Default::default()
+            })
+            .collect();
+        let a = build_skill_listing_section_with_budget(&skills, Some(200_000))
+            .unwrap()
+            .text;
+        let b = build_skill_listing_section_with_budget(&skills, Some(200_000))
+            .unwrap()
+            .text;
+        assert_eq!(a, b, "skill listing must be byte-stable across builds");
+    }
+
+    #[test]
+    fn deferred_section_token_budget_math_per_provider_context_window() {
+        // Verify that smaller context windows produce fewer entries.
+        // Budget is applied to the entry portion only (not the XML wrapper/instructions).
+        let surface = make_deferred_surface(200);
+
+        // 200K (Anthropic Claude) — should fit many entries
+        let s200k = build_deferred_tools_section_with_budget(&surface, Some(200_000)).unwrap();
+        let count_200k = s200k.text.matches("<name>").count();
+
+        // 128K (OpenAI GPT-4o) — fewer entries
+        let s128k = build_deferred_tools_section_with_budget(&surface, Some(128_000)).unwrap();
+        let count_128k = s128k.text.matches("<name>").count();
+
+        // 32K (small model) — much fewer entries
+        let s32k = build_deferred_tools_section_with_budget(&surface, Some(32_000)).unwrap();
+        let count_32k = s32k.text.matches("<name>").count();
+
+        assert!(
+            count_32k < count_128k && count_128k <= count_200k,
+            "larger context window must fit more tools: 32K={count_32k}, 128K={count_128k}, 200K={count_200k}"
+        );
+        // 32K budget = 2666 chars — at ~80 chars/entry, fits ~33 entries max
+        assert!(
+            count_32k < 50,
+            "32K context should fit well under 50 tools, got {count_32k}"
+        );
+    }
+
+    #[test]
+    fn skill_listing_token_budget_math_per_provider_context_window() {
+        let skills: Vec<_> = (0..100)
+            .map(|i| astra_skills::traits::SkillToolInfo {
+                name: format!("skill-{i:03}"),
+                description: format!("Does thing {i} with extra words for length"),
+                when_to_use: Some(format!("When user wants to do {i} operations")),
+                ..Default::default()
+            })
+            .collect();
+
+        // 200K → budget = 200_000/25 = 8_000 chars
+        let s200k = build_skill_listing_section_with_budget(&skills, Some(200_000)).unwrap();
+        let count_200k = s200k.text.matches("<name>").count();
+
+        // 32K → budget = 32_000/25 = 1_280 chars
+        let s32k = build_skill_listing_section_with_budget(&skills, Some(32_000)).unwrap();
+        let count_32k = s32k.text.matches("<name>").count();
+
+        assert!(
+            count_32k < count_200k,
+            "smaller window must fit fewer skills: 32K={count_32k}, 200K={count_200k}"
+        );
+        // 32K budget is very tight — verify degradation hint
+        assert!(
+            s32k.text.contains("discover_skills"),
+            "tight budget must emit discover_skills hint"
+        );
+    }
+
+    #[test]
+    fn combined_discovery_token_overhead_within_5_percent() {
+        // Total token overhead of both listings combined should not exceed
+        // 5% of context window for a realistic catalog (20 deferred + 10 skills).
+        let surface = make_deferred_surface(20);
+        let skills: Vec<_> = (0..10)
+            .map(|i| astra_skills::traits::SkillToolInfo {
+                name: format!("skill-{i}"),
+                description: format!("Skill description for {i}"),
+                when_to_use: Some(format!("When user wants {i}")),
+                ..Default::default()
+            })
+            .collect();
+
+        let context_window: u32 = 200_000;
+        let deferred = build_deferred_tools_section_with_budget(&surface, Some(context_window))
+            .unwrap()
+            .text;
+        let skill_listing = build_skill_listing_section_with_budget(&skills, Some(context_window))
+            .unwrap()
+            .text;
+
+        let total_chars = deferred.len() + skill_listing.len();
+        // ~4 chars per token, so total_tokens ≈ total_chars / 4
+        let approx_tokens = total_chars / 4;
+        let five_percent = context_window as usize * 5 / 100;
+        assert!(
+            approx_tokens <= five_percent,
+            "combined discovery overhead {approx_tokens} tokens > 5% ({five_percent} tokens) \
+             of context window — discovery listings are too expensive"
+        );
+    }
+
+    #[test]
+    fn deferred_section_tool_search_activation_always_mentioned() {
+        // Regardless of size, the instruction to use tool_search must appear.
+        // Without it, the model would see tool names but not know how to activate them.
+        let small = make_deferred_surface(3);
+        let section = build_deferred_tools_section_with_budget(&small, Some(200_000)).unwrap();
+        assert!(
+            section.text.contains("tool_search"),
+            "must always mention tool_search for activation"
+        );
+
+        let large = make_deferred_surface(200);
+        let section = build_deferred_tools_section_with_budget(&large, Some(5_000)).unwrap();
+        assert!(
+            section.text.contains("tool_search"),
+            "overflow case must also mention tool_search"
+        );
+    }
+
     // ── SystemPromptBuilder invariants ─────────────────────────────────
 
     #[test]
