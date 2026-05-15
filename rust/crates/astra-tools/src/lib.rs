@@ -29,6 +29,7 @@ pub mod git_ops;
 pub mod github;
 pub mod passive_cargo_check;
 pub mod passive_tsc_check;
+pub mod relevance_score;
 #[cfg(unix)]
 pub mod rpc_bridge;
 #[cfg(unix)]

@@ -443,15 +443,31 @@ pub fn is_discover_skills_call(tool_call: &Value) -> bool {
     false
 }
 
+/// Adapter to score `SkillToolInfo` using the shared relevance utility.
+struct SkillScoreAdapter<'a>(&'a SkillToolInfo);
+
+impl astra_tools::relevance_score::Scoreable for SkillScoreAdapter<'_> {
+    fn score_name(&self) -> &str {
+        &self.0.name
+    }
+    fn score_description(&self) -> &str {
+        &self.0.description
+    }
+    fn score_extra(&self) -> Option<&str> {
+        self.0.when_to_use.as_deref()
+    }
+}
+
 /// Run discovery; returns assistant-facing text and canonical names to merge into session state.
-/// Selector removed — returns all not-yet-excluded skills (capped) without ranking.
+/// Scores candidates by query relevance. Falls back to first N when query is empty or no matches.
 pub fn execute_discover_skills(
-    _query: &str,
+    query: &str,
     catalog: &[SkillToolInfo],
     mut excluded_lowercase: HashSet<String>,
     _quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
 ) -> (String, Vec<String>) {
-    let candidate_indices: Vec<usize> = catalog
+    // Filter excluded skills first.
+    let candidates: Vec<(usize, &SkillToolInfo)> = catalog
         .iter()
         .enumerate()
         .filter(|(_, s)| {
@@ -461,19 +477,51 @@ pub fn execute_discover_skills(
                     .iter()
                     .any(|a| excluded_lowercase.contains(&a.to_lowercase()))
         })
-        .map(|(idx, _)| idx)
-        .take(DISCOVER_SKILLS_MAX_RESULTS)
         .collect();
-    if candidate_indices.is_empty() {
+
+    if candidates.is_empty() {
         return (
             "No additional skills matched that query. Try different keywords, or proceed with general tools.".to_string(),
             Vec::new(),
         );
     }
 
+    // Score candidates by query relevance, fall back to insertion order.
+    let result_indices: Vec<usize> = if query.trim().is_empty() {
+        candidates
+            .iter()
+            .take(DISCOVER_SKILLS_MAX_RESULTS)
+            .map(|(idx, _)| *idx)
+            .collect()
+    } else {
+        let adapters: Vec<SkillScoreAdapter> = candidates
+            .iter()
+            .map(|(_, s)| SkillScoreAdapter(s))
+            .collect();
+        let ranked = astra_tools::relevance_score::rank_by_relevance(
+            &adapters,
+            query,
+            DISCOVER_SKILLS_MAX_RESULTS,
+        );
+        if ranked.is_empty() {
+            // No matches — fallback to first N (backward compat).
+            candidates
+                .iter()
+                .take(DISCOVER_SKILLS_MAX_RESULTS)
+                .map(|(idx, _)| *idx)
+                .collect()
+        } else {
+            // Map adapter indices back to catalog indices.
+            ranked
+                .iter()
+                .map(|(adapter_idx, _)| candidates[*adapter_idx].0)
+                .collect()
+        }
+    };
+
     let mut lines = Vec::new();
     let mut new_names = Vec::new();
-    for idx in candidate_indices {
+    for idx in result_indices {
         let s = &catalog[idx];
         lines.push(format!("- **{}**: {}", s.name, format_skill_description(s)));
         new_names.push(s.name.clone());
@@ -2257,7 +2305,109 @@ mod tests {
         assert!(!names.iter().any(|name| name == "already-visible"));
         assert!(!names.iter().any(|name| name == "blocked-by-alias"));
         assert!(names.iter().all(|name| name.starts_with("candidate-")));
+        // "anything" doesn't match any name/desc → fallback to first N.
         assert!(text.contains("candidate-0"), "{text}");
+    }
+
+    #[test]
+    fn discover_skills_ranks_by_query_relevance() {
+        let catalog = vec![
+            SkillToolInfo {
+                name: "review".into(),
+                description: "Review code changes".into(),
+                ..Default::default()
+            },
+            SkillToolInfo {
+                name: "deploy-k8s".into(),
+                description: "Deploy to Kubernetes cluster".into(),
+                ..Default::default()
+            },
+            SkillToolInfo {
+                name: "verify".into(),
+                description: "Run tests and linters".into(),
+                ..Default::default()
+            },
+        ];
+        let (_, names) =
+            execute_discover_skills("deploy kubernetes", &catalog, HashSet::new(), None);
+        assert_eq!(names[0], "deploy-k8s", "best match should be first");
+    }
+
+    #[test]
+    fn discover_skills_empty_query_returns_first_n() {
+        let catalog: Vec<SkillToolInfo> = (0..5)
+            .map(|i| SkillToolInfo {
+                name: format!("skill-{i}"),
+                description: format!("Desc {i}"),
+                ..Default::default()
+            })
+            .collect();
+        let (_, names) = execute_discover_skills("", &catalog, HashSet::new(), None);
+        assert_eq!(names.len(), 5);
+        assert_eq!(names[0], "skill-0");
+    }
+
+    #[test]
+    fn discover_skills_no_match_falls_back_to_first_n() {
+        let catalog: Vec<SkillToolInfo> = (0..3)
+            .map(|i| SkillToolInfo {
+                name: format!("alpha-{i}"),
+                description: format!("Something about {i}"),
+                ..Default::default()
+            })
+            .collect();
+        let (_, names) =
+            execute_discover_skills("zzz_nonexistent_xyz", &catalog, HashSet::new(), None);
+        assert_eq!(names.len(), 3, "fallback should return all available");
+    }
+
+    #[test]
+    fn discover_skills_when_to_use_contributes_to_score() {
+        let catalog = vec![
+            SkillToolInfo {
+                name: "generic".into(),
+                description: "Does generic things".into(),
+                when_to_use: None,
+                ..Default::default()
+            },
+            SkillToolInfo {
+                name: "also-generic".into(),
+                description: "Also does generic things".into(),
+                when_to_use: Some("User wants to validate code quality".into()),
+                ..Default::default()
+            },
+        ];
+        let (_, names) = execute_discover_skills("validate", &catalog, HashSet::new(), None);
+        assert_eq!(
+            names[0], "also-generic",
+            "when_to_use containing query term should boost ranking"
+        );
+    }
+
+    #[test]
+    fn discover_skills_exclusion_overrides_score() {
+        let catalog = vec![
+            SkillToolInfo {
+                name: "deploy".into(),
+                description: "Deploy application".into(),
+                ..Default::default()
+            },
+            SkillToolInfo {
+                name: "backup".into(),
+                description: "Backup before deploy".into(),
+                ..Default::default()
+            },
+        ];
+        let excluded = HashSet::from(["deploy".to_string()]);
+        let (_, names) = execute_discover_skills("deploy", &catalog, excluded, None);
+        assert!(
+            !names.contains(&"deploy".to_string()),
+            "excluded must not appear"
+        );
+        assert!(
+            names.contains(&"backup".to_string()),
+            "non-excluded match should appear"
+        );
     }
 
     #[tokio::test]

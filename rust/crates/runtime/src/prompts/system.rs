@@ -305,25 +305,83 @@ fn format_skill_description(description: &str, when_to_use: Option<&str>) -> Str
     }
 }
 
+/// Budget: deferred tool listing occupies at most 2% of context window.
+/// `BUDGET_NUM/BUDGET_DEN = 1/12 ≈ 4 chars/token × 2%`.
+const DEFERRED_TOOLS_BUDGET_NUM: u64 = 1;
+const DEFERRED_TOOLS_BUDGET_DEN: u64 = 12;
+const DEFERRED_TOOLS_DEFAULT_CHAR_BUDGET: usize = 16_000;
+
 #[allow(dead_code)]
 pub fn build_deferred_tools_section(
     surface: &crate::tool_registry::surface::ToolSurface,
+) -> Option<PromptSection> {
+    build_deferred_tools_section_with_budget(surface, None)
+}
+
+/// Build deferred tools listing with explicit budget from context window size.
+pub fn build_deferred_tools_section_with_budget(
+    surface: &crate::tool_registry::surface::ToolSurface,
+    context_window_tokens: Option<u32>,
 ) -> Option<PromptSection> {
     let entries = surface.deferred();
     if entries.is_empty() {
         return None;
     }
 
-    let mut body = String::with_capacity(entries.len() * 80 + 256);
+    let char_budget = context_window_tokens
+        .map(|t| (u64::from(t) * DEFERRED_TOOLS_BUDGET_NUM / DEFERRED_TOOLS_BUDGET_DEN) as usize)
+        .unwrap_or(DEFERRED_TOOLS_DEFAULT_CHAR_BUDGET);
+
+    const TOOL_OPEN: &str = "  <tool>\n    <name>";
+    const NAME_TO_DESC: &str = "</name>\n    <description>";
+    const DESC_CLOSE: &str = "</description>\n  </tool>\n";
+    const NAME_CLOSE: &str = "</name>\n  </tool>\n";
+    let name_only_wrap = TOOL_OPEN.len() + NAME_CLOSE.len();
+    let full_wrap = TOOL_OPEN.len() + NAME_TO_DESC.len() + DESC_CLOSE.len();
+
+    let mut body = String::with_capacity(char_budget + 1024);
     body.push_str("<deferred_tools>\n");
+
+    let mut listing_chars = 0usize;
+    let mut has_degraded = false;
+
+    // entries are already sorted alphabetically by ToolSurface::build()
     for entry in entries {
-        body.push_str("  <tool>\n    <name>");
-        body.push_str(&xml_escape_text(&entry.name));
-        body.push_str("</name>\n    <description>");
-        body.push_str(&xml_escape_text(&entry.short_desc));
-        body.push_str("</description>\n  </tool>\n");
+        let escaped_name = xml_escape_text(&entry.name);
+        let name_only_len = name_only_wrap + escaped_name.len();
+
+        if listing_chars + name_only_len > char_budget {
+            has_degraded = true;
+            break;
+        }
+
+        let escaped_desc = xml_escape_text(&entry.short_desc);
+        let full_len = full_wrap + escaped_name.len() + escaped_desc.len();
+
+        if listing_chars + full_len <= char_budget {
+            body.push_str(TOOL_OPEN);
+            body.push_str(&escaped_name);
+            body.push_str(NAME_TO_DESC);
+            body.push_str(&escaped_desc);
+            body.push_str(DESC_CLOSE);
+            listing_chars += full_len;
+        } else {
+            body.push_str(TOOL_OPEN);
+            body.push_str(&escaped_name);
+            body.push_str(NAME_CLOSE);
+            listing_chars += name_only_len;
+            has_degraded = true;
+        }
     }
     body.push_str("</deferred_tools>\n\n");
+
+    if has_degraded {
+        body.push_str(
+            "Some tools above are listed by name only or omitted. \
+             Call `tool_search` to search the full catalog.\n\n",
+        );
+    }
+
     body.push_str(
         "If a tool in `<deferred_tools>` fits your next step, call \
          `tool_search(query=\"select:NAME\")` first — the tool_result will contain the \
@@ -3451,6 +3509,99 @@ mod tests {
             section.text.matches("<name>").count() < skills.len(),
             "when budget is tiny, some skills should be omitted entirely so the full listing stays within budget"
         );
+    }
+
+    // ── Deferred tools budget ────────────────────────────────────────────
+
+    fn make_deferred_surface(n: usize) -> crate::tool_registry::surface::ToolSurface {
+        let schemas: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "function": {
+                        "name": format!("tool_{i:03}"),
+                        "description": format!("Description for tool number {i} with some extra text to fill space"),
+                        "parameters": {"type": "object"}
+                    }
+                })
+            })
+            .collect();
+        // Build with empty pinned list so all go to deferred
+        crate::tool_registry::surface::ToolSurface::build(
+            schemas,
+            &astra_config::ToolSurfaceConfig {
+                pinned_tools: vec![],
+            },
+            &[],
+        )
+    }
+
+    #[test]
+    fn deferred_section_all_entries_fit_within_large_budget() {
+        let surface = make_deferred_surface(10);
+        let section = build_deferred_tools_section_with_budget(&surface, Some(200_000)).unwrap();
+        // All 10 tools should have descriptions
+        assert_eq!(section.text.matches("<name>").count(), 10);
+        assert_eq!(section.text.matches("<description>").count(), 10);
+        assert!(!section.text.contains("listed by name only or omitted"));
+    }
+
+    #[test]
+    fn deferred_section_truncates_at_budget() {
+        let surface = make_deferred_surface(200);
+        // With tiny context window, budget = 1000/12 ≈ 83 chars — barely fits 1 entry
+        let section = build_deferred_tools_section_with_budget(&surface, Some(1_000)).unwrap();
+        let included_count = section.text.matches("<name>").count();
+        assert!(
+            included_count < 200,
+            "should not fit all 200, got {included_count}"
+        );
+        assert!(included_count > 0, "should include at least one tool");
+    }
+
+    #[test]
+    fn deferred_section_degrades_to_name_only_before_omitting() {
+        let surface = make_deferred_surface(100);
+        // Moderate budget — some full, some name-only
+        let section = build_deferred_tools_section_with_budget(&surface, Some(5_000)).unwrap();
+        let name_count = section.text.matches("<name>").count();
+        let desc_count = section.text.matches("<description>").count();
+        let name_only = name_count - desc_count;
+        assert!(
+            name_only > 0 || name_count < 100,
+            "overflow should produce name-only entries or omit some"
+        );
+    }
+
+    #[test]
+    fn deferred_section_shows_tool_search_hint_on_overflow() {
+        let surface = make_deferred_surface(200);
+        let section = build_deferred_tools_section_with_budget(&surface, Some(5_000)).unwrap();
+        assert!(
+            section.text.contains("listed by name only or omitted"),
+            "overflow must show the tool_search hint"
+        );
+    }
+
+    #[test]
+    fn deferred_section_is_session_scoped() {
+        let surface = make_deferred_surface(5);
+        let section = build_deferred_tools_section_with_budget(&surface, Some(200_000)).unwrap();
+        assert_eq!(section.scope, CacheScope::Session);
+    }
+
+    #[test]
+    fn deferred_section_preserves_alphabetical_order() {
+        let surface = make_deferred_surface(20);
+        let section = build_deferred_tools_section_with_budget(&surface, Some(200_000)).unwrap();
+        let names: Vec<&str> = section
+            .text
+            .split("<name>")
+            .skip(1)
+            .filter_map(|s| s.split("</name>").next())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "entries must be alphabetical");
     }
 
     // ── SystemPromptBuilder invariants ─────────────────────────────────
