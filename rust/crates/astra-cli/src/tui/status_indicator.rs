@@ -185,7 +185,7 @@ fn render_for(
 
     let label: String = match state {
         IndicatorState::Thinking { .. } => "Thinking".into(),
-        IndicatorState::Tool { name, .. } => format!("Running {name}"),
+        IndicatorState::Tool { name, .. } => label_for_tool(name),
         IndicatorState::WaitingModel { .. } => "Waiting for model".into(),
         IndicatorState::AwaitingApproval { .. } => "Awaiting approval".into(),
         IndicatorState::Idle => return None,
@@ -202,6 +202,31 @@ fn render_for(
         Span::styled(label, label_style),
         Span::styled(suffix(elapsed, stream_chars, thought_for), dim),
     ]))
+}
+
+/// Map an in-progress tool name to the spinner verb the user sees.
+/// Well-known tools get a single action word that describes what the
+/// tool is actually doing right now — `Writing` is more informative
+/// than `Running write_file`. `bash` is special: keeping the literal
+/// name preserves the "what shell command" signal the user expects.
+/// Unknown tools (plugins, MCP servers) fall back to `Running <name>`.
+///
+/// Pinned by `tool_name_maps_to_human_verb` so renaming a verb is a
+/// deliberate one-line change with a corresponding test update,
+/// not a drive-by rewrite.
+fn label_for_tool(name: &str) -> String {
+    match name {
+        "bash" => "Running bash".into(),
+        "write_file" => "Writing".into(),
+        "read_file" => "Reading".into(),
+        "str_replace" => "Editing".into(),
+        "grep" | "glob" => "Searching".into(),
+        "list_dir" => "Listing".into(),
+        "task" => "Tracking".into(),
+        "memory" => "Recalling".into(),
+        "tool_search" => "Loading tool".into(),
+        _ => format!("Running {name}"),
+    }
 }
 
 /// Returns `Some(elapsed)` when the spinner should display the
@@ -377,6 +402,44 @@ mod tests {
         };
         let line = render_for(&state, 0, None, t0 + Duration::from_secs(1)).unwrap();
         assert!(text_of(&line).contains("Running bash"));
+    }
+
+    /// Pure spinner verbs — replaces the `Running <name>` fallback
+    /// for the well-known tools with an action verb that says what's
+    /// actually happening. `bash` keeps the literal name (the user
+    /// expects to see the shell name); the unknown-tool fallback
+    /// (`Running {name}`) is preserved for plugin tools we don't
+    /// have a dedicated verb for. Pinning the table here keeps
+    /// future contributors from rewording verbs ad-hoc.
+    #[test]
+    fn tool_name_maps_to_human_verb() {
+        let t0 = Instant::now();
+        let cases: &[(&str, &str)] = &[
+            ("bash", "Running bash"),
+            ("write_file", "Writing"),
+            ("read_file", "Reading"),
+            ("str_replace", "Editing"),
+            ("grep", "Searching"),
+            ("glob", "Searching"),
+            ("list_dir", "Listing"),
+            ("task", "Tracking"),
+            ("memory", "Recalling"),
+            ("tool_search", "Loading tool"),
+            // Unknown plugin tool — fall back to Running.
+            ("astra_custom_xyz", "Running astra_custom_xyz"),
+        ];
+        for (name, expected) in cases {
+            let state = IndicatorState::Tool {
+                name: (*name).into(),
+                started_at: t0,
+            };
+            let line = render_for(&state, 0, None, t0 + Duration::from_secs(1)).unwrap();
+            let text = text_of(&line);
+            assert!(
+                text.contains(expected),
+                "tool {name}: expected `{expected}` in line, got `{text}`"
+            );
+        }
     }
 
     #[test]
