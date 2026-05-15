@@ -74,6 +74,13 @@ pub(crate) struct StatusIndicator {
     /// Per-turn streamed-char count (for the `↓ 5.1k tokens`
     /// counter). Reset on each new turn.
     stream_chars: u64,
+    /// When the *turn* started — not the current state. Survives
+    /// Thinking ↔ Tool ↔ Thinking transitions so the `(Ns)` elapsed
+    /// counter grows monotonically across the whole turn instead of
+    /// flashing back to 0 every time a tool fires. Set by
+    /// [`Self::begin_turn`] at turn start; cleared by [`Self::end_turn`]
+    /// (or implicitly by the next `begin_turn`).
+    turn_started_at: Option<Instant>,
 }
 
 impl StatusIndicator {
@@ -86,13 +93,38 @@ impl StatusIndicator {
     }
 
     pub fn set_state(&mut self, state: IndicatorState) {
-        // Any transition into a new active state resets the
-        // stream counter so the `↓` number reflects THIS turn,
-        // not carryover. Transitioning to `Idle` also zeroes it
-        // so a subsequent show-line (in an edge case where state
-        // flips back) doesn't ghost stale tokens.
-        self.stream_chars = 0;
+        // The stream counter resets across state changes only when
+        // entering a *brand new turn*. Within a turn, tool ↔ thinking
+        // transitions preserve `stream_chars` so `↓ Nk tokens` keeps
+        // climbing instead of flashing back to 0 each time the model
+        // fires a tool. `begin_turn` is the explicit reset point.
+        if matches!(state, IndicatorState::Idle) {
+            self.stream_chars = 0;
+            self.turn_started_at = None;
+        } else if self.turn_started_at.is_none() {
+            // Auto-start a turn when transitioning out of Idle. Lets
+            // existing callers that drive `set_state(Thinking{...})`
+            // directly (and forget to invoke `begin_turn`) still get
+            // the correct turn-stable elapsed counter. The state's
+            // own `started_at` is the truthy turn-start signal — it
+            // was set by the caller at `Instant::now()` for exactly
+            // this transition.
+            if let Some(t) = state.started_at() {
+                self.turn_started_at = Some(t);
+                self.stream_chars = 0;
+            }
+        }
         self.state = state;
+    }
+
+    /// Mark the start of a new turn. Drives the elapsed counter that
+    /// renders in the spinner suffix (`(7s · esc to interrupt)`).
+    /// Called at the same moment the host transitions out of Idle —
+    /// usually right alongside `set_state(Thinking { ... })` or
+    /// `set_state(WaitingModel { ... })`.
+    pub fn begin_turn(&mut self, at: Instant) {
+        self.turn_started_at = Some(at);
+        self.stream_chars = 0;
     }
 
     pub fn bump_stream_chars(&mut self, n: usize) {
@@ -102,20 +134,38 @@ impl StatusIndicator {
     /// Produce the single line to render. `None` means "don't
     /// draw anything" — the caller should reserve zero rows.
     pub fn render(&self) -> Option<Line<'static>> {
-        render_for(&self.state, self.stream_chars, Instant::now())
+        self.render_at(Instant::now())
+    }
+
+    /// Like `render` but with an explicit `now`. Lets tests pin the
+    /// clock without mocking `Instant`. Production callers use
+    /// `render()`.
+    pub fn render_at(&self, now: Instant) -> Option<Line<'static>> {
+        render_for(
+            &self.state,
+            self.stream_chars,
+            self.turn_started_at,
+            now,
+        )
     }
 }
 
 /// Rendering extracted to a free fn with explicit `now` so tests
-/// can pin the clock without mocking `Instant`.
-fn render_for(state: &IndicatorState, stream_chars: u64, now: Instant) -> Option<Line<'static>> {
+/// can pin the clock without mocking `Instant`. `turn_started_at`
+/// (when set) wins over the per-state `started_at` so a tool
+/// dispatch mid-turn doesn't reset the visible elapsed counter.
+fn render_for(
+    state: &IndicatorState,
+    stream_chars: u64,
+    turn_started_at: Option<Instant>,
+    now: Instant,
+) -> Option<Line<'static>> {
     if !state.is_active() {
         return None;
     }
 
-    let elapsed = state
-        .started_at()
-        .and_then(|t| now.checked_duration_since(t));
+    let elapsed_origin = turn_started_at.or_else(|| state.started_at());
+    let elapsed = elapsed_origin.and_then(|t| now.checked_duration_since(t));
 
     let theme = crate::tui::theme::current();
     let star_style = Style::default()
@@ -210,6 +260,51 @@ mod tests {
 
     // ── render rules ─────────────────────────────────────────────
 
+    /// REGRESSION: a multi-tool turn used to look like the spinner
+    /// "kept disappearing and reappearing" because every Thinking ↔
+    /// Tool transition reset `started_at` and the elapsed counter
+    /// flashed back to 0s. The cure: separate the per-state
+    /// `started_at` from a turn-level start instant that survives
+    /// state transitions. Test pins that elapsed grows monotonically
+    /// across a full Thinking → Tool → Thinking cycle.
+    #[test]
+    fn elapsed_does_not_reset_on_tool_switch() {
+        let mut s = StatusIndicator::new();
+        let turn_start = Instant::now();
+        s.begin_turn(turn_start);
+        s.set_state(IndicatorState::Thinking {
+            started_at: turn_start,
+        });
+
+        // 3s into the turn — model is thinking.
+        let line = s.render_at(turn_start + Duration::from_secs(3)).unwrap();
+        let t1 = text_of(&line);
+        assert!(t1.contains("3s"), "expected 3s elapsed, got: {t1}");
+
+        // Model fires a tool at t=4s. Tool runs for 2s.
+        s.set_state(IndicatorState::Tool {
+            name: "bash".into(),
+            started_at: turn_start + Duration::from_secs(4),
+        });
+        let line = s.render_at(turn_start + Duration::from_secs(5)).unwrap();
+        let t2 = text_of(&line);
+        assert!(
+            t2.contains("5s"),
+            "tool-state elapsed must reflect TURN time, not state time; got: {t2}"
+        );
+
+        // Tool completes, back to thinking.
+        s.set_state(IndicatorState::Thinking {
+            started_at: turn_start + Duration::from_secs(6),
+        });
+        let line = s.render_at(turn_start + Duration::from_secs(7)).unwrap();
+        let t3 = text_of(&line);
+        assert!(
+            t3.contains("7s"),
+            "post-tool Thinking must keep growing the turn timer; got: {t3}"
+        );
+    }
+
     #[test]
     fn idle_renders_none() {
         let s = StatusIndicator::new();
@@ -221,7 +316,8 @@ mod tests {
         let mut s = StatusIndicator::new();
         let t0 = Instant::now();
         s.set_state(IndicatorState::Thinking { started_at: t0 });
-        let line = render_for(&s.state, s.stream_chars, t0 + Duration::from_secs(3)).unwrap();
+        let line =
+            render_for(&s.state, s.stream_chars, None, t0 + Duration::from_secs(3)).unwrap();
         let text = text_of(&line);
         assert!(any_star(&text), "star missing: {text}");
         assert!(text.contains("Thinking"));
@@ -236,7 +332,7 @@ mod tests {
             name: "bash".into(),
             started_at: t0,
         };
-        let line = render_for(&state, 0, t0 + Duration::from_secs(1)).unwrap();
+        let line = render_for(&state, 0, None, t0 + Duration::from_secs(1)).unwrap();
         assert!(text_of(&line).contains("Running bash"));
     }
 
@@ -246,6 +342,7 @@ mod tests {
         let w = render_for(
             &IndicatorState::WaitingModel { started_at: t0 },
             0,
+            None,
             t0 + Duration::from_secs(0),
         )
         .unwrap();
@@ -254,6 +351,7 @@ mod tests {
         let a = render_for(
             &IndicatorState::AwaitingApproval { started_at: t0 },
             0,
+            None,
             t0 + Duration::from_secs(0),
         )
         .unwrap();
@@ -268,6 +366,7 @@ mod tests {
         let line = render_for(
             &IndicatorState::Thinking { started_at: t0 },
             0,
+            None,
             t0 + Duration::from_secs(1),
         )
         .unwrap();
@@ -284,6 +383,7 @@ mod tests {
         let line = render_for(
             &IndicatorState::Thinking { started_at: t0 },
             20_000, // ~5k tokens at 4 chars/token
+            None,
             t0 + Duration::from_secs(5),
         )
         .unwrap();
@@ -305,19 +405,74 @@ mod tests {
     }
 
     #[test]
-    fn set_state_resets_stream_chars() {
-        // Invariant: each turn starts at `↓ 0 tokens`. Without a
-        // reset the counter would carry the previous turn's tail.
+    fn begin_turn_zeroes_stream_chars_for_fresh_turn() {
+        // Invariant: each turn starts at `↓ 0 tokens`. Mid-turn
+        // state changes (Thinking → Tool → Thinking) preserve the
+        // counter so it climbs continuously across the whole turn;
+        // only `begin_turn` (or transitioning to Idle) resets it.
         let mut s = StatusIndicator::new();
-        s.set_state(IndicatorState::Thinking {
-            started_at: Instant::now(),
-        });
+        let t0 = Instant::now();
+        s.begin_turn(t0);
+        s.set_state(IndicatorState::Thinking { started_at: t0 });
         s.bump_stream_chars(5_000);
         assert_eq!(s.stream_chars, 5_000);
-        s.set_state(IndicatorState::Thinking {
-            started_at: Instant::now(),
+
+        // Mid-turn tool dispatch must NOT reset the counter — that
+        // was the old "spinner flashes 0 every tool call" bug.
+        s.set_state(IndicatorState::Tool {
+            name: "bash".into(),
+            started_at: t0 + Duration::from_secs(1),
         });
+        assert_eq!(
+            s.stream_chars, 5_000,
+            "tool dispatch within a turn must preserve stream_chars"
+        );
+
+        // Starting a fresh turn does reset.
+        s.begin_turn(t0 + Duration::from_secs(60));
         assert_eq!(s.stream_chars, 0, "new turn must zero the counter");
+    }
+
+    #[test]
+    fn first_active_set_state_auto_begins_turn() {
+        // Production callers in event_loop.rs invoke
+        // `set_state(Thinking { started_at: now })` directly without
+        // remembering `begin_turn`. The auto-promote keeps the
+        // turn-stable elapsed counter working without forcing every
+        // call site to be updated.
+        let mut s = StatusIndicator::new();
+        let t0 = Instant::now();
+        s.set_state(IndicatorState::Thinking { started_at: t0 });
+        assert_eq!(
+            s.turn_started_at,
+            Some(t0),
+            "first transition out of Idle must seed the turn origin"
+        );
+
+        // Subsequent state changes do NOT overwrite the turn origin.
+        let later = t0 + Duration::from_secs(5);
+        s.set_state(IndicatorState::Tool {
+            name: "bash".into(),
+            started_at: later,
+        });
+        assert_eq!(
+            s.turn_started_at,
+            Some(t0),
+            "mid-turn state change must preserve the original turn origin"
+        );
+    }
+
+    #[test]
+    fn idle_state_clears_turn_origin() {
+        // Idle terminates a turn — counter and turn origin both clear
+        // so a stale next-frame render doesn't ghost the previous turn.
+        let mut s = StatusIndicator::new();
+        let t0 = Instant::now();
+        s.begin_turn(t0);
+        s.bump_stream_chars(2_000);
+        s.set_state(IndicatorState::Idle);
+        assert_eq!(s.stream_chars, 0);
+        assert!(s.turn_started_at.is_none());
     }
 
     // ── formatting ───────────────────────────────────────────────
