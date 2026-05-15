@@ -6,7 +6,7 @@ help:
 	@echo "=================================="
 	@echo ""
 	@echo "Quick Start:"
-	@echo "  make dev-start          - Start all (deps + API server)"
+	@echo "  make dev-start          - Start all (deps + API server + web UI)"
 	@echo "  make dev-stop           - Stop all services"
 	@echo "  make dev-status         - Show all service status"
 	@echo "  make dev-init           - Initialize development environment"
@@ -27,6 +27,15 @@ help:
 	@echo "  make dev-api-restart-debug - Restart API server (debug, fast)"
 	@echo "  make dev-api-logs       - Show API server logs"
 	@echo "  make dev-api-status     - Show API server status"
+	@echo ""
+	@echo "Web UI:"
+	@echo "  make dev-sdk-deps       - Install/build local @astra/sdk for web UI"
+	@echo "  make dev-web-deps       - Install web UI dependencies"
+	@echo "  make dev-web-start      - Start web UI on http://localhost:3536"
+	@echo "  make dev-web-stop       - Stop web UI"
+	@echo "  make dev-web-restart    - Restart web UI"
+	@echo "  make dev-web-logs       - Show web UI logs"
+	@echo "  make dev-web-status     - Show web UI status"
 	@echo ""
 	@echo "Testing:"
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
@@ -124,7 +133,8 @@ setup:
 install-dev-deps:
 	@echo "Installing Rust workspace dependencies..."
 	@cargo fetch --manifest-path rust/Cargo.toml
-	@echo "✅ Rust dependencies ready"
+	@$(MAKE) dev-web-deps
+	@echo "✅ Development dependencies ready"
 
 .PHONY: check-runtime
 check-runtime:
@@ -291,6 +301,69 @@ dev-api-status:
 	fi
 
 # ============================================================================
+# Web UI (Next.js Dev Server)
+# ============================================================================
+
+.PHONY: dev-sdk-deps
+dev-sdk-deps:
+	@if [ ! -x packages/sdk/node_modules/.bin/tsup ]; then \
+		echo "Installing local @astra/sdk dependencies..."; \
+		cd packages/sdk && npm install --no-audit --no-fund; \
+	else \
+		echo "✅ Local @astra/sdk dependencies ready"; \
+	fi
+	@if [ ! -f packages/sdk/dist/index.js ] || [ ! -f packages/sdk/dist/index.d.ts ]; then \
+		echo "Building local @astra/sdk package..."; \
+		cd packages/sdk && npm run build; \
+	else \
+		echo "✅ Local @astra/sdk build ready"; \
+	fi
+
+.PHONY: dev-web-deps
+dev-web-deps: dev-sdk-deps
+	@if [ ! -f web/node_modules/next/dist/bin/next ]; then \
+		echo "Installing web UI dependencies..."; \
+		cd web && npm install --no-audit --no-fund; \
+	else \
+		echo "✅ Web UI dependencies ready"; \
+	fi
+
+.PHONY: dev-web-start
+dev-web-start: dev-web-deps
+	@./scripts/dev/start-web.sh
+
+.PHONY: dev-web-stop
+dev-web-stop:
+	@./scripts/dev/stop-web.sh
+
+.PHONY: dev-web-restart
+dev-web-restart: dev-web-stop
+	@sleep 1
+	@$(MAKE) dev-web-start
+
+.PHONY: dev-web-logs
+dev-web-logs:
+	@LOG_FILE=$${ASTRA_WEB_LOG_FILE:-web_server.log}; \
+	if [ -f "$$LOG_FILE" ]; then \
+		tail -f "$$LOG_FILE"; \
+	else \
+		echo "❌ $$LOG_FILE not found. Is web UI running?"; \
+	fi
+
+.PHONY: dev-web-status
+dev-web-status:
+	@PID_FILE=$${ASTRA_WEB_PID_FILE:-web_server.pid}; \
+	WEB_PORT=$${ASTRA_WEB_PORT:-$${WEB_PORT:-3536}}; \
+	echo "Web UI Status:"; \
+	echo "=============="; \
+	if [ -f "$$PID_FILE" ] && kill -0 $$(cat "$$PID_FILE") 2>/dev/null; then \
+		echo "  ✅ Running (PID: $$(cat "$$PID_FILE"), URL: http://localhost:$$WEB_PORT)"; \
+		NO_PROXY=localhost,127.0.0.1 curl -s --connect-timeout 1 --max-time 2 "http://127.0.0.1:$$WEB_PORT" >/dev/null 2>&1 || echo "  ⚠️  HTTP check failed"; \
+	else \
+		echo "  ❌ Not running"; \
+	fi
+
+# ============================================================================
 # API Server (Docker Mode)
 # ============================================================================
 
@@ -331,10 +404,11 @@ dev-api-docker-scale:
 # ============================================================================
 
 .PHONY: dev-start
-dev-start: dev-deps-up dev-deps-wait dev-api-start
+dev-start: dev-deps-up dev-deps-wait dev-api-start dev-web-start
 	@echo ""
 	@echo "✅ Development environment started!"
 	@echo "   API: http://localhost:8000"
+	@echo "   Web: http://localhost:$${ASTRA_WEB_PORT:-$${WEB_PORT:-3536}}"
 	@echo ""
 	@echo "Next steps:"
 	@echo "  astra register"
@@ -349,7 +423,7 @@ dev-start-docker: dev-deps-up dev-deps-wait dev-api-docker-up
 	@echo "   API: http://localhost:8000"
 
 .PHONY: dev-stop
-dev-stop: dev-api-stop dev-deps-down
+dev-stop: dev-web-stop dev-api-stop dev-deps-down
 	@echo "✅ All services stopped"
 
 .PHONY: dev-restart
@@ -363,9 +437,11 @@ dev-status:
 	@$(MAKE) dev-deps-status
 	@echo ""
 	@$(MAKE) dev-api-status
+	@echo ""
+	@$(MAKE) dev-web-status
 
 .PHONY: dev-clean
-dev-clean: dev-api-stop dev-deps-clean
+dev-clean: dev-web-stop dev-api-stop dev-deps-clean
 	@echo "✅ Development environment cleaned"
 
 .PHONY: dev-reset
