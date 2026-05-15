@@ -785,6 +785,21 @@ fn task_lifecycle_section(tool_names: &[&str]) -> Option<String> {
     )
 }
 
+fn plan_lifecycle_section(tool_names: &[&str]) -> Option<String> {
+    if !tool_names.contains(&"enter_plan_mode") || !tool_names.contains(&"exit_plan_mode") {
+        return None;
+    }
+    Some(
+        "\n## Plan Mode Lifecycle\n\
+         Use `enter_plan_mode` when the user wants architecture exploration, a phased plan, or approval before edits:\n\
+         - Enter plan mode before write work when the task is design-heavy, ambiguous, or likely to churn without a written plan.\n\
+         - While plan mode is active, use read/exploration tools to author the plan; write tools stay blocked until the plan is approved.\n\
+         - Finish with `exit_plan_mode(plan='<markdown>', approved=true)` once the plan is ready. Use `approved=false` only if the user rejected the plan or wants to keep iterating.\n\
+         - Do not enter plan mode for simple single-step fixes, direct Q&A, or work that can be completed in one straightforward pass.\n"
+            .to_string(),
+    )
+}
+
 /// Per-turn advisory for tool-selector uncertainty.
 ///
 /// This must stay out of Session-scoped prompt blocks: confidence is computed
@@ -1085,6 +1100,13 @@ pub fn build_system_prompt_sections_with_style(
         // belongs in `Environment`, not `BasePersona`.
         sections.push(PromptSection::dynamic(
             task_lifecycle,
+            PromptTokenBucket::Environment,
+        ));
+    }
+
+    if let Some(plan_lifecycle) = plan_lifecycle_section(tool_names) {
+        sections.push(PromptSection::dynamic(
+            plan_lifecycle,
             PromptTokenBucket::Environment,
         ));
     }
@@ -2118,6 +2140,27 @@ mod tests {
         let p = build_main_system_prompt(&["bash", "read_file"], "", 1.0, None);
         assert!(!p.contains("Task Lifecycle"));
         assert!(!p.contains("Use the `task` tool automatically"));
+    }
+
+    #[test]
+    fn plan_tools_add_lifecycle_guidance() {
+        let p = build_main_system_prompt(
+            &["enter_plan_mode", "exit_plan_mode", "bash"],
+            "",
+            1.0,
+            None,
+        );
+        assert!(p.contains("Plan Mode Lifecycle"));
+        assert!(p.contains("Use `enter_plan_mode`"));
+        assert!(p.contains("approved=true"));
+        assert!(p.contains("write tools stay blocked"));
+    }
+
+    #[test]
+    fn incomplete_plan_tool_set_omits_plan_lifecycle_guidance() {
+        let p = build_main_system_prompt(&["enter_plan_mode", "bash"], "", 1.0, None);
+        assert!(!p.contains("Plan Mode Lifecycle"));
+        assert!(!p.contains("Use `enter_plan_mode`"));
     }
 
     #[test]
