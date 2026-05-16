@@ -2302,7 +2302,7 @@ mod tests {
         let metadata = r#"{
             "executing_plan": "{\"subtasks\":[{\"id\":\"s1\",\"title\":\"task\"}]}",
             "plan_goal": "Build feature X",
-            "plan_config": "{\"step_by_step\":true,\"auto_execute\":false}",
+            "plan_config": "{\"step_by_step\":true}",
             "plan_execution_rounds": 3
         }"#;
         let (plan, goal, config, rounds) = extract_plan_from_metadata(metadata);

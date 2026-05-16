@@ -23,7 +23,7 @@
 //! * `plan_step_runs` is append-only. Every subtask attempt creates a new row
 //!   — never UPDATE, never DELETE.
 
-use crate::decompose::{PlanModeState, SavedPlanInfo};
+use crate::decompose::PlanModeState;
 use astra_services::task_orchestrator::TaskStatus;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -94,6 +94,16 @@ pub struct NewStepRun<'a> {
     pub status: TaskStatus,
     pub session_id: &'a str,
     pub request_id: &'a str,
+}
+
+/// Summary info for a saved plan.
+#[derive(Debug, Clone)]
+pub struct SavedPlanInfo {
+    pub name: String,
+    pub goal: String,
+    pub progress_pct: u32,
+    pub subtask_count: usize,
+    pub status: String,
 }
 
 // ─── Trait ───────────────────────────────────────────────────────────────────
@@ -177,8 +187,6 @@ pub trait PlanRepository: Send + Sync {
         artifact_ref: Option<&str>,
     ) -> Result<String, PlanLoadError>;
 
-    /// Finalize an existing step-run with its outcome. Status/finished_at/error
-    /// are the mutable fields; everything else is immutable.
     /// Finalize an existing step-run with its outcome. Status/finished_at/error
     /// are the mutable fields; everything else is immutable.
     ///
@@ -273,6 +281,21 @@ fn map_sqlx(err: sqlx::Error) -> PlanLoadError {
     PlanLoadError::Internal(format!("sql error: {err}"))
 }
 
+fn validate_plan_id(plan_id: &str) -> Result<(), PlanLoadError> {
+    if plan_id.is_empty() {
+        return Err(PlanLoadError::InvalidId("plan ID must not be empty".into()));
+    }
+    if !plan_id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(PlanLoadError::InvalidId(format!(
+            "'{plan_id}': only alphanumeric, dash, and underscore allowed"
+        )));
+    }
+    Ok(())
+}
+
 fn truncate_plan_resume_text(text: &str, max_chars: usize) -> String {
     let mut out = String::new();
     for (i, ch) in text.chars().enumerate() {
@@ -285,7 +308,7 @@ fn truncate_plan_resume_text(text: &str, max_chars: usize) -> String {
     out
 }
 
-fn plan_resume_digest(state: &PlanModeState) -> Option<String> {
+pub fn plan_resume_digest(state: &PlanModeState) -> Option<String> {
     let goal = state.goal.trim();
     let subtasks = &state.plan.subtasks;
     if goal.is_empty() && subtasks.is_empty() {
@@ -363,7 +386,7 @@ impl PlanRepository for CloudPlanRepository {
         state: &mut PlanModeState,
         expected_version: Option<u64>,
     ) -> Result<(), PlanLoadError> {
-        PlanModeState::validate_plan_id(plan_id)?;
+        validate_plan_id(plan_id)?;
         let phase = infer_phase_for_persist(state);
         let progress = state.plan.progress_pct() as i32;
         let goal = state.goal.clone();
@@ -512,7 +535,7 @@ impl PlanRepository for CloudPlanRepository {
     }
 
     async fn load(&self, plan_id: &str) -> Result<PlanModeState, PlanLoadError> {
-        PlanModeState::validate_plan_id(plan_id)?;
+        validate_plan_id(plan_id)?;
         let row = sqlx::query(
             "SELECT plan_json, plan_md, session_id, version FROM plans WHERE plan_id = ?",
         )
@@ -610,7 +633,7 @@ impl PlanRepository for CloudPlanRepository {
     }
 
     async fn delete(&self, plan_id: &str) -> Result<(), PlanLoadError> {
-        PlanModeState::validate_plan_id(plan_id)?;
+        validate_plan_id(plan_id)?;
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
 
         let result = sqlx::query("DELETE FROM plans WHERE plan_id = ?")
@@ -833,7 +856,7 @@ impl PlanRepository for CloudPlanRepository {
         subtask_id: Option<&str>,
         limit: i32,
     ) -> Result<Vec<PlanStepRun>, PlanLoadError> {
-        PlanModeState::validate_plan_id(plan_id)?;
+        validate_plan_id(plan_id)?;
         let limit = limit.clamp(1, 1000);
 
         // Stable order: newest started_at first, `run_id` ASC as the
@@ -894,7 +917,7 @@ impl PlanRepository for CloudPlanRepository {
         plan_id: &str,
         subtask_ids: &[String],
     ) -> Result<u64, PlanLoadError> {
-        PlanModeState::validate_plan_id(plan_id)?;
+        validate_plan_id(plan_id)?;
         if subtask_ids.is_empty() {
             return Ok(0);
         }
@@ -971,7 +994,7 @@ impl PlanRepository for InMemoryPlanRepository {
         state: &mut PlanModeState,
         expected_version: Option<u64>,
     ) -> Result<(), PlanLoadError> {
-        PlanModeState::validate_plan_id(plan_id)?;
+        validate_plan_id(plan_id)?;
         let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
         match (
             guard.plans.get(plan_id).map(|s| s.version),
@@ -998,7 +1021,7 @@ impl PlanRepository for InMemoryPlanRepository {
     }
 
     async fn load(&self, plan_id: &str) -> Result<PlanModeState, PlanLoadError> {
-        PlanModeState::validate_plan_id(plan_id)?;
+        validate_plan_id(plan_id)?;
         self.inner
             .read()
             .unwrap_or_else(|p| p.into_inner())
@@ -1055,7 +1078,7 @@ impl PlanRepository for InMemoryPlanRepository {
     }
 
     async fn delete(&self, plan_id: &str) -> Result<(), PlanLoadError> {
-        PlanModeState::validate_plan_id(plan_id)?;
+        validate_plan_id(plan_id)?;
         let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
         guard.plans.remove(plan_id);
         guard.active_plans.retain(|_, active| active != plan_id);
@@ -1071,7 +1094,7 @@ impl PlanRepository for InMemoryPlanRepository {
         let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
         guard.active_plans.remove(session_id);
         if let Some(plan_id) = plan_id {
-            PlanModeState::validate_plan_id(plan_id)?;
+            validate_plan_id(plan_id)?;
             guard.active_plans.retain(|_, active| active != plan_id);
             guard
                 .active_plans
@@ -1251,13 +1274,39 @@ pub async fn plan_resume_hint_for_session(
     plan_resume_prompt_hint(&state)
 }
 
-// ─── Fork helper ─────────────────────────────────────────────────────────────
-
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_plan_id_rejects_unsafe_ids() {
+        for id in [
+            "",
+            "../etc/passwd",
+            "foo/../bar",
+            "foo/bar",
+            "foo\\bar",
+            "plan.json",
+            "id with space",
+            "a;b",
+            "a&b",
+        ] {
+            let err = validate_plan_id(id).unwrap_err();
+            assert!(
+                matches!(err, PlanLoadError::InvalidId(_)),
+                "should reject {id}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_plan_id_accepts_safe_ids() {
+        for id in ["abc", "plan-123", "my_plan_v2", "ABC-xyz_01"] {
+            assert!(validate_plan_id(id).is_ok(), "should accept {id}");
+        }
+    }
 
     #[test]
     fn plan_resume_prompt_hint_returns_none_for_empty_state() {

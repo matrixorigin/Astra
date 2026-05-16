@@ -3,8 +3,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::repository::PlanLoadError;
-
 // Re-export task types from services
 pub use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
 
@@ -99,22 +97,6 @@ impl PlanModeState {
         } else {
             format!("{}-{:04x}", slug.to_lowercase(), (hash & 0xFFFF) as u16)
         }
-    }
-
-    /// Validate that a plan_id is safe for filesystem use (no path traversal).
-    pub fn validate_plan_id(plan_id: &str) -> Result<(), PlanLoadError> {
-        if plan_id.is_empty() {
-            return Err(PlanLoadError::InvalidId("plan ID must not be empty".into()));
-        }
-        if !plan_id
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-        {
-            return Err(PlanLoadError::InvalidId(format!(
-                "'{plan_id}': only alphanumeric, dash, and underscore allowed"
-            )));
-        }
-        Ok(())
     }
 }
 
@@ -281,7 +263,7 @@ pub fn format_subtask_prompt_with_operator_notes(
     format!("{block}\n{body}")
 }
 
-// ─── Plan Execution Config & Summary ─────────────────────────────────────────
+// ─── Plan Execution Config ───────────────────────────────────────────────────
 
 /// Configuration for plan execution behavior.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -296,10 +278,6 @@ pub struct PlanExecutionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TimelineEventKind {
-    /// Plan was created
-    PlanCreated { subtask_count: usize },
-    /// Plan was modified/replanned
-    Replan { reason: String, changes: String },
     /// Plan was rewound — subtask at `from_idx` and every subtask after it
     /// reset to pending. `reset_count` is the number that actually flipped.
     SubtaskRewound {
@@ -439,16 +417,6 @@ pub fn analyze_parallelism(plan: &TaskPlan) -> ParallelGroups {
     }
 
     ParallelGroups { groups, conflicts }
-}
-
-/// Summary info for a saved plan.
-#[derive(Debug, Clone)]
-pub struct SavedPlanInfo {
-    pub name: String,
-    pub goal: String,
-    pub progress_pct: u32,
-    pub subtask_count: usize,
-    pub status: String,
 }
 
 #[cfg(test)]
@@ -700,53 +668,5 @@ mod tests {
     fn plan_execution_config_defaults() {
         let config = PlanExecutionConfig::default();
         assert!(!config.step_by_step);
-    }
-
-    // ── validate_plan_id security regression tests ──────────────────────────
-
-    #[test]
-    fn validate_plan_id_rejects_empty() {
-        assert!(PlanModeState::validate_plan_id("").is_err());
-    }
-
-    #[test]
-    fn validate_plan_id_rejects_path_traversal() {
-        let malicious = ["../etc/passwd", "../../secret", "foo/../bar", ".."];
-        for id in &malicious {
-            let err = PlanModeState::validate_plan_id(id).unwrap_err();
-            assert!(
-                matches!(err, PlanLoadError::InvalidId(_)),
-                "should reject {id}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn validate_plan_id_rejects_slashes_and_special_chars() {
-        let bad = [
-            "foo/bar",
-            "foo\\bar",
-            "plan.json",
-            "id with space",
-            "a;b",
-            "a&b",
-        ];
-        for id in &bad {
-            assert!(
-                PlanModeState::validate_plan_id(id).is_err(),
-                "should reject {id}"
-            );
-        }
-    }
-
-    #[test]
-    fn validate_plan_id_accepts_valid_ids() {
-        let good = ["abc", "plan-123", "my_plan_v2", "ABC-xyz_01"];
-        for id in &good {
-            assert!(
-                PlanModeState::validate_plan_id(id).is_ok(),
-                "should accept {id}"
-            );
-        }
     }
 }

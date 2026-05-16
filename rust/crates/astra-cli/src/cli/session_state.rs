@@ -180,7 +180,7 @@ pub(crate) struct SessionState {
     pub plan_mode_sync_error: Option<String>,
     /// Plan being auto-executed — subtasks sent sequentially through chat.
     pub executing_plan: Option<astra_services::task_orchestrator::TaskPlan>,
-    /// Configuration for current plan execution (step-by-step, auto-execute, etc.).
+    /// Configuration for current plan execution.
     pub plan_execution_config: Option<plan::PlanExecutionConfig>,
     /// Goal text for the executing plan (for summary generation).
     pub executing_plan_goal: Option<String>,

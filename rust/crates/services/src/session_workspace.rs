@@ -1023,7 +1023,7 @@ mod tests {
                 .to_string(),
         );
         ws.plan_goal = Some("Implement feature X".to_string());
-        ws.plan_config_json = Some(r#"{"step_by_step":true,"auto_execute":false}"#.to_string());
+        ws.plan_config_json = Some(r#"{"step_by_step":true}"#.to_string());
         ws.plan_execution_rounds = 3;
 
         let yaml = serde_yaml_ng::to_string(&ws).unwrap();
