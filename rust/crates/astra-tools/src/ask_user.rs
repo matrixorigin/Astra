@@ -408,7 +408,7 @@ fn parse_answers_for_prompt(prompt: &AskUserPrompt, value: &Value) -> Option<Ask
     for question in &prompt.questions {
         let value = answers.get(&question.question)?;
         let parsed_answers = if question.multi_select {
-            value
+            let parsed_answers = value
                 .as_array()?
                 .iter()
                 .map(|item| {
@@ -419,7 +419,11 @@ fn parse_answers_for_prompt(prompt: &AskUserPrompt, value: &Value) -> Option<Ask
                 .collect::<Option<Vec<_>>>()?
                 .into_iter()
                 .map(ToString::to_string)
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            if parsed_answers.is_empty() {
+                return None;
+            }
+            parsed_answers
         } else {
             let answer = value.as_str()?.trim();
             if answer.is_empty() {
@@ -1013,5 +1017,29 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("missing answer for question 'What should we call it?'"));
+    }
+
+    #[test]
+    fn parse_answers_rejects_empty_multiselect_after_trimming() {
+        let prompt = parse_ask_user_prompt(&json!({
+            "questions": [{
+                "header": "Features",
+                "question": "Which features should we include first?",
+                "options": ["RBAC", "Reports"],
+                "multi_select": true
+            }]
+        }))
+        .unwrap();
+
+        let parsed = parse_answers_for_prompt(
+            &prompt,
+            &json!({
+                "answers": {
+                    "Which features should we include first?": [" ", "\t"]
+                }
+            }),
+        );
+
+        assert!(parsed.is_none());
     }
 }
