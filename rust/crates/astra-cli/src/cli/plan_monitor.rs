@@ -924,6 +924,7 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut SessionState) {
     loop {
         let outcome = display_plan_updates_live(state, &mut plan_spinner, &mut current_subtask_tag);
 
+        sync_task_board_from_executing_plan(state).await;
         sync_plan_run_task_progress(state).await;
 
         match outcome {
@@ -1088,6 +1089,83 @@ fn sync_subtask_status(
     }
 }
 
+async fn sync_task_board_subtask_status(
+    state: &SessionState,
+    plan_fingerprint: &str,
+    subtask_id: &str,
+    status: astra_services::task_orchestrator::TaskStatus,
+) -> Result<(), String> {
+    let task = state
+        .task_manager
+        .snapshot()
+        .await
+        .into_iter()
+        .find(|task| {
+            let is_plan_task = task
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("source"))
+                .and_then(serde_json::Value::as_str)
+                == Some("approved_plan");
+            let fingerprint_matches = task
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("plan_fingerprint"))
+                .and_then(serde_json::Value::as_str)
+                == Some(plan_fingerprint);
+            is_plan_task
+                && fingerprint_matches
+                && task.subtasks.iter().any(|subtask| subtask.id == subtask_id)
+        });
+
+    let Some(task) = task else {
+        return Ok(());
+    };
+
+    let output = state
+        .task_manager
+        .update(&serde_json::json!({
+            "task_id": task.id,
+            "subtask_id": subtask_id,
+            "new_status": status.as_str(),
+        }))
+        .await;
+    if output.starts_with("Error:") {
+        return Err(output);
+    }
+    Ok(())
+}
+
+async fn sync_task_board_from_executing_plan(state: &SessionState) {
+    let Some(plan) = state.executing_plan.as_ref() else {
+        return;
+    };
+    if let Some(goal) = state.executing_plan_goal.as_deref()
+        && let Err(error) =
+            crate::plan_interaction::mirror_plan_to_task_board(state, goal, plan).await
+    {
+        tracing::warn!(
+            goal = %goal,
+            error = %error,
+            "failed to ensure executing plan is mirrored into task board"
+        );
+    }
+    let plan_fingerprint = crate::plan_interaction::plan_task_board_fingerprint(plan);
+    for subtask in &plan.subtasks {
+        if let Err(error) =
+            sync_task_board_subtask_status(state, &plan_fingerprint, &subtask.id, subtask.status)
+                .await
+        {
+            tracing::warn!(
+                subtask_id = %subtask.id,
+                status = subtask.status.as_str(),
+                error = %error,
+                "failed to sync plan subtask status into task board"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1124,6 +1202,116 @@ mod tests {
                 .status,
             TaskStatus::InProgress
         );
+    }
+
+    #[tokio::test]
+    async fn task_board_subtask_status_sync_updates_visible_plan_step() {
+        let state = SessionState::default();
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "s1".into(),
+                    title: "Design state model".into(),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "s2".into(),
+                    title: "Handle unhappy paths".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let plan_fingerprint = crate::plan_interaction::plan_task_board_fingerprint(&plan);
+        let create = state
+            .task_manager
+            .create(&serde_json::json!({
+                "title": "Ship plan UX",
+                "metadata": {
+                    "source": "approved_plan",
+                    "plan_id": "plan-1",
+                    "plan_fingerprint": plan_fingerprint
+                },
+                "subtasks": [
+                    { "id": "s1", "title": "Design state model" },
+                    { "id": "s2", "title": "Handle unhappy paths" }
+                ]
+            }))
+            .await;
+        assert!(create.contains("created"), "{create}");
+
+        sync_task_board_subtask_status(&state, &plan_fingerprint, "s2", TaskStatus::InProgress)
+            .await
+            .unwrap();
+
+        let task = state
+            .task_manager
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|task| task.title == "Ship plan UX")
+            .expect("plan task should exist");
+        assert_eq!(task.status, "in_progress");
+        let subtask = task
+            .subtasks
+            .iter()
+            .find(|subtask| subtask.id == "s2")
+            .expect("subtask should exist");
+        assert_eq!(subtask.status, "in_progress");
+    }
+
+    #[tokio::test]
+    async fn executing_plan_sync_does_not_update_stale_plan_with_same_subtask_id() {
+        let mut state = SessionState::default();
+        let stale = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "old step".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        crate::plan_interaction::mirror_plan_to_task_board(&state, "same goal", &stale)
+            .await
+            .unwrap();
+
+        let current = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "new step".into(),
+                status: TaskStatus::InProgress,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        crate::plan_interaction::mirror_plan_to_task_board(&state, "same goal", &current)
+            .await
+            .unwrap();
+        state.executing_plan = Some(current);
+        state.executing_plan_goal = Some("same goal".into());
+
+        sync_task_board_from_executing_plan(&state).await;
+
+        let tasks = state.task_manager.snapshot().await;
+        let stale_task = tasks
+            .iter()
+            .find(|task| {
+                task.subtasks
+                    .iter()
+                    .any(|subtask| subtask.title == "old step")
+            })
+            .expect("stale task exists");
+        assert_eq!(stale_task.subtasks[0].status, "pending");
+
+        let current_task = tasks
+            .iter()
+            .find(|task| {
+                task.subtasks
+                    .iter()
+                    .any(|subtask| subtask.title == "new step")
+            })
+            .expect("current task exists");
+        assert_eq!(current_task.subtasks[0].status, "in_progress");
     }
 
     // ── R3: journal metadata assertion tests ──────────────────────────────────

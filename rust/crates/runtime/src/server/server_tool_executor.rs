@@ -28,7 +28,9 @@ use uuid::Uuid;
 use astra_core::SharedPool;
 use astra_services::{SessionArtifactJsonRecord, SessionArtifactJsonStore};
 use astra_tools::executor::DefaultToolExecutor;
-use astra_tools::task_mgmt::{InMemoryTaskStore, TaskManager, TaskManagerSnapshot, TaskStore};
+use astra_tools::task_mgmt::{
+    InMemoryTaskStore, SessionTask, TaskManager, TaskManagerSnapshot, TaskStore,
+};
 use astra_tools::{AskUserDecision, AskUserGate, ToolExecutor};
 use async_trait::async_trait;
 
@@ -2837,6 +2839,175 @@ impl ServerToolExecutor {
         output
     }
 
+    async fn mirror_approved_plan_to_task_board(
+        &self,
+        plan_id: &str,
+        plan_state: &astra_plan::PlanModeState,
+    ) -> Result<(), String> {
+        if plan_state.plan.subtasks.is_empty() {
+            return Ok(());
+        }
+        let plan_fingerprint = Self::plan_task_board_fingerprint(&plan_state.plan);
+
+        let existing_task_id = self
+            .task_manager
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|task| Self::approved_plan_task_matches(task, plan_id, &plan_fingerprint))
+            .map(|task| task.id);
+
+        let task_id = if let Some(task_id) = existing_task_id {
+            task_id
+        } else {
+            let subtasks: Vec<Value> = plan_state
+                .plan
+                .subtasks
+                .iter()
+                .map(|subtask| {
+                    json!({
+                        "id": subtask.id,
+                        "title": subtask.title,
+                        "description": subtask.description,
+                        "depends_on": subtask.depends_on,
+                    })
+                })
+                .collect();
+            let create_output = self
+                .task_manager
+                .create(&json!({
+                    "title": plan_state.goal,
+                    "description": format!(
+                        "Approved plan: {} step(s). This is the user-visible task tree for plan execution.",
+                        plan_state.plan.subtasks.len()
+                    ),
+                    "active_form": "Executing approved plan",
+                    "owner": self.user_id,
+                    "metadata": {
+                        "source": "approved_plan",
+                        "plan_id": plan_id,
+                        "plan_fingerprint": plan_fingerprint,
+                        "session_id": self.session_id,
+                        "step_count": plan_state.plan.subtasks.len(),
+                    },
+                    "subtasks": subtasks,
+                }))
+                .await;
+            if create_output.starts_with("Error:") {
+                return Err(create_output);
+            }
+
+            let created_task_id = self
+                .task_manager
+                .snapshot()
+                .await
+                .into_iter()
+                .find(|task| Self::approved_plan_task_matches(task, plan_id, &plan_fingerprint))
+                .map(|task| task.id);
+            if let Some(task_id) = created_task_id {
+                task_id
+            } else if create_output.contains("already has this title")
+                || create_output.contains("duplicate_of")
+            {
+                let suffix: String = plan_id.chars().take(16).collect();
+                let disambiguated_title = if suffix.is_empty() {
+                    format!("{} (new plan)", plan_state.goal)
+                } else {
+                    format!("{} ({suffix})", plan_state.goal)
+                };
+                let retry_output = self
+                    .task_manager
+                    .create(&json!({
+                        "title": disambiguated_title,
+                        "description": format!(
+                            "Approved plan: {} step(s). This is the user-visible task tree for plan execution.",
+                            plan_state.plan.subtasks.len()
+                        ),
+                        "active_form": "Executing approved plan",
+                        "owner": self.user_id,
+                        "metadata": {
+                            "source": "approved_plan",
+                            "plan_id": plan_id,
+                            "plan_fingerprint": plan_fingerprint,
+                            "session_id": self.session_id,
+                            "step_count": plan_state.plan.subtasks.len(),
+                        },
+                        "subtasks": subtasks,
+                    }))
+                    .await;
+                if retry_output.starts_with("Error:") {
+                    return Err(retry_output);
+                }
+                self.task_manager
+                    .snapshot()
+                    .await
+                    .into_iter()
+                    .find(|task| Self::approved_plan_task_matches(task, plan_id, &plan_fingerprint))
+                    .map(|task| task.id)
+                    .ok_or_else(|| {
+                        format!(
+                            "approved plan {plan_id} was not visible in task board after duplicate-title retry"
+                        )
+                    })?
+            } else {
+                return Err(format!(
+                    "approved plan {plan_id} was not visible in task board after task.create"
+                ));
+            }
+        };
+
+        let update_output = self
+            .task_manager
+            .update(&json!({
+                "task_id": task_id,
+                "new_status": "in_progress",
+                "metadata": {
+                    "source": "approved_plan",
+                    "plan_id": plan_id,
+                    "plan_fingerprint": plan_fingerprint,
+                    "session_id": self.session_id,
+                    "step_count": plan_state.plan.subtasks.len(),
+                }
+            }))
+            .await;
+        if update_output.starts_with("Error:") {
+            return Err(update_output);
+        }
+        Ok(())
+    }
+
+    fn plan_task_board_fingerprint(plan: &astra_services::task_orchestrator::TaskPlan) -> String {
+        let mut parts = Vec::new();
+        for subtask in &plan.subtasks {
+            parts.push(format!("{}:{}", subtask.id, subtask.title));
+        }
+        parts.join("|")
+    }
+
+    fn approved_plan_task_matches(
+        task: &SessionTask,
+        plan_id: &str,
+        plan_fingerprint: &str,
+    ) -> bool {
+        let metadata = task.metadata.as_ref();
+        let source = metadata
+            .and_then(|metadata| metadata.get("source"))
+            .and_then(Value::as_str);
+        let task_plan_id = metadata
+            .and_then(|metadata| metadata.get("plan_id"))
+            .and_then(Value::as_str);
+        let task_fingerprint = metadata
+            .and_then(|metadata| metadata.get("plan_fingerprint"))
+            .and_then(Value::as_str);
+
+        source == Some("approved_plan")
+            && task_fingerprint == Some(plan_fingerprint)
+            && match task_plan_id {
+                Some(existing_plan_id) => existing_plan_id == plan_id,
+                None => true,
+            }
+    }
+
     fn server_get_agent_info(&self, args: &Value) -> String {
         let dimension = args
             .get("dimension")
@@ -3743,6 +3914,19 @@ impl ServerToolExecutor {
                 return format!("Error: clear active plan: {e}");
             }
 
+            let approved_plan_state = match repo.load(&active).await {
+                Ok(state) => Some(state),
+                Err(e) => {
+                    tracing::warn!(
+                        plan_id = %active,
+                        session_id = %self.session_id,
+                        error = %e,
+                        "exit_plan_mode: failed to load approved plan for task synchronization"
+                    );
+                    None
+                }
+            };
+
             // Seed `session_plan_todos` so the next turn has executable
             // items without the model manually re-creating each subtask.
             // The sink is optional: when `None`, the seed step is a no-op
@@ -3752,19 +3936,9 @@ impl ServerToolExecutor {
             // way, and the model can still re-create todos via the
             // `task` tool. We log via the journal but don't roll back
             // the unlock.
-            if let Some(sink) = self.plan_todo_sink.clone() {
-                let plan_state = match repo.load(&active).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!(
-                            plan_id = %active,
-                            session_id = %self.session_id,
-                            error = %e,
-                            "exit_plan_mode: failed to load plan for todo seed"
-                        );
-                        astra_plan::PlanModeState::default()
-                    }
-                };
+            if let (Some(sink), Some(plan_state)) =
+                (self.plan_todo_sink.clone(), approved_plan_state.as_ref())
+            {
                 let seeds: Vec<astra_services::PlanTodoSeed> = plan_state
                     .plan
                     .subtasks
@@ -3791,6 +3965,22 @@ impl ServerToolExecutor {
                          model can re-create via `task` tool"
                     );
                 }
+            }
+
+            // Keep the user-visible task board aligned with the approved
+            // plan. `session_plan_todos` remains the execution queue; this
+            // task tree is the surface the user and model can inspect.
+            if let Some(plan_state) = approved_plan_state.as_ref()
+                && let Err(e) = self
+                    .mirror_approved_plan_to_task_board(&active, plan_state)
+                    .await
+            {
+                tracing::warn!(
+                    plan_id = %active,
+                    session_id = %self.session_id,
+                    error = %e,
+                    "exit_plan_mode: failed to mirror approved plan into task board"
+                );
             }
         }
 
@@ -6194,6 +6384,359 @@ esac
                 "every seeded todo must inherit the plan owner so isolation holds"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_approved_mirrors_plan_into_user_visible_task_tree() {
+        let repo = Arc::new(InMemoryPlanRepo::new());
+        let mut state = astra_plan::PlanModeState::new_with_owner(
+            "ship user-visible plan".into(),
+            astra_plan::ProjectContext::default(),
+            "alice".into(),
+        );
+        for (i, title) in [
+            "design state model",
+            "sync task board",
+            "cover unhappy paths",
+        ]
+        .iter()
+        .enumerate()
+        {
+            state
+                .plan
+                .subtasks
+                .push(astra_services::task_orchestrator::SubtaskPlan {
+                    id: format!("step-{}", i + 1),
+                    title: (*title).into(),
+                    status: astra_services::task_orchestrator::TaskStatus::Pending,
+                    ..Default::default()
+                });
+        }
+        repo.save("plan-visible-task", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("visible-session", Some("plan-visible-task"))
+            .await
+            .unwrap();
+
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
+        exec.session_id = "visible-session".to_string();
+        exec.user_id = "alice".to_string();
+
+        let result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            result.contains("unlocked"),
+            "exit_plan_mode approved must announce unlock; got: {result}"
+        );
+
+        let tasks = exec.task_manager.snapshot().await;
+        let plan_task = tasks
+            .iter()
+            .find(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("source"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("approved_plan")
+            })
+            .expect("approved plan must be mirrored into the user-visible task board");
+        assert_eq!(plan_task.title, "ship user-visible plan");
+        assert_eq!(plan_task.status, "in_progress");
+        assert_eq!(plan_task.subtasks.len(), 3);
+        assert_eq!(plan_task.subtasks[0].id, "step-1");
+        assert_eq!(plan_task.subtasks[0].title, "design state model");
+        assert!(
+            plan_task
+                .subtasks
+                .iter()
+                .all(|subtask| subtask.status == "pending"),
+            "newly approved plan steps should start pending: {plan_task:?}"
+        );
+        assert_eq!(
+            plan_task
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("plan_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("plan-visible-task")
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_approved_does_not_collide_with_existing_async_or_subagent_task_title() {
+        let repo = Arc::new(InMemoryPlanRepo::new());
+        let mut state = astra_plan::PlanModeState::new_with_owner(
+            "ship user-visible plan".into(),
+            astra_plan::ProjectContext::default(),
+            "alice".into(),
+        );
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "step-1".into(),
+                title: "sync task board".into(),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        repo.save("plan-title-collision", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("collision-session", Some("plan-title-collision"))
+            .await
+            .unwrap();
+
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
+        exec.session_id = "collision-session".to_string();
+        exec.user_id = "alice".to_string();
+
+        let unrelated = exec
+            .task_manager
+            .create(&json!({
+                "title": "ship user-visible plan",
+                "owner": "subagent-1",
+                "metadata": {
+                    "source": "agent_job",
+                    "agent_id": "subagent-1"
+                }
+            }))
+            .await;
+        assert!(unrelated.contains("created"), "{unrelated}");
+
+        let result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            result.contains("unlocked"),
+            "exit_plan_mode approved must announce unlock; got: {result}"
+        );
+
+        let tasks = exec.task_manager.snapshot().await;
+        assert!(
+            tasks.iter().any(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("source"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("agent_job")
+            }),
+            "pre-existing async/subagent task must remain visible"
+        );
+        assert!(
+            tasks.iter().any(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("source"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("approved_plan")
+                    && task
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("plan_id"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("plan-title-collision")
+            }),
+            "approved plan must still create its own task tree despite title collision: {tasks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_approved_reuses_cli_style_plan_tree_with_matching_fingerprint() {
+        let repo = Arc::new(InMemoryPlanRepo::new());
+        let mut state = astra_plan::PlanModeState::new_with_owner(
+            "ship user-visible plan".into(),
+            astra_plan::ProjectContext::default(),
+            "alice".into(),
+        );
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "step-1".into(),
+                title: "sync task board".into(),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        repo.save("plan-reuse-cli-tree", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("reuse-session", Some("plan-reuse-cli-tree"))
+            .await
+            .unwrap();
+
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
+        exec.session_id = "reuse-session".to_string();
+        exec.user_id = "alice".to_string();
+
+        let fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
+        let cli_style = exec
+            .task_manager
+            .create(&json!({
+                "title": "ship user-visible plan",
+                "metadata": {
+                    "source": "approved_plan",
+                    "plan_fingerprint": fingerprint
+                },
+                "subtasks": [
+                    { "id": "step-1", "title": "sync task board" }
+                ]
+            }))
+            .await;
+        assert!(cli_style.contains("created"), "{cli_style}");
+
+        let result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            result.contains("unlocked"),
+            "exit_plan_mode approved must announce unlock; got: {result}"
+        );
+
+        let approved_plan_tasks: Vec<_> = exec
+            .task_manager
+            .snapshot()
+            .await
+            .into_iter()
+            .filter(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("source"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("approved_plan")
+            })
+            .collect();
+        assert_eq!(
+            approved_plan_tasks.len(),
+            1,
+            "server path should reuse CLI-style mirrored tree instead of duplicating it: {approved_plan_tasks:?}"
+        );
+        assert_eq!(
+            approved_plan_tasks[0]
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("plan_fingerprint"))
+                .and_then(serde_json::Value::as_str),
+            Some(fingerprint.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_approved_does_not_reuse_stale_server_tree_when_fingerprint_changes() {
+        let repo = Arc::new(InMemoryPlanRepo::new());
+        let mut state = astra_plan::PlanModeState::new_with_owner(
+            "ship user-visible plan".into(),
+            astra_plan::ProjectContext::default(),
+            "alice".into(),
+        );
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "step-1".into(),
+                title: "old task board sync".into(),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        let stale_fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
+        repo.save("plan-same-id-new-steps", &mut state, None)
+            .await
+            .unwrap();
+
+        state.plan.subtasks[0].title = "new task board sync".into();
+        let fresh_fingerprint = ServerToolExecutor::plan_task_board_fingerprint(&state.plan);
+        repo.save("plan-same-id-new-steps", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("same-id-session", Some("plan-same-id-new-steps"))
+            .await
+            .unwrap();
+
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
+        exec.session_id = "same-id-session".to_string();
+        exec.user_id = "alice".to_string();
+
+        let stale_tree = exec
+            .task_manager
+            .create(&json!({
+                "title": "ship user-visible plan",
+                "metadata": {
+                    "source": "approved_plan",
+                    "plan_id": "plan-same-id-new-steps",
+                    "plan_fingerprint": stale_fingerprint,
+                },
+                "subtasks": [
+                    { "id": "step-1", "title": "old task board sync" }
+                ]
+            }))
+            .await;
+        assert!(stale_tree.contains("created"), "{stale_tree}");
+
+        let result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            result.contains("unlocked"),
+            "exit_plan_mode approved must announce unlock; got: {result}"
+        );
+
+        let approved_plan_tasks: Vec<_> = exec
+            .task_manager
+            .snapshot()
+            .await
+            .into_iter()
+            .filter(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("source"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("approved_plan")
+            })
+            .collect();
+        assert_eq!(
+            approved_plan_tasks.len(),
+            2,
+            "a changed plan fingerprint must create a fresh mirrored tree instead of reusing stale steps: {approved_plan_tasks:?}"
+        );
+        assert!(
+            approved_plan_tasks.iter().any(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("plan_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("plan-same-id-new-steps")
+                    && task
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("plan_fingerprint"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(fresh_fingerprint.as_str())
+                    && task
+                        .subtasks
+                        .iter()
+                        .any(|subtask| subtask.title == "new task board sync")
+            }),
+            "fresh mirrored tree missing after plan edit: {approved_plan_tasks:?}"
+        );
+        assert!(
+            approved_plan_tasks.iter().any(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("plan_fingerprint"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(stale_fingerprint.as_str())
+                    && task
+                        .subtasks
+                        .iter()
+                        .any(|subtask| subtask.title == "old task board sync")
+            }),
+            "stale tree should remain distinct rather than being silently mutated: {approved_plan_tasks:?}"
+        );
     }
 
     /// Rejected plans must NOT seed todos — the plan is still being
