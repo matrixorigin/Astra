@@ -94,6 +94,28 @@ pub fn local_tool_schemas() -> Vec<Value> {
     }
     schemas
 }
+
+/// Plan-mode write guard tool list (CLI parity with
+/// `server_tool_executor::is_plan_mode_blocked_tool`). While a plan is
+/// in `phase=planning` these tools must be short-circuited: they all
+/// mutate the world (filesystem, DB, git, GitHub), so allowing them
+/// would let the model execute a plan it has not yet had approved.
+/// Read-only tools (read_file, grep, glob, git_status/diff/log,
+/// task_*, memory_*) stay available so the agent can keep authoring.
+fn is_plan_mode_blocked_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "bash"
+            | "write_file"
+            | "str_replace"
+            | "mo"
+            | "rollback_database_snapshots"
+            | "git_commit"
+            | "git_stash"
+            | "git_revert_commit"
+            | "github_create_issue"
+    )
+}
 #[path = "edge_tools/diagnose.rs"]
 mod diagnose;
 #[path = "edge_tools/file_state.rs"]
@@ -624,6 +646,13 @@ pub struct ToolExecutor {
     /// activation can reach plugin tools. Populated by the TUI after
     /// `PluginRegistry::register` loads the user's skill manifests.
     plugin_schemas: std::sync::RwLock<Vec<Value>>,
+    /// Cached plan-mode authoring flag for the active session. Mirrors the
+    /// server-side write guard so a CLI run that talks to the same plan
+    /// store cannot bypass plan mode by routing mutations through the
+    /// local executor (session b4cef5bb regression). `None` = not yet
+    /// probed; `Some(true)` = a planning-phase plan exists, mutations
+    /// must be blocked; `Some(false)` = no planning plan, writes flow.
+    plan_mode_authoring_cache: std::sync::Arc<tokio::sync::RwLock<Option<bool>>>,
 }
 
 impl ToolExecutor {
@@ -713,6 +742,7 @@ impl ToolExecutor {
                     detach_shell_handle: None,
                 },
             ),
+            plan_mode_authoring_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -1114,6 +1144,58 @@ impl ToolExecutor {
             .clone()
     }
 
+    // ─── Plan-mode write guard (parity with server_tool_executor) ───────────
+    //
+    // While a plan is in `phase=planning`, world-mutating tools must be
+    // short-circuited so the model cannot bypass authoring by routing
+    // writes through the local executor. The check fails open when the
+    // CLI is offline / unauthenticated — without a cloud binding there
+    // is no plan store to consult, and a "fail closed" stance would
+    // break every offline `astra` invocation.
+
+    async fn plan_mode_authoring_active(&self) -> bool {
+        if let Some(cached) = *self.plan_mode_authoring_cache.read().await {
+            return cached;
+        }
+        let active = self.recompute_plan_mode_authoring().await;
+        *self.plan_mode_authoring_cache.write().await = Some(active);
+        active
+    }
+
+    async fn recompute_plan_mode_authoring(&self) -> bool {
+        let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty()) else {
+            return false;
+        };
+        let Some(token) = self.cloud_token() else {
+            return false;
+        };
+        let Ok(client) = self.remote_plan_client() else {
+            return false;
+        };
+        let plans = match client
+            .get_plans_query_json(
+                &token,
+                &[
+                    ("session_id", session_id),
+                    ("phase", "planning".to_string()),
+                    ("limit", "1".to_string()),
+                ],
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(_) => return false, // fail open: a transient lookup error must not block writes
+        };
+        plans
+            .get("plans")
+            .and_then(Value::as_array)
+            .is_some_and(|arr| !arr.is_empty())
+    }
+
+    pub(crate) async fn invalidate_plan_mode_cache(&self) {
+        *self.plan_mode_authoring_cache.write().await = None;
+    }
+
     // ─── Task management methods (delegated to task_mgmt module) ────────────
 
     /// Phase 1 split (2026-05): the four background actions moved off
@@ -1240,6 +1322,11 @@ impl ToolExecutor {
             return "Error: failed to enter plan mode: create plan response missing plan_id."
                 .to_string();
         };
+        // The new planning plan flips the write guard; force the cache to
+        // re-probe on the next mutation attempt (or, equivalently, seed
+        // it directly to `true` so the very first post-enter write is
+        // blocked without an extra round-trip).
+        *self.plan_mode_authoring_cache.write().await = Some(true);
         format!(
             "Entered plan mode. plan_id={plan_id} goal=\"{goal}\". Write tools are now blocked — author the plan, then call exit_plan_mode when it's ready for execution."
         )
@@ -1321,10 +1408,17 @@ impl ToolExecutor {
             .unwrap_or(plan_id);
 
         if approved {
+            // Approval flips the guard off — seed the cache so the very
+            // next mutation tool runs without an extra probe.
+            *self.plan_mode_authoring_cache.write().await = Some(false);
             format!(
                 "Exited plan mode. plan_id={resolved_plan_id} is approved; write tools unlocked. Use /plans/{resolved_plan_id}/execute to run the plan."
             )
         } else {
+            // Rejection keeps the plan in `planning`; the guard stays on.
+            // Re-seed `true` to defend against any racy outside change to
+            // the cache state.
+            *self.plan_mode_authoring_cache.write().await = Some(true);
             format!(
                 "Plan {resolved_plan_id} left open for another authoring pass. Write tools remain blocked."
             )
@@ -2597,6 +2691,14 @@ impl ToolExecutor {
             crate::tool_safety_guard::ToolSafetyGuard::check_dispatch(name, args)
         {
             error
+        } else if is_plan_mode_blocked_tool(name) && self.plan_mode_authoring_active().await {
+            format!(
+                "Error: Tool '{name}' is blocked while plan mode is active. \
+                 The agent must call `exit_plan_mode` with an approved plan \
+                 before any write operation. This mirrors Claude Code's plan \
+                 mode: the plan is authored with read-only tools, approved by \
+                 the user, then execution proceeds with writes unlocked."
+            )
         } else {
             match name {
                 "bash" => self.bash_async(args).await,

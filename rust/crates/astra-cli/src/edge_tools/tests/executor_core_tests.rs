@@ -274,6 +274,232 @@ async fn exit_plan_mode_accepts_plan_alias_and_defaults_to_approved() {
     );
 }
 
+// ── Plan-mode write guard (CLI parity with server-side guard) ──────────
+//
+// Session b4cef5bb (2026-05-16, Haiku 4.5) showed the model writing 14
+// files via `write_file` while the active plan was still in `planning`
+// phase (rejected v2/v3, never approved). The server tool executor
+// already short-circuits mutation tools while a plan is being authored
+// (`server_tool_executor::is_plan_mode_blocked_tool` +
+// `plan_mode_authoring_active`), but the CLI's local `ToolExecutor`
+// did NOT. These tests pin the parity contract.
+
+async fn mock_planning_plan_present(server: &MockServer, session_id: &str, plan_id: &str) {
+    Mock::given(method("GET"))
+        .and(path("/plans"))
+        .and(header("authorization", "Bearer token"))
+        .and(query_param("session_id", session_id))
+        .and(query_param("phase", "planning"))
+        .and(query_param("limit", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "plans": [
+                { "plan_id": plan_id, "goal": "Ship auth" }
+            ]
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn mock_no_planning_plan(server: &MockServer, session_id: &str) {
+    Mock::given(method("GET"))
+        .and(path("/plans"))
+        .and(header("authorization", "Bearer token"))
+        .and(query_param("session_id", session_id))
+        .and(query_param("phase", "planning"))
+        .and(query_param("limit", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"plans": []})))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn write_file_is_blocked_while_plan_mode_is_authoring() {
+    let server = MockServer::start().await;
+    mock_planning_plan_present(&server, "sess-1", "plan-9").await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(temp.path().to_path_buf())
+        .with_active_session_id("sess-1")
+        .with_cloud(server.uri(), "token");
+    let target = temp.path().join("ledger.txt");
+
+    let result = executor
+        .execute(
+            "write_file",
+            &json!({"path": target.to_string_lossy(), "content": "x"}),
+        )
+        .await;
+
+    assert!(
+        result.contains("blocked while plan mode is active"),
+        "write_file must be blocked while a plan is being authored (parity with server). Got: {result}"
+    );
+    assert!(
+        result.contains("exit_plan_mode"),
+        "the error must point the model at exit_plan_mode as the escape hatch. Got: {result}"
+    );
+    assert!(
+        !target.exists(),
+        "the guard must short-circuit BEFORE any file is created on disk"
+    );
+}
+
+#[tokio::test]
+async fn bash_is_blocked_while_plan_mode_is_authoring() {
+    let server = MockServer::start().await;
+    mock_planning_plan_present(&server, "sess-1", "plan-9").await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let canary = temp.path().join("canary.txt");
+    let executor = ToolExecutor::new(temp.path().to_path_buf())
+        .with_active_session_id("sess-1")
+        .with_cloud(server.uri(), "token");
+
+    let result = executor
+        .execute(
+            "bash",
+            &json!({"command": format!("touch {}", canary.display())}),
+        )
+        .await;
+
+    assert!(
+        result.contains("blocked while plan mode is active"),
+        "bash must be blocked while a plan is being authored. Got: {result}"
+    );
+    assert!(
+        !canary.exists(),
+        "the bash guard must run before the shell, so no side effects leak"
+    );
+}
+
+#[tokio::test]
+async fn read_only_tools_are_not_blocked_while_plan_mode_is_authoring() {
+    let server = MockServer::start().await;
+    mock_planning_plan_present(&server, "sess-1", "plan-9").await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let probe = temp.path().join("probe.txt");
+    std::fs::write(&probe, "hello").unwrap();
+
+    let executor = ToolExecutor::new(temp.path().to_path_buf())
+        .with_active_session_id("sess-1")
+        .with_cloud(server.uri(), "token");
+
+    let result = executor
+        .execute("read_file", &json!({"path": probe.to_string_lossy()}))
+        .await;
+
+    assert!(
+        !result.contains("blocked while plan mode is active"),
+        "read_file is read-only and must remain available during plan authoring. Got: {result}"
+    );
+    assert!(
+        result.contains("hello"),
+        "read_file must return the file contents. Got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn writes_are_unblocked_after_exit_plan_mode_approved() {
+    let server = MockServer::start().await;
+    // Initially a planning plan exists. exit_plan_mode flips the phase.
+    mock_planning_plan_present(&server, "sess-1", "plan-9").await;
+    Mock::given(method("POST"))
+        .and(path("/plans/plan-9/exit-plan-mode"))
+        .and(header("authorization", "Bearer token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "plan_id": "plan-9",
+            "phase": "refining"
+        })))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("note.txt");
+    let executor = ToolExecutor::new(temp.path().to_path_buf())
+        .with_active_session_id("sess-1")
+        .with_cloud(server.uri(), "token");
+
+    // Sanity: blocked first.
+    let blocked = executor
+        .execute(
+            "write_file",
+            &json!({"path": target.to_string_lossy(), "content": "x"}),
+        )
+        .await;
+    assert!(
+        blocked.contains("blocked while plan mode is active"),
+        "precondition: writes must be blocked before exit. Got: {blocked}"
+    );
+
+    // Approve exit.
+    let exit = executor
+        .execute("exit_plan_mode", &json!({"approved": true}))
+        .await;
+    assert!(
+        exit.starts_with("Exited plan mode."),
+        "exit_plan_mode(approved=true) must succeed. Got: {exit}"
+    );
+
+    // After approval, writes go through.
+    let unblocked = executor
+        .execute(
+            "write_file",
+            &json!({"path": target.to_string_lossy(), "content": "x"}),
+        )
+        .await;
+    assert!(
+        !unblocked.contains("blocked while plan mode is active"),
+        "after exit_plan_mode(approved=true), writes must be unblocked. Got: {unblocked}"
+    );
+}
+
+#[tokio::test]
+async fn write_guard_is_inactive_when_no_planning_plan_exists() {
+    let server = MockServer::start().await;
+    mock_no_planning_plan(&server, "sess-1").await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("note.txt");
+    let executor = ToolExecutor::new(temp.path().to_path_buf())
+        .with_active_session_id("sess-1")
+        .with_cloud(server.uri(), "token");
+
+    let result = executor
+        .execute(
+            "write_file",
+            &json!({"path": target.to_string_lossy(), "content": "x"}),
+        )
+        .await;
+
+    assert!(
+        !result.contains("blocked while plan mode is active"),
+        "with no planning plan present, the guard must be inactive. Got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn write_guard_is_inactive_without_cloud_binding() {
+    // No cloud binding ⇒ guard cannot consult the plan store; it must
+    // fail open so offline / unauthenticated CLI runs still work.
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("note.txt");
+    let executor =
+        ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-1");
+
+    let result = executor
+        .execute(
+            "write_file",
+            &json!({"path": target.to_string_lossy(), "content": "x"}),
+        )
+        .await;
+
+    assert!(
+        !result.contains("blocked while plan mode is active"),
+        "without cloud binding, the guard must fail open. Got: {result}"
+    );
+}
+
 /// `agent_job` is the new entry point. It must dispatch the four
 /// background actions to the same handlers that previously sat on
 /// `task` — verified here with the cheapest possible smoke: an
