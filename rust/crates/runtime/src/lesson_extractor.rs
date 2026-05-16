@@ -1,8 +1,8 @@
 //! Session-end lesson extractor.
 //!
 //! When a session ends, the signals we already track — repeated tool
-//! failures, stall events, user corrections, unmet postconditions — need
-//! to be distilled into lessons for Memoria L3 storage.
+//! failures, stall events, and user corrections — need to be distilled
+//! into lessons for Memoria L3 storage.
 //!
 //! This module is the pure mapping step: `SessionSummary` → `Vec<NewLesson>`.
 //! No DB, no clocks, no config. The main loop (or the session-end hook) is
@@ -43,8 +43,6 @@ pub struct SessionSummary {
     pub stall_events: u32,
     /// User-correction snippets recorded during the session.
     pub user_corrections: Vec<String>,
-    /// Number of unmet postconditions on the session's last ActionPlan run.
-    pub unmet_postconditions: u32,
     /// Tools that were successfully used ≥ SUCCESS_REHABILITATE_THRESHOLD
     /// times this session. Used to weaken stale ToolDeprioritize lessons:
     /// if the agent successfully used grep 5 times today, the "avoid grep"
@@ -72,17 +70,15 @@ pub const SUCCESS_REHABILITATE_THRESHOLD: usize = 3;
 pub const STALL_LESSON_THRESHOLD: u32 = 3;
 /// User corrections that warrant a PromptShape lesson.
 pub const CORRECTION_LESSON_THRESHOLD: usize = 2;
-/// Unmet postconditions that warrant a PostconditionPattern lesson.
-pub const UNMET_POSTCONDITION_LESSON_THRESHOLD: u32 = 3;
 
 // ── Extractor ───────────────────────────────────────────────────────────────
 
 /// Distil a session summary into durable lessons for
 /// `(user_id, persona, workload_tag)`.
 ///
-/// Output ordering is deterministic: tool deprioritize lessons first
-/// (sorted by tool name), then stall / correction / postcondition
-/// pattern lessons. Deterministic output keeps upstream tests stable.
+/// Output ordering is deterministic: tool deprioritize lessons first,
+/// then stall / correction prompt-shape lessons. Deterministic output
+/// keeps upstream tests stable.
 #[must_use]
 pub fn extract_lessons(
     summary: &SessionSummary,
@@ -159,21 +155,6 @@ pub fn extract_lessons(
         });
     }
 
-    // Unmet postconditions → PostconditionPattern.
-    if summary.unmet_postconditions >= UNMET_POSTCONDITION_LESSON_THRESHOLD {
-        out.push(NewLesson {
-            user_id: user_id.to_string(),
-            persona: persona.to_string(),
-            workload_tag: workload_tag.map(str::to_string),
-            kind: LessonKind::PostconditionPattern,
-            trigger_signal: "unmet_postconditions".to_string(),
-            action: "split the plan into smaller actions with narrower postconditions; \
-                     verify each action's outcome before the next one"
-                .into(),
-            confidence: None,
-        });
-    }
-
     out
 }
 
@@ -184,8 +165,8 @@ pub fn extract_lessons(
 ///
 /// Zero-failure tools are omitted so the extractor's thresholds don't
 /// see noise. Missing `ObservabilitySession` degrades gracefully: the
-/// secondary signals (stalls / corrections / unmet postconditions) stay
-/// at zero rather than pretending we have data we don't.
+/// secondary signals (stalls / corrections) stay at zero rather than
+/// pretending we have data we don't.
 #[must_use]
 pub fn summarise_from_runtime(
     tool_health: &[ToolHealthEntry],
@@ -232,11 +213,10 @@ pub fn summarise_from_runtime(
         }
     }
 
-    let (user_corrections, unmet_postconditions, stall_events) = match obs {
-        None => (Vec::new(), 0, 0),
+    let (user_corrections, stall_events) = match obs {
+        None => (Vec::new(), 0),
         Some(session) => (
             session.recent_correction_excerpts.clone(),
-            session.unmet_postcondition_count,
             session.stall_event_count,
         ),
     };
@@ -257,7 +237,6 @@ pub fn summarise_from_runtime(
         undetermined_failure_tools,
         stall_events,
         user_corrections,
-        unmet_postconditions,
         rehabilitated_tools,
     }
 }
@@ -305,7 +284,6 @@ mod tests {
         s.tool_failures.insert("grep".into(), 2); // threshold is 3
         s.stall_events = 2;
         s.user_corrections = vec!["nit 1".into()]; // threshold is 2
-        s.unmet_postconditions = 2;
         assert!(extract_lessons(&s, "u", "p", None).is_empty());
     }
 
@@ -397,30 +375,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unmet_postconditions_at_threshold_yield_postcondition_pattern() {
-        let mut s = base_summary();
-        s.unmet_postconditions = 3;
-        let out = extract_lessons(&s, "u", "p", None);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].kind, LessonKind::PostconditionPattern);
-    }
-
     // ── Composition — multiple signals at once ──────────────────────────────
 
     #[test]
-    fn all_four_signals_present_yield_all_four_lesson_kinds() {
+    fn tool_stall_and_correction_signals_yield_expected_lesson_kinds() {
         let mut s = base_summary();
         s.tool_failures.insert("grep".into(), 3);
         s.stall_events = 3;
         s.user_corrections = vec!["a".into(), "b".into()];
-        s.unmet_postconditions = 3;
         let out = extract_lessons(&s, "u", "p", None);
-        assert_eq!(out.len(), 4);
+        assert_eq!(out.len(), 3);
         let kinds: std::collections::HashSet<LessonKind> = out.iter().map(|l| l.kind).collect();
         assert!(kinds.contains(&LessonKind::ToolDeprioritize));
         assert!(kinds.contains(&LessonKind::PromptShape));
-        assert!(kinds.contains(&LessonKind::PostconditionPattern));
     }
 
     // ── Workload tag plumbing ───────────────────────────────────────────────
@@ -446,7 +413,6 @@ mod tests {
         s.tool_failures.insert("rg".into(), 3);
         s.stall_events = 7;
         s.user_corrections = (0..6).map(|i| format!("correction {i}")).collect();
-        s.unmet_postconditions = 9;
         let out = extract_lessons(&s, "u", "p", Some("x"));
         for l in &out {
             l.validate().unwrap_or_else(|e| {
@@ -464,7 +430,6 @@ mod tests {
         s.tool_failures.insert("grep".into(), 3);
         s.stall_events = 5;
         s.user_corrections = vec!["a".into(), "b".into()];
-        s.unmet_postconditions = 4;
         let lessons = extract_lessons(&s, "u", "p", None);
 
         for l in &lessons {
@@ -482,7 +447,6 @@ mod tests {
         s2.tool_failures.insert("grep".into(), 10); // different count
         s2.stall_events = 20;
         s2.user_corrections = vec!["x".into(), "y".into()]; // different snippets
-        s2.unmet_postconditions = 99;
         let lessons2 = extract_lessons(&s2, "u", "p", None);
 
         let keys1: Vec<(&str, &str)> = lessons
@@ -571,11 +535,10 @@ mod tests {
         let s = summarise_from_runtime(&entries, None);
         assert_eq!(s.stall_events, 0);
         assert!(s.user_corrections.is_empty());
-        assert_eq!(s.unmet_postconditions, 0);
     }
 
     #[test]
-    fn summarise_with_observability_extracts_corrections_and_unmet() {
+    fn summarise_with_observability_extracts_corrections() {
         use crate::observability_integration::ObservabilitySession;
         let mut obs = ObservabilitySession::new_simple("s-test");
         obs.recent_correction_excerpts = vec!["use rg not grep".into(), "narrow to src/".into()];
@@ -586,32 +549,27 @@ mod tests {
     }
 
     #[test]
-    fn summarise_propagates_stall_and_unmet_counts_from_observability() {
-        // P7a: the two new counters must flow through to the extractor so
-        // session-end can emit PromptShape / PostconditionPattern lessons.
+    fn summarise_propagates_stall_counts_from_observability() {
         use crate::observability_integration::ObservabilitySession;
         let mut obs = ObservabilitySession::new_simple("s-p7a");
         obs.record_stall_event();
         obs.record_stall_event();
         obs.record_stall_event();
-        obs.record_unmet_postconditions(5);
 
         let s = summarise_from_runtime(&[], Some(&obs));
         assert_eq!(s.stall_events, 3);
-        assert_eq!(s.unmet_postconditions, 5);
     }
 
     #[test]
-    fn summarise_with_stalls_and_unmet_yields_all_lesson_kinds_end_to_end() {
+    fn summarise_with_stalls_yields_expected_lesson_kinds_end_to_end() {
         // Full stack: observability counters → summary → extractor must
-        // produce ToolDeprioritize + PromptShape (stalls) + PostconditionPattern.
+        // produce ToolDeprioritize + PromptShape (stalls).
         use crate::observability_integration::ObservabilitySession;
         let entries = vec![health_inherent("grep", 3, 5)];
         let mut obs = ObservabilitySession::new_simple("s-p7a-e2e");
         obs.record_stall_event();
         obs.record_stall_event();
         obs.record_stall_event();
-        obs.record_unmet_postconditions(4);
 
         let summary = summarise_from_runtime(&entries, Some(&obs));
         let lessons = extract_lessons(&summary, "u1", "generic", None);
@@ -619,6 +577,5 @@ mod tests {
         let kinds: std::collections::HashSet<LessonKind> = lessons.iter().map(|l| l.kind).collect();
         assert!(kinds.contains(&LessonKind::ToolDeprioritize));
         assert!(kinds.contains(&LessonKind::PromptShape));
-        assert!(kinds.contains(&LessonKind::PostconditionPattern));
     }
 }

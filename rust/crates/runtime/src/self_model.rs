@@ -92,12 +92,6 @@ pub struct SelfModel {
     /// them or try anyway.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub low_confidence_tools: Vec<LowConfidenceTool>,
-    /// Postconditions that the most recent `ActionPlan` execution did not
-    /// satisfy. Surfaced so the next turn's LLM reasoning is grounded in
-    /// structured "what I expected but didn't observe", not in re-reading
-    /// its own free-text plan.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unmet_postconditions: Vec<UnmetPostCondition>,
     /// Output of the most recent auto-invoked diagnostic skill
     /// ([`astra_skills::auto_invoke::SkillDiagnosis`]). Stays attached until
     /// a fresh auto-invoke replaces it or the caller explicitly clears.
@@ -124,34 +118,12 @@ pub struct SelfModel {
 // `use astra_runtime::self_model::LessonHint` imports continue to compile.
 pub use astra_services::LessonHint;
 
-/// A single unmet postcondition, typed for prompt rendering and audit.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct UnmetPostCondition {
-    pub action_index: u32,
-    /// Stable discriminator matching `PostCondition` variants, so the
-    /// renderer and any downstream tooling can grow new cases without a
-    /// lossy `Debug` round-trip.
-    pub kind: String,
-}
-
 /// Actionable feedback derived from the previous turn's passive evaluator.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TurnQualityFeedback {
     pub turn: u32,
     pub findings: Vec<String>,
     pub recommended_action: String,
-}
-
-impl From<&astra_plan::action_plan::PostCondition> for UnmetPostCondition {
-    fn from(pc: &astra_plan::action_plan::PostCondition) -> Self {
-        use astra_plan::action_plan::PostCondition as Pc;
-        match pc {
-            Pc::ToolCallSucceeded { action_index } => Self {
-                action_index: *action_index,
-                kind: "tool_call_succeeded".to_string(),
-            },
-        }
-    }
 }
 
 /// A tool that has been failing at a high rate in recent use, surfaced
@@ -543,49 +515,10 @@ impl SelfModel {
             recent_correction_excerpts: Vec::new(),
             outcome_bias: std::collections::BTreeMap::new(),
             low_confidence_tools: Vec::new(),
-            unmet_postconditions: Vec::new(),
             skill_diagnosis: None,
             turn_quality_feedback: None,
             lessons: Vec::new(),
         }
-    }
-
-    /// Attach the set of postconditions that the most recent `ActionPlan`
-    /// run failed to satisfy. Empty input clears any previously attached set.
-    pub fn with_unmet_postconditions(mut self, unmet: Vec<UnmetPostCondition>) -> Self {
-        self.unmet_postconditions = unmet;
-        self
-    }
-
-    /// Bind the self-model to the most recent entry of an
-    /// [`astra_plan::action_plan::ExecutionLedger`].
-    ///
-    /// Three-state semantics:
-    /// * **empty ledger** (no runs yet) → no-op; any previously attached
-    ///   `unmet_postconditions` is preserved.
-    /// * **latest ran and everything was met** → `unmet_postconditions` is
-    ///   cleared; stale verdicts must not linger past a successful run.
-    /// * **latest ran with unmet** → `unmet_postconditions` is replaced by
-    ///   the latest run's unmet list (typed via `UnmetPostCondition::from`).
-    ///
-    /// The ledger binding is the authoritative source when present, so it
-    /// overrides any manual `with_unmet_postconditions` call made earlier
-    /// in the builder chain.
-    pub fn with_execution_ledger(
-        mut self,
-        ledger: &astra_plan::action_plan::ExecutionLedger,
-    ) -> Self {
-        // `latest_unmet()` distinguishes three cases:
-        //   * `None`            → ledger empty (never ran) → preserve caller's field as-is.
-        //   * `Some(vec![])`    → latest ran, everything met → overwrite with empty vec
-        //                         (this is what clears stale verdicts after a successful run).
-        //   * `Some(non-empty)` → latest ran with unmet → overwrite with the latest set.
-        // Merging the last two into a single assignment is deliberate: any
-        // `Some` from the ledger is authoritative for "most recent run".
-        if let Some(latest_unmet) = ledger.latest_unmet() {
-            self.unmet_postconditions = latest_unmet.iter().map(UnmetPostCondition::from).collect();
-        }
-        self
     }
 
     /// Attach a guardrail view (called by edge_tools after `snapshot_with_strategy`).
@@ -1017,18 +950,6 @@ impl SelfModel {
             }
         }
 
-        if !self.unmet_postconditions.is_empty() {
-            const MAX_SHOWN: usize = 5;
-            let total = self.unmet_postconditions.len();
-            s.push_str("⚠ Unmet postconditions from last action plan:\n");
-            for entry in self.unmet_postconditions.iter().take(MAX_SHOWN) {
-                let _ = writeln!(s, "  - action {} ({})", entry.action_index, entry.kind);
-            }
-            if total > MAX_SHOWN {
-                let _ = writeln!(s, "  … {} more", total - MAX_SHOWN);
-            }
-        }
-
         // ── Auto-invoked diagnostic skill output ──
         if let Some(ref diag) = self.skill_diagnosis {
             s.push_str(&diag.render_prompt_block());
@@ -1144,7 +1065,7 @@ impl SelfModel {
     /// - recorded recent feedback signals
     #[must_use]
     pub fn has_meaningful_self_awareness(&self) -> bool {
-        // Plan goal: explicit plan_goal means an ActionPlan is steering.
+        // Plan goal: explicit plan_goal means a structured plan is steering.
         if self.goals.plan_goal.is_some() {
             return true;
         }
@@ -1183,9 +1104,6 @@ impl SelfModel {
             return true;
         }
         if !self.low_confidence_tools.is_empty() {
-            return true;
-        }
-        if !self.unmet_postconditions.is_empty() {
             return true;
         }
         if self.skill_diagnosis.is_some() {
@@ -2308,15 +2226,6 @@ mod tests {
     #[test]
     fn meaningful_when_recent_corrections_captured() {
         let model = minimal_model().with_recent_correction_excerpts(vec!["no, use X".into()]);
-        assert!(model.has_meaningful_self_awareness());
-    }
-
-    #[test]
-    fn meaningful_when_unmet_postcondition() {
-        let model = minimal_model().with_unmet_postconditions(vec![UnmetPostCondition {
-            action_index: 0,
-            kind: "tool_call_succeeded".into(),
-        }]);
         assert!(model.has_meaningful_self_awareness());
     }
 
