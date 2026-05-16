@@ -22,6 +22,12 @@ pub struct IntrospectSnapshot {
     pub alerts: Vec<String>,
     pub tool_health: Vec<ToolHealthEntry>,
     pub working_memory_summary: String,
+    /// Host-provided lifecycle context. In the CLI this is the same
+    /// turn-start plan/task/session block injected into the prompt; it is not
+    /// a live mid-turn projection of mutations that happened after the round
+    /// began.
+    #[serde(default)]
+    pub lifecycle_summary: String,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub cache_read_tokens: u64,
@@ -229,6 +235,10 @@ fn render_summary(s: &IntrospectSnapshot) -> String {
     }
     if !s.working_memory_summary.is_empty() {
         out.push_str(&s.working_memory_summary);
+        out.push('\n');
+    }
+    if !s.lifecycle_summary.is_empty() {
+        out.push_str(&s.lifecycle_summary);
         out.push('\n');
     }
     out.trim_end().to_string()
@@ -605,6 +615,9 @@ mod tests {
                 },
             ],
             working_memory_summary: "Goal: implement streaming resume".into(),
+            lifecycle_summary:
+                "### Turn-start session execution state\nresume pending: [plan-resume] goal=\"Fix auth\""
+                    .into(),
             total_input_tokens: 145_000,
             total_output_tokens: 12_000,
             cache_read_tokens: 95_000,
@@ -638,6 +651,7 @@ mod tests {
         assert!(output.contains("## Session Health"));
         assert!(output.contains("cache_regression"));
         assert!(output.contains("Goal: implement streaming resume"));
+        assert!(output.contains("### Turn-start session execution state"));
         // Should NOT contain full tool table
         assert!(!output.contains("| Tool |"));
     }

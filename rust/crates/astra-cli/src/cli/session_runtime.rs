@@ -706,14 +706,13 @@ pub(crate) fn maybe_restore_pending_plan_mode(line: &str, state: &mut SessionSta
         || state.executing_plan.is_some()
         || state.plan_handle.is_some()
         || state.pending_plan_resume_digest.is_none()
-        || !line.contains("@resume-plan")
+        || !astra_runtime::plan::plan_resume::message_signals_resume(line)
     {
         return false;
     }
 
     let path = astra_runtime::plan_decompose::PlanModeState::state_path();
     if !path.exists() {
-        state.pending_plan_resume_digest = None;
         return false;
     }
 
@@ -747,7 +746,6 @@ pub(crate) fn maybe_restore_pending_plan_mode(line: &str, state: &mut SessionSta
         }
         Err(err) => {
             eprintln!("  ⚠ failed to restore saved plan mode: {err}");
-            state.pending_plan_resume_digest = None;
             false
         }
     }
@@ -1704,6 +1702,65 @@ mod tests {
         assert_eq!(
             state.plan_mode.as_ref().map(|ps| ps.goal.as_str()),
             Some("Ship plan resume")
+        );
+    }
+
+    #[test]
+    fn maybe_restore_pending_plan_mode_accepts_plain_continue_signal() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let _creds_guard = isolate_credentials();
+        let home = tempdir().unwrap();
+        let _home_guard = EnvGuard::set("HOME", home.path().to_str().unwrap());
+        std::fs::create_dir_all(home.path().join(".astra")).unwrap();
+
+        let mut plan_state = astra_runtime::plan_decompose::PlanModeState::new(
+            "Resume without explicit tag".to_string(),
+            Default::default(),
+        );
+        plan_state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "t1".into(),
+                title: "Continue current subtask".into(),
+                status: astra_services::task_orchestrator::TaskStatus::InProgress,
+                ..Default::default()
+            });
+        plan_state
+            .save_to_file(&astra_runtime::plan_decompose::PlanModeState::state_path())
+            .unwrap();
+
+        let mut state = SessionState {
+            pending_plan_resume_digest: Some(
+                "[plan-resume] goal=\"Resume without explicit tag\"".into(),
+            ),
+            ..SessionState::default()
+        };
+        assert!(maybe_restore_pending_plan_mode("continue", &mut state));
+        assert!(state.pending_plan_resume_digest.is_none());
+        assert_eq!(
+            state.plan_mode.as_ref().map(|ps| ps.goal.as_str()),
+            Some("Resume without explicit tag")
+        );
+    }
+
+    #[test]
+    fn maybe_restore_pending_plan_mode_missing_file_keeps_digest_for_fallback() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let _creds_guard = isolate_credentials();
+        let home = tempdir().unwrap();
+        let _home_guard = EnvGuard::set("HOME", home.path().to_str().unwrap());
+        std::fs::create_dir_all(home.path().join(".astra")).unwrap();
+
+        let mut state = SessionState {
+            pending_plan_resume_digest: Some("[plan-resume] goal=\"Lost local file\"".into()),
+            ..SessionState::default()
+        };
+
+        assert!(!maybe_restore_pending_plan_mode("continue", &mut state));
+        assert_eq!(
+            state.pending_plan_resume_digest.as_deref(),
+            Some("[plan-resume] goal=\"Lost local file\"")
         );
     }
 

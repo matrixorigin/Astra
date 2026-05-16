@@ -677,6 +677,10 @@ pub struct ServerAgenticLoopHost {
     // ── Agent progress ──
     /// Optional receiver for agent progress events (multi-agent tree updates).
     progress_rx: Option<tokio::sync::broadcast::Receiver<crate::orchestration::AgentProgressEvent>>,
+    /// Latches the first lifecycle summary built for this host/user turn.
+    /// Keeps prompt and introspection lifecycle context byte-consistent across
+    /// multi-round tool loops.
+    turn_start_lifecycle_summary: Option<String>,
 
     // ── Test hooks ──
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -969,6 +973,7 @@ impl ServerAgenticLoopHostBuilder {
             client_cancel_flag: None,
             client_cancel_token: None,
             progress_rx,
+            turn_start_lifecycle_summary: None,
             plan_resume_hint: Arc::new(std::sync::RwLock::new(self.plan_resume_hint)),
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds: std::collections::VecDeque::from(self.test_llm_rounds),
@@ -995,6 +1000,138 @@ impl ServerAgenticLoopHost {
     /// new plan state instead of the snapshot baked at loop start.
     pub(crate) fn plan_resume_hint_handle(&self) -> Arc<std::sync::RwLock<Option<String>>> {
         Arc::clone(&self.plan_resume_hint)
+    }
+
+    fn read_plan_resume_hint(&self) -> Option<String> {
+        match self.plan_resume_hint.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                astra_core::agent_warn!(
+                    "pipeline",
+                    "plan_resume_hint RwLock poisoned — plan context lost for this turn"
+                );
+                poisoned.into_inner().clone()
+            }
+        }
+    }
+
+    fn render_turn_start_lifecycle_summary(
+        &self,
+        state: &AgenticLoopState,
+        plan_hint: Option<&str>,
+    ) -> String {
+        let session_id = state
+            .current_session_id
+            .as_deref()
+            .unwrap_or(self.session_id.as_str());
+        let run_id = state.current_run_id.as_deref().unwrap_or("none");
+        let model = self
+            .resolved_model_name
+            .as_deref()
+            .or(self.model_override.as_deref())
+            .unwrap_or("auto");
+        let mode = if self.server_side_tools {
+            "web-agent (server-side tools)"
+        } else {
+            "edge-agent (edge-provided tools)"
+        };
+        let interaction = if self.interactive_client {
+            "interactive"
+        } else {
+            "headless"
+        };
+        let workspace = self
+            .edge_profile
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let agent_id = self.edge_profile.get("agent_id").and_then(Value::as_str);
+
+        let lineage_parent = self
+            .edge_profile
+            .get("session_lineage")
+            .and_then(Value::as_object)
+            .and_then(|lineage| lineage.get("parent_session_id"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                self.edge_profile
+                    .get("parent_session_id")
+                    .and_then(Value::as_str)
+            });
+        let lineage_turn = self
+            .edge_profile
+            .get("session_lineage")
+            .and_then(Value::as_object)
+            .and_then(|lineage| {
+                lineage
+                    .get("forked_after_turn")
+                    .or_else(|| lineage.get("forked_at_turn"))
+            })
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                self.edge_profile
+                    .get("forked_at_turn")
+                    .and_then(Value::as_u64)
+            });
+
+        let interruption = state
+            .interruption
+            .as_ref()
+            .map(|record| format!("{:?}", record.kind))
+            .unwrap_or_else(|| "none".to_string());
+
+        let plan_line = plan_hint
+            .map(str::trim)
+            .filter(|hint| !hint.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| "none".to_string());
+
+        let mut lines = vec![
+            "# Turn-start session execution state".to_string(),
+            format!("- Mode: {mode} · interaction: {interaction}"),
+            format!("- Session: {session_id} · run: {run_id} · model: {model}"),
+            match workspace {
+                Some(cwd) => format!("- Workspace: {cwd}"),
+                None if self.server_side_tools => {
+                    "- Workspace: server-provisioned (edge cwd unavailable)".to_string()
+                }
+                None => "- Workspace: unavailable".to_string(),
+            },
+            format!("- Plan resume: {plan_line}"),
+            format!(
+                "- Delegation: engine={} · this_turn={} · progress_stream={}",
+                if state.delegation_engine.is_some() {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                state.delegations_this_turn,
+                if self.progress_rx.is_some() {
+                    "subscribed"
+                } else {
+                    "none"
+                }
+            ),
+            format!("- Interruption: {interruption}"),
+        ];
+        if state.recursion_depth > 0 || agent_id.is_some() {
+            lines.push(format!(
+                "- Delegation context: recursion_depth={}{}",
+                state.recursion_depth,
+                agent_id
+                    .map(|id| format!(" · agent_id={id}"))
+                    .unwrap_or_default()
+            ));
+        }
+
+        if let Some(parent) = lineage_parent {
+            let turn_suffix = lineage_turn
+                .map(|turn| format!(" · forked_after_turn={turn}"))
+                .unwrap_or_default();
+            lines.push(format!("- Session lineage: parent={parent}{turn_suffix}"));
+        }
+
+        lines.join("\n")
     }
 
     fn turn_interaction_mode(&self) -> TurnInteractionMode {
@@ -1861,16 +1998,18 @@ impl ServerAgenticLoopHost {
         model_name: &str,
         user_content: &str,
     ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
-        let plan_hint = match self.plan_resume_hint.read() {
-            Ok(g) => g.clone(),
-            Err(poisoned) => {
-                astra_core::agent_warn!(
-                    "pipeline",
-                    "plan_resume_hint RwLock poisoned — plan context lost for this turn"
-                );
-                poisoned.into_inner().clone()
-            }
+        let plan_hint = self.read_plan_resume_hint();
+        let lifecycle_summary = if let Some(existing) = &self.turn_start_lifecycle_summary {
+            existing.clone()
+        } else {
+            let summary = self.render_turn_start_lifecycle_summary(state, plan_hint.as_deref());
+            self.turn_start_lifecycle_summary = Some(summary.clone());
+            summary
         };
+        let lifecycle_sections = vec![crate::prompts::PromptSection::dynamic(
+            lifecycle_summary,
+            crate::prompts::PromptTokenBucket::Environment,
+        )];
         let restricted_snapshot = state.restricted_tools.clone();
         let selection_trace = Some(json!({
             "source": "server_loop_host",
@@ -1892,7 +2031,7 @@ impl ServerAgenticLoopHost {
                     plan_hint,
                     self.selection_confidence,
                 )
-                .with_extra_sections(&[], &[]),
+                .with_extra_sections(&[], &lifecycle_sections),
                 cache_cfg: &cache_cfg,
                 provider,
                 model_name,
@@ -2019,6 +2158,14 @@ impl ServerAgenticLoopHost {
 impl AgenticLoopHost for ServerAgenticLoopHost {
     fn injects_round_guidance(&self) -> bool {
         true // Server injects guidance into the system prompt in execute_turn.
+    }
+
+    fn turn_start_lifecycle_summary(&self, state: &AgenticLoopState) -> String {
+        if let Some(summary) = &self.turn_start_lifecycle_summary {
+            return summary.clone();
+        }
+        let plan_hint = self.read_plan_resume_hint();
+        self.render_turn_start_lifecycle_summary(state, plan_hint.as_deref())
     }
 
     fn render_final_text(&mut self, text: &str) {
@@ -3177,6 +3324,39 @@ mod tests {
         tools
     }
 
+    fn message_text(message: &Value) -> String {
+        let Some(content) = message.get("content") else {
+            return message.to_string();
+        };
+        if let Some(text) = content.as_str() {
+            return text.to_string();
+        }
+        if let Some(blocks) = content.as_array() {
+            return blocks
+                .iter()
+                .filter_map(|block| {
+                    block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| block.as_str())
+                        .map(str::to_string)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        content.to_string()
+    }
+
+    fn pipeline_outcome_text(outcome: &PipelineTurnOutcome) -> String {
+        outcome
+            .system_messages
+            .iter()
+            .chain(outcome.volatile_preamble.iter())
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn llm_request_dump_failures_are_not_silently_ignored() {
         let source = include_str!("server_loop_host.rs");
@@ -3752,6 +3932,200 @@ mod tests {
         // System messages are rendered from pipeline's serialized system blocks.
         assert!(!outcome.system_messages.is_empty());
         assert_eq!(outcome.system_messages[0]["role"], "system");
+    }
+
+    #[tokio::test]
+    async fn run_turn_pipeline_includes_turn_start_lifecycle_summary_for_web_agent() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert(
+            "session_lineage".to_string(),
+            json!({
+                "parent_session_id": "parent-session-1",
+                "forked_after_turn": 7
+            }),
+        );
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-lifecycle".to_string(),
+            "s-lifecycle".to_string(),
+        )
+        .with_edge_profile(edge_profile)
+        .with_plan_resume_hint(Some("[plan-resume] goal=\"stabilize\"".to_string()))
+        .build();
+
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-lifecycle".into());
+        state.current_run_id = Some("run-lifecycle".into());
+        state.delegations_this_turn = 2;
+        state.max_turn_input_tokens = 200_000;
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        let tools = host.edge_tools.clone();
+
+        let outcome = host
+            .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "continue")
+            .expect("pipeline should succeed");
+        let text = pipeline_outcome_text(&outcome);
+
+        assert!(
+            text.contains("Turn-start session execution state"),
+            "turn-start lifecycle summary must be injected into prompt context: {text}"
+        );
+        assert!(
+            text.contains("Mode: web-agent (server-side tools) · interaction: headless"),
+            "web-agent mode marker must be explicit: {text}"
+        );
+        assert!(
+            text.contains("Workspace: server-provisioned (edge cwd unavailable)"),
+            "web-agent mode without edge cwd must explain workspace source: {text}"
+        );
+        assert!(
+            text.contains("Plan resume: [plan-resume] goal=\"stabilize\""),
+            "plan resume digest must be visible in lifecycle summary: {text}"
+        );
+        assert!(
+            text.contains("Session lineage: parent=parent-session-1 · forked_after_turn=7"),
+            "fork lineage must be surfaced when available: {text}"
+        );
+        assert!(
+            text.contains("Delegation: engine=disabled · this_turn=2 · progress_stream=none"),
+            "delegation state must be visible: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_turn_pipeline_surfaces_legacy_fork_keys_and_delegation_context() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert(
+            "parent_session_id".to_string(),
+            Value::String("parent-legacy".to_string()),
+        );
+        edge_profile.insert("forked_at_turn".to_string(), Value::Number(11u64.into()));
+        edge_profile.insert(
+            "agent_id".to_string(),
+            Value::String("reviewer-1".to_string()),
+        );
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-legacy".to_string(),
+            "s-legacy".to_string(),
+        )
+        .with_edge_profile(edge_profile)
+        .build();
+
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-legacy".into());
+        state.current_run_id = Some("run-legacy".into());
+        state.recursion_depth = 2;
+        state.max_turn_input_tokens = 200_000;
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        let tools = host.edge_tools.clone();
+
+        let outcome = host
+            .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "continue")
+            .expect("pipeline should succeed");
+        let text = pipeline_outcome_text(&outcome);
+
+        assert!(
+            text.contains("Session lineage: parent=parent-legacy · forked_after_turn=11"),
+            "legacy fork keys should map into lifecycle lineage summary: {text}"
+        );
+        assert!(
+            text.contains("Delegation context: recursion_depth=2 · agent_id=reviewer-1"),
+            "sub-agent delegation context should be visible in lifecycle summary: {text}"
+        );
+    }
+
+    #[test]
+    fn turn_start_lifecycle_summary_reports_edge_mode_and_workspace() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert("cwd".to_string(), Value::String("/tmp/proj".to_string()));
+
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-edge".to_string(),
+            "s-edge".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_edge_profile(edge_profile)
+        .with_interactive_client(true)
+        .build();
+
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-edge".into());
+        state.current_run_id = Some("run-edge".into());
+        let summary = host.turn_start_lifecycle_summary(&state);
+
+        assert!(
+            summary.contains("Mode: edge-agent (edge-provided tools) · interaction: interactive"),
+            "edge-connected mode should be explicit: {summary}"
+        );
+        assert!(
+            summary.contains("Workspace: /tmp/proj"),
+            "edge cwd should be surfaced in lifecycle summary: {summary}"
+        );
+        assert!(
+            summary.contains("Plan resume: none"),
+            "summary should clearly report missing resume hint: {summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_turn_pipeline_latches_turn_start_lifecycle_summary_across_rounds() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-latch".to_string(),
+            "s-latch".to_string(),
+        )
+        .with_plan_resume_hint(Some("[plan-resume] goal=\"initial\"".to_string()))
+        .build();
+
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-latch".into());
+        state.current_run_id = Some("run-latch".into());
+        state.max_turn_input_tokens = 200_000;
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        let tools = host.edge_tools.clone();
+
+        state.current_round_index = 0;
+        let round0 = host
+            .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "continue")
+            .expect("round 0 pipeline should succeed");
+        let round0_text = pipeline_outcome_text(&round0);
+        assert!(round0_text.contains("Plan resume: [plan-resume] goal=\"initial\""));
+        assert!(round0_text.contains("this_turn=0"));
+
+        state.current_round_index = 3;
+        state.delegations_this_turn = 5;
+        {
+            let hint_handle = host.plan_resume_hint_handle();
+            let mut guard = hint_handle.write().expect("plan hint lock");
+            *guard = Some("[plan-resume] goal=\"mutated\"".to_string());
+        }
+
+        let round3 = host
+            .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "continue")
+            .expect("round 3 pipeline should succeed");
+        let round3_text = pipeline_outcome_text(&round3);
+        assert!(
+            round3_text.contains("Plan resume: [plan-resume] goal=\"initial\""),
+            "later rounds must keep turn-start lifecycle summary immutable: {round3_text}"
+        );
+        assert!(
+            round3_text.contains("this_turn=0"),
+            "delegation counters should remain turn-start snapshot values: {round3_text}"
+        );
     }
 
     /// Session 986a553e observed MiniMax-M2.7 cache collapsing from

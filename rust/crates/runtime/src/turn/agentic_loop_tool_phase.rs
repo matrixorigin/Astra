@@ -979,6 +979,13 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         .map(|r| (tool_dedup_signature(&r.tool, &r.args), r.output.clone()))
         .collect();
 
+    // Update introspect snapshot so the tool can return fresh state.
+    if let Some(executor) = state.server_tool_executor.as_deref() {
+        let lifecycle_summary = host.turn_start_lifecycle_summary(state);
+        let snapshot = build_introspect_snapshot(state, lifecycle_summary);
+        executor.update_introspect_snapshot(snapshot);
+    }
+
     let evo_records_before = state.stall.tool_call_records.len();
     {
         let mut term_adapter = HostTerminalAdapter(host);
@@ -992,11 +999,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             .as_ref()
             .map(|b| b.current_round())
             .unwrap_or(0);
-        // Update introspect snapshot so the tool can return fresh state.
-        if let Some(executor) = state.server_tool_executor.as_deref() {
-            let snapshot = build_introspect_snapshot(state);
-            executor.update_introspect_snapshot(snapshot);
-        }
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index,
@@ -1525,6 +1527,7 @@ fn observe_gate_cancelled(
 
 fn build_introspect_snapshot(
     state: &super::agentic_loop_host::AgenticLoopState,
+    lifecycle_summary: String,
 ) -> astra_turn_core::introspect::IntrospectSnapshot {
     let total_in = state.total_prompt + state.total_cache_read + state.total_cache_creation;
     let cache_ratio = if total_in > 0 {
@@ -1624,6 +1627,7 @@ fn build_introspect_snapshot(
         alerts: Vec::new(),
         tool_health,
         working_memory_summary: working_mem,
+        lifecycle_summary,
         total_input_tokens: state.total_prompt + state.total_cache_read,
         total_output_tokens: state.total_completion,
         cache_read_tokens: state.total_cache_read,
@@ -1672,6 +1676,13 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn introspect_snapshot_includes_host_lifecycle_summary() {
+        let state = make_state();
+        let snapshot = build_introspect_snapshot(&state, "turn-start lifecycle".to_string());
+        assert_eq!(snapshot.lifecycle_summary, "turn-start lifecycle");
     }
 
     #[test]

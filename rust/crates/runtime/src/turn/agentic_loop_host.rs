@@ -149,6 +149,14 @@ pub trait AgenticLoopHost: Send {
         TurnInteractionMode::NonInteractive
     }
 
+    /// Host-provided turn-start lifecycle summary for prompt/introspection.
+    ///
+    /// Default is empty; hosts can override to surface mode/run/resume/delegation
+    /// context as turn-start state.
+    fn turn_start_lifecycle_summary(&self, _state: &AgenticLoopState) -> String {
+        String::new()
+    }
+
     /// Optional LLM summary client for summary-based compaction helpers.
     ///
     /// Hosts can provide a client that uses the same model/credentials as the

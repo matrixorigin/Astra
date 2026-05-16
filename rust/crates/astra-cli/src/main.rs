@@ -87,6 +87,8 @@ mod durable_bridge;
 mod edge_lifecycle;
 #[path = "cli/effects/mod.rs"]
 mod effects;
+#[path = "cli/execution_state_summary.rs"]
+mod execution_state_summary;
 #[path = "cli/file_history.rs"]
 mod file_history;
 #[path = "cli/followup_suggestion.rs"]

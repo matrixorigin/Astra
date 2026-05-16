@@ -3722,11 +3722,13 @@ mod tests {
             total_input_tokens: 12345,
             total_output_tokens: 678,
             compaction_tier: "None".to_string(),
+            lifecycle_summary: "resume pending: [plan-resume] goal=\"Fix auth\"".to_string(),
             ..Default::default()
         });
         let out = executor.handle_introspect(&serde_json::json!({"detail": "summary"}));
         assert!(out.contains("Turns: 5/15"), "got: {out}");
         assert!(out.contains("12345in"), "got: {out}");
+        assert!(out.contains("resume pending"), "got: {out}");
     }
 
     #[test]

@@ -755,7 +755,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "introspect",
-                "description": "Query own runtime state. Subtopics: 'session' (default — token pressure, cache hit rate, tool health, alerts, working memory); 'cache' (cache-regression diagnosis over recent LLM captures); 'recent' (last N LLM-round summaries from in-memory ring — tokens, tool calls, duration); 'volatile' (what runtime nudges / working-set / coaching are about to be injected); 'stall' (loop-guard state — nudge count, stall events, forced corrections); 'all' (session + recent + volatile + stall).",
+                "description": "Query own runtime state. Subtopics: 'session' (default — token pressure, cache hit rate, tool health, alerts, working memory, and host-provided plan/task/session lifecycle context such as restore/resume state and last lifecycle event when available); 'cache' (cache-regression diagnosis over recent LLM captures); 'recent' (last N LLM-round summaries from in-memory ring — tokens, tool calls, duration); 'volatile' (what runtime nudges / working-set / coaching are about to be injected); 'stall' (loop-guard state — nudge count, stall events, forced corrections); 'all' (session + recent + volatile + stall).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1339,6 +1339,27 @@ mod tests {
                 "plan schema must not encode phrase-list triggers: {desc}"
             );
         }
+    }
+
+    #[test]
+    fn introspect_schema_mentions_lifecycle_and_resume_state() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let introspect = find_schema(&schemas, "introspect").expect("introspect schema must exist");
+        let desc = introspect["function"]["description"]
+            .as_str()
+            .expect("introspect description must be a string");
+        assert!(
+            desc.contains("plan/task/session lifecycle context"),
+            "introspect should advertise lifecycle visibility: {desc}"
+        );
+        assert!(
+            desc.contains("restore/resume state"),
+            "introspect should advertise resume visibility: {desc}"
+        );
+        assert!(
+            desc.contains("last lifecycle event"),
+            "introspect should advertise causal last-event visibility: {desc}"
+        );
     }
 
     #[test]

@@ -4632,6 +4632,15 @@ fn build_step_resume_guidance(
     })
 }
 
+fn apply_resume_recovery_state(
+    state: &mut SessionState,
+    interruption: Option<&serde_json::Value>,
+    compaction_state: Option<&serde_json::Value>,
+) {
+    state.last_turn_interrupted = interruption.is_some();
+    state.resume_guidance = build_step_resume_guidance(interruption, compaction_state);
+}
+
 fn history_pairs_from_messages(messages: &[serde_json::Value]) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     let mut last_user = String::new();
@@ -4856,7 +4865,8 @@ async fn apply_restored_session(
         if state.recent_tools.is_empty() {
             state.recent_tools = step_restored.recent_tools;
         }
-        state.resume_guidance = build_step_resume_guidance(
+        apply_resume_recovery_state(
+            state,
             step_restored.interruption.as_ref(),
             step_restored.compaction_state.as_ref(),
         );
@@ -4868,7 +4878,8 @@ async fn apply_restored_session(
         astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&restored.session_id)
     {
         apply_heavy_checkpoint_fallback(state, &heavy);
-        state.resume_guidance = build_step_resume_guidance(
+        apply_resume_recovery_state(
+            state,
             heavy.interruption.as_ref(),
             heavy.compaction_state.as_ref(),
         );
@@ -4879,7 +4890,8 @@ async fn apply_restored_session(
         || restored.compaction_state.is_some()
     {
         apply_restored_cloud_heavy_state(state, &restored);
-        state.resume_guidance = build_step_resume_guidance(
+        apply_resume_recovery_state(
+            state,
             restored.interruption.as_ref(),
             restored.compaction_state.as_ref(),
         );
@@ -4904,7 +4916,8 @@ async fn apply_restored_session(
                             &heavy.messages,
                             heavy.approval_overrides.as_ref(),
                         );
-                        state.resume_guidance = build_step_resume_guidance(
+                        apply_resume_recovery_state(
+                            state,
                             heavy.interruption.as_ref(),
                             heavy.compaction_state.as_ref(),
                         );
@@ -5584,6 +5597,98 @@ mod resume_tests {
         session_workspace::write_workspace(&ws).unwrap();
     }
 
+    fn write_local_step_checkpoint_with_interruption(session_id: &str, turn_count: u32) {
+        let mut heavy = match astra_pipeline::step_protocol::StepCheckpoint::heavy(
+            format!("step-{turn_count}"),
+            format!("task-{turn_count}"),
+            session_id.to_string(),
+            astra_pipeline::step_protocol::ExecutionCursor::default(),
+        ) {
+            astra_pipeline::step_protocol::StepCheckpoint::Heavy(heavy) => *heavy,
+            _ => unreachable!("heavy checkpoint constructor should yield Heavy"),
+        };
+        heavy.messages = vec![
+            serde_json::json!({"role": "user", "content": "continue"}),
+            serde_json::json!({"role": "assistant", "content": "restoring interrupted lifecycle work"}),
+        ];
+        heavy.recent_tools = vec!["bash".into(), "introspect".into()];
+        heavy.interruption = Some(serde_json::json!({
+            "kind": "rate_limited",
+            "resumable": true,
+            "has_checkpoint": true,
+            "tool_calls_completed": 1,
+            "turns_completed": turn_count,
+            "remaining_turns": 2,
+        }));
+        astra_pipeline::step_checkpoint::write_step_checkpoint(
+            session_id,
+            turn_count,
+            &astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),
+        )
+        .unwrap();
+    }
+
+    fn write_workspace_lifecycle_state(session_id: &str) {
+        let mut ws = astra_services::session_workspace::read_workspace(session_id).unwrap();
+        let executing_plan = astra_services::task_orchestrator::TaskPlan {
+            subtasks: vec![
+                astra_services::task_orchestrator::SubtaskPlan {
+                    id: "plan-1".into(),
+                    title: "Capture restore summary".into(),
+                    status: astra_services::task_orchestrator::TaskStatus::Completed,
+                    ..Default::default()
+                },
+                astra_services::task_orchestrator::SubtaskPlan {
+                    id: "plan-2".into(),
+                    title: "Verify lifecycle state".into(),
+                    status: astra_services::task_orchestrator::TaskStatus::InProgress,
+                    ..Default::default()
+                },
+                astra_services::task_orchestrator::SubtaskPlan {
+                    id: "plan-3".into(),
+                    title: "Close recovery loop".into(),
+                    status: astra_services::task_orchestrator::TaskStatus::Pending,
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+        let contract = astra_services::durable_task::TaskContract {
+            contract_id: "contract-restore".into(),
+            task_id: "task-restore".into(),
+            goal: "Ship lifecycle UX".into(),
+            scope: astra_services::durable_task::TaskScope::default(),
+            subtasks: vec![
+                astra_services::durable_task::DurableSubtask {
+                    id: "verify-1".into(),
+                    title: "Capture restore summary".into(),
+                    stage: astra_services::durable_task::SubtaskStage::Completed,
+                    ..Default::default()
+                },
+                astra_services::durable_task::DurableSubtask {
+                    id: "verify-2".into(),
+                    title: "Verify restore contract".into(),
+                    stage: astra_services::durable_task::SubtaskStage::AwaitingVerification,
+                    ..Default::default()
+                },
+            ],
+            global_verification: Vec::new(),
+            version: 1,
+            status: astra_services::durable_task::ContractStatus::Active,
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            domain_hint: None,
+            task_type: None,
+            last_global_results: Vec::new(),
+        };
+        ws.executing_plan_json = Some(serde_json::to_string(&executing_plan).unwrap());
+        ws.plan_goal = Some("Ship lifecycle UX".into());
+        ws.plan_execution_rounds = 4;
+        ws.plan_corrections = vec!["tighten resume messaging".into()];
+        ws.contract_json = Some(serde_json::to_string(&contract).unwrap());
+        astra_services::session_workspace::write_workspace(&ws).unwrap();
+    }
+
     fn write_profile_with_token(session_id: &str) {
         let mut creds = crate::cli_utils::CredentialsFile::default();
         creds.profiles.insert(
@@ -5924,6 +6029,59 @@ mod resume_tests {
         assert_eq!(state.turn, 2);
         assert_eq!(state.total_prompt_tokens, 15);
         assert_eq!(state.total_completion_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn restore_session_into_state_surfaces_interrupted_plan_and_durable_lifecycle_summary() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = format!("resume-lifecycle-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 2);
+        write_local_step_checkpoint_with_interruption(&session_id, 2);
+        write_workspace_lifecycle_state(&session_id);
+        write_profile_with_token(&session_id);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "status": "active"
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let mut state = SessionState::default();
+        restore_session_into_state(&session_id, None, &api, &mut state)
+            .await
+            .unwrap();
+
+        assert!(state.last_turn_interrupted);
+        assert!(state.resume_guidance.is_some());
+        assert_eq!(
+            state.executing_plan_goal.as_deref(),
+            Some("Ship lifecycle UX")
+        );
+        assert_eq!(state.plan_execution_rounds, 4);
+        assert_eq!(
+            state.plan_execution_corrections,
+            vec!["tighten resume messaging"]
+        );
+        assert!(state.durable_task_state.is_some());
+
+        let summary =
+            crate::execution_state_summary::format_for_session_state(&state, &[]).unwrap();
+        assert!(summary.contains("turn state: last turn was interrupted"));
+        assert!(summary.contains("plan execution: goal=\"Ship lifecycle UX\""));
+        assert!(summary.contains("in_progress=\"Verify lifecycle state\""));
+        assert!(summary.contains("rounds=4"));
+        assert!(summary.contains("corrections=1"));
+        assert!(summary.contains("durable verification: status=active"));
+        assert!(summary.contains("verified=1/2"));
+        assert!(summary.contains("subtask=\"Verify restore contract\""));
+        assert!(summary.contains("stage=awaiting_verification"));
     }
 
     #[tokio::test]

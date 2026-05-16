@@ -403,7 +403,10 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         }
 
         // Update introspect snapshot so the `introspect` tool returns fresh
-        // data if the model calls it on a subsequent round this turn.
+        // token/tool/round diagnostics if the model calls it on a subsequent
+        // round this turn. The lifecycle block is the turn-start prompt
+        // context that the model already saw; task/plan mutations after
+        // turn start are intentionally not represented as live state here.
         let total_in = state.total_prompt + state.total_cache_read + state.total_cache_creation;
         let cache_ratio = if total_in > 0 {
             state.total_cache_read as f64 / total_in as f64
@@ -415,6 +418,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             .as_ref()
             .map(|s| s.working_memory().render_prompt_section())
             .unwrap_or_default();
+        let lifecycle_summary = self.append_system_prompt.clone().unwrap_or_default();
         self.executor
             .update_introspect_snapshot(astra_turn_core::introspect::IntrospectSnapshot {
                 token_pressure: 0.0,
@@ -440,6 +444,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                     })
                     .collect(),
                 working_memory_summary: working_mem,
+                lifecycle_summary,
                 total_input_tokens: state.total_prompt + state.total_cache_read,
                 total_output_tokens: state.total_completion,
                 cache_read_tokens: state.total_cache_read,
