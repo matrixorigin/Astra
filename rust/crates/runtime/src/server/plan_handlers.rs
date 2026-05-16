@@ -20,7 +20,7 @@
 //! source of truth for plan lifecycle state.
 
 use super::*;
-use crate::plan::{ApprovalPolicy, PlanCapabilities, PlanLoadError, PlanModeState, PlanPhase};
+use crate::plan::{ApprovalPolicy, PlanCapabilities, PlanLoadError, PlanModeState};
 use astra_plan::{PlanListFilter, PlanStepRun};
 use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
 
@@ -478,14 +478,13 @@ pub(super) async fn create_plan_handler(
         ),
     );
 
-    let phase = PlanPhase::Planning { goal: goal.clone() };
-    let capabilities = PlanCapabilities::for_phase(&phase);
+    let capabilities = PlanCapabilities::planning();
 
     Ok((
         StatusCode::CREATED,
         Json(PlanResponse {
             plan_id,
-            phase: phase.phase_name().to_string(),
+            phase: "planning".to_string(),
             goal,
             version: plan_state.version,
             plan: None,
