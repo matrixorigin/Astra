@@ -1,104 +1,9 @@
-//! Shared plan-mode types and helpers:
-//! - persisted plan state, execution summaries, and parallelism analysis
+//! Execution-time helpers for prompting and subtask scheduling.
 
-use serde::{Deserialize, Serialize};
-
-// Re-export task types from services
-pub use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
-
-// ─── Plan Mode State ─────────────────────────────────────────────────────────
-
-fn default_version() -> u64 {
-    1
-}
-
-/// Cloud-backed plan authoring state mirrored into CLI/server flows.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PlanModeState {
-    /// The original user goal.
-    pub goal: String,
-    /// Current executable plan.
-    pub plan: TaskPlan,
-    /// Optional rendered markdown artifact for UI/sync consumers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_md: Option<String>,
-    /// Whether the mirrored plan has loaded or local edits.
-    #[serde(default)]
-    pub modified: bool,
-    /// Execution timeline used by active plan/executor flows.
-    #[serde(default)]
-    pub timeline: ExecutionTimeline,
-    /// Monotonic version counter for optimistic concurrency control.
-    /// Incremented on every save; checked on update to detect lost writes.
-    #[serde(default = "default_version")]
-    pub version: u64,
-    /// User who created this plan (for ownership filtering).
-    #[serde(default)]
-    pub created_by: Option<String>,
-    /// Most-recent session that touched this plan.
-    #[serde(skip)]
-    pub session_hint: Option<String>,
-}
-
-impl PlanModeState {
-    /// Create a new plan state with the initial goal.
-    pub fn new(goal: String) -> Self {
-        Self {
-            goal,
-            plan: TaskPlan::default(),
-            plan_md: None,
-            modified: false,
-            timeline: ExecutionTimeline::default(),
-            version: 1,
-            created_by: None,
-            session_hint: None,
-        }
-    }
-
-    /// Create a new plan with an owner user ID.
-    pub fn new_with_owner(goal: String, user_id: String) -> Self {
-        let mut state = Self::new(goal);
-        state.created_by = Some(user_id);
-        state
-    }
-}
-
-// ─── Plan Identifiers ────────────────────────────────────────────────────────
-
-impl PlanModeState {
-    /// Generate a unique plan ID from the goal.
-    pub fn generate_plan_id(goal: &str) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        // Create a slug from the goal (first few words)
-        let slug: String = goal
-            .split_whitespace()
-            .take(3)
-            .collect::<Vec<_>>()
-            .join("-")
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '-')
-            .take(30)
-            .collect();
-
-        // Add a short hash for uniqueness
-        let mut hasher = DefaultHasher::new();
-        goal.hash(&mut hasher);
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        ts.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        if slug.is_empty() {
-            format!("plan-{:08x}", hash as u32)
-        } else {
-            format!("{}-{:04x}", slug.to_lowercase(), (hash & 0xFFFF) as u16)
-        }
-    }
-}
+use astra_services::{
+    durable_task::VerifierKind,
+    task_orchestrator::{SubtaskPlan, TaskPlan},
+};
 
 /// Returns true when a subtask explicitly calls for real browser/UI verification.
 pub fn subtask_requires_browser_verification(subtask: &SubtaskPlan) -> bool {
@@ -108,7 +13,6 @@ pub fn subtask_requires_browser_verification(subtask: &SubtaskPlan) -> bool {
         text.push_str(&desc.to_lowercase());
     }
 
-    // Strong signals: tool/framework names that unambiguously mean browser.
     let strong_browser = [
         "browser",
         "in browser",
@@ -121,16 +25,12 @@ pub fn subtask_requires_browser_verification(subtask: &SubtaskPlan) -> bool {
     .iter()
     .any(|needle| text.contains(needle));
 
-    // Weak signals: only count if paired with explicit browser context.
-    // "page" alone matches "pagination", "ui" matches "build"/"suite".
     let weak_browser = !strong_browser
         && [" web page", "web ui", "in the dom", "html canvas", "页面"]
             .iter()
             .any(|needle| text.contains(needle));
 
     let mentions_browser = strong_browser || weak_browser;
-
-    // Verification keywords — removed "run" (too generic: "run tests", "run migration").
     let mentions_verification = [
         "test in browser",
         "verify in browser",
@@ -177,17 +77,11 @@ pub fn format_subtask_prompt_with_operator_notes(
         body.push_str("\nAcceptance checks (automated verification will run these):\n");
         for (i, vk) in subtask.acceptance_checks.iter().enumerate() {
             let desc = match vk {
-                astra_services::durable_task::VerifierKind::FileExists { paths } => {
-                    format!("Files exist: {}", paths.join(", "))
-                }
-                astra_services::durable_task::VerifierKind::ReadFileContains {
-                    path,
-                    contains,
-                    ..
-                } => {
+                VerifierKind::FileExists { paths } => format!("Files exist: {}", paths.join(", ")),
+                VerifierKind::ReadFileContains { path, contains, .. } => {
                     format!("{path} contains {:?}", contains)
                 }
-                astra_services::durable_task::VerifierKind::GrepCheck {
+                VerifierKind::GrepCheck {
                     file,
                     pattern,
                     should_match,
@@ -198,20 +92,12 @@ pub fn format_subtask_prompt_with_operator_notes(
                         format!("grep '{pattern}' must NOT match in {file}")
                     }
                 }
-                astra_services::durable_task::VerifierKind::Command { cmd, .. } => {
-                    format!("Command succeeds: {cmd}")
-                }
-                astra_services::durable_task::VerifierKind::CommandOutput {
-                    cmd, contains, ..
-                } => {
+                VerifierKind::Command { cmd, .. } => format!("Command succeeds: {cmd}"),
+                VerifierKind::CommandOutput { cmd, contains, .. } => {
                     format!("{cmd} output contains {:?}", contains)
                 }
-                astra_services::durable_task::VerifierKind::BuildPass { cmd } => {
-                    format!("Build: {cmd}")
-                }
-                astra_services::durable_task::VerifierKind::TestPass { cmd, .. } => {
-                    format!("Test: {cmd}")
-                }
+                VerifierKind::BuildPass { cmd } => format!("Build: {cmd}"),
+                VerifierKind::TestPass { cmd, .. } => format!("Test: {cmd}"),
                 _ => "Automated check".into(),
             };
             body.push_str(&format!("  {}. {}\n", i + 1, desc));
@@ -263,77 +149,6 @@ pub fn format_subtask_prompt_with_operator_notes(
     format!("{block}\n{body}")
 }
 
-// ─── Plan Execution Config ───────────────────────────────────────────────────
-
-/// Configuration for plan execution behavior.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PlanExecutionConfig {
-    /// If true, prompt user for confirmation before executing each subtask.
-    pub step_by_step: bool,
-}
-
-// ─── Execution Timeline ─────────────────────────────────────────────────────
-
-/// Types of events that can occur during plan execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum TimelineEventKind {
-    /// Plan was rewound — subtask at `from_idx` and every subtask after it
-    /// reset to pending. `reset_count` is the number that actually flipped.
-    SubtaskRewound {
-        anchor: String,
-        from_idx: usize,
-        reset_count: usize,
-        reason: Option<String>,
-    },
-    /// A single subtask was reset for re-execution (distinct from a rewind).
-    SubtaskRedone {
-        subtask_id: String,
-        title: String,
-        attempt: u32,
-    },
-}
-
-/// A single event in the execution timeline.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TimelineEvent {
-    /// ISO 8601 timestamp
-    pub timestamp: String,
-    /// The event details
-    pub event: TimelineEventKind,
-}
-
-impl TimelineEvent {
-    /// Create a new timeline event with current timestamp.
-    pub fn new(event: TimelineEventKind) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        Self {
-            timestamp: now.to_string(),
-            event,
-        }
-    }
-}
-
-/// Execution timeline tracking all events during plan execution.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ExecutionTimeline {
-    /// All recorded events, in chronological order.
-    pub events: Vec<TimelineEvent>,
-}
-
-impl ExecutionTimeline {
-    /// Record a new event.
-    pub fn record(&mut self, kind: TimelineEventKind) {
-        self.events.push(TimelineEvent::new(kind));
-    }
-}
-
-// ─── Parallel Subtask Detection & File Conflict ─────────────────────────────
-
 /// Analysis of which subtasks can run in parallel.
 #[derive(Debug, Clone)]
 pub struct ParallelGroups {
@@ -366,7 +181,6 @@ pub fn analyze_parallelism(plan: &TaskPlan) -> ParallelGroups {
         };
     }
 
-    // Detect file conflicts between all pairs of ready subtasks
     let mut conflicts = Vec::new();
     for i in 0..ready.len() {
         for j in (i + 1)..ready.len() {
@@ -386,8 +200,6 @@ pub fn analyze_parallelism(plan: &TaskPlan) -> ParallelGroups {
         }
     }
 
-    // Build groups: use a simple greedy coloring approach
-    // conflicting subtasks can't be in the same group
     let conflict_pairs: std::collections::HashSet<(String, String)> = conflicts
         .iter()
         .flat_map(|c| {
@@ -401,7 +213,7 @@ pub fn analyze_parallelism(plan: &TaskPlan) -> ParallelGroups {
     let mut groups: Vec<Vec<String>> = Vec::new();
     for st in &ready {
         let mut placed = false;
-        for group in groups.iter_mut() {
+        for group in &mut groups {
             let has_conflict = group
                 .iter()
                 .any(|g_id| conflict_pairs.contains(&(g_id.clone(), st.id.clone())));
@@ -422,8 +234,6 @@ pub fn analyze_parallelism(plan: &TaskPlan) -> ParallelGroups {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ═══════════════════════════ Auto-Execution Tests ═══════════════════════
 
     #[test]
     fn format_subtask_prompt_minimal() {
@@ -447,7 +257,7 @@ mod tests {
             title: "Add auth middleware".into(),
             description: Some("JWT token validation for all /api routes".into()),
             files: vec!["src/middleware.rs".into(), "src/auth.rs".into()],
-            acceptance_checks: vec![astra_services::durable_task::VerifierKind::GrepCheck {
+            acceptance_checks: vec![VerifierKind::GrepCheck {
                 file: "src/middleware.rs".into(),
                 pattern: "401".into(),
                 should_match: true,
@@ -506,7 +316,6 @@ mod tests {
 
     #[test]
     fn browser_verification_no_false_positive_on_non_browser_tasks() {
-        // "page" in "pagination", "ui" in "build", "run" alone — should NOT trigger.
         for title in [
             "Run database migration for user page",
             "Build UI component library",
@@ -548,8 +357,6 @@ mod tests {
             );
         }
     }
-
-    // ═══════════════════════════ Parallel Subtask Tests ══════════════════════
 
     #[test]
     fn parallel_groups_no_deps_all_parallel() {
@@ -613,8 +420,6 @@ mod tests {
                 .shared_files
                 .contains(&"src/main.rs".to_string())
         );
-
-        // a and b should be in different groups, c can go with either
         assert!(
             analysis.groups.len() >= 2,
             "should split conflicting subtasks: {:?}",
@@ -659,14 +464,7 @@ mod tests {
         };
 
         let analysis = analyze_parallelism(&plan);
-        // Only "a" is ready, "b" depends on "a"
         assert_eq!(analysis.groups.len(), 1);
         assert_eq!(analysis.groups[0], vec!["a"]);
-    }
-
-    #[test]
-    fn plan_execution_config_defaults() {
-        let config = PlanExecutionConfig::default();
-        assert!(!config.step_by_step);
     }
 }
