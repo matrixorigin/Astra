@@ -846,17 +846,10 @@ impl PlanModeState {
         state.created_by = Some(user_id);
         state
     }
-
-    /// Replace the current plan contents.
-    pub fn set_plan(&mut self, plan: TaskPlan) {
-        self.plan = plan;
-        self.modified = true;
-    }
 }
 
-// ─── Auto Plan Detection ─────────────────────────────────────────────────────
+// ─── Plan Identifiers ────────────────────────────────────────────────────────
 
-/// Returns true when the input clearly asks an analytical/evaluative
 impl PlanModeState {
     /// Generate a unique plan ID from the goal.
     pub fn generate_plan_id(goal: &str) -> String {
@@ -1039,10 +1032,7 @@ pub fn rewind_plan_from_subtask(plan: &mut TaskPlan, start_idx: usize) -> usize 
     n
 }
 
-/// Format a subtask as a rich prompt for the LLM to execute.
-///
-/// Includes the task title, description, files to modify, and acceptance criteria.
-/// Used by the plan auto-execution loop to convert subtasks into actionable LLM prompts.
+/// Returns true when a subtask explicitly calls for real browser/UI verification.
 pub fn subtask_requires_browser_verification(subtask: &SubtaskPlan) -> bool {
     let mut text = subtask.title.to_lowercase();
     if let Some(desc) = &subtask.description {
@@ -1205,7 +1195,7 @@ pub fn format_subtask_prompt_with_operator_notes(
     format!("{block}\n{body}")
 }
 
-// ─── Plan Execution Config & Preview ─────────────────────────────────────────
+// ─── Plan Execution Config & Summary ─────────────────────────────────────────
 
 /// Configuration for plan execution behavior.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1274,45 +1264,8 @@ impl PlanExecutionSummary {
 pub enum TimelineEventKind {
     /// Plan was created
     PlanCreated { subtask_count: usize },
-    /// Execution started (auto or step mode)
-    ExecutionStarted { mode: String },
-    /// A subtask started
-    SubtaskStarted { subtask_id: String, title: String },
-    /// A subtask completed successfully
-    SubtaskCompleted {
-        subtask_id: String,
-        title: String,
-        duration_sec: u64,
-    },
-    /// A subtask failed
-    SubtaskFailed {
-        subtask_id: String,
-        title: String,
-        error: String,
-    },
-    /// A subtask was skipped
-    SubtaskSkipped {
-        subtask_id: String,
-        title: String,
-        reason: String,
-    },
     /// Plan was modified/replanned
     Replan { reason: String, changes: String },
-    /// User provided feedback/rating
-    UserRating { rating: u8 },
-    /// Execution was paused
-    ExecutionPaused { reason: String },
-    /// Execution was resumed
-    ExecutionResumed,
-    /// Plan completed (all subtasks done)
-    PlanCompleted { success: bool, duration_sec: u64 },
-    /// A discovery/observation during execution
-    Discovery { message: String },
-    /// Git commit associated with changes
-    GitCommit {
-        commit_hash: String,
-        message: String,
-    },
     /// Plan was rewound — subtask at `from_idx` and every subtask after it
     /// reset to pending. `reset_count` is the number that actually flipped.
     SubtaskRewound {
@@ -1334,8 +1287,6 @@ pub enum TimelineEventKind {
 pub struct TimelineEvent {
     /// ISO 8601 timestamp
     pub timestamp: String,
-    /// Human-readable time (e.g., "14:23")
-    pub time_display: String,
     /// The event details
     pub event: TimelineEventKind,
 }
@@ -1348,13 +1299,8 @@ impl TimelineEvent {
             .unwrap_or_default()
             .as_secs();
 
-        // Convert to HH:MM format (simplified - assumes local time)
-        let hours = (now / 3600) % 24;
-        let minutes = (now / 60) % 60;
-
         Self {
             timestamp: now.to_string(),
-            time_display: format!("{:02}:{:02}", hours, minutes),
             event,
         }
     }
@@ -1365,29 +1311,12 @@ impl TimelineEvent {
 pub struct ExecutionTimeline {
     /// All recorded events, in chronological order.
     pub events: Vec<TimelineEvent>,
-    /// Plan creation timestamp (for duration calculation).
-    pub start_timestamp: Option<String>,
-    /// Plan completion timestamp.
-    pub end_timestamp: Option<String>,
 }
 
 impl ExecutionTimeline {
     /// Record a new event.
     pub fn record(&mut self, kind: TimelineEventKind) {
-        let event = TimelineEvent::new(kind);
-
-        // Track start/end timestamps
-        match &event.event {
-            TimelineEventKind::PlanCreated { .. } => {
-                self.start_timestamp = Some(event.timestamp.clone());
-            }
-            TimelineEventKind::PlanCompleted { .. } => {
-                self.end_timestamp = Some(event.timestamp.clone());
-            }
-            _ => {}
-        }
-
-        self.events.push(event);
+        self.events.push(TimelineEvent::new(kind));
     }
 }
 
