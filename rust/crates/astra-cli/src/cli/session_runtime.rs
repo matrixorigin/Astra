@@ -706,8 +706,14 @@ pub(crate) fn maybe_restore_pending_plan_mode(line: &str, state: &mut SessionSta
         || state.executing_plan.is_some()
         || state.plan_handle.is_some()
         || state.pending_plan_resume_digest.is_none()
-        || !astra_runtime::plan::plan_resume::message_signals_resume(line)
     {
+        return false;
+    }
+    // When a plan is already pending, bare "continue" is unambiguous — accept
+    // it in addition to the canonical resume phrases.
+    let is_resume = astra_runtime::plan::plan_resume::message_signals_resume(line)
+        || line.trim().eq_ignore_ascii_case("continue");
+    if !is_resume {
         return false;
     }
 
