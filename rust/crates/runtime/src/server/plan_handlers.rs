@@ -20,7 +20,7 @@
 //! source of truth for plan lifecycle state.
 
 use super::*;
-use crate::plan::{ApprovalPolicy, PlanCapabilities, PlanLoadError, PlanModeState};
+use crate::plan::{PlanLoadError, PlanModeState};
 use astra_plan::{PlanListFilter, PlanStepRun};
 use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
 
@@ -38,6 +38,66 @@ const MAX_ATTEMPT: i32 = 1_000_000;
 /// Cap on free-form client text stored in journal/state so a hostile caller
 /// can't bloat `plan_json` or the journal with multi-MB payloads.
 const MAX_REASON_LENGTH: usize = 5_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct PlanCapabilities {
+    pub can_read_files: bool,
+    pub can_execute_tools: bool,
+    pub can_modify_files: bool,
+    pub can_access_network: bool,
+    pub max_subtasks: usize,
+    pub max_execution_rounds: usize,
+    pub requires_approval: ApprovalPolicy,
+}
+
+impl Default for PlanCapabilities {
+    fn default() -> Self {
+        Self {
+            can_read_files: true,
+            can_execute_tools: true,
+            can_modify_files: true,
+            can_access_network: true,
+            max_subtasks: 20,
+            max_execution_rounds: 50,
+            requires_approval: ApprovalPolicy::Destructive,
+        }
+    }
+}
+
+impl PlanCapabilities {
+    fn planning() -> Self {
+        Self {
+            can_read_files: true,
+            can_execute_tools: false,
+            can_modify_files: false,
+            can_access_network: false,
+            max_subtasks: 20,
+            max_execution_rounds: 0,
+            requires_approval: ApprovalPolicy::All,
+        }
+    }
+
+    fn auto_execute() -> Self {
+        Self::default()
+    }
+
+    fn step_by_step() -> Self {
+        Self {
+            requires_approval: ApprovalPolicy::PerSubtask,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ApprovalPolicy {
+    None,
+    PerSubtask,
+    #[default]
+    Destructive,
+    All,
+}
 const MAX_ERROR_LENGTH: usize = 10_000;
 const MAX_ARTIFACT_REF_LENGTH: usize = 1_000;
 
