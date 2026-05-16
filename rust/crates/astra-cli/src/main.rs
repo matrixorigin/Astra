@@ -24,8 +24,6 @@ use std::{
 };
 
 use astra_core::SharedPool;
-#[cfg(test)]
-use astra_runtime::plan_decompose;
 use astra_runtime::{prompts, tool_registry};
 use astra_services::session_journal;
 use clap::Parser;
@@ -115,12 +113,15 @@ mod permission_manager;
 mod plan_executor;
 #[path = "cli/plan_interaction.rs"]
 mod plan_interaction;
-#[path = "cli/plan_mode_client.rs"]
-mod plan_mode_client;
+#[path = "cli/plan_lifecycle.rs"]
+mod plan_lifecycle;
 #[path = "cli/plan_monitor.rs"]
 mod plan_monitor;
 #[path = "cli/plan_runtime.rs"]
 mod plan_runtime;
+#[cfg(test)]
+#[path = "cli/plan_test_support.rs"]
+mod plan_test_support;
 #[path = "cli/preferences_client.rs"]
 mod preferences_client;
 #[path = "cli/project_instructions.rs"]
@@ -164,6 +165,8 @@ mod slash_mcp;
 mod slash_memory;
 #[path = "cli/slash_messaging.rs"]
 mod slash_messaging;
+#[path = "cli/slash_plan.rs"]
+mod slash_plan;
 #[path = "cli/slash_profile.rs"]
 mod slash_profile;
 #[path = "cli/slash_router.rs"]
@@ -2498,32 +2501,6 @@ total_tokens_out: 500
                 assert_eq!(words, &["what", "is", "rust"]);
             }
             _ => panic!("expected Message command"),
-        }
-    }
-
-    #[test]
-    fn cli_plan_decompose_parses() {
-        let cli = Cli::try_parse_from([
-            "astra",
-            "plan",
-            "decompose",
-            "-g",
-            "smoke goal",
-            "--json",
-            "-q",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Command::Plan(PlanCmd::Decompose {
-                ref goal,
-                json,
-                quiet,
-            })) => {
-                assert_eq!(goal, "smoke goal");
-                assert!(json);
-                assert!(quiet);
-            }
-            _ => panic!("expected Plan::Decompose command"),
         }
     }
 

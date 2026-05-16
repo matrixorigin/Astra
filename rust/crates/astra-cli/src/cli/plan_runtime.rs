@@ -31,7 +31,7 @@ fn build_fallback_delegation_engine()
 ///
 /// Clones the active plan for the background executor, moves durable task state
 /// and corrections out of `state`, and leaves an in-memory copy behind so
-/// `/plan status` can keep reporting progress after plan mode exits.
+/// execution state can still be surfaced after plan mode exits.
 fn take_plan_context(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
@@ -98,7 +98,7 @@ fn take_plan_context(
 /// returns after the blocking monitor loop exits, so the normal REPL prompt is not
 /// interleaved with that plan run. The in-memory `executing_plan` copy and
 /// `plan_handle` keep [`crate::plan_monitor::flush_plan_updates_between_prompts`] and
-/// `/plan status` useful when the user is at the prompt again.
+/// related execution state available when the user is at the prompt again.
 pub(crate) async fn start_and_monitor_plan(
     state: &mut SessionState,
     current_token: Option<&str>,

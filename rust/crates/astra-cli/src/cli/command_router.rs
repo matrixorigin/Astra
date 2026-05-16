@@ -1650,6 +1650,10 @@ async fn execute_repl_bridge_command(
         "/memory" => {
             handle_memory_domain_command("/memory", arg, api, &mut state, token.as_deref()).await?
         }
+        "/plan" => {
+            crate::slash_plan::handle_plan_command(arg, api, profile, &mut state, token.as_deref())
+                .await?
+        }
         "/review" | "/grep" => {
             handle_info_command(slash_cmd, arg, api, &mut state, profile, token.as_deref()).await?
         }
@@ -2040,32 +2044,6 @@ pub(super) async fn execute_cli_command(
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }
-
-        Some(Command::Plan(plan_cmd)) => match plan_cmd {
-            PlanCmd::Decompose { goal, json, quiet } => {
-                let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-                let session_id = validated_resumable_last_session_id(api, profile.as_deref()).await;
-                let plan = crate::slash_memory::headless_plan_decompose(
-                    api,
-                    &token,
-                    &goal,
-                    session_id.as_deref(),
-                    global_model.as_deref(),
-                    quiet,
-                )
-                .await?;
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&plan)
-                            .map_err(|e| format!("serialize plan: {e}"))?
-                    );
-                } else {
-                    println!("{}", astra_runtime::plan_decompose::format_plan(&plan));
-                }
-                Ok(ExitCode::Success)
-            }
-        },
 
         Some(Command::Team(args)) => {
             execute_repl_bridge_command(

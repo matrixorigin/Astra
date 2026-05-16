@@ -710,7 +710,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
         `agent(action='spawn', description='Audit auth flow', prompt='Read src/auth/* and report any token-handling bugs. Focus on session expiry and refresh logic. Return findings as a numbered list.', agent_type='general-purpose')`\n\n\
         ## Execution mode\n\
         - **Default (synchronous)**: `spawn` blocks until the sub-agent's final result is ready. Use this for work you depend on in the current turn. The sub-agent's tool calls stream back inline — the TUI renders them inside the parent Task card so the user sees progress live.\n\
-        - **Background**: pass `run_in_background: true` (alias: legacy `background: true`) to return immediately with `{agent_id}`. Use this for fire-and-forget or long-running work you don't need to await; follow up with `get_result` later. Durable-task store persists the run across session death so it survives `astra` restarts.\n\n\
+        - **Background**: pass `run_in_background: true` to return immediately with `{agent_id}`. Use this for fire-and-forget or long-running work you don't need to await; follow up with `get_result` later. Durable-task store persists the run across session death so it survives `astra` restarts.\n\n\
         ## Parallel sub-agent fan-out\n\
         To run N sub-agents in parallel (e.g. multi-angle code review), emit N `agent` tool calls **in a single assistant message**, each with `action='spawn'` and `run_in_background: true`. They run concurrently. After all are spawned, call `agent(action='get_result', agent_id=...)` for each one — `get_result` blocks until that child finishes. This is the ONLY way to fan out parallel agents; do not use `action='delegate'` (removed: it had no execution backend).\n\
         Do NOT pass an `agents:[...]` payload and do NOT wrap spawn arguments under a `spawn` field. Each child must be its own `agent(...)` tool call.",
@@ -724,7 +724,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Sub-agent persona (spawn). Default: general-purpose."},
                         "model": {"type": "string", "description": "Model override (spawn). Default: parent's model."},
                         "run_in_background": {"type": "boolean", "description": "If true, return immediately with agent_id instead of blocking on the sub-agent's final result. Default false (sync). Applies to spawn."},
-                        "background": {"type": "boolean", "description": "(Deprecated alias for run_in_background.) If true, return immediately with agent_id (spawn)."},
                         "name": {"type": "string", "description": "Addressable name (spawn). Optional; auto-generated if omitted."},
                         "max_turns": {"type": "integer", "description": "Max turns (spawn). Explicit value wins over `complexity`."},
                         "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Task-complexity hint scaling the default budget when `max_turns` is absent. `light`≈10 turns, `normal`=agent default, `deep`=2× default. Use `deep` for review/refactor/multi-file tasks that routinely exhaust the default."},

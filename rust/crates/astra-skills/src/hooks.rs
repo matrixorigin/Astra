@@ -278,18 +278,12 @@ pub fn load_all_hooks(
     )
 }
 
-/// JSON format: top-level array of ToolEventHook objects, or an object with a "hooks" key
-/// and optional `default_timeout_secs`. Session hooks live under `"session_hooks"`.
+/// JSON format: object with a `hooks` key and optional `default_timeout_secs`.
+/// Session hooks live under `session_hooks`.
 fn parse_all_hooks_json(
     content: &str,
     path: &std::path::Path,
 ) -> (Vec<ToolEventHook>, Vec<SessionEventHook>) {
-    // Try direct array first (legacy: tool hooks only)
-    if let Ok(hooks) = serde_json::from_str::<Vec<ToolEventHook>>(content) {
-        return (hooks, Vec::new());
-    }
-
-    // Try wrapper with both tool and session hooks
     #[derive(serde::Deserialize)]
     struct Wrapper {
         #[serde(default)]
@@ -307,23 +301,17 @@ fn parse_all_hooks_json(
 
     tracing::warn!(
         target: "hook",
-        "Failed to parse {}: expected JSON array or {{\"hooks\": [...]}}",
+        "Failed to parse {}: expected {{\"hooks\": [...], \"session_hooks\": [...]}}",
         path.display()
     );
     (Vec::new(), Vec::new())
 }
 
-/// YAML format: same as JSON — top-level list or `hooks:` + `session_hooks:` keys.
+/// YAML format: same as JSON — object with `hooks:` and optional `session_hooks:`.
 fn parse_all_hooks_yaml(
     content: &str,
     path: &std::path::Path,
 ) -> (Vec<ToolEventHook>, Vec<SessionEventHook>) {
-    // Try direct array (legacy: tool hooks only)
-    if let Ok(hooks) = serde_yaml_ng::from_str::<Vec<ToolEventHook>>(content) {
-        return (hooks, Vec::new());
-    }
-
-    // Try wrapper
     #[derive(serde::Deserialize)]
     struct Wrapper {
         #[serde(default)]
@@ -341,7 +329,7 @@ fn parse_all_hooks_yaml(
 
     tracing::warn!(
         target: "hook",
-        "Failed to parse {}: expected YAML list or `hooks:` mapping",
+        "Failed to parse {}: expected YAML mapping with `hooks:` / `session_hooks:`",
         path.display()
     );
     (Vec::new(), Vec::new())
@@ -2020,7 +2008,7 @@ mod tests {
     // ── Config loading tests ────────────────────────────────────────
 
     #[test]
-    fn load_hooks_json_array() {
+    fn load_hooks_json_legacy_array_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
         let astra = dir.path().join(".astra");
         std::fs::create_dir_all(&astra).unwrap();
@@ -2035,9 +2023,7 @@ mod tests {
         std::fs::write(astra.join("hooks.json"), json).unwrap();
 
         let registry = load_tool_event_hooks(dir.path());
-        assert_eq!(registry.len(), 1);
-        let hooks = registry.matching(ToolEventKind::PreToolUse, "bash");
-        assert_eq!(hooks.len(), 1);
+        assert!(registry.is_empty());
     }
 
     #[test]
@@ -2066,12 +2052,13 @@ mod tests {
         let astra = dir.path().join(".astra");
         std::fs::create_dir_all(&astra).unwrap();
         let yaml = r#"
-- event: pre_tool_use
-  matcher: "*"
-  action:
-    type: shell
-    command: audit-log.sh
-  timeout_secs: 2
+hooks:
+  - event: pre_tool_use
+    matcher: "*"
+    action:
+      type: shell
+      command: audit-log.sh
+    timeout_secs: 2
 "#;
         std::fs::write(astra.join("hooks.yaml"), yaml).unwrap();
 
@@ -2130,14 +2117,15 @@ hooks:
         let astra = dir.path().join(".astra");
         std::fs::create_dir_all(&astra).unwrap();
 
-        let json = r#"[
-            {"event": "pre_tool_use", "matcher": "a", "action": {"type": "shell", "command": "a"}},
-            {"event": "pre_tool_use", "matcher": "b", "action": {"type": "shell", "command": "b"}}
-        ]"#;
+        let json = r#"{
+            "hooks": [
+                {"event": "pre_tool_use", "matcher": "a", "action": {"type": "shell", "command": "a"}},
+                {"event": "pre_tool_use", "matcher": "b", "action": {"type": "shell", "command": "b"}}
+            ]
+        }"#;
         std::fs::write(astra.join("hooks.json"), json).unwrap();
 
-        let yaml =
-            "- event: pre_tool_use\n  matcher: c\n  action:\n    type: shell\n    command: c\n";
+        let yaml = "hooks:\n  - event: pre_tool_use\n    matcher: c\n    action:\n      type: shell\n      command: c\n";
         std::fs::write(astra.join("hooks.yaml"), yaml).unwrap();
 
         let registry = load_tool_event_hooks(dir.path());

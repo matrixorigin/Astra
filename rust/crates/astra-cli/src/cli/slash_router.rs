@@ -556,8 +556,12 @@ pub(crate) async fn handle_slash_command(
             .await?;
         }
 
-        "/memory" | "/plan" => {
+        "/memory" => {
             handle_memory_domain_command(cmd, arg, api, state, token).await?;
+        }
+
+        "/plan" => {
+            crate::slash_plan::handle_plan_command(arg, api, profile, state, token).await?;
         }
 
         "/task" => {

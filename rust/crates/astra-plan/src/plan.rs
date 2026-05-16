@@ -23,7 +23,7 @@ use std::fmt;
 /// Unified state machine for the plan lifecycle.
 ///
 /// Replaces the former 6+ independent boolean/optional fields in `ReplState`
-/// (`chat_plan_only`, `plan_mode`, `executing_plan`, `plan_execution_config`,
+/// (`plan_mode`, `executing_plan`, `plan_execution_config`,
 /// `executing_plan_goal`, `current_plan_subtask_id`) with a single enum that
 /// makes invalid states unrepresentable.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -32,10 +32,6 @@ pub enum PlanPhase {
     /// No active plan. The user is in normal chat mode.
     #[default]
     Idle,
-
-    /// Plan-only chat mode: tools are disabled, model produces plans as text.
-    /// This is the lightweight planning mode (`/plan on`).
-    PlanOnlyChat,
 
     /// Goal submitted, waiting for LLM decomposition.
     Planning {
@@ -71,11 +67,6 @@ impl PlanPhase {
         matches!(self, Self::Idle)
     }
 
-    /// Whether we're in plan-only chat mode.
-    pub fn is_plan_only_chat(&self) -> bool {
-        matches!(self, Self::PlanOnlyChat)
-    }
-
     /// Whether we're in the interactive plan editing mode.
     pub fn is_refining(&self) -> bool {
         matches!(self, Self::Refining { .. })
@@ -94,10 +85,6 @@ impl PlanPhase {
     /// Whether the plan has reached a terminal state.
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Completed { .. } | Self::Failed { .. })
-    }
-    /// Get the plan-only chat flag (backward compat with `chat_plan_only`).
-    pub fn chat_plan_only(&self) -> bool {
-        matches!(self, Self::PlanOnlyChat)
     }
     /// Get the executing plan (backward compat with `executing_plan`).
     pub fn executing_plan(&self) -> Option<&TaskPlan> {
@@ -131,17 +118,8 @@ impl PlanPhase {
         use PlanPhase::*;
 
         match (self, action) {
-            // Idle → PlanOnlyChat
-            (Idle, EnablePlanOnlyChat) => Ok(PlanOnlyChat),
-
-            // PlanOnlyChat → Idle
-            (PlanOnlyChat, DisablePlanOnlyChat) => Ok(Idle),
-
             // Idle → Planning
             (Idle, SubmitGoal { goal, context }) => Ok(Planning { goal, context }),
-
-            // PlanOnlyChat → Planning (auto-escalate from plan-only to structured)
-            (PlanOnlyChat, SubmitGoal { goal, context }) => Ok(Planning { goal, context }),
 
             // Planning → Refining
             (Planning { .. }, PlanGenerated { state }) => Ok(Refining { state }),
@@ -248,7 +226,6 @@ impl PlanPhase {
     pub fn phase_name(&self) -> &'static str {
         match self {
             Self::Idle => "idle",
-            Self::PlanOnlyChat => "plan_only_chat",
             Self::Planning { .. } => "planning",
             Self::Refining { .. } => "refining",
             Self::Executing { .. } => "executing",
@@ -297,8 +274,6 @@ pub struct PlanExecutionState {
 /// Actions that can trigger phase transitions.
 #[derive(Debug, Clone)]
 pub enum PlanAction {
-    EnablePlanOnlyChat,
-    DisablePlanOnlyChat,
     SubmitGoal {
         goal: String,
         context: ProjectContext,
@@ -335,8 +310,6 @@ impl PlanAction {
     /// Human-readable name for this action.
     pub fn action_name(&self) -> &'static str {
         match self {
-            Self::EnablePlanOnlyChat => "enable_plan_only_chat",
-            Self::DisablePlanOnlyChat => "disable_plan_only_chat",
             Self::SubmitGoal { .. } => "submit_goal",
             Self::PlanGenerated { .. } => "plan_generated",
             Self::PlanEdited { .. } => "plan_edited",
@@ -476,14 +449,6 @@ pub enum PlanCommand {
     Cancel,
     /// Show current plan status.
     Status,
-    /// Show plan diff between versions.
-    Diff { from: Option<u32>, to: Option<u32> },
-    /// Rollback to a specific plan version.
-    Rollback { version: u32 },
-    /// Show plan timeline.
-    Timeline,
-    /// Show plan metrics.
-    Metrics,
     /// Add operator correction for upcoming subtasks.
     Correct { guidance: String },
     /// Clear stacked corrections.
@@ -492,14 +457,6 @@ pub enum PlanCommand {
     Rewind { anchor: String },
     /// Re-do a single subtask — resets only the named subtask to Pending.
     RedoStep { subtask_id: String },
-    /// Enable plan-only chat mode.
-    EnablePlanOnly,
-    /// Disable plan-only chat mode.
-    DisablePlanOnly,
-    /// List saved plans.
-    List,
-    /// Show version history.
-    History,
     /// Show the current plan in detail.
     Show,
     /// Show available commands.
@@ -571,45 +528,9 @@ impl PlanCommand {
             return Some(PlanCommand::Pause);
         }
 
-        // Timeline
-        if lower == "timeline" || lower == "时间线" {
-            return Some(PlanCommand::Timeline);
-        }
-
-        // Metrics
-        if lower == "metrics" || lower == "指标" || lower == "cost" {
-            return Some(PlanCommand::Metrics);
-        }
-
-        // History
-        if lower == "history" || lower == "历史" {
-            return Some(PlanCommand::History);
-        }
-
         // Show
         if lower == "show" || lower == "detail" || lower == "详情" {
             return Some(PlanCommand::Show);
-        }
-
-        // List
-        if lower == "list" || lower == "列表" {
-            return Some(PlanCommand::List);
-        }
-
-        // Diff
-        if lower.starts_with("diff") {
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            let from = parts.get(1).and_then(|s| s.parse::<u32>().ok());
-            let to = parts.get(2).and_then(|s| s.parse::<u32>().ok());
-            return Some(PlanCommand::Diff { from, to });
-        }
-
-        // Rollback
-        if lower.starts_with("rollback") || lower.starts_with("undo") {
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if let Some(version) = parts.get(1).and_then(|s| s.parse::<u32>().ok()) {
-                return Some(PlanCommand::Rollback { version });
-            }
         }
 
         // Corrections (prefixed commands)
@@ -662,14 +583,6 @@ impl PlanCommand {
                     subtask_id: rest.to_string(),
                 });
             }
-        }
-
-        // Plan-only mode
-        if lower == "on" {
-            return Some(PlanCommand::EnablePlanOnly);
-        }
-        if lower == "off" {
-            return Some(PlanCommand::DisablePlanOnly);
         }
 
         None
@@ -759,9 +672,7 @@ impl PlanCapabilities {
     pub fn for_phase(phase: &PlanPhase) -> Self {
         match phase {
             PlanPhase::Idle => Self::default(),
-            PlanPhase::PlanOnlyChat | PlanPhase::Planning { .. } | PlanPhase::Refining { .. } => {
-                Self::planning()
-            }
+            PlanPhase::Planning { .. } | PlanPhase::Refining { .. } => Self::planning(),
             PlanPhase::Executing { state } => {
                 if state.config.step_by_step {
                     Self::step_by_step()
@@ -892,20 +803,6 @@ pub enum ApprovalPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn idle_to_plan_only_chat() {
-        let phase = PlanPhase::Idle;
-        let next = phase.transition(PlanAction::EnablePlanOnlyChat).unwrap();
-        assert!(next.is_plan_only_chat());
-    }
-
-    #[test]
-    fn plan_only_chat_to_idle() {
-        let phase = PlanPhase::PlanOnlyChat;
-        let next = phase.transition(PlanAction::DisablePlanOnlyChat).unwrap();
-        assert!(next.is_idle());
-    }
 
     #[test]
     fn idle_to_planning() {
@@ -1090,7 +987,10 @@ mod tests {
         let idle_caps = PlanCapabilities::for_phase(&PlanPhase::Idle);
         assert!(idle_caps.can_execute_tools);
 
-        let plan_caps = PlanCapabilities::for_phase(&PlanPhase::PlanOnlyChat);
+        let plan_caps = PlanCapabilities::for_phase(&PlanPhase::Planning {
+            goal: "test".into(),
+            context: ProjectContext::default(),
+        });
         assert!(!plan_caps.can_execute_tools);
         assert!(!plan_caps.can_modify_files);
 
@@ -1103,7 +1003,16 @@ mod tests {
     #[test]
     fn phase_display() {
         assert_eq!(format!("{}", PlanPhase::Idle), "idle");
-        assert_eq!(format!("{}", PlanPhase::PlanOnlyChat), "plan_only_chat");
+        assert_eq!(
+            format!(
+                "{}",
+                PlanPhase::Planning {
+                    goal: "test".into(),
+                    context: ProjectContext::default()
+                }
+            ),
+            "planning"
+        );
     }
 
     // ── Circuit breaker tests ───────────────────────────────────────────

@@ -179,9 +179,6 @@ pub(crate) enum Command {
     Completion(CompletionArgs),
     /// Diagnose installation, config, and connectivity
     Doctor,
-    /// Structured plan in non-interactive mode (scripting / CI)
-    #[command(subcommand)]
-    Plan(PlanCmd),
     /// Team orchestration and shared context management
     #[command(alias = "teams")]
     Team(TeamArgs),
@@ -249,23 +246,6 @@ pub(crate) struct ContextDumpArgs {
     /// a JSON file.  Useful for `| grep`, CI logs, bug reports.
     #[arg(long)]
     pub summary: bool,
-}
-
-/// Headless plan commands (no interactive `plan>` prompt).
-#[derive(Subcommand, Debug)]
-pub(crate) enum PlanCmd {
-    /// Decompose a goal into a structured plan (same backend as `/plan enter`).
-    Decompose {
-        /// Goal text for decomposition
-        #[arg(short = 'g', long)]
-        goal: String,
-        /// Print parsed plan as JSON on stdout
-        #[arg(long, default_value_t = false)]
-        json: bool,
-        /// Suppress progress messages on stderr
-        #[arg(short, long, default_value_t = false)]
-        quiet: bool,
-    },
 }
 
 #[derive(Args, Debug)]

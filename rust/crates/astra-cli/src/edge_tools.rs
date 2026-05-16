@@ -62,7 +62,7 @@ use astra_tools::passive_tsc_check;
 #[allow(clippy::needless_range_loop)]
 mod shell;
 use astra_tools::env_tools;
-pub use astra_tools::schemas::all_tool_schemas;
+use astra_tools::schemas::{all_tool_schemas as full_tool_schemas, default_executor_tool_schemas};
 pub use env_tools::apply_overlay as apply_env_overlay;
 #[path = "edge_tools/code_analysis.rs"]
 mod code_analysis;
@@ -70,6 +70,30 @@ mod code_analysis;
 mod config_tool;
 #[path = "edge_tools/context_tools.rs"]
 mod context_tools;
+
+pub fn all_tool_schemas() -> Vec<Value> {
+    full_tool_schemas()
+}
+
+fn function_schema_name(schema: &Value) -> Option<&str> {
+    schema
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+}
+
+pub fn local_tool_schemas() -> Vec<Value> {
+    let mut schemas = default_executor_tool_schemas();
+    for schema in full_tool_schemas() {
+        if matches!(
+            function_schema_name(&schema),
+            Some("enter_plan_mode" | "exit_plan_mode")
+        ) {
+            schemas.push(schema);
+        }
+    }
+    schemas
+}
 #[path = "edge_tools/diagnose.rs"]
 mod diagnose;
 #[path = "edge_tools/file_state.rs"]
@@ -1108,116 +1132,11 @@ impl ToolExecutor {
         )
     }
 
-    /// Phase 2 split (2026-05): plan-mode actions promoted from buried
-    /// `session` sub-actions to dedicated top-level tools (claudecode
-    /// parity). The model picked the buried sub-actions only ~rarely,
-    /// missing the plan-authoring discipline. Stale callers get an
-    /// Error: redirect — same shape as the agent.delegate fix and the
-    /// Phase 1 task→agent_job split.
     fn redirect_to_plan_mode_tool(old_action: &str, new_tool: &str) -> String {
         format!(
-            "Error: `session(action='{old_action}')` was promoted to the \
-             top-level `{new_tool}` tool in the Phase 2 plan-mode split. \
-             Call `{new_tool}` directly — see its description for the \
-             plan-authoring contract. The buried sub-action no longer exists."
+            "Error: `session(action='{old_action}')` was removed in the plan-mode cleanup. \
+             Use `{new_tool}` instead. The `session` tool no longer owns plan lifecycle actions."
         )
-    }
-
-    /// CLI entry point for the top-level `enter_plan_mode` tool. Posts
-    /// to the cloud `/plans` endpoint to mint or relink a plan, sets the
-    /// session's active plan id, and returns workflow instructions.
-    /// Falls back to a clear Error: when no cloud is wired (offline / no
-    /// auth) — astra is edge-cloud and plan state is authoritative in
-    /// the cloud DB; we don't keep a local-only ghost plan.
-    async fn cli_enter_plan_mode(&self, args: &Value) -> String {
-        let goal = args
-            .get("goal")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("(pending)");
-        let Some(cloud_base) = self.cloud_base.clone() else {
-            return "Error: plan mode requires a cloud connection (no cloud_base configured). \
-                    Set ASTRA_API_URL or sign in with `astra login`, then retry. Plan state \
-                    is authoritative in the cloud DB — without it the plan would be a local \
-                    ghost that desyncs across devices."
-                .to_string();
-        };
-        let Some(session_id) = self.active_session_id() else {
-            return "Error: plan mode requires an active session id. \
-                    Call `enter_plan_mode` from inside an interactive REPL session, not \
-                    a one-shot CLI invocation."
-                .to_string();
-        };
-        let token = self.cloud_token();
-        match crate::plan_mode_client::enter_plan_mode(
-            &cloud_base,
-            token.as_deref(),
-            &session_id,
-            goal,
-        )
-        .await
-        {
-            Ok(plan_id) => format!(
-                "Entered plan mode. plan_id={plan_id} goal=\"{goal}\". Write tools are now \
-                 blocked — explore the codebase with read tools (read_file/grep/glob/list_dir/symbols), \
-                 author the plan, then call `exit_plan_mode(plan='...', approved=true)` to \
-                 surface it for user approval."
-            ),
-            Err(err) => format!("Error: enter_plan_mode failed: {err}"),
-        }
-    }
-
-    /// CLI entry point for the top-level `exit_plan_mode` tool. POSTs
-    /// to `/plans/{id}/exit-plan-mode` so the server-side handler runs
-    /// the same code path as the web agent (plan_md persistence,
-    /// session_plan_todos seed, write-tool unlock).
-    async fn cli_exit_plan_mode(&self, args: &Value) -> String {
-        let plan = match args.get("plan").and_then(Value::as_str) {
-            Some(p) if !p.trim().is_empty() => p.to_string(),
-            _ => {
-                return "Error: `plan` is required for exit_plan_mode (markdown for user approval)"
-                    .to_string();
-            }
-        };
-        let approved = args
-            .get("approved")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        let Some(cloud_base) = self.cloud_base.clone() else {
-            return "Error: plan mode requires a cloud connection (no cloud_base configured)"
-                .to_string();
-        };
-        let Some(session_id) = self.active_session_id() else {
-            return "Error: plan mode requires an active session id".to_string();
-        };
-        let token = self.cloud_token();
-        match crate::plan_mode_client::exit_plan_mode(
-            &cloud_base,
-            token.as_deref(),
-            &session_id,
-            &plan,
-            approved,
-        )
-        .await
-        {
-            Ok(plan_id) => {
-                if approved {
-                    format!(
-                        "Exited plan mode. plan_id={plan_id} approved; write tools unlocked. \
-                         Plan items have been seeded to the session task list — start with the \
-                         first item."
-                    )
-                } else {
-                    format!(
-                        "Plan {plan_id} left open for another authoring pass. Write tools \
-                         remain blocked. Refine the plan and call exit_plan_mode again with \
-                         approved=true when ready."
-                    )
-                }
-            }
-            Err(err) => format!("Error: exit_plan_mode failed: {err}"),
-        }
     }
 
     fn task_output_success(output: &str) -> bool {
@@ -1270,6 +1189,151 @@ impl ToolExecutor {
                 Some(output)
             }
             Err(err) => Some(format!("Error: cloud todo {action} failed: {err}")),
+        }
+    }
+
+    fn remote_plan_client(&self) -> Result<astra_thin_client::ThinClient, String> {
+        let Some(cloud_base) = self.cloud_base.clone() else {
+            return Err(
+                "Error: plan lifecycle is unavailable in offline CLI mode; connect to cloud first."
+                    .to_string(),
+            );
+        };
+        astra_thin_client::ThinClient::new(&cloud_base, None)
+            .map_err(|err| format!("Error: failed to initialize plan client: {err}"))
+    }
+
+    async fn enter_plan_mode_remote(&self, args: &Value) -> String {
+        let goal = args
+            .get("goal")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|goal| !goal.is_empty());
+        let Some(goal) = goal else {
+            return "Error: missing required parameter `goal`.".to_string();
+        };
+
+        let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty()) else {
+            return "Error: enter_plan_mode requires an active session.".to_string();
+        };
+        let Some(token) = self.cloud_token() else {
+            return "Error: enter_plan_mode requires an authenticated cloud session.".to_string();
+        };
+
+        let client = match self.remote_plan_client() {
+            Ok(client) => client,
+            Err(err) => return err,
+        };
+        let response = match client
+            .post_plans_json(
+                &token,
+                &json!({
+                    "goal": goal,
+                    "session_id": session_id,
+                }),
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                return format!(
+                    "Error: failed to enter plan mode: {}",
+                    crate::map_thin_err(err)
+                );
+            }
+        };
+
+        let Some(plan_id) = response.get("plan_id").and_then(Value::as_str) else {
+            return "Error: failed to enter plan mode: create plan response missing plan_id."
+                .to_string();
+        };
+        format!(
+            "Entered plan mode. plan_id={plan_id} goal=\"{goal}\". Write tools are now blocked — author the plan, then call exit_plan_mode when it's ready for execution."
+        )
+    }
+
+    async fn exit_plan_mode_remote(&self, args: &Value) -> String {
+        let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty()) else {
+            return "Error: exit_plan_mode requires an active session.".to_string();
+        };
+        let Some(token) = self.cloud_token() else {
+            return "Error: exit_plan_mode requires an authenticated cloud session.".to_string();
+        };
+
+        let client = match self.remote_plan_client() {
+            Ok(client) => client,
+            Err(err) => return err,
+        };
+        let plans = match client
+            .get_plans_query_json(
+                &token,
+                &[
+                    ("session_id", session_id),
+                    ("phase", "planning".to_string()),
+                    ("limit", "1".to_string()),
+                ],
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                return format!(
+                    "Error: failed to look up active planning session: {}",
+                    crate::map_thin_err(err)
+                );
+            }
+        };
+        let Some(plan_id) = plans
+            .get("plans")
+            .and_then(Value::as_array)
+            .and_then(|plans| plans.first())
+            .and_then(|plan| plan.get("plan_id"))
+            .and_then(Value::as_str)
+        else {
+            return "Error: no active planning plan found for the current session.".to_string();
+        };
+
+        let approved = args
+            .get("approved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let plan_markdown = args
+            .get("plan_markdown")
+            .and_then(Value::as_str)
+            .or_else(|| args.get("plan_md").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|plan| !plan.is_empty());
+
+        let mut body = json!({ "approved": approved });
+        if let Some(plan_markdown) = plan_markdown {
+            body["plan_md"] = Value::String(plan_markdown.to_string());
+        }
+
+        let response = match client
+            .post_plan_exit_mode_json(&token, plan_id, &body)
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                return format!(
+                    "Error: failed to exit plan mode: {}",
+                    crate::map_thin_err(err)
+                );
+            }
+        };
+        let resolved_plan_id = response
+            .get("plan_id")
+            .and_then(Value::as_str)
+            .unwrap_or(plan_id);
+
+        if approved {
+            format!(
+                "Exited plan mode. plan_id={resolved_plan_id} is approved; write tools unlocked. Use /plans/{resolved_plan_id}/execute to run the plan."
+            )
+        } else {
+            format!(
+                "Plan {resolved_plan_id} left open for another authoring pass. Write tools remain blocked."
+            )
         }
     }
 
@@ -1453,7 +1517,7 @@ impl ToolExecutor {
                 .get("agent_type")
                 .and_then(Value::as_str)
                 .unwrap_or("general-purpose"),
-            "background": true,
+            "run_in_background": true,
         });
         if let Some(model) = args.get("model").and_then(Value::as_str) {
             spawn_args["model"] = json!(model);
@@ -2545,10 +2609,9 @@ impl ToolExecutor {
                 #[cfg(windows)]
                 "powershell" => self.powershell(args),
                 // Activation primitive for the deferred tool layer.
-                // MUST use the CLI-side full catalog (`all_tool_schemas()`)
-                // so `select:NAME` can reach every cataloged tool — not
-                // just the 14 in `default_executor_tool_schemas()` that
-                // the fallback `default_executor.execute()` would hit.
+                // Uses the local CLI catalog plus plugin-installed schemas,
+                // so `select:NAME` matches the tools this surface actually
+                // exposes while still resolving MCP/skill-backed tools.
                 "tool_search" => self.tool_search(args),
                 "read_file" => self.read_file(args),
                 "write_file" => {
@@ -2693,6 +2756,8 @@ impl ToolExecutor {
                     let clean_args = self.memory_args_with_context(args);
                     self.memoria_call(op, &clean_args).await
                 }
+                "enter_plan_mode" => self.enter_plan_mode_remote(args).await,
+                "exit_plan_mode" => self.exit_plan_mode_remote(args).await,
                 "adjust_config" => self.adjust_config(args),
                 "prioritize_tool" => self.prioritize_tool(args),
                 "deprioritize_tool" => self.deprioritize_tool(args),
@@ -2853,16 +2918,18 @@ impl ToolExecutor {
                         "list_released" => self.list_released_context(),
                         // Phase 2 split: plan-mode actions promoted to top-level
                         // tools (claudecode parity). Stale callers get an
-                        // Error: with redirect — same shape as the Phase 1
+                        // Error: redirect — same shape as the Phase 1
                         // task→agent_job split.
-                        "enter_plan" => Self::redirect_to_plan_mode_tool("enter_plan", "enter_plan_mode"),
-                        "exit_plan" => Self::redirect_to_plan_mode_tool("exit_plan", "exit_plan_mode"),
+                        "enter_plan" => {
+                            Self::redirect_to_plan_mode_tool("enter_plan", "enter_plan_mode")
+                        }
+                        "exit_plan" => {
+                            Self::redirect_to_plan_mode_tool("exit_plan", "exit_plan_mode")
+                        }
                         "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, compact, rollback_edits, sleep, timeline, summary, history, suppress_memory(memory_id, reason?), unsuppress_memory(memory_id), list_suppressed, release_context(tool_call_id|string[]), list_released. Use the first-class `ask_user` tool for user questions. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools.".to_string(),
                         other => format!("Error: unknown `session` action '{other}'. Valid: config, prioritize, deprioritize, compact, rollback_edits, sleep, timeline, summary, history, suppress_memory, unsuppress_memory, list_suppressed, release_context, list_released. Use the first-class `ask_user` tool for user questions. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools."),
                     }
                 }
-                "enter_plan_mode" => self.cli_enter_plan_mode(args).await,
-                "exit_plan_mode" => self.cli_exit_plan_mode(args).await,
                 // Task management (unified tool with action param)
                 "task" => {
                     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
@@ -3517,14 +3584,13 @@ mod tests {
         assert!(output.contains("done"), "unexpected bash output: {output}");
     }
 
-    // ── tool_search dispatch: CLI must route to the full catalog ───────
+    // ── tool_search dispatch: CLI must route to its local catalog ──────
     //
     // Before this fix: `execute()` had no `"tool_search"` arm, so
     // `default_executor.execute("tool_search")` was called. That uses
-    // `default_executor_tool_schemas()` — a 14-tool subset without
-    // github, memory, session, agent, lsp, symbols. CLI users hitting
-    // `tool_search(select:github)` got `missing:["github"]` and the
-    // entire deferred-activation flow was dead on CLI.
+    // the default executor's built-in dispatch instead of the CLI's
+    // local-tool catalog + plugin schemas. That broke deferred activation
+    // for plugin tools on CLI.
 
     /// P0 regression: when ToolExecutor is constructed without a
     /// wired `bg_task_commands` queue (no TUI to drain), the
@@ -3588,7 +3654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_search_select_github_returns_schema_on_cli_path() {
+    async fn tool_search_select_github_is_missing_on_cli_path() {
         let executor = test_executor();
         let out = executor
             .execute(
@@ -3600,23 +3666,18 @@ mod tests {
             serde_json::from_str(&out).expect("tool_search must return valid JSON");
         let missing = parsed["missing"].as_array().expect("missing field");
         assert!(
-            missing.is_empty(),
-            "CLI tool_search(select:github) must resolve, not return missing; got: {out}"
+            missing.iter().any(|value| value.as_str() == Some("github")),
+            "CLI tool_search(select:github) should stay missing because github is not in the local CLI surface; got: {out}"
         );
         let matches = parsed["matches"].as_array().expect("matches field");
-        assert_eq!(matches.len(), 1, "exactly one match; got: {out}");
-        assert_eq!(matches[0]["name"].as_str(), Some("github"));
         assert!(
-            matches[0].get("parameters").is_some(),
-            "must include full parameters for activation"
+            matches.is_empty(),
+            "server-only tools should not be returned on the local CLI path; got: {out}"
         );
     }
 
     #[tokio::test]
-    async fn tool_search_select_memory_returns_schema_on_cli_path() {
-        // memory is in DEFAULT_PINNED but deferred activation must still
-        // return its schema on demand. Tests that the CLI dispatch pool
-        // covers all pinned catalog tools.
+    async fn tool_search_select_memory_is_missing_on_cli_path() {
         let executor = test_executor();
         let out = executor
             .execute(
@@ -3625,8 +3686,14 @@ mod tests {
             )
             .await;
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert!(parsed["missing"].as_array().unwrap().is_empty());
-        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("memory"));
+        assert!(
+            parsed["missing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("memory"))
+        );
+        assert!(parsed["matches"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

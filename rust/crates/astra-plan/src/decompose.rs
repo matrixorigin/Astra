@@ -20,7 +20,7 @@ use std::time::Instant;
 // Re-export task types from services
 pub use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
 
-/// First `messages[]` row (`role: system`) when the CLI enables **plan-only chat** (`/plan on`).
+/// First `messages[]` row (`role: system`) for the tools-disabled planning flow.
 /// Edge tools are omitted from the payload; the model should reason and answer with a plan only.
 pub const CHAT_PLAN_ONLY_SYSTEM: &str = "You are in **plan-only** mode.\n\n\
 Rules:\n\
@@ -4612,7 +4612,7 @@ pub struct SavedPlanInfo {
 /// Format saved plans for display.
 pub fn format_plan_list(plans: &[SavedPlanInfo]) -> String {
     if plans.is_empty() {
-        return "  No saved plans. Use /plan enter <goal> to create one.\n".to_string();
+        return "  No saved plans. Use /plan to create one.\n".to_string();
     }
     let mut out = String::new();
     out.push_str("  ┌── Saved Plans ──\n");

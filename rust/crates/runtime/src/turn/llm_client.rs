@@ -8724,7 +8724,7 @@ mod tests {
                             "maximum": 100,
                             "default": 10
                         },
-                        "background": {
+                        "run_in_background": {
                             "type": "boolean",
                             "description": "Run in background",
                             "default": true

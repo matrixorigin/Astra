@@ -684,7 +684,7 @@ impl DynamicAgentSpawner {
         }
 
         // 8. Execute or launch
-        if input.background {
+        if input.run_in_background {
             // Background mode: launch async and return immediately.
             // The JoinHandle is tracked in `background_tasks` so `shutdown_and_wait`
             // can drain it and panics are surfaced instead of silently lost.
@@ -1451,7 +1451,7 @@ mod tests {
             description: "Test agent".to_string(),
             prompt: "Do a test".to_string(),
             agent_type: "explore".to_string(),
-            background: true,
+            run_in_background: true,
             ..Default::default()
         };
         let context = SpawnContext {
@@ -1554,7 +1554,7 @@ mod tests {
             description: "Explore codebase".to_string(),
             prompt: "Explore".to_string(),
             agent_type: "explore".to_string(),
-            background: true,
+            run_in_background: true,
             ..Default::default()
         };
         let result = spawner.spawn(input, &context).await.unwrap();
@@ -1598,7 +1598,7 @@ mod tests {
             prompt: "Send a message".to_string(),
             agent_type: "explore".to_string(),
             name: Some("named".to_string()),
-            background: true,
+            run_in_background: true,
             ..Default::default()
         };
 
@@ -1776,7 +1776,7 @@ mod tests {
             prompt: "Finish immediately".to_string(),
             agent_type: "explore".to_string(),
             name: Some("bg".to_string()),
-            background: true,
+            run_in_background: true,
             ..Default::default()
         };
 
@@ -1818,7 +1818,7 @@ mod tests {
             description: "Depth test".to_string(),
             prompt: "Run depth test".to_string(),
             agent_type: "explore".to_string(),
-            background: false, // drive the synchronous Completed path
+            run_in_background: false, // drive the synchronous Completed path
             ..Default::default()
         };
 
@@ -1873,7 +1873,7 @@ mod tests {
             description: "Sync agent".to_string(),
             prompt: "Fail immediately".to_string(),
             agent_type: "explore".to_string(),
-            background: false, // drive the synchronous Failed path
+            run_in_background: false, // drive the synchronous Failed path
             ..Default::default()
         };
 
@@ -1942,7 +1942,7 @@ mod tests {
             description: "Test with skills".to_string(),
             prompt: "Test".to_string(),
             agent_type: "explore".to_string(),
-            background: true,
+            run_in_background: true,
             ..Default::default()
         };
         // Skills are stored in context and passed through — spawner launches successfully
@@ -2038,7 +2038,7 @@ mod tests {
             description: "bg test".to_string(),
             prompt: "do it".to_string(),
             agent_type: "explore".to_string(),
-            background: true,
+            run_in_background: true,
             ..Default::default()
         }
     }
@@ -2205,7 +2205,7 @@ mod tests {
         assert!(matches!(b, Some(AgentStatus::Completed { .. })), "b={b:?}");
     }
 
-    /// REGRESSION (reviewer L2-3): after `spawn(background:true)`
+    /// REGRESSION (reviewer L2-3): after `spawn(run_in_background:true)`
     /// returned `Launched` immediately (the auto-wait timeout was
     /// removed in commit a4719d7ca), there's a tiny window where
     /// the child future has been pushed to `JoinSet` but hasn't yet
@@ -2612,7 +2612,7 @@ mod tests {
             description: "child".into(),
             prompt: "work".into(),
             agent_type: "explore".into(),
-            background: true,
+            run_in_background: true,
             ..Default::default()
         };
         let ctx = parent_context("run-parent");
@@ -2649,7 +2649,7 @@ mod tests {
         // Sync spawn (background=false) so the executor runs before
         // spawn() returns and we can read the captured config.
         let mut input = child_with_inherit(false);
-        input.background = false;
+        input.run_in_background = false;
         let ctx = parent_context("run-parent-A");
         let _ = spawner.spawn(input, &ctx).await.unwrap();
 
@@ -2681,7 +2681,7 @@ mod tests {
             .with_executor(exec.clone() as Arc<dyn SpawnAgentExecutor>);
 
         let mut input = child_with_inherit(false);
-        input.background = false;
+        input.run_in_background = false;
         let ctx = parent_context("run-no-capture");
         let _ = spawner.spawn(input, &ctx).await.unwrap();
 
@@ -2706,7 +2706,7 @@ mod tests {
             description: "no inherit".into(),
             prompt: "work".into(),
             agent_type: "explore".into(),
-            background: false,
+            run_in_background: false,
             ..Default::default()
         };
         let ctx = parent_context("run-parent");
@@ -2741,7 +2741,7 @@ mod tests {
         let captured_canonical = stored_prefix.canonical_prefix_bytes().clone();
 
         let mut input = child_with_inherit(false);
-        input.background = false;
+        input.run_in_background = false;
         let _ = spawner
             .spawn(input, &parent_context("run-parent-bid"))
             .await

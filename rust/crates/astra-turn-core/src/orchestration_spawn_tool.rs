@@ -54,15 +54,8 @@ pub struct SpawnAgentInput {
     /// Run in background (async). Default false — synchronous mode
     /// ensures the parent receives the child's result in the tool-call
     /// response before its turn budget is consumed.
-    ///
-    /// Accepts both `background` (legacy) and `run_in_background`
-    /// (claude-code-style) as wire keys.
-    #[serde(
-        default,
-        alias = "run_in_background",
-        deserialize_with = "deserialize_bool_lenient"
-    )]
-    pub background: bool,
+    #[serde(default, deserialize_with = "deserialize_bool_lenient")]
+    pub run_in_background: bool,
 
     /// Name for agent-to-agent messaging.
     pub name: Option<String>,
@@ -120,7 +113,7 @@ pub struct SpawnAgentInput {
 /// Lenient bool deserializer: accepts `true`, `false`, `"true"`,
 /// `"false"`, `"1"`, `"0"`, `1`, `0`, or null/absent (→ false).
 /// LLMs frequently serialize booleans as strings (session 7e3fecb5:
-/// `"background": "true"` caused 3 consecutive InvalidInput errors
+/// `"run_in_background": "true"` caused 3 consecutive InvalidInput errors
 /// that triggered ToolHealthTracker restriction).
 fn deserialize_bool_lenient<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
@@ -248,7 +241,7 @@ impl Default for SpawnAgentInput {
             prompt: String::new(),
             agent_type: default_agent_type(),
             model: None,
-            background: false,
+            run_in_background: false,
             name: None,
             max_turns: None,
             max_output_tokens: None,
@@ -438,7 +431,7 @@ pub fn spawn_agent_schema() -> serde_json::Value {
                         "type": "string",
                         "description": "Optional model override."
                     },
-                    "background": {
+                    "run_in_background": {
                         "type": "boolean",
                         "description": "If true, return immediately with agent_id and you MUST call get_agent_result(agent_id) to collect the output. Default false waits for the result synchronously.",
                         "default": false
@@ -508,9 +501,9 @@ mod tests {
         let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
         assert_eq!(input.description, "Test");
         assert_eq!(input.agent_type, "general-purpose");
-        // Default is synchronous (background=false) so the parent
+        // Default is synchronous (run_in_background=false) so the parent
         // receives the child's result in the tool-call response.
-        assert!(!input.background);
+        assert!(!input.run_in_background);
         // Inheritance defaults to None — existing clients get no
         // behavior change when they don't set inherit_prefix.
         assert!(input.inherit_prefix.is_none());
@@ -518,39 +511,33 @@ mod tests {
     }
 
     #[test]
-    fn background_default_is_false() {
+    fn run_in_background_default_is_false() {
         let input = SpawnAgentInput::default();
         assert!(
-            !input.background,
-            "background must default to false — synchronous spawn \
+            !input.run_in_background,
+            "run_in_background must default to false — synchronous spawn \
              ensures the parent receives the child's result before \
              its turn budget is consumed"
         );
     }
 
     #[test]
-    fn background_true_requires_explicit_opt_in() {
-        let json = r#"{"description": "D", "prompt": "P", "background": true}"#;
+    fn run_in_background_true_requires_explicit_opt_in() {
+        let json = r#"{"description": "D", "prompt": "P", "run_in_background": true}"#;
         let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
         assert!(
-            input.background,
-            "explicit background: true must be honored"
+            input.run_in_background,
+            "explicit run_in_background: true must be honored"
         );
     }
 
     #[test]
-    fn run_in_background_alias_maps_to_background_field() {
-        // The tool schema advertises `run_in_background` (claude-code
-        // style). Some models primed on that name will emit that key
-        // instead of the legacy `background`. Both must route to the
-        // same boolean — otherwise the sync-default promise breaks
-        // silently for any caller that uses the schema-documented
-        // name.
+    fn run_in_background_populates_canonical_field() {
         let json = r#"{"description": "D", "prompt": "P", "run_in_background": true}"#;
         let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
         assert!(
-            input.background,
-            "run_in_background alias must populate the background field"
+            input.run_in_background,
+            "run_in_background must populate the canonical field"
         );
     }
 
@@ -559,7 +546,7 @@ mod tests {
         let json = r#"{"description": "D", "prompt": "P", "run_in_background": false}"#;
         let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
         assert!(
-            !input.background,
+            !input.run_in_background,
             "run_in_background: false must produce the sync-default spawn"
         );
     }
@@ -754,29 +741,30 @@ mod bool_lenient_tests {
     use super::SpawnAgentInput;
 
     #[test]
-    fn background_accepts_string_true() {
+    fn run_in_background_accepts_string_true() {
         // Regression (session 7e3fecb5): LLM passed "true" (string)
         // instead of true (bool) → serde rejected → 3 failures →
         // tool restricted. Lenient deserializer fixes this.
-        let input: SpawnAgentInput =
-            serde_json::from_str(r#"{"description":"test","prompt":"p","background":"true"}"#)
-                .expect("string 'true' must deserialize");
-        assert!(input.background);
+        let input: SpawnAgentInput = serde_json::from_str(
+            r#"{"description":"test","prompt":"p","run_in_background":"true"}"#,
+        )
+        .expect("string 'true' must deserialize");
+        assert!(input.run_in_background);
     }
 
     #[test]
-    fn background_accepts_bool_true() {
+    fn run_in_background_accepts_bool_true() {
         let input: SpawnAgentInput =
-            serde_json::from_str(r#"{"description":"test","prompt":"p","background":true}"#)
+            serde_json::from_str(r#"{"description":"test","prompt":"p","run_in_background":true}"#)
                 .expect("bool true must deserialize");
-        assert!(input.background);
+        assert!(input.run_in_background);
     }
 
     #[test]
-    fn background_defaults_false_on_absence() {
+    fn run_in_background_defaults_false_on_absence() {
         let input: SpawnAgentInput = serde_json::from_str(r#"{"description":"test","prompt":"p"}"#)
-            .expect("absent background must default to false");
-        assert!(!input.background);
+            .expect("absent run_in_background must default to false");
+        assert!(!input.run_in_background);
     }
 
     #[test]
@@ -788,12 +776,12 @@ mod bool_lenient_tests {
     }
 
     #[test]
-    fn background_rejects_unknown_string() {
+    fn run_in_background_rejects_unknown_string() {
         // Contract: only {true,false,1,0,yes,no} are accepted. Anything
         // else must error instead of silently defaulting to false — so
         // genuine LLM bugs surface rather than masquerading as success.
         let err = serde_json::from_str::<SpawnAgentInput>(
-            r#"{"description":"test","prompt":"p","background":"maybe"}"#,
+            r#"{"description":"test","prompt":"p","run_in_background":"maybe"}"#,
         )
         .expect_err("unknown string must be rejected");
         assert!(
@@ -803,22 +791,22 @@ mod bool_lenient_tests {
     }
 
     #[test]
-    fn background_rejects_empty_string() {
+    fn run_in_background_rejects_empty_string() {
         // Regression guard: empty string used to coerce to `false`,
-        // hiding malformed `"background": ""` input. Now must error.
+        // hiding malformed `"run_in_background": ""` input. Now must error.
         let err = serde_json::from_str::<SpawnAgentInput>(
-            r#"{"description":"test","prompt":"p","background":""}"#,
+            r#"{"description":"test","prompt":"p","run_in_background":""}"#,
         )
         .expect_err("empty string must be rejected");
         assert!(err.to_string().contains("unrecognized boolean string"));
     }
 
     #[test]
-    fn background_rejects_arbitrary_integer() {
+    fn run_in_background_rejects_arbitrary_integer() {
         // Contract: only 0/1 are accepted. `42` used to silently
         // coerce to `true`; now must error.
         let err = serde_json::from_str::<SpawnAgentInput>(
-            r#"{"description":"test","prompt":"p","background":42}"#,
+            r#"{"description":"test","prompt":"p","run_in_background":42}"#,
         )
         .expect_err("arbitrary integer must be rejected");
         assert!(
@@ -828,10 +816,10 @@ mod bool_lenient_tests {
     }
 
     #[test]
-    fn background_accepts_integer_one() {
+    fn run_in_background_accepts_integer_one() {
         let input: SpawnAgentInput =
-            serde_json::from_str(r#"{"description":"test","prompt":"p","background":1}"#)
+            serde_json::from_str(r#"{"description":"test","prompt":"p","run_in_background":1}"#)
                 .expect("integer 1 must deserialize to true");
-        assert!(input.background);
+        assert!(input.run_in_background);
     }
 }

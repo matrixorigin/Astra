@@ -143,27 +143,21 @@ Session management.
 /session export                  # Export to Markdown
 ```
 
-### `/plan [subcommand]`
+### `/plan [description]`
 Structured planning mode for complex tasks.
 
-| Subcommand | Description |
-|------------|-------------|
-| (none) | Enter plan mode with a goal |
-| `go` | Execute plan automatically |
-| `step` | Execute one step at a time |
-| `status` | Show plan progress |
-| `show` | Display current plan |
-| `pause` | Pause execution |
-| `resume` | Resume execution |
-| `exit` | Exit plan mode |
-| `help` | Show plan commands |
+| Form | Description |
+|------|-------------|
+| `/plan` | Enter plan mode, or leave it if already in `plan>` |
+| `/plan <description>` | Enter plan mode and immediately start planning that goal |
 
 ```
 /plan Build a REST API           # Start planning
-/plan go                         # Auto-execute
-/plan step                       # Step-by-step
-/plan exit                       # Leave plan mode
+/plan                            # Enter or leave plan mode
 ```
+
+Inside `plan>` mode, use plain commands like `execute`, `step`, `status`, `show`,
+`pause`, `resume`, `cancel`, and `help`.
 
 ### `/report [save]`
 Show the last delivery report from plan execution.

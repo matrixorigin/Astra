@@ -16,7 +16,7 @@
 //!   "description": "Search codebase for auth",
 //!   "prompt": "Find all authentication-related code in the project",
 //!   "agent_type": "explore",
-//!   "background": true
+//!   "run_in_background": true
 //! }
 //! ```
 
@@ -90,7 +90,7 @@ pub async fn handle_spawn_agent_tool(args: &Value, ctx: Option<&SpawnAgentContex
 
     // Build spawn context
     let mut inherited_permissions = ctx.inherited_permissions.clone();
-    inherited_permissions.is_background = input.background;
+    inherited_permissions.is_background = input.run_in_background;
     let spawn_ctx = SpawnContext {
         parent_run_id: ctx.run_id.clone(),
         parent_agent_id: ctx.agent_id.clone(),
@@ -183,7 +183,7 @@ fn normalize_spawn_agent_args(args: &Value) -> Result<Value, String> {
 
 /// Handle get_agent_result tool call — retrieves a background child's result.
 ///
-/// When a parent spawns a child with `background: true`, the child runs
+/// When a parent spawns a child with `run_in_background: true`, the child runs
 /// asynchronously and the parent receives only a "launched" status. This
 /// tool lets the parent poll for the child's result once it completes.
 pub async fn handle_get_agent_result_tool(args: &Value, ctx: Option<&SpawnAgentContext>) -> String {
@@ -318,7 +318,7 @@ pub fn get_agent_result_schema() -> Value {
         "type": "function",
         "function": {
             "name": "get_agent_result",
-            "description": "Retrieve the result of a background-spawned agent. Call this after spawn_agent with background:true to get the child's output once it finishes.",
+            "description": "Retrieve the result of a background-spawned agent. Call this after spawn_agent with run_in_background:true to get the child's output once it finishes.",
             "parameters": {
                 "type": "object",
                 "properties": {

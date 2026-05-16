@@ -233,6 +233,15 @@ pub(super) async fn handle_chat_input_with_ui(
 
     ui.blank_line();
 
+    if crate::plan_lifecycle::looks_like_pending_local_plan_entry(state)
+        && let Err(error) =
+            crate::plan_lifecycle::enter_remote_plan_mode(ctx.api, ctx.profile, token, state, &line)
+                .await
+    {
+        ui.show_error(&error);
+        return Ok(());
+    }
+
     let restored_plan_mode = session_runtime::maybe_restore_pending_plan_mode(&line, state);
 
     // Consume one-shot resume guidance before building the effective line.
@@ -300,13 +309,15 @@ pub(super) async fn handle_chat_input_with_ui(
     let session_id = state.session_id.clone();
     match run_chat_turn(state, &ctx, token, &effective_line, session_id.as_deref()).await {
         TurnAttempt::Interrupted(result) => {
-            apply_user_cancelled_turn(state, ctx.profile, &line, *result, turn_start, ui).await;
+            apply_user_cancelled_turn(state, ctx.api, ctx.profile, &line, *result, turn_start, ui)
+                .await;
             return Ok(());
         }
         TurnAttempt::Completed(result) => match *result {
             Ok(result) => {
                 state.last_turn_interrupted = false;
-                apply_turn_success_async(state, ctx.profile, &line, result, turn_start).await;
+                apply_turn_success_async(state, ctx.api, ctx.profile, &line, result, turn_start)
+                    .await;
                 return Ok(());
             }
             Err(failure) => {
@@ -328,6 +339,7 @@ pub(super) async fn handle_chat_input_with_ui(
                         TurnAttempt::Interrupted(result) => {
                             apply_user_cancelled_turn(
                                 state,
+                                ctx.api,
                                 ctx.profile,
                                 &line,
                                 *result,
@@ -341,6 +353,7 @@ pub(super) async fn handle_chat_input_with_ui(
                             Ok(result) => {
                                 apply_turn_success_async(
                                     state,
+                                    ctx.api,
                                     ctx.profile,
                                     &line,
                                     result,
@@ -386,6 +399,7 @@ pub(super) async fn handle_chat_input_with_ui(
                                 TurnAttempt::Interrupted(result) => {
                                     apply_user_cancelled_turn(
                                         state,
+                                        ctx.api,
                                         ctx.profile,
                                         &line,
                                         *result,
@@ -399,6 +413,7 @@ pub(super) async fn handle_chat_input_with_ui(
                                     Ok(result) => {
                                         apply_turn_success_async(
                                             state,
+                                            ctx.api,
                                             ctx.profile,
                                             &line,
                                             result,
@@ -1026,7 +1041,6 @@ async fn run_chat_turn(
             latest_skill_diagnosis: state.latest_skill_diagnosis.as_ref(),
             latest_turn_quality_feedback: state.latest_turn_quality_feedback.as_ref(),
             unified_skill_registry: &state.unified_skill_registry,
-            plan_only_chat: state.chat_plan_only && state.current_plan_subtask_id.is_none(),
             is_plan_subtask: state.current_plan_subtask_id.is_some(),
             plan_subtask_id: state.current_plan_subtask_id.as_deref(),
             delegation_engine: state.delegation_engine.clone(),
@@ -1862,6 +1876,7 @@ fn apply_turn_success(
 
 async fn apply_turn_success_async(
     state: &mut SessionState,
+    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     line: &str,
     mut result: StreamResult,
@@ -1886,6 +1901,13 @@ async fn apply_turn_success_async(
         {
             astra_core::agent_warn!("csl", "persist failed: {e}");
         }
+    }
+    if state.plan_mode.is_some()
+        && let Some(token) = super::session_runtime::current_access_token(profile)
+        && let Err(error) =
+            crate::plan_lifecycle::sync_remote_plan_mode_state(api, &token, state).await
+    {
+        astra_core::agent_warn!("plan", "failed to sync mirrored plan mode state: {error}");
     }
     check_skill_improvement_async(state).await;
 
@@ -3016,6 +3038,7 @@ where
 /// post-cancel cleanup, not here.
 async fn apply_user_cancelled_turn(
     state: &mut SessionState,
+    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     line: &str,
     result: Result<StreamResult, crate::TurnFailure>,
@@ -3032,7 +3055,7 @@ async fn apply_user_cancelled_turn(
     state.last_turn_interrupted = true;
     match result {
         Ok(stream_result) => {
-            apply_turn_success_async(state, profile, line, stream_result, turn_start).await;
+            apply_turn_success_async(state, api, profile, line, stream_result, turn_start).await;
             // Re-assert the flag in case anything downstream cleared it.
             state.last_turn_interrupted = true;
         }
@@ -4271,9 +4294,9 @@ mod tests {
 
     #[test]
     fn restored_plan_mode_provides_resume_digest_for_effective_line() {
-        let mut plan = plan_decompose::PlanModeState::new(
+        let mut plan = astra_runtime::plan::PlanModeState::new(
             "Fix auth".into(),
-            plan_decompose::ProjectContext::default(),
+            astra_runtime::plan::ProjectContext::default(),
         );
         plan.plan
             .subtasks
@@ -4988,9 +5011,11 @@ mod tests {
                 ..Default::default()
             },
         };
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
 
         apply_user_cancelled_turn(
             &mut state,
+            &api,
             None,
             "explain LoopDispatcher",
             Err(failure),
@@ -5069,9 +5094,11 @@ mod tests {
         }));
 
         let initial_turn = state.turn;
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
 
         apply_user_cancelled_turn(
             &mut state,
+            &api,
             None,
             "explain LoopDispatcher",
             Ok(stream_result),
@@ -5126,9 +5153,11 @@ mod tests {
             error: "stream cancelled before first token".into(),
             partial: crate::PartialTurnData::default(),
         };
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
 
         apply_user_cancelled_turn(
             &mut state,
+            &api,
             None,
             "what's in run_lifecycle.rs",
             Err(failure),
@@ -5405,9 +5434,9 @@ mod tests {
         let (_tmp, _g) = isolated_sessions_dir();
 
         let mut state = SessionState {
-            plan_mode: Some(plan_decompose::PlanModeState::new(
+            plan_mode: Some(astra_runtime::plan::PlanModeState::new(
                 "goal".to_string(),
-                plan_decompose::ProjectContext::default(),
+                astra_runtime::plan::ProjectContext::default(),
             )),
             ..Default::default()
         };

@@ -554,76 +554,25 @@ fn agent_job_schema_per_action_required_fields() {
     );
 }
 
-// ── Phase 2: plan-mode top-level tools (claudecode parity) ──────────────
+// ── Plan mode surfaces ────────────────────────────────────────────────────
 //
-// Astra previously exposed plan-mode entry/exit only via `session.enter_plan`
-// and `session.exit_plan` — buried in a 15-action enum with no permission
-// gate plumbing. The model rarely picked them. claudecode promotes them to
-// dedicated top-level tools (`EnterPlanMode`, `ExitPlanMode`) with strong
-// prose so the model self-triggers plan mode for non-trivial work.
-//
-// These tests pin the schema-side contract: the new tools exist, they
-// take the right shape, and the legacy `session.enter_plan/exit_plan`
-// actions are gone (replaced by an Error: redirect at the dispatcher,
-// see executor_core_tests).
+// Local CLI keeps `/plan` as the human entrypoint, but the model-facing local
+// tool catalog now includes client-backed enter/exit wrappers so the active
+// cloud plan lifecycle stays consistent across turns.
 
 #[test]
-fn enter_plan_mode_tool_exists_with_no_required_args() {
-    let schemas = all_tool_schemas();
-    let tool = schemas
+fn local_cli_catalog_includes_plan_mode_wrappers() {
+    let names: Vec<String> = crate::edge_tools::local_tool_schemas()
         .iter()
-        .find(|s| s["function"]["name"].as_str() == Some("enter_plan_mode"))
-        .expect(
-            "enter_plan_mode must be a top-level tool (claudecode parity). \
-             Promoting it from a buried `session` action is the whole point \
-             of Phase 2 — the model never picked it as a sub-action.",
-        );
-    let params = &tool["function"]["parameters"];
-    let required = params
-        .get("required")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+        .filter_map(|s| s["function"]["name"].as_str().map(ToString::to_string))
+        .collect();
     assert!(
-        required.is_empty(),
-        "enter_plan_mode must take no required args — claudecode's \
-         EnterPlanMode is a pure sentinel ('flip mode and tell me how to \
-         author the plan'). Optional `goal` is fine. Got required: {required:?}"
-    );
-    let desc = tool["function"]["description"]
-        .as_str()
-        .expect("description");
-    assert!(
-        desc.to_lowercase().contains("plan") && desc.to_lowercase().contains("read"),
-        "enter_plan_mode description must explain the plan-mode contract \
-         (read-only exploration, no edits) so the model picks it correctly. \
-         Got: {desc}"
-    );
-}
-
-#[test]
-fn exit_plan_mode_tool_exists_with_plan_arg() {
-    let schemas = all_tool_schemas();
-    let tool = schemas
-        .iter()
-        .find(|s| s["function"]["name"].as_str() == Some("exit_plan_mode"))
-        .expect(
-            "exit_plan_mode must be a top-level tool. It's the plan-of-record \
-             handoff — the markdown the user approves becomes the next turn's \
-             execution input.",
-        );
-    let props = &tool["function"]["parameters"]["properties"];
-    assert!(
-        props.get("plan").is_some(),
-        "exit_plan_mode must accept a `plan` parameter (the markdown to \
-         present to the user for approval). Without it the model has no way \
-         to surface the plan it just wrote. Got props: {props}"
+        names.iter().any(|n| n == "enter_plan_mode"),
+        "local CLI catalog should expose enter_plan_mode via the client-backed wrapper"
     );
     assert!(
-        props.get("approved").is_some(),
-        "exit_plan_mode must accept an `approved` boolean — server-side \
-         tool_exit_plan_mode already takes it and gates the write-tool \
-         unlock on it. The schema must mirror."
+        names.iter().any(|n| n == "exit_plan_mode"),
+        "local CLI catalog should expose exit_plan_mode via the client-backed wrapper"
     );
 }
 
@@ -646,11 +595,8 @@ fn enter_plan_mode_and_exit_plan_mode_listed_in_executor_tool_names() {
 
 #[test]
 fn session_schema_no_longer_advertises_enter_plan_or_exit_plan() {
-    // After the Phase 2 promotion to top-level tools, the legacy
-    // `session.enter_plan` / `session.exit_plan` actions must be removed
-    // from the action enum. Otherwise the model has TWO valid paths to
-    // enter plan mode, picks the buried one, and bypasses the new prose
-    // that explains the plan-mode contract.
+    // The local CLI keeps plan mode on `/plan`; session-tool plan actions
+    // must stay absent so there is only one user-facing entrypoint.
     let schemas = all_tool_schemas();
     let session = tool_schema(&schemas, "session");
     let actions: Vec<&str> = session["function"]["parameters"]["properties"]["action"]["enum"]

@@ -803,7 +803,7 @@ fn browser_verification_gap_report(
 ) -> Option<astra_services::verification::SubtaskVerificationReport> {
     use astra_services::verification::{SubtaskVerificationReport, VerificationResult};
 
-    if !astra_runtime::plan_decompose::subtask_requires_browser_verification(subtask) {
+    if !astra_runtime::plan::subtask_requires_browser_verification(subtask) {
         return None;
     }
     if result
@@ -981,7 +981,7 @@ impl PlanExecutorHandle {
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use astra_runtime::plan_decompose;
+use astra_runtime::plan;
 use astra_services::session_journal;
 use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
@@ -1155,7 +1155,7 @@ pub(super) struct BackgroundPlanContext {
     pub matrix_runtime: Option<Arc<astra_runtime::MatrixCloudRuntime>>,
 
     // ─── Execution Config ────────────────────────────────────────────────
-    pub plan_execution_config: Option<plan_decompose::PlanExecutionConfig>,
+    pub plan_execution_config: Option<plan::PlanExecutionConfig>,
     pub turn: u32,
 
     /// Local tracking for LLM turn failures (separate from durable verification retries).
@@ -1307,7 +1307,7 @@ async fn plan_executor_task(
         }
 
         // ── Find ready subtasks ──────────────────────────────────────
-        let analysis = plan_decompose::analyze_parallelism(&ctx.plan);
+        let analysis = plan::analyze_parallelism(&ctx.plan);
         let ready = ctx.plan.ready_subtasks();
 
         if ready.is_empty() {
@@ -1622,8 +1622,7 @@ async fn plan_executor_task(
                 if let Some(ref hint) = ctx.current_subtask_strategy_hint {
                     corrections.push(hint.clone());
                 }
-                let prompt =
-                    plan_decompose::format_subtask_prompt_with_operator_notes(st, &corrections);
+                let prompt = plan::format_subtask_prompt_with_operator_notes(st, &corrections);
                 (prompt, st.title.clone())
             };
 
@@ -1729,7 +1728,6 @@ async fn plan_executor_task(
                     latest_skill_diagnosis: None,
                     latest_turn_quality_feedback: None,
                     unified_skill_registry: &ctx.unified_skill_registry,
-                    plan_only_chat: false,
                     is_plan_subtask: true,
                     plan_subtask_id: Some(next_id),
                     delegation_engine: ctx.delegation_engine.clone(),

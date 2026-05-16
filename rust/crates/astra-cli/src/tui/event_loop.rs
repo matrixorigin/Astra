@@ -262,6 +262,142 @@ fn should_flush_ambient_commits(pending_deferred_slash_flush: bool) -> bool {
     !pending_deferred_slash_flush
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PlanModeUiSnapshot {
+    active: bool,
+    goal: String,
+    executing: bool,
+}
+
+fn capture_plan_mode_ui_snapshot(state: &crate::session_state::SessionState) -> PlanModeUiSnapshot {
+    PlanModeUiSnapshot {
+        active: state.plan_mode.is_some(),
+        goal: state
+            .plan_mode
+            .as_ref()
+            .map(|ps| ps.goal.trim().to_string())
+            .unwrap_or_default(),
+        executing: state.executing_plan.is_some() || state.plan_handle.is_some(),
+    }
+}
+
+fn summarize_plan_goal(goal: &str) -> String {
+    let summary: String = goal.chars().take(80).collect();
+    if goal.chars().count() > 80 {
+        format!("{summary}...")
+    } else {
+        summary
+    }
+}
+
+fn plan_transition_notice(
+    before: &PlanModeUiSnapshot,
+    after: &PlanModeUiSnapshot,
+    triggered_by_plan_request: bool,
+) -> Option<String> {
+    match (before.active, after.active) {
+        (false, true) => {
+            if after.goal.is_empty() {
+                Some(
+                    "Plan mode active - describe your goal. Use `go` to run once a plan is ready, or `/plan` to exit.".into(),
+                )
+            } else {
+                Some(format!(
+                    "Plan mode active - goal: {}. Send edits, `show` to inspect, `go` to run, `/plan` to exit.",
+                    summarize_plan_goal(&after.goal)
+                ))
+            }
+        }
+        (true, true) if before.goal != after.goal && !after.goal.is_empty() => Some(format!(
+            "Plan goal set - {}. Send edits, `show` to inspect, `go` to run, `/plan` to exit.",
+            summarize_plan_goal(&after.goal)
+        )),
+        (true, false) if after.executing => {
+            Some("Plan mode closed - execution is running in the background.".into())
+        }
+        (true, false) => Some("Plan mode closed - back to normal chat.".into()),
+        (false, false) if triggered_by_plan_request => {
+            Some("Planning response delivered - continuing in normal chat.".into())
+        }
+        _ => None,
+    }
+}
+
+fn commit_plan_transition_notice(
+    chat_widget: &mut chat_widget::ChatWidget,
+    before: &PlanModeUiSnapshot,
+    state: &crate::session_state::SessionState,
+    triggered_by_plan_request: bool,
+) {
+    let after = capture_plan_mode_ui_snapshot(state);
+    if let Some(msg) = plan_transition_notice(before, &after, triggered_by_plan_request) {
+        chat_widget.commit_system(history_cell::system::SystemCell::response(msg));
+    }
+}
+
+fn looks_like_implicit_plan_request(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.starts_with('/') {
+        return false;
+    }
+
+    let lowered = trimmed.to_lowercase();
+    let meta_queries = [
+        "what is /plan",
+        "how does /plan",
+        "what does /plan",
+        "plan mode",
+        "plan模式",
+        "现在plan是怎么",
+        "什么是/plan",
+        "/plan是什么意思",
+        "怎么进入plan",
+    ];
+    if meta_queries.iter().any(|needle| lowered.contains(needle)) {
+        return false;
+    }
+
+    let planning_requests = [
+        "help me plan",
+        "please plan",
+        "plan how to",
+        "make a plan",
+        "draft a plan",
+        "come up with a plan",
+        "plan out",
+        "帮我计划",
+        "帮我规划",
+        "给我一个计划",
+        "给我个计划",
+        "做个计划",
+        "规划一下",
+        "计划一下",
+        "制定计划",
+        "先计划",
+    ];
+    planning_requests
+        .iter()
+        .any(|needle| lowered.contains(needle))
+}
+
+fn slash_plan_goal(text: &str) -> Option<&str> {
+    let rest = text.trim().strip_prefix("/plan")?;
+    let goal = rest.trim();
+    (!goal.is_empty()).then_some(goal)
+}
+
+fn refresh_footer_from_state(
+    bottom_pane: &mut BottomPane,
+    state: &crate::session_state::SessionState,
+) {
+    bottom_pane.footer.model = state.model.clone();
+    bottom_pane.footer.session_id = state
+        .session_id
+        .as_ref()
+        .map(|sid| sid[..8.min(sid.len())].to_string());
+    bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
+}
+
 /// Replay a session's JSONL transcript into a fresh `ChatWidget`,
 /// paint the restored cells into the terminal scrollback, and
 /// advance the widget's watermark so future ticks don't reflush
@@ -741,11 +877,69 @@ pub(crate) async fn run_tui_repl(
                                     }
                                 }
 
-                                if text.starts_with('/') {
+                                let mut inline_chat_submit = None;
+                                if let Some(plan_goal) = slash_plan_goal(&text) {
+                                    let before = capture_plan_mode_ui_snapshot(&state);
+                                    let Some(token) =
+                                        crate::plan_lifecycle::fresh_token_for_plan(api, profile).await
+                                    else {
+                                        chat_widget.commit_system(
+                                            history_cell::system::SystemCell::error(
+                                                "Not logged in. Use /login.".to_string(),
+                                            ),
+                                        );
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    };
+                                    match crate::plan_lifecycle::enter_remote_plan_mode(
+                                        api,
+                                        profile,
+                                        &token,
+                                        &mut state,
+                                        plan_goal,
+                                    )
+                                    .await
+                                    {
+                                        Ok(_) => {
+                                            inline_chat_submit = Some(plan_goal.to_string());
+                                            commit_plan_transition_notice(
+                                                &mut chat_widget,
+                                                &before,
+                                                &state,
+                                                true,
+                                            );
+                                            if let Some(ref sid) = state.session_id
+                                                && chat_widget.session_id() != sid
+                                            {
+                                                chat_widget.set_session_id(sid.clone());
+                                                task_board.rebind_session(sid.clone());
+                                                board_user_pin = None;
+                                            }
+                                            refresh_footer_from_state(&mut bottom_pane, &state);
+                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        }
+                                        Err(error) => {
+                                            chat_widget.commit_system(
+                                                history_cell::system::SystemCell::error(error),
+                                            );
+                                            refresh_footer_from_state(&mut bottom_pane, &state);
+                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                            frame_requester.schedule_frame();
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                if text.starts_with('/') && inline_chat_submit.is_none() {
                                     // Snapshot session id before dispatch so we
                                     // can detect when a `/resume <id>` fallback
                                     // rebinds it and trigger the replay.
                                     let pre_sid = state.session_id.clone();
+                                    let pre_plan_snapshot = text
+                                        .trim_start()
+                                        .starts_with("/plan")
+                                        .then(|| capture_plan_mode_ui_snapshot(&state));
                                     let mut dctx = slash_dispatch::DispatchContext {
                                         api, profile, state: &mut state,
                                         guard: &mut guard, bottom_pane: &mut bottom_pane,
@@ -803,10 +997,128 @@ pub(crate) async fn run_tui_repl(
                                         // re-enters auto-rules.
                                         board_user_pin = None;
                                     }
-                                    if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.clone()); }
-                                    if let Some(ref s) = state.session_id { bottom_pane.footer.session_id = Some(s[..8.min(s.len())].to_string()); }
-                                    bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
+                                    refresh_footer_from_state(&mut bottom_pane, &state);
+                                    if let Some(before) = pre_plan_snapshot.as_ref() {
+                                        commit_plan_transition_notice(
+                                            &mut chat_widget,
+                                            before,
+                                            &state,
+                                            true,
+                                        );
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                    }
                                 } else {
+                                    let submit_text = inline_chat_submit.unwrap_or(text);
+                                    if crate::plan_lifecycle::looks_like_pending_local_plan_entry(
+                                        &state,
+                                    ) {
+                                        let before = capture_plan_mode_ui_snapshot(&state);
+                                        let Some(token) =
+                                            crate::plan_lifecycle::fresh_token_for_plan(api, profile)
+                                                .await
+                                        else {
+                                            chat_widget.commit_system(
+                                                history_cell::system::SystemCell::error(
+                                                    "Not logged in. Use /login.".to_string(),
+                                                ),
+                                            );
+                                            refresh_footer_from_state(&mut bottom_pane, &state);
+                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                            frame_requester.schedule_frame();
+                                            continue;
+                                        };
+                                        match crate::plan_lifecycle::enter_remote_plan_mode(
+                                            api,
+                                            profile,
+                                            &token,
+                                            &mut state,
+                                            &submit_text,
+                                        )
+                                        .await
+                                        {
+                                            Ok(_) => {
+                                                commit_plan_transition_notice(
+                                                    &mut chat_widget,
+                                                    &before,
+                                                    &state,
+                                                    false,
+                                                );
+                                                if let Some(ref sid) = state.session_id
+                                                    && chat_widget.session_id() != sid
+                                                {
+                                                    chat_widget.set_session_id(sid.clone());
+                                                    task_board.rebind_session(sid.clone());
+                                                    board_user_pin = None;
+                                                }
+                                                refresh_footer_from_state(&mut bottom_pane, &state);
+                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                            }
+                                            Err(error) => {
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::error(error),
+                                                );
+                                                refresh_footer_from_state(&mut bottom_pane, &state);
+                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                frame_requester.schedule_frame();
+                                                continue;
+                                            }
+                                        }
+                                    } else if looks_like_implicit_plan_request(&submit_text) {
+                                        let before = capture_plan_mode_ui_snapshot(&state);
+                                        let Some(token) =
+                                            crate::plan_lifecycle::fresh_token_for_plan(api, profile)
+                                                .await
+                                        else {
+                                            chat_widget.commit_system(
+                                                history_cell::system::SystemCell::error(
+                                                    "Not logged in. Use /login.".to_string(),
+                                                ),
+                                            );
+                                            refresh_footer_from_state(&mut bottom_pane, &state);
+                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                            frame_requester.schedule_frame();
+                                            continue;
+                                        };
+                                        match crate::plan_lifecycle::enter_remote_plan_mode(
+                                            api,
+                                            profile,
+                                            &token,
+                                            &mut state,
+                                            &submit_text,
+                                        )
+                                        .await
+                                        {
+                                            Ok(_) => {
+                                                commit_plan_transition_notice(
+                                                    &mut chat_widget,
+                                                    &before,
+                                                    &state,
+                                                    true,
+                                                );
+                                                if let Some(ref sid) = state.session_id
+                                                    && chat_widget.session_id() != sid
+                                                {
+                                                    chat_widget.set_session_id(sid.clone());
+                                                    task_board.rebind_session(sid.clone());
+                                                    board_user_pin = None;
+                                                }
+                                                refresh_footer_from_state(&mut bottom_pane, &state);
+                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                frame_requester.schedule_frame();
+                                                continue;
+                                            }
+                                            Err(e) => {
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::error(e),
+                                                );
+                                                refresh_footer_from_state(&mut bottom_pane, &state);
+                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                frame_requester.schedule_frame();
+                                                continue;
+                                            }
+                                        }
+                                    }
+
                                     bottom_pane.set_task_status(TaskStatus::WaitingModel);
                                     let turn_start = std::time::Instant::now();
                                     let pre_prompt_tokens = state.total_prompt_tokens;
@@ -848,7 +1160,7 @@ pub(crate) async fn run_tui_repl(
                                         let ctx = crate::chat_turn::TurnContext { api, profile };
                                         let token = crate::session_runtime::fresh_access_token(api, profile).await;
                                         let mut tui_ui = ui_adapter::TuiUiAdapter::new(tui_tx.clone());
-                                        let fut = crate::chat_turn::handle_chat_input_with_ui(text, token.as_deref(), &mut state, ctx, &mut tui_ui);
+                                        let fut = crate::chat_turn::handle_chat_input_with_ui(submit_text, token.as_deref(), &mut state, ctx, &mut tui_ui);
                                         tokio::pin!(fut);
 
                                         let r: Result<(), String> = loop {
@@ -2240,6 +2552,88 @@ mod tests {
         assert_eq!(ReopenTarget::parse(""), None);
         assert_eq!(ReopenTarget::parse("not-a-target"), None);
         assert_eq!(ReopenTarget::parse("Agents"), None, "case-sensitive");
+    }
+
+    #[test]
+    fn implicit_plan_request_detector_accepts_actionable_prompts() {
+        assert!(looks_like_implicit_plan_request(
+            "帮我计划在/tmp下生成一个报销系统"
+        ));
+        assert!(looks_like_implicit_plan_request(
+            "help me plan how to refactor the auth middleware"
+        ));
+        assert!(looks_like_implicit_plan_request(
+            "please plan how to migrate this service to Axum"
+        ));
+    }
+
+    #[test]
+    fn implicit_plan_request_detector_rejects_meta_plan_questions() {
+        assert!(!looks_like_implicit_plan_request("现在plan是怎么工作的?"));
+        assert!(!looks_like_implicit_plan_request("what is /plan mode?"));
+        assert!(!looks_like_implicit_plan_request("/plan"));
+    }
+
+    #[test]
+    fn plan_transition_notice_covers_enter_goal_and_exit() {
+        let inactive = PlanModeUiSnapshot::default();
+        let entered_empty = PlanModeUiSnapshot {
+            active: true,
+            goal: String::new(),
+            executing: false,
+        };
+        let entered_goal = PlanModeUiSnapshot {
+            active: true,
+            goal: "Implement auth middleware".into(),
+            executing: false,
+        };
+        let exited_running = PlanModeUiSnapshot {
+            active: false,
+            goal: String::new(),
+            executing: true,
+        };
+
+        let enter_msg = plan_transition_notice(&inactive, &entered_empty, false)
+            .expect("entering plan mode should announce itself");
+        assert!(enter_msg.contains("Plan mode active"));
+        assert!(enter_msg.contains("describe your goal"));
+
+        let goal_msg = plan_transition_notice(&entered_empty, &entered_goal, false)
+            .expect("setting the first goal should be surfaced");
+        assert!(goal_msg.contains("Plan goal set"));
+        assert!(goal_msg.contains("Implement auth middleware"));
+
+        let exit_msg = plan_transition_notice(&entered_goal, &exited_running, false)
+            .expect("background execution exit should be surfaced");
+        assert!(exit_msg.contains("running in the background"));
+    }
+
+    #[test]
+    fn submit_input_routes_plan_mode_and_implicit_plan_requests_before_chat_turn() {
+        let source = include_str!("event_loop.rs");
+        let arm_start = source
+            .find("BottomPaneAction::SubmitInput(text) => {")
+            .expect("SubmitInput arm must exist");
+        let arm_end = source[arm_start..]
+            .find("BottomPaneAction::ViewCompleted { result, reopen } => {")
+            .expect("SubmitInput arm must end before ViewCompleted");
+        let arm = &source[arm_start..arm_start + arm_end];
+
+        assert!(
+            arm.contains("slash_plan_goal(&text)")
+                && arm.contains("crate::plan_lifecycle::enter_remote_plan_mode("),
+            "/plan <goal> should pre-enter remote plan mode before the chat turn"
+        );
+        assert!(
+            arm.contains("looks_like_implicit_plan_request(&submit_text)")
+                && arm.contains("crate::plan_lifecycle::enter_remote_plan_mode("),
+            "plain planning requests should enter remote /plan semantics before normal chat turns"
+        );
+        assert!(
+            arm.contains("crate::plan_lifecycle::looks_like_pending_local_plan_entry(")
+                && arm.contains("crate::plan_lifecycle::enter_remote_plan_mode("),
+            "the first plain message after bare /plan should bind remote plan mode and continue as chat"
+        );
     }
 
     /// REGRESSION (review M1): the `else if pending_deferred_slash_flush`

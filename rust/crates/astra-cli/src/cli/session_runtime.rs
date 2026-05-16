@@ -178,8 +178,8 @@ fn create_pipeline_modules_inner(
     profile: Option<&str>,
     _announce_skills: bool,
 ) -> PipelineModules {
-    // Selector removed — tool schemas are now sent in full to the LLM each turn
-    // via edge_tools::all_tool_schemas(). No registry/selector state to build here.
+    // Selector removed — the runtime now builds the turn-specific tool surface
+    // directly from the local CLI catalog plus any mounted server/MCP schemas.
 
     // Initialize the local CLI capability catalog.
     //
@@ -661,11 +661,11 @@ fn pending_recovery_status_line(state: &SessionState) -> Option<String> {
 /// only injected into the next turn's system prompt when the user message
 /// signals resume intent, and cleared thereafter.
 fn detect_pending_plan_resume_digest() -> Option<String> {
-    let path = astra_runtime::plan_decompose::PlanModeState::state_path();
+    let path = astra_runtime::plan::PlanModeState::state_path();
     if !path.exists() {
         return None;
     }
-    match astra_runtime::plan_decompose::PlanModeState::load_with_recovery(&path) {
+    match astra_runtime::plan::PlanModeState::load_with_recovery(&path) {
         Ok(state) => {
             // B8: Don't surface a resume hint for a plan from a different
             // workspace — it would mis-direct @resume-plan.
@@ -717,12 +717,12 @@ pub(crate) fn maybe_restore_pending_plan_mode(line: &str, state: &mut SessionSta
         return false;
     }
 
-    let path = astra_runtime::plan_decompose::PlanModeState::state_path();
+    let path = astra_runtime::plan::PlanModeState::state_path();
     if !path.exists() {
         return false;
     }
 
-    match astra_runtime::plan_decompose::PlanModeState::load_with_recovery(&path) {
+    match astra_runtime::plan::PlanModeState::load_with_recovery(&path) {
         Ok(mut plan_state) => {
             // B8: Refuse to restore a plan from a different workspace —
             // continuing it against the wrong project would corrupt
@@ -741,12 +741,11 @@ pub(crate) fn maybe_restore_pending_plan_mode(line: &str, state: &mut SessionSta
             if should_refresh_pending_plan_context(&path) {
                 let project_root =
                     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                plan_state.context = astra_runtime::plan_decompose::analyze_project(&project_root);
+                plan_state.context = astra_runtime::plan::analyze_project(&project_root);
                 let _ = plan_state.save_with_backup(&path);
             }
 
             state.pending_plan_resume_digest = None;
-            state.chat_plan_only = false;
             state.plan_mode = Some(plan_state);
             true
         }
@@ -1664,7 +1663,7 @@ mod tests {
         let _home_guard = EnvGuard::set("HOME", home.path().to_str().unwrap());
         std::fs::create_dir_all(home.path().join(".astra")).unwrap();
 
-        let mut plan_state = astra_runtime::plan_decompose::PlanModeState::new(
+        let mut plan_state = astra_runtime::plan::PlanModeState::new(
             "Fix auth middleware".to_string(),
             Default::default(),
         );
@@ -1678,7 +1677,7 @@ mod tests {
                 ..Default::default()
             });
         plan_state
-            .save_to_file(&astra_runtime::plan_decompose::PlanModeState::state_path())
+            .save_to_file(&astra_runtime::plan::PlanModeState::state_path())
             .unwrap();
 
         let state = initialize_session_state(None, Some("gpt-5"));
@@ -1695,7 +1694,7 @@ mod tests {
         let _home_guard = EnvGuard::set("HOME", home.path().to_str().unwrap());
         std::fs::create_dir_all(home.path().join(".astra")).unwrap();
 
-        let mut plan_state = astra_runtime::plan_decompose::PlanModeState::new(
+        let mut plan_state = astra_runtime::plan::PlanModeState::new(
             "Ship plan resume".to_string(),
             Default::default(),
         );
@@ -1709,7 +1708,7 @@ mod tests {
                 ..Default::default()
             });
         plan_state
-            .save_to_file(&astra_runtime::plan_decompose::PlanModeState::state_path())
+            .save_to_file(&astra_runtime::plan::PlanModeState::state_path())
             .unwrap();
 
         let mut state = SessionState {
@@ -1735,7 +1734,7 @@ mod tests {
         let _home_guard = EnvGuard::set("HOME", home.path().to_str().unwrap());
         std::fs::create_dir_all(home.path().join(".astra")).unwrap();
 
-        let mut plan_state = astra_runtime::plan_decompose::PlanModeState::new(
+        let mut plan_state = astra_runtime::plan::PlanModeState::new(
             "Resume without explicit tag".to_string(),
             Default::default(),
         );
@@ -1749,7 +1748,7 @@ mod tests {
                 ..Default::default()
             });
         plan_state
-            .save_to_file(&astra_runtime::plan_decompose::PlanModeState::state_path())
+            .save_to_file(&astra_runtime::plan::PlanModeState::state_path())
             .unwrap();
 
         let mut state = SessionState {
@@ -1859,9 +1858,9 @@ mod tests {
 
         // Create a plan state rooted at a different directory.
         let other_dir = tempdir().unwrap();
-        let mut plan_state = astra_runtime::plan_decompose::PlanModeState::new(
+        let mut plan_state = astra_runtime::plan::PlanModeState::new(
             "goal from other workspace".to_string(),
-            astra_runtime::plan_decompose::ProjectContext {
+            astra_runtime::plan::ProjectContext {
                 root: other_dir.path().to_string_lossy().into_owned(),
                 ..Default::default()
             },
@@ -1877,7 +1876,7 @@ mod tests {
             });
         // Save to the current-cwd-scoped path (which is the test's cwd, not other_dir).
         plan_state
-            .save_to_file(&astra_runtime::plan_decompose::PlanModeState::state_path())
+            .save_to_file(&astra_runtime::plan::PlanModeState::state_path())
             .unwrap();
 
         let mut state = SessionState {

@@ -1,18 +1,18 @@
 //! Tool search: delegates to astra_tools::tool_search.
 //!
-//! Union of static catalog (`all_tool_schemas`) + plugin-registered
-//! schemas installed via `ToolExecutor::set_plugin_schemas`. The union
-//! lets the deferred-activation flow reach MCP/skill-backed tools; the
-//! static catalog alone would make `select:mcp__X` always return
-//! `missing:[...]`.
+//! Union of the local CLI static catalog (`local_tool_schemas`) +
+//! plugin-registered schemas installed via `ToolExecutor::set_plugin_schemas`.
+//! This keeps `tool_search(select:...)` aligned with the tool surface the local
+//! CLI actually exposes, while still allowing deferred activation of
+//! MCP/skill-backed tools.
 
 use serde_json::Value;
 
-use super::{ToolExecutor, all_tool_schemas};
+use super::{ToolExecutor, local_tool_schemas};
 
 impl ToolExecutor {
     pub(super) fn tool_search(&self, args: &Value) -> String {
-        let mut pool = all_tool_schemas();
+        let mut pool = local_tool_schemas();
         // Poison recovery: lock may be poisoned by an earlier panic on
         // the write side. Recover via `into_inner()` so plugin-backed
         // deferred activation survives the poison. A silent `if let Ok`

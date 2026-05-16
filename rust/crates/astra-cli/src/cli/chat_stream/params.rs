@@ -292,8 +292,6 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Unified skill registry (single source of truth for all skill resolution).
     pub(crate) unified_skill_registry:
         &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
-    /// When true, omit edge tools and inject plan-only system instructions (CLI `/plan on`).
-    pub(crate) plan_only_chat: bool,
     /// When true, this turn is executing a plan subtask — `when: task_completed` stop hooks apply.
     pub(crate) is_plan_subtask: bool,
     /// Sent on `/chat/turn` JSON so cloud can classify the turn like local `is_plan_subtask`.
@@ -494,7 +492,6 @@ impl<'a> ChatTurnParams<'a> {
             latest_skill_diagnosis: None,
             latest_turn_quality_feedback: None,
             unified_skill_registry: ctx.unified_skill_registry,
-            plan_only_chat: false,
             is_plan_subtask: false,
             plan_subtask_id: None,
             delegation_engine: None,

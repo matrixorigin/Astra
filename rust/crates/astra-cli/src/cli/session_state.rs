@@ -9,7 +9,7 @@ use crate::mcp_client;
 use crate::plan_executor;
 use crate::prompts;
 use crate::slash_team;
-use astra_runtime::plan_decompose;
+use astra_runtime::plan;
 use astra_runtime::tool_registry;
 use astra_services::session_journal;
 use astra_turn_core::conversation_log::manager::CslManager;
@@ -172,14 +172,12 @@ pub(crate) struct SessionState {
     /// cumulative per-tool selection/quality counters.
     pub tool_quality_tracker:
         Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
-    /// Plan-only chat (`/plan on`): normal REPL turns omit edge tools; model plans without executing.
-    pub chat_plan_only: bool,
     /// Plan Mode state — when Some, REPL is in interactive plan editing mode.
-    pub plan_mode: Option<plan_decompose::PlanModeState>,
+    pub plan_mode: Option<plan::PlanModeState>,
     /// Plan being auto-executed — subtasks sent sequentially through chat.
     pub executing_plan: Option<astra_services::task_orchestrator::TaskPlan>,
     /// Configuration for current plan execution (step-by-step, auto-execute, etc.).
-    pub plan_execution_config: Option<plan_decompose::PlanExecutionConfig>,
+    pub plan_execution_config: Option<plan::PlanExecutionConfig>,
     /// Goal text for the executing plan (for summary generation).
     pub executing_plan_goal: Option<String>,
     /// Cloud `plan_id` this execution is mirroring to, for posting
@@ -495,7 +493,6 @@ impl Default for SessionState {
             tool_health_entries: Vec::new(),
             synced_tool_health_entries: Vec::new(),
             tool_quality_tracker: None,
-            chat_plan_only: false,
             plan_mode: None,
             executing_plan: None,
             plan_execution_config: None,

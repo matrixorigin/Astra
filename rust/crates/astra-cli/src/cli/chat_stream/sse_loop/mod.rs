@@ -19,7 +19,6 @@ use astra_core::RuntimeLimits;
 use astra_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
-    plan_decompose::CHAT_PLAN_ONLY_SYSTEM,
     semantic_dedup::SemanticDedup,
     tool_registry::ToolRegistry,
     turn::agentic_loop_finalization::run_agentic_loop_with_host,
@@ -322,45 +321,36 @@ pub(crate) async fn stream_chat_sse(
             executor.expand_sandbox_path(PathBuf::from(dir));
         }
     }
-    let mut messages = load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message);
+    let messages = load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message);
 
     // ─── Context pre-fetch (disabled) ─────────────────────────────────────
     // Returns (all_schemas, mcp_plugin_schemas) so the edge executor can
     // install MCP tools for `tool_search(select:)` resolution while the
     // registry gets the capability-filtered list.
-    let all_schemas: (Vec<Value>, Vec<Value>) = if p.plan_only_chat {
-        messages.insert(
-            0,
-            json!({
-                "role": "system",
-                "content": CHAT_PLAN_ONLY_SYSTEM,
-            }),
-        );
-        (Vec::new(), Vec::new())
+    // Refresh any MCP servers that received tool-list-changed notifications
+    if let Some(ref mgr) = p.mcp_manager {
+        let mut m = mgr.write().await;
+        m.refresh_changed_tools().await;
+        m.consume_prompt_changes();
+        m.consume_resource_changes();
+    }
+    // Inject MCP tool schemas from connected servers.
+    // Tracked separately from the static catalog so the edge
+    // `ToolExecutor` can install them via `set_plugin_schemas` for
+    // `tool_search(select:mcp__X)` resolution.
+    let mcp_schemas = if let Some(ref mgr) = p.mcp_manager {
+        let m = mgr.read().await;
+        m.all_tool_schemas()
     } else {
-        // Refresh any MCP servers that received tool-list-changed notifications
-        if let Some(ref mgr) = p.mcp_manager {
-            let mut m = mgr.write().await;
-            m.refresh_changed_tools().await;
-            m.consume_prompt_changes();
-            m.consume_resource_changes();
-        }
-        // Inject MCP tool schemas from connected servers.
-        // Tracked separately from the static catalog so the edge
-        // `ToolExecutor` can install them via `set_plugin_schemas` for
-        // `tool_search(select:mcp__X)` resolution.
-        let mcp_schemas = if let Some(ref mgr) = p.mcp_manager {
-            let m = mgr.read().await;
-            m.all_tool_schemas()
-        } else {
-            Vec::new()
-        };
-        let schemas = astra_runtime::capabilities::cli_local_tool_schemas(
-            edge_tools::all_tool_schemas(),
-            mcp_schemas.clone(),
-        );
-        (schemas, mcp_schemas)
+        Vec::new()
     };
+    let all_schemas: (Vec<Value>, Vec<Value>) = (
+        astra_runtime::capabilities::cli_local_tool_schemas(
+            edge_tools::local_tool_schemas(),
+            mcp_schemas.clone(),
+        ),
+        mcp_schemas,
+    );
     let mcp_plugin_schemas = all_schemas.1.clone();
     let all_schemas = all_schemas.0;
     // Install MCP schemas on the edge executor so `tool_search(select:NAME)`
@@ -440,12 +430,7 @@ pub(crate) async fn stream_chat_sse(
     } else {
         None
     };
-    let mut task_profile = infer_task_execution_profile(p.message);
-    // Plan-only turns have no tools; factual retry would inject a useless "call tools" nudge and
-    // spurious "↻ … corrective retry" when the decomposition prompt mentions repo/context words.
-    if p.plan_only_chat {
-        task_profile.allow_factual_retry = false;
-    }
+    let task_profile = infer_task_execution_profile(p.message);
 
     let turn_guard = if p.tool_health_entries.is_empty() {
         TurnGuard::with_profile(task_profile)

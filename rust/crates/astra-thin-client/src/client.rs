@@ -448,6 +448,70 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
 
+    pub async fn post_plans_json(
+        &self,
+        token: &str,
+        body: &Value,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(paths::PLANS)?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(Self::bearer_headers(token)?)
+            .json(body)
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    pub async fn get_plans_query_json(
+        &self,
+        token: &str,
+        query: &[(&str, String)],
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(paths::PLANS)?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(Self::bearer_headers(token)?)
+            .query(query)
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    pub async fn get_plan_json(
+        &self,
+        token: &str,
+        plan_id: &str,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::plan(plan_id))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(Self::bearer_headers(token)?)
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    pub async fn post_plan_exit_mode_json(
+        &self,
+        token: &str,
+        plan_id: &str,
+        body: &Value,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::plan_exit_mode(plan_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(Self::bearer_headers(token)?)
+            .json(body)
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
     pub async fn get_session_artifact_latest_text(
         &self,
         token: &str,
@@ -1543,6 +1607,87 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v["session_id"], "new");
+    }
+
+    #[tokio::test]
+    async fn wiremock_plan_lifecycle_requests_hit_expected_paths() {
+        let srv = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/plans"))
+            .and(header("authorization", "Bearer tkn"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "plan_id": "plan-1"
+            })))
+            .mount(&srv)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/plans"))
+            .and(header("authorization", "Bearer tkn"))
+            .and(query_param("session_id", "sess-1"))
+            .and(query_param("phase", "planning"))
+            .and(query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "plans": []
+            })))
+            .mount(&srv)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/plans/plan-1"))
+            .and(header("authorization", "Bearer tkn"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "plan_id": "plan-1",
+                "goal": "Ship auth",
+                "version": 7
+            })))
+            .mount(&srv)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/plans/plan-1/exit-plan-mode"))
+            .and(header("authorization", "Bearer tkn"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "plan_id": "plan-1",
+                "phase": "refining"
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+
+        let created = client
+            .post_plans_json("tkn", &serde_json::json!({"goal": "Ship auth"}))
+            .await
+            .unwrap();
+        assert_eq!(created["plan_id"], "plan-1");
+
+        let listed = client
+            .get_plans_query_json(
+                "tkn",
+                &[
+                    ("session_id", "sess-1".to_string()),
+                    ("phase", "planning".to_string()),
+                    ("limit", "1".to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed["plans"], serde_json::json!([]));
+
+        let fetched = client.get_plan_json("tkn", "plan-1").await.unwrap();
+        assert_eq!(fetched["version"], 7);
+
+        let exited = client
+            .post_plan_exit_mode_json(
+                "tkn",
+                "plan-1",
+                &serde_json::json!({"approved": true, "plan_md": "1. Ship auth"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exited["phase"], "refining");
     }
 
     #[tokio::test]

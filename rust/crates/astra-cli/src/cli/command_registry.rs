@@ -198,17 +198,6 @@ const MCP_SUBCOMMANDS: &[(&str, &str)] = &[
     ),
 ];
 
-const PLAN_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("exit", "Exit structured plan mode"),
-    ("go", "Execute plan (auto mode)"),
-    ("help", "Show all plan commands"),
-    ("pause", "Pause plan execution"),
-    ("resume", "Resume plan execution"),
-    ("show", "Display current plan"),
-    ("status", "Show plan progress"),
-    ("step", "Execute plan (step-by-step)"),
-];
-
 const TASK_SUBCOMMANDS: &[(&str, &str)] = &[
     ("add", "Create task (needs title)"),
     ("done", "Mark task done (needs id/query)"),
@@ -455,47 +444,10 @@ pub static COMMANDS: &[CommandMeta] = &[
     ),
     CommandMeta::new(
         "/plan",
-        "Structured plan: go|step|pause|resume|exit|show|help",
+        "Enter plan mode; optionally start with a description",
         CommandGroup::SessionPlan,
     )
-    .with_subcommands(PLAN_SUBCOMMANDS)
-    .with_arg_hint("[go|step|pause|resume|exit|show|help]"),
-    CommandMeta::new(
-        "/plan go",
-        "Execute plan (auto mode)",
-        CommandGroup::SessionPlan,
-    ),
-    CommandMeta::new(
-        "/plan step",
-        "Execute plan (step-by-step)",
-        CommandGroup::SessionPlan,
-    ),
-    CommandMeta::new(
-        "/plan status",
-        "Plan progress and state",
-        CommandGroup::SessionPlan,
-    ),
-    CommandMeta::new(
-        "/plan show",
-        "Display current plan",
-        CommandGroup::SessionPlan,
-    ),
-    CommandMeta::new(
-        "/plan pause",
-        "Pause plan execution",
-        CommandGroup::SessionPlan,
-    ),
-    CommandMeta::new(
-        "/plan resume",
-        "Resume plan execution",
-        CommandGroup::SessionPlan,
-    ),
-    CommandMeta::new("/plan exit", "Leave plan mode", CommandGroup::SessionPlan),
-    CommandMeta::new(
-        "/plan help",
-        "Show all plan commands",
-        CommandGroup::SessionPlan,
-    ),
+    .with_arg_hint("[description]"),
     CommandMeta::new(
         "/report",
         "Last delivery report (/report save = JSON)",

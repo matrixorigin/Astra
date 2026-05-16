@@ -1215,7 +1215,6 @@ pub(super) async fn handle_info_command(
                 latest_skill_diagnosis: state.latest_skill_diagnosis.as_ref(),
                 latest_turn_quality_feedback: state.latest_turn_quality_feedback.as_ref(),
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
-                plan_only_chat: false,
                 is_plan_subtask: false,
                 plan_subtask_id: None,
                 delegation_engine: None,

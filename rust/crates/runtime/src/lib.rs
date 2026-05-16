@@ -83,7 +83,6 @@ pub mod memory_relevance;
 pub mod observability_integration;
 pub mod pipeline;
 pub use astra_plan as plan;
-pub use astra_plan as plan_decompose;
 pub use astra_sandbox as tool_sandbox;
 pub mod prompts;
 pub mod self_model;

@@ -466,16 +466,14 @@ fn plan_select_theme() -> inquire::ui::RenderConfig<'static> {
 /// Display a clarification question with modern styled formatting.
 ///
 /// Category icons are kept, options use `▸` prefix for default, dim `·` for others.
-pub(super) fn eprint_clarification_question(
-    q: &astra_runtime::plan_decompose::ClarificationQuestion,
-) {
+pub(super) fn eprint_clarification_question(q: &plan::ClarificationQuestion) {
     let icon = match q.category {
-        astra_runtime::plan_decompose::ClarificationCategory::Scope => "📦",
-        astra_runtime::plan_decompose::ClarificationCategory::Approach => "🛤️ ",
-        astra_runtime::plan_decompose::ClarificationCategory::Behavior => "⚙️ ",
-        astra_runtime::plan_decompose::ClarificationCategory::Technical => "🔧",
-        astra_runtime::plan_decompose::ClarificationCategory::Confirmation => "❓",
-        astra_runtime::plan_decompose::ClarificationCategory::Other => "💬",
+        plan::ClarificationCategory::Scope => "📦",
+        plan::ClarificationCategory::Approach => "🛤️ ",
+        plan::ClarificationCategory::Behavior => "⚙️ ",
+        plan::ClarificationCategory::Technical => "🔧",
+        plan::ClarificationCategory::Confirmation => "❓",
+        plan::ClarificationCategory::Other => "💬",
     };
 
     eprintln!("  {} {}", icon, q.question.as_str().bold().magenta());
@@ -516,7 +514,7 @@ pub(super) enum PlanConfirmChoice {
 /// or `inquire` returns an error (e.g. user presses Esc).
 pub(super) fn prompt_plan_confirmation(subtask_count: usize) -> Option<PlanConfirmChoice> {
     use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() {
+    if cfg!(test) || !std::io::stdin().is_terminal() {
         eprint_plan_commands_help();
         return None;
     }
@@ -844,10 +842,9 @@ fn abort_plan_mode_after_failure(state: &mut SessionState, stage: &'static str, 
         })),
     );
     state.plan_mode = None;
-    state.chat_plan_only = false;
     state.pending_plan_resume_digest = None;
-    let path = astra_runtime::plan_decompose::PlanModeState::state_path();
-    let _ = astra_runtime::plan_decompose::PlanModeState::clear_saved_state_at(&path);
+    let path = plan::PlanModeState::state_path();
+    let _ = plan::PlanModeState::clear_saved_state_at(&path);
 }
 
 /// P2: Single-stage analytical-plan generation.
@@ -916,10 +913,9 @@ async fn handle_analytical_goal(
             // Analytical is one-shot: drop plan_mode so the user falls
             // back into normal chat to discuss any of the sub-questions.
             state.plan_mode = None;
-            state.chat_plan_only = false;
             state.pending_plan_resume_digest = None;
-            let path = astra_runtime::plan_decompose::PlanModeState::state_path();
-            let _ = astra_runtime::plan_decompose::PlanModeState::clear_saved_state_at(&path);
+            let path = plan::PlanModeState::state_path();
+            let _ = plan::PlanModeState::clear_saved_state_at(&path);
             Ok(PlanInputResult::Handled)
         }
         Err(e) => {
@@ -1298,11 +1294,6 @@ pub async fn handle_plan_mode_input(
                             let _ = svc.complete_task(&task.task_id).await;
                         }
                     }
-                    eprintln!();
-                    eprintln!(
-                        "  {} Rate this plan (1-5)? Or 'skip' to skip: /plan rate <1-5>",
-                        "💡".magenta()
-                    );
                 }
             }
             Err(e) => eprintln!("  {} {}", theme::icon_warn(), e),
@@ -1638,7 +1629,7 @@ async fn handle_plan_command(
                         }
                     }
 
-                    eprintln!("{}", "  execute | step | edit <…> | diff | history".dim());
+                    eprintln!("{}", "  execute | step | show | status | edit <…>".dim());
                 }
             } else if let Some(plan) = &state.executing_plan {
                 let pct = plan.progress_pct();
@@ -1827,13 +1818,11 @@ async fn handle_plan_command(
             state.plan_execution_corrections.clear();
             state.executing_plan = Some(plan);
             state.plan_mode = None;
-            state.chat_plan_only = false;
             state.pending_plan_resume_digest = None;
             PlanModeState::clear_saved_state();
             eprintln!(
-                "  {} Left plan mode — execution is now running in background. Use {} to inspect it.",
+                "  {} Left plan mode — execution is now running in background.",
                 "←".magenta(),
-                "/plan status".magenta()
             );
         }
 
@@ -1854,11 +1843,7 @@ async fn handle_plan_command(
                             "Plan execution resumed",
                             Some(serde_json::json!({ "stage": "resumed" })),
                         );
-                        eprintln!(
-                            "  {} Resuming plan execution in background. Use {} for progress.",
-                            "▶".magenta(),
-                            "/plan status".magenta()
-                        );
+                        eprintln!("  {} Resuming plan execution in background.", "▶".magenta());
                     }
                     Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
                 }
@@ -1914,70 +1899,6 @@ async fn handle_plan_command(
             }
         }
 
-        PlanCommand::Timeline => {
-            if let Some(ref ps) = state.plan_mode {
-                eprintln!("{}", ps.timeline.format_display());
-            } else {
-                eprintln!("  {}", "(no timeline data)".dim());
-            }
-        }
-
-        PlanCommand::Metrics => {
-            if let Some(ref ps) = state.plan_mode {
-                let pct = ps.plan.progress_pct();
-                let done = ps.plan.items_done();
-                let total = ps.plan.subtasks.len();
-                let versions = ps.version_history.versions.len();
-                let edits = ps.history.len();
-                let timeline_events = ps.timeline.events.len();
-
-                eprintln!("{}", "Metrics".bold().magenta());
-                eprintln!(
-                    "  {} {}/{} {}  {} {}  {} events",
-                    "Progress:".dim(),
-                    format!("{done}").magenta(),
-                    format!("{total}").dim(),
-                    format!("({pct}%)").bold(),
-                    format!("v{versions}").dim(),
-                    format!("({edits} edits)").dim(),
-                    timeline_events,
-                );
-
-                if !ps.plan.subtasks.is_empty() {
-                    for st in &ps.plan.subtasks {
-                        let icon = match st.status {
-                            astra_services::task_orchestrator::TaskStatus::Completed => {
-                                theme::icon_ok().to_string()
-                            }
-                            astra_services::task_orchestrator::TaskStatus::Failed => {
-                                "✗".red().to_string()
-                            }
-                            astra_services::task_orchestrator::TaskStatus::InProgress => {
-                                "▶".magenta().to_string()
-                            }
-                            _ => "○".dim().to_string(),
-                        };
-                        let deps = if st.depends_on.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" {}", format!("(deps: {})", st.depends_on.join(", ")).dim())
-                        };
-                        eprintln!("  {icon} {} {}{deps}", st.id.clone().magenta(), st.title);
-                    }
-                }
-            } else {
-                eprintln!("  {}", "No active plan for metrics".dim());
-            }
-        }
-
-        PlanCommand::History => {
-            if let Some(ref ps) = state.plan_mode {
-                eprintln!("{}", ps.version_history.format_log());
-            } else {
-                eprintln!("  {}", "No version history".dim());
-            }
-        }
-
         PlanCommand::Show => {
             if let Some(ref ps) = state.plan_mode {
                 eprintln!();
@@ -1985,49 +1906,6 @@ async fn handle_plan_command(
             } else {
                 eprintln!("  {}", "No active plan".dim());
             }
-        }
-
-        PlanCommand::Diff { from, to } => {
-            if let Some(ref ps) = state.plan_mode {
-                let f = from.unwrap_or(ps.version_history.current_version.saturating_sub(1));
-                let t = to.unwrap_or(ps.version_history.current_version);
-                match ps.version_history.diff_versions(f, t) {
-                    Ok(diff) => eprintln!("{}", diff.format()),
-                    Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
-                }
-            }
-        }
-
-        PlanCommand::Rollback { version } => {
-            if plan_execution_ui_active(state) {
-                eprintln!(
-                    "  {} Rollback is disabled while a plan run is active. Pause or cancel first.",
-                    theme::icon_warn()
-                );
-                return Ok(PlanInputResult::Handled);
-            }
-            if let Some(ref mut ps) = state.plan_mode {
-                match ps.rollback_to_version(version) {
-                    Ok(msg) => {
-                        let _ = ps.save_to_file(&PlanModeState::state_path());
-                        journal_plan_event(
-                            &mut state.journal,
-                            session_journal::JournalEventType::PlanEdit,
-                            &format!("Plan rolled back to v{version}"),
-                            None,
-                        );
-                        eprintln!("  {} {}", theme::icon_ok(), msg);
-                        eprintln!();
-                        eprint_plan_markdown_streaming(&ps.plan, Some(&ps.goal));
-                    }
-                    Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
-                }
-            }
-        }
-
-        PlanCommand::List => {
-            let plans = plan::list_saved_plans();
-            eprintln!("{}", plan::format_plan_list(&plans));
         }
 
         PlanCommand::Correct { guidance } => {
@@ -2108,22 +1986,6 @@ async fn handle_plan_command(
                     "Redo is only available during execution".yellow()
                 );
             }
-        }
-
-        PlanCommand::EnablePlanOnly => {
-            state.chat_plan_only = true;
-            eprintln!(
-                "  {} Plan-only chat enabled (tools disabled)",
-                theme::icon_ok()
-            );
-        }
-
-        PlanCommand::DisablePlanOnly => {
-            state.chat_plan_only = false;
-            eprintln!(
-                "  {} Plan-only chat disabled (tools re-enabled)",
-                theme::icon_ok()
-            );
         }
 
         PlanCommand::Help => {
@@ -2213,12 +2075,12 @@ async fn handle_goal_submission(
             // P5: classify the goal at entry so downstream digesters can
             // distinguish executable vs analytical without re-running the
             // heuristic.
-            "kind": match astra_runtime::plan_decompose::classify_plan_suggestion(&goal)
+            "kind": match plan::classify_plan_suggestion(&goal)
                 .map(|s| s.kind)
-                .unwrap_or(astra_runtime::plan_decompose::PlanKind::Executable)
+                .unwrap_or(plan::PlanKind::Executable)
             {
-                astra_runtime::plan_decompose::PlanKind::Executable => "executable",
-                astra_runtime::plan_decompose::PlanKind::Analytical => "analytical",
+                plan::PlanKind::Executable => "executable",
+                plan::PlanKind::Analytical => "analytical",
             },
             "started_at_ms": std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2247,8 +2109,8 @@ async fn handle_goal_submission(
     // one-shot deliverable; we tear down plan_mode after rendering so the
     // user falls back into normal chat to continue the discussion.
     if matches!(
-        astra_runtime::plan_decompose::classify_plan_suggestion(&goal).map(|s| s.kind),
-        Some(astra_runtime::plan_decompose::PlanKind::Analytical)
+        plan::classify_plan_suggestion(&goal).map(|s| s.kind),
+        Some(plan::PlanKind::Analytical)
     ) {
         return handle_analytical_goal(goal, tok, state, api).await;
     }
@@ -2396,7 +2258,7 @@ enum OutlineChoice {
 /// Interactive outline confirmation using `inquire::Select`.
 fn prompt_outline_confirmation(phase_count: usize) -> OutlineChoice {
     use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() {
+    if cfg!(test) || !std::io::stdin().is_terminal() {
         return OutlineChoice::Confirm;
     }
 
@@ -3049,6 +2911,7 @@ pub(crate) fn plan_task_board_fingerprint(
 mod tests {
     use super::*;
     use crate::plan_executor;
+    use crate::plan_test_support::{ScriptedSseServer, sse_text_response};
     use astra_services::task_orchestrator::{SubtaskPlan, TaskStatus};
 
     #[test]
@@ -3193,7 +3056,6 @@ mod tests {
     #[tokio::test]
     async fn execute_exits_plan_mode_and_leaves_background_state() {
         let mut state = SessionState::default();
-        state.chat_plan_only = true;
         let mut ps = plan::PlanModeState::new("goal".into(), plan::ProjectContext::default());
         ps.plan.subtasks.push(SubtaskPlan {
             id: "s1".into(),
@@ -3215,10 +3077,6 @@ mod tests {
             "execute should preserve plan for background status"
         );
         assert_eq!(state.executing_plan_goal.as_deref(), Some("goal"));
-        assert!(
-            !state.chat_plan_only,
-            "execute should restore normal chat after leaving plan mode"
-        );
         let tasks = state.task_manager.snapshot().await;
         let plan_task = tasks
             .iter()
@@ -3233,6 +3091,182 @@ mod tests {
         assert_eq!(plan_task.title, "goal");
         assert_eq!(plan_task.subtasks.len(), 1);
         assert_eq!(plan_task.subtasks[0].id, "s1");
+    }
+
+    #[tokio::test]
+    async fn analytical_goal_success_is_one_shot_and_clears_saved_state() {
+        let analytical_json = serde_json::json!({
+            "goal": "Should we split auth middleware?",
+            "summary": "Inspect the current coupling and evaluate alternatives.",
+            "questions": [
+                {
+                    "id": "q1",
+                    "title": "What is coupled today?",
+                    "why_it_matters": "The answer sets the migration cost.",
+                    "key_aspects": ["middleware ownership", "token parsing"],
+                    "suggested_investigations": ["src/auth.rs"]
+                }
+            ]
+        })
+        .to_string();
+        let server = ScriptedSseServer::start(vec![sse_text_response(&analytical_json)]).await;
+        let api = astra_thin_client::ThinClient::new(&server.base_url, None).unwrap();
+
+        let mut state = SessionState::default();
+        state.plan_mode = Some(plan::PlanModeState::new(
+            String::new(),
+            plan::ProjectContext::default(),
+        ));
+        state.pending_plan_resume_digest = Some("stale digest".into());
+
+        let result = handle_goal_submission(
+            "Should we split auth middleware?".into(),
+            Some("token"),
+            &mut state,
+            &api,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, PlanInputResult::Handled));
+        assert!(
+            state.plan_mode.is_none(),
+            "analytical path should be one-shot"
+        );
+        assert!(
+            state.pending_plan_resume_digest.is_none(),
+            "analytical success should clear stale resume hints"
+        );
+    }
+
+    #[tokio::test]
+    async fn analytical_goal_parse_failure_aborts_plan_mode_and_clears_saved_state() {
+        let server =
+            ScriptedSseServer::start(vec![sse_text_response("not valid analytical json")]).await;
+        let api = astra_thin_client::ThinClient::new(&server.base_url, None).unwrap();
+
+        let mut state = SessionState::default();
+        state.plan_mode = Some(plan::PlanModeState::new(
+            String::new(),
+            plan::ProjectContext::default(),
+        ));
+        state.pending_plan_resume_digest = Some("stale digest".into());
+
+        let result = handle_goal_submission(
+            "Should we split auth middleware?".into(),
+            Some("token"),
+            &mut state,
+            &api,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, PlanInputResult::Handled));
+        assert!(
+            state.plan_mode.is_none(),
+            "analytical parse failure should abort plan mode cleanly"
+        );
+        assert!(
+            state.pending_plan_resume_digest.is_none(),
+            "abort path should clear stale resume hints"
+        );
+    }
+
+    #[tokio::test]
+    async fn executable_goal_parse_failure_aborts_plan_mode_and_clears_saved_state() {
+        let server = ScriptedSseServer::start(vec![
+            sse_text_response("this is not an outline"),
+            sse_text_response("still not a valid plan"),
+        ])
+        .await;
+        let api = astra_thin_client::ThinClient::new(&server.base_url, None).unwrap();
+
+        let mut state = SessionState::default();
+        state.plan_mode = Some(plan::PlanModeState::new(
+            String::new(),
+            plan::ProjectContext::default(),
+        ));
+        state.pending_plan_resume_digest = Some("stale digest".into());
+
+        let result = handle_goal_submission(
+            "Implement auth middleware and add tests".into(),
+            Some("token"),
+            &mut state,
+            &api,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, PlanInputResult::Handled));
+        assert!(
+            state.plan_mode.is_none(),
+            "executable parse failure should abort plan mode cleanly"
+        );
+        assert!(
+            state.pending_plan_resume_digest.is_none(),
+            "executable abort path should clear stale resume hints"
+        );
+        assert!(
+            state.executing_plan.is_none(),
+            "failed generation must not leave a phantom executing plan"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn slash_plan_goal_then_go_executes_clean_local_journey() {
+        plan::PlanModeState::clear_saved_state();
+        let plan_json = serde_json::json!({
+            "subtasks": [
+                {"id": "auth-middleware", "title": "Implement auth middleware"},
+                {"id": "auth-tests", "title": "Add auth tests", "depends_on": ["auth-middleware"]}
+            ]
+        })
+        .to_string();
+        let server = ScriptedSseServer::start(vec![sse_text_response(&plan_json)]).await;
+        let api = astra_thin_client::ThinClient::new(&server.base_url, None).unwrap();
+        let goal = "Implement auth middleware and add tests";
+
+        let mut state = SessionState::default();
+        crate::slash_plan::handle_plan_command("", &api, None, &mut state, Some("token"))
+            .await
+            .unwrap();
+        assert!(
+            state.plan_mode.is_some(),
+            "bare /plan should enter plan mode before goal submission"
+        );
+
+        let generated = handle_plan_mode_input(goal.into(), Some("token"), &mut state, &api)
+            .await
+            .unwrap();
+        assert!(matches!(generated, PlanInputResult::Handled));
+        let plan_state = state
+            .plan_mode
+            .as_ref()
+            .expect("executable generation should keep plan mode active");
+        let generated_goal = plan_state.goal.clone();
+        assert_eq!(plan_state.plan.subtasks.len(), 2);
+        assert_eq!(plan_state.plan.subtasks[0].id, "auth-middleware");
+        assert_eq!(plan_state.plan.subtasks[1].id, "auth-tests");
+        assert!(
+            state.executing_plan.is_none(),
+            "non-interactive generation should stage the plan, not auto-execute"
+        );
+
+        let executed = handle_plan_mode_input("go".into(), None, &mut state, &api)
+            .await
+            .unwrap();
+        assert!(matches!(executed, PlanInputResult::Handled));
+        assert!(state.plan_mode.is_none(), "go should leave plan mode");
+        assert_eq!(
+            state.executing_plan_goal.as_deref(),
+            Some(generated_goal.as_str())
+        );
+        assert!(
+            state.executing_plan.is_some(),
+            "go should promote the approved plan into background execution state"
+        );
+        plan::PlanModeState::clear_saved_state();
     }
 
     #[tokio::test]

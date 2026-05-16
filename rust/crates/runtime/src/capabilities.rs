@@ -535,6 +535,38 @@ mod tests {
     }
 
     #[test]
+    fn real_plan_lifecycle_tools_are_server_only() {
+        let server_builtins = server_runtime_tool_schemas();
+        let local = names(resolve_tool_schemas(
+            ToolCatalogRequest::new(CapabilitySurface::CliLocal)
+                .with_source(ToolCapabilitySource::ServerBuiltin, server_builtins.clone()),
+        ));
+        let web = names(resolve_tool_schemas(
+            ToolCatalogRequest::new(CapabilitySurface::Web)
+                .with_source(ToolCapabilitySource::ServerBuiltin, server_builtins.clone()),
+        ));
+        let remote = names(resolve_tool_schemas(
+            ToolCatalogRequest::new(CapabilitySurface::CliRemote)
+                .with_source(ToolCapabilitySource::ServerBuiltin, server_builtins),
+        ));
+
+        assert!(
+            !local.contains(&"enter_plan_mode".to_string())
+                && !local.contains(&"exit_plan_mode".to_string()),
+            "local CLI must not expose server-owned plan lifecycle tools"
+        );
+        assert!(
+            web.contains(&"enter_plan_mode".to_string())
+                && web.contains(&"exit_plan_mode".to_string()),
+            "web must expose the server-owned plan lifecycle tools"
+        );
+        assert_eq!(
+            remote, web,
+            "remote/thin CLI should expose the same server-owned lifecycle tools as web"
+        );
+    }
+
+    #[test]
     fn remote_skill_record_requires_real_instructions() {
         let record = SkillRecord {
             skill_id: "empty@1.0.0".to_string(),

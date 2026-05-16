@@ -391,7 +391,7 @@ mod tests {
                         "description": {"type": "string"},
                         "prompt": {"type": "string"},
                         "task": {"type": "string"},
-                        "background": {"type": "boolean"}
+                        "run_in_background": {"type": "boolean"}
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {
@@ -420,7 +420,7 @@ mod tests {
         );
         // Pure optional stays stripped.
         assert!(
-            props.get("background").is_none(),
+            props.get("run_in_background").is_none(),
             "purely-optional props still get pruned"
         );
     }

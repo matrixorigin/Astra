@@ -198,21 +198,12 @@ async fn task_background_actions_are_rejected_with_redirect_to_agent_job() {
     }
 }
 
-/// Phase 2: `session.enter_plan` and `session.exit_plan` were
-/// promoted to top-level `enter_plan_mode` / `exit_plan_mode` tools
-/// for claudecode parity (the buried sub-actions never got picked).
-/// Calling them on `session` must fail with an Error: redirect to
-/// the new tool — same shape as `task.background_*` and
-/// `agent.delegate`. Without this guard, a stale model schema would
-/// silently no-op (session dispatch hits the `Unknown session action`
-/// branch with a generic message that doesn't name the new tool).
+/// Local CLI keeps plan mode on `/plan`; stale session sub-actions should
+/// simply be rejected as unknown instead of redirecting to hidden tools.
 #[tokio::test]
-async fn session_enter_exit_plan_actions_redirect_to_top_level_tools() {
+async fn session_enter_exit_plan_actions_are_unknown() {
     let executor = test_executor();
-    for (action, redirect_tool) in &[
-        ("enter_plan", "enter_plan_mode"),
-        ("exit_plan", "exit_plan_mode"),
-    ] {
+    for action in &["enter_plan", "exit_plan"] {
         let result = executor
             .execute("session", &json!({"action": action}))
             .await;
@@ -221,9 +212,8 @@ async fn session_enter_exit_plan_actions_redirect_to_top_level_tools() {
             "session.{action} must return an Error: prefix — got: {result}"
         );
         assert!(
-            result.contains(redirect_tool),
-            "session.{action} error must name the top-level `{redirect_tool}` tool \
-             so the model self-corrects on the next turn. Got: {result}"
+            result.contains("unknown `session` action"),
+            "session.{action} should be rejected as unknown. Got: {result}"
         );
         assert!(
             astra_turn_core::tool_result_semantics::is_tool_error(&result),
@@ -231,42 +221,6 @@ async fn session_enter_exit_plan_actions_redirect_to_top_level_tools() {
              TUI shows red. Got: {result}"
         );
     }
-}
-
-/// CLI executor must dispatch the new top-level `enter_plan_mode` /
-/// `exit_plan_mode` calls. Without a wired plan repository (CLI mode
-/// uses cloud REST through ThinClient — see Phase 2.2), we expect a
-/// fail-fast Error: that explicitly names the missing dependency, NOT
-/// silent success or a generic "unknown tool".
-#[tokio::test]
-async fn enter_plan_mode_dispatches_through_executor() {
-    let executor = test_executor();
-    let result = executor.execute("enter_plan_mode", &json!({})).await;
-    // Without a cloud-backed plan_repo wired, the CLI must surface a
-    // clear failure instead of silently no-op'ing. The exact message
-    // is up to Phase 2.2; this test only pins that the dispatcher
-    // routes the call (not the unknown-tool fallback).
-    assert!(
-        !result.contains("not available") || result.to_lowercase().contains("plan"),
-        "enter_plan_mode must reach a plan-mode-aware code path. \
-         A generic 'tool not available' means the dispatcher missed \
-         the route entirely. Got: {result}"
-    );
-}
-
-#[tokio::test]
-async fn exit_plan_mode_dispatches_through_executor() {
-    let executor = test_executor();
-    let result = executor
-        .execute(
-            "exit_plan_mode",
-            &json!({"plan": "1. Write tests\n2. Implement", "approved": true}),
-        )
-        .await;
-    assert!(
-        !result.contains("not available") || result.to_lowercase().contains("plan"),
-        "exit_plan_mode must reach a plan-mode-aware code path. Got: {result}"
-    );
 }
 
 /// `agent_job` is the new entry point. It must dispatch the four

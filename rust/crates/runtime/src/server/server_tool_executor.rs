@@ -689,7 +689,7 @@ fn render_session_history_rows(
 }
 
 /// Tools that mutate the world outside the session. Blocked while plan mode
-/// is active (`PlanPhase` = PlanOnlyChat|Planning|Refining) to mirror Claude
+/// is active (`PlanPhase` = Planning|Refining) to mirror Claude
 /// Code's `prepareContextForPlanMode` behaviour: the model must call
 /// ExitPlanMode before writing anything.
 ///
