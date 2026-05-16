@@ -1738,6 +1738,7 @@ async fn plan_executor_task(
                     stream_event_tx: Some(stream_tx),
                     agent_live_event_sink: None,
                     approval_request_tx: Some(approval_tx),
+                    ask_user_request_tx: None,
                     mcp_manager: None,
                     skill_search: &ctx.skill_search,
                     skill_quality_tracker: &mut skill_qt,

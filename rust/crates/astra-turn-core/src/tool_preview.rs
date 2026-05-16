@@ -180,7 +180,13 @@ pub fn render_preview(tool: &str, args: &Value, style: PreviewStyle, desc_budget
             format!("Notify: \"{}\"", trunc(msg, path_budget(10)))
         }
         "ask_user" => {
-            let question = args.get("question").and_then(Value::as_str).unwrap_or("");
+            let question = args
+                .get("questions")
+                .and_then(Value::as_array)
+                .and_then(|questions| questions.first())
+                .and_then(|question| question.get("question"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
             format!("Asking user: \"{}\"", trunc(question, path_budget(15)))
         }
 
@@ -904,7 +910,10 @@ mod tests {
     #[test]
     fn ask_user_shows_question() {
         assert_eq!(
-            p("ask_user", json!({"question": "Continue?"})),
+            p(
+                "ask_user",
+                json!({"questions": [{"header": "Confirm", "question": "Continue?", "options": ["Yes", "No"]}]})
+            ),
             r#"Asking user: "Continue?""#
         );
     }

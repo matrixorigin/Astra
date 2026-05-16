@@ -247,6 +247,25 @@ fn stream_event_to_agent_live_kind(
         StreamEvent::ModelResponding => {
             Some(AgentLiveEventKind::Status("model responding".to_string()))
         }
+        StreamEvent::AskUserPrompted { prompt, .. } => Some(AgentLiveEventKind::Status(format!(
+            "ask_user waiting ({} questions)",
+            prompt
+                .get("prompt")
+                .and_then(|value| value.get("question_count"))
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0)
+        ))),
+        StreamEvent::AskUserResolved { resolution, .. } => {
+            Some(AgentLiveEventKind::Status(format!(
+                "ask_user {}",
+                resolution
+                    .get("audit")
+                    .and_then(|value| value.get("response"))
+                    .and_then(|value| value.get("outcome"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("resolved")
+            )))
+        }
         StreamEvent::StatusLine(text) => Some(AgentLiveEventKind::Status(text)),
         StreamEvent::PermissionAutoApproved { tool, reason } => Some(AgentLiveEventKind::Status(
             astra_turn_core::permission_notice::format_auto_approved_permission(&tool, &reason)

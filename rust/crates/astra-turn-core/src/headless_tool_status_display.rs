@@ -493,7 +493,10 @@ fn fmt_memory_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
 fn fmt_utility_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
     match name {
         "ask_user" => obj
-            .get("question")
+            .get("questions")
+            .and_then(|v| v.as_array())
+            .and_then(|questions| questions.first())
+            .and_then(|question| question.get("question"))
             .and_then(|v| v.as_str())
             .map(|q| truncate_str(q, 60)),
         "sleep" => {
@@ -1072,7 +1075,10 @@ mod tests {
 
     #[test]
     fn tool_call_detail_ask_user_shows_question() {
-        let detail = tool_call_detail("ask_user", &json!({"question": "Continue?"}));
+        let detail = tool_call_detail(
+            "ask_user",
+            &json!({"questions": [{"header": "Confirm", "question": "Continue?", "options": ["Yes", "No"]}]}),
+        );
         assert_eq!(detail.as_deref(), Some("Continue?"));
     }
 

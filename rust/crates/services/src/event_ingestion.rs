@@ -21,6 +21,7 @@
 //! - **Graceful shutdown**: flush remaining buffer on drop
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
@@ -322,13 +323,24 @@ impl IngestionEvent {
                     raw_content
                 };
 
-                let metadata = serde_json::json!({
-                    "tool_name": tc.name,
-                    "ok": tc.ok,
-                    "duration_ms": tc.ms,
-                    "error": tc.error,
-                    "turn": event.turn,
-                });
+                let mut metadata = serde_json::Map::new();
+                metadata.insert("tool_name".into(), Value::String(tc.name.clone()));
+                metadata.insert("ok".into(), Value::Bool(tc.ok));
+                metadata.insert("duration_ms".into(), Value::from(tc.ms));
+                metadata.insert(
+                    "error".into(),
+                    tc.error
+                        .as_ref()
+                        .map(|error| Value::String(error.clone()))
+                        .unwrap_or(Value::Null),
+                );
+                metadata.insert(
+                    "turn".into(),
+                    event.turn.map(Value::from).unwrap_or(Value::Null),
+                );
+                if let Some(ask_user) = tc.ask_user.clone() {
+                    metadata.insert("ask_user".into(), ask_user);
+                }
 
                 events.push(Self {
                     event_id: tc_event_id,
@@ -343,7 +355,7 @@ impl IngestionEvent {
                     token_usage: None,
                     llm_model_used: None,
                     skill_name: Some(tc.name.clone()),
-                    metadata: Some(metadata),
+                    metadata: Some(Value::Object(metadata)),
                     created_at: event.ts.clone(),
                     parent_event_id: Some(main_event_id.clone()),
                     parent_event_ids: vec![main_event_id.clone()],
@@ -1433,6 +1445,28 @@ mod tests {
         assert_eq!(meta["ok"], true);
         assert_eq!(meta["duration_ms"], 500);
         assert_eq!(meta["turn"], 3);
+    }
+
+    #[test]
+    fn expand_tool_call_events_include_ask_user_metadata() {
+        let mut journal = make_turn_event();
+        journal.tool_calls = Some(vec![crate::session_journal::ToolCallRecord {
+            name: "ask_user".into(),
+            ok: false,
+            ms: 125,
+            error: Some("Error: ask_user was cancelled by the user".into()),
+            ask_user: Some(serde_json::json!({
+                "prompt": {"question_count": 2, "headers": ["Scope", "Notes"]},
+                "response": {"outcome": "cancelled", "answered_question_count": 0},
+            })),
+            ..Default::default()
+        }]);
+
+        let events = IngestionEvent::expand_journal_event(&journal, "u1");
+        let meta = events[1].metadata.as_ref().expect("metadata");
+        assert_eq!(meta["tool_name"], "ask_user");
+        assert_eq!(meta["ask_user"]["response"]["outcome"], "cancelled");
+        assert_eq!(meta["ask_user"]["prompt"]["question_count"], 2);
     }
 
     #[test]

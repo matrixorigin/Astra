@@ -13,11 +13,15 @@ mod sse_loop;
 mod tests;
 
 pub(crate) use edge_executor::edge_executor_instance_id;
+#[cfg(test)]
+pub(crate) use params::AskUserChoice;
 pub(crate) use params::BasicCliChatContext;
 pub(crate) use params::ChatTurnParams;
 pub(crate) use params::{
-    ApprovalRequest, ApprovalRequestTx, ApprovalResponse, SharedStreamEventSink, StreamEvent,
-    StreamEventSink, StreamEventTx, ToolProgressSink,
+    ApprovalRequest, ApprovalRequestTx, ApprovalResponse, AskUserAnnotation, AskUserAnswers,
+    AskUserPrompt, AskUserQuestion, AskUserQuestionAnswer, AskUserRequest, AskUserRequestTx,
+    AskUserResponse, SharedStreamEventSink, StreamEvent, StreamEventSink, StreamEventTx,
+    ToolProgressSink,
 };
 pub(crate) use sse_loop::stream_chat_sse;
 pub(crate) use sse_loop::turn_policy_from_payload_edge_tools;

@@ -149,6 +149,7 @@ pub(crate) mod memoria;
 use astra_tools::memoria::parse_memory_search_contents;
 #[path = "edge_tools/ask_user.rs"]
 mod ask_user;
+pub(crate) use ask_user::parse_ask_user_prompt;
 #[path = "edge_tools/context_analysis.rs"]
 mod context_analysis;
 #[path = "edge_tools/mcp_dispatch.rs"]
@@ -2841,7 +2842,6 @@ impl ToolExecutor {
                         "deprioritize" => self.deprioritize_tool(args),
                         "compact" => self.compress_context(args),
                         "rollback_edits" => self.rollback_file_edits(args),
-                        "ask_user" => self.ask_user(args),
                         "sleep" => self.sleep_tool(args).await,
                         "timeline" => self.render_session_timeline(args),
                         "summary" => self.render_session_summary().await,
@@ -2857,8 +2857,8 @@ impl ToolExecutor {
                         // task→agent_job split.
                         "enter_plan" => Self::redirect_to_plan_mode_tool("enter_plan", "enter_plan_mode"),
                         "exit_plan" => Self::redirect_to_plan_mode_tool("exit_plan", "exit_plan_mode"),
-                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, compact, rollback_edits, ask_user, sleep, timeline, summary, history, suppress_memory(memory_id, reason?), unsuppress_memory(memory_id), list_suppressed, release_context(tool_call_id|string[]), list_released. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools.".to_string(),
-                        other => format!("Error: unknown `session` action '{other}'. Valid: config, prioritize, deprioritize, compact, rollback_edits, ask_user, sleep, timeline, summary, history, suppress_memory, unsuppress_memory, list_suppressed, release_context, list_released. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools."),
+                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, compact, rollback_edits, sleep, timeline, summary, history, suppress_memory(memory_id, reason?), unsuppress_memory(memory_id), list_suppressed, release_context(tool_call_id|string[]), list_released. Use the first-class `ask_user` tool for user questions. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools.".to_string(),
+                        other => format!("Error: unknown `session` action '{other}'. Valid: config, prioritize, deprioritize, compact, rollback_edits, sleep, timeline, summary, history, suppress_memory, unsuppress_memory, list_suppressed, release_context, list_released. Use the first-class `ask_user` tool for user questions. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools."),
                     }
                 }
                 "enter_plan_mode" => self.cli_enter_plan_mode(args).await,
@@ -2910,7 +2910,7 @@ impl ToolExecutor {
                 "task_update" => self.task_update(args).await,
                 "task_stop" => self.task_stop(args).await,
                 "web_search" => self.web_search(args),
-                "ask_user" => self.ask_user(args),
+                "ask_user" => "Error: ask_user requires an interactive TUI prompt sink".to_string(),
                 "notify" => {
                     const MAX_NOTIFY_MSG: usize = 4096;
                     let message = args.get("message").and_then(Value::as_str).unwrap_or("");

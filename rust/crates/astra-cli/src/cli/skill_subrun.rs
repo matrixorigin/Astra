@@ -306,6 +306,7 @@ impl AgenticLoopHost for SubRunHost {
             stream_event_tx: self.stream_event_tx.clone(),
             stream_event_sink: self.stream_event_sink.clone(),
             approval_request_tx: None,
+            ask_user_request_tx: None,
             skill_resolver: self.skill_resolver.clone(),
             skill_continuation: false,
             turn_rollback_on_failure: false,

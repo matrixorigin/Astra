@@ -493,6 +493,9 @@ pub struct ToolCallRecord {
     /// Enables debugging tool failures without re-execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_full: Option<String>,
+    /// Dedicated ask_user prompt/response audit payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_user: Option<serde_json::Value>,
     /// When set, this record represents a short-circuited `skill(name=X)`
     /// re-invocation. The value is the re-entry index (1 = first repeat call,
     /// 2 = second, ...). Surfaces skill-loop inefficiencies in journal digests

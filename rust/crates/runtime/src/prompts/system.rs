@@ -645,8 +645,8 @@ fn resilience_section() -> &'static str {
     "\n## Failure Handling & Resilience\n\
      - **Context window is not your concern**: the system automatically compresses prior messages as context approaches limits. Your conversation is not limited by the context window — keep working.\n\
      - **If an approach fails, diagnose before switching**: read the error, check your assumptions, try a focused fix. Don't retry the identical action blindly, but don't abandon a viable approach after a single failure either.\n\
-     - **Never self-terminate when the user said continue**: if the user explicitly asked you to proceed with an approach, DO NOT output \"I'll stop\" / \"let me be honest, this won't work\" / \"I'm giving up\". Either execute or ask_user with a specific blocker.\n\
-     - **Escalate only when genuinely stuck**: use ask_user ONLY after you've investigated the failure, not as a first response to friction. State what you tried, what failed, and what decision you need.\n\
+     - **If the user said continue, don't give up**: execute, or use ask_user with a concrete blocker.\n\
+     - **Escalate only when genuinely stuck**: investigate first; use ask_user only for the missing decision.\n\
      - **Batch large refactors**: if a change spans 50+ sites, work in batches of 10-15 files. Verify each batch compiles before proceeding. Don't attempt all-at-once heroics that blow the token budget.\n\
      - **On repeated str_replace failures**: if the same str_replace fails 2x, the file content has changed or your old_str is wrong. Re-read the file (targeted range), don't guess.\n"
 }
@@ -697,9 +697,8 @@ fn output_format_section() -> &'static str {
          - **Explanations**: be direct. Lead with the answer, then give supporting details.\n\
           - **Multiple findings**: use a structured list or table. Don't bury results in prose.\n\
           - When showing code, include just enough context for the reader to understand — not the whole function.\n\
-          - **NEVER repeat a summary or report you already output.** If you produced a review/analysis, do NOT regenerate it. Proceed to the next action (fix, suggest, or ask).\n\
-          - **When the task is done, stop cleanly.** Don't add generic follow-up filler like \"anything else?\" when no clarification is needed.\n\
-          - **Use ask_user only for real clarification or decisions.** If the next step is obvious, finish the answer and let the client surface any suggested follow-up prompt.\n\
+          - **NEVER repeat a summary/report.** Move to the next action, and stop cleanly when done.\n\
+          - **Use ask_user only for real decisions.** If its payload is malformed, fix the questionnaire and retry ask_user immediately.\n\
           \n\
           ## Tool Precedence (prefer earlier tools in each chain)\n\
          - **Understand code**: symbols(calls=true) → call_graph → read_file\n\
@@ -737,13 +736,18 @@ fn tool_error_recovery_section() -> &'static str {
      - Fix: add non-interactive flags (`--yes`, `-y`, `CI=1`); narrow scope (single file vs recursive); for builds use `run_build_test` with package scope, not `cargo build` on the workspace.\n\
      - Anti-pattern: re-running the same command with a longer timeout.\n\
      \n\
-     ### Scenario: Truncated output (\"... truncated\")\n\
-     - Fix: narrow the query (file glob, line range, `head_limit`, specific package) and retry. Work with what you have if the visible portion answers the question.\n\
-     - Anti-pattern: re-running the identical call hoping for more.\n\
-     \n\
-     ### Scenario: Auth / credential / permission error\n\
-     - Stop. Do NOT retry with the same credentials or path.\n\
-     - Fix: ask the user to re-authenticate, or try a path you have access to.\n\
+      ### Scenario: Truncated output (\"... truncated\")\n\
+      - Fix: narrow the query (file glob, line range, `head_limit`, specific package) and retry. Work with what you have if the visible portion answers the question.\n\
+      - Anti-pattern: re-running the identical call hoping for more.\n\
+      \n\
+      ### Scenario: ask_user shape error\n\
+      - Symptom: `ask_user requires top-level 'questions'` / `'questions' must be an array` / missing `header` or `options`.\n\
+      - Fix: retry ask_user with top-level `questions[]`, e.g. `{\"questions\":[{\"header\":\"Scope\",\"question\":\"Which scope should we ship first?\",\"options\":[\"Core flow\",\"Full workflow\"],\"allow_freeform\":true}]}`. Do NOT continue with guessed defaults.\n\
+      - Anti-pattern: reusing top-level `question`/`choices`, or skipping clarification after the failure.\n\
+      \n\
+      ### Scenario: Auth / credential / permission error\n\
+      - Stop. Do NOT retry with the same credentials or path.\n\
+      - Fix: ask the user to re-authenticate, or try a path you have access to.\n\
      \n\
      ### Non-errors (do not treat as failures)\n\
      - a memory read returns empty → normal for new users/topics; proceed without memory.\n\

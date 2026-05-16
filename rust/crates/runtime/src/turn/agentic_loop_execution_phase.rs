@@ -3872,6 +3872,7 @@ mod tests {
                 round: None,
                 args_full: None,
                 result_full: None,
+                ask_user: None,
                 skill_reentry_count: None,
                 skill_locked_out: None,
             });

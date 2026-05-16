@@ -370,7 +370,7 @@ fn memory_schema_requires_content_query_new_content_signal() {
 }
 
 #[test]
-fn session_schema_requires_path_value_tool_question_query() {
+fn session_schema_requires_path_value_tool_query_and_not_ask_user() {
     let schemas = all_tool_schemas();
     let sess = tool_schema(&schemas, "session");
     assert_eq!(
@@ -387,8 +387,43 @@ fn session_schema_requires_path_value_tool_question_query() {
     );
     assert_eq!(
         conditional_required_for(sess, "ask_user"),
-        vec!["question".to_string()]
+        Vec::<String>::new()
     );
+    let actions = sess["function"]["parameters"]["properties"]["action"]["enum"]
+        .as_array()
+        .expect("session action enum");
+    assert!(
+        !actions.iter().any(|v| v.as_str() == Some("ask_user")),
+        "ask_user must be a first-class tool, not a stale session action"
+    );
+}
+
+#[test]
+fn ask_user_schema_advertises_questionnaire_tabs_and_multi_select() {
+    let schemas = all_tool_schemas();
+    let ask = tool_schema(&schemas, "ask_user");
+    let description = ask["function"]["description"]
+        .as_str()
+        .expect("ask_user description should be a string");
+    assert!(description.contains("retry ask_user immediately"));
+    let params = &ask["function"]["parameters"];
+    assert!(
+        params["required"]
+            .as_array()
+            .unwrap()
+            .contains(&"questions".into())
+    );
+    let question = &params["properties"]["questions"]["items"];
+    assert_eq!(question["properties"]["multi_select"]["type"], "boolean");
+    assert_eq!(question["properties"]["allow_freeform"]["type"], "boolean");
+    let choices = &question["properties"]["options"]["items"];
+    assert!(
+        choices.get("anyOf").is_some(),
+        "options should accept either strings or described option objects"
+    );
+    let choice_object = &choices["anyOf"][1]["properties"];
+    assert_eq!(choice_object["preview"]["type"], "string");
+    assert_eq!(question["required"], serde_json::json!(["question"]));
 }
 
 #[test]

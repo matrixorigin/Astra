@@ -354,7 +354,8 @@ pub async fn build_server_state(
     .with_skill_service(state.skill_service.clone())
     .with_hook_db_writer(state.turn_hook_db_writer.clone())
     .with_observer_worker(state.turn_observer_worker.clone())
-    .with_tool_event_writer(state.turn_tool_event_writer.clone());
+    .with_tool_event_writer(state.turn_tool_event_writer.clone())
+    .with_auxiliary_event_writer(state.turn_auxiliary_event_writer.clone());
     if let Some(svc) = memory_extraction_service.as_ref() {
         run_lifecycle = run_lifecycle.with_memory_extraction_service(Arc::clone(svc));
     }

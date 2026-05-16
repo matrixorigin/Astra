@@ -268,6 +268,23 @@ fn map_stream_event(event: StreamEvent) -> TuiAppEvent {
             tool_use_id,
             parent_tool_use_id,
         },
+        StreamEvent::AskUserPrompted { prompt, .. } => TuiAppEvent::StatusLine(format!(
+            "ask_user: waiting for user ({} questions)",
+            prompt
+                .get("prompt")
+                .and_then(|value| value.get("question_count"))
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0)
+        )),
+        StreamEvent::AskUserResolved { resolution, .. } => TuiAppEvent::StatusLine(format!(
+            "ask_user: {}",
+            resolution
+                .get("audit")
+                .and_then(|value| value.get("response"))
+                .and_then(|value| value.get("outcome"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("resolved")
+        )),
         StreamEvent::AgentControlCompleted {
             action,
             label,

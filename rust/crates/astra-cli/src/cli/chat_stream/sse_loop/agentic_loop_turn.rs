@@ -919,6 +919,8 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub stream_event_tx: Option<super::super::StreamEventTx>,
     /// Optional channel for async tool approval requests during plan execution.
     pub approval_request_tx: Option<super::super::ApprovalRequestTx>,
+    /// Optional channel for native TUI ask_user prompts.
+    pub ask_user_request_tx: Option<super::super::AskUserRequestTx>,
     /// Skill resolver for intercepting "skill" tool calls.
     pub skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     /// Effort level override from skill activation.
@@ -1063,6 +1065,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         plan_assemble_line_release,
         stream_event_tx,
         approval_request_tx,
+        ask_user_request_tx,
         skill_resolver,
         skill_effort,
         skill_agent_type,
@@ -1164,6 +1167,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         stream_event_tx,
         stream_event_sink: None,
         approval_request_tx,
+        ask_user_request_tx,
         skill_resolver,
         skill_continuation,
         turn_rollback_on_failure: is_plan_subtask,

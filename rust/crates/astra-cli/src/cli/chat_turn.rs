@@ -1035,6 +1035,7 @@ async fn run_chat_turn(
             stream_event_tx: state.tui_stream_event_tx.clone(),
             agent_live_event_sink: state.tui_agent_live_event_sink.clone(),
             approval_request_tx: state.tui_approval_request_tx.clone(),
+            ask_user_request_tx: state.tui_ask_user_request_tx.clone(),
             mcp_manager: Some(state.mcp_manager.clone()),
             skill_search: &state.skill_search,
             skill_quality_tracker: &mut state.skill_quality_tracker,

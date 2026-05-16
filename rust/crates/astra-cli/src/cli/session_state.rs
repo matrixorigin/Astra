@@ -389,6 +389,8 @@ pub(crate) struct SessionState {
     /// When set, tool approval requests are sent through this channel
     /// instead of using interactive inquire prompts.
     pub tui_approval_request_tx: Option<crate::chat_stream::ApprovalRequestTx>,
+    /// When set, ask_user requests are rendered by the native TUI overlay.
+    pub tui_ask_user_request_tx: Option<crate::chat_stream::AskUserRequestTx>,
 
     /// Notifications from background tasks (completed/failed/stalled)
     /// queued for injection into the model's next turn context.
@@ -579,6 +581,7 @@ impl Default for SessionState {
             tui_agent_live_event_sink: None,
             tui_cancel_token: None,
             tui_approval_request_tx: None,
+            tui_ask_user_request_tx: None,
             pending_bg_notifications: Vec::new(),
             turns_since_task_use: 0,
             turns_since_task_reminder: 0,

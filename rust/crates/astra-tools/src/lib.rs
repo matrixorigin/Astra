@@ -7,6 +7,7 @@
 //! Both the CLI (`CliToolExecutor`) and the server (`ServerToolExecutor`) depend
 //! on this crate and compose its `DefaultToolExecutor` with their own wrappers.
 
+pub mod ask_user;
 pub mod memoria;
 pub mod schemas;
 pub mod web_fetch;
@@ -47,6 +48,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
+
+pub use ask_user::{
+    AskUserAnnotation, AskUserAnswers, AskUserChoice, AskUserPrompt, AskUserQuestion,
+    AskUserQuestionAnswer, build_ask_user_prompt_telemetry, build_ask_user_tool_call_audit,
+    normalize_ask_user_answers, parse_ask_user_prompt, summarize_ask_user_tool_call,
+};
 
 // ─── Core trait ─────────────────────────────────────────────────────────────
 
@@ -356,18 +363,13 @@ pub trait ToolApprovalGate: Send + Sync {
 
 // ─── ask_user gate ────────────────────────────────────────────────────────────
 
-/// Final answer returned from an interactive ask_user prompt.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AskUserResponse {
-    pub answer: String,
-    pub was_custom: bool,
-}
-
 /// Result from an ask_user gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AskUserDecision {
-    /// User provided an answer.
-    Answer(AskUserResponse),
+    /// User submitted the questionnaire.
+    Submitted(AskUserAnswers),
+    /// User explicitly cancelled the questionnaire.
+    Cancelled,
     /// The prompt timed out before the user responded.
     Timeout,
     /// The prompt could not be delivered or decoded.
@@ -377,14 +379,11 @@ pub enum AskUserDecision {
 /// Trait for routing ask_user prompts through an interactive frontend.
 #[async_trait]
 pub trait AskUserGate: Send + Sync {
-    /// Ask the user a question and wait for their response.
-    async fn request_user_input(
+    /// Ask the user a questionnaire and wait for their response.
+    async fn request_questionnaire(
         &self,
         request_id: &str,
-        question: &str,
-        choices: &[String],
-        default: Option<&str>,
-        context: Option<&str>,
+        prompt: &AskUserPrompt,
     ) -> AskUserDecision;
 }
 
@@ -404,6 +403,17 @@ pub trait ToolProgressCallback: Send + Sync {
 
     /// Tool execution completed.
     async fn tool_completed(&self, call_id: &str, result: &str, success: bool);
+
+    /// ask_user resolved for a specific prompt request.
+    async fn ask_user_resolved(
+        &self,
+        _request_id: &str,
+        _outcome: &str,
+        _answers: &[String],
+        _was_custom: Option<bool>,
+        _error: Option<&str>,
+    ) {
+    }
 }
 
 /// Tools that require user approval in server-side execution by default.

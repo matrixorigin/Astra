@@ -377,6 +377,9 @@ pub(crate) async fn run_tui_repl(
     let (approval_tx, mut approval_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::ApprovalRequest>();
     state.tui_approval_request_tx = Some(approval_tx);
+    let (ask_user_tx, mut ask_user_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::AskUserRequest>();
+    state.tui_ask_user_request_tx = Some(ask_user_tx);
 
     // ── Enter TUI ───────────────────────────────────────────────────────
     let mut guard = TerminalGuard::init().map_err(|e| format!("TUI init failed: {e}"))?;
@@ -1244,6 +1247,24 @@ pub(crate) async fn run_tui_repl(
                                                             req.response_tx,
                                                         )
                                                     };
+                                                    frame_requester.schedule_frame();
+                                                    {
+                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                    let frame = active_viewport(
+                                        &chat_widget,
+                                        &status_indicator,
+                                        Some(&*task_board),
+                                        board_expanded,
+                                        board_user_pin,
+                                        w,
+                                        guard.terminal.size().map(|s| s.height).unwrap_or(24),
+                                    );
+                                    board_expanded = frame.resolved_board_expanded;
+                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                }
+                                                 }
+                                                Some(req) = ask_user_rx.recv() => {
+                                                    bottom_pane.enqueue_ask_user(req.prompt, req.response_tx);
                                                     frame_requester.schedule_frame();
                                                     {
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);

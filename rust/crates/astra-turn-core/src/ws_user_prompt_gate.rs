@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use astra_tools::{AskUserDecision, AskUserGate, AskUserResponse};
+use astra_tools::{AskUserAnswers, AskUserDecision, AskUserGate, AskUserPrompt};
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::Mutex as TokioMutex;
@@ -24,10 +24,7 @@ const USER_PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserPromptOutboundRequest {
     pub request_id: String,
-    pub question: String,
-    pub choices: Vec<String>,
-    pub default: Option<String>,
-    pub context: Option<String>,
+    pub prompt: AskUserPrompt,
 }
 
 /// [`AskUserGate`] implementation backed by WebSocket messaging.
@@ -55,20 +52,14 @@ impl WebSocketUserPromptGate {
 
 #[async_trait]
 impl AskUserGate for WebSocketUserPromptGate {
-    async fn request_user_input(
+    async fn request_questionnaire(
         &self,
         request_id: &str,
-        question: &str,
-        choices: &[String],
-        default: Option<&str>,
-        context: Option<&str>,
+        prompt: &AskUserPrompt,
     ) -> AskUserDecision {
         let request = serde_json::json!({
             "request_id": request_id,
-            "question": question,
-            "choices": choices,
-            "default": default,
-            "context": context,
+            "prompt": prompt,
         });
 
         if self.request_tx.send(request).is_err() {
@@ -78,22 +69,24 @@ impl AskUserGate for WebSocketUserPromptGate {
         let key = user_prompt_callback_key(&self.user_id, request_id);
         match take_ledger_entry(&self.edge_callback_ledger, &key, self.timeout).await {
             Some(value) => {
-                let Some(answer) = value
-                    .get("answer")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-                else {
+                if value
+                    .get("cancelled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    return AskUserDecision::Cancelled;
+                }
+                let Some(answers) = value.get("answers").cloned() else {
                     return AskUserDecision::Error(
-                        "Invalid user prompt response: missing answer".into(),
+                        "Invalid user prompt response: missing answers".into(),
                     );
                 };
-                AskUserDecision::Answer(AskUserResponse {
-                    answer,
-                    was_custom: value
-                        .get("was_custom")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                })
+                match serde_json::from_value::<AskUserAnswers>(answers) {
+                    Ok(answers) => AskUserDecision::Submitted(answers),
+                    Err(error) => {
+                        AskUserDecision::Error(format!("Invalid user prompt response: {error}"))
+                    }
+                }
             }
             None => AskUserDecision::Timeout,
         }
@@ -120,28 +113,63 @@ mod tests {
         let ledger_bg = ledger.clone();
         tokio::spawn(async move {
             let req = rx.recv().await.unwrap();
-            assert_eq!(req["question"].as_str().unwrap(), "Continue?");
-            assert_eq!(req["choices"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                req["prompt"]["questions"][0]["question"].as_str().unwrap(),
+                "Continue?"
+            );
+            assert_eq!(req["prompt"]["questions"].as_array().unwrap().len(), 1);
 
             let key = user_prompt_callback_key("u1", req["request_id"].as_str().unwrap());
             let mut g = ledger_bg.lock().await;
-            g.insert(key, json!({"answer": "yes", "was_custom": false}));
+            g.insert(
+                key,
+                json!({
+                    "answers": {
+                        "answers": [{
+                            "question": "Continue?",
+                            "answers": ["yes"],
+                            "multi_select": false
+                        }]
+                    }
+                }),
+            );
         });
 
         let decision = gate
-            .request_user_input(
+            .request_questionnaire(
                 "req-1",
-                "Continue?",
-                &["yes".to_string(), "no".to_string()],
-                Some("yes"),
-                Some("Pick one"),
+                &AskUserPrompt {
+                    context: Some("Pick one".into()),
+                    questions: vec![astra_tools::AskUserQuestion {
+                        header: "Confirm".into(),
+                        question: "Continue?".into(),
+                        options: vec![
+                            astra_tools::AskUserChoice {
+                                label: "yes".into(),
+                                description: None,
+                                preview: None,
+                            },
+                            astra_tools::AskUserChoice {
+                                label: "no".into(),
+                                description: None,
+                                preview: None,
+                            },
+                        ],
+                        multi_select: false,
+                        allow_freeform: false,
+                    }],
+                },
             )
             .await;
         assert_eq!(
             decision,
-            AskUserDecision::Answer(AskUserResponse {
-                answer: "yes".into(),
-                was_custom: false,
+            AskUserDecision::Submitted(AskUserAnswers {
+                answers: vec![astra_tools::AskUserQuestionAnswer {
+                    question: "Continue?".into(),
+                    answers: vec!["yes".into()],
+                    multi_select: false,
+                    annotation: None,
+                }],
             })
         );
     }
@@ -159,7 +187,19 @@ mod tests {
         };
 
         let decision = gate
-            .request_user_input("req-2", "Continue?", &[], None, None)
+            .request_questionnaire(
+                "req-2",
+                &AskUserPrompt {
+                    context: None,
+                    questions: vec![astra_tools::AskUserQuestion {
+                        header: "Confirm".into(),
+                        question: "Continue?".into(),
+                        options: vec![],
+                        multi_select: false,
+                        allow_freeform: true,
+                    }],
+                },
+            )
             .await;
         assert_eq!(decision, AskUserDecision::Timeout);
     }
@@ -178,11 +218,61 @@ mod tests {
         };
 
         let decision = gate
-            .request_user_input("req-3", "Continue?", &[], None, None)
+            .request_questionnaire(
+                "req-3",
+                &AskUserPrompt {
+                    context: None,
+                    questions: vec![astra_tools::AskUserQuestion {
+                        header: "Confirm".into(),
+                        question: "Continue?".into(),
+                        options: vec![],
+                        multi_select: false,
+                        allow_freeform: true,
+                    }],
+                },
+            )
             .await;
         assert_eq!(
             decision,
             AskUserDecision::Error("WebSocket connection closed".into())
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_via_ledger() {
+        let ledger = Arc::new(TokioMutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let gate = WebSocketUserPromptGate {
+            user_id: "u1".into(),
+            edge_callback_ledger: ledger.clone(),
+            request_tx: tx,
+            timeout: Duration::from_secs(5),
+        };
+
+        let ledger_bg = ledger.clone();
+        tokio::spawn(async move {
+            let req = rx.recv().await.unwrap();
+            let key = user_prompt_callback_key("u1", req["request_id"].as_str().unwrap());
+            let mut g = ledger_bg.lock().await;
+            g.insert(key, json!({"cancelled": true}));
+        });
+
+        let decision = gate
+            .request_questionnaire(
+                "req-4",
+                &AskUserPrompt {
+                    context: None,
+                    questions: vec![astra_tools::AskUserQuestion {
+                        header: "Confirm".into(),
+                        question: "Continue?".into(),
+                        options: vec![],
+                        multi_select: false,
+                        allow_freeform: true,
+                    }],
+                },
+            )
+            .await;
+        assert_eq!(decision, AskUserDecision::Cancelled);
     }
 }

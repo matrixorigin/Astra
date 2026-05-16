@@ -580,6 +580,31 @@ fn display_plan_updates_live(
                             PostSpinner::None,
                         )
                     }
+                    StreamEvent::AskUserPrompted { prompt, .. } => (
+                        format!(
+                            "  {} Asking user ({} questions) …",
+                            "⬢".magenta(),
+                            prompt
+                                .get("prompt")
+                                .and_then(|value| value.get("question_count"))
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0)
+                        ),
+                        PostSpinner::Tool("ask_user".into()),
+                    ),
+                    StreamEvent::AskUserResolved { resolution, .. } => (
+                        format!(
+                            "  {} ask_user {}",
+                            theme::icon_ok(),
+                            resolution
+                                .get("audit")
+                                .and_then(|value| value.get("response"))
+                                .and_then(|value| value.get("outcome"))
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("resolved")
+                        ),
+                        PostSpinner::None,
+                    ),
                     StreamEvent::AgentControlCompleted {
                         label,
                         status,

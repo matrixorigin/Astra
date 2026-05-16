@@ -21,6 +21,7 @@ use super::{
 const MAX_INTROSPECTION_SNAPSHOTS: i32 = 128;
 const MAX_INTROSPECTION_USAGE_ROWS: i32 = 128;
 const MAX_MEMORY_RECALL_RESULTS: i32 = 50;
+const ASK_USER_HISTORY_EVENT_LIMIT: i32 = 50;
 
 #[derive(Clone, Debug)]
 pub struct DatabaseIntrospectionService {
@@ -71,6 +72,134 @@ impl DatabaseIntrospectionService {
         }
         connect_matrixone(&self.matrixone).await
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct AskUserHistoryRow {
+    session_id: String,
+    event_type: String,
+    created_at: String,
+    metadata: Value,
+    content_preview: String,
+}
+
+fn extract_ask_user_audit(metadata: &Value) -> Option<&Value> {
+    metadata.get("ask_user").or_else(|| {
+        metadata
+            .get("prompt")
+            .map(|_| metadata)
+            .filter(|meta| meta.get("response").is_some())
+    })
+}
+
+fn build_ask_user_history_summary(rows: &[AskUserHistoryRow]) -> Value {
+    let has_first_class_events = rows
+        .iter()
+        .any(|row| row.event_type.starts_with("ask_user_"));
+    let mut submitted_count = 0usize;
+    let mut cancelled_count = 0usize;
+    let mut timeout_count = 0usize;
+    let mut error_count = 0usize;
+    let mut prompt_count = 0usize;
+    let mut question_count_sum = 0usize;
+    let mut recent_interactions = Vec::new();
+
+    for row in rows {
+        let Some(audit) = extract_ask_user_audit(&row.metadata) else {
+            continue;
+        };
+        let prompt = audit.get("prompt");
+        let counts_as_prompt = if has_first_class_events {
+            row.event_type == "ask_user_prompted"
+        } else {
+            prompt.is_some()
+        };
+        if counts_as_prompt {
+            let Some(prompt) = prompt else {
+                continue;
+            };
+            prompt_count += 1;
+            question_count_sum += prompt
+                .get("question_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default() as usize;
+        }
+
+        let counts_as_interaction = if has_first_class_events {
+            matches!(
+                row.event_type.as_str(),
+                "ask_user_submitted" | "ask_user_cancelled" | "ask_user_timeout" | "ask_user_error"
+            )
+        } else {
+            matches!(row.event_type.as_str(), "tool_call" | "tool_error")
+        };
+        if !counts_as_interaction {
+            continue;
+        }
+
+        let Some(response) = audit.get("response") else {
+            continue;
+        };
+        let Some(outcome) = response.get("outcome").and_then(Value::as_str) else {
+            continue;
+        };
+        match outcome {
+            "submitted" => submitted_count += 1,
+            "cancelled" => cancelled_count += 1,
+            "timeout" => timeout_count += 1,
+            _ => error_count += 1,
+        }
+        let first_question = prompt
+            .and_then(|prompt| prompt.get("questions"))
+            .and_then(Value::as_array)
+            .and_then(|questions| questions.first())
+            .and_then(|question| question.get("question"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        recent_interactions.push(serde_json::json!({
+            "session_id": row.session_id,
+            "created_at": row.created_at,
+            "event_type": row.event_type,
+            "outcome": outcome,
+            "question_count": prompt
+                .and_then(|prompt| prompt.get("question_count"))
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            "first_question": first_question,
+            "answered_question_count": response
+                .get("answered_question_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            "annotation_count": response
+                .get("annotation_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            "freeform_answer_count": response
+                .get("freeform_answer_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            "content_preview": row.content_preview,
+        }));
+    }
+
+    let interactions_observed = submitted_count + cancelled_count + timeout_count + error_count;
+    let avg_question_count = if prompt_count > 0 {
+        question_count_sum as f64 / prompt_count as f64
+    } else {
+        0.0
+    };
+
+    serde_json::json!({
+        "interactions_observed": interactions_observed,
+        "submitted_count": submitted_count,
+        "cancelled_count": cancelled_count,
+        "timeout_count": timeout_count,
+        "error_count": error_count,
+        "prompt_count": prompt_count,
+        "avg_question_count": avg_question_count,
+        "recent_interactions": recent_interactions,
+    })
 }
 
 #[async_trait]
@@ -864,20 +993,18 @@ impl IntrospectionService for DatabaseIntrospectionService {
     ) -> ServiceResult<Value> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let window_hours = window_hours.clamp(1, 24 * 30); // up to 30 days
+        let is_ask_user = tool == "ask_user";
 
-        // Counts across the user's sessions within the rolling window.
-        // We match on both `skill_name` (the canonical path) and
-        // `meta_tool_name` (free-form) so older rows still show up.
         let agg = query(
             "SELECT \
-               COUNT(*) AS total_calls, \
-               SUM(CASE WHEN event_type IN ('error', 'tool_error') \
-                        OR event_type LIKE '%error%' \
-                        OR event_type LIKE '%fail%' THEN 1 ELSE 0 END) AS fail_count \
-             FROM agent_events \
-             WHERE user_id = ? \
-               AND (skill_name = ? OR meta_tool_name = ?) \
-               AND created_at >= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? HOUR)",
+               SUM(CASE WHEN event_type IN ('tool_call', 'tool_error') THEN 1 ELSE 0 END) AS tool_total_calls, \
+               SUM(CASE WHEN event_type = 'tool_error' THEN 1 ELSE 0 END) AS tool_fail_count, \
+               SUM(CASE WHEN event_type IN ('ask_user_submitted', 'ask_user_cancelled', 'ask_user_timeout', 'ask_user_error') THEN 1 ELSE 0 END) AS ask_user_total_calls, \
+               SUM(CASE WHEN event_type IN ('ask_user_cancelled', 'ask_user_timeout', 'ask_user_error') THEN 1 ELSE 0 END) AS ask_user_fail_count \
+              FROM agent_events \
+              WHERE user_id = ? \
+                AND (skill_name = ? OR meta_tool_name = ?) \
+                AND created_at >= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? HOUR)",
         )
         .bind(user_id)
         .bind(tool)
@@ -887,8 +1014,15 @@ impl IntrospectionService for DatabaseIntrospectionService {
         .await
         .map_err(internal_error)?;
 
-        let total_calls: i64 = agg.try_get("total_calls").unwrap_or(0);
-        let fail_count: i64 = agg.try_get("fail_count").unwrap_or(0);
+        let tool_total_calls: i64 = agg.try_get("tool_total_calls").unwrap_or(0);
+        let tool_fail_count: i64 = agg.try_get("tool_fail_count").unwrap_or(0);
+        let ask_user_total_calls: i64 = agg.try_get("ask_user_total_calls").unwrap_or(0);
+        let ask_user_fail_count: i64 = agg.try_get("ask_user_fail_count").unwrap_or(0);
+        let (total_calls, fail_count) = if is_ask_user && ask_user_total_calls > 0 {
+            (ask_user_total_calls, ask_user_fail_count)
+        } else {
+            (tool_total_calls, tool_fail_count)
+        };
         let ok_count = (total_calls - fail_count).max(0);
         let success_rate = if total_calls > 0 {
             (ok_count as f64) / (total_calls as f64)
@@ -896,25 +1030,45 @@ impl IntrospectionService for DatabaseIntrospectionService {
             0.0
         };
 
-        let failures = query(
-            "SELECT session_id, \
-                    SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 200) AS error_preview, \
-                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM agent_events \
-             WHERE user_id = ? \
-               AND (skill_name = ? OR meta_tool_name = ?) \
-               AND (event_type IN ('error', 'tool_error') \
-                    OR event_type LIKE '%error%' OR event_type LIKE '%fail%') \
-               AND created_at >= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? HOUR) \
-             ORDER BY created_at DESC LIMIT 10",
-        )
-        .bind(user_id)
-        .bind(tool)
-        .bind(tool)
-        .bind(i64::from(window_hours))
-        .fetch_all(&pool)
-        .await
-        .map_err(internal_error)?;
+        let failures = if is_ask_user && ask_user_total_calls > 0 {
+            query(
+                "SELECT session_id, \
+                        SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 200) AS error_preview, \
+                        DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+                 FROM agent_events \
+                 WHERE user_id = ? \
+                   AND (skill_name = ? OR meta_tool_name = ?) \
+                   AND event_type IN ('ask_user_cancelled', 'ask_user_timeout', 'ask_user_error') \
+                   AND created_at >= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? HOUR) \
+                 ORDER BY created_at DESC LIMIT 10",
+            )
+            .bind(user_id)
+            .bind(tool)
+            .bind(tool)
+            .bind(i64::from(window_hours))
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?
+        } else {
+            query(
+                "SELECT session_id, \
+                        SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 200) AS error_preview, \
+                        DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+                 FROM agent_events \
+                 WHERE user_id = ? \
+                   AND (skill_name = ? OR meta_tool_name = ?) \
+                   AND event_type = 'tool_error' \
+                   AND created_at >= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? HOUR) \
+                 ORDER BY created_at DESC LIMIT 10",
+            )
+            .bind(user_id)
+            .bind(tool)
+            .bind(tool)
+            .bind(i64::from(window_hours))
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?
+        };
 
         let recent_failures: Vec<Value> = failures
             .iter()
@@ -927,7 +1081,73 @@ impl IntrospectionService for DatabaseIntrospectionService {
             })
             .collect();
 
-        Ok(serde_json::json!({
+        let ask_user_summary = if is_ask_user {
+            let rows = query(
+                "SELECT session_id, event_type, \
+                        SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 200) AS content_preview, \
+                        IFNULL(CAST(metadata AS CHAR), '{}') AS metadata_json, \
+                        DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+                 FROM agent_events \
+                 WHERE user_id = ? \
+                   AND (skill_name = ? OR meta_tool_name = ?) \
+                   AND event_type IN ('ask_user_prompted', 'ask_user_submitted', 'ask_user_cancelled', 'ask_user_timeout', 'ask_user_error') \
+                   AND created_at >= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? HOUR) \
+                 ORDER BY created_at DESC LIMIT ?",
+            )
+            .bind(user_id)
+            .bind(tool)
+            .bind(tool)
+            .bind(i64::from(window_hours))
+            .bind(i64::from(ASK_USER_HISTORY_EVENT_LIMIT))
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?;
+            let rows = if rows.is_empty() {
+                query(
+                    "SELECT session_id, event_type, \
+                            SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 200) AS content_preview, \
+                            IFNULL(CAST(metadata AS CHAR), '{}') AS metadata_json, \
+                            DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+                     FROM agent_events \
+                     WHERE user_id = ? \
+                       AND (skill_name = ? OR meta_tool_name = ?) \
+                       AND event_type IN ('tool_call', 'tool_error') \
+                       AND created_at >= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? HOUR) \
+                     ORDER BY created_at DESC LIMIT ?",
+                )
+                .bind(user_id)
+                .bind(tool)
+                .bind(tool)
+                .bind(i64::from(window_hours))
+                .bind(i64::from(ASK_USER_HISTORY_EVENT_LIMIT))
+                .fetch_all(&pool)
+                .await
+                .map_err(internal_error)?
+            } else {
+                rows
+            };
+            let history_rows = rows
+                .iter()
+                .map(|row| AskUserHistoryRow {
+                    session_id: row.try_get::<String, _>("session_id").unwrap_or_default(),
+                    event_type: row.try_get::<String, _>("event_type").unwrap_or_default(),
+                    created_at: row.try_get::<String, _>("created_at").unwrap_or_default(),
+                    metadata: serde_json::from_str(
+                        &row.try_get::<String, _>("metadata_json")
+                            .unwrap_or_else(|_| "{}".into()),
+                    )
+                    .unwrap_or(Value::Null),
+                    content_preview: row
+                        .try_get::<String, _>("content_preview")
+                        .unwrap_or_default(),
+                })
+                .collect::<Vec<_>>();
+            Some(build_ask_user_history_summary(&history_rows))
+        } else {
+            None
+        };
+
+        let mut response = serde_json::json!({
             "schema_version": 1,
             "user_id": user_id,
             "tool": tool,
@@ -937,7 +1157,13 @@ impl IntrospectionService for DatabaseIntrospectionService {
             "fail_count": fail_count,
             "success_rate": success_rate,
             "recent_failures": recent_failures,
-        }))
+        });
+        if let Some(ask_user) = ask_user_summary
+            && let Some(obj) = response.as_object_mut()
+        {
+            obj.insert("ask_user".into(), ask_user);
+        }
+        Ok(response)
     }
 
     async fn get_drift_check(&self, user_id: &str, session_id: &str) -> ServiceResult<Value> {
@@ -1286,6 +1512,132 @@ mod tests {
         let result = raw_contents(Some(events), Some(code), None, None, 5000);
         assert!(result.get("events").is_some());
         assert!(result.get("code").is_some());
+    }
+
+    #[test]
+    fn ask_user_history_summary_aggregates_recent_interactions() {
+        let rows = vec![
+            AskUserHistoryRow {
+                session_id: "s1".into(),
+                event_type: "tool_call".into(),
+                created_at: "2026-01-01T00:00:00".into(),
+                metadata: serde_json::json!({
+                    "ask_user": {
+                        "prompt": {
+                            "question_count": 2,
+                            "headers": ["Scope", "Notes"],
+                            "questions": [{"question": "Which scope should we ship first?"}]
+                        },
+                        "response": {
+                            "outcome": "submitted",
+                            "answered_question_count": 2,
+                            "annotation_count": 1,
+                            "freeform_answer_count": 1
+                        }
+                    }
+                }),
+                content_preview: String::new(),
+            },
+            AskUserHistoryRow {
+                session_id: "s2".into(),
+                event_type: "tool_error".into(),
+                created_at: "2026-01-02T00:00:00".into(),
+                metadata: serde_json::json!({
+                    "ask_user": {
+                        "prompt": {
+                            "question_count": 1,
+                            "headers": ["Scope"],
+                            "questions": [{"question": "Which scope should we ship first?"}]
+                        },
+                        "response": {
+                            "outcome": "cancelled",
+                            "answered_question_count": 0,
+                            "annotation_count": 0,
+                            "freeform_answer_count": 0
+                        }
+                    }
+                }),
+                content_preview: "ask_user failed".into(),
+            },
+        ];
+
+        let summary = build_ask_user_history_summary(&rows);
+        assert_eq!(summary["interactions_observed"], 2);
+        assert_eq!(summary["submitted_count"], 1);
+        assert_eq!(summary["cancelled_count"], 1);
+        assert_eq!(summary["avg_question_count"], 1.5);
+        assert_eq!(summary["recent_interactions"][0]["outcome"], "submitted");
+    }
+
+    #[test]
+    fn ask_user_history_summary_prefers_first_class_events_without_double_counting() {
+        let rows = vec![
+            AskUserHistoryRow {
+                session_id: "s1".into(),
+                event_type: "ask_user_prompted".into(),
+                created_at: "2026-01-01T00:00:00".into(),
+                metadata: serde_json::json!({
+                    "request_id": "req-1",
+                    "ask_user": {
+                        "prompt": {
+                            "question_count": 2,
+                            "headers": ["Scope", "Notes"],
+                            "questions": [{"question": "Which scope should we ship first?"}]
+                        }
+                    }
+                }),
+                content_preview: String::new(),
+            },
+            AskUserHistoryRow {
+                session_id: "s1".into(),
+                event_type: "ask_user_submitted".into(),
+                created_at: "2026-01-01T00:00:01".into(),
+                metadata: serde_json::json!({
+                    "request_id": "req-1",
+                    "ask_user": {
+                        "prompt": {
+                            "question_count": 2,
+                            "headers": ["Scope", "Notes"],
+                            "questions": [{"question": "Which scope should we ship first?"}]
+                        },
+                        "response": {
+                            "outcome": "submitted",
+                            "answered_question_count": 2,
+                            "annotation_count": 1,
+                            "freeform_answer_count": 0
+                        }
+                    }
+                }),
+                content_preview: String::new(),
+            },
+            AskUserHistoryRow {
+                session_id: "s1".into(),
+                event_type: "tool_call".into(),
+                created_at: "2026-01-01T00:00:02".into(),
+                metadata: serde_json::json!({
+                    "ask_user": {
+                        "prompt": {
+                            "question_count": 2,
+                            "headers": ["Scope", "Notes"],
+                            "questions": [{"question": "Which scope should we ship first?"}]
+                        },
+                        "response": {
+                            "outcome": "submitted",
+                            "answered_question_count": 2,
+                            "annotation_count": 1,
+                            "freeform_answer_count": 0
+                        }
+                    }
+                }),
+                content_preview: "legacy duplicate".into(),
+            },
+        ];
+
+        let summary = build_ask_user_history_summary(&rows);
+        assert_eq!(summary["prompt_count"], 1);
+        assert_eq!(summary["avg_question_count"], 2.0);
+        assert_eq!(summary["interactions_observed"], 1);
+        assert_eq!(summary["recent_interactions"].as_array().unwrap().len(), 1);
     }
 
     // ── UnconfiguredIntrospectionService ─────────────────────────────────

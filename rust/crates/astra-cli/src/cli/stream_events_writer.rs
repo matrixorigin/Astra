@@ -79,6 +79,23 @@ fn event_to_json(event: &StreamEvent) -> String {
                 "parent_tool_use_id": parent_tool_use_id,
             })
         }
+        StreamEvent::AskUserPrompted { request_id, prompt } => {
+            serde_json::json!({
+                "type": "ask_user_prompted",
+                "request_id": request_id,
+                "prompt": prompt,
+            })
+        }
+        StreamEvent::AskUserResolved {
+            request_id,
+            resolution,
+        } => {
+            serde_json::json!({
+                "type": "ask_user_resolved",
+                "request_id": request_id,
+                "resolution": resolution,
+            })
+        }
         StreamEvent::AgentControlCompleted {
             action,
             label,
@@ -198,6 +215,36 @@ mod tests {
     }
 
     #[test]
+    fn ask_user_prompted_event_serializes() {
+        let json = event_to_json(&StreamEvent::AskUserPrompted {
+            request_id: "ask_1".into(),
+            prompt: serde_json::json!({
+                "prompt": {"question_count": 2, "headers": ["Scope", "Notes"]},
+                "source": "tui"
+            }),
+        });
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "ask_user_prompted");
+        assert_eq!(v["request_id"], "ask_1");
+        assert_eq!(v["prompt"]["prompt"]["question_count"], 2);
+        assert_eq!(v["prompt"]["source"], "tui");
+    }
+
+    #[test]
+    fn ask_user_resolved_event_serializes() {
+        let json = event_to_json(&StreamEvent::AskUserResolved {
+            request_id: "ask_1".into(),
+            resolution: serde_json::json!({
+                "response": {"outcome": "submitted", "answered_question_count": 2}
+            }),
+        });
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "ask_user_resolved");
+        assert_eq!(v["request_id"], "ask_1");
+        assert_eq!(v["resolution"]["response"]["outcome"], "submitted");
+    }
+
+    #[test]
     fn all_event_types_produce_valid_json() {
         let events = vec![
             StreamEvent::Token("x".into()),
@@ -218,6 +265,14 @@ mod tests {
                 output: None,
                 tool_use_id: "tu_test".into(),
                 parent_tool_use_id: None,
+            },
+            StreamEvent::AskUserPrompted {
+                request_id: "ask_evt".into(),
+                prompt: serde_json::json!({"prompt": {"question_count": 1}}),
+            },
+            StreamEvent::AskUserResolved {
+                request_id: "ask_evt".into(),
+                resolution: serde_json::json!({"response": {"outcome": "submitted"}}),
             },
             StreamEvent::WaitingForModel,
             StreamEvent::ModelResponding,

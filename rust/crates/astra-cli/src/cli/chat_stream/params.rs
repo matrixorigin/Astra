@@ -93,6 +93,18 @@ pub enum StreamEvent {
         tool_use_id: String,
         parent_tool_use_id: Option<String>,
     },
+    /// Dedicated ask_user lifecycle event emitted when the native
+    /// questionnaire UI is presented to the user.
+    AskUserPrompted {
+        request_id: String,
+        prompt: serde_json::Value,
+    },
+    /// Dedicated ask_user lifecycle event emitted when the native
+    /// questionnaire UI resolves.
+    AskUserResolved {
+        request_id: String,
+        resolution: serde_json::Value,
+    },
     AgentControlCompleted {
         action: String,
         label: String,
@@ -219,6 +231,27 @@ impl ApprovalRequest {
 
 pub type ApprovalRequestTx = mpsc::UnboundedSender<ApprovalRequest>;
 
+pub(crate) type AskUserAnnotation = astra_tools::AskUserAnnotation;
+pub(crate) type AskUserAnswers = astra_tools::AskUserAnswers;
+pub(crate) type AskUserChoice = astra_tools::AskUserChoice;
+pub(crate) type AskUserPrompt = astra_tools::AskUserPrompt;
+pub(crate) type AskUserQuestion = astra_tools::AskUserQuestion;
+pub(crate) type AskUserQuestionAnswer = astra_tools::AskUserQuestionAnswer;
+
+/// User response from the native ask_user overlay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AskUserResponse {
+    Submitted(AskUserAnswers),
+    Cancelled,
+}
+
+pub struct AskUserRequest {
+    pub prompt: AskUserPrompt,
+    pub response_tx: tokio::sync::oneshot::Sender<AskUserResponse>,
+}
+
+pub type AskUserRequestTx = mpsc::UnboundedSender<AskUserRequest>;
+
 /// Parameters for a single agentic chat turn — groups the many arguments
 /// to `stream_chat_sse` into a named struct to reduce cognitive load.
 pub(crate) struct ChatTurnParams<'a> {
@@ -286,6 +319,8 @@ pub(crate) struct ChatTurnParams<'a> {
     /// When a bypass-immune permission check triggers, the approval request is sent
     /// through this channel instead of blocking on stdin.
     pub(crate) approval_request_tx: Option<ApprovalRequestTx>,
+    /// Optional channel for native TUI ask_user prompts.
+    pub(crate) ask_user_request_tx: Option<AskUserRequestTx>,
     /// MCP client manager for external tool servers.
     pub(crate) mcp_manager:
         Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
@@ -468,6 +503,7 @@ impl<'a> ChatTurnParams<'a> {
             stream_event_tx: ctx.stream_event_tx.clone(),
             agent_live_event_sink: None,
             approval_request_tx: None,
+            ask_user_request_tx: None,
             mcp_manager: None,
             skill_search: ctx.skill_search,
             skill_quality_tracker,

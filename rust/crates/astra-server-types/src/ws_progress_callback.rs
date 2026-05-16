@@ -24,6 +24,14 @@ pub enum ProgressEvent {
     Delta { call_id: String, content: String },
     #[serde(rename = "completed")]
     Completed { call_id: String, success: bool },
+    #[serde(rename = "user_prompt_resolved")]
+    UserPromptResolved {
+        request_id: String,
+        outcome: String,
+        answers: Vec<String>,
+        was_custom: Option<bool>,
+        error: Option<String>,
+    },
 }
 
 /// [`ToolProgressCallback`] implementation backed by an `mpsc` channel.
@@ -62,6 +70,23 @@ impl ToolProgressCallback for WebSocketProgressCallback {
         let _ = self.tx.send(ProgressEvent::Completed {
             call_id: call_id.to_string(),
             success,
+        });
+    }
+
+    async fn ask_user_resolved(
+        &self,
+        request_id: &str,
+        outcome: &str,
+        answers: &[String],
+        was_custom: Option<bool>,
+        error: Option<&str>,
+    ) {
+        let _ = self.tx.send(ProgressEvent::UserPromptResolved {
+            request_id: request_id.to_string(),
+            outcome: outcome.to_string(),
+            answers: answers.to_vec(),
+            was_custom,
+            error: error.map(ToString::to_string),
         });
     }
 }
@@ -125,6 +150,39 @@ mod tests {
                 assert!(success);
             }
             _ => panic!("expected Completed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_user_resolved_event_sent() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cb = WebSocketProgressCallback::new(tx);
+
+        cb.ask_user_resolved(
+            "ask-1",
+            "submitted",
+            &["Cards".into(), "Reports".into()],
+            Some(true),
+            None,
+        )
+        .await;
+
+        let evt = rx.recv().await.unwrap();
+        match evt {
+            ProgressEvent::UserPromptResolved {
+                request_id,
+                outcome,
+                answers,
+                was_custom,
+                error,
+            } => {
+                assert_eq!(request_id, "ask-1");
+                assert_eq!(outcome, "submitted");
+                assert_eq!(answers, vec!["Cards".to_string(), "Reports".to_string()]);
+                assert_eq!(was_custom, Some(true));
+                assert!(error.is_none());
+            }
+            _ => panic!("expected UserPromptResolved"),
         }
     }
 

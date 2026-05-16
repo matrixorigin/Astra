@@ -372,6 +372,12 @@ fn build_bridge_tool_call_records(
             Some(&(r, _)) => (Some(r), None, None),
             None => (None, None, None),
         };
+        let ask_user = astra_tools::summarize_ask_user_tool_call(
+            arguments.as_deref(),
+            output.as_deref(),
+            ok,
+            error.as_deref(),
+        );
         records.push(ToolCallRecord {
             name: tool_name,
             ok,
@@ -391,6 +397,7 @@ fn build_bridge_tool_call_records(
             original_tool_name: None,
             args_full: arguments.clone(),
             result_full: output.clone(),
+            ask_user,
             round,
             batch_id,
             parallel,
@@ -407,6 +414,12 @@ fn build_bridge_tool_call_records(
             Some(&(r, _)) => (Some(r), None, None),
             None => (None, None, None),
         };
+        let ask_user = astra_tools::summarize_ask_user_tool_call(
+            arguments.as_deref(),
+            None,
+            false,
+            Some("missing tool result"),
+        );
         records.push(ToolCallRecord {
             name: tool_name,
             ok: false,
@@ -423,6 +436,7 @@ fn build_bridge_tool_call_records(
             original_tool_name: None,
             args_full: arguments,
             result_full: None,
+            ask_user,
             round,
             batch_id,
             parallel,

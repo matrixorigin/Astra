@@ -44,6 +44,7 @@ use super::run_handlers::transform_stream_run_events_for_client_with_pending;
 use super::*;
 use astra_core::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED};
 use astra_server_types::merge_plan_subtask_context;
+use astra_tools::{AskUserAnswers, AskUserPrompt};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use serde_json::Value;
@@ -134,9 +135,10 @@ pub(super) enum WsClientMessage {
     #[serde(rename = "user_prompt")]
     UserPrompt {
         request_id: String,
-        answer: String,
         #[serde(default)]
-        was_custom: bool,
+        answers: Option<AskUserAnswers>,
+        #[serde(default)]
+        cancelled: bool,
     },
 
     /// Client heartbeat.
@@ -208,12 +210,19 @@ pub(super) enum WsServerMessage {
     #[serde(rename = "user_prompt_request")]
     UserPromptRequest {
         request_id: String,
-        question: String,
-        choices: Vec<String>,
+        prompt: AskUserPrompt,
+    },
+
+    /// ask_user prompt resolved and the turn can continue.
+    #[serde(rename = "user_prompt_resolved")]
+    UserPromptResolved {
+        request_id: String,
+        outcome: String,
+        answers: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        default: Option<String>,
+        was_custom: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        context: Option<String>,
+        error: Option<String>,
     },
 
     /// Tool execution started on server.
@@ -554,15 +563,15 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                             }
                             Ok(WsClientMessage::UserPrompt {
                                 request_id,
-                                answer,
-                                was_custom,
+                                answers,
+                                cancelled,
                             }) => {
                                 handle_user_prompt_response(
                                     state,
                                     &conn,
                                     &request_id,
-                                    answer,
-                                    was_custom,
+                                    answers,
+                                    cancelled,
                                 )
                                 .await;
                             }
@@ -882,16 +891,17 @@ async fn handle_user_prompt_response(
     state: &AppState,
     conn: &WsConnection,
     request_id: &str,
-    answer: String,
-    was_custom: bool,
+    answers: Option<AskUserAnswers>,
+    cancelled: bool,
 ) {
     use astra_turn_core::edge_ledger::user_prompt_callback_key;
 
     let key = user_prompt_callback_key(&conn.user.user_id, request_id);
-    let value = serde_json::json!({
-        "answer": answer,
-        "was_custom": was_custom,
-    });
+    let value = if cancelled {
+        serde_json::json!({ "cancelled": true })
+    } else {
+        serde_json::json!({ "answers": answers })
+    };
     let ledger = state.edge_callback_ledger.clone();
     let mut guard = ledger.lock().await;
     ws_ledger_dedup_insert(&mut guard, key, value);
@@ -1250,15 +1260,15 @@ async fn stream_run_over_websocket(
                             }
                             Ok(WsClientMessage::UserPrompt {
                                 request_id,
-                                answer,
-                                was_custom,
+                                answers,
+                                cancelled,
                             }) => {
                                 handle_user_prompt_response(
                                     state,
                                     conn,
                                     &request_id,
-                                    answer,
-                                    was_custom,
+                                    answers,
+                                    cancelled,
                                 )
                                 .await;
                             }
@@ -1348,6 +1358,16 @@ async fn stream_run_over_websocket(
                     .drain_user_prompt_requests(run_id)
                     .await
                 {
+                    let Ok(prompt) = serde_json::from_value::<AskUserPrompt>(
+                        req.get("prompt").cloned().unwrap_or(Value::Null),
+                    ) else {
+                        tracing::warn!(
+                            target: "astra_runtime::ws_handler",
+                            run_id = %run_id,
+                            "skipping invalid ask_user websocket prompt payload"
+                        );
+                        continue;
+                    };
                     send_msg(
                         socket,
                         &WsServerMessage::UserPromptRequest {
@@ -1356,29 +1376,7 @@ async fn stream_run_over_websocket(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or_default()
                                 .to_string(),
-                            question: req
-                                .get("question")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            choices: req
-                                .get("choices")
-                                .and_then(|v| v.as_array())
-                                .map(|items| {
-                                    items
-                                        .iter()
-                                        .filter_map(|item| item.as_str().map(ToString::to_string))
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default(),
-                            default: req
-                                .get("default")
-                                .and_then(|v| v.as_str())
-                                .map(ToString::to_string),
-                            context: req
-                                .get("context")
-                                .and_then(|v| v.as_str())
-                                .map(ToString::to_string),
+                            prompt,
                         },
                     )
                     .await;
@@ -1434,6 +1432,34 @@ async fn stream_run_over_websocket(
                                     success: evt.get("success")
                                         .and_then(|v| v.as_bool())
                                         .unwrap_or(false),
+                                },
+                            )
+                            .await;
+                        }
+                        Some("user_prompt_resolved") => {
+                            send_msg(
+                                socket,
+                                &WsServerMessage::UserPromptResolved {
+                                    request_id: evt.get("request_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    outcome: evt.get("outcome")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    answers: evt.get("answers")
+                                        .and_then(|v| v.as_array())
+                                        .map(|items| {
+                                            items.iter()
+                                                .filter_map(|item| item.as_str().map(ToString::to_string))
+                                                .collect::<Vec<_>>()
+                                        })
+                                        .unwrap_or_default(),
+                                    was_custom: evt.get("was_custom").and_then(|v| v.as_bool()),
+                                    error: evt.get("error")
+                                        .and_then(|v| v.as_str())
+                                        .map(ToString::to_string),
                                 },
                             )
                             .await;
@@ -3896,18 +3922,20 @@ mod tests {
 
     #[test]
     fn parse_user_prompt_response() {
-        let json =
-            r#"{"type":"user_prompt","request_id":"req-3","answer":"custom","was_custom":true}"#;
+        let json = r#"{"type":"user_prompt","request_id":"req-3","answers":{"answers":[{"question":"Continue?","answers":["custom"],"multi_select":false}]}}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
             WsClientMessage::UserPrompt {
                 request_id,
-                answer,
-                was_custom,
+                answers,
+                cancelled,
             } => {
                 assert_eq!(request_id, "req-3");
-                assert_eq!(answer, "custom");
-                assert!(was_custom);
+                assert!(!cancelled);
+                assert_eq!(
+                    answers.unwrap().answers[0].answers,
+                    vec!["custom".to_string()]
+                );
             }
             _ => panic!("expected UserPrompt"),
         }
@@ -4077,16 +4105,33 @@ mod tests {
     fn serialize_user_prompt_request() {
         let msg = WsServerMessage::UserPromptRequest {
             request_id: "req-2".into(),
-            question: "Continue?".into(),
-            choices: vec!["yes".into(), "no".into()],
-            default: Some("yes".into()),
-            context: Some("Need confirmation".into()),
+            prompt: AskUserPrompt {
+                context: Some("Need confirmation".into()),
+                questions: vec![astra_tools::AskUserQuestion {
+                    header: "Confirm".into(),
+                    question: "Continue?".into(),
+                    options: vec![
+                        astra_tools::AskUserChoice {
+                            label: "yes".into(),
+                            description: None,
+                            preview: None,
+                        },
+                        astra_tools::AskUserChoice {
+                            label: "no".into(),
+                            description: None,
+                            preview: None,
+                        },
+                    ],
+                    multi_select: false,
+                    allow_freeform: false,
+                }],
+            },
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"user_prompt_request""#));
         assert!(json.contains(r#""question":"Continue?""#));
-        assert!(json.contains(r#""choices":["yes","no"]"#));
-        assert!(json.contains(r#""default":"yes""#));
+        assert!(json.contains(r#""header":"Confirm""#));
+        assert!(json.contains(r#""context":"Need confirmation""#));
     }
 
     #[test]
@@ -4123,10 +4168,27 @@ mod tests {
             },
             WsServerMessage::UserPromptRequest {
                 request_id: "req-2".into(),
-                question: "Continue?".into(),
-                choices: vec!["yes".into(), "no".into()],
-                default: Some("yes".into()),
-                context: None,
+                prompt: AskUserPrompt {
+                    context: None,
+                    questions: vec![astra_tools::AskUserQuestion {
+                        header: "Confirm".into(),
+                        question: "Continue?".into(),
+                        options: vec![
+                            astra_tools::AskUserChoice {
+                                label: "yes".into(),
+                                description: None,
+                                preview: None,
+                            },
+                            astra_tools::AskUserChoice {
+                                label: "no".into(),
+                                description: None,
+                                preview: None,
+                            },
+                        ],
+                        multi_select: false,
+                        allow_freeform: false,
+                    }],
+                },
             },
             WsServerMessage::Error {
                 message: "err".into(),
@@ -4156,7 +4218,7 @@ mod tests {
             r#"{"type":"message","content":"hello"}"#,
             r#"{"type":"cancel_run","run_id":"r1"}"#,
             r#"{"type":"tool_approval","request_id":"req-1","approved":true}"#,
-            r#"{"type":"user_prompt","request_id":"req-2","answer":"yes","was_custom":false}"#,
+            r#"{"type":"user_prompt","request_id":"req-2","answers":{"answers":[{"question":"Continue?","answers":["yes"],"multi_select":false}]}}"#,
             r#"{"type":"ping"}"#,
         ];
         for json in &inputs {
@@ -4185,11 +4247,8 @@ mod tests {
     }
 
     #[test]
-    fn user_prompt_requires_request_id_and_answer() {
-        let json = r#"{"type":"user_prompt","answer":"yes"}"#;
-        assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
-
-        let json = r#"{"type":"user_prompt","request_id":"req-1"}"#;
+    fn user_prompt_requires_request_id() {
+        let json = r#"{"type":"user_prompt","answers":{"answers":[]}}"#;
         assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
     }
 

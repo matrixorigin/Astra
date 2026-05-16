@@ -140,6 +140,13 @@ pub fn build_recovery_message(
 ) -> String {
     let alternatives = suggest_alternatives(tool_name, deprioritized);
     let error_lower = error_str.to_lowercase();
+    let ask_user_shape_error = tool_name == "ask_user"
+        && (matches!(
+            category,
+            ErrorCategory::ToolInvalidArgs | ErrorCategory::InvalidRequest
+        ) || error_lower.contains("ask_user input is invalid")
+            || error_lower.contains("top-level 'questions'")
+            || error_lower.contains("'questions' must be an array"));
     let write_file_missing_args = tool_name == "write_file"
         && category == ErrorCategory::ToolInvalidArgs
         && (error_lower.contains("missing 'path' parameter")
@@ -166,7 +173,9 @@ pub fn build_recovery_message(
             tool_name
         ),
         ErrorCategory::ToolInvalidArgs | ErrorCategory::InvalidRequest => {
-            if write_file_missing_args {
+            if ask_user_shape_error {
+                "⚠ ask_user failed: invalid questionnaire arguments. You chose ask_user because user clarification is required. Retry the SAME ask_user tool immediately with corrected questionnaire args. Do NOT continue implementation, guess defaults, or act as if the user already answered. Use a top-level `questions` array, for example: {\"questions\":[{\"header\":\"Scope\",\"question\":\"Which scope should we ship first?\",\"options\":[\"Core flow\",\"Full workflow\"],\"allow_freeform\":true}]}.".to_string()
+            } else if write_file_missing_args {
                 "⚠ write_file failed: invalid arguments. Retry the same tool with both `path` and `content` for writes, or `path` + `delete=true` for deletes. Do NOT switch to bash or python just to write or delete this file.".to_string()
             } else {
                 format!(
@@ -196,17 +205,21 @@ pub fn build_recovery_message(
             tool_name
         ),
         _ => {
-            astra_core::agent_debug!(
-                "error_recovery",
-                "unclassified_error tool={} error={}",
-                tool_name,
-                error_str.chars().take(200).collect::<String>()
-            );
-            format!(
-                "⚠ {} failed with an unexpected error. Check the tool output and adjust; \
-                 enable RUST_LOG=debug for a structured log line.",
-                tool_name
-            )
+            if ask_user_shape_error {
+                "⚠ ask_user failed: invalid questionnaire arguments. You chose ask_user because user clarification is required. Retry the SAME ask_user tool immediately with corrected questionnaire args. Do NOT continue implementation, guess defaults, or act as if the user already answered. Use a top-level `questions` array, for example: {\"questions\":[{\"header\":\"Scope\",\"question\":\"Which scope should we ship first?\",\"options\":[\"Core flow\",\"Full workflow\"],\"allow_freeform\":true}]}.".to_string()
+            } else {
+                astra_core::agent_debug!(
+                    "error_recovery",
+                    "unclassified_error tool={} error={}",
+                    tool_name,
+                    error_str.chars().take(200).collect::<String>()
+                );
+                format!(
+                    "⚠ {} failed with an unexpected error. Check the tool output and adjust; \
+                     enable RUST_LOG=debug for a structured log line.",
+                    tool_name
+                )
+            }
         }
     };
 
@@ -721,6 +734,17 @@ mod tests {
             msg.contains("str_replace") || msg.contains("multi_edit"),
             "editing alternatives must not be suppressed for missing-args errors: {msg}"
         );
+    }
+
+    #[test]
+    fn recovery_message_ask_user_invalid_args_forces_retry() {
+        let err =
+            "Error: ask_user input is invalid. ask_user requires top-level 'questions': [...].";
+        let cat = classify_error(err);
+        let msg = build_recovery_message("ask_user", err, cat, &[]);
+        assert!(msg.contains("Retry the SAME ask_user tool immediately"));
+        assert!(msg.contains("Do NOT continue implementation"));
+        assert!(msg.contains("\"questions\""));
     }
 
     // ── Escalation ──

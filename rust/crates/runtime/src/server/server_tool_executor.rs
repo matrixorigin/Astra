@@ -31,7 +31,11 @@ use astra_tools::executor::DefaultToolExecutor;
 use astra_tools::task_mgmt::{
     InMemoryTaskStore, SessionTask, TaskManager, TaskManagerSnapshot, TaskStore,
 };
-use astra_tools::{AskUserDecision, AskUserGate, ToolExecutor};
+use astra_tools::{
+    AskUserAnswers, AskUserDecision, AskUserGate, AskUserPrompt, AskUserQuestionAnswer,
+    ToolExecutor, build_ask_user_prompt_telemetry, build_ask_user_tool_call_audit,
+    normalize_ask_user_answers, parse_ask_user_prompt,
+};
 use async_trait::async_trait;
 
 use crate::tool_sandbox::{
@@ -204,14 +208,6 @@ struct DatabaseSnapshotRollbackEntry {
 struct DatabaseSnapshotRollbackJournal {
     entries: Vec<DatabaseSnapshotRollbackEntry>,
     next_sequence: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AskUserRequest {
-    question: String,
-    choices: Vec<String>,
-    default: Option<String>,
-    context: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -868,6 +864,8 @@ pub struct ServerToolExecutor {
     ask_user_gate: Option<Arc<dyn AskUserGate>>,
     /// Optional progress callback for streaming tool output.
     progress_callback: Option<Arc<dyn astra_tools::ToolProgressCallback>>,
+    /// Optional auxiliary event writer for ask_user-specific audit events.
+    auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
     /// Optional resource governor for usage tracking (Phase 5).
     resource_governor:
         Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
@@ -989,6 +987,7 @@ impl ServerToolExecutor {
             approval_gate: None,
             ask_user_gate: None,
             progress_callback: None,
+            auxiliary_event_writer: None,
             resource_governor: None,
             edge_connection_pool: None,
             observability_session: None,
@@ -1058,6 +1057,11 @@ impl ServerToolExecutor {
     /// Set the progress callback for streaming tool output.
     pub fn set_progress_callback(&mut self, cb: Arc<dyn astra_tools::ToolProgressCallback>) {
         self.progress_callback = Some(cb);
+    }
+
+    /// Set the auxiliary event writer for ask_user lifecycle audit events.
+    pub fn set_auxiliary_event_writer(&mut self, writer: Arc<dyn crate::TurnAuxiliaryEventWriter>) {
+        self.auxiliary_event_writer = Some(writer);
     }
 
     pub fn with_cancel_token(
@@ -2088,8 +2092,8 @@ impl ServerToolExecutor {
     }
 
     async fn server_ask_user(&self, args: &Value) -> astra_tools::ToolResult {
-        let request = match parse_ask_user_request(args) {
-            Ok(request) => request,
+        let prompt = match parse_ask_user_prompt(args) {
+            Ok(prompt) => prompt,
             Err(error) => return astra_tools::ToolResult::error(error),
         };
 
@@ -2100,32 +2104,164 @@ impl ServerToolExecutor {
         };
 
         let request_id = format!("ask-{}-{}", self.session_id, uuid_v4_short());
-        match gate
-            .request_user_input(
-                &request_id,
-                &request.question,
-                &request.choices,
-                request.default.as_deref(),
-                request.context.as_deref(),
-            )
-            .await
-        {
-            AskUserDecision::Answer(response) => {
-                let mut body = json!({
-                    "answer": response.answer,
-                    "question": request.question,
-                });
-                if !request.choices.is_empty() {
-                    body["was_custom"] = Value::Bool(response.was_custom);
+        let content = ask_user_content_preview(&prompt);
+        self.persist_ask_user_auxiliary_event(
+            "ask_user_prompted",
+            content.clone(),
+            request_id.clone(),
+            serde_json::json!({
+                "tool_name": "ask_user",
+                "request_id": request_id.clone(),
+                "ask_user": {
+                    "prompt": build_ask_user_prompt_telemetry(&prompt),
+                },
+            }),
+        )
+        .await;
+
+        match gate.request_questionnaire(&request_id, &prompt).await {
+            AskUserDecision::Submitted(submitted) => {
+                let answers = match normalize_ask_user_answers(&prompt, &submitted) {
+                    Ok(answers) => answers,
+                    Err(error) => {
+                        if let Some(cb) = &self.progress_callback {
+                            cb.ask_user_resolved(&request_id, "error", &[], None, Some(&error))
+                                .await;
+                        }
+                        self.persist_ask_user_auxiliary_event(
+                            "ask_user_error",
+                            content,
+                            request_id.clone(),
+                            serde_json::json!({
+                                "tool_name": "ask_user",
+                                "request_id": request_id.clone(),
+                                "ask_user": build_ask_user_tool_call_audit(&prompt, "error", None, Some(&error)),
+                            }),
+                        )
+                        .await;
+                        return astra_tools::ToolResult::error(error);
+                    }
+                };
+                let flattened_answers = flatten_ask_user_answers(&answers);
+                let was_custom = Some(ask_user_answers_use_freeform(&prompt, &answers));
+                if let Some(cb) = &self.progress_callback {
+                    cb.ask_user_resolved(
+                        &request_id,
+                        "submitted",
+                        &flattened_answers,
+                        was_custom,
+                        None,
+                    )
+                    .await;
                 }
-                astra_tools::ToolResult::text(body.to_string())
+                self.persist_ask_user_auxiliary_event(
+                    "ask_user_submitted",
+                    content,
+                    request_id.clone(),
+                    serde_json::json!({
+                        "tool_name": "ask_user",
+                        "request_id": request_id.clone(),
+                        "ask_user": build_ask_user_tool_call_audit(
+                            &prompt,
+                            "submitted",
+                            Some(&answers),
+                            None,
+                        ),
+                    }),
+                )
+                .await;
+                astra_tools::ToolResult::text(answers.to_tool_result_value().to_string())
             }
-            AskUserDecision::Timeout => astra_tools::ToolResult::error(
-                "Error: ask_user timed out waiting for user response".into(),
-            ),
+            AskUserDecision::Cancelled => {
+                let error = "Error: ask_user was cancelled by the user";
+                if let Some(cb) = &self.progress_callback {
+                    cb.ask_user_resolved(&request_id, "cancelled", &[], None, Some(error))
+                        .await;
+                }
+                self.persist_ask_user_auxiliary_event(
+                    "ask_user_cancelled",
+                    content,
+                    request_id.clone(),
+                    serde_json::json!({
+                        "tool_name": "ask_user",
+                        "request_id": request_id.clone(),
+                        "ask_user": build_ask_user_tool_call_audit(&prompt, "cancelled", None, Some(error)),
+                    }),
+                )
+                .await;
+                astra_tools::ToolResult::error(error.into())
+            }
+            AskUserDecision::Timeout => {
+                let error = "Error: ask_user timed out waiting for user response";
+                if let Some(cb) = &self.progress_callback {
+                    cb.ask_user_resolved(&request_id, "timeout", &[], None, Some(error))
+                        .await;
+                }
+                self.persist_ask_user_auxiliary_event(
+                    "ask_user_timeout",
+                    content,
+                    request_id.clone(),
+                    serde_json::json!({
+                        "tool_name": "ask_user",
+                        "request_id": request_id.clone(),
+                        "ask_user": build_ask_user_tool_call_audit(&prompt, "timeout", None, Some(error)),
+                    }),
+                )
+                .await;
+                astra_tools::ToolResult::error(error.into())
+            }
             AskUserDecision::Error(message) => {
-                astra_tools::ToolResult::error(format!("Error: ask_user failed: {message}"))
+                let error = format!("Error: ask_user failed: {message}");
+                if let Some(cb) = &self.progress_callback {
+                    cb.ask_user_resolved(&request_id, "error", &[], None, Some(&error))
+                        .await;
+                }
+                self.persist_ask_user_auxiliary_event(
+                    "ask_user_error",
+                    content,
+                    request_id.clone(),
+                    serde_json::json!({
+                        "tool_name": "ask_user",
+                        "request_id": request_id.clone(),
+                        "ask_user": build_ask_user_tool_call_audit(&prompt, "error", None, Some(&error)),
+                    }),
+                )
+                .await;
+                astra_tools::ToolResult::error(format!("ask_user failed: {message}"))
             }
+        }
+    }
+
+    async fn persist_ask_user_auxiliary_event(
+        &self,
+        event_type: &str,
+        content: String,
+        request_id: String,
+        metadata: Value,
+    ) {
+        let Some(writer) = &self.auxiliary_event_writer else {
+            return;
+        };
+        let record = crate::TurnAuxiliaryEventRecord {
+            event_id: Uuid::now_v7().to_string(),
+            user_id: self.user_id.clone(),
+            session_id: self.session_id.clone(),
+            agent_id: None,
+            event_type: event_type.to_string(),
+            content,
+            parent_event_id: None,
+            parent_event_ids: Vec::new(),
+            causal_chain_id: request_id,
+            metadata: Some(metadata),
+            reasoning_content: None,
+        };
+        if let Err(error) = writer.persist_events(vec![record]).await {
+            tracing::warn!(
+                session_id = %self.session_id,
+                event_type,
+                error = %error,
+                "failed to persist ask_user auxiliary event"
+            );
         }
     }
 
@@ -4521,39 +4657,40 @@ fn edit_type_label(edit_type: EditType) -> &'static str {
     }
 }
 
-fn parse_ask_user_request(args: &Value) -> Result<AskUserRequest, String> {
-    let question = match args.get("question").and_then(Value::as_str) {
-        Some(question) if !question.trim().is_empty() => question.to_string(),
-        _ => return Err("Error: 'question' is required".into()),
-    };
+fn ask_user_content_preview(prompt: &AskUserPrompt) -> String {
+    prompt
+        .questions
+        .first()
+        .map(|question| question.question.clone())
+        .unwrap_or_else(|| "ask_user".to_string())
+}
 
-    let choices: Vec<String> = args
-        .get("choices")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+fn flatten_ask_user_answers(answers: &AskUserAnswers) -> Vec<String> {
+    answers
+        .answers
+        .iter()
+        .flat_map(|answer| answer.answers.iter().cloned())
+        .collect()
+}
 
-    if !choices.is_empty() && !(2..=9).contains(&choices.len()) {
-        return Err("Error: choices must contain 2-9 options".into());
-    }
-
-    Ok(AskUserRequest {
-        question,
-        choices,
-        default: args
-            .get("default")
-            .and_then(Value::as_str)
-            .map(ToString::to_string),
-        context: args
-            .get("context")
-            .and_then(Value::as_str)
-            .map(ToString::to_string),
+fn ask_user_answers_use_freeform(prompt: &AskUserPrompt, answers: &AskUserAnswers) -> bool {
+    answers.answers.iter().any(|answer| {
+        prompt
+            .questions
+            .iter()
+            .find(|question| question.question == answer.question)
+            .map(|question| {
+                let option_labels = question
+                    .options
+                    .iter()
+                    .map(|option| option.label.as_str())
+                    .collect::<std::collections::HashSet<_>>();
+                answer
+                    .answers
+                    .iter()
+                    .any(|item| !option_labels.contains(item.as_str()))
+            })
+            .unwrap_or(false)
     })
 }
 
@@ -4611,7 +4748,7 @@ mod tests {
 
     use super::*;
     use astra_plan::PlanRepository;
-    use astra_tools::{AskUserDecision, AskUserGate, AskUserResponse};
+    use astra_tools::{AskUserAnnotation, AskUserDecision, AskUserGate};
     use async_trait::async_trait;
     use serde_json::json;
     use tempfile::TempDir;
@@ -4817,31 +4954,75 @@ esac
 
     #[derive(Clone)]
     struct StaticAskUserGate {
-        expected_question: &'static str,
-        expected_choices: Vec<&'static str>,
+        expected_prompt: Value,
         decision: AskUserDecision,
     }
 
     #[async_trait]
     impl AskUserGate for StaticAskUserGate {
-        async fn request_user_input(
+        async fn request_questionnaire(
             &self,
             _request_id: &str,
-            question: &str,
-            choices: &[String],
-            _default: Option<&str>,
-            _context: Option<&str>,
+            prompt: &AskUserPrompt,
         ) -> AskUserDecision {
-            assert_eq!(question, self.expected_question);
-            assert_eq!(
-                choices,
-                &self
-                    .expected_choices
-                    .iter()
-                    .map(|choice| choice.to_string())
-                    .collect::<Vec<_>>()
-            );
+            assert_eq!(serde_json::to_value(prompt).unwrap(), self.expected_prompt);
             self.decision.clone()
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AskUserResolvedProgress {
+        request_id: String,
+        outcome: String,
+        answers: Vec<String>,
+        was_custom: Option<bool>,
+        error: Option<String>,
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingProgressCallback {
+        ask_user: std::sync::Mutex<Vec<AskUserResolvedProgress>>,
+    }
+
+    #[async_trait]
+    impl astra_tools::ToolProgressCallback for RecordingProgressCallback {
+        async fn tool_started(&self, _call_id: &str, _tool_name: &str, _args: &Value) {}
+
+        async fn tool_output_delta(&self, _call_id: &str, _delta: &str) {}
+
+        async fn tool_completed(&self, _call_id: &str, _result: &str, _success: bool) {}
+
+        async fn ask_user_resolved(
+            &self,
+            request_id: &str,
+            outcome: &str,
+            answers: &[String],
+            was_custom: Option<bool>,
+            error: Option<&str>,
+        ) {
+            self.ask_user.lock().unwrap().push(AskUserResolvedProgress {
+                request_id: request_id.to_string(),
+                outcome: outcome.to_string(),
+                answers: answers.to_vec(),
+                was_custom,
+                error: error.map(ToString::to_string),
+            });
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingAuxiliaryWriter {
+        events: std::sync::Mutex<Vec<crate::TurnAuxiliaryEventRecord>>,
+    }
+
+    #[async_trait]
+    impl crate::TurnAuxiliaryEventWriter for RecordingAuxiliaryWriter {
+        async fn persist_events(
+            &self,
+            events: Vec<crate::TurnAuxiliaryEventRecord>,
+        ) -> Result<(), String> {
+            self.events.lock().unwrap().extend(events);
+            Ok(())
         }
     }
 
@@ -4901,22 +5082,78 @@ esac
     async fn ask_user_returns_structured_response_from_gate() {
         let (mut exec, _dir) = test_executor();
         exec.set_ask_user_gate(Arc::new(StaticAskUserGate {
-            expected_question: "Which option?",
-            expected_choices: vec!["first", "second"],
-            decision: AskUserDecision::Answer(AskUserResponse {
-                answer: "custom".into(),
-                was_custom: true,
+            expected_prompt: json!({
+                "context": "Need both product choices",
+                "questions": [
+                    {
+                        "header": "Choice",
+                        "question": "Which option?",
+                        "options": [
+                            {"label": "first", "description": null, "preview": "preview-first"},
+                            {"label": "second", "description": null, "preview": "preview-second"}
+                        ],
+                        "multi_select": false,
+                        "allow_freeform": false
+                    },
+                    {
+                        "header": "Features",
+                        "question": "Which features?",
+                        "options": [
+                            {"label": "Alpha", "description": null, "preview": null},
+                            {"label": "Beta", "description": null, "preview": null}
+                        ],
+                        "multi_select": true,
+                        "allow_freeform": true
+                    }
+                ]
+            }),
+            decision: AskUserDecision::Submitted(AskUserAnswers {
+                answers: vec![
+                    AskUserQuestionAnswer {
+                        question: "Which features?".into(),
+                        answers: vec!["Beta".into(), "Custom".into()],
+                        multi_select: false,
+                        annotation: Some(AskUserAnnotation {
+                            notes: Some("ship both".into()),
+                            preview: Some("ignored".into()),
+                        }),
+                    },
+                    AskUserQuestionAnswer {
+                        question: "Which option?".into(),
+                        answers: vec!["first".into()],
+                        multi_select: true,
+                        annotation: Some(AskUserAnnotation {
+                            notes: Some("preview matters".into()),
+                            preview: Some("ignored".into()),
+                        }),
+                    },
+                ],
             }),
         }));
 
         let result = exec
             .execute_with_metadata(
-                "session",
+                "ask_user",
                 &json!({
-                    "action": "ask_user",
-                    "question": "Which option?",
-                    "choices": ["first", "second"],
-                    "default": "first"
+                    "context": "Need both product choices",
+                    "questions": [
+                        {
+                            "header": "Choice",
+                            "question": "Which option?",
+                            "options": [
+                                {"label": "first", "preview": "preview-first"},
+                                {"label": "second", "preview": "preview-second"}
+                            ],
+                            "allow_freeform": false
+                        },
+                        {
+                            "header": "Features",
+                            "question": "Which features?",
+                            "options": ["Alpha", "Beta"],
+                            "multi_select": true,
+                            "allow_freeform": true
+                        }
+                    ]
                 }),
             )
             .await;
@@ -4925,9 +5162,14 @@ esac
         assert_eq!(
             serde_json::from_str::<Value>(&result.output).unwrap(),
             json!({
-                "answer": "custom",
-                "question": "Which option?",
-                "was_custom": true
+                "answers": {
+                    "Which option?": "first",
+                    "Which features?": ["Beta", "Custom"]
+                },
+                "annotations": {
+                    "Which option?": {"notes": "preview matters", "preview": "preview-first"},
+                    "Which features?": {"notes": "ship both"}
+                }
             })
         );
     }
@@ -4937,8 +5179,14 @@ esac
         let (exec, _dir) = test_executor();
         let result = exec
             .execute_with_metadata(
-                "session",
-                &json!({"action": "ask_user", "question": "Continue?"}),
+                "ask_user",
+                &json!({
+                    "questions": [{
+                        "header": "Confirm",
+                        "question": "Continue?",
+                        "options": ["Yes", "No"]
+                    }]
+                }),
             )
             .await;
 
@@ -4951,13 +5199,85 @@ esac
         let (exec, _dir) = test_executor();
         let result = exec
             .execute_with_metadata(
-                "session",
-                &json!({"action": "ask_user", "question": "Pick one", "choices": ["only-one"]}),
+                "ask_user",
+                &json!({
+                    "questions": [{
+                        "header": "Pick",
+                        "question": "Pick one",
+                        "options": ["only-one"],
+                        "allow_freeform": false
+                    }]
+                }),
             )
             .await;
 
         assert!(result.is_error);
-        assert!(result.output.contains("choices must contain 2-9 options"));
+        assert!(result.output.contains("needs 2-9 options"));
+    }
+
+    #[tokio::test]
+    async fn ask_user_emits_progress_and_auxiliary_events() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_ask_user_gate(Arc::new(StaticAskUserGate {
+            expected_prompt: json!({
+                "context": null,
+                "questions": [{
+                    "header": "Choice",
+                    "question": "Which option?",
+                    "options": [
+                        {"label": "first", "description": null, "preview": null},
+                        {"label": "second", "description": null, "preview": null}
+                    ],
+                    "multi_select": false,
+                    "allow_freeform": true
+                }]
+            }),
+            decision: AskUserDecision::Submitted(AskUserAnswers {
+                answers: vec![AskUserQuestionAnswer {
+                    question: "Which option?".into(),
+                    answers: vec!["custom".into()],
+                    multi_select: false,
+                    annotation: None,
+                }],
+            }),
+        }));
+        let progress = Arc::new(RecordingProgressCallback::default());
+        exec.set_progress_callback(progress.clone());
+        let auxiliary = Arc::new(RecordingAuxiliaryWriter::default());
+        exec.set_auxiliary_event_writer(auxiliary.clone());
+
+        let result = exec
+            .execute_with_metadata(
+                "ask_user",
+                &json!({
+                    "questions": [{
+                        "header": "Choice",
+                        "question": "Which option?",
+                        "options": ["first", "second"]
+                    }]
+                }),
+            )
+            .await;
+
+        assert!(!result.is_error);
+        let progress_events = progress.ask_user.lock().unwrap();
+        assert_eq!(progress_events.len(), 1);
+        assert_eq!(progress_events[0].outcome, "submitted");
+        assert_eq!(progress_events[0].answers, vec!["custom".to_string()]);
+        assert_eq!(progress_events[0].was_custom, Some(true));
+
+        let aux_events = auxiliary.events.lock().unwrap();
+        assert_eq!(aux_events.len(), 2);
+        assert_eq!(aux_events[0].event_type, "ask_user_prompted");
+        assert_eq!(aux_events[1].event_type, "ask_user_submitted");
+        assert_eq!(
+            aux_events[1].metadata.as_ref().unwrap()["ask_user"]["response"]["outcome"],
+            "submitted"
+        );
+        assert_eq!(
+            aux_events[0].metadata.as_ref().unwrap()["ask_user"]["prompt"]["question_count"],
+            1
+        );
     }
 
     #[tokio::test]

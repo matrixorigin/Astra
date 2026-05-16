@@ -1825,6 +1825,8 @@ pub struct AgenticRunLifecycleService {
     observer_worker: Option<Arc<dyn TurnObserverWorker>>,
     /// Tool event writer for persisting tool_call events to agent_events.
     tool_event_writer: Option<Arc<dyn TurnToolEventWriter>>,
+    /// Auxiliary event writer for ask_user lifecycle audit events.
+    auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
     /// Counter of in-flight background agentic loop tasks.
     /// Incremented before spawn, decremented when the task exits.
     /// Used by `drain_background_tasks` for graceful shutdown.
@@ -1862,6 +1864,7 @@ impl AgenticRunLifecycleService {
             hook_db_writer: None,
             observer_worker: None,
             tool_event_writer: None,
+            auxiliary_event_writer: None,
             background_task_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(feature = "harness")]
             harness_registry: None,
@@ -1937,6 +1940,14 @@ impl AgenticRunLifecycleService {
 
     pub fn with_tool_event_writer(mut self, writer: Arc<dyn TurnToolEventWriter>) -> Self {
         self.tool_event_writer = Some(writer);
+        self
+    }
+
+    pub fn with_auxiliary_event_writer(
+        mut self,
+        writer: Arc<dyn crate::TurnAuxiliaryEventWriter>,
+    ) -> Self {
+        self.auxiliary_event_writer = Some(writer);
         self
     }
 
@@ -3150,6 +3161,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             {
                 executor.set_observability_session(observability_session);
             }
+            if let Some(writer) = self.auxiliary_event_writer.clone() {
+                executor.set_auxiliary_event_writer(writer);
+            }
 
             // ── Phase E: Wire WebSocket approval gate ───────────────
             let (approval_tx, approval_rx) = mpsc::unbounded_channel();
@@ -3592,6 +3606,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
             if let Some(observability_session) = state.telemetry.observability_session.clone() {
                 executor.set_observability_session(observability_session);
+            }
+            if let Some(writer) = self.auxiliary_event_writer.clone() {
+                executor.set_auxiliary_event_writer(writer);
             }
             state.server_tool_executor = Some(std::sync::Arc::new(executor));
         }

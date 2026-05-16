@@ -312,6 +312,7 @@ pub(super) async fn handle_task_command(
                     stream_event_tx: None,
                     agent_live_event_sink: None,
                     approval_request_tx: None,
+                    ask_user_request_tx: None,
                     mcp_manager: None,
                     skill_search: &bg_skill_search,
                     skill_quality_tracker: &mut skill_qt,

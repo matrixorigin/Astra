@@ -1,3 +1,4 @@
+pub(crate) mod ask_user_view;
 pub(crate) mod busy_view;
 pub(crate) mod chat_composer;
 pub(crate) mod config_edit_view;
@@ -22,6 +23,8 @@ pub(crate) mod worktrees_view;
 
 #[cfg(test)]
 mod approval_integration_tests;
+#[cfg(test)]
+mod ask_user_integration_tests;
 #[cfg(test)]
 mod config_edit_tests;
 #[cfg(test)]
@@ -48,6 +51,7 @@ use super::mention_menu::{
 use super::slash_menu::{SlashItem, SlashMenu, is_open_for, popup as slash_popup_render};
 use super::task_status::TaskStatus;
 use crate::chat_stream::ApprovalResponse;
+use ask_user_view::AskUserView;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -184,6 +188,15 @@ impl BottomPane {
 
     pub fn push_view(&mut self, view: Box<dyn BottomPaneView>) {
         self.view_stack.push(view);
+    }
+
+    pub fn enqueue_ask_user(
+        &mut self,
+        prompt: crate::chat_stream::AskUserPrompt,
+        response_tx: oneshot::Sender<crate::chat_stream::AskUserResponse>,
+    ) {
+        self.view_stack
+            .push(Box::new(AskUserView::new(prompt, response_tx)));
     }
 
     pub fn refresh_task_detail(

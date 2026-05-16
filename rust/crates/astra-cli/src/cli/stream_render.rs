@@ -573,6 +573,8 @@ pub(super) struct EdgeSseContext<'a> {
     pub stream_event_sink: Option<super::chat_stream::SharedStreamEventSink>,
     /// Optional channel for async tool approval requests during plan execution.
     pub approval_request_tx: Option<super::chat_stream::ApprovalRequestTx>,
+    /// Optional channel for native TUI ask_user prompts.
+    pub ask_user_request_tx: Option<super::chat_stream::AskUserRequestTx>,
     /// Skill resolver for intercepting "skill" tool calls in the SSE stream.
     pub skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     /// When true, this is a continuation turn after a skill has already produced output.
@@ -630,6 +632,8 @@ struct CliSseStreamHost<'a> {
     stream_event_sink: Option<super::chat_stream::SharedStreamEventSink>,
     /// Optional channel for async tool approval requests during plan execution.
     approval_request_tx: Option<super::chat_stream::ApprovalRequestTx>,
+    /// Optional channel for native TUI ask_user prompts.
+    ask_user_request_tx: Option<super::chat_stream::AskUserRequestTx>,
     /// Skill resolver for intercepting "skill" tool calls.
     skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     /// Skills already invoked during this SSE stream (for edge-path dedup).
@@ -882,6 +886,7 @@ impl<'a> CliSseStreamHost<'a> {
             stream_event_tx: ctx.stream_event_tx,
             stream_event_sink: ctx.stream_event_sink,
             approval_request_tx: ctx.approval_request_tx,
+            ask_user_request_tx: ctx.ask_user_request_tx,
             skill_resolver: ctx.skill_resolver,
             skills_invoked: std::collections::HashSet::new(),
             cloud_pre_approved: std::collections::HashSet::new(),
@@ -2206,6 +2211,81 @@ impl CliSseStreamHost<'_> {
             ApprovalResponse::Deny => ApprovalDecision::Deny,
         }
     }
+
+    async fn ask_user_via_tui(&mut self, args: &serde_json::Value) -> String {
+        use super::chat_stream::{AskUserRequest, AskUserResponse};
+
+        let prompt = match crate::edge_tools::parse_ask_user_prompt(args) {
+            Ok(prompt) => prompt,
+            Err(error) => return error,
+        };
+        let Some(tx) = &self.ask_user_request_tx else {
+            return "Error: ask_user requires an interactive TUI prompt sink".to_string();
+        };
+
+        let request_id = format!("ask_{}", uuid::Uuid::now_v7().simple());
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        if tx
+            .send(AskUserRequest {
+                prompt: prompt.clone(),
+                response_tx,
+            })
+            .is_err()
+        {
+            return "Error: ask_user prompt sink is closed".to_string();
+        }
+        self.emit_stream_event(super::chat_stream::StreamEvent::AskUserPrompted {
+            request_id: request_id.clone(),
+            prompt: serde_json::json!({
+                "source": "tui",
+                "prompt": astra_tools::build_ask_user_prompt_telemetry(&prompt),
+            }),
+        });
+
+        let response = if let Some(token) = self.cancel_token {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => AskUserResponse::Cancelled,
+                r = response_rx => r.unwrap_or(AskUserResponse::Cancelled),
+            }
+        } else {
+            response_rx.await.unwrap_or(AskUserResponse::Cancelled)
+        };
+
+        match response {
+            AskUserResponse::Submitted(answers) => {
+                self.emit_stream_event(super::chat_stream::StreamEvent::AskUserResolved {
+                    request_id,
+                    resolution: serde_json::json!({
+                        "source": "tui",
+                        "audit": astra_tools::build_ask_user_tool_call_audit(
+                            &prompt,
+                            "submitted",
+                            Some(&answers),
+                            None,
+                        ),
+                    }),
+                });
+                answers.to_tool_result_value().to_string()
+            }
+            AskUserResponse::Cancelled => {
+                let error = "Error: ask_user was cancelled by the user";
+                self.emit_stream_event(super::chat_stream::StreamEvent::AskUserResolved {
+                    request_id,
+                    resolution: serde_json::json!({
+                        "source": "tui",
+                        "audit": astra_tools::build_ask_user_tool_call_audit(
+                            &prompt,
+                            "cancelled",
+                            None,
+                            Some(error),
+                        ),
+                    }),
+                });
+                error.to_string()
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -2873,6 +2953,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                  run and aggregate, and the summarized results will be injected \
                  before the parent agent finishes."
                     .to_string()
+            } else if tool == astra_turn_core::interaction_types::ASK_USER_TOOL_NAME {
+                self.ask_user_via_tui(args).await
             } else {
                 let mut outcome = execute_with_metadata_responsive(
                     std::sync::Arc::clone(&self.executor),
@@ -6967,6 +7049,7 @@ mod tests {
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: Some(approval_tx),
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
@@ -7022,6 +7105,7 @@ mod tests {
                     stream_event_tx: None,
                     stream_event_sink: None,
                     approval_request_tx: Some(approval_tx),
+                    ask_user_request_tx: None,
                     skill_resolver: None,
                     skill_continuation: false,
                     turn_rollback_on_failure: false,
@@ -7083,6 +7167,7 @@ mod tests {
                     stream_event_tx: None,
                     stream_event_sink: None,
                     approval_request_tx: Some(approval_tx),
+                    ask_user_request_tx: None,
                     skill_resolver: None,
                     skill_continuation: false,
                     turn_rollback_on_failure: false,
@@ -7217,6 +7302,7 @@ mod tests {
             stream_event_tx: None,
             stream_event_sink: None,
             approval_request_tx: None,
+            ask_user_request_tx: None,
             skill_resolver: None,
             skill_continuation: false,
             turn_rollback_on_failure: false,
@@ -8470,6 +8556,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
@@ -8563,6 +8650,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
@@ -8654,6 +8742,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
@@ -8747,6 +8836,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
@@ -8833,6 +8923,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
@@ -8917,6 +9008,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
@@ -9012,6 +9104,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
@@ -9092,6 +9185,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
@@ -9191,6 +9285,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
@@ -9280,6 +9375,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
@@ -9377,6 +9473,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
@@ -9440,6 +9537,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
@@ -9499,6 +9597,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
@@ -9559,6 +9658,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
@@ -9650,6 +9750,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
@@ -9705,6 +9806,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
@@ -9763,6 +9865,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
@@ -9860,6 +9963,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
@@ -9937,6 +10041,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
@@ -10031,6 +10136,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
@@ -10119,6 +10225,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 stream_event_tx: None,
                 stream_event_sink: None,
                 approval_request_tx: None,
+                ask_user_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
                 turn_rollback_on_failure: false,

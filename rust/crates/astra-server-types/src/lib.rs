@@ -28,6 +28,8 @@ use astra_services::{
     SessionRecord,
 };
 #[cfg(feature = "server")]
+use astra_tools::AskUserPrompt;
+#[cfg(feature = "server")]
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "server")]
@@ -635,6 +637,25 @@ pub enum WsServerMessage {
         request_id: String,
         tool: String,
         args: serde_json::Value,
+    },
+
+    /// ask_user requires a frontend response before the turn can continue.
+    #[serde(rename = "user_prompt_request")]
+    UserPromptRequest {
+        request_id: String,
+        prompt: AskUserPrompt,
+    },
+
+    /// ask_user prompt resolved and the turn can continue.
+    #[serde(rename = "user_prompt_resolved")]
+    UserPromptResolved {
+        request_id: String,
+        outcome: String,
+        answers: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        was_custom: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 
     /// Tool execution started on server.

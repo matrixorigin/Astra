@@ -640,11 +640,11 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session lifecycle and introspection. Actions: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, timeline, summary, history_page, history_search, history_around. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools — they're not session sub-actions any more. Use the history_* actions when the user refers to older turns in this same chat and the visible context is insufficient.",
+                "description": "Session lifecycle and introspection. Actions: config, prioritize, deprioritize, set_goal, compact, rollback_edits, sleep, timeline, summary, history_page, history_search, history_around. Use the first-class `ask_user` tool for user questions. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools — they're not session sub-actions any more. Use the history_* actions when the user refers to older turns in this same chat and the visible context is insufficient.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","rollback_edits","ask_user","sleep","timeline","summary","history_page","history_search","history_around"]},
+                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","rollback_edits","sleep","timeline","summary","history_page","history_search","history_around"]},
                         "key": {"type": "string", "description": "Config key"},
                         "value": {"type": "string", "description": "Config value"},
                         "tool": {"type": "string", "description": "Tool name (prioritize/deprioritize)"},
@@ -652,10 +652,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "scope": {"type": "string", "enum": ["current_turn","turn","file","list"], "description": "Rollback scope"},
                         "path": {"type": "string", "description": "File path (rollback scope=file)"},
                         "turn_index": {"type": "integer", "description": "Turn index (rollback scope=turn)"},
-                        "question": {"type": "string", "description": "Question (ask_user)"},
-                        "choices": {"type": "array", "items": {"type": "string"}, "description": "Choices 2-9 (ask_user)"},
-                        "default": {"type": "string", "description": "Default answer (ask_user)"},
-                        "context": {"type": "string", "description": "Brief context (ask_user)"},
                         "duration_ms": {"type": "integer", "description": "Sleep ms, max 300000"},
                         "reason": {"type": "string", "description": "Reason (sleep)"},
                         "pattern": {"type": "string", "description": "history_search search text: compact topic, phrase, filename, error text, decision, or Chinese/English keyword."},
@@ -673,7 +669,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "config": ["path", "value"],
                         "prioritize": ["tool"],
                         "deprioritize": ["tool"],
-                        "ask_user": ["question"],
                         "history_search": ["pattern"]
                     }
                 }
@@ -815,16 +810,35 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "ask_user",
-                "description": "Ask the user a question when you need clarification or a decision. Supports multiple-choice (2-9 options, single-key select) and free-form text input. Use sparingly — only when the next step is genuinely ambiguous.",
+                "description": "Ask the user a structured questionnaire when you need clarification or a decision. In TUI Prompt mode this opens a native tabbed overlay and pauses until the user answers. ALWAYS send a top-level `questions` array; do not send legacy top-level fields like `question` or `choices`. If an ask_user call fails because the payload shape is wrong, fix the questionnaire and retry ask_user immediately — do not continue implementation without the clarification. Prefer 1-6 focused questions in `questions[]`. Each question should have a short header for the tab chip, a clear question, and usually 2-9 options. For a pure freeform question, you may omit options and leave allow_freeform=true. Set multi_select=true when choices are not mutually exclusive. Single-select questions may optionally attach preview text to options; the UI will show a side-by-side preview panel for the focused option. Do not include an Other option because the UI adds freeform input automatically when allow_freeform is true. Put the recommended option first and include '(Recommended)' in its label when applicable. Example: {\"questions\":[{\"header\":\"Scope\",\"question\":\"Which scope should we ship first?\",\"options\":[\"Core flow\",\"Full workflow\"],\"allow_freeform\":true}]}. Use sparingly — only when the next step is genuinely ambiguous.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "question": {"type": "string", "description": "The question to ask"},
-                        "choices": {"type": "array", "items": {"type": "string"}, "description": "2-9 options for multiple choice. Omit for free-form input."},
-                        "default": {"type": "string", "description": "Default answer (used if user presses Enter without typing)"},
-                        "context": {"type": "string", "description": "Brief context shown above the question (dimmed)"}
+                        "context": {"type": "string", "description": "Brief context shown above the questionnaire (dimmed)"},
+                        "questions": {
+                            "type": "array",
+                            "description": "1-6 questions to present in the ask_user questionnaire.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "header": {"type": "string", "description": "Very short tab label, e.g. 'Frontend' or 'Database'. If omitted, the UI derives one from the question."},
+                                    "question": {"type": "string", "description": "The focused question to ask for this tab."},
+                                    "options": {"type": "array", "items": {"anyOf": [
+                                        {"type": "string"},
+                                        {"type": "object", "properties": {
+                                            "label": {"type": "string", "description": "Option label shown in the picker"},
+                                            "description": {"type": "string", "description": "Short explanatory text shown next to the option"},
+                                            "preview": {"type": "string", "description": "Optional preview text shown in a side-by-side preview panel for single-select questions."}
+                                        }, "required": ["label"]}
+                                    ]}, "description": "Usually 2-9 options for this question. Do not include Other; use allow_freeform. May be omitted for a pure freeform question."},
+                                    "multi_select": {"type": "boolean", "description": "Whether the user may select multiple options for this question."},
+                                    "allow_freeform": {"type": "boolean", "description": "Whether the UI should add an automatic Other/freeform path for this question. Defaults to true."}
+                                },
+                                "required": ["question"]
+                            }
+                        }
                     },
-                    "required": ["question"]
+                    "required": ["questions"]
                 }
             }
         }),
