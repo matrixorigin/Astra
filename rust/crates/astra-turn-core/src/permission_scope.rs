@@ -77,6 +77,9 @@ pub enum ScopeUnavailableReason {
     /// Dynamic-eval shell ($(…) / backticks) — same reason as
     /// CompoundCommand: rule shape is undefined.
     DynamicEvalCommand,
+    /// The tool request lacks a stable match target, so persisting
+    /// an Always rule would become broader than the user approved.
+    UnsafeRuleShape,
 }
 
 /// Inputs to the scope-availability decision. Aggregated as a
@@ -89,6 +92,7 @@ pub struct ScopeAvailabilityContext {
     pub source_agent_present: bool,
     pub mcp_unknown_capability: bool,
     pub workspace_untrusted: bool,
+    pub unsafe_rule_shape: bool,
 }
 
 /// Decision for one scope: available or not, and why.
@@ -144,6 +148,9 @@ fn unavailable_reason_for(
     }
     if ctx.has_dynamic_eval && scope.outlives_turn() {
         return Some(ScopeUnavailableReason::DynamicEvalCommand);
+    }
+    if ctx.unsafe_rule_shape && scope.outlives_turn() {
+        return Some(ScopeUnavailableReason::UnsafeRuleShape);
     }
 
     // Sub-agent requests can never extend project / user rules
@@ -257,6 +264,21 @@ mod tests {
         assert!(matches!(
             availability(&scopes, AllowScope::Project).reason,
             Some(ScopeUnavailableReason::DynamicEvalCommand)
+        ));
+    }
+
+    #[test]
+    fn unsafe_rule_shape_blocks_anything_beyond_turn() {
+        let mut c = ctx();
+        c.unsafe_rule_shape = true;
+        let scopes = permitted_scopes(&c);
+        assert!(availability(&scopes, AllowScope::OnceThisCall).available);
+        assert!(availability(&scopes, AllowScope::RestOfTurn).available);
+        assert!(!availability(&scopes, AllowScope::RestOfSession).available);
+        assert!(!availability(&scopes, AllowScope::Project).available);
+        assert!(matches!(
+            availability(&scopes, AllowScope::Project).reason,
+            Some(ScopeUnavailableReason::UnsafeRuleShape)
         ));
     }
 

@@ -114,6 +114,20 @@ fn derive_turn_interaction_mode(
         // which in turn disabled the nudge-suppression gate the user
         // opted into.
         PermissionMode::Auto => TurnInteractionMode::Auto,
+        PermissionMode::Plan => {
+            if has_approval_request_tx || render_is_silent || !stdin_is_terminal {
+                TurnInteractionMode::NonInteractive
+            } else {
+                TurnInteractionMode::Deny
+            }
+        }
+        PermissionMode::AcceptEdits => {
+            if has_approval_request_tx || render_is_silent || !stdin_is_terminal {
+                TurnInteractionMode::NonInteractive
+            } else {
+                TurnInteractionMode::Prompt
+            }
+        }
         // Prompt requires user interaction; if we can't actually prompt
         // (no tty, alternate approval channel, silenced UI), fall back
         // to NonInteractive so callers don't block on a human.
@@ -684,6 +698,10 @@ mod tests {
             TurnInteractionMode::Prompt
         );
         assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::AcceptEdits, false, false, false, true),
+            TurnInteractionMode::Prompt
+        );
+        assert_eq!(
             derive_turn_interaction_mode(PermissionMode::Auto, false, false, false, true),
             TurnInteractionMode::Auto
         );
@@ -783,6 +801,22 @@ mod tests {
         // denial, same as NonInteractive's restrictive default).
         assert_eq!(
             derive_turn_interaction_mode(PermissionMode::Deny, false, false, false, false),
+            TurnInteractionMode::NonInteractive
+        );
+    }
+
+    #[test]
+    fn derive_turn_interaction_mode_uses_deny_for_interactive_plan() {
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Plan, false, false, false, true),
+            TurnInteractionMode::Deny
+        );
+    }
+
+    #[test]
+    fn derive_turn_interaction_mode_uses_noninteractive_for_structural_plan() {
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Plan, false, false, true, true),
             TurnInteractionMode::NonInteractive
         );
     }

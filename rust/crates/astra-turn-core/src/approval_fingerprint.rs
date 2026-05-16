@@ -218,9 +218,9 @@ impl ApprovalFingerprint {
         // If self has no command prefix, it matches any command for this tool.
         if let Some(ref my_prefix) = self.command_prefix {
             let Some(their_command) = other
-                .command_exact
+                .command_prefix
                 .as_deref()
-                .or(other.command_prefix.as_deref())
+                .or(other.command_exact.as_deref())
             else {
                 return false;
             };
@@ -327,13 +327,15 @@ fn command_prefix_matches(prefix: &str, command: &str) -> bool {
 #[must_use]
 pub fn normalize_path_pattern(path: &str) -> String {
     let path = path.trim();
+    let is_absolute = path.starts_with('/');
     // Keep the directory and immediate parent for grouping.
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     if parts.len() <= 2 {
         path.to_string()
     } else {
         // Keep first two path segments + wildcard.
-        format!("{}/{}/**", parts[0], parts[1])
+        let prefix = if is_absolute { "/" } else { "" };
+        format!("{prefix}{}/{}/**", parts[0], parts[1])
     }
 }
 
@@ -675,9 +677,29 @@ mod tests {
     }
 
     #[test]
+    fn shell_prefix_rule_matches_cd_wrapped_command_family() {
+        let stored = ApprovalFingerprint::shell_prefix("bash", "cargo test", false);
+        let candidate =
+            ApprovalFingerprint::shell("bash", "cd rust && cargo test -p astra-cli", false);
+        assert!(
+            stored.matches(&candidate),
+            "stored command-family approval should match cd-wrapped cargo test"
+        );
+    }
+
+    #[test]
     fn file_op_normalizes_deep_paths() {
         let fp = ApprovalFingerprint::file_op("write_file", Some("src/turn/interruption.rs"));
         assert_eq!(fp.path_pattern.as_deref(), Some("src/turn/**"));
+    }
+
+    #[test]
+    fn file_op_preserves_absolute_root_when_normalizing() {
+        let fp = ApprovalFingerprint::file_op(
+            "write_file",
+            Some("/home/xupeng/github/astra/src/turn/interruption.rs"),
+        );
+        assert_eq!(fp.path_pattern.as_deref(), Some("/home/xupeng/**"));
     }
 
     #[test]

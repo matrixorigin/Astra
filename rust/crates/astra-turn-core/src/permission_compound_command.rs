@@ -235,6 +235,19 @@ pub fn tokenize_compound_command(input: &str) -> CompoundCommand {
     }
 }
 
+/// Returns true when the shell input is just a workspace-local `cd … &&`
+/// wrapper around one real command. We treat this as a single-command
+/// approval shape so persistent command-family rules can still work.
+#[must_use]
+pub fn is_cd_wrapper_single_command(compound: &CompoundCommand) -> bool {
+    if compound.steps.len() != 2 {
+        return false;
+    }
+
+    compound.steps[0].trailing_separator == Some(CompoundSeparator::AndThen)
+        && compound.steps[0].command.trim_start().starts_with("cd ")
+}
+
 fn detect_dynamic_eval(input: &str) -> bool {
     // Outside-of-quotes detection of $(…) and `…`. We accept some
     // false-positives — single quote tracking in shell is itself
@@ -357,6 +370,19 @@ mod tests {
     fn escaped_separator_is_not_split() {
         let c = tokenize_compound_command(r#"echo a\&\&b && pwd"#);
         assert_eq!(cmds(&c), vec![r#"echo a\&\&b"#, "pwd"]);
+    }
+
+    #[test]
+    fn cd_wrapper_single_command_is_recognized() {
+        let c = tokenize_compound_command(r#"cd rust && grep -n "a\|b" file.rs"#);
+        assert_eq!(cmds(&c), vec!["cd rust", r#"grep -n "a\|b" file.rs"#]);
+        assert!(is_cd_wrapper_single_command(&c));
+    }
+
+    #[test]
+    fn real_compound_command_is_not_cd_wrapper() {
+        let c = tokenize_compound_command("cd rust && cargo test && cargo fmt");
+        assert!(!is_cd_wrapper_single_command(&c));
     }
 
     // ── Subshell / brace / paren grouping is preserved ─────────

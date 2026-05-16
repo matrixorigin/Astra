@@ -261,6 +261,8 @@ fn render_permissions_args(args: &PermissionsArgs) -> String {
         None => String::new(),
         Some(PermissionsSubcommand::Status) => "status".to_string(),
         Some(PermissionsSubcommand::Auto) => "auto".to_string(),
+        Some(PermissionsSubcommand::AcceptEdits) => "accept_edits".to_string(),
+        Some(PermissionsSubcommand::Plan) => "plan".to_string(),
         Some(PermissionsSubcommand::Prompt) => "prompt".to_string(),
         Some(PermissionsSubcommand::Deny) => "deny".to_string(),
         Some(PermissionsSubcommand::All) => "all".to_string(),
@@ -1680,7 +1682,9 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
     match arg {
         "" => {
             let next = match state.perm_manager.mode() {
-                PermissionMode::Prompt => PermissionMode::Auto,
+                PermissionMode::Prompt => PermissionMode::Plan,
+                PermissionMode::Plan => PermissionMode::AcceptEdits,
+                PermissionMode::AcceptEdits => PermissionMode::Auto,
                 PermissionMode::Auto => PermissionMode::Deny,
                 PermissionMode::Deny => PermissionMode::Prompt,
             };
@@ -1697,6 +1701,22 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
                 "  {} Permission mode → {} (all tools auto-approved)",
                 "⚡".yellow(),
                 "auto".magenta()
+            );
+        }
+        "plan" => {
+            state.perm_manager.set_mode(PermissionMode::Plan);
+            eprintln!(
+                "  {} Permission mode → {} (read-only investigation mode)",
+                theme::icon_info(),
+                "plan".magenta()
+            );
+        }
+        "accept_edits" | "accept-edits" => {
+            state.perm_manager.set_mode(PermissionMode::AcceptEdits);
+            eprintln!(
+                "  {} Permission mode → {} (workspace-local edits auto-approved)",
+                theme::icon_info(),
+                "accept_edits".magenta()
             );
         }
         "rules" | "status" => {
@@ -1753,7 +1773,7 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
             }
             Err(_) => {
                 eprintln!(
-                    "  {} Unknown mode '{}'. Use: auto, prompt, deny, all, rules, trust, untrust, trace",
+                    "  {} Unknown mode '{}'. Use: auto, plan, accept_edits, prompt, deny, all, rules, trust, untrust, trace",
                     theme::icon_warn(),
                     arg
                 );
@@ -3946,7 +3966,7 @@ const KNOWN_SETTINGS: &[(&str, &str)] = &[
     ("theme", "Color theme (auto/dark/light)"),
     (
         "permission_mode",
-        "Default permission mode (auto/prompt/deny)",
+        "Default permission mode (auto/plan/accept_edits/prompt/deny)",
     ),
 ];
 

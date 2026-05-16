@@ -7,7 +7,7 @@
 //!   rm -rf /tmp/scratch
 //!   destructive path outside cwd
 //!
-//! ▸ Accept      Reject    Always   Skip
+//! ▸ Allow once    Always    Reject
 //!   ← → navigate · Enter confirm · Esc reject
 //! ```
 //!
@@ -74,11 +74,10 @@ pub(crate) struct ApprovalCell {
     /// badge line. Each tag becomes a coloured chip in the
     /// header. Empty = no badge displayed.
     pub risk_tag_labels: Vec<String>,
-    /// Issue #326 P3: precomputed "Will save" preview. Renders
-    /// as a separate line `Will save: <rule>` so the user sees
-    /// exactly what permissions.json would gain before pressing
-    /// Always.
-    pub will_save_preview: Option<String>,
+    /// Human-readable preview of what pressing Always will remember.
+    /// This deliberately avoids permission-rule syntax such as
+    /// `Bash(npm test:*)`; users should see product language, not DSL.
+    pub remember_preview: Option<String>,
     /// Issue #326 P3 / R1 Major 11 / scenarios #21-#25: agent
     /// that issued the request. Renders as `[agent: <id>]` chip
     /// next to the header.
@@ -87,8 +86,8 @@ pub(crate) struct ApprovalCell {
     /// as `host:` prefix on the detail block.
     pub host: Option<String>,
     /// Issue #326 P5d / R2 Minor 1: post-save confirmation
-    /// message. Distinct from `will_save_preview` (the *future*
-    /// rule shown before the user clicks Always) — this is the
+    /// message. Distinct from `remember_preview` (the *future*
+    /// memory shown before the user clicks Always) — this is the
     /// *past* outcome shown after the save attempt:
     ///
     ///   None        -> not yet attempted (or no Always pressed)
@@ -97,11 +96,10 @@ pub(crate) struct ApprovalCell {
     ///                  "Failed to save rule: <reason>"
     pub save_outcome: Option<String>,
     pub selection_hint: Option<String>,
-    pub custom_match_input: Option<String>,
-    pub custom_match_source: Option<String>,
     pub workspace_untrusted: bool,
     pub is_compound_command: bool,
     pub has_dynamic_eval: bool,
+    pub unsafe_rule_shape: bool,
 }
 
 impl ApprovalCell {
@@ -122,16 +120,15 @@ impl ApprovalCell {
             focused,
             buttons: ButtonRow::primary(),
             risk_tag_labels: Vec::new(),
-            will_save_preview: None,
+            remember_preview: None,
             source_agent: None,
             host: None,
             save_outcome: None,
             selection_hint: None,
-            custom_match_input: None,
-            custom_match_source: None,
             workspace_untrusted: false,
             is_compound_command: false,
             has_dynamic_eval: false,
+            unsafe_rule_shape: false,
         }
     }
 
@@ -155,23 +152,22 @@ impl ApprovalCell {
             focused,
             buttons: ButtonRow::primary_with_batch(),
             risk_tag_labels: Vec::new(),
-            will_save_preview: None,
+            remember_preview: None,
             source_agent: None,
             host: None,
             save_outcome: None,
             selection_hint: None,
-            custom_match_input: None,
-            custom_match_source: None,
             workspace_untrusted: false,
             is_compound_command: false,
             has_dynamic_eval: false,
+            unsafe_rule_shape: false,
         }
     }
 
     /// Issue #326 P3: builder for the approval card's display
     /// metadata. Threading these through positionally would
     /// churn every call site; a builder keeps the API local to
-    /// the few places that compute risk/will_save/agent.
+    /// the few places that compute risk/remember-preview/agent.
     #[must_use]
     pub fn with_risk_tag_labels(mut self, labels: Vec<String>) -> Self {
         self.risk_tag_labels = labels;
@@ -179,8 +175,8 @@ impl ApprovalCell {
     }
 
     #[must_use]
-    pub fn with_will_save_preview(mut self, preview: impl Into<String>) -> Self {
-        self.will_save_preview = Some(preview.into());
+    pub fn with_remember_preview(mut self, preview: impl Into<String>) -> Self {
+        self.remember_preview = Some(preview.into());
         self
     }
 
@@ -212,27 +208,17 @@ impl ApprovalCell {
     }
 
     #[must_use]
-    pub fn with_custom_match_input(mut self, input: impl Into<String>) -> Self {
-        self.custom_match_input = Some(input.into());
-        self
-    }
-
-    #[must_use]
-    pub fn with_custom_match_source(mut self, source: impl Into<String>) -> Self {
-        self.custom_match_source = Some(source.into());
-        self
-    }
-
-    #[must_use]
     pub fn with_scope_context(
         mut self,
         workspace_untrusted: bool,
         is_compound_command: bool,
         has_dynamic_eval: bool,
+        unsafe_rule_shape: bool,
     ) -> Self {
         self.workspace_untrusted = workspace_untrusted;
         self.is_compound_command = is_compound_command;
         self.has_dynamic_eval = has_dynamic_eval;
+        self.unsafe_rule_shape = unsafe_rule_shape;
         self
     }
 
@@ -262,7 +248,7 @@ impl ApprovalCell {
         // Sub-agent requests can never persist on the parent's
         // permissions.json.
         if self.source_agent.is_some() {
-            return Some("sub-agent");
+            return Some("sub-agent request");
         }
         for label in &self.risk_tag_labels {
             match label.as_str() {
@@ -274,7 +260,22 @@ impl ApprovalCell {
                 _ => {}
             }
         }
+        if self.has_dynamic_eval {
+            return Some("shell command built at runtime");
+        }
+        if self.is_compound_command {
+            return Some("multi-step shell command");
+        }
+        if self.unsafe_rule_shape {
+            return Some("command shape too broad to remember");
+        }
         None
+    }
+
+    fn always_action_disabled(&self) -> bool {
+        self.always_disabled_reason().is_some()
+            || (!self.workspace_untrusted
+                && !self.scope_available(astra_turn_core::permission_scope::AllowScope::Project))
     }
 
     fn risk_tags_for_scope(&self) -> Vec<astra_turn_core::permission_engine::RiskTag> {
@@ -325,6 +326,7 @@ impl ApprovalCell {
             workspace_untrusted: self.workspace_untrusted,
             is_compound_command: self.is_compound_command,
             has_dynamic_eval: self.has_dynamic_eval,
+            unsafe_rule_shape: self.unsafe_rule_shape,
         }
     }
 
@@ -336,7 +338,9 @@ impl ApprovalCell {
 
     fn button_disabled(&self, btn: &crate::tui::approval::Button) -> bool {
         match &btn.action {
-            crate::tui::approval::ButtonAction::SelectScope(scope) => !self.scope_available(*scope),
+            crate::tui::approval::ButtonAction::Respond(
+                crate::chat_stream::ApprovalResponse::AlwaysAllow,
+            ) => self.always_action_disabled(),
             _ => false,
         }
     }
@@ -483,13 +487,12 @@ impl HistoryCell for ApprovalCell {
             ]));
         }
 
-        // Will-save preview (issue #326 P3): users see exactly
-        // what permissions.json would gain before pressing
-        // Always.
-        if let Some(preview) = &self.will_save_preview {
+        // Memory preview: keep this as product language, never raw
+        // permission-rule syntax.
+        if let Some(preview) = &self.remember_preview {
             lines.push(Line::from(vec![
                 bar.clone(),
-                Span::styled("Will save: ".to_string(), muted),
+                Span::styled("Always remembers: ".to_string(), muted),
                 Span::styled(preview.clone(), body_style.add_modifier(Modifier::BOLD)),
             ]));
         }
@@ -514,52 +517,26 @@ impl HistoryCell for ApprovalCell {
         if let Some(hint) = &self.selection_hint {
             lines.push(Line::from(vec![
                 bar.clone(),
-                Span::styled("Match: ".to_string(), muted),
+                Span::styled("Note: ".to_string(), muted),
                 Span::styled(hint.clone(), body_style),
             ]));
         }
 
-        if let Some(input) = &self.custom_match_input {
-            let ghost_suffix = self
-                .custom_match_source
-                .as_deref()
-                .and_then(|source| source.strip_prefix(input.as_str()))
-                .filter(|suffix| !suffix.is_empty());
-            let mut spans = vec![
-                bar.clone(),
-                Span::styled("Prefix: ".to_string(), muted),
-                Span::styled(input.clone(), body_style.add_modifier(Modifier::BOLD)),
-                Span::styled("▌".to_string(), accent_style.add_modifier(Modifier::BOLD)),
-            ];
-            if let Some(suffix) = ghost_suffix {
-                spans.push(Span::styled(
-                    suffix.to_string(),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            lines.push(Line::from(spans));
-        }
-
-        // Issue #326 P3 / scenarios #6/#9/#15: when the request
-        // carries destructive risk tags, advertise that the
-        // Always button can't be used to persist a project /
-        // user rule. The button row itself stays clickable —
-        // the Always-resolve handler upstream still records
-        // the override in session-only memory — but the user
-        // sees up-front why no on-disk rule landed.
+        // Keep high-risk persistence disabled in plain language; the
+        // UI should not expose old scope internals.
         if self.always_disabled_reason().is_some() {
             let reason_text = self.always_disabled_reason().unwrap_or_default();
             lines.push(Line::from(vec![
                 bar.clone(),
-                Span::styled("Always: ".to_string(), Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    "session-only ".to_string(),
+                    "Always disabled".to_string(),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
+                Span::styled(": ".to_string(), Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    format!("({reason_text})"),
+                    reason_text.to_string(),
                     Style::default().fg(Color::DarkGray),
                 ),
             ]));
@@ -578,11 +555,7 @@ impl HistoryCell for ApprovalCell {
         // style. Unfocused: plain border close — the user isn't
         // looking at this card for actions yet.
         let bottom = if self.focused {
-            let hint = if self.custom_match_input.is_some() {
-                "type prefix · Enter approve · Esc back"
-            } else {
-                "↑↓←→ select · Enter confirm · Esc reject · Ctrl+Enter quick accept"
-            };
+            let hint = "↑↓←→ select · Enter confirm · Esc reject · Ctrl+Enter quick accept";
             Line::from(vec![
                 Span::styled("╰─ ".to_string(), accent_style),
                 Span::styled(hint.to_string(), muted),
@@ -682,38 +655,12 @@ mod tests {
     }
 
     #[test]
-    fn custom_prefix_input_renders_source_suffix_as_placeholder() {
-        let cell = ApprovalCell::new(
-            1,
-            "bash".into(),
-            "git status --short".into(),
-            None,
-            "execute".into(),
-            true,
-        )
-        .with_custom_match_input("git ")
-        .with_custom_match_source("git status --short");
-        let lines = cell.display_lines(80);
-        let prefix_line = lines
-            .iter()
-            .find(|line| line.spans.iter().any(|span| span.content == "Prefix: "))
-            .expect("prefix input line should render");
-        let rendered = prefix_line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert_eq!(rendered, "│ Prefix: git ▌status --short");
-        assert_eq!(prefix_line.spans[4].style.fg, Some(Color::DarkGray));
-    }
-
-    #[test]
     fn never_persists() {
         let cell = ApprovalCell::new(1, "t".into(), "h".into(), None, "r".into(), true);
         assert!(cell.to_persist().is_none());
     }
 
-    // ── Issue #326 P3 enrichment: risk badge / will-save / agent / host ──
+    // ── Issue #326 P3 enrichment: risk badge / remember preview / agent / host ──
 
     #[test]
     fn renders_risk_tag_badge_when_present() {
@@ -735,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_will_save_preview_when_present() {
+    fn renders_remember_preview_when_present() {
         let cell = ApprovalCell::new(
             1,
             "bash".into(),
@@ -744,18 +691,22 @@ mod tests {
             "execute".into(),
             true,
         )
-        .with_will_save_preview("Bash(npm test:*)");
+        .with_remember_preview("similar `npm test` commands in this workspace");
         let rendered = render(&cell);
         assert!(
-            rendered.contains("Will save: Bash(npm test:*)"),
-            "expected Will save preview line, got:\n{rendered}"
+            rendered.contains("Always remembers: similar `npm test` commands in this workspace"),
+            "expected remember preview line, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Bash("),
+            "must not expose permission DSL:\n{rendered}"
         );
     }
 
     #[test]
     fn renders_save_outcome_when_present() {
         // Issue #326 P5d / R2 Minor 1: post-save confirmation
-        // line appears below Will save and tells the user the
+        // line appears below the approval details and tells the user the
         // rule actually persisted.
         let cell = ApprovalCell::new(
             1,
@@ -819,14 +770,14 @@ mod tests {
 
     #[test]
     fn omits_optional_lines_when_unset() {
-        // Default cell has no risk tags / will-save / agent /
+        // Default cell has no risk tags / remember-preview / agent /
         // host, and should not render those lines.
         let cell = ApprovalCell::new(1, "bash".into(), "h".into(), None, "r".into(), true);
         let rendered = render(&cell);
         assert!(!rendered.contains("⚑ "), "no risk badge expected");
         assert!(
-            !rendered.contains("Will save:"),
-            "no will-save row expected"
+            !rendered.contains("Always remembers:"),
+            "no remember-preview row expected"
         );
         assert!(!rendered.contains("[agent:"), "no agent chip expected");
     }
@@ -889,7 +840,24 @@ mod tests {
             true,
         )
         .with_source_agent("review-subagent");
-        assert_eq!(cell.always_disabled_reason(), Some("sub-agent"));
+        assert_eq!(cell.always_disabled_reason(), Some("sub-agent request"));
+    }
+
+    #[test]
+    fn always_disabled_reason_mentions_runtime_built_shell_command() {
+        let cell = ApprovalCell::new(
+            1,
+            "bash".into(),
+            "echo $(pwd)".into(),
+            None,
+            "execute".into(),
+            true,
+        )
+        .with_scope_context(false, false, true, false);
+        assert_eq!(
+            cell.always_disabled_reason(),
+            Some("shell command built at runtime")
+        );
     }
 
     #[test]
@@ -907,6 +875,62 @@ mod tests {
     }
 
     #[test]
+    fn always_enabled_for_untrusted_workspace_benign_request() {
+        let cell = ApprovalCell::new(
+            1,
+            "git_show".into(),
+            "Git show HEAD".into(),
+            None,
+            "This command needs your approval before it runs.".into(),
+            true,
+        )
+        .with_risk_tag_labels(vec!["BashExecute".into()])
+        .with_scope_context(true, false, false, false);
+        let rendered = render(&cell);
+        assert!(
+            !rendered.contains("Always×"),
+            "workspace-untrusted benign request should still allow session-level Always, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn always_disabled_reason_mentions_multi_step_shell_command() {
+        let cell = ApprovalCell::new(
+            1,
+            "bash".into(),
+            "cd rust && cargo test".into(),
+            None,
+            "This command needs your approval before it runs.".into(),
+            true,
+        )
+        .with_risk_tag_labels(vec!["BashExecute".into()])
+        .with_scope_context(false, true, false, false);
+        assert_eq!(
+            cell.always_disabled_reason(),
+            Some("multi-step shell command")
+        );
+    }
+
+    #[test]
+    fn always_disabled_reason_mentions_unsafe_rule_shape() {
+        let cell = ApprovalCell::new(
+            1,
+            "bash".into(),
+            "bash".into(),
+            None,
+            "execute".into(),
+            true,
+        )
+        .with_scope_context(false, false, false, true);
+
+        assert_eq!(
+            cell.always_disabled_reason(),
+            Some("command shape too broad to remember")
+        );
+        assert!(cell.always_action_disabled());
+    }
+
+    #[test]
     fn always_disabled_renders_in_card() {
         let cell = ApprovalCell::new(
             1,
@@ -919,10 +943,33 @@ mod tests {
         .with_risk_tag_labels(vec!["GitDestructive".into()]);
         let rendered = render(&cell);
         assert!(
-            rendered.contains("Always: session-only"),
+            rendered.contains("Always disabled: git destructive"),
             "destructive cell must advertise the disabled-Always state, got:\n{rendered}"
         );
-        assert!(rendered.contains("git destructive"));
+    }
+
+    #[test]
+    fn selection_hint_renders_as_note_not_match() {
+        let cell = ApprovalCell::new(
+            1,
+            "str_replace".into(),
+            "Editing rust/crates/astra-cli/src/tui/approval/queue.rs".into(),
+            None,
+            "This command needs your approval before it runs.".into(),
+            true,
+        )
+        .with_selection_hint(
+            "Always remembers for this session only. Run `astra permissions trust` to save workspace rules.",
+        );
+        let rendered = render(&cell);
+        assert!(
+            rendered.contains("Note: Always remembers for this session only."),
+            "selection hints should render as a note, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Match:"),
+            "selection hint must not reuse the retired match-target label, got:\n{rendered}"
+        );
     }
 
     // ── Issue #326 P3 / R1 Major 11: snapshot tests at 3 widths ──
@@ -946,11 +993,11 @@ mod tests {
             "bash".into(),
             "npm test --filter auth".into(),
             Some("npm test --filter auth -- --verbose".into()),
-            "execute (Prompt mode, no allow rule matches)".into(),
+            "This command needs your approval before it runs.".into(),
             true,
         )
         .with_risk_tag_labels(vec!["BashExecute".into()])
-        .with_will_save_preview("Bash(npm test:*)")
+        .with_remember_preview("similar `npm test` commands in this workspace")
     }
 
     /// Smoke-snapshot the rendered card at three terminal widths

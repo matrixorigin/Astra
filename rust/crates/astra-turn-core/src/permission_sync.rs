@@ -5,6 +5,8 @@
 
 pub use crate::permission_types::*;
 
+use crate::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind_with_args};
+use crate::permission_match_target::{AllowMatchTarget, default_match_target};
 use astra_messaging::types::{
     AgentAddress, AgentMessage, MessagePayload, MessageTarget, RequestType,
 };
@@ -237,6 +239,16 @@ mod tests {
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+fn accept_edits_auto_allows_request(request: &PermissionRequest) -> bool {
+    matches!(
+        (
+            cloud_gated_tool_kind_with_args(&request.tool_name, Some(&request.args)),
+            default_match_target(&request.tool_name, &request.args),
+        ),
+        (Some(CloudGatedToolKind::Write), AllowMatchTarget::Prefix(_))
+    )
+}
+
 /// Handler for incoming permission requests from child agents.
 ///
 /// The parent agent creates a handler and registers a callback to make
@@ -304,11 +316,28 @@ impl PermissionRequestHandler {
 
                 response
             }
+            PermissionMode::AcceptEdits if accept_edits_auto_allows_request(request) => {
+                let response = if let Some(ref rule_str) = request.suggested_rule {
+                    PermissionResponse::approve()
+                        .with_update(PermissionUpdate::allow(PermissionRule::parse(rule_str)))
+                } else {
+                    PermissionResponse::approve()
+                };
+
+                drop(ctx);
+                if !response.updates.is_empty() {
+                    let mut ctx_mut = self.sync_context.write().await;
+                    ctx_mut.apply_response(&response);
+                }
+
+                response
+            }
             PermissionMode::Deny => {
                 // Deny mode: reject without escalation
                 PermissionResponse::deny("permission mode is deny")
             }
-            PermissionMode::Prompt => {
+            PermissionMode::Plan => PermissionResponse::deny("permission mode is plan"),
+            PermissionMode::AcceptEdits | PermissionMode::Prompt => {
                 // Prompt mode: use callback or default logic
                 drop(ctx);
 
@@ -393,6 +422,8 @@ impl PermissionRequestHandler {
 #[cfg(test)]
 mod handler_tests {
     use super::*;
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn handler_auto_mode_approves() {
@@ -415,6 +446,91 @@ mod handler_tests {
 
         assert!(!response.approved);
         assert!(response.reason.as_ref().unwrap().contains("deny"));
+    }
+
+    #[tokio::test]
+    async fn handler_plan_mode_denies() {
+        let ctx = PermissionSyncContext::root(PermissionMode::Plan);
+        let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
+
+        let request = PermissionRequest::new("write_file", serde_json::json!({"path": "plan.txt"}));
+        let response = handler.handle_request(&request).await;
+
+        assert!(!response.approved);
+        assert!(response.reason.as_ref().unwrap().contains("plan"));
+    }
+
+    #[tokio::test]
+    async fn handler_accept_edits_auto_approves_workspace_write_without_callback() {
+        let ctx = PermissionSyncContext::root(PermissionMode::AcceptEdits);
+        let callback_calls = StdArc::new(AtomicUsize::new(0));
+        let seen = StdArc::clone(&callback_calls);
+        let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx))).with_callback(
+            Box::new(move |_req, _ctx| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                PermissionDecision::deny("callback should not run for workspace edits")
+            }),
+        );
+
+        let request = PermissionRequest::new(
+            "write_file",
+            serde_json::json!({"path": "src/lib.rs", "content": "pub fn shipped() {}\n"}),
+        );
+        let response = handler.handle_request(&request).await;
+
+        assert!(response.approved);
+        assert_eq!(callback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn handler_accept_edits_background_denies_external_write_escalation() {
+        let mut inherited = InheritedPermissions::new(PermissionMode::AcceptEdits);
+        inherited.is_background = true;
+        let ctx = PermissionSyncContext::new(inherited);
+        let callback_calls = StdArc::new(AtomicUsize::new(0));
+        let seen = StdArc::clone(&callback_calls);
+        let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx))).with_callback(
+            Box::new(move |_req, _ctx| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                PermissionDecision::Escalate
+            }),
+        );
+
+        let request = PermissionRequest::new(
+            "write_file",
+            serde_json::json!({"path": "/tmp/outside.rs", "content": "pub fn nope() {}\n"}),
+        );
+        let response = handler.handle_request(&request).await;
+
+        assert!(!response.approved);
+        assert_eq!(callback_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            response.reason.as_deref(),
+            Some("cannot escalate in background mode")
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_accept_edits_still_asks_callback_for_bash() {
+        let ctx = PermissionSyncContext::root(PermissionMode::AcceptEdits);
+        let callback_calls = StdArc::new(AtomicUsize::new(0));
+        let seen = StdArc::clone(&callback_calls);
+        let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx))).with_callback(
+            Box::new(move |_req, _ctx| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                PermissionDecision::deny("bash still needs approval")
+            }),
+        );
+
+        let request = PermissionRequest::new("bash", serde_json::json!({"command": "cargo test"}));
+        let response = handler.handle_request(&request).await;
+
+        assert!(!response.approved);
+        assert_eq!(callback_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            response.reason.as_deref(),
+            Some("bash still needs approval")
+        );
     }
 
     #[tokio::test]

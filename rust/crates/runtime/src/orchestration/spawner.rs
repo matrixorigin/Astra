@@ -59,7 +59,7 @@ pub use astra_turn_core::orchestration_types::{
 /// Permission summary for display purposes.
 #[derive(Debug, Clone, Default)]
 pub struct PermissionSummary {
-    /// Permission mode (auto, prompt, deny).
+    /// Permission mode (auto, plan, accept_edits, prompt, deny).
     pub mode: String,
     /// Number of explicit allow rules.
     pub allow_rules: u32,
@@ -1379,6 +1379,8 @@ fn build_permission_summary(context: &SpawnContext) -> PermissionSummary {
     if let Some(ref inherited) = context.inherited_permissions {
         summary.mode = match inherited.mode {
             super::permission_sync::PermissionMode::Auto => "auto".to_string(),
+            super::permission_sync::PermissionMode::Plan => "plan".to_string(),
+            super::permission_sync::PermissionMode::AcceptEdits => "accept_edits".to_string(),
             super::permission_sync::PermissionMode::Prompt => "prompt".to_string(),
             super::permission_sync::PermissionMode::Deny => "deny".to_string(),
         };

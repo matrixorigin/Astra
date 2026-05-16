@@ -57,6 +57,8 @@ impl Footer {
     fn permission_mode_enum(&self) -> PermissionMode {
         match self.permission_mode.as_deref() {
             Some("auto") => PermissionMode::Auto,
+            Some("plan") => PermissionMode::Plan,
+            Some("accept_edits") => PermissionMode::AcceptEdits,
             Some("deny") => PermissionMode::Deny,
             _ => PermissionMode::Ask,
         }

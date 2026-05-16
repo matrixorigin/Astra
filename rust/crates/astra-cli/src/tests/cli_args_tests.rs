@@ -309,10 +309,56 @@ fn cli_chat_permission_mode_legacy_aliases() {
         let cli = Cli::try_parse_from(["astra", "chat", "--permission-mode", mode]).unwrap();
         match cli.command {
             Some(Command::Chat(ref args)) => {
-                assert_eq!(args.permission_mode.as_deref(), Some(mode));
+                assert_eq!(args.permission_mode.as_deref(), Some("auto"));
             }
             _ => panic!("expected Chat command"),
         }
+    }
+}
+
+#[test]
+fn cli_chat_permission_mode_accept_edits() {
+    let cli = Cli::try_parse_from(["astra", "chat", "--permission-mode", "accept-edits"]).unwrap();
+    match cli.command {
+        Some(Command::Chat(ref args)) => {
+            assert_eq!(args.permission_mode.as_deref(), Some("accept_edits"));
+        }
+        _ => panic!("expected Chat command"),
+    }
+}
+
+#[test]
+fn cli_chat_permission_mode_plan() {
+    let cli = Cli::try_parse_from(["astra", "chat", "--permission-mode", "plan"]).unwrap();
+    match cli.command {
+        Some(Command::Chat(ref args)) => {
+            assert_eq!(args.permission_mode.as_deref(), Some("plan"));
+        }
+        _ => panic!("expected Chat command"),
+    }
+}
+
+#[test]
+fn cli_permissions_command_accept_edits_mode() {
+    let cli = Cli::try_parse_from(["astra", "permissions", "accept_edits"]).unwrap();
+    match cli.command {
+        Some(Command::Permissions(args)) => match args.command {
+            Some(PermissionsSubcommand::AcceptEdits) => {}
+            other => panic!("unexpected permissions subcommand: {other:?}"),
+        },
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
+#[test]
+fn cli_permissions_command_plan_mode() {
+    let cli = Cli::try_parse_from(["astra", "permissions", "plan"]).unwrap();
+    match cli.command {
+        Some(Command::Permissions(args)) => match args.command {
+            Some(PermissionsSubcommand::Plan) => {}
+            other => panic!("unexpected permissions subcommand: {other:?}"),
+        },
+        other => panic!("unexpected command: {other:?}"),
     }
 }
 
@@ -1016,6 +1062,8 @@ fn permission_mode_set_mode() {
         &std::path::PathBuf::from("/tmp"),
     );
     assert_eq!(pm.mode(), permission_manager::PermissionMode::Prompt);
+    pm.set_mode(permission_manager::PermissionMode::AcceptEdits);
+    assert_eq!(pm.mode(), permission_manager::PermissionMode::AcceptEdits);
     pm.set_mode(permission_manager::PermissionMode::Auto);
     assert_eq!(pm.mode(), permission_manager::PermissionMode::Auto);
     pm.set_mode(permission_manager::PermissionMode::Deny);
@@ -1024,7 +1072,7 @@ fn permission_mode_set_mode() {
 
 #[test]
 fn permission_mode_roundtrip_parse() {
-    for mode_str in &["auto", "prompt", "deny"] {
+    for mode_str in &["auto", "accept_edits", "plan", "prompt", "deny"] {
         let mode: permission_manager::PermissionMode = mode_str.parse().unwrap();
         assert_eq!(mode.to_string().to_lowercase(), *mode_str);
     }

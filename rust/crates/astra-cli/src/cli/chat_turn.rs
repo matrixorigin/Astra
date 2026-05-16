@@ -4197,6 +4197,25 @@ mod tests {
     }
 
     #[test]
+    fn pending_recovery_restore_is_gated_to_low_information_followups() {
+        let source = include_str!("chat_turn.rs");
+        let start = source
+            .find("pub(super) async fn handle_chat_input_with_ui")
+            .expect("handle_chat_input_with_ui should exist");
+        let body = &source[start..];
+        let gate_end = body
+            .find("ui.blank_line();")
+            .expect("pre-turn gate should reach the blank-line boundary");
+        let pre_turn_gate = &body[..gate_end];
+        assert!(
+            pre_turn_gate.contains("restore_session_into_state(&session_id")
+                && pre_turn_gate.contains("is_low_information_followup(&line)")
+                && pre_turn_gate.contains("state.pending_recovery = None;"),
+            "interactive chat should only restore pending recovery for low-information resume/repair follow-ups"
+        );
+    }
+
+    #[test]
     fn build_effective_line_leaves_normal_prompt_untouched() {
         let state = SessionState {
             continuation_anchor: Some("Latest user task: debug Chinese input drops".to_string()),

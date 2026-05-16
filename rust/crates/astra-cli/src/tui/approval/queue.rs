@@ -7,20 +7,12 @@ use tokio::sync::oneshot;
 
 use super::button_row::ButtonRow;
 use crate::chat_stream::ApprovalResponse;
-use astra_turn_core::permission_match_target::AllowMatchTarget;
 use astra_turn_core::permission_scope::AllowScope;
 
 /// Monotonic id assigned by the queue. Stable across the session so the
 /// reducer and tool cells can refer to a pending approval without owning
 /// the non-Clone `oneshot::Sender`.
 pub(crate) type ApprovalId = u64;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ApprovalSelection {
-    Scope,
-    MatchTarget { scope: AllowScope },
-    CustomPrefix { scope: AllowScope, input: String },
-}
 
 /// One pending approval. The `response_txs` vec lets dedup
 /// merge multiple in-flight requests with byte-identical
@@ -40,7 +32,6 @@ pub(crate) struct PendingApproval {
     /// Live button row owned per entry so arrow-key focus sticks
     /// through navigation even when focus cycles between entries.
     pub buttons: ButtonRow,
-    pub selection: ApprovalSelection,
     /// Issue #326 P3 / R1 Major 11 / scenarios #21-#25: when a sub-agent
     /// owns this request, the agent identifier is recorded here.
     /// `None` for requests originating in the main TUI session.
@@ -72,21 +63,16 @@ pub(crate) struct PendingApproval {
     /// tags emitted by the engine"; the UI falls back to the
     /// existing reason text.
     pub risk_tags: Vec<astra_turn_core::permission_engine::RiskTag>,
-    /// Issue #326 P3: precomputed "Will save" preview — what
-    /// would be persisted if the user pressed Always with the
-    /// default Project scope. The TUI renders this verbatim in
-    /// the approval card so users see exactly what
-    /// `permissions.json` would gain. `None` means the request
-    /// is not eligible for Always (e.g. compound shell command,
-    /// MCP unknown capability).
-    pub will_save_preview: Option<String>,
-    pub custom_match_source: String,
+    /// Human-readable preview of what pressing Always will remember.
+    /// This must not expose permission-rule DSL.
+    pub remember_preview: Option<String>,
     /// Workspace trust gate for Project scope. When true, Project
     /// is rendered but cannot be activated; project allow rules are
     /// not trusted for this session.
     pub workspace_untrusted: bool,
     pub is_compound_command: bool,
     pub has_dynamic_eval: bool,
+    pub unsafe_rule_shape: bool,
     /// Issue #326 P3 / P5f / R2 Major 3: host-computed digest of
     /// the file the tool will mutate, snapshotted at the moment
     /// the approval enters the queue. The executor compares this
@@ -122,11 +108,11 @@ pub(crate) struct ApprovalMetadata {
     pub mcp_capability: Option<astra_turn_core::permission_engine::ToolCapabilityMetadata>,
     pub host: Option<String>,
     pub risk_tags: Vec<astra_turn_core::permission_engine::RiskTag>,
-    pub will_save_preview: Option<String>,
-    pub custom_match_source: String,
+    pub remember_preview: Option<String>,
     pub workspace_untrusted: bool,
     pub is_compound_command: bool,
     pub has_dynamic_eval: bool,
+    pub unsafe_rule_shape: bool,
     /// Host-computed snapshot of the file the tool will mutate;
     /// see [`PendingApproval::base_digest`].
     pub base_digest: Option<astra_turn_core::approval_base_digest::BaseDigest>,
@@ -160,8 +146,8 @@ impl ApprovalMetadata {
     }
 
     #[must_use]
-    pub fn with_will_save_preview(mut self, preview: impl Into<String>) -> Self {
-        self.will_save_preview = Some(preview.into());
+    pub fn with_remember_preview(mut self, preview: impl Into<String>) -> Self {
+        self.remember_preview = Some(preview.into());
         self
     }
 
@@ -175,6 +161,12 @@ impl ApprovalMetadata {
     pub fn with_scope_shape(mut self, is_compound_command: bool, has_dynamic_eval: bool) -> Self {
         self.is_compound_command = is_compound_command;
         self.has_dynamic_eval = has_dynamic_eval;
+        self
+    }
+
+    #[must_use]
+    pub fn with_unsafe_rule_shape(mut self, unsafe_rule_shape: bool) -> Self {
+        self.unsafe_rule_shape = unsafe_rule_shape;
         self
     }
 
@@ -240,7 +232,7 @@ impl std::fmt::Debug for PendingApproval {
             .field("source_agent", &self.source_agent)
             .field("host", &self.host)
             .field("risk_tag_count", &self.risk_tags.len())
-            .field("will_save_preview", &self.will_save_preview)
+            .field("remember_preview", &self.remember_preview)
             .field(
                 "base_digest",
                 &self.base_digest.as_ref().map(|d| d.short_display()),
@@ -271,15 +263,14 @@ pub(crate) struct ApprovalView {
     /// `Eq` / `Hash`-friendly (the engine's `RiskTag` enum is
     /// not currently `Eq`-derived for use as a HashSet key).
     pub risk_tag_labels: Vec<String>,
-    /// "Will save: …" preview, mirrored from
-    /// [`PendingApproval::will_save_preview`].
-    pub will_save_preview: Option<String>,
+    /// Always-remembers preview, mirrored from
+    /// [`PendingApproval::remember_preview`].
+    pub remember_preview: Option<String>,
     pub selection_hint: Option<String>,
-    pub custom_match_input: Option<String>,
-    pub custom_match_source: Option<String>,
     pub workspace_untrusted: bool,
     pub is_compound_command: bool,
     pub has_dynamic_eval: bool,
+    pub unsafe_rule_shape: bool,
 }
 
 impl From<&PendingApproval> for ApprovalView {
@@ -293,68 +284,17 @@ impl From<&PendingApproval> for ApprovalView {
             source_agent: p.source_agent.clone(),
             host: p.host.clone(),
             risk_tag_labels: p.risk_tags.iter().map(|tag| format!("{tag:?}")).collect(),
-            will_save_preview: p.will_save_preview.clone(),
+            remember_preview: p.remember_preview.clone(),
             selection_hint: p.selection_hint(),
-            custom_match_input: match &p.selection {
-                ApprovalSelection::CustomPrefix { input, .. } => Some(input.clone()),
-                _ => None,
-            },
-            custom_match_source: match &p.selection {
-                ApprovalSelection::CustomPrefix { .. } if !p.custom_match_source.is_empty() => {
-                    Some(p.custom_match_source.clone())
-                }
-                _ => None,
-            },
             workspace_untrusted: p.workspace_untrusted,
             is_compound_command: p.is_compound_command,
             has_dynamic_eval: p.has_dynamic_eval,
+            unsafe_rule_shape: p.unsafe_rule_shape,
         }
     }
 }
 
 impl PendingApproval {
-    fn selection_hint(&self) -> Option<String> {
-        match &self.selection {
-            ApprovalSelection::Scope => None,
-            ApprovalSelection::MatchTarget { scope } => {
-                let action = self.buttons.focused().map(|b| &b.action);
-                Some(match action {
-                    Some(super::button_row::ButtonAction::SelectMatch(AllowMatchTarget::Exact)) => {
-                        format!("Approve exactly this request {}.", scope_duration(*scope))
-                    }
-                    Some(super::button_row::ButtonAction::SelectMatch(AllowMatchTarget::Tool)) => {
-                        format!(
-                            "Approve this tool for all future permission requests {}.",
-                            scope_duration(*scope)
-                        )
-                    }
-                    Some(super::button_row::ButtonAction::EditCustomPrefix) => format!(
-                        "Type a prefix of `{}` {}.",
-                        self.custom_match_source,
-                        scope_duration(*scope)
-                    ),
-                    Some(super::button_row::ButtonAction::BackToScopes) => {
-                        "Return to scope selection.".to_string()
-                    }
-                    _ => format!(
-                        "Choose what this {} approval should match.",
-                        scope_label(*scope)
-                    ),
-                })
-            }
-            ApprovalSelection::CustomPrefix { scope, input } if input.is_empty() => Some(format!(
-                "Type a prefix of `{}` {}.",
-                self.custom_match_source,
-                scope_duration(*scope)
-            )),
-            ApprovalSelection::CustomPrefix { scope, input } => Some(format!(
-                "Approve requests matching `{}` {}. Only real prefixes are accepted.",
-                input,
-                scope_duration(*scope)
-            )),
-        }
-    }
-
     fn scope_context(&self) -> astra_turn_core::permission_scope::ScopeAvailabilityContext {
         astra_turn_core::permission_scope::ScopeAvailabilityContext {
             risk_tags: self.risk_tags.clone(),
@@ -369,6 +309,7 @@ impl PendingApproval {
             workspace_untrusted: self.workspace_untrusted,
             is_compound_command: self.is_compound_command,
             has_dynamic_eval: self.has_dynamic_eval,
+            unsafe_rule_shape: self.unsafe_rule_shape,
         }
     }
 
@@ -377,25 +318,40 @@ impl PendingApproval {
             .into_iter()
             .any(|entry| entry.scope == scope && entry.available)
     }
-}
 
-fn scope_label(scope: AllowScope) -> &'static str {
-    match scope {
-        AllowScope::OnceThisCall => "request",
-        AllowScope::RestOfTurn => "turn",
-        AllowScope::RestOfSession => "session",
-        AllowScope::Project => "project",
-        AllowScope::User => "user",
+    fn always_action_disabled(&self) -> bool {
+        use astra_turn_core::permission_engine::RiskTag;
+
+        if self.source_agent.is_some()
+            || self.is_compound_command
+            || self.has_dynamic_eval
+            || self.unsafe_rule_shape
+            || self.risk_tags.contains(&RiskTag::WritesSensitiveFile)
+            || self.risk_tags.contains(&RiskTag::GitDestructive)
+            || self.risk_tags.contains(&RiskTag::WritesOutsideWorkspace)
+            || self.risk_tags.contains(&RiskTag::CredentialAccess)
+            || self.risk_tags.contains(&RiskTag::MCPUnknownCapability)
+        {
+            return true;
+        }
+
+        !self.workspace_untrusted && !self.scope_available(AllowScope::Project)
     }
-}
 
-fn scope_duration(scope: AllowScope) -> &'static str {
-    match scope {
-        AllowScope::OnceThisCall => "for this request",
-        AllowScope::RestOfTurn => "for the rest of this turn",
-        AllowScope::RestOfSession => "in this session",
-        AllowScope::Project => "for this project",
-        AllowScope::User => "for this user",
+    fn always_uses_session_fallback(&self) -> bool {
+        self.workspace_untrusted
+            && !self.always_action_disabled()
+            && !self.scope_available(AllowScope::Project)
+    }
+
+    fn selection_hint(&self) -> Option<String> {
+        if self.always_uses_session_fallback() {
+            return Some(
+                "Always remembers for this session only. Choose Trust Workspace or run `/allow trust` to save workspace rules."
+                    .to_string(),
+            );
+        }
+        None
     }
 }
 
@@ -484,16 +440,15 @@ impl ApprovalQueue {
             reason,
             response_txs: vec![response_tx],
             buttons,
-            selection: ApprovalSelection::Scope,
             source_agent: metadata.source_agent,
             mcp_capability: metadata.mcp_capability,
             host: metadata.host,
             risk_tags: metadata.risk_tags,
-            will_save_preview: metadata.will_save_preview,
-            custom_match_source: metadata.custom_match_source,
+            remember_preview: metadata.remember_preview,
             workspace_untrusted: metadata.workspace_untrusted,
             is_compound_command: metadata.is_compound_command,
             has_dynamic_eval: metadata.has_dynamic_eval,
+            unsafe_rule_shape: metadata.unsafe_rule_shape,
             base_digest: metadata.base_digest,
             request_key: metadata.request_key,
             batch_group_key: metadata.batch_group_key,
@@ -555,126 +510,6 @@ impl ApprovalQueue {
         sent
     }
 
-    pub fn select_scope_for_focused(&mut self, scope: AllowScope) -> bool {
-        let total = self.entries.len();
-        let Some(entry) = self.entries.get_mut(self.focus) else {
-            return false;
-        };
-        if !entry.scope_available(scope) {
-            return false;
-        }
-        entry.selection = ApprovalSelection::MatchTarget { scope };
-        entry.buttons = ButtonRow::match_targets();
-        if total > 1 {
-            // Batch buttons are intentionally scope-step only; once a
-            // single entry is choosing a match target, batch approval no
-            // longer has one unambiguous match object.
-        }
-        true
-    }
-
-    pub fn back_to_scope_for_focused(&mut self) -> bool {
-        let total = self.entries.len();
-        let Some(entry) = self.entries.get_mut(self.focus) else {
-            return false;
-        };
-        entry.selection = ApprovalSelection::Scope;
-        entry.buttons = if total > 1 {
-            ButtonRow::primary_with_batch()
-        } else {
-            ButtonRow::primary()
-        };
-        true
-    }
-
-    pub fn enter_custom_prefix_for_focused(&mut self) -> bool {
-        let Some(entry) = self.entries.get_mut(self.focus) else {
-            return false;
-        };
-        let ApprovalSelection::MatchTarget { scope } = entry.selection else {
-            return false;
-        };
-        entry.selection = ApprovalSelection::CustomPrefix {
-            scope,
-            input: String::new(),
-        };
-        true
-    }
-
-    pub fn focused_custom_prefix_active(&self) -> bool {
-        self.entries
-            .get(self.focus)
-            .is_some_and(|entry| matches!(entry.selection, ApprovalSelection::CustomPrefix { .. }))
-    }
-
-    pub fn push_custom_prefix_char(&mut self, ch: char) -> bool {
-        let Some(entry) = self.entries.get_mut(self.focus) else {
-            return false;
-        };
-        if let ApprovalSelection::CustomPrefix { input, .. } = &mut entry.selection {
-            let mut proposed = input.clone();
-            proposed.push(ch);
-            if astra_turn_core::permission_match_target::is_valid_custom_prefix(
-                &proposed,
-                &entry.custom_match_source,
-            ) {
-                *input = proposed;
-                return true;
-            }
-        }
-        false
-    }
-
-    pub fn pop_custom_prefix_char(&mut self) -> bool {
-        let Some(entry) = self.entries.get_mut(self.focus) else {
-            return false;
-        };
-        if let ApprovalSelection::CustomPrefix { input, .. } = &mut entry.selection {
-            input.pop();
-            return true;
-        }
-        false
-    }
-
-    pub fn cancel_custom_prefix_for_focused(&mut self) -> bool {
-        let Some(entry) = self.entries.get_mut(self.focus) else {
-            return false;
-        };
-        let ApprovalSelection::CustomPrefix { scope, .. } = entry.selection.clone() else {
-            return false;
-        };
-        entry.selection = ApprovalSelection::MatchTarget { scope };
-        true
-    }
-
-    pub fn submit_custom_prefix_for_focused(&mut self) -> Option<ApprovalResponse> {
-        let entry = self.entries.get(self.focus)?;
-        let ApprovalSelection::CustomPrefix { scope, input } = &entry.selection else {
-            return None;
-        };
-        if !astra_turn_core::permission_match_target::is_valid_custom_prefix(
-            input,
-            &entry.custom_match_source,
-        ) {
-            return None;
-        }
-        Some(ApprovalResponse::AlwaysAllowScopedTarget {
-            scope: *scope,
-            match_target: AllowMatchTarget::Prefix(input.clone()),
-        })
-    }
-
-    pub fn response_for_match_target(&self, target: AllowMatchTarget) -> Option<ApprovalResponse> {
-        let entry = self.entries.get(self.focus)?;
-        let ApprovalSelection::MatchTarget { scope } = entry.selection else {
-            return None;
-        };
-        Some(ApprovalResponse::AlwaysAllowScopedTarget {
-            scope,
-            match_target: target,
-        })
-    }
-
     pub fn respond_by_id(&mut self, id: ApprovalId, response: ApprovalResponse) -> bool {
         let Some(idx) = self.entries.iter().position(|e| e.id == id) else {
             return false;
@@ -733,16 +568,15 @@ impl ApprovalQueue {
     pub fn focused_button_action(&self) -> Option<super::button_row::ButtonAction> {
         let entry = self.entries.get(self.focus)?;
         let action = entry.buttons.activate()?;
-        if let super::button_row::ButtonAction::SelectScope(scope) = &action
-            && !entry.scope_available(*scope)
+        if matches!(
+            action,
+            super::button_row::ButtonAction::Respond(ApprovalResponse::AlwaysAllow)
+        ) && entry.always_action_disabled()
         {
             return None;
         }
         match action {
             super::button_row::ButtonAction::RespondAll(ref response) if response.is_approved() => {
-                if !matches!(entry.selection, ApprovalSelection::Scope) {
-                    return None;
-                }
                 match entry.batch_group_key.as_ref() {
                     Some(group) if group.allows_accept_all() => Some(action.clone()),
                     Some(_) => None,
@@ -911,9 +745,9 @@ mod tests {
     }
 
     #[test]
-    fn push_with_metadata_carries_risk_tags_and_will_save() {
-        // Issue #326 P3 / R1 Major 7: risk tags and the will-save
-        // preview must reach the view layer.
+    fn push_with_metadata_carries_risk_tags_and_remember_preview() {
+        // Risk tags and the human-readable remember preview must
+        // reach the view layer.
         use astra_turn_core::permission_engine::RiskTag;
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
@@ -925,11 +759,14 @@ mod tests {
             tx,
             ApprovalMetadata::default()
                 .with_risk_tags(vec![RiskTag::BashExecute])
-                .with_will_save_preview("Bash(npm test:*)"),
+                .with_remember_preview("similar `npm test` commands in this workspace"),
         );
         let view = q.focused_view().unwrap();
         assert_eq!(view.risk_tag_labels, vec!["BashExecute"]);
-        assert_eq!(view.will_save_preview.as_deref(), Some("Bash(npm test:*)"));
+        assert_eq!(
+            view.remember_preview.as_deref(),
+            Some("similar `npm test` commands in this workspace")
+        );
     }
 
     // ── Issue #326 P3 / P5f / R2 Major 3: base digest ──
@@ -1303,8 +1140,8 @@ mod tests {
             ApprovalMetadata::default().with_batch_group_key(group),
         );
 
-        // Move from Accept to Accept all (index 7).
-        for _ in 0..7 {
+        // Move from Allow once to Accept all (index 3).
+        for _ in 0..3 {
             q.focused_button_move_right();
         }
         assert!(
@@ -1323,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_button_action_blocks_unavailable_project_scope() {
+    fn focused_button_action_blocks_unavailable_workspace_always() {
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
         q.push_with_metadata(
@@ -1335,139 +1172,89 @@ mod tests {
             ApprovalMetadata::default().with_workspace_untrusted(true),
         );
 
-        // Accept, Reject, Turn, Session, Project.
-        for _ in 0..4 {
-            q.focused_button_move_right();
-        }
-        assert!(
-            q.focused_button_action().is_none(),
-            "Project scope must be inactive when workspace trust is missing"
+        // Allow once -> Always.
+        q.focused_button_move_right();
+        assert_eq!(
+            q.focused_button_action(),
+            Some(super::super::button_row::ButtonAction::Respond(
+                ApprovalResponse::AlwaysAllow
+            )),
+            "benign untrusted-workspace request should keep Always available via session fallback"
         );
 
         q.focused_button_move_left();
         assert_eq!(
             q.focused_button_action(),
-            Some(super::super::button_row::ButtonAction::SelectScope(
-                astra_turn_core::permission_scope::AllowScope::RestOfSession
+            Some(super::super::button_row::ButtonAction::Respond(
+                ApprovalResponse::AllowOnce
             )),
-            "Session scope remains available for untrusted workspaces"
+            "Allow once remains available for untrusted workspaces"
         );
     }
 
     #[test]
-    fn scope_selection_requires_match_target_before_resolving() {
-        let mut q = ApprovalQueue::new();
-        let (tx, mut rx) = oneshot::channel();
-        q.push(
-            "bash".into(),
-            "git status".into(),
-            None,
-            "execute".into(),
-            tx,
-        );
-
-        assert!(q.select_scope_for_focused(
-            astra_turn_core::permission_scope::AllowScope::RestOfSession
-        ));
-        assert!(rx.try_recv().is_err(), "scope selection must not resolve");
-
-        let response = q
-            .response_for_match_target(AllowMatchTarget::Tool)
-            .expect("match target response");
-        assert!(q.respond_focused(response));
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            ApprovalResponse::AlwaysAllowScopedTarget {
-                scope: astra_turn_core::permission_scope::AllowScope::RestOfSession,
-                match_target: AllowMatchTarget::Tool,
-            }
-        );
-    }
-
-    #[test]
-    fn custom_prefix_input_accepts_only_source_prefixes() {
+    fn focused_button_action_blocks_always_for_compound_commands() {
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
-        let mut meta = ApprovalMetadata::default();
-        meta.custom_match_source = "git status --short".to_string();
         q.push_with_metadata(
             "bash".into(),
-            "git status --short".into(),
+            "cd rust && cargo test".into(),
             None,
             "execute".into(),
             tx,
-            meta,
-        );
-        assert!(q.select_scope_for_focused(
-            astra_turn_core::permission_scope::AllowScope::RestOfSession
-        ));
-        assert!(q.enter_custom_prefix_for_focused());
-        let empty_view = q.focused_view().unwrap();
-        assert_eq!(empty_view.custom_match_input.as_deref(), Some(""));
-        assert_eq!(
-            empty_view.custom_match_source.as_deref(),
-            Some("git status --short")
-        );
-        assert!(
-            empty_view
-                .selection_hint
-                .as_deref()
-                .unwrap()
-                .contains("Type a prefix of `git status --short`")
+            ApprovalMetadata::default().with_scope_shape(true, false),
         );
 
-        for ch in "git st".chars() {
-            assert!(q.push_custom_prefix_char(ch), "{ch:?} should extend prefix");
-        }
+        q.focused_button_move_right();
         assert!(
-            !q.push_custom_prefix_char('x'),
-            "non-prefix character must be rejected"
-        );
-        assert_eq!(
-            q.focused_view().unwrap().custom_match_input.as_deref(),
-            Some("git st")
-        );
-        assert_eq!(
-            q.submit_custom_prefix_for_focused(),
-            Some(ApprovalResponse::AlwaysAllowScopedTarget {
-                scope: astra_turn_core::permission_scope::AllowScope::RestOfSession,
-                match_target: AllowMatchTarget::Prefix("git st".to_string()),
-            })
+            q.focused_button_action().is_none(),
+            "compound shell commands must keep Always disabled"
         );
     }
 
     #[test]
-    fn custom_prefix_input_rejects_trailing_chars_outside_source_prefix() {
+    fn focused_button_action_blocks_always_for_unsafe_rule_shape() {
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
-        let mut meta = ApprovalMetadata::default();
-        meta.custom_match_source = "git status --short".to_string();
         q.push_with_metadata(
             "bash".into(),
-            "git status --short".into(),
+            "bash".into(),
             None,
             "execute".into(),
             tx,
-            meta,
+            ApprovalMetadata::default().with_unsafe_rule_shape(true),
         );
-        assert!(q.select_scope_for_focused(
-            astra_turn_core::permission_scope::AllowScope::RestOfSession
-        ));
-        assert!(q.enter_custom_prefix_for_focused());
 
-        for ch in "git ".chars() {
-            assert!(q.push_custom_prefix_char(ch), "{ch:?} should extend prefix");
-        }
+        q.focused_button_move_right();
         assert!(
-            !q.push_custom_prefix_char(' '),
-            "second space is not a prefix of the original command"
+            q.focused_button_action().is_none(),
+            "requests without a safe match target must not offer Always"
         );
+    }
+
+    #[test]
+    fn untrusted_workspace_view_explains_how_to_trust() {
+        let mut q = ApprovalQueue::new();
+        let (tx, _rx) = oneshot::channel();
+        q.push_with_metadata(
+            "git_show".into(),
+            "Git show HEAD".into(),
+            None,
+            "This command needs your approval before it runs.".into(),
+            tx,
+            ApprovalMetadata::default().with_workspace_untrusted(true),
+        );
+
+        let view = q
+            .views()
+            .into_iter()
+            .next()
+            .expect("pending approval should exist");
         assert_eq!(
-            q.submit_custom_prefix_for_focused(),
-            Some(ApprovalResponse::AlwaysAllowScopedTarget {
-                scope: astra_turn_core::permission_scope::AllowScope::RestOfSession,
-                match_target: AllowMatchTarget::Prefix("git ".to_string()),
-            })
+            view.selection_hint.as_deref(),
+            Some(
+                "Always remembers for this session only. Choose Trust Workspace or run `/allow trust` to save workspace rules."
+            )
         );
     }
 }

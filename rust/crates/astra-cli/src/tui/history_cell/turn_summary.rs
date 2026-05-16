@@ -27,7 +27,7 @@ pub(crate) struct TurnSummaryCell {
     pub ttft_ms: Option<u64>,
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
-    /// Cache-read portion of `tokens_in`. Drives the `💾 N%` band.
+    /// Cache-read portion of `tokens_in`. Drives the `▓░ N%` band.
     pub cache_read_tokens: Option<u64>,
     pub tools: u32,
     pub cumulative_tokens: Option<u64>,
@@ -100,7 +100,7 @@ impl HistoryCell for TurnSummaryCell {
             segments.push(format!("🛠 {}", self.tools));
         }
 
-        // 💾 cache-hit percentage of input tokens. Only shown when
+        // ▓░ cache-hit percentage of input tokens. Only shown when
         // the provider actually reported a non-zero `cache_read`
         // this turn — first turn and non-caching providers elide
         // the segment entirely so the band doesn't lie about 0%
@@ -110,7 +110,7 @@ impl HistoryCell for TurnSummaryCell {
             && tin > 0
         {
             let pct = ((cache_read as f64 / tin as f64) * 100.0).round() as u32;
-            segments.push(format!("💾 {pct}%"));
+            segments.push(format!("▓░ {pct}%"));
         }
 
         // Σ session totals — either the running cumulative token
@@ -276,7 +276,7 @@ mod tests {
         // 23.2k tokens in, 18k cache read → ~78%
         c.cache_read_tokens = Some(18_000);
         let out = render(&c, 120);
-        assert!(out.contains("💾"), "cache icon missing: {out}");
+        assert!(out.contains("▓░"), "cache icon missing: {out}");
         assert!(out.contains("78%"), "expected ~78% hit rate in: {out}");
     }
 
@@ -288,7 +288,7 @@ mod tests {
         let mut c = mk_full();
         c.cache_read_tokens = None;
         let out = render(&c, 120);
-        assert!(!out.contains("💾"), "cache chip must be elided: {out}");
+        assert!(!out.contains("▓░"), "cache chip must be elided: {out}");
     }
 
     #[test]

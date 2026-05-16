@@ -341,15 +341,6 @@ fn has_shell_injection_vector(command: &str) -> bool {
     has_shell_injection_patterns(command) || command.contains(';')
 }
 
-fn split_compound_segments(command: &str) -> impl Iterator<Item = &str> {
-    command
-        .split('\n')
-        .flat_map(|chunk| chunk.split("&&"))
-        .flat_map(|chunk| chunk.split("||"))
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
-}
-
 /// Why a bash command was classified as **requiring approval** (not read-only).
 ///
 /// Returned by [`bash_command_approval_reason`]. Surfaced in CLI approval
@@ -479,37 +470,16 @@ pub fn bash_command_approval_reason(command: &str) -> Option<BashApprovalReason>
         return Some(BashApprovalReason::ShellInjection);
     }
 
-    let mut saw_segment = false;
-    let mut first_failure: Option<BashApprovalReason> = None;
-    for segment in split_compound_segments(normalized) {
-        saw_segment = true;
-        let reason = if segment.contains('|') {
-            let mut saw_pipe_segment = false;
-            let mut pipe_failure: Option<BashApprovalReason> = None;
-            for pipe_segment in segment.split('|').map(str::trim).filter(|s| !s.is_empty()) {
-                saw_pipe_segment = true;
-                if let Some(r) = bash_segment_approval_reason(pipe_segment) {
-                    pipe_failure = Some(r);
-                    break;
-                }
-            }
-            if !saw_pipe_segment {
-                Some(BashApprovalReason::Empty)
-            } else {
-                pipe_failure
-            }
-        } else {
-            bash_segment_approval_reason(segment)
-        };
-        if let Some(r) = reason {
-            first_failure = Some(r);
-            break;
-        }
-    }
-    if !saw_segment {
+    let parsed = crate::permission_compound_command::tokenize_compound_command(normalized);
+    if parsed.steps.is_empty() {
         return Some(BashApprovalReason::Empty);
     }
-    first_failure
+    for step in parsed.steps {
+        if let Some(reason) = bash_segment_approval_reason(step.command.as_str()) {
+            return Some(reason);
+        }
+    }
+    None
 }
 
 /// Segment-level classifier with rationale. Returns `None` if the segment is
@@ -751,6 +721,12 @@ mod tests {
         assert!(bash_command_is_read_only(
             "cd rust && cargo test --no-run 2>&1 | tail -20"
         ));
+        assert!(bash_command_is_read_only(
+            r#"cd /home/xupeng/github/astra && grep -n "fn powershell\|fn bash_with_cancel\|execute_with_metadata_responsive" rust/crates/astra-cli/src/edge_tools/shell.rs rust/crates/astra-cli/src/cli/stream_render.rs"#
+        ));
+        assert!(bash_command_is_read_only(
+            r#"cd rust && grep -n "is_unsafe_bare_shell_prefix\|UNSAFE_SHELL\|is_dangerous_bash_allow_shape" crates/astra-cli/src/edge_tools/shell.rs | head -n 20"#
+        ));
 
         // cd-prefixed commands
         assert!(bash_command_is_read_only("cd project && ls"));
@@ -803,6 +779,10 @@ mod tests {
         assert!(!bash_command_is_read_only(
             "cargo check 2>&1 | tee build.log"
         ));
+        // Regression for the compound-parsing unification: an unsafe step on
+        // the RHS of a pipe must still mark the chain as approval-required.
+        assert!(!bash_command_is_read_only("ls | rm -rf /"));
+        assert!(!bash_command_is_read_only("git status | sh"));
     }
 
     #[test]

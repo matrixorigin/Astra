@@ -183,12 +183,21 @@ fn approval_scope_context_for_tool(
     workspace_untrusted: bool,
 ) -> astra_turn_core::permission_scope::ScopeAvailabilityContext {
     use astra_turn_core::permission_engine::RiskTag;
+    use astra_turn_core::permission_memory_profile::{
+        PersistentMemoryBlock, permission_memory_profile,
+    };
 
     let mut ctx = astra_turn_core::permission_scope::ScopeAvailabilityContext {
         source_agent_present,
         workspace_untrusted,
         ..Default::default()
     };
+    let memory_profile = permission_memory_profile(tool, args);
+    ctx.unsafe_rule_shape = !memory_profile.has_stable_target
+        || matches!(
+            memory_profile.persistent_block,
+            Some(PersistentMemoryBlock::UnsafeRuleShape)
+        );
 
     let base_tag = match astra_turn_core::cloud_approval_policy::cloud_gated_tool_kind_with_args(
         tool,
@@ -210,14 +219,19 @@ fn approval_scope_context_for_tool(
         push_risk_tag(&mut ctx.risk_tags, RiskTag::WritesSensitiveFile);
     }
 
-    if tool == "bash"
+    if matches!(tool, "bash" | "powershell")
         && let Some(cmd) = args.get("command").and_then(|v| v.as_str())
     {
-        let parsed = astra_turn_core::permission_compound_command::tokenize_compound_command(cmd);
-        ctx.is_compound_command = parsed.steps.len() > 1;
-        ctx.has_dynamic_eval = parsed.has_dynamic_eval;
+        ctx.is_compound_command = matches!(
+            memory_profile.persistent_block,
+            Some(PersistentMemoryBlock::CompoundCommand)
+        );
+        ctx.has_dynamic_eval = matches!(
+            memory_profile.persistent_block,
+            Some(PersistentMemoryBlock::DynamicEval)
+        );
 
-        if !astra_runtime::tool_sandbox::validate_git_command(cmd).is_empty() {
+        if tool == "bash" && !astra_runtime::tool_sandbox::validate_git_command(cmd).is_empty() {
             push_risk_tag(&mut ctx.risk_tags, RiskTag::GitDestructive);
         }
     }
@@ -232,6 +246,11 @@ fn approval_scope_context_for_tool(
     }
 
     ctx
+}
+
+fn approval_has_stable_memory_target(tool: &str, args: &Value) -> bool {
+    astra_turn_core::permission_memory_profile::permission_memory_profile(tool, args)
+        .has_stable_target
 }
 
 fn approval_default_always_scope(
@@ -257,6 +276,14 @@ fn approval_default_always_scope(
     }
 
     AllowScope::OnceThisCall
+}
+
+fn approval_memory_preview(tool: &str, args: &Value, scope_label: Option<&str>) -> String {
+    let location = scope_label
+        .map(|label| format!("under `{label}/`"))
+        .unwrap_or_else(|| "in this workspace".to_string());
+
+    astra_turn_core::permission_match_target::remember_preview(tool, args, &location)
 }
 
 fn audit_scope_for_always(
@@ -305,9 +332,7 @@ fn approval_memory_action(
 
     match response {
         ApprovalResponse::AllowOnce => ApprovalMemoryAction::None,
-        ApprovalResponse::AlwaysAllow
-        | ApprovalResponse::AlwaysAllowScoped(_)
-        | ApprovalResponse::AlwaysAllowScopedTarget { .. } => {
+        ApprovalResponse::AlwaysAllow => {
             let selected_scope = response.always_scope(always_scope).unwrap_or(always_scope);
             match selected_scope {
                 AllowScope::Project => ApprovalMemoryAction::PersistProjectRule,
@@ -317,7 +342,7 @@ fn approval_memory_action(
                 AllowScope::User => ApprovalMemoryAction::PersistUserRule,
             }
         }
-        ApprovalResponse::Skip | ApprovalResponse::Deny => ApprovalMemoryAction::None,
+        ApprovalResponse::Deny => ApprovalMemoryAction::None,
     }
 }
 
@@ -331,6 +356,12 @@ fn persist_scoped_allow_rule(
 ) {
     let default_target = astra_turn_core::permission_match_target::default_match_target(tool, args);
     let match_target = match_target.unwrap_or(&default_target);
+    let location = match target {
+        astra_turn_core::permission_audit::PersistTarget::Project => "in this workspace",
+        astra_turn_core::permission_audit::PersistTarget::User => "for this user",
+    };
+    let remember_preview =
+        astra_turn_core::permission_match_target::remember_preview(tool, args, location);
     pm.record_approval_with_match_target(tool, args, match_target, true);
     let rule = crate::permission_manager::PermissionManager::make_allow_rule_with_match_target(
         tool,
@@ -348,11 +379,11 @@ fn persist_scoped_allow_rule(
         };
         astra_core::agent_warn!(
             "permission",
-            "Always allow for {tool} is session-only; failed to save rule {rule} to {target_label}: {err}"
+            "Always allow for {remember_preview} is session-only; failed to save rule {rule} to {target_label}: {err}"
         );
         if let Some(tx) = save_warning_tx {
             let _ = tx.send(super::chat_stream::StreamEvent::StatusLine(format!(
-                "Failed to save permission rule {rule} to {target_label}: {err}"
+                "Failed to save Always allow for {remember_preview} to {target_label}: {err}"
             )));
         }
     }
@@ -2105,7 +2136,7 @@ impl CliSseStreamHost<'_> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let header = format!("Cloud approval required: {tool}");
         let reason = if matches!(approval_kind, astra_thin_client::ApprovalKind::Explicit) {
-            "This tool call requires explicit approval before it can run.".to_string()
+            "This tool call requires approval before it can run.".to_string()
         } else {
             "Cloud approval required before this tool can run.".to_string()
         };
@@ -2146,20 +2177,10 @@ impl CliSseStreamHost<'_> {
         ));
         match response {
             ApprovalResponse::AllowOnce => ApprovalDecision::Allow,
-            // The current TUI button row has one Always button.
             // Explicit cloud approvals are confirm-once by contract,
-            // so treat Always as AllowOnce until the P3 scope picker
-            // can disable persistent scopes for this prompt kind.
-            ApprovalResponse::AlwaysAllow
-            | ApprovalResponse::AlwaysAllowScoped(_)
-            | ApprovalResponse::AlwaysAllowScopedTarget { .. }
-                if explicit =>
-            {
-                ApprovalDecision::Allow
-            }
-            ApprovalResponse::AlwaysAllow
-            | ApprovalResponse::AlwaysAllowScoped(_)
-            | ApprovalResponse::AlwaysAllowScopedTarget { .. } => {
+            // so treat Always as AllowOnce for this prompt kind.
+            ApprovalResponse::AlwaysAllow if explicit => ApprovalDecision::Allow,
+            ApprovalResponse::AlwaysAllow => {
                 let action = approval_memory_action(&response, always_scope, true);
                 let save_warning_tx = self.stream_event_tx.clone();
                 if let Some(pm) = self.perm_manager.as_mut() {
@@ -2181,12 +2202,6 @@ impl CliSseStreamHost<'_> {
                         ApprovalDecision::Allow
                     }
                 }
-            }
-            ApprovalResponse::Skip => {
-                if let Some(pm) = self.perm_manager.as_mut() {
-                    pm.record_approval(tool, Some(&approval_args), false);
-                }
-                ApprovalDecision::Deny
             }
             ApprovalResponse::Deny => ApprovalDecision::Deny,
         }
@@ -2494,7 +2509,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     use super::chat_stream::ApprovalResponse;
                     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                     // Issue #326 P3: compute the metadata bundle so
-                    // the TUI card can render the will-save preview,
+                    // the TUI card can render the remember preview,
                     // risk badge, and (if applicable) compound-
                     // command split. Senders without this context
                     // would call ApprovalRequest::bare instead.
@@ -2519,7 +2534,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
 
                     // Issue #326 P3/P5: one shared host-side
                     // classifier feeds the risk badges, batch-group
-                    // safety gate, will-save visibility, and the
+                    // safety gate, remember-preview visibility, and the
                     // actual Always storage action.
                     let workspace_untrusted = self
                         .perm_manager
@@ -2535,30 +2550,15 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     metadata.workspace_untrusted = scope_ctx.workspace_untrusted;
                     metadata.is_compound_command = scope_ctx.is_compound_command;
                     metadata.has_dynamic_eval = scope_ctx.has_dynamic_eval;
+                    metadata.unsafe_rule_shape = scope_ctx.unsafe_rule_shape;
                     let always_scope = approval_default_always_scope(&scope_ctx);
-                    metadata.custom_match_source =
-                        astra_turn_core::permission_match_target::custom_prefix_source(&t, args);
-
-                    // Will-save: what would Always persist? We use
-                    // the same make_allow_rule the post-resolve
-                    // path uses, so the user sees an exact preview
-                    // of what permissions.json will gain. Only show
-                    // it when the actual default Always scope is
-                    // Project; session-only / call-only approvals
-                    // must not advertise an on-disk write.
+                    // Show what Always will remember in product
+                    // language. The persisted rule remains an internal
+                    // detail; the UI must not leak `Bash(...:*)` or
+                    // other permissions.json DSL.
                     if always_scope == astra_turn_core::permission_scope::AllowScope::Project {
-                        let will_save =
-                            crate::permission_manager::PermissionManager::make_allow_rule(&t, args);
-                        // Issue #326 P5 / scenario #28: include
-                        // the package root in the will-save
-                        // preview so the user knows the rule will
-                        // be scoped to (say) `packages/web`, not
-                        // promoted globally. nearest_package_root
-                        // walks up from the cwd looking for a
-                        // package marker (Cargo.toml, package.json,
-                        // pyproject.toml, …); None means
-                        // "workspace root" — we use a literal
-                        // marker so the user sees something.
+                        // Include the package root when available so
+                        // the user understands the memory boundary.
                         let cwd = std::env::current_dir().unwrap_or_default();
                         let scope_label =
                             astra_turn_core::permission_cwd_root::nearest_package_root(&cwd, None)
@@ -2583,12 +2583,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         })
                                         .unwrap_or_else(|| p.to_string_lossy().into_owned())
                                 });
-                        let will_save_with_scope = if let Some(label) = scope_label {
-                            format!("{will_save}  (scope: {label}/)")
-                        } else {
-                            will_save
-                        };
-                        metadata.will_save_preview = Some(will_save_with_scope);
+                        metadata.remember_preview =
+                            Some(approval_memory_preview(&t, args, scope_label.as_deref()));
                     }
                     metadata.batch_group_key =
                         Some(approval_batch_group_key(&t, args, &metadata.risk_tags));
@@ -2743,17 +2739,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             ApprovalResponse::AlwaysAllow => {
                                 astra_turn_core::approval_sink::ApprovalResponse::AlwaysAllow
                             }
-                            ApprovalResponse::AlwaysAllowScoped(_) => {
-                                astra_turn_core::approval_sink::ApprovalResponse::AlwaysAllow
-                            }
-                            ApprovalResponse::AlwaysAllowScopedTarget { .. } => {
-                                astra_turn_core::approval_sink::ApprovalResponse::AlwaysAllow
-                            }
                             ApprovalResponse::Deny => {
                                 astra_turn_core::approval_sink::ApprovalResponse::Deny
-                            }
-                            ApprovalResponse::Skip => {
-                                astra_turn_core::approval_sink::ApprovalResponse::Skip
                             }
                         };
                         let scope = response
@@ -2887,7 +2874,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                  before the parent agent finishes."
                     .to_string()
             } else {
-                let mut outcome = self.executor.execute_with_metadata(tool, args).await;
+                let mut outcome = execute_with_metadata_responsive(
+                    std::sync::Arc::clone(&self.executor),
+                    tool.to_string(),
+                    args.clone(),
+                    self.cancel_token.cloned(),
+                )
+                .await;
                 // If the sandbox denied the operation, prompt the user for
                 // authorization. On approval, temporarily expand the sandbox
                 // boundary and retry the tool.
@@ -2943,15 +2936,23 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                             // Persistent: writes a tool-level allow
                                             // rule to settings for future sessions.
                                             let rule = crate::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
+                                            let remember_preview =
+                                                astra_turn_core::permission_match_target::remember_preview(
+                                                    &sandbox_tool_key,
+                                                    &guard_args,
+                                                    "in this workspace",
+                                                );
                                             pm.add_allow_rule(&rule);
                                             if let Some(err) = pm.take_last_save_error() {
                                                 astra_core::agent_warn!(
                                                     "permission",
-                                                    "Always allow for {sandbox_tool_key} is session-only; failed to save rule {rule}: {err}"
+                                                    "Always allow for {remember_preview} is session-only; failed to save rule {rule}: {err}"
                                                 );
                                                 if let Some(tx) = &self.stream_event_tx {
                                                     let _ = tx.send(super::chat_stream::StreamEvent::StatusLine(
-                                                        format!("Failed to save permission rule {rule}: {err}"),
+                                                        format!(
+                                                            "Failed to save Always allow for {remember_preview}: {err}"
+                                                        ),
                                                     ));
                                                 }
                                             }
@@ -2966,15 +2967,23 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                             astra_turn_core::permission_scope::AllowScope::User,
                                         ) => {
                                             let rule = crate::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
+                                            let remember_preview =
+                                                astra_turn_core::permission_match_target::remember_preview(
+                                                    &sandbox_tool_key,
+                                                    &guard_args,
+                                                    "for this user",
+                                                );
                                             pm.add_user_allow_rule(&rule);
                                             if let Some(err) = pm.take_last_save_error() {
                                                 astra_core::agent_warn!(
                                                     "permission",
-                                                    "Always allow for {sandbox_tool_key} is session-only; failed to save user rule {rule}: {err}"
+                                                    "Always allow for {remember_preview} is session-only; failed to save user rule {rule}: {err}"
                                                 );
                                                 if let Some(tx) = &self.stream_event_tx {
                                                     let _ = tx.send(super::chat_stream::StreamEvent::StatusLine(
-                                                        format!("Failed to save user permission rule {rule}: {err}"),
+                                                        format!(
+                                                            "Failed to save Always allow for {remember_preview}: {err}"
+                                                        ),
                                                     ));
                                                 }
                                             }
@@ -3032,7 +3041,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             {
                                 self.executor.expand_sandbox_path(dir);
                             }
-                            outcome = self.executor.execute_with_metadata(tool, args).await;
+                            outcome = execute_with_metadata_responsive(
+                                std::sync::Arc::clone(&self.executor),
+                                tool.to_string(),
+                                args.clone(),
+                                self.cancel_token.cloned(),
+                            )
+                            .await;
                             tool_result_fields = outcome.tool_result_fields;
                             outcome.output
                         } else {
@@ -3525,7 +3540,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // from saturating edge I/O or exhausting file descriptors.
         // Each future is wrapped with `catch_unwind` so a panicking tool is surfaced as
         // a tool failure instead of aborting the whole batch/turn.
-        let executor: &crate::edge_tools::ToolExecutor = &self.executor;
+        let executor = std::sync::Arc::clone(&self.executor);
         // Use the process-wide shared semaphore so the concurrency cap
         // genuinely spans every batch and every concurrent session in this
         // process — previously each batch constructed its own `Semaphore::new(10)`,
@@ -3544,6 +3559,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     let args = req.args.clone();
                     let request_id = req.request_id.clone();
                     let sem = sem.clone();
+                    let executor = std::sync::Arc::clone(&executor);
+                    let cancel_token_for_tool = self.cancel_token.cloned();
                     let speculative = speculative_by_id.get(&req.request_id).cloned();
                     let cancel_token = self.cancel_token.cloned();
                     async move {
@@ -3595,9 +3612,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         // (it lives only for this batch), so acquire() won't fail; the
                         // `ok()` fallback is defensive.
                         let _permit = sem.acquire_owned().await.ok();
-                        let exec = catch_tool_execution_panic(
-                            executor.execute_with_metadata(&tool, &effective_args),
-                        );
+                        let exec = catch_tool_execution_panic(execute_with_metadata_responsive(
+                            std::sync::Arc::clone(&executor),
+                            tool.clone(),
+                            effective_args.clone(),
+                            cancel_token_for_tool,
+                        ));
                         let (outcome, dur) = if let Some(token) = cancel_token {
                             tokio::select! {
                                 biased;
@@ -3788,7 +3808,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 pm.record_approval(&sandbox_tool_key, Some(&args), true);
             }
             let (retried, retry_dur) =
-                catch_tool_execution_panic(self.executor.execute_with_metadata(&tool, &args)).await;
+                catch_tool_execution_panic(execute_with_metadata_responsive(
+                    std::sync::Arc::clone(&self.executor),
+                    tool.clone(),
+                    args.clone(),
+                    self.cancel_token.cloned(),
+                ))
+                .await;
             outputs[pos] = (retried, retry_dur);
         }
 
@@ -3976,7 +4002,8 @@ fn build_streaming_tool_exec(
                         other => other.clone(),
                     })
                     .unwrap_or_else(|| serde_json::json!({}));
-                let outcome = executor.execute_with_metadata(&tool_name, &args).await;
+                let outcome =
+                    execute_with_metadata_responsive(executor, tool_name.clone(), args, None).await;
                 (call_id, tool_name, outcome.output, true)
             })
         });
@@ -6065,6 +6092,69 @@ where
     }
 }
 
+/// Whether a tool's edge implementation is dominated by a long-running
+/// blocking syscall (e.g. spawning a child shell + busy-polling for exit) and
+/// should therefore be moved off the async runtime worker via
+/// `spawn_blocking`. Gated by `cfg(windows)` because `powershell` only has a
+/// cancelable sync path on Windows — on non-Windows it falls through to the
+/// generic async path inside `execute_with_metadata`, where `spawn_blocking`
+/// would just add latency without preventing a stall.
+fn should_offload_blocking_tool(tool_name: &str) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(tool_name, "bash" | "powershell")
+    }
+    #[cfg(not(windows))]
+    {
+        matches!(tool_name, "bash")
+    }
+}
+
+async fn execute_with_metadata_responsive(
+    executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
+    tool_name: String,
+    args: Value,
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
+) -> crate::edge_tools::ToolExecutionOutcome {
+    if !should_offload_blocking_tool(&tool_name) {
+        return executor
+            .execute_with_metadata_cancelable(&tool_name, &args, cancel_token.as_ref())
+            .await;
+    }
+
+    // The cancelable bash/powershell paths are sync work wrapped in an
+    // `async fn`, so we can call the sync core directly inside
+    // `spawn_blocking`. This avoids re-entering the runtime via
+    // `Handle::block_on` from a blocking-pool thread, which is fragile on
+    // `current_thread` runtimes and a well-known anti-pattern.
+    let executor_for_blocking = std::sync::Arc::clone(&executor);
+    let tool_for_blocking = tool_name.clone();
+    let args_for_blocking = args.clone();
+    let cancel_for_blocking = cancel_token.clone();
+    let blocking_outcome = tokio::task::spawn_blocking(move || {
+        executor_for_blocking.execute_blocking_shell_tool(
+            &tool_for_blocking,
+            &args_for_blocking,
+            cancel_for_blocking.as_ref(),
+        )
+    })
+    .await;
+    match blocking_outcome {
+        Ok(Some(outcome)) => outcome,
+        // `should_offload_blocking_tool` can only return true for tool names
+        // that `execute_blocking_shell_tool` handles, so `None` here is
+        // unreachable; fall back to the async path defensively.
+        Ok(None) => {
+            executor
+                .execute_with_metadata_cancelable(&tool_name, &args, cancel_token.as_ref())
+                .await
+        }
+        Err(join_error) => crate::edge_tools::ToolExecutionOutcome::error(format!(
+            "Tool execution panicked: {join_error}"
+        )),
+    }
+}
+
 /// Human-friendly tool description from a `ToolCallRecord`'s name + args_preview.
 /// Mirrors `format_tool_description_with_output` but works without full args JSON.
 pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<&str>) -> String {
@@ -6441,6 +6531,36 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_bash_execution_yields_to_runtime_ticks() {
+        let dir = tempdir().expect("tempdir");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(dir.path()));
+        let execution = execute_with_metadata_responsive(
+            executor,
+            "bash".to_string(),
+            serde_json::json!({
+                "command": "sleep 0.2 && echo responsive",
+                "timeout": 2.0,
+            }),
+            None,
+        );
+        tokio::pin!(execution);
+
+        tokio::select! {
+            biased;
+            outcome = &mut execution => {
+                panic!(
+                    "foreground bash completed before the runtime could tick; output={}",
+                    outcome.output
+                );
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+
+        let outcome = execution.await;
+        assert!(outcome.output.contains("responsive"), "{}", outcome.output);
+    }
+
     // ── D-9 regression: speculative success flag must gate reuse ──
     //
     // Guards against the cascade bug where a speculative tool execution that
@@ -6596,6 +6716,159 @@ mod tests {
         assert_eq!(
             approval_default_always_scope(&ctx),
             AllowScope::RestOfSession
+        );
+    }
+
+    #[test]
+    fn approval_scope_context_allows_always_for_cd_wrapped_single_command() {
+        use astra_turn_core::permission_scope::AllowScope;
+
+        let ctx = approval_scope_context_for_tool(
+            "bash",
+            &serde_json::json!({"command": r#"cd rust && grep -n "restore_session_into_state\|is_low_information_followup" rust/crates/astra-cli/src/cli/chat_turn.rs"#}),
+            false,
+            false,
+        );
+
+        assert!(
+            !ctx.is_compound_command,
+            "cd-wrapper around one real command should not disable Always"
+        );
+        assert_eq!(approval_default_always_scope(&ctx), AllowScope::Project);
+    }
+
+    #[test]
+    fn approval_scope_context_allows_always_for_cd_wrapped_cargo_build() {
+        use astra_turn_core::permission_scope::AllowScope;
+
+        let ctx = approval_scope_context_for_tool(
+            "bash",
+            &serde_json::json!({"command": "cd /home/xupeng/github/astra/rust && cargo build -p astra-turn-core -p astra-cli"}),
+            false,
+            false,
+        );
+
+        assert!(
+            !ctx.is_compound_command,
+            "cd-wrapper cargo build should not disable Always"
+        );
+        assert_eq!(approval_default_always_scope(&ctx), AllowScope::Project);
+    }
+
+    #[test]
+    fn approval_scope_context_allows_always_for_cd_wrapped_cargo_test() {
+        use astra_turn_core::permission_scope::AllowScope;
+
+        let ctx = approval_scope_context_for_tool(
+            "bash",
+            &serde_json::json!({"command": "cd /home/xupeng/github/astra/rust && cargo test -p astra-turn-core --lib cloud_approval_policy -- --nocapture"}),
+            false,
+            false,
+        );
+
+        assert!(
+            !ctx.is_compound_command,
+            "cd-wrapper cargo test should not disable Always"
+        );
+        assert_eq!(approval_default_always_scope(&ctx), AllowScope::Project);
+    }
+
+    #[test]
+    fn approval_scope_context_allows_always_for_read_only_pipe_chain() {
+        use astra_turn_core::permission_scope::AllowScope;
+
+        let ctx = approval_scope_context_for_tool(
+            "bash",
+            &serde_json::json!({"command": r#"cd rust && grep -n "is_unsafe_bare_shell_prefix\|UNSAFE_SHELL\|is_dangerous_bash_allow_shape" crates/astra-cli/src/edge_tools/shell.rs | head -n 20"#}),
+            false,
+            false,
+        );
+
+        assert!(
+            !ctx.is_compound_command,
+            "read-only pipe chains should still allow Always"
+        );
+        assert_eq!(approval_default_always_scope(&ctx), AllowScope::Project);
+    }
+
+    #[test]
+    fn approval_scope_context_allows_always_for_quoted_grep_regex() {
+        use astra_turn_core::permission_scope::AllowScope;
+
+        let ctx = approval_scope_context_for_tool(
+            "bash",
+            &serde_json::json!({"command": r#"cd /home/xupeng/github/astra && grep -n "fn powershell\|fn bash_with_cancel\|execute_with_metadata_responsive" rust/crates/astra-cli/src/edge_tools/shell.rs rust/crates/astra-cli/src/cli/stream_render.rs"#}),
+            false,
+            false,
+        );
+
+        assert!(
+            !ctx.is_compound_command,
+            "quoted grep regex alternation should not disable Always"
+        );
+        assert_eq!(approval_default_always_scope(&ctx), AllowScope::Project);
+    }
+
+    #[test]
+    fn approval_memory_preview_uses_product_language_not_permission_dsl() {
+        let preview = approval_memory_preview(
+            "bash",
+            &serde_json::json!({"command": "npm test -- --watch"}),
+            Some("web"),
+        );
+
+        assert_eq!(preview, "the `npm test` command family under `web/`");
+        assert!(
+            !preview.contains("Bash(") && !preview.contains("argv_prefix"),
+            "approval prompt must not expose permission-rule syntax: {preview}"
+        );
+    }
+
+    #[test]
+    fn approval_memory_preview_describes_file_edits_without_exact_scope_terms() {
+        let preview = approval_memory_preview(
+            "write_file",
+            &serde_json::json!({"path": "src/lib.rs"}),
+            None,
+        );
+
+        assert_eq!(preview, "file edits in this workspace");
+        assert!(
+            !preview.contains("Exact") && !preview.contains("Prefix"),
+            "approval prompt must not expose match-target terms: {preview}"
+        );
+    }
+
+    #[test]
+    fn approval_scope_context_blocks_persistent_memory_without_command_shape() {
+        use astra_turn_core::permission_scope::AllowScope;
+
+        let ctx = approval_scope_context_for_tool("bash", &serde_json::json!({}), false, false);
+
+        assert!(ctx.unsafe_rule_shape);
+        assert_eq!(approval_default_always_scope(&ctx), AllowScope::RestOfTurn);
+    }
+
+    #[test]
+    fn approval_scope_context_allows_exact_memory_for_interpreter_command() {
+        use astra_turn_core::permission_scope::AllowScope;
+
+        let ctx = approval_scope_context_for_tool(
+            "bash",
+            &serde_json::json!({"command": "python -c 'print(1)'"}),
+            false,
+            false,
+        );
+
+        assert!(!ctx.unsafe_rule_shape);
+        assert_eq!(approval_default_always_scope(&ctx), AllowScope::Project);
+        assert_eq!(
+            approval_memory_preview(
+                "bash",
+                &serde_json::json!({"command": "python -c 'print(1)'"}),
+                None
+            ),
+            "this shell command in this workspace"
         );
     }
 

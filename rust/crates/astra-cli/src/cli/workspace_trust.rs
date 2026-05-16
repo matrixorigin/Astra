@@ -135,10 +135,10 @@ impl WorkspaceTrustEvaluation {
     #[must_use]
     pub fn summary_line(&self) -> String {
         if self.applies_project_allow() {
-            return "Workspace trust: trusted; project allow rules are active".to_string();
+            return "Workspace trust: trusted; saved workspace rules are active".to_string();
         }
         format!(
-            "Workspace trust: {}; project allow rules are ignored",
+            "Workspace trust: {}; saved workspace rules are ignored",
             self.reason.display()
         )
     }

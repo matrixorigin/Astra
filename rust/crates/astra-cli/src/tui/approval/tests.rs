@@ -145,11 +145,11 @@ fn respond_by_id_finds_nonfocused_entry() {
     let (id_b, rx_b) = enqueue(&mut q, "b");
     let (id_c, _rx_c) = enqueue(&mut q, "c");
     // Focus is on a; resolve b out of order.
-    assert!(q.respond_by_id(id_b, ApprovalResponse::Skip));
+    assert!(q.respond_by_id(id_b, ApprovalResponse::Deny));
     assert_eq!(q.len(), 2);
     let remaining: Vec<_> = q.views().iter().map(|v| v.tool.clone()).collect();
     assert_eq!(remaining, vec!["a", "c"]);
-    assert_eq!(rx_b.blocking_recv().unwrap(), ApprovalResponse::Skip);
+    assert_eq!(rx_b.blocking_recv().unwrap(), ApprovalResponse::Deny);
 
     // rx_a still pending — the queue shouldn't have resolved it.
     // Drop q to release the sender without firing.

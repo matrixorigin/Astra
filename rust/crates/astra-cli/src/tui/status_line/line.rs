@@ -16,6 +16,8 @@ pub(crate) enum PermissionMode {
     #[default]
     Ask,
     Auto,
+    Plan,
+    AcceptEdits,
     Deny,
 }
 
@@ -24,6 +26,8 @@ impl PermissionMode {
         match self {
             Self::Ask => "",
             Self::Auto => "⚡auto",
+            Self::Plan => "plan",
+            Self::AcceptEdits => "✎edits",
             Self::Deny => "⚡deny",
         }
     }
@@ -126,6 +130,18 @@ impl StatusLine {
                 out.left.push(Segment::styled(
                     PermissionMode::Auto.chip_text(),
                     Style::default().fg(Color::Yellow),
+                ));
+            }
+            PermissionMode::Plan => {
+                out.left.push(Segment::styled(
+                    PermissionMode::Plan.chip_text(),
+                    Style::default().fg(Color::Blue),
+                ));
+            }
+            PermissionMode::AcceptEdits => {
+                out.left.push(Segment::styled(
+                    PermissionMode::AcceptEdits.chip_text(),
+                    Style::default().fg(Color::Cyan),
                 ));
             }
             PermissionMode::Deny => {

@@ -1,8 +1,7 @@
 //! Pure logic for the Cursor-style button row on an approval cell.
 //!
 //! The cell renders a horizontal row of buttons with a focus index. Arrow
-//! keys shift focus; Enter either resolves the approval or advances from
-//! scope selection into match-target selection.
+//! keys shift focus; Enter resolves the approval.
 //!
 //! When the pending queue contains more than one entry we prepend two
 //! **batch buttons** (Accept all / Reject all). Those are surfaced
@@ -12,8 +11,6 @@
 #![allow(dead_code)]
 
 use crate::chat_stream::ApprovalResponse;
-use astra_turn_core::permission_match_target::AllowMatchTarget;
-use astra_turn_core::permission_scope::AllowScope;
 
 /// What a single button does when Enter fires.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,14 +19,6 @@ pub(crate) enum ButtonAction {
     Respond(ApprovalResponse),
     /// Resolve the focused approval's batch group with this response.
     RespondAll(ApprovalResponse),
-    /// Move from scope selection into match-target selection.
-    SelectScope(AllowScope),
-    /// Resolve the selected scope with this match target.
-    SelectMatch(AllowMatchTarget),
-    /// Return from match-target selection to scope selection.
-    BackToScopes,
-    /// Enter custom-prefix input mode.
-    EditCustomPrefix,
 }
 
 /// Static metadata for a button.
@@ -39,46 +28,19 @@ pub(crate) struct Button {
     pub action: ButtonAction,
 }
 
-/// The four single-approval buttons in presentation order.
+/// Primary approval buttons in presentation order.
 pub(crate) const PRIMARY_BUTTONS: &[Button] = &[
     Button {
-        label: "Accept",
+        label: "Allow once",
         action: ButtonAction::Respond(ApprovalResponse::AllowOnce),
     },
-    // Issue #326 P5e: Reject is intentionally **one-shot** — it
-    // resolves THIS approval as Deny and does NOT persist a deny
-    // rule. The user's "no" is local to this call. The only way
-    // to add a permanent deny is the explicit
-    // `/permissions add deny <rule>` slash command, so accidental
-    // Rejects never grow the deny list.
-    //
-    // The user-visible label is short ("Reject") for terminal-
-    // width reasons; the tooltip / footer text spells out the
-    // semantics ("Reject (this call only)") so first-time users
-    // aren't surprised.
+    Button {
+        label: "Always",
+        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllow),
+    },
     Button {
         label: "Reject",
         action: ButtonAction::Respond(ApprovalResponse::Deny),
-    },
-    Button {
-        label: "Turn",
-        action: ButtonAction::SelectScope(AllowScope::RestOfTurn),
-    },
-    Button {
-        label: "Session",
-        action: ButtonAction::SelectScope(AllowScope::RestOfSession),
-    },
-    Button {
-        label: "Project",
-        action: ButtonAction::SelectScope(AllowScope::Project),
-    },
-    Button {
-        label: "User",
-        action: ButtonAction::SelectScope(AllowScope::User),
-    },
-    Button {
-        label: "Skip",
-        action: ButtonAction::Respond(ApprovalResponse::Skip),
     },
 ];
 
@@ -99,32 +61,16 @@ pub(crate) const BATCH_BUTTONS: &[Button] = &[
 /// cell when the queue has more than one entry.
 pub(crate) const PRIMARY_WITH_BATCH: &[Button] = &[
     Button {
-        label: "Accept",
+        label: "Allow once",
         action: ButtonAction::Respond(ApprovalResponse::AllowOnce),
+    },
+    Button {
+        label: "Always",
+        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllow),
     },
     Button {
         label: "Reject",
         action: ButtonAction::Respond(ApprovalResponse::Deny),
-    },
-    Button {
-        label: "Turn",
-        action: ButtonAction::SelectScope(AllowScope::RestOfTurn),
-    },
-    Button {
-        label: "Session",
-        action: ButtonAction::SelectScope(AllowScope::RestOfSession),
-    },
-    Button {
-        label: "Project",
-        action: ButtonAction::SelectScope(AllowScope::Project),
-    },
-    Button {
-        label: "User",
-        action: ButtonAction::SelectScope(AllowScope::User),
-    },
-    Button {
-        label: "Skip",
-        action: ButtonAction::Respond(ApprovalResponse::Skip),
     },
     Button {
         label: "Accept all",
@@ -136,25 +82,6 @@ pub(crate) const PRIMARY_WITH_BATCH: &[Button] = &[
     },
 ];
 
-pub(crate) const MATCH_TARGET_BUTTONS: &[Button] = &[
-    Button {
-        label: "Exact",
-        action: ButtonAction::SelectMatch(AllowMatchTarget::Exact),
-    },
-    Button {
-        label: "This tool",
-        action: ButtonAction::SelectMatch(AllowMatchTarget::Tool),
-    },
-    Button {
-        label: "Custom prefix",
-        action: ButtonAction::EditCustomPrefix,
-    },
-    Button {
-        label: "Back",
-        action: ButtonAction::BackToScopes,
-    },
-];
-
 /// Pure button-row state. Owned per focused approval cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ButtonRow {
@@ -163,7 +90,7 @@ pub(crate) struct ButtonRow {
 }
 
 impl ButtonRow {
-    /// Row for a single pending approval (Accept / Reject / Always / Skip).
+    /// Row for a single pending approval.
     pub fn primary() -> Self {
         Self {
             buttons: PRIMARY_BUTTONS,
@@ -184,13 +111,6 @@ impl ButtonRow {
     pub fn primary_with_batch() -> Self {
         Self {
             buttons: PRIMARY_WITH_BATCH,
-            focus: 0,
-        }
-    }
-
-    pub fn match_targets() -> Self {
-        Self {
-            buttons: MATCH_TARGET_BUTTONS,
             focus: 0,
         }
     }

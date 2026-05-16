@@ -45,7 +45,6 @@ pub enum ApprovalResponse {
     AllowOnce,
     AlwaysAllow,
     Deny,
-    Skip,
 }
 
 impl ApprovalResponse {
@@ -72,9 +71,7 @@ pub trait ApprovalSink: Send + Sync {
 
     /// Convenience wrapper that converts the sink's response back
     /// into a `HardDecision`. Default impl is enough for most
-    /// sinks; override only if you need special handling for
-    /// `Skip` (e.g. mailbox-based sinks that want to surface
-    /// "parent didn't answer in time" as a distinct outcome).
+    /// sinks.
     async fn resolve(&self, prompt: ApprovalPrompt) -> HardDecision {
         let prompt_for_deny = prompt.clone();
         match self.ask(prompt).await {
@@ -84,9 +81,6 @@ pub trait ApprovalSink: Send + Sync {
                     "User denied approval for {}: {}",
                     prompt_for_deny.tool, prompt_for_deny.header
                 ),
-            },
-            ApprovalResponse::Skip => HardDecision::Deny {
-                reason: format!("Tool {} skipped without recording", prompt_for_deny.tool),
             },
         }
     }
@@ -141,7 +135,6 @@ mod tests {
         assert!(ApprovalResponse::AllowOnce.is_approved());
         assert!(ApprovalResponse::AlwaysAllow.is_approved());
         assert!(!ApprovalResponse::Deny.is_approved());
-        assert!(!ApprovalResponse::Skip.is_approved());
     }
 
     #[tokio::test]

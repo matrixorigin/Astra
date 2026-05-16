@@ -10,13 +10,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::approval_fingerprint::ApprovalFingerprint;
-use crate::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
+use crate::cloud_approval_policy::{
+    CloudGatedToolKind, cloud_gated_tool_kind, cloud_gated_tool_kind_with_args,
+};
 use crate::parallel_tool_exec::is_read_only_tool_with_args;
+use crate::permission_memory_profile::{permission_memory_profile, workspace_write_prefix};
 use crate::permission_rule_grammar::{PermissionRuleV2, serialize_rule_v2};
 use crate::permission_scope::AllowScope;
-use crate::tool_argument_hints::{
-    command_hint_from_args, normalized_argv_prefix, path_hint_from_args,
-};
+use crate::tool_argument_hints::{command_hint_from_args, path_hint_from_args};
 
 /// The second dimension of an approval choice: what future tool call
 /// should the selected scope apply to?
@@ -43,45 +44,12 @@ impl AllowMatchTarget {
     }
 }
 
-/// The default used by legacy one-step Always paths. The TUI now sends
-/// explicit match targets, but non-TUI and older paths still need a
-/// conservative, content-aware choice.
+/// Conservative content-aware match target used when the user chooses
+/// Always. The UI exposes this as "remember similar commands/actions"
+/// instead of raw exact/prefix/tool terminology.
 #[must_use]
 pub fn default_match_target(tool_name: &str, args: &Value) -> AllowMatchTarget {
-    match cloud_gated_tool_kind(tool_name) {
-        Some(CloudGatedToolKind::Execute) => command_hint_from_args(args)
-            .map(normalized_argv_prefix)
-            .filter(|prefix| !prefix.is_empty())
-            .map(AllowMatchTarget::Prefix)
-            .unwrap_or(AllowMatchTarget::Tool),
-        Some(CloudGatedToolKind::Write) => {
-            if path_hint_from_args(args).is_some() {
-                AllowMatchTarget::Exact
-            } else {
-                AllowMatchTarget::Tool
-            }
-        }
-        None => AllowMatchTarget::Tool,
-    }
-}
-
-#[must_use]
-pub fn custom_prefix_source(tool_name: &str, args: &Value) -> String {
-    match cloud_gated_tool_kind(tool_name) {
-        Some(CloudGatedToolKind::Execute) => command_hint_from_args(args)
-            .map(ToOwned::to_owned)
-            .unwrap_or_default(),
-        Some(CloudGatedToolKind::Write) => path_hint_from_args(args).unwrap_or_default(),
-        None => String::new(),
-    }
-}
-
-#[must_use]
-pub fn is_valid_custom_prefix(prefix: &str, source: &str) -> bool {
-    if prefix.is_empty() {
-        return false;
-    }
-    source.starts_with(prefix)
+    permission_memory_profile(tool_name, args).match_target
 }
 
 #[must_use]
@@ -145,13 +113,13 @@ pub fn match_target_description(
     scope: AllowScope,
     target: &AllowMatchTarget,
     tool_name: &str,
-    _args: &Value,
+    args: &Value,
 ) -> String {
     let duration = match scope {
         AllowScope::OnceThisCall => "for this request",
         AllowScope::RestOfTurn => "for the rest of this turn",
         AllowScope::RestOfSession => "in this session",
-        AllowScope::Project => "for this project",
+        AllowScope::Project => "for this workspace",
         AllowScope::User => "for this user",
     };
     let is_execute = matches!(
@@ -171,9 +139,55 @@ pub fn match_target_description(
         AllowMatchTarget::Prefix(prefix) if is_execute => {
             format!("Approve commands starting with `{prefix}` {duration}.")
         }
+        AllowMatchTarget::Prefix(prefix)
+            if matches!(
+                cloud_gated_tool_kind(tool_name),
+                Some(CloudGatedToolKind::Write)
+            ) && path_hint_from_args(args)
+                .and_then(|path| workspace_write_prefix(&path))
+                .as_deref()
+                == Some(prefix.as_str()) =>
+        {
+            format!("Approve file edits in this workspace {duration}.")
+        }
         AllowMatchTarget::Prefix(prefix) => {
             format!("Approve paths matching `{prefix}` {duration}.")
         }
+    }
+}
+
+#[must_use]
+pub fn remember_preview(tool_name: &str, args: &Value, location: &str) -> String {
+    match (
+        cloud_gated_tool_kind_with_args(tool_name, Some(args)),
+        tool_name,
+        default_match_target(tool_name, args),
+    ) {
+        (_, "bash", AllowMatchTarget::Prefix(prefix)) => {
+            format!("the `{prefix}` command family {location}")
+        }
+        (_, "bash", AllowMatchTarget::Exact) => format!("this shell command {location}"),
+        (_, "bash", AllowMatchTarget::Tool) => format!("safe shell commands {location}"),
+        (Some(CloudGatedToolKind::Write), _, AllowMatchTarget::Exact) => {
+            format!("this file edit {location}")
+        }
+        (Some(CloudGatedToolKind::Write), _, AllowMatchTarget::Prefix(prefix))
+            if path_hint_from_args(args)
+                .and_then(|path| workspace_write_prefix(&path))
+                .as_deref()
+                == Some(prefix.as_str()) =>
+        {
+            format!("file edits {location}")
+        }
+        (Some(CloudGatedToolKind::Write), _, AllowMatchTarget::Tool) => {
+            format!("file edits {location}")
+        }
+        (Some(CloudGatedToolKind::Write), _, AllowMatchTarget::Prefix(prefix)) => {
+            format!("similar file edits under `{prefix}`")
+        }
+        (_, _, AllowMatchTarget::Prefix(prefix)) => format!("similar `{prefix}` calls {location}"),
+        (_, _, AllowMatchTarget::Exact) => format!("this `{tool_name}` action {location}"),
+        (_, _, AllowMatchTarget::Tool) => format!("`{tool_name}` calls {location}"),
     }
 }
 
@@ -232,19 +246,24 @@ fn prefix_rule(tool_name: &str, _args: &Value, prefix: &str) -> Option<String> {
             capability: None,
             extra: Default::default(),
         })),
-        CloudGatedToolKind::Write => Some(serialize_rule_v2(&PermissionRuleV2 {
-            tool: tool_name.to_string(),
-            argv_exact: None,
-            argv_prefix: None,
-            path_glob: None,
-            path_prefix: Some(prefix.to_string()),
-            op: Some("write".to_string()),
-            cwd_root: None,
-            git_branch: None,
-            domain: None,
-            capability: None,
-            extra: Default::default(),
-        })),
+        CloudGatedToolKind::Write => {
+            let cwd_root = path_hint_from_args(_args)
+                .and_then(|path| workspace_write_prefix(&path))
+                .filter(|root| root == prefix);
+            Some(serialize_rule_v2(&PermissionRuleV2 {
+                tool: tool_name.to_string(),
+                argv_exact: None,
+                argv_prefix: None,
+                path_glob: None,
+                path_prefix: Some(prefix.to_string()),
+                op: Some("write".to_string()),
+                cwd_root,
+                git_branch: None,
+                domain: None,
+                capability: None,
+                extra: Default::default(),
+            }))
+        }
     }
 }
 
@@ -303,6 +322,29 @@ mod tests {
     }
 
     #[test]
+    fn default_bash_target_uses_command_family_not_broad_tool_or_cd_wrapper() {
+        let args = serde_json::json!({
+            "command": "cd /home/xupeng/github/astra/rust && cargo test -p astra-cli -- --nocapture"
+        });
+        let target = default_match_target("bash", &args);
+        assert_eq!(target, AllowMatchTarget::Prefix("cargo test".to_string()));
+        let rule = allow_rule_for_match_target("bash", &args, &target);
+        assert_eq!(rule, r#"Bash(argv_prefix="cargo test", op="execute")"#);
+    }
+
+    #[test]
+    fn default_bash_target_uses_exact_for_unstable_command_family() {
+        let args = serde_json::json!({"command": "python -c 'print(1)'"});
+        let target = default_match_target("bash", &args);
+        assert_eq!(target, AllowMatchTarget::Exact);
+        let rule = allow_rule_for_match_target("bash", &args, &target);
+        assert_eq!(
+            rule,
+            r#"Bash(argv_exact="python -c 'print(1)'", op="execute")"#
+        );
+    }
+
+    #[test]
     fn path_prefix_rule_uses_literal_path_prefix() {
         let args = serde_json::json!({"path": "zzz1.md"});
         let rule = allow_rule_for_match_target(
@@ -348,10 +390,52 @@ mod tests {
     }
 
     #[test]
-    fn custom_prefix_validation_rejects_non_source_trailing_chars() {
-        assert!(is_valid_custom_prefix("git ", "git status --short"));
-        assert!(!is_valid_custom_prefix("git  ", "git status --short"));
-        assert!(!is_valid_custom_prefix("git sx", "git status --short"));
+    fn default_write_target_uses_workspace_prefix_for_safe_paths() {
+        let args =
+            serde_json::json!({"path": "rust/crates/astra-cli/src/cli/permission_manager.rs"});
+        let target = default_match_target("write_file", &args);
+        let workspace_root = std::env::current_dir()
+            .unwrap()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::current_dir().unwrap())
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(target, AllowMatchTarget::Prefix(workspace_root.clone()));
+
+        let rule = allow_rule_for_match_target("write_file", &args, &target);
+        let parsed = PermissionRule::parse(&rule);
+        assert!(parsed.matches_with_context(
+            "write_file",
+            &RuleMatchContext::from_tool_args(
+                "write_file",
+                &serde_json::json!({"path": "web/src/app/page.tsx"})
+            )
+        ));
+        assert!(!parsed.matches_with_context(
+            "write_file",
+            &RuleMatchContext::from_tool_args(
+                "write_file",
+                &serde_json::json!({"path": "/tmp/outside.txt"})
+            )
+        ));
+    }
+
+    #[test]
+    fn default_write_target_keeps_sensitive_paths_exact() {
+        let args = serde_json::json!({"path": ".env"});
+        assert_eq!(
+            default_match_target("write_file", &args),
+            AllowMatchTarget::Exact
+        );
+    }
+
+    #[test]
+    fn default_write_target_keeps_absolute_outside_workspace_exact() {
+        let args = serde_json::json!({"path": "/tmp/astra-permission-test.txt"});
+        assert_eq!(
+            default_match_target("write_file", &args),
+            AllowMatchTarget::Exact
+        );
     }
 
     #[test]
@@ -376,6 +460,40 @@ mod tests {
         assert_eq!(
             text,
             "Approve this tool for all future permission requests in this session."
+        );
+    }
+
+    #[test]
+    fn remember_preview_describes_command_family() {
+        let preview = remember_preview(
+            "bash",
+            &serde_json::json!({"command": "cd rust && cargo test -p astra-cli"}),
+            "in this workspace",
+        );
+        assert_eq!(preview, "the `cargo test` command family in this workspace");
+    }
+
+    #[test]
+    fn remember_preview_describes_workspace_writes() {
+        let preview = remember_preview(
+            "write_file",
+            &serde_json::json!({"path": "src/main.rs"}),
+            "in this workspace",
+        );
+        assert_eq!(preview, "file edits in this workspace");
+    }
+
+    #[test]
+    fn workspace_write_rule_uses_workspace_guard_not_bare_tool() {
+        let args = serde_json::json!({"path": "src/main.rs"});
+        let target = default_match_target("write_file", &args);
+        let workspace_root = workspace_write_prefix("src/main.rs").unwrap();
+        assert_eq!(target, AllowMatchTarget::Prefix(workspace_root.clone()));
+        assert_eq!(
+            allow_rule_for_match_target("write_file", &args, &target),
+            format!(
+                r#"write_file(path_prefix="{workspace_root}", op="write", cwd_root="{workspace_root}")"#
+            )
         );
     }
 }

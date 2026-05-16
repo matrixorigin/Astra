@@ -100,6 +100,36 @@ fn auto_mode_renders_yellow_chip() {
 }
 
 #[test]
+fn accept_edits_mode_renders_cyan_chip() {
+    let c = StatusContext {
+        permission_mode: PermissionMode::AcceptEdits,
+        ..ctx()
+    };
+    let s = StatusLine::from_context(&c);
+    let chip = s
+        .left
+        .iter()
+        .find(|seg| seg.text.contains("✎edits"))
+        .expect("accept_edits chip segment");
+    assert_eq!(chip.style.fg, Some(ratatui::style::Color::Cyan));
+}
+
+#[test]
+fn plan_mode_renders_blue_chip() {
+    let c = StatusContext {
+        permission_mode: PermissionMode::Plan,
+        ..ctx()
+    };
+    let s = StatusLine::from_context(&c);
+    let chip = s
+        .left
+        .iter()
+        .find(|seg| seg.text.contains("plan"))
+        .expect("plan chip segment");
+    assert_eq!(chip.style.fg, Some(ratatui::style::Color::Blue));
+}
+
+#[test]
 fn deny_mode_renders_red_chip() {
     let c = StatusContext {
         permission_mode: PermissionMode::Deny,

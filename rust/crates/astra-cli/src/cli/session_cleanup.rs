@@ -17,7 +17,6 @@ use std::time::Duration;
 use super::SessionState;
 use super::auth_flow::clear_profile_last_session;
 use super::chat_turn::enqueue_ingestion_pub;
-use super::cli_utils::prefix_chars;
 use super::edge_tools;
 use super::session_guard::{ShutdownSignal, clear_panic_guard};
 
@@ -25,7 +24,7 @@ use super::session_guard::{ShutdownSignal, clear_panic_guard};
 /// decisions in `finalize_session_exit`:
 ///   * whether to print the "Session … saved. To resume: …" hint
 ///   * whether to clear `last_session_id` from the credentials file
-///     (so the next `astra` launch does NOT auto-resume into this sid)
+///     (so the next `astra` launch does NOT keep offering this sid for resume)
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SessionExit {
     /// User typed `/exit` / `/quit` (or any slash command that returned
@@ -36,7 +35,7 @@ pub(crate) enum SessionExit {
     Eof,
     /// Ctrl-C at idle. Treated like a "cancel" rather than EOF: the
     /// session is saved (and resumable via the hint) but
-    /// `last_session_id` stays put so a plain `astra` reattaches.
+    /// `last_session_id` stays put so the next launch can still offer `/resume`.
     Interrupt,
     /// `--max-budget` reached during a turn.
     BudgetLimit,
@@ -44,7 +43,7 @@ pub(crate) enum SessionExit {
     Shutdown(ShutdownSignal),
     /// The TUI loop bailed with an error (terminal draw failure, etc.).
     /// Session stays addressable so the user can investigate and
-    /// `astra` reattaches on next launch.
+    /// the next launch can still offer `/resume`.
     Error,
 }
 
@@ -61,11 +60,10 @@ pub(crate) async fn finalize_session_exit(
         && state.turn > 0
         && let Some(ref sid) = state.session_id
     {
-        let short = prefix_chars(sid, 8);
-        eprintln!(
-            "{}",
-            format!("  Session {short}… saved. To resume: /resume {sid}").dim()
-        );
+        let (label, command) = resume_hint_lines(sid);
+        eprintln!();
+        eprintln!("{}", format!("  {label}").dim());
+        eprintln!("{}", format!("    {command}").cyan());
     }
 
     if should_clear_last_session_id(reason) && state.session_id.is_some() {
@@ -79,10 +77,17 @@ fn should_show_resume_hint(reason: SessionExit) -> bool {
     !matches!(reason, SessionExit::Error)
 }
 
+fn resume_hint_lines(session_id: &str) -> (String, String) {
+    (
+        "Resume this session with:".to_string(),
+        format!("/resume {session_id}"),
+    )
+}
+
 fn should_clear_last_session_id(reason: SessionExit) -> bool {
     // Only true EOF clears the persisted "last session". Ctrl-C, `/exit`,
     // budget cap, signals, and errors all leave it alone so the next
-    // `astra` launch reattaches.
+    // `astra` launch can still offer explicit resume.
     matches!(reason, SessionExit::Eof)
 }
 
@@ -285,5 +290,12 @@ mod tests {
             ShutdownSignal::Sighup
         )));
         assert!(!should_clear_last_session_id(SessionExit::Error));
+    }
+
+    #[test]
+    fn resume_hint_prints_copyable_resume_command() {
+        let (label, command) = resume_hint_lines("1234-5678");
+        assert_eq!(label, "Resume this session with:");
+        assert_eq!(command, "/resume 1234-5678");
     }
 }

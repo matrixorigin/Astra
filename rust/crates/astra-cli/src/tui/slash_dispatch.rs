@@ -243,6 +243,22 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                             is_current: current == PermissionMode::Auto,
                         },
                         SelectionItem {
+                            name: "Plan".into(),
+                            description: Some(
+                                "Read-only investigation mode; write and shell mutations are denied"
+                                    .into(),
+                            ),
+                            is_current: current == PermissionMode::Plan,
+                        },
+                        SelectionItem {
+                            name: "Accept Edits".into(),
+                            description: Some(
+                                "Auto-approve workspace-local edits; still ask for shell/external writes"
+                                    .into(),
+                            ),
+                            is_current: current == PermissionMode::AcceptEdits,
+                        },
+                        SelectionItem {
                             name: "Prompt".into(),
                             description: Some("Ask before write/execute tools".into()),
                             is_current: current == PermissionMode::Prompt,
@@ -262,14 +278,14 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                         SelectionItem {
                             name: "Trust Workspace".into(),
                             description: Some(
-                                "Apply project allow rules after hash validation".into(),
+                                "Apply saved workspace rules after hash validation".into(),
                             ),
                             is_current: false,
                         },
                         SelectionItem {
                             name: "Untrust Workspace".into(),
                             description: Some(
-                                "Ignore project allow rules for this workspace".into(),
+                                "Ignore saved workspace rules for this workspace".into(),
                             ),
                             is_current: false,
                         },
@@ -290,6 +306,21 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 "all" | "auto" => {
                     ctx.state.perm_manager.set_mode(PermissionMode::Auto);
                     ctx.show_response("Permission mode → auto (all tools auto-approved)".into());
+                    SlashResult::Handled
+                }
+                "plan" => {
+                    ctx.state.perm_manager.set_mode(PermissionMode::Plan);
+                    ctx.show_response(
+                        "Permission mode → plan (read-only investigation mode)".into(),
+                    );
+                    SlashResult::Handled
+                }
+                "accept_edits" | "accept-edits" => {
+                    ctx.state.perm_manager.set_mode(PermissionMode::AcceptEdits);
+                    ctx.show_response(
+                        "Permission mode → accept_edits (workspace-local edits auto-approved)"
+                            .into(),
+                    );
                     SlashResult::Handled
                 }
                 "prompt" => {
@@ -358,7 +389,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 }
                 _ => {
                     ctx.show_error(format!(
-                        "Unknown mode '{args}'. Use: auto, prompt, deny, all, rules, trust, untrust, trace"
+                        "Unknown mode '{args}'. Use: auto, plan, accept_edits, prompt, deny, all, rules, trust, untrust, trace"
                     ));
                     SlashResult::Handled
                 }
@@ -1006,6 +1037,18 @@ pub(crate) fn handle_view_result(
             use crate::permission_manager::PermissionMode;
             state.perm_manager.set_mode(PermissionMode::Auto);
             chat_widget.commit_system(SystemCell::response("Permission mode → auto"));
+            return;
+        }
+        "Accept Edits" => {
+            use crate::permission_manager::PermissionMode;
+            state.perm_manager.set_mode(PermissionMode::AcceptEdits);
+            chat_widget.commit_system(SystemCell::response("Permission mode → accept_edits"));
+            return;
+        }
+        "Plan" => {
+            use crate::permission_manager::PermissionMode;
+            state.perm_manager.set_mode(PermissionMode::Plan);
+            chat_widget.commit_system(SystemCell::response("Permission mode → plan"));
             return;
         }
         "Prompt" => {
@@ -2389,6 +2432,41 @@ mod view_result_tests {
         assert_eq!(
             last_system_message(&chat_widget).as_deref(),
             Some("Permission mode → auto")
+        );
+    }
+
+    #[test]
+    fn accept_edits_selection_updates_state_and_commits_feedback() {
+        let mut state = SessionState::default();
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = ChatWidget::new("");
+
+        handle_view_result(
+            "Accept Edits",
+            &mut state,
+            &mut bottom_pane,
+            &mut chat_widget,
+        );
+
+        assert_eq!(state.perm_manager.mode(), PermissionMode::AcceptEdits);
+        assert_eq!(
+            last_system_message(&chat_widget).as_deref(),
+            Some("Permission mode → accept_edits")
+        );
+    }
+
+    #[test]
+    fn plan_selection_updates_state_and_commits_feedback() {
+        let mut state = SessionState::default();
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = ChatWidget::new("");
+
+        handle_view_result("Plan", &mut state, &mut bottom_pane, &mut chat_widget);
+
+        assert_eq!(state.perm_manager.mode(), PermissionMode::Plan);
+        assert_eq!(
+            last_system_message(&chat_widget).as_deref(),
+            Some("Permission mode → plan")
         );
     }
 

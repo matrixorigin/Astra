@@ -218,7 +218,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(
-                summary_text.contains("💾 75%"),
+                summary_text.contains("▓░ 75%"),
                 "cache-read stats must remain user-visible after resume"
             );
         });

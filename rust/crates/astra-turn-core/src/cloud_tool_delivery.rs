@@ -14,7 +14,7 @@ use uuid::Uuid;
 #[cfg(test)]
 use futures_util::stream::StreamExt;
 
-use crate::action_compensation::{compensation_prompt_note, explicit_approval_reason};
+use crate::action_compensation::explicit_approval_reason;
 use crate::cloud_approval_policy::edge_tool_requires_cloud_approval_with_args;
 use crate::edge_ledger::{
     DEFAULT_POLL_INTERVAL_MS, MSG_TOOL_LEDGER_TIMEOUT, approval_callback_key,
@@ -77,13 +77,7 @@ fn tool_approval_detail(tool_call: &Value) -> Option<String> {
     let raw = raw_tool_arguments(tool_call);
     let parsed = normalize_llm_function_arguments(&raw);
     let primary = permission_prompt_primary_detail(tool_name, &parsed);
-    let explicit = explicit_approval_reason(tool_name, &parsed);
-    let compensation = compensation_prompt_note(tool_name, &parsed);
-    let detail = [primary, explicit, compensation]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("\n");
+    let detail = primary.into_iter().collect::<Vec<_>>().join("\n");
     (!detail.is_empty()).then_some(detail)
 }
 
@@ -969,18 +963,29 @@ mod tests {
     }
 
     #[test]
-    fn approval_detail_includes_compensation_note_for_write_tool() {
+    fn approval_detail_keeps_recovery_jargon_out_of_primary_prompt() {
         let detail = tool_approval_detail(&write_tool("w1")).expect("detail");
         assert!(detail.contains("b.rs"));
-        assert!(detail.contains("Compensation:"));
-        assert!(detail.contains("restore prior contents"));
+        assert!(!detail.contains("Compensation:"));
+        assert!(!detail.contains("rollback"));
+        assert!(!detail.contains("restore prior contents"));
     }
 
     #[test]
-    fn approval_detail_includes_explicit_note_for_irreversible_tool() {
+    fn approval_detail_keeps_explicit_policy_jargon_out_of_primary_prompt() {
         let detail = tool_approval_detail(&destructive_bash_tool("b1")).expect("detail");
-        assert!(detail.contains("Explicit approval required:"));
-        assert!(detail.contains("Compensation:"));
+        assert!(detail.contains("rm -rf tmp"));
+        for forbidden in [
+            "Explicit approval required:",
+            "Compensation:",
+            "unbounded",
+            "rollback is not automatic",
+        ] {
+            assert!(
+                !detail.contains(forbidden),
+                "primary approval detail must not expose {forbidden:?}: {detail}"
+            );
+        }
     }
 
     #[test]

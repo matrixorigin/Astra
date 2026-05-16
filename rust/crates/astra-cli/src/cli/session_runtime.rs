@@ -650,6 +650,13 @@ fn detect_pending_recovery_session(cli_profile: Option<&str>) -> Option<String> 
     workspace_matches_current_project(&workspace).then_some(session_id)
 }
 
+fn pending_recovery_status_line(state: &SessionState) -> Option<String> {
+    state
+        .pending_recovery
+        .as_ref()
+        .map(|_| "previous session available via /resume".to_string())
+}
+
 /// P3.3 — if a persisted plan_state.json exists for the active user, load it
 /// and compute a compact resume digest. The digest is a one-shot hint: it is
 /// only injected into the next turn's system prompt when the user message
@@ -907,6 +914,9 @@ pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
         .dim()
         .to_string(),
     );
+    if let Some(line) = pending_recovery_status_line(state) {
+        right.push(line.dim().to_string());
+    }
     if let Ok(proxy) = std::env::var("http_proxy").or_else(|_| std::env::var("HTTP_PROXY")) {
         if !proxy.is_empty() {
             let max_proxy = right_col_w.saturating_sub(8);
@@ -1578,6 +1588,19 @@ mod tests {
         assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
         assert!(state.history.is_empty());
         assert_eq!(state.turn, 0);
+    }
+
+    #[test]
+    fn pending_recovery_status_line_requires_explicit_resume() {
+        let state = SessionState {
+            pending_recovery: Some("sess-123".to_string()),
+            ..SessionState::default()
+        };
+        assert_eq!(
+            pending_recovery_status_line(&state).as_deref(),
+            Some("previous session available via /resume")
+        );
+        assert_eq!(pending_recovery_status_line(&SessionState::default()), None);
     }
 
     #[test]

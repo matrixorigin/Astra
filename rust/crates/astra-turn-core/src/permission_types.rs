@@ -26,6 +26,10 @@ pub enum PermissionMode {
     /// Auto-approve all tools (except bypass-immune safety checks).
     #[serde(alias = "yolo", alias = "bypass-safety", alias = "bypass_safety")]
     Auto,
+    /// Read-only investigation/planning mode: allow read tools, deny mutations.
+    Plan,
+    /// Auto-approve safe workspace-local edit/write operations only.
+    AcceptEdits,
     /// Prompt the user for write/execute tools (default interactive mode).
     #[default]
     Prompt,
@@ -37,6 +41,8 @@ impl std::fmt::Display for PermissionMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Auto => write!(f, "auto"),
+            Self::Plan => write!(f, "plan"),
+            Self::AcceptEdits => write!(f, "accept_edits"),
             Self::Prompt => write!(f, "prompt"),
             Self::Deny => write!(f, "deny"),
         }
@@ -48,10 +54,12 @@ impl std::str::FromStr for PermissionMode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "auto" | "yolo" | "bypass-safety" | "bypass_safety" => Ok(Self::Auto),
+            "plan" => Ok(Self::Plan),
+            "accept_edits" | "accept-edits" => Ok(Self::AcceptEdits),
             "prompt" => Ok(Self::Prompt),
             "deny" => Ok(Self::Deny),
             _ => Err(format!(
-                "invalid permission mode '{s}': expected auto, prompt, or deny"
+                "invalid permission mode '{s}': expected auto, plan, accept_edits, prompt, or deny"
             )),
         }
     }
@@ -240,6 +248,25 @@ impl PermissionRule {
         self.matches_with_context(tool_name, &RuleMatchContext::legacy(command))
     }
 
+    /// True when a bash allow rule is broad enough to bypass the safety
+    /// classifier for arbitrary code execution. Deny rules may still use these
+    /// shapes; callers should apply this only when evaluating allow rules.
+    #[must_use]
+    pub fn is_dangerous_bash_allow_shape(&self) -> bool {
+        if self.tool != "bash" || self.pattern_match == PermissionPatternMatch::Exact {
+            return false;
+        }
+        let Some(pattern) = self.pattern.as_deref() else {
+            return true;
+        };
+        let pattern = pattern.trim();
+        if pattern.is_empty() || pattern == "*" {
+            return true;
+        }
+        let first = pattern.split_whitespace().next().unwrap_or_default();
+        crate::tool_argument_hints::is_unsafe_shell_prefix_token(first)
+    }
+
     /// Check if this rule matches a fully-described tool call.
     pub fn matches_with_context(&self, tool_name: &str, ctx: &RuleMatchContext) -> bool {
         if self.tool != tool_name.to_lowercase() {
@@ -283,13 +310,28 @@ impl PermissionRule {
             return false;
         }
 
+        let target_is_constrained_path =
+            self.tool != "bash" && ctx.path.is_some() && self.op.is_some();
+        let resolved_constrained_path = if target_is_constrained_path && self.cwd_root.is_some() {
+            ctx.path.as_deref().and_then(|path| {
+                ctx.cwd
+                    .as_deref()
+                    .and_then(|cwd| {
+                        crate::permission_memory_profile::resolve_write_path_from_cwd(cwd, path)
+                    })
+                    .map(|resolved| resolved.to_string_lossy().into_owned())
+            })
+        } else {
+            None
+        };
         let target = if self.tool == "bash" {
             ctx.command.as_deref()
         } else {
-            ctx.path.as_deref().or(ctx.command.as_deref())
+            resolved_constrained_path
+                .as_deref()
+                .or(ctx.path.as_deref())
+                .or(ctx.command.as_deref())
         };
-        let target_is_constrained_path =
-            self.tool != "bash" && ctx.path.is_some() && self.op.is_some();
         match (&self.pattern, target) {
             (None, _) => true, // Bare tool name matches all
             (Some(pattern), Some(cmd)) => {
@@ -632,7 +674,7 @@ impl InheritedPermissions {
     pub fn is_allowed_with_context(&self, tool_name: &str, ctx: &RuleMatchContext) -> bool {
         self.allow_rules
             .iter()
-            .any(|r| r.matches_with_context(tool_name, ctx))
+            .any(|r| !r.is_dangerous_bash_allow_shape() && r.matches_with_context(tool_name, ctx))
     }
 
     /// Check if a tool is explicitly denied by inherited rules.
@@ -897,7 +939,7 @@ impl PermissionSyncContext {
         if self
             .session_allow
             .iter()
-            .any(|r| r.matches_with_context(tool_name, ctx))
+            .any(|r| !r.is_dangerous_bash_allow_shape() && r.matches_with_context(tool_name, ctx))
         {
             return true;
         }
@@ -1059,6 +1101,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn permission_mode_roundtrip_includes_accept_edits() {
+        let parsed = "accept_edits".parse::<PermissionMode>().unwrap();
+        assert_eq!(parsed, PermissionMode::AcceptEdits);
+        assert_eq!(parsed.to_string(), "accept_edits");
+        assert_eq!(
+            "accept-edits".parse::<PermissionMode>().unwrap(),
+            PermissionMode::AcceptEdits
+        );
+    }
+
+    #[test]
+    fn permission_mode_roundtrip_includes_plan() {
+        let parsed = "plan".parse::<PermissionMode>().unwrap();
+        assert_eq!(parsed, PermissionMode::Plan);
+        assert_eq!(parsed.to_string(), "plan");
+    }
+
+    #[test]
     fn test_permission_rule_parse() {
         let rule = PermissionRule::parse("bash");
         assert_eq!(rule.tool, "bash");
@@ -1094,6 +1154,38 @@ mod tests {
         assert!(!rule.matches("bash", Some("git commitizen")));
         assert!(!rule.matches("bash", Some("git push")));
         assert!(!rule.matches("edit", Some("git commit")));
+    }
+
+    #[test]
+    fn dangerous_bash_allow_shapes_are_not_honored_as_allow_rules() {
+        let mut inherited = InheritedPermissions::new(PermissionMode::Prompt);
+        inherited.add_allow(PermissionRule::parse("bash"));
+        inherited.add_allow(PermissionRule::parse(
+            r#"Bash(argv_prefix="python", op="execute")"#,
+        ));
+        inherited.add_allow(PermissionRule::parse(
+            r#"Bash(argv_prefix="npm test", op="execute")"#,
+        ));
+        inherited.add_deny(PermissionRule::parse("Bash(python:*)"));
+
+        assert!(!inherited.is_allowed_with_context(
+            "bash",
+            &RuleMatchContext::from_tool_args(
+                "bash",
+                &serde_json::json!({"command": "python -c 'print(1)'"})
+            )
+        ));
+        assert!(inherited.is_allowed_with_context(
+            "bash",
+            &RuleMatchContext::from_tool_args(
+                "bash",
+                &serde_json::json!({"command": "npm test -- --watch"})
+            )
+        ));
+        assert!(
+            inherited.is_denied("bash", Some("python -c 'print(1)'")),
+            "dangerous bash shapes remain valid for deny rules"
+        );
     }
 
     #[test]

@@ -440,23 +440,6 @@ impl BottomPane {
                     response: resp,
                 })
             }
-            ButtonAction::SelectScope(scope) => {
-                self.approval_queue.select_scope_for_focused(scope);
-                None
-            }
-            ButtonAction::SelectMatch(target) => {
-                let response = self.approval_queue.response_for_match_target(target)?;
-                let id = self.respond_focused_approval(response.clone())?;
-                Some(ApprovalActivation::Single { id, response })
-            }
-            ButtonAction::EditCustomPrefix => {
-                self.approval_queue.enter_custom_prefix_for_focused();
-                None
-            }
-            ButtonAction::BackToScopes => {
-                self.approval_queue.back_to_scope_for_focused();
-                None
-            }
         }
     }
 
@@ -517,7 +500,7 @@ impl BottomPane {
         cell.buttons = buttons;
         // Issue #326 P3: forward the view's metadata so the
         // approval card renders the source-agent / host /
-        // risk-tag / will-save lines populated by
+        // risk-tag / remember-preview lines populated by
         // enqueue_approval_with_metadata.
         if let Some(agent) = view.source_agent {
             cell = cell.with_source_agent(agent);
@@ -528,22 +511,17 @@ impl BottomPane {
         if !view.risk_tag_labels.is_empty() {
             cell = cell.with_risk_tag_labels(view.risk_tag_labels);
         }
-        if let Some(preview) = view.will_save_preview {
-            cell = cell.with_will_save_preview(preview);
+        if let Some(preview) = view.remember_preview {
+            cell = cell.with_remember_preview(preview);
         }
         if let Some(hint) = view.selection_hint {
             cell = cell.with_selection_hint(hint);
-        }
-        if let Some(input) = view.custom_match_input {
-            cell = cell.with_custom_match_input(input);
-        }
-        if let Some(source) = view.custom_match_source {
-            cell = cell.with_custom_match_source(source);
         }
         cell = cell.with_scope_context(
             view.workspace_untrusted,
             view.is_compound_command,
             view.has_dynamic_eval,
+            view.unsafe_rule_shape,
         );
         Some(cell)
     }
@@ -682,31 +660,6 @@ impl BottomPane {
             return None;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if self.approval_queue.focused_custom_prefix_active() {
-            return match key.code {
-                KeyCode::Enter => {
-                    if let Some(response) = self.approval_queue.submit_custom_prefix_for_focused() {
-                        if let Some(id) = self.respond_focused_approval(response) {
-                            return Some(BottomPaneAction::ApprovalResolved { id });
-                        }
-                    }
-                    Some(BottomPaneAction::Consumed)
-                }
-                KeyCode::Esc => {
-                    self.approval_queue.cancel_custom_prefix_for_focused();
-                    Some(BottomPaneAction::Consumed)
-                }
-                KeyCode::Backspace => {
-                    self.approval_queue.pop_custom_prefix_char();
-                    Some(BottomPaneAction::Consumed)
-                }
-                KeyCode::Char(ch) if !ctrl => {
-                    self.approval_queue.push_custom_prefix_char(ch);
-                    Some(BottomPaneAction::Consumed)
-                }
-                _ => None,
-            };
-        }
 
         // Ctrl+Enter → quick accept regardless of button focus.
         if key.code == KeyCode::Enter && ctrl {

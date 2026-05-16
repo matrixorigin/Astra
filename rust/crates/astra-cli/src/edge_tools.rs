@@ -2401,6 +2401,55 @@ impl ToolExecutor {
         self.maybe_persist_large_output(output, name)
     }
 
+    pub async fn execute_with_metadata_cancelable(
+        &self,
+        name: &str,
+        args: &Value,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> ToolExecutionOutcome {
+        if let Some(outcome) = self.execute_blocking_shell_tool(name, args, cancel_token) {
+            return outcome;
+        }
+        self.execute_with_metadata(name, args).await
+    }
+
+    /// Synchronous core for `bash` / `powershell` execution. Returns
+    /// `Some(outcome)` when `name` matches a cancel-aware shell tool, allowing
+    /// the caller to invoke this directly inside `tokio::task::spawn_blocking`
+    /// without re-entering the runtime via `Handle::block_on`. Returns `None`
+    /// for any other tool, signaling that the caller should fall back to the
+    /// generic async path.
+    pub fn execute_blocking_shell_tool(
+        &self,
+        name: &str,
+        args: &Value,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Option<ToolExecutionOutcome> {
+        if name == "bash" {
+            let output = self.finalize_tool_output(self.bash_with_cancel(args, cancel_token), name);
+            self.record_output_size(output.len());
+            return Some(if output.starts_with("Error") {
+                ToolExecutionOutcome::error(output)
+            } else {
+                ToolExecutionOutcome::ok(output)
+            });
+        }
+        #[cfg(windows)]
+        if name == "powershell" {
+            let output =
+                self.finalize_tool_output(self.powershell_with_cancel(args, cancel_token), name);
+            self.record_output_size(output.len());
+            return Some(if output.starts_with("Error") {
+                ToolExecutionOutcome::error(output)
+            } else {
+                ToolExecutionOutcome::ok(output)
+            });
+        }
+        #[cfg(not(windows))]
+        let _ = cancel_token; // powershell branch is the only other cancel-aware tool
+        None
+    }
+
     pub async fn execute_with_metadata(&self, name: &str, args: &Value) -> ToolExecutionOutcome {
         if name == "mo_query" {
             let mut outcome = self.mo_query_with_metadata(args);

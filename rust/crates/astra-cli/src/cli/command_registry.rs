@@ -254,6 +254,11 @@ const DIFF_SUBCOMMANDS: &[(&str, &str)] = &[
 const ALLOW_SUBCOMMANDS: &[(&str, &str)] = &[
     ("all", "Auto-approve all (alias for auto)"),
     ("auto", "Auto-approve all tool use"),
+    ("plan", "Read-only investigation mode; mutations are denied"),
+    (
+        "accept_edits",
+        "Auto-approve workspace-local file edits while still prompting for shell and external writes",
+    ),
     ("deny", "Deny all tool use"),
     ("prompt", "Prompt before tool use"),
     ("rules", "Show current permission rules"),
@@ -672,11 +677,11 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── System ────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/allow",
-        "Permission mode: /allow [auto|prompt|deny|all|rules|trust|untrust|trace]",
+        "Permission mode: /allow [auto|plan|accept_edits|prompt|deny|all|rules|trust|untrust|trace]",
         CommandGroup::System,
     )
     .with_subcommands(ALLOW_SUBCOMMANDS)
-    .with_arg_hint("[auto|prompt|deny|all|rules]"),
+    .with_arg_hint("[auto|accept_edits|plan|prompt|deny|all|rules]"),
     CommandMeta::new(
         "/instructions",
         "Project instructions: /instructions [show|reload|off]",
@@ -962,6 +967,24 @@ mod tests {
         assert!(subs.iter().any(|(tok, _)| *tok == "uninstall"));
         assert!(subs.iter().any(|(tok, _)| *tok == "unpin"));
         assert!(subs.iter().any(|(tok, _)| *tok == "upgrade"));
+    }
+
+    #[test]
+    fn allow_command_lists_accept_edits_mode() {
+        let allow = COMMANDS
+            .iter()
+            .find(|meta| meta.name == "/allow")
+            .expect("/allow command");
+        assert!(allow.description.contains("accept_edits"));
+        assert!(allow.description.contains("plan"));
+        assert_eq!(
+            allow.arg_hint,
+            Some("[auto|accept_edits|plan|prompt|deny|all|rules]")
+        );
+
+        let subs = subcommand_completions("/allow").expect("/allow subcommands");
+        assert!(subs.iter().any(|(tok, _)| *tok == "accept_edits"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "plan"));
     }
 
     #[test]

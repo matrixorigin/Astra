@@ -36,6 +36,7 @@ use super::{
 };
 
 const AGENT_DRILLDOWN_RECENT_COMPLETED: usize = 5;
+const WORKSPACE_TRUST_SENTINEL: &str = "__workspace_trust__\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReopenTarget {
@@ -451,6 +452,38 @@ pub(crate) async fn run_tui_repl(
         }
         _ => chat_widget::ChatWidget::new(String::new()),
     };
+
+    if let Some(prompt) = state.perm_manager.workspace_trust_startup_prompt() {
+        use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
+
+        let items = vec![
+            SelectionItem {
+                name: "Trust Workspace".into(),
+                description: Some("Enable saved workspace rules for this path".into()),
+                is_current: false,
+            },
+            SelectionItem {
+                name: "Continue This Session".into(),
+                description: Some(
+                    "Keep saved workspace rules off for now; ask again next time".into(),
+                ),
+                is_current: false,
+            },
+            SelectionItem {
+                name: "Mark Untrusted".into(),
+                description: Some(
+                    "Keep saved workspace rules off and stop asking on startup".into(),
+                ),
+                is_current: false,
+            },
+        ];
+        bottom_pane.push_view(Box::new(
+            ListSelectionView::new(items, Some(prompt.header))
+                .with_result_prefix(WORKSPACE_TRUST_SENTINEL),
+        ));
+    } else if let Some(notice) = state.perm_manager.workspace_trust_notice() {
+        chat_widget.commit_system(history_cell::system::SystemCell::info(notice));
+    }
 
     // Resume-time summary: surface background tasks that reached
     // terminal state while the user was away. One ResumeSummary
@@ -1425,6 +1458,59 @@ pub(crate) async fn run_tui_repl(
                                         frame_requester.schedule_frame();
                                         continue;
                                     }
+                                    if let Some(choice) =
+                                        name.strip_prefix(WORKSPACE_TRUST_SENTINEL)
+                                    {
+                                        match choice {
+                                            "Trust Workspace" => {
+                                                match state.perm_manager.trust_workspace() {
+                                                    Ok(message) => chat_widget.commit_system(
+                                                        history_cell::system::SystemCell::response(
+                                                            message,
+                                                        ),
+                                                    ),
+                                                    Err(err) => chat_widget.commit_system(
+                                                        history_cell::system::SystemCell::error(
+                                                            format!(
+                                                                "Failed to trust workspace: {err}"
+                                                            ),
+                                                        ),
+                                                    ),
+                                                }
+                                            }
+                                            "Continue This Session" => {
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::info(
+                                                        "Continuing without trusting this workspace. Saved workspace rules stay off for this session."
+                                                            .to_string(),
+                                                    ),
+                                                );
+                                            }
+                                            "Mark Untrusted" => {
+                                                match state.perm_manager.untrust_workspace() {
+                                                    Ok(message) => chat_widget.commit_system(
+                                                        history_cell::system::SystemCell::response(
+                                                            message,
+                                                        ),
+                                                    ),
+                                                    Err(err) => chat_widget.commit_system(
+                                                        history_cell::system::SystemCell::error(
+                                                            format!(
+                                                                "Failed to mark workspace untrusted: {err}"
+                                                            ),
+                                                        ),
+                                                    ),
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                        pending_deferred_slash_flush = false;
+                                        let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        bottom_pane.sync_popups();
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    }
                                     // credentials arrive as a sentinel-
                                     // prefixed string so we can dispatch
                                     // auth without leaving the TUI (no
@@ -2096,6 +2182,36 @@ mod tests {
             let decoded = ReopenTarget::parse(encoded).expect("known variant must round-trip");
             assert_eq!(decoded, target, "variant {encoded} did not round-trip");
         }
+    }
+
+    #[test]
+    fn startup_workspace_trust_prompt_is_wired_into_tui_boot() {
+        let source = include_str!("event_loop.rs");
+        assert!(
+            source.contains("workspace_trust_startup_prompt()"),
+            "run_tui_repl should query the permission manager for a startup trust prompt"
+        );
+        assert!(
+            source.contains("Trust Workspace")
+                && source.contains("Continue This Session")
+                && source.contains("Mark Untrusted"),
+            "startup trust picker should offer trust / continue-once / untrust choices"
+        );
+    }
+
+    #[test]
+    fn startup_workspace_trust_picker_results_are_handled() {
+        let source = include_str!("event_loop.rs");
+        let arm = source
+            .find("name.strip_prefix(WORKSPACE_TRUST_SENTINEL)")
+            .expect("view completion should handle the workspace trust picker sentinel");
+        let body = &source[arm..];
+        assert!(
+            body.contains("trust_workspace()")
+                && body.contains("untrust_workspace()")
+                && body.contains("Continuing without trusting this workspace."),
+            "workspace trust picker must wire all three outcomes"
+        );
     }
 
     #[test]

@@ -815,6 +815,27 @@ pub fn explicit_approval_reason(tool_name: &str, args: &Value) -> Option<String>
     Some(reason.to_string())
 }
 
+pub fn primary_approval_reason(tool_name: &str, args: &Value) -> Option<String> {
+    let profile = tool_action_profile(tool_name, args);
+    if !profile_requires_explicit_approval(tool_name, Some(args), &profile) {
+        return None;
+    }
+
+    let reason = match cloud_gated_tool_kind_with_args(tool_name, Some(args)) {
+        Some(CloudGatedToolKind::Execute) if profile.category == ActionCategory::Destructive => {
+            "This command can make destructive changes, so it needs your approval."
+        }
+        Some(CloudGatedToolKind::Execute) => {
+            "This command runs in your shell and can change files or system state."
+        }
+        Some(CloudGatedToolKind::Write) => {
+            "This action can change files or project state, so it needs your approval."
+        }
+        None => "This action can change project state, so it needs your approval.",
+    };
+    Some(reason.to_string())
+}
+
 pub fn tool_action_profile_value(tool_name: &str, args: &Value) -> Value {
     serde_json::to_value(tool_action_profile(tool_name, args)).unwrap_or(Value::Null)
 }

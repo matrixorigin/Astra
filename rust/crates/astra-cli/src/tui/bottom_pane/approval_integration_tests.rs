@@ -10,8 +10,6 @@ use super::{ApprovalActivation, BottomPane, BottomPaneAction};
 use crate::chat_stream::ApprovalResponse;
 use crate::tui::approval::queue::ApprovalMetadata;
 use crate::tui::slash_menu::SlashItem;
-use astra_turn_core::permission_match_target::AllowMatchTarget;
-use astra_turn_core::permission_scope::AllowScope;
 
 fn key(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -103,23 +101,23 @@ fn enter_activates_accept_by_default() {
 }
 
 #[test]
-fn right_moves_focus_then_enter_rejects() {
+fn right_moves_focus_to_always_and_enter_remembers_workspace_default() {
     let mut bp = BottomPane::new();
     let rx = enqueue(&mut bp, "bash");
 
-    // Accept → Reject
+    // Allow once -> Always
     let _ = bp.handle_key(special(KeyCode::Right));
     let _ = bp.handle_key(special(KeyCode::Enter));
-    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::Deny);
+    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::AlwaysAllow);
 }
 
 #[test]
-fn left_from_accept_wraps_to_skip() {
+fn left_from_allow_once_wraps_to_reject() {
     let mut bp = BottomPane::new();
     let rx = enqueue(&mut bp, "bash");
     let _ = bp.handle_key(special(KeyCode::Left));
     let _ = bp.handle_key(special(KeyCode::Enter));
-    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::Skip);
+    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::Deny);
 }
 
 #[test]
@@ -312,8 +310,8 @@ fn batch_button_resolves_focused_group_only() {
     let rx_c = enqueue_grouped(&mut bp, "c", group_a);
     assert_eq!(bp.footer.pending_approvals, 3);
 
-    // Navigate to Accept-all (index 7 in the scoped + batch row).
-    for _ in 0..7 {
+    // Navigate to Accept-all (index 3 in the simplified + batch row).
+    for _ in 0..3 {
         bp.handle_key(special(KeyCode::Right));
     }
     let action = bp.handle_key(special(KeyCode::Enter));
@@ -363,8 +361,8 @@ fn activation_single_vs_batch_reports_correct_variant() {
     ));
     assert_eq!(bp.footer.pending_approvals, 1);
 
-    // Navigate to Accept-all (index 7 in the scoped + batch row).
-    for _ in 0..7 {
+    // Navigate to Accept-all (index 3 in the simplified + batch row).
+    for _ in 0..3 {
         bp.handle_key(special(KeyCode::Right));
     }
     let act = bp.activate_focused_approval_button();
@@ -390,40 +388,30 @@ fn activation_single_vs_batch_reports_correct_variant() {
 fn down_moves_focus_like_right() {
     let mut bp = BottomPane::new();
     let rx = enqueue(&mut bp, "bash");
-    // Down from Accept → Reject. Enter rejects.
+    // Down from Allow once -> Always.
     let _ = bp.handle_key(special(KeyCode::Down));
+    let _ = bp.handle_key(special(KeyCode::Enter));
+    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::AlwaysAllow);
+}
+
+#[test]
+fn up_moves_focus_like_left_wrapping_to_reject() {
+    let mut bp = BottomPane::new();
+    let rx = enqueue(&mut bp, "bash");
+    // Up from Allow once wraps to the last button (Reject).
+    let _ = bp.handle_key(special(KeyCode::Up));
     let _ = bp.handle_key(special(KeyCode::Enter));
     assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::Deny);
 }
 
 #[test]
-fn up_moves_focus_like_left_wrapping_to_skip() {
+fn primary_always_resolves_without_second_match_target_step() {
     let mut bp = BottomPane::new();
     let rx = enqueue(&mut bp, "bash");
-    // Up from Accept wraps to the last button (Skip).
-    let _ = bp.handle_key(special(KeyCode::Up));
-    let _ = bp.handle_key(special(KeyCode::Enter));
-    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::Skip);
-}
-
-#[test]
-fn up_down_reach_turn_scope_then_exact_match_button() {
-    // End-to-end: scope selection is step one; match target is step two.
-    // From Accept (index 0), Down twice lands on Turn (index 2), then
-    // Enter opens match targets where Exact is focused by default.
-    let mut bp = BottomPane::new();
-    let rx = enqueue(&mut bp, "bash");
-    let _ = bp.handle_key(special(KeyCode::Down));
+    // From Allow once (index 0), Down once lands on Always.
     let _ = bp.handle_key(special(KeyCode::Down));
     let _ = bp.handle_key(special(KeyCode::Enter));
-    let _ = bp.handle_key(special(KeyCode::Enter));
-    assert_eq!(
-        rx.blocking_recv().unwrap(),
-        ApprovalResponse::AlwaysAllowScopedTarget {
-            scope: AllowScope::RestOfTurn,
-            match_target: AllowMatchTarget::Exact,
-        }
-    );
+    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::AlwaysAllow);
 }
 
 #[test]

@@ -29,13 +29,21 @@ pub fn command_hint_from_args(args: &Value) -> Option<&str> {
 
 /// Extract the persistent allow-rule prefix from a shell command.
 ///
-/// We stop at the first flag, the first shell metacharacter, or after at most
-/// three tokens. That keeps "Always allow" precise enough for subcommands
-/// without baking user data or flags into the rule.
+/// Mirrors Claude Code's safety posture: only stable command+subcommand
+/// shapes become reusable prefixes (`git commit`, `npm test`, `cargo test`).
+/// Single-word commands, interpreter invocations (`python -c`, `bash -c`),
+/// shell wrappers (`sudo`, `env`, `timeout`), flags, paths, and filenames fall
+/// back to exact-command rules instead of broad `Bash(foo:*)` rules.
 #[must_use]
 pub fn normalized_argv_prefix(cmd: &str) -> String {
-    const MAX_PREFIX_TOKENS: usize = 3;
     const SHELL_METACHARS: &[&str] = &["|", ";", "&&", "||", ">", "<", ">>", "<<", "&"];
+
+    let mut cmd = cmd.trim();
+    if let Some((head, tail)) = cmd.split_once("&&")
+        && head.trim_start().starts_with("cd ")
+    {
+        cmd = tail.trim();
+    }
 
     let mut tokens = Vec::new();
     for raw in cmd.split_whitespace() {
@@ -45,13 +53,153 @@ pub fn normalized_argv_prefix(cmd: &str) -> String {
         if raw.starts_with('-') {
             break;
         }
+        if tokens.is_empty() && looks_like_env_assignment(raw) {
+            let Some((key, _)) = raw.split_once('=') else {
+                return String::new();
+            };
+            if is_safe_env_prefix(key) {
+                continue;
+            }
+            return String::new();
+        }
         tokens.push(raw);
-        if tokens.len() >= MAX_PREFIX_TOKENS {
+        if tokens.len() >= 2 {
             break;
         }
     }
 
-    tokens.join(" ")
+    let [command, subcommand] = tokens.as_slice() else {
+        return String::new();
+    };
+    if is_unsafe_bare_shell_prefix(command) || !looks_like_subcommand(subcommand) {
+        return String::new();
+    }
+
+    format!("{command} {subcommand}")
+}
+
+fn looks_like_env_assignment(token: &str) -> bool {
+    let Some((key, value)) = token.split_once('=') else {
+        return false;
+    };
+    !key.is_empty()
+        && !value.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        && key
+            .chars()
+            .next()
+            .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+}
+
+fn is_safe_env_prefix(key: &str) -> bool {
+    matches!(
+        key,
+        "GOEXPERIMENT"
+            | "GOOS"
+            | "GOARCH"
+            | "CGO_ENABLED"
+            | "GO111MODULE"
+            | "RUST_BACKTRACE"
+            | "RUST_LOG"
+            | "NODE_ENV"
+            | "CI"
+            | "PYTHONUNBUFFERED"
+            | "PYTHONDONTWRITEBYTECODE"
+            | "PYTEST_DISABLE_PLUGIN_AUTOLOAD"
+            | "PYTEST_DEBUG"
+            | "LANG"
+            | "LANGUAGE"
+            | "LC_ALL"
+            | "LC_CTYPE"
+            | "LC_TIME"
+            | "CHARSET"
+            | "TERM"
+            | "COLORTERM"
+            | "NO_COLOR"
+            | "FORCE_COLOR"
+            | "TZ"
+    )
+}
+
+fn is_unsafe_bare_shell_prefix(command: &str) -> bool {
+    is_unsafe_shell_prefix_token(command)
+}
+
+/// Single source of truth for shell/interpreter/wrapper command tokens that
+/// must never anchor a broad allow rule (case-insensitive). Used by both the
+/// argument-hint prefix extractor and the allow-rule safety classifier in
+/// `PermissionRule::is_dangerous_bash_allow_shape`.
+///
+/// Invariants:
+/// - All entries are ASCII lowercase; matching lowercases the input.
+/// - Tokens here either spawn arbitrary code (shells, interpreters), elevate
+///   privileges (`sudo`, `doas`, `pkexec`), or wrap an arbitrary inner
+///   command (`env`, `xargs`, `nice`, `stdbuf`, `nohup`, `timeout`, `time`,
+///   `exec`, `busybox`).
+/// - Adding an entry tightens both code paths simultaneously; do not
+///   duplicate this list elsewhere.
+pub fn is_unsafe_shell_prefix_token(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        // Shells
+        "sh"
+            | "bash"
+            | "zsh"
+            | "fish"
+            | "csh"
+            | "tcsh"
+            | "ksh"
+            | "dash"
+            | "ash"
+            | "cmd"
+            | "powershell"
+            | "pwsh"
+            // Interpreters
+            | "python"
+            | "python2"
+            | "python3"
+            | "node"
+            | "nodejs"
+            | "deno"
+            | "bun"
+            | "ruby"
+            | "perl"
+            | "php"
+            | "lua"
+            // Wrappers that pass through to an arbitrary inner command
+            | "env"
+            | "xargs"
+            | "nice"
+            | "stdbuf"
+            | "nohup"
+            | "timeout"
+            | "time"
+            | "exec"
+            | "busybox"
+            // Privilege elevation
+            | "sudo"
+            | "doas"
+            | "pkexec"
+    )
+}
+
+fn looks_like_subcommand(token: &str) -> bool {
+    // Subcommands are conventionally lowercase ASCII identifiers; allow `-`
+    // and `_` in trailing chars (e.g. `make install_deps`, `cargo nextest-run`).
+    // The first char must be a lowercase ASCII letter or digit so flag-like
+    // tokens (`-v`, `--all`) and underscore-led tokens (`_foo`) don't sneak
+    // through and get mistaken for subcommands. Rejects paths, redirection,
+    // quoting, env-style `KEY=value`, etc.
+    let mut chars = token.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
 /// Raw hint used for **permission rule matching** — `starts_with`
@@ -155,11 +303,59 @@ mod tests {
         assert_eq!(normalized_argv_prefix("cargo test --release"), "cargo test");
         assert_eq!(
             normalized_argv_prefix("npm run deploy:prod -- --foo"),
-            "npm run deploy:prod"
+            "npm run"
         );
         assert_eq!(normalized_argv_prefix("git commit -m 'fix'"), "git commit");
-        assert_eq!(normalized_argv_prefix("bash -c 'rm -rf tmp'"), "bash");
+        assert_eq!(normalized_argv_prefix("bash -c 'rm -rf tmp'"), "");
         assert_eq!(normalized_argv_prefix("echo hi > out.txt"), "echo hi");
+    }
+
+    #[test]
+    fn normalized_argv_prefix_uses_main_command_after_cd_and_env() {
+        assert_eq!(
+            normalized_argv_prefix("cd rust && cargo test -p astra-cli"),
+            "cargo test"
+        );
+        assert_eq!(
+            normalized_argv_prefix("RUST_LOG=debug cargo check --workspace"),
+            "cargo check"
+        );
+        assert_eq!(
+            normalized_argv_prefix("cd web && CI=1 npm test -- --runInBand"),
+            "npm test"
+        );
+    }
+
+    #[test]
+    fn normalized_argv_prefix_rejects_broad_shell_and_wrapper_rules() {
+        assert_eq!(normalized_argv_prefix("python -c 'print(1)'"), "");
+        assert_eq!(normalized_argv_prefix("python3 script.py"), "");
+        assert_eq!(normalized_argv_prefix("sudo apt install ripgrep"), "");
+        assert_eq!(normalized_argv_prefix("cat src/lib.rs"), "");
+        assert_eq!(normalized_argv_prefix("UNSAFE=1 npm run build"), "");
+        assert_eq!(
+            normalized_argv_prefix("NODE_ENV=test npm run build"),
+            "npm run"
+        );
+    }
+
+    #[test]
+    fn unsafe_shell_prefix_token_covers_new_interpreters_and_wrappers() {
+        for token in ["ash", "nodejs", "deno", "bun", "exec", "busybox", "BusyBox"] {
+            assert!(
+                is_unsafe_shell_prefix_token(token),
+                "{token} should stay blocked as a reusable shell prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn subcommand_shape_allows_underscores_without_allowing_flags_or_paths() {
+        assert!(looks_like_subcommand("install_deps"));
+        assert!(looks_like_subcommand("nextest-run"));
+        assert!(!looks_like_subcommand("_hidden"));
+        assert!(!looks_like_subcommand("--workspace"));
+        assert!(!looks_like_subcommand("src/lib.rs"));
     }
 
     #[test]

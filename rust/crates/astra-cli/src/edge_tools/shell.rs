@@ -2927,6 +2927,7 @@ struct ShellRunConfig {
     effective_project_root: PathBuf,
     sandbox_policy: Option<SandboxPolicy>,
     progress_sink: Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>>,
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::Output, String> {
@@ -3007,6 +3008,15 @@ fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::
                 break;
             }
             Ok(None) => {
+                if config
+                    .cancel_token
+                    .as_ref()
+                    .is_some_and(|token| token.is_cancelled())
+                {
+                    sigkill_process_group(&mut child);
+                    let _ = child.wait();
+                    return Err("Error: command cancelled by user".to_string());
+                }
                 if std::time::Instant::now() > deadline {
                     // Kill entire process group (bash + all children)
                     sigkill_process_group(&mut child);
@@ -3682,6 +3692,7 @@ impl ToolExecutor {
         command: &str,
         timeout_secs: f64,
         harden_command: bool,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> ShellRunConfig {
         let sandbox_policy = self
             .sandbox_policy
@@ -3697,6 +3708,7 @@ impl ToolExecutor {
             effective_project_root: self.effective_project_root(),
             sandbox_policy,
             progress_sink: self.current_bash_progress_sink(),
+            cancel_token: cancel_token.cloned(),
         }
     }
 
@@ -3707,9 +3719,16 @@ impl ToolExecutor {
         command: &str,
         timeout_secs: f64,
         harden_command: bool,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<std::process::Output, String> {
-        let config =
-            self.shell_run_config(program, shell_flag, command, timeout_secs, harden_command);
+        let config = self.shell_run_config(
+            program,
+            shell_flag,
+            command,
+            timeout_secs,
+            harden_command,
+            cancel_token,
+        );
         run_shell_output_with_config(config)
     }
 
@@ -3718,19 +3737,36 @@ impl ToolExecutor {
         command: &str,
         timeout_secs: f64,
     ) -> Result<std::process::Output, String> {
-        self.run_shell_output_with_program("bash", "-c", command, timeout_secs, true)
+        self.run_shell_output_with_program("bash", "-c", command, timeout_secs, true, None)
+    }
+
+    pub(crate) fn run_shell_output_cancelable(
+        &self,
+        command: &str,
+        timeout_secs: f64,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<std::process::Output, String> {
+        self.run_shell_output_with_program("bash", "-c", command, timeout_secs, true, cancel_token)
     }
 
     fn run_powershell_output(
         &self,
         command: &str,
         timeout_secs: f64,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<std::process::Output, String> {
         let program = find_powershell_program().ok_or_else(|| {
             "Error: PowerShell not available. Install 'pwsh' (PowerShell 7+) or 'powershell'."
                 .to_string()
         })?;
-        self.run_shell_output_with_program(program, "-Command", command, timeout_secs, false)
+        self.run_shell_output_with_program(
+            program,
+            "-Command",
+            command,
+            timeout_secs,
+            false,
+            cancel_token,
+        )
     }
 
     /// Register file paths that were read by a successful bash command so
@@ -3969,7 +4005,7 @@ impl ToolExecutor {
             Ok(invocation) => invocation,
             Err(message) => return message,
         };
-        let config = self.shell_run_config("bash", "-c", &command, timeout_secs, true);
+        let config = self.shell_run_config("bash", "-c", &command, timeout_secs, true, None);
         match tokio::task::spawn_blocking(move || run_shell_output_with_config(config)).await {
             Ok(Ok(out)) => self.render_bash_output(&command, out),
             Ok(Err(error)) => error,
@@ -3978,17 +4014,33 @@ impl ToolExecutor {
     }
 
     pub(crate) fn bash(&self, args: &Value) -> String {
+        self.bash_with_cancel(args, None)
+    }
+
+    pub(crate) fn bash_with_cancel(
+        &self,
+        args: &Value,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> String {
         let (command, timeout_secs) = match self.prepare_bash_invocation(args) {
             Ok(invocation) => invocation,
             Err(message) => return message,
         };
-        match self.run_shell_output(&command, timeout_secs) {
+        match self.run_shell_output_cancelable(&command, timeout_secs, cancel_token) {
             Ok(out) => self.render_bash_output(&command, out),
             Err(error) => error,
         }
     }
 
     pub(crate) fn powershell(&self, args: &Value) -> String {
+        self.powershell_with_cancel(args, None)
+    }
+
+    pub(crate) fn powershell_with_cancel(
+        &self,
+        args: &Value,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> String {
         let command = match args.get("command").and_then(Value::as_str) {
             Some(c) => c,
             None => return "Error: missing 'command'".to_string(),
@@ -4009,7 +4061,7 @@ impl ToolExecutor {
             }
         }
 
-        match self.run_powershell_output(command, timeout_secs) {
+        match self.run_powershell_output(command, timeout_secs, cancel_token) {
             Err(error) => error,
             Ok(out) => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
