@@ -651,10 +651,9 @@ fn detect_pending_recovery_session(cli_profile: Option<&str>) -> Option<String> 
 }
 
 fn pending_recovery_status_line(state: &SessionState) -> Option<String> {
-    state
-        .pending_recovery
-        .as_ref()
-        .map(|_| "previous session available via /resume".to_string())
+    state.pending_recovery.as_ref().map(|_| {
+        "previous session available via /resume or a short continue/fix/test follow-up".to_string()
+    })
 }
 
 /// P3.3 — if a persisted plan_state.json exists for the active user, load it
@@ -1591,14 +1590,14 @@ mod tests {
     }
 
     #[test]
-    fn pending_recovery_status_line_requires_explicit_resume() {
+    fn pending_recovery_status_line_describes_explicit_resume_intents() {
         let state = SessionState {
             pending_recovery: Some("sess-123".to_string()),
             ..SessionState::default()
         };
         assert_eq!(
             pending_recovery_status_line(&state).as_deref(),
-            Some("previous session available via /resume")
+            Some("previous session available via /resume or a short continue/fix/test follow-up")
         );
         assert_eq!(pending_recovery_status_line(&SessionState::default()), None);
     }

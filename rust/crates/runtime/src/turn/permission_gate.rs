@@ -189,6 +189,14 @@ fn is_read_only_in_plan_mode(tool_name: &str) -> bool {
             | "grep"
             | "glob"
             | "list_dir"
+            | "git_status"
+            | "git_diff"
+            | "git_log"
+            | "git_file_history"
+            | "git_contributors"
+            | "git_log_search"
+            | "git_show"
+            | "git_blame"
             | "symbols"
             | "introspect"
             | "lsp"
@@ -865,7 +873,21 @@ mod tests {
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
-        for tool in &["read_file", "grep", "glob", "list_dir", "symbols"] {
+        for tool in &[
+            "read_file",
+            "grep",
+            "glob",
+            "list_dir",
+            "git_status",
+            "git_diff",
+            "git_log",
+            "git_file_history",
+            "git_contributors",
+            "git_log_search",
+            "git_show",
+            "git_blame",
+            "symbols",
+        ] {
             let result = check_tool_permission_in_plan_mode(
                 tool,
                 None,
