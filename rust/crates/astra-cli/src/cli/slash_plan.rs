@@ -2,7 +2,7 @@ use super::*;
 use astra_runtime::plan;
 
 fn pending_plan_state() -> plan::PlanModeState {
-    plan::PlanModeState::new(String::new(), plan::ProjectContext::default())
+    plan::PlanModeState::new(String::new())
 }
 
 async fn resolve_plan_token(
@@ -109,10 +109,7 @@ mod tests {
     async fn bare_plan_exits_pending_local_entry_without_remote_call() {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         let mut state = SessionState::default();
-        state.plan_mode = Some(plan::PlanModeState::new(
-            String::new(),
-            plan::ProjectContext::default(),
-        ));
+        state.plan_mode = Some(plan::PlanModeState::new(String::new()));
 
         handle_plan_command("", &api, None, &mut state, None)
             .await
@@ -153,10 +150,7 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = SessionState::default();
         state.session_id = Some("sess-1".to_string());
-        state.plan_mode = Some(plan::PlanModeState::new(
-            "Ship auth".to_string(),
-            plan::ProjectContext::default(),
-        ));
+        state.plan_mode = Some(plan::PlanModeState::new("Ship auth".to_string()));
 
         handle_plan_command("", &api, None, &mut state, Some("token"))
             .await

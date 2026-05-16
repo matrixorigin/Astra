@@ -23,7 +23,7 @@
 //! * `plan_step_runs` is append-only. Every subtask attempt creates a new row
 //!   — never UPDATE, never DELETE.
 
-use crate::decompose::{PlanLoadError, PlanModeState, SavedPlanInfo};
+use crate::decompose::{PlanModeState, SavedPlanInfo};
 use astra_services::task_orchestrator::TaskStatus;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -34,6 +34,35 @@ use std::{
     sync::{Arc, RwLock},
 };
 use uuid::Uuid;
+
+/// Typed errors for plan persistence operations.
+#[derive(Debug, Clone)]
+pub enum PlanLoadError {
+    /// Plan ID contains illegal characters (path traversal, etc.)
+    InvalidId(String),
+    /// Plan does not exist in storage.
+    NotFound(String),
+    /// Stored plan payload is corrupted or unreadable.
+    Corrupt(String),
+    /// Optimistic-concurrency conflict.
+    Conflict { expected: u64, actual: u64 },
+    /// I/O or other unexpected error.
+    Internal(String),
+}
+
+impl std::fmt::Display for PlanLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidId(msg) => write!(f, "invalid plan ID: {msg}"),
+            Self::NotFound(msg) => write!(f, "plan not found: {msg}"),
+            Self::Corrupt(msg) => write!(f, "plan corrupted: {msg}"),
+            Self::Conflict { expected, actual } => {
+                write!(f, "version conflict: expected {expected}, stored {actual}")
+            }
+            Self::Internal(msg) => write!(f, "plan error: {msg}"),
+        }
+    }
+}
 
 // ─── Step-run record ─────────────────────────────────────────────────────────
 
@@ -1239,16 +1268,11 @@ pub async fn fork_plan_for_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decompose::ProjectContext;
 
     #[tokio::test]
     async fn in_memory_save_and_load_roundtrip() {
         let repo = InMemoryPlanRepository::new();
-        let mut state = PlanModeState::new_with_owner(
-            "test goal".into(),
-            ProjectContext::default(),
-            "u-1".into(),
-        );
+        let mut state = PlanModeState::new_with_owner("test goal".into(), "u-1".into());
         state.plan_md = Some("# test plan".into());
         repo.save("plan-1", &mut state, None).await.unwrap();
 
@@ -1261,8 +1285,7 @@ mod tests {
     #[tokio::test]
     async fn in_memory_load_owned_returns_not_found_for_wrong_user() {
         let repo = InMemoryPlanRepository::new();
-        let mut state =
-            PlanModeState::new_with_owner("goal".into(), ProjectContext::default(), "u-1".into());
+        let mut state = PlanModeState::new_with_owner("goal".into(), "u-1".into());
         repo.save("plan-2", &mut state, None).await.unwrap();
 
         let err = repo.load_owned("plan-2", "u-other").await.unwrap_err();

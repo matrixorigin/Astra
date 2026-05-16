@@ -4917,7 +4917,6 @@ mod tests {
         state.session_id = Some("sess-1".to_string());
         state.plan_mode = Some(astra_runtime::plan::PlanModeState::new(
             "Ship auth".to_string(),
-            astra_runtime::plan::ProjectContext::default(),
         ));
         let result = stub_stream_result("Updated the plan.");
         let mut ui = CollectingUi::default();
@@ -5466,10 +5465,7 @@ mod tests {
         let (_tmp, _g) = isolated_sessions_dir();
 
         let mut state = SessionState {
-            plan_mode: Some(astra_runtime::plan::PlanModeState::new(
-                "goal".to_string(),
-                astra_runtime::plan::ProjectContext::default(),
-            )),
+            plan_mode: Some(astra_runtime::plan::PlanModeState::new("goal".to_string())),
             ..Default::default()
         };
         let result = stub_stream_result("Plan updated.");

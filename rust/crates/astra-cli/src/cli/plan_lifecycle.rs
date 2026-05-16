@@ -26,7 +26,7 @@ fn build_plan_mode_state(
     plan_json: Option<Value>,
     version: Option<u64>,
 ) -> plan::PlanModeState {
-    let mut state = plan::PlanModeState::new(goal, plan::ProjectContext::default());
+    let mut state = plan::PlanModeState::new(goal);
     if let Some(plan_json) = plan_json
         && let Ok(task_plan) =
             serde_json::from_value::<astra_services::task_orchestrator::TaskPlan>(plan_json)
@@ -346,10 +346,7 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = crate::SessionState::default();
         state.session_id = Some("sess-1".to_string());
-        state.plan_mode = Some(plan::PlanModeState::new(
-            "stale".to_string(),
-            plan::ProjectContext::default(),
-        ));
+        state.plan_mode = Some(plan::PlanModeState::new("stale".to_string()));
 
         sync_remote_plan_mode_state(&api, "token", &mut state)
             .await
@@ -444,10 +441,7 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = crate::SessionState::default();
         state.session_id = Some("sess-1".to_string());
-        state.plan_mode = Some(plan::PlanModeState::new(
-            "stale goal".to_string(),
-            plan::ProjectContext::default(),
-        ));
+        state.plan_mode = Some(plan::PlanModeState::new("stale goal".to_string()));
 
         let error = sync_remote_plan_mode_state(&api, "token", &mut state)
             .await
@@ -493,10 +487,7 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = crate::SessionState::default();
         state.session_id = Some("sess-1".to_string());
-        state.plan_mode = Some(plan::PlanModeState::new(
-            "Ship auth".to_string(),
-            plan::ProjectContext::default(),
-        ));
+        state.plan_mode = Some(plan::PlanModeState::new("Ship auth".to_string()));
 
         let plan_id = exit_remote_plan_mode(&api, "token", &mut state, true)
             .await
@@ -543,10 +534,7 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = crate::SessionState::default();
         state.session_id = Some("sess-1".to_string());
-        state.plan_mode = Some(plan::PlanModeState::new(
-            "Ship auth".to_string(),
-            plan::ProjectContext::default(),
-        ));
+        state.plan_mode = Some(plan::PlanModeState::new("Ship auth".to_string()));
 
         let error = exit_remote_plan_mode(&api, "token", &mut state, false)
             .await

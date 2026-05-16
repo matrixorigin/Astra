@@ -3937,11 +3937,8 @@ impl ServerToolExecutor {
                 (s, Some(v))
             }
             Err(astra_plan::PlanLoadError::NotFound(_)) => {
-                let mut s = astra_plan::PlanModeState::new_with_owner(
-                    goal.clone(),
-                    astra_plan::ProjectContext::default(),
-                    self.user_id.clone(),
-                );
+                let mut s =
+                    astra_plan::PlanModeState::new_with_owner(goal.clone(), self.user_id.clone());
                 s.session_hint = Some(self.session_id.clone());
                 (s, None)
             }
@@ -6544,11 +6541,8 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
 
         // Seed a plan in authoring state (has subtasks, all pending, none done).
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "test plan".into(),
-            astra_plan::ProjectContext::default(),
-            "test-user".into(),
-        );
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("test plan".into(), "test-user".into());
         state
             .plan
             .subtasks
@@ -6624,11 +6618,8 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
 
         // Plan with 3 subtasks — typical "split into steps" output.
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "ship feature X".into(),
-            astra_plan::ProjectContext::default(),
-            "alice".into(),
-        );
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("ship feature X".into(), "alice".into());
         for (i, title) in ["wire schema", "implement handler", "write tests"]
             .iter()
             .enumerate()
@@ -6704,7 +6695,6 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
-            astra_plan::ProjectContext::default(),
             "alice".into(),
         );
         for (i, title) in [
@@ -6783,7 +6773,6 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
-            astra_plan::ProjectContext::default(),
             "alice".into(),
         );
         state
@@ -6862,7 +6851,6 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
-            astra_plan::ProjectContext::default(),
             "alice".into(),
         );
         state
@@ -6943,7 +6931,6 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
-            astra_plan::ProjectContext::default(),
             "alice".into(),
         );
         state
@@ -7058,11 +7045,8 @@ esac
     #[tokio::test]
     async fn exit_plan_mode_rejected_does_not_seed_todos() {
         let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "still drafting".into(),
-            astra_plan::ProjectContext::default(),
-            "alice".into(),
-        );
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("still drafting".into(), "alice".into());
         state
             .plan
             .subtasks
@@ -7105,11 +7089,8 @@ esac
     #[tokio::test]
     async fn exit_plan_mode_with_empty_plan_seeds_nothing() {
         let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "empty plan".into(),
-            astra_plan::ProjectContext::default(),
-            "alice".into(),
-        );
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("empty plan".into(), "alice".into());
         repo.save("plan-empty-test", &mut state, None)
             .await
             .unwrap();
@@ -7301,11 +7282,8 @@ esac
     #[tokio::test]
     async fn exit_plan_mode_rejected_keeps_write_guard_blocking() {
         let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "draft plan".into(),
-            astra_plan::ProjectContext::default(),
-            "alice".into(),
-        );
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("draft plan".into(), "alice".into());
         state
             .plan
             .subtasks
@@ -7347,11 +7325,8 @@ esac
     #[tokio::test]
     async fn exit_plan_mode_seed_failure_is_non_fatal_and_unlocks_writes() {
         let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "seed failure plan".into(),
-            astra_plan::ProjectContext::default(),
-            "alice".into(),
-        );
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("seed failure plan".into(), "alice".into());
         state
             .plan
             .subtasks

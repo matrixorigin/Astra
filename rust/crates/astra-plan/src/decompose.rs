@@ -1,25 +1,13 @@
 //! Shared plan-mode types and helpers:
-//! - lightweight project context carried through plan flows
 //! - robust JSON extraction/repair for LLM responses
 //! - persisted plan state, rewind helpers, execution summaries, and parallelism analysis
 
 use serde::{Deserialize, Serialize};
 
+use crate::repository::PlanLoadError;
+
 // Re-export task types from services
 pub use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
-
-/// Project context gathered for plan decomposition.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ProjectContext {
-    /// Languages detected in the project.
-    pub languages: Vec<String>,
-    /// Number of source files.
-    pub source_file_count: usize,
-    /// Key source modules with line counts: ("src/main.rs", 150)
-    pub key_modules: Vec<(String, usize)>,
-    /// Git branch name if in a repo.
-    pub git_branch: Option<String>,
-}
 
 /// Extract JSON from a response that may include markdown code blocks.
 fn extract_json(response: &str) -> String {
@@ -364,37 +352,6 @@ pub fn extract_json_robust(response: &str) -> String {
 
 // ─── Plan Mode State ─────────────────────────────────────────────────────────
 
-/// Typed errors for plan persistence operations.
-#[derive(Debug, Clone)]
-pub enum PlanLoadError {
-    /// Plan ID contains illegal characters (path traversal, etc.)
-    InvalidId(String),
-    /// Plan file does not exist on disk.
-    NotFound(String),
-    /// Plan file exists but is corrupted or unreadable.
-    Corrupt(String),
-    /// Optimistic-concurrency conflict — caller's `expected_version` did not
-    /// match the version actually stored. Typed separately from Internal so
-    /// HTTP handlers can map it to 409 without string matching.
-    Conflict { expected: u64, actual: u64 },
-    /// I/O or other unexpected error.
-    Internal(String),
-}
-
-impl std::fmt::Display for PlanLoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidId(msg) => write!(f, "invalid plan ID: {msg}"),
-            Self::NotFound(msg) => write!(f, "plan not found: {msg}"),
-            Self::Corrupt(msg) => write!(f, "plan corrupted: {msg}"),
-            Self::Conflict { expected, actual } => {
-                write!(f, "version conflict: expected {expected}, stored {actual}")
-            }
-            Self::Internal(msg) => write!(f, "plan error: {msg}"),
-        }
-    }
-}
-
 fn default_version() -> u64 {
     1
 }
@@ -409,8 +366,6 @@ pub struct PlanModeState {
     /// Optional rendered markdown artifact for UI/sync consumers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_md: Option<String>,
-    /// Project context captured when the plan was created.
-    pub context: ProjectContext,
     /// Whether the mirrored plan has loaded or local edits.
     #[serde(default)]
     pub modified: bool,
@@ -430,11 +385,10 @@ pub struct PlanModeState {
 }
 
 impl PlanModeState {
-    /// Create a new plan state with initial goal and context.
-    pub fn new(goal: String, context: ProjectContext) -> Self {
+    /// Create a new plan state with the initial goal.
+    pub fn new(goal: String) -> Self {
         Self {
             goal,
-            context,
             plan: TaskPlan::default(),
             plan_md: None,
             modified: false,
@@ -446,8 +400,8 @@ impl PlanModeState {
     }
 
     /// Create a new plan with an owner user ID.
-    pub fn new_with_owner(goal: String, context: ProjectContext, user_id: String) -> Self {
-        let mut state = Self::new(goal, context);
+    pub fn new_with_owner(goal: String, user_id: String) -> Self {
+        let mut state = Self::new(goal);
         state.created_by = Some(user_id);
         state
     }
@@ -504,72 +458,6 @@ impl PlanModeState {
         }
         Ok(())
     }
-}
-
-// ── Paused plan: operator corrections + rewind ─────────────────────────────
-
-/// Where to rewind when re-running part of a plan (1-based index or id prefix).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PlanRewindAnchor {
-    /// 1-based index in `plan.subtasks` order (as shown during execution).
-    OneBased(usize),
-    /// Exact id or unique prefix of `SubtaskPlan.id`.
-    IdPrefix(String),
-}
-
-pub fn resolve_rewind_start_index(
-    plan: &TaskPlan,
-    anchor: &PlanRewindAnchor,
-) -> Result<usize, String> {
-    match anchor {
-        PlanRewindAnchor::OneBased(n) => {
-            if *n == 0 || *n > plan.subtasks.len() {
-                return Err(format!("subtask index must be 1..={}", plan.subtasks.len()));
-            }
-            Ok(*n - 1)
-        }
-        PlanRewindAnchor::IdPrefix(s) => {
-            let q = s.trim();
-            if q.is_empty() {
-                return Err("empty subtask id".into());
-            }
-            let matches: Vec<usize> = plan
-                .subtasks
-                .iter()
-                .enumerate()
-                .filter(|(_, st)| st.id == q || st.id.starts_with(q))
-                .map(|(i, _)| i)
-                .collect();
-            match matches.len() {
-                0 => Err(format!("no subtask id matches {q:?}")),
-                1 => Ok(matches[0]),
-                _ => Err(format!(
-                    "ambiguous id {:?} ({} matches); use a longer prefix or `rewind N` (1-based)",
-                    q,
-                    matches.len()
-                )),
-            }
-        }
-    }
-}
-
-/// Set `start_idx` and all following subtasks (in plan order) to pending if they were in progress.
-/// Returns how many subtasks were reset.
-pub fn rewind_plan_from_subtask(plan: &mut TaskPlan, start_idx: usize) -> usize {
-    let mut n = 0usize;
-    for st in plan.subtasks.iter_mut().skip(start_idx) {
-        if matches!(
-            st.status,
-            TaskStatus::Completed
-                | TaskStatus::InProgress
-                | TaskStatus::Paused
-                | TaskStatus::Failed
-        ) {
-            st.status = TaskStatus::Pending;
-            n += 1;
-        }
-    }
-    n
 }
 
 /// Returns true when a subtask explicitly calls for real browser/UI verification.
@@ -1384,40 +1272,6 @@ mod tests {
         assert_eq!(ready[0].id, "c");
     }
 
-    #[test]
-    fn rewind_plan_resets_suffix() {
-        let mut plan = TaskPlan {
-            subtasks: vec![
-                SubtaskPlan {
-                    id: "1".into(),
-                    title: "a".into(),
-                    status: TaskStatus::Completed,
-                    ..Default::default()
-                },
-                SubtaskPlan {
-                    id: "2".into(),
-                    title: "b".into(),
-                    status: TaskStatus::Completed,
-                    ..Default::default()
-                },
-                SubtaskPlan {
-                    id: "3".into(),
-                    title: "c".into(),
-                    status: TaskStatus::InProgress,
-                    ..Default::default()
-                },
-            ],
-            notes: None,
-        };
-        let idx = resolve_rewind_start_index(&plan, &PlanRewindAnchor::OneBased(2)).unwrap();
-        assert_eq!(idx, 1);
-        let n = rewind_plan_from_subtask(&mut plan, idx);
-        assert_eq!(n, 2);
-        assert_eq!(plan.subtasks[0].status, TaskStatus::Completed);
-        assert_eq!(plan.subtasks[1].status, TaskStatus::Pending);
-        assert_eq!(plan.subtasks[2].status, TaskStatus::Pending);
-    }
-
     // ═══════════════════════════ Parallel Subtask Tests ══════════════════════
 
     #[test]
@@ -2072,203 +1926,6 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&out).expect("escaped embedded quote should parse");
         assert_eq!(v["msg"], "she said \"hi\"");
-    }
-
-    // ═══════════════════════ resolve_rewind_start_index Tests ════════════════════════
-
-    #[test]
-    fn rewind_index_one_based_valid() {
-        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan};
-        let plan = TaskPlan {
-            subtasks: vec![
-                SubtaskPlan {
-                    id: "a".into(),
-                    title: "A".into(),
-                    ..Default::default()
-                },
-                SubtaskPlan {
-                    id: "b".into(),
-                    title: "B".into(),
-                    ..Default::default()
-                },
-            ],
-            notes: None,
-        };
-        assert_eq!(
-            resolve_rewind_start_index(&plan, &PlanRewindAnchor::OneBased(1)),
-            Ok(0)
-        );
-        assert_eq!(
-            resolve_rewind_start_index(&plan, &PlanRewindAnchor::OneBased(2)),
-            Ok(1)
-        );
-    }
-
-    #[test]
-    fn rewind_index_one_based_out_of_range() {
-        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan};
-        let plan = TaskPlan {
-            subtasks: vec![SubtaskPlan {
-                id: "a".into(),
-                title: "A".into(),
-                ..Default::default()
-            }],
-            notes: None,
-        };
-        assert!(resolve_rewind_start_index(&plan, &PlanRewindAnchor::OneBased(0)).is_err());
-        assert!(resolve_rewind_start_index(&plan, &PlanRewindAnchor::OneBased(5)).is_err());
-    }
-
-    #[test]
-    fn rewind_index_id_prefix_exact_match() {
-        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan};
-        let plan = TaskPlan {
-            subtasks: vec![
-                SubtaskPlan {
-                    id: "setup".into(),
-                    title: "Setup".into(),
-                    ..Default::default()
-                },
-                SubtaskPlan {
-                    id: "build".into(),
-                    title: "Build".into(),
-                    ..Default::default()
-                },
-            ],
-            notes: None,
-        };
-        assert_eq!(
-            resolve_rewind_start_index(&plan, &PlanRewindAnchor::IdPrefix("build".into())),
-            Ok(1)
-        );
-    }
-
-    #[test]
-    fn rewind_index_id_prefix_ambiguous() {
-        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan};
-        let plan = TaskPlan {
-            subtasks: vec![
-                SubtaskPlan {
-                    id: "test-unit".into(),
-                    title: "Unit".into(),
-                    ..Default::default()
-                },
-                SubtaskPlan {
-                    id: "test-integration".into(),
-                    title: "Integ".into(),
-                    ..Default::default()
-                },
-            ],
-            notes: None,
-        };
-        let r = resolve_rewind_start_index(&plan, &PlanRewindAnchor::IdPrefix("test".into()));
-        assert!(r.is_err());
-        assert!(r.unwrap_err().contains("ambiguous"));
-    }
-
-    #[test]
-    fn rewind_index_id_prefix_no_match() {
-        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan};
-        let plan = TaskPlan {
-            subtasks: vec![SubtaskPlan {
-                id: "a".into(),
-                title: "A".into(),
-                ..Default::default()
-            }],
-            notes: None,
-        };
-        assert!(
-            resolve_rewind_start_index(&plan, &PlanRewindAnchor::IdPrefix("zzz".into())).is_err()
-        );
-    }
-
-    #[test]
-    fn rewind_index_id_prefix_empty() {
-        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan};
-        let plan = TaskPlan {
-            subtasks: vec![SubtaskPlan {
-                id: "a".into(),
-                title: "A".into(),
-                ..Default::default()
-            }],
-            notes: None,
-        };
-        assert!(resolve_rewind_start_index(&plan, &PlanRewindAnchor::IdPrefix("".into())).is_err());
-    }
-
-    // ═══════════════════════ rewind_plan_from_subtask Tests ════════════════════════
-
-    #[test]
-    fn rewind_resets_from_start_index() {
-        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
-        let mut plan = TaskPlan {
-            subtasks: vec![
-                SubtaskPlan {
-                    id: "a".into(),
-                    title: "A".into(),
-                    status: TaskStatus::Completed,
-                    ..Default::default()
-                },
-                SubtaskPlan {
-                    id: "b".into(),
-                    title: "B".into(),
-                    status: TaskStatus::InProgress,
-                    ..Default::default()
-                },
-                SubtaskPlan {
-                    id: "c".into(),
-                    title: "C".into(),
-                    status: TaskStatus::Pending,
-                    ..Default::default()
-                },
-            ],
-            notes: None,
-        };
-        let n = rewind_plan_from_subtask(&mut plan, 1);
-        assert_eq!(n, 1); // only "b" was reset (c was already pending)
-        assert_eq!(plan.subtasks[0].status, TaskStatus::Completed); // unchanged
-        assert_eq!(plan.subtasks[1].status, TaskStatus::Pending);
-        assert_eq!(plan.subtasks[2].status, TaskStatus::Pending);
-    }
-
-    #[test]
-    fn rewind_all_from_zero() {
-        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
-        let mut plan = TaskPlan {
-            subtasks: vec![
-                SubtaskPlan {
-                    id: "a".into(),
-                    title: "A".into(),
-                    status: TaskStatus::Completed,
-                    ..Default::default()
-                },
-                SubtaskPlan {
-                    id: "b".into(),
-                    title: "B".into(),
-                    status: TaskStatus::Failed,
-                    ..Default::default()
-                },
-            ],
-            notes: None,
-        };
-        let n = rewind_plan_from_subtask(&mut plan, 0);
-        assert_eq!(n, 2);
-    }
-
-    #[test]
-    fn rewind_past_end_resets_nothing() {
-        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
-        let mut plan = TaskPlan {
-            subtasks: vec![SubtaskPlan {
-                id: "a".into(),
-                title: "A".into(),
-                status: TaskStatus::Completed,
-                ..Default::default()
-            }],
-            notes: None,
-        };
-        let n = rewind_plan_from_subtask(&mut plan, 10);
-        assert_eq!(n, 0);
     }
 
     // ═══════════════════════ analyze_parallelism Tests ════════════════════════

@@ -271,7 +271,6 @@ fn preview(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_runtime::plan::ProjectContext;
     use astra_services::VerifierKind;
     use astra_services::durable_task::{
         ContractStatus, DurableSubtask, TaskScope, VerificationCriterion,
@@ -349,7 +348,7 @@ mod tests {
 
     #[test]
     fn summary_includes_resume_authoring_execution_durable_and_last_event() {
-        let mut plan_mode = PlanModeState::new("Harden auth".into(), ProjectContext::default());
+        let mut plan_mode = PlanModeState::new("Harden auth".into());
         plan_mode.modified = true;
         plan_mode
             .plan

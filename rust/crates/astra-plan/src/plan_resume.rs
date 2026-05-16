@@ -152,7 +152,7 @@ mod tests {
     use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
 
     fn make_state(goal: &str, subtasks: Vec<SubtaskPlan>) -> PlanModeState {
-        let mut st = PlanModeState::new(goal.to_string(), Default::default());
+        let mut st = PlanModeState::new(goal.to_string());
         st.plan = TaskPlan {
             subtasks,
             notes: None,

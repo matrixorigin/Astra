@@ -15,7 +15,6 @@
 use astra_core::{MatrixOneSettings, SharedPool};
 use astra_plan::{
     CloudPlanRepository, NewStepRun, PlanListFilter, PlanLoadError, PlanModeState, PlanRepository,
-    ProjectContext,
 };
 use astra_services::ensure_core_schema;
 use astra_services::task_orchestrator::{SubtaskPlan, TaskStatus};
@@ -102,11 +101,7 @@ async fn ensure_session(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str, user_i
 }
 
 fn make_state_with_goal(owner: &str, goal: &str) -> PlanModeState {
-    PlanModeState::new_with_owner(
-        goal.to_string(),
-        ProjectContext::default(),
-        owner.to_string(),
-    )
+    PlanModeState::new_with_owner(goal.to_string(), owner.to_string())
 }
 
 fn make_state_with_subtasks(owner: &str, goal: &str, ids: &[&str]) -> PlanModeState {

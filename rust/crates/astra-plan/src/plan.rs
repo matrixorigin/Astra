@@ -34,10 +34,7 @@ pub enum PlanPhase {
     Idle,
 
     /// Goal submitted, waiting for LLM decomposition.
-    Planning {
-        goal: String,
-        context: ProjectContext,
-    },
+    Planning { goal: String },
 
     /// Plan generated, user is interactively refining it (`plan>` prompt).
     Refining { state: PlanModeState },
@@ -119,7 +116,7 @@ impl PlanPhase {
 
         match (self, action) {
             // Idle → Planning
-            (Idle, SubmitGoal { goal, context }) => Ok(Planning { goal, context }),
+            (Idle, SubmitGoal { goal }) => Ok(Planning { goal }),
 
             // Planning → Refining
             (Planning { .. }, PlanGenerated { state }) => Ok(Refining { state }),
@@ -145,7 +142,6 @@ impl PlanPhase {
             // Refining → Planning (regenerate)
             (Refining { state }, Regenerate) => Ok(Planning {
                 goal: state.goal.clone(),
-                context: state.context.clone(),
             }),
 
             // Refining → Executing
@@ -198,8 +194,7 @@ impl PlanPhase {
 
             // Paused → Refining (replan — preserves existing plan and timeline)
             (Paused { state, .. }, Replan) => {
-                let mut plan_state =
-                    PlanModeState::new(state.goal.unwrap_or_default(), ProjectContext::default());
+                let mut plan_state = PlanModeState::new(state.goal.unwrap_or_default());
                 plan_state.plan = state.plan;
                 plan_state.timeline = state.timeline;
                 Ok(Refining { state: plan_state })
@@ -274,36 +269,21 @@ pub struct PlanExecutionState {
 /// Actions that can trigger phase transitions.
 #[derive(Debug, Clone)]
 pub enum PlanAction {
-    SubmitGoal {
-        goal: String,
-        context: ProjectContext,
-    },
-    PlanGenerated {
-        state: PlanModeState,
-    },
-    PlanEdited {
-        state: PlanModeState,
-    },
+    SubmitGoal { goal: String },
+    PlanGenerated { state: PlanModeState },
+    PlanEdited { state: PlanModeState },
     Regenerate,
-    Execute {
-        config: PlanExecutionConfig,
-    },
+    Execute { config: PlanExecutionConfig },
     Cancel,
     SubtaskDone,
-    Pause {
-        reason: PauseReason,
-    },
+    Pause { reason: PauseReason },
     Resume,
     Replan,
     Abandon,
     Complete,
-    Fail {
-        error: PlanError,
-    },
+    Fail { error: PlanError },
     Dismiss,
-    RetryPlan {
-        state: PlanModeState,
-    },
+    RetryPlan { state: PlanModeState },
 }
 
 impl PlanAction {
@@ -810,7 +790,6 @@ mod tests {
         let next = phase
             .transition(PlanAction::SubmitGoal {
                 goal: "test".into(),
-                context: ProjectContext::default(),
             })
             .unwrap();
         assert!(matches!(next, PlanPhase::Planning { .. }));
@@ -825,7 +804,7 @@ mod tests {
 
     #[test]
     fn refining_to_executing() {
-        let state = PlanModeState::new("test goal".into(), ProjectContext::default());
+        let state = PlanModeState::new("test goal".into());
         let phase = PlanPhase::Refining { state };
         let next = phase
             .transition(PlanAction::Execute {
@@ -989,13 +968,12 @@ mod tests {
 
         let plan_caps = PlanCapabilities::for_phase(&PlanPhase::Planning {
             goal: "test".into(),
-            context: ProjectContext::default(),
         });
         assert!(!plan_caps.can_execute_tools);
         assert!(!plan_caps.can_modify_files);
 
         let refine_caps = PlanCapabilities::for_phase(&PlanPhase::Refining {
-            state: PlanModeState::new("test".into(), ProjectContext::default()),
+            state: PlanModeState::new("test".into()),
         });
         assert!(!refine_caps.can_execute_tools);
     }
@@ -1007,8 +985,7 @@ mod tests {
             format!(
                 "{}",
                 PlanPhase::Planning {
-                    goal: "test".into(),
-                    context: ProjectContext::default()
+                    goal: "test".into()
                 }
             ),
             "planning"
@@ -1109,7 +1086,6 @@ mod tests {
     fn planning_to_idle_on_cancel() {
         let phase = PlanPhase::Planning {
             goal: "test".into(),
-            context: ProjectContext::default(),
         };
         let next = phase.transition(PlanAction::Cancel).unwrap();
         assert!(next.is_idle());
@@ -1119,7 +1095,6 @@ mod tests {
     fn planning_to_failed_preserves_error_and_partial_summary() {
         let phase = PlanPhase::Planning {
             goal: "build auth system".into(),
-            context: ProjectContext::default(),
         };
         let next = phase
             .transition(PlanAction::Fail {
@@ -1252,7 +1227,7 @@ mod tests {
             },
             partial: None,
         };
-        let state = PlanModeState::new("retry".into(), ProjectContext::default());
+        let state = PlanModeState::new("retry".into());
         let next = phase.transition(PlanAction::RetryPlan { state }).unwrap();
         assert!(next.is_refining());
     }
