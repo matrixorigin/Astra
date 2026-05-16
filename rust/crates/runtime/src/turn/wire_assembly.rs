@@ -350,6 +350,7 @@ pub(crate) fn assemble_llm_messages(
 
     // Prepend volatile content to the last user message so the stable
     // prefix (system + history) stays byte-identical for prefix caching.
+    let mut synthetic_fallback_only = false;
     if !volatile_preamble.is_empty() {
         let volatile_text: String = volatile_preamble
             .iter()
@@ -370,10 +371,15 @@ pub(crate) fn assemble_llm_messages(
                     .unwrap_or("");
                 last_user["content"] = Value::String(format!("{volatile_text}\n\n{existing}"));
             } else {
-                // No user message yet — insert as a standalone pair (fallback)
+                // No user message yet — insert as a standalone pair (fallback).
+                // Mark as synthetic so cache metadata is not applied: there is
+                // no real history to anchor a cache breakpoint, and annotating
+                // the synthetic assistant turn would falsely signal a cached
+                // prefix to callers that inspect last_message_has_cache_control.
                 llm_messages.push(serde_json::json!({"role": "user", "content": volatile_text}));
                 llm_messages
                     .push(serde_json::json!({"role": "assistant", "content": "Understood."}));
+                synthetic_fallback_only = true;
             }
         }
     }
@@ -399,7 +405,9 @@ pub(crate) fn assemble_llm_messages(
         llm_messages.extend(file_messages);
     }
 
-    apply_anthropic_cache_metadata(&mut llm_messages, cache_cfg, session_id);
+    if !synthetic_fallback_only {
+        apply_anthropic_cache_metadata(&mut llm_messages, cache_cfg, session_id);
+    }
     llm_messages
 }
 
