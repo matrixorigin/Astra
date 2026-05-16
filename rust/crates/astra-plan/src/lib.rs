@@ -4,8 +4,6 @@ pub mod action_plan;
 pub mod analytical;
 pub mod decompose;
 pub mod metrics;
-pub mod outline;
-pub mod performance;
 pub mod plan;
 pub mod plan_resume;
 pub mod repository;

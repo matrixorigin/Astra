@@ -2,9 +2,7 @@ use super::*;
 use astra_runtime::plan;
 
 fn pending_plan_state() -> plan::PlanModeState {
-    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let context = plan::analyze_project(&project_root);
-    plan::PlanModeState::new(String::new(), context)
+    plan::PlanModeState::new(String::new(), plan::ProjectContext::default())
 }
 
 async fn resolve_plan_token(
