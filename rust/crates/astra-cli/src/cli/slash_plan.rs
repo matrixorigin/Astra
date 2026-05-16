@@ -62,7 +62,6 @@ pub(super) async fn handle_plan_command(
     if plan_request.is_empty() {
         state.plan_mode = Some(pending_plan_state());
         state.plan_mode_sync_error = None;
-        state.pending_plan_resume_digest = None;
         eprintln!();
         eprintln!(
             "  {} Plan mode active. Describe your goal.",

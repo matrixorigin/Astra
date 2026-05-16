@@ -1820,13 +1820,7 @@ impl ServerToolExecutor {
                 }
             }
             "list_dir" => self.default_executor.execute("list_dir", args).await,
-            // ── Top-level plan-mode tools (Phase 2) ────────────────────
-            // Promoted from `session.enter_plan` / `session.exit_plan` to
-            // dedicated tools matching claudecode's `EnterPlanMode` /
-            // `ExitPlanMode`. The buried sub-actions never got picked,
-            // wasting the plan-authoring discipline. The schema-side
-            // entries are gone (see schemas.rs); the dispatch here also
-            // redirects stale calls so the model self-corrects.
+            // ── Top-level plan-mode tools ───────────────────────────────
             "enter_plan_mode" => {
                 astra_tools::ToolResult::text(self.tool_enter_plan_mode(args).await)
             }
@@ -1839,19 +1833,6 @@ impl ServerToolExecutor {
                     "prioritize" => tool_result_from_output(self.prioritize_tool(args)),
                     "deprioritize" => tool_result_from_output(self.deprioritize_tool(args)),
                     "compact" => tool_result_from_output(self.compress_context(args)),
-                    // Phase 2 split: plan-mode actions promoted to top-level
-                    // tools. Stale callers get a redirect Error so the model
-                    // self-corrects instead of silently no-op'ing.
-                    "enter_plan" => astra_tools::ToolResult::text(format!(
-                        "Error: `session(action='enter_plan')` was promoted to the \
-                         top-level `enter_plan_mode` tool in the Phase 2 plan-mode split. \
-                         Call `enter_plan_mode` directly. The buried sub-action no longer exists."
-                    )),
-                    "exit_plan" => astra_tools::ToolResult::text(format!(
-                        "Error: `session(action='exit_plan')` was promoted to the \
-                         top-level `exit_plan_mode` tool in the Phase 2 plan-mode split. \
-                         Call `exit_plan_mode` directly with the plan markdown."
-                    )),
                     "rollback_edits" => tool_result_from_output(self.rollback_file_edits(args)),
                     "ask_user" => self.server_ask_user(args).await,
                     "sleep" => self.default_executor.execute("sleep", args).await,
@@ -5932,6 +5913,18 @@ esac
     }
 
     #[tokio::test]
+    async fn session_enter_plan_legacy_action_is_unknown() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute("session", &json!({"action": "enter_plan"}))
+            .await;
+        assert!(
+            result.contains("Unknown session action: 'enter_plan'"),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
     async fn symbols_extracts_rust_symbols() {
         let (exec, dir) = test_executor();
         std::fs::write(
@@ -6317,7 +6310,7 @@ esac
         let active = Arc::new(AtomicU32::new(0));
         let load = Arc::new(AtomicU32::new(0));
         let inner: Arc<dyn astra_plan::PlanRepository> =
-            Arc::new(astra_plan::LocalCachePlanRepository::new());
+            Arc::new(astra_plan::InMemoryPlanRepository::new());
         let wrapper = Arc::new(QueryCountingPlanRepo {
             inner,
             active_calls: active.clone(),
@@ -6359,7 +6352,7 @@ esac
         // in the system prompt for the rest of the run. The executor now
         // shares the slot and pushes updates through on enter/exit.
         let inner: Arc<dyn astra_plan::PlanRepository> =
-            Arc::new(astra_plan::LocalCachePlanRepository::new());
+            Arc::new(astra_plan::InMemoryPlanRepository::new());
         let (mut exec, _dir) = test_executor();
         exec.set_plan_repository(inner);
 
@@ -6394,7 +6387,7 @@ esac
         let active = Arc::new(AtomicU32::new(0));
         let load = Arc::new(AtomicU32::new(0));
         let inner: Arc<dyn astra_plan::PlanRepository> =
-            Arc::new(astra_plan::LocalCachePlanRepository::new());
+            Arc::new(astra_plan::InMemoryPlanRepository::new());
         let wrapper = Arc::new(QueryCountingPlanRepo {
             inner,
             active_calls: active.clone(),

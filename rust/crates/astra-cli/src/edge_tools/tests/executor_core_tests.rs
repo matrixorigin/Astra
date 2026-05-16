@@ -484,8 +484,7 @@ async fn write_guard_is_inactive_without_cloud_binding() {
     // fail open so offline / unauthenticated CLI runs still work.
     let temp = tempfile::tempdir().unwrap();
     let target = temp.path().join("note.txt");
-    let executor =
-        ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-1");
+    let executor = ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-1");
 
     let result = executor
         .execute(

@@ -242,17 +242,8 @@ pub(super) async fn handle_chat_input_with_ui(
         return Ok(());
     }
 
-    let restored_plan_mode = session_runtime::maybe_restore_pending_plan_mode(&line, state);
-
     // Consume one-shot resume guidance before building the effective line.
     let resume_guidance = state.resume_guidance.take();
-    // P3.3 — pending plan-resume digest. Kept until the user sends an
-    // explicit resume-like line, then consumed once.
-    let plan_resume_digest = if restored_plan_mode {
-        plan_resume_digest_from_active_plan_mode(state)
-    } else {
-        consume_plan_resume_if_matches(state, &line)
-    };
     let mut effective_line = build_effective_line(&line, state, ui);
     state.diagnostics_context = None; // consumed after injection
 
@@ -303,7 +294,7 @@ pub(super) async fn handle_chat_input_with_ui(
         effective_line = format!("{nudge}\n\n{effective_line}");
         state.turns_since_task_reminder = 0;
     }
-    effective_line = apply_resume_context(effective_line, resume_guidance, plan_resume_digest);
+    effective_line = apply_resume_context(effective_line, resume_guidance);
     let turn_start = Instant::now();
 
     let session_id = state.session_id.clone();
@@ -458,32 +449,9 @@ pub(super) async fn handle_chat_input_with_ui(
     Ok(())
 }
 
-pub(super) fn consume_plan_resume_if_matches(
-    state: &mut SessionState,
-    line: &str,
-) -> Option<String> {
-    astra_runtime::plan::plan_resume::message_signals_resume(line)
-        .then(|| state.pending_plan_resume_digest.take())
-        .flatten()
-}
-
-fn plan_resume_digest_from_active_plan_mode(state: &SessionState) -> Option<String> {
-    state
-        .plan_mode
-        .as_ref()
-        .and_then(astra_runtime::plan::plan_resume_digest)
-}
-
-fn apply_resume_context(
-    mut effective_line: String,
-    resume_guidance: Option<String>,
-    plan_resume_digest: Option<String>,
-) -> String {
+fn apply_resume_context(mut effective_line: String, resume_guidance: Option<String>) -> String {
     if let Some(guidance) = resume_guidance {
         effective_line = format!("{guidance}\n\n{effective_line}");
-    }
-    if let Some(digest) = plan_resume_digest {
-        effective_line = format!("@resume-plan\n{digest}\n\n{effective_line}");
     }
     effective_line
 }
@@ -4319,70 +4287,13 @@ mod tests {
     }
 
     #[test]
-    fn consume_plan_resume_if_matches_requires_resume_signal() {
-        let mut state = SessionState {
-            pending_plan_resume_digest: Some("[plan-resume] goal=\"Fix auth\"".to_string()),
-            ..SessionState::default()
-        };
-
-        assert!(consume_plan_resume_if_matches(&mut state, "tell me a joke").is_none());
-        assert_eq!(
-            state.pending_plan_resume_digest.as_deref(),
-            Some("[plan-resume] goal=\"Fix auth\"")
-        );
-    }
-
-    #[test]
-    fn consume_plan_resume_if_matches_consumes_digest_on_explicit_tag() {
-        let mut state = SessionState {
-            pending_plan_resume_digest: Some("[plan-resume] goal=\"Fix auth\"".to_string()),
-            ..SessionState::default()
-        };
-
-        let digest = consume_plan_resume_if_matches(&mut state, "please @resume-plan");
-        assert_eq!(digest.as_deref(), Some("[plan-resume] goal=\"Fix auth\""));
-        assert!(state.pending_plan_resume_digest.is_none());
-    }
-
-    #[test]
-    fn apply_resume_context_injects_implicit_resume_tag_and_digest() {
+    fn apply_resume_context_prepends_resume_guidance() {
         let effective = apply_resume_context(
             "continue".to_string(),
-            None,
-            Some("[plan-resume] goal=\"Fix auth\"".to_string()),
+            Some("Resume the interrupted turn before answering.".to_string()),
         );
-        assert!(effective.starts_with("@resume-plan\n[plan-resume]"));
+        assert!(effective.starts_with("Resume the interrupted turn before answering."));
         assert!(effective.ends_with("\n\ncontinue"));
-    }
-
-    #[test]
-    fn restored_plan_mode_provides_resume_digest_for_effective_line() {
-        let mut plan = astra_runtime::plan::PlanModeState::new(
-            "Fix auth".into(),
-            astra_runtime::plan::ProjectContext::default(),
-        );
-        plan.plan
-            .subtasks
-            .push(astra_services::task_orchestrator::SubtaskPlan {
-                id: "t1".into(),
-                title: "Patch token validation".into(),
-                status: astra_services::task_orchestrator::TaskStatus::InProgress,
-                ..Default::default()
-            });
-        let state = SessionState {
-            plan_mode: Some(plan),
-            ..SessionState::default()
-        };
-
-        let digest = plan_resume_digest_from_active_plan_mode(&state).expect("digest");
-        let effective = apply_resume_context("continue".to_string(), None, Some(digest));
-
-        assert!(effective.starts_with("@resume-plan\n[plan-resume]"));
-        assert!(effective.contains("goal=\"Fix auth\""), "{effective}");
-        assert!(
-            effective.contains("in_progress=\"Patch token validation\""),
-            "{effective}"
-        );
     }
 
     #[test]

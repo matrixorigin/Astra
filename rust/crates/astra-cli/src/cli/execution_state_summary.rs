@@ -20,7 +20,6 @@ use astra_tools::task_mgmt::SessionTask;
 pub(crate) struct ExecutionStateSummaryInput<'a> {
     pub model: Option<&'a str>,
     pub last_turn_interrupted: bool,
-    pub pending_plan_resume_digest: Option<&'a str>,
     pub plan_mode: Option<&'a PlanModeState>,
     pub executing_plan: Option<&'a TaskPlan>,
     pub executing_plan_goal: Option<&'a str>,
@@ -38,7 +37,6 @@ pub(crate) fn format_for_session_state(
     format_summary(ExecutionStateSummaryInput {
         model: state.model.as_deref(),
         last_turn_interrupted: state.last_turn_interrupted,
-        pending_plan_resume_digest: state.pending_plan_resume_digest.as_deref(),
         plan_mode: state.plan_mode.as_ref(),
         executing_plan: state.executing_plan.as_ref(),
         executing_plan_goal: state.executing_plan_goal.as_deref(),
@@ -60,13 +58,6 @@ pub(crate) fn format_summary(input: ExecutionStateSummaryInput<'_>) -> Option<St
         lifecycle_lines.push(
             "turn state: last turn was interrupted; inspect partial work before resuming".into(),
         );
-    }
-    if let Some(digest) = input
-        .pending_plan_resume_digest
-        .map(str::trim)
-        .filter(|digest| !digest.is_empty())
-    {
-        lifecycle_lines.push(format!("resume pending: {digest}"));
     }
     if let Some(plan_mode) = input.plan_mode {
         let mut line = format!(
@@ -423,9 +414,6 @@ mod tests {
         let out = format_summary(ExecutionStateSummaryInput {
             model: Some("gpt-5.4"),
             last_turn_interrupted: true,
-            pending_plan_resume_digest: Some(
-                "[plan-resume] goal=\"Ship auth flow\" · in_progress=\"Verify auth API\" · open=1 · done=1/2",
-            ),
             plan_mode: Some(&plan_mode),
             executing_plan: Some(&executing_plan),
             executing_plan_goal: Some("Ship auth flow"),
@@ -442,7 +430,6 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("model: gpt-5.4"), "{out}");
-        assert!(out.contains("resume pending: [plan-resume]"), "{out}");
         assert!(
             out.contains("plan authoring: [plan-resume] goal=\"Harden auth\""),
             "{out}"
@@ -475,7 +462,6 @@ mod tests {
         let out = format_summary(ExecutionStateSummaryInput {
             model: Some("gpt-5.4"),
             last_turn_interrupted: false,
-            pending_plan_resume_digest: None,
             plan_mode: None,
             executing_plan: None,
             executing_plan_goal: None,
@@ -517,7 +503,6 @@ mod tests {
         let out = format_summary(ExecutionStateSummaryInput {
             model: None,
             last_turn_interrupted: false,
-            pending_plan_resume_digest: None,
             plan_mode: None,
             executing_plan: Some(&executing_plan),
             executing_plan_goal: Some("Ship auth flow"),

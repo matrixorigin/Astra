@@ -103,7 +103,7 @@ pub struct AppState {
     /// Reuses connection pool and TLS state across requests.
     pub(crate) http_client: reqwest::Client,
     /// Cloud-authoritative repository for plan state and step-run history.
-    /// Defaults to [`astra_plan::LocalCachePlanRepository`]; production wires
+    /// Defaults to [`astra_plan::InMemoryPlanRepository`]; production wires
     /// [`astra_plan::CloudPlanRepository`] backed by the MatrixOne pool.
     pub(crate) plan_repo: Arc<dyn astra_plan::PlanRepository>,
     pub(crate) cors_origins: Option<String>,
@@ -212,7 +212,7 @@ impl AppState {
                 .timeout(std::time::Duration::from_secs(120))
                 .build()
                 .expect("failed to build shared HTTP client"),
-            plan_repo: Arc::new(astra_plan::LocalCachePlanRepository::new()),
+            plan_repo: Arc::new(astra_plan::InMemoryPlanRepository::new()),
             cors_origins: None,
             metrics_registry: Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new()),
             #[cfg(feature = "harness")]
@@ -227,7 +227,7 @@ impl AppState {
 
     /// Inject the plan repository — production wires
     /// [`astra_plan::CloudPlanRepository`]; tests typically keep the default
-    /// [`astra_plan::LocalCachePlanRepository`].
+    /// [`astra_plan::InMemoryPlanRepository`].
     pub fn with_plan_repository(mut self, repo: Arc<dyn astra_plan::PlanRepository>) -> Self {
         self.plan_repo = repo;
         self

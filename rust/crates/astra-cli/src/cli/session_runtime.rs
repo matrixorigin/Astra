@@ -602,7 +602,6 @@ pub(crate) fn initialize_session_state(
 ) -> SessionState {
     let mut state = SessionState::default();
     state.pending_recovery = detect_pending_recovery_session(profile);
-    state.pending_plan_resume_digest = detect_pending_plan_resume_digest();
     if let Some(m) = initial_model {
         state.model = Some(m.to_string());
     }
@@ -654,106 +653,6 @@ fn pending_recovery_status_line(state: &SessionState) -> Option<String> {
     state.pending_recovery.as_ref().map(|_| {
         "previous session available via /resume or a short continue/fix/test follow-up".to_string()
     })
-}
-
-/// P3.3 — if a persisted plan_state.json exists for the active user, load it
-/// and compute a compact resume digest. The digest is a one-shot hint: it is
-/// only injected into the next turn's system prompt when the user message
-/// signals resume intent, and cleared thereafter.
-fn detect_pending_plan_resume_digest() -> Option<String> {
-    let path = astra_runtime::plan::PlanModeState::state_path();
-    if !path.exists() {
-        return None;
-    }
-    match astra_runtime::plan::PlanModeState::load_with_recovery(&path) {
-        Ok(state) => {
-            // B8: Don't surface a resume hint for a plan from a different
-            // workspace — it would mis-direct @resume-plan.
-            let cwd = std::env::current_dir().ok()?;
-            if !state.matches_workspace(&cwd) {
-                return None;
-            }
-            astra_runtime::plan::plan_resume::plan_resume_digest(&state)
-        }
-        Err(err) => {
-            eprintln!("  ⚠ plan_state.json present but unreadable: {err}");
-            None
-        }
-    }
-}
-
-const PLAN_RESUME_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
-fn plan_context_is_stale(
-    modified: std::time::SystemTime,
-    now: std::time::SystemTime,
-    stale_after: std::time::Duration,
-) -> bool {
-    now.duration_since(modified)
-        .map(|elapsed| elapsed >= stale_after)
-        .unwrap_or(false)
-}
-
-fn should_refresh_pending_plan_context(path: &std::path::Path) -> bool {
-    path.metadata()
-        .ok()
-        .and_then(|meta| meta.modified().ok())
-        .is_some_and(|modified| {
-            plan_context_is_stale(
-                modified,
-                std::time::SystemTime::now(),
-                PLAN_RESUME_STALE_AFTER,
-            )
-        })
-}
-
-pub(crate) fn maybe_restore_pending_plan_mode(line: &str, state: &mut SessionState) -> bool {
-    if state.plan_mode.is_some()
-        || state.executing_plan.is_some()
-        || state.plan_handle.is_some()
-        || state.pending_plan_resume_digest.is_none()
-        || !astra_runtime::plan::plan_resume::message_signals_resume(line)
-    {
-        return false;
-    }
-
-    let path = astra_runtime::plan::PlanModeState::state_path();
-    if !path.exists() {
-        return false;
-    }
-
-    match astra_runtime::plan::PlanModeState::load_with_recovery(&path) {
-        Ok(mut plan_state) => {
-            // B8: Refuse to restore a plan from a different workspace —
-            // continuing it against the wrong project would corrupt
-            // both contexts.
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            if !plan_state.matches_workspace(&cwd) {
-                eprintln!(
-                    "  ⚠ Saved plan belongs to a different workspace ({}) — \
-                     ignoring @resume-plan in this directory.",
-                    plan_state.context.root
-                );
-                state.pending_plan_resume_digest = None;
-                return false;
-            }
-
-            if should_refresh_pending_plan_context(&path) {
-                let project_root =
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                plan_state.context = astra_runtime::plan::analyze_project(&project_root);
-                let _ = plan_state.save_with_backup(&path);
-            }
-
-            state.pending_plan_resume_digest = None;
-            state.plan_mode = Some(plan_state);
-            true
-        }
-        Err(err) => {
-            eprintln!("  ⚠ failed to restore saved plan mode: {err}");
-            false
-        }
-    }
 }
 
 fn workspace_matches_current_project(
@@ -1656,7 +1555,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_session_state_detects_pending_plan_resume_digest() {
+    fn initialize_session_state_ignores_saved_plan_state_files() {
         let (_tmp, _g) = isolated_sessions_dir();
         let _creds_guard = isolate_credentials();
         let home = tempdir().unwrap();
@@ -1677,129 +1576,15 @@ mod tests {
                 ..Default::default()
             });
         plan_state
-            .save_to_file(&astra_runtime::plan::PlanModeState::state_path())
+            .save_to_file(&home.path().join(".astra").join("plan_state.json"))
             .unwrap();
 
         let state = initialize_session_state(None, Some("gpt-5"));
-        let digest = state.pending_plan_resume_digest.expect("resume digest");
-        assert!(digest.contains("Fix auth middleware"), "{digest}");
-        assert!(digest.contains("Patch token validation"), "{digest}");
-    }
-
-    #[test]
-    fn maybe_restore_pending_plan_mode_activates_saved_plan() {
-        let (_tmp, _g) = isolated_sessions_dir();
-        let _creds_guard = isolate_credentials();
-        let home = tempdir().unwrap();
-        let _home_guard = EnvGuard::set("HOME", home.path().to_str().unwrap());
-        std::fs::create_dir_all(home.path().join(".astra")).unwrap();
-
-        let mut plan_state = astra_runtime::plan::PlanModeState::new(
-            "Ship plan resume".to_string(),
-            Default::default(),
+        assert!(
+            state.plan_mode.is_none(),
+            "startup must not implicitly restore saved plan files"
         );
-        plan_state
-            .plan
-            .subtasks
-            .push(astra_services::task_orchestrator::SubtaskPlan {
-                id: "t1".into(),
-                title: "Wire implicit resume".into(),
-                status: astra_services::task_orchestrator::TaskStatus::Pending,
-                ..Default::default()
-            });
-        plan_state
-            .save_to_file(&astra_runtime::plan::PlanModeState::state_path())
-            .unwrap();
-
-        let mut state = SessionState {
-            pending_plan_resume_digest: Some("[plan-resume] goal=\"Ship plan resume\"".into()),
-            ..SessionState::default()
-        };
-        assert!(maybe_restore_pending_plan_mode(
-            "please @resume-plan",
-            &mut state
-        ));
-        assert!(state.pending_plan_resume_digest.is_none());
-        assert_eq!(
-            state.plan_mode.as_ref().map(|ps| ps.goal.as_str()),
-            Some("Ship plan resume")
-        );
-    }
-
-    #[test]
-    fn maybe_restore_pending_plan_mode_accepts_plain_continue_signal() {
-        let (_tmp, _g) = isolated_sessions_dir();
-        let _creds_guard = isolate_credentials();
-        let home = tempdir().unwrap();
-        let _home_guard = EnvGuard::set("HOME", home.path().to_str().unwrap());
-        std::fs::create_dir_all(home.path().join(".astra")).unwrap();
-
-        let mut plan_state = astra_runtime::plan::PlanModeState::new(
-            "Resume without explicit tag".to_string(),
-            Default::default(),
-        );
-        plan_state
-            .plan
-            .subtasks
-            .push(astra_services::task_orchestrator::SubtaskPlan {
-                id: "t1".into(),
-                title: "Continue current subtask".into(),
-                status: astra_services::task_orchestrator::TaskStatus::InProgress,
-                ..Default::default()
-            });
-        plan_state
-            .save_to_file(&astra_runtime::plan::PlanModeState::state_path())
-            .unwrap();
-
-        let mut state = SessionState {
-            pending_plan_resume_digest: Some(
-                "[plan-resume] goal=\"Resume without explicit tag\"".into(),
-            ),
-            ..SessionState::default()
-        };
-        assert!(maybe_restore_pending_plan_mode("continue", &mut state));
-        assert!(state.pending_plan_resume_digest.is_none());
-        assert_eq!(
-            state.plan_mode.as_ref().map(|ps| ps.goal.as_str()),
-            Some("Resume without explicit tag")
-        );
-    }
-
-    #[test]
-    fn maybe_restore_pending_plan_mode_missing_file_keeps_digest_for_fallback() {
-        let (_tmp, _g) = isolated_sessions_dir();
-        let _creds_guard = isolate_credentials();
-        let home = tempdir().unwrap();
-        let _home_guard = EnvGuard::set("HOME", home.path().to_str().unwrap());
-        std::fs::create_dir_all(home.path().join(".astra")).unwrap();
-
-        let mut state = SessionState {
-            pending_plan_resume_digest: Some("[plan-resume] goal=\"Lost local file\"".into()),
-            ..SessionState::default()
-        };
-
-        assert!(!maybe_restore_pending_plan_mode("continue", &mut state));
-        assert_eq!(
-            state.pending_plan_resume_digest.as_deref(),
-            Some("[plan-resume] goal=\"Lost local file\"")
-        );
-    }
-
-    #[test]
-    fn plan_context_is_stale_respects_threshold() {
-        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10_000);
-        let fresh = now - std::time::Duration::from_secs(60);
-        let stale = now - std::time::Duration::from_secs(31 * 60);
-        assert!(!plan_context_is_stale(
-            fresh,
-            now,
-            std::time::Duration::from_secs(30 * 60)
-        ));
-        assert!(plan_context_is_stale(
-            stale,
-            now,
-            std::time::Duration::from_secs(30 * 60)
-        ));
+        assert!(state.pending_recovery.is_none());
     }
 
     // ── Session display logic ──────────────────────────────────────────────
@@ -1844,54 +1629,6 @@ mod tests {
         };
         let display = state.model.as_deref().unwrap_or("auto");
         assert_eq!(display, "gpt-5");
-    }
-
-    // ── R4: persistence contract tests ────────────────────────────────────────
-
-    #[test]
-    fn maybe_restore_pending_plan_mode_rejects_workspace_mismatch() {
-        let (_tmp, _g) = isolated_sessions_dir();
-        let _creds_guard = isolate_credentials();
-        let home = tempdir().unwrap();
-        let _home_guard = EnvGuard::set("HOME", home.path().to_str().unwrap());
-        std::fs::create_dir_all(home.path().join(".astra")).unwrap();
-
-        // Create a plan state rooted at a different directory.
-        let other_dir = tempdir().unwrap();
-        let mut plan_state = astra_runtime::plan::PlanModeState::new(
-            "goal from other workspace".to_string(),
-            astra_runtime::plan::ProjectContext {
-                root: other_dir.path().to_string_lossy().into_owned(),
-                ..Default::default()
-            },
-        );
-        plan_state
-            .plan
-            .subtasks
-            .push(astra_services::task_orchestrator::SubtaskPlan {
-                id: "t1".into(),
-                title: "step".into(),
-                status: astra_services::task_orchestrator::TaskStatus::Pending,
-                ..Default::default()
-            });
-        // Save to the current-cwd-scoped path (which is the test's cwd, not other_dir).
-        plan_state
-            .save_to_file(&astra_runtime::plan::PlanModeState::state_path())
-            .unwrap();
-
-        let mut state = SessionState {
-            pending_plan_resume_digest: Some(
-                "[plan-resume] goal=\"goal from other workspace\"".into(),
-            ),
-            ..SessionState::default()
-        };
-        // Should refuse to restore because the saved plan's root != current cwd.
-        let restored = maybe_restore_pending_plan_mode("please @resume-plan", &mut state);
-        assert!(!restored, "workspace mismatch must not restore");
-        assert!(
-            state.plan_mode.is_none(),
-            "plan_mode must remain None on mismatch"
-        );
     }
 
     // ─── auto-auth regression guards ──────────────────────────

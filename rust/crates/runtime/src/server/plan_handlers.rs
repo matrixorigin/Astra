@@ -922,8 +922,7 @@ pub(super) async fn redo_step_handler(
         .map_err(map_plan_load_err)?;
 
     // Compute the next attempt number by counting prior runs for this subtask.
-    // The LocalCachePlanRepository returns an empty vec so attempt starts at 1
-    // there — that's fine for offline/test paths.
+    // In-memory/test repos start empty too, so the first attempt is 1 there.
     let prior_runs = state
         .plan_repo
         .list_step_runs(&plan_id, Some(&resolved_subtask_id), DEFAULT_RUNS_LIMIT)

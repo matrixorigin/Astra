@@ -107,7 +107,6 @@ pub(crate) async fn enter_remote_plan_mode(
         value.get("version").and_then(Value::as_u64),
     ));
     state.plan_mode_sync_error = None;
-    state.pending_plan_resume_digest = None;
     Ok(plan_id)
 }
 

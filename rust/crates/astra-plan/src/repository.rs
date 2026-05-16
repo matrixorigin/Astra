@@ -8,9 +8,9 @@
 //!
 //! * [`CloudPlanRepository`] — SQLx backed by the `plans` + `plan_step_runs`
 //!   MatrixOne tables created in `astra-services::storage`. Source of truth.
-//! * [`LocalCachePlanRepository`] — thin wrapper over the legacy on-disk
-//!   `~/.astra/plans/{plan_id}.json` helpers on [`PlanModeState`]. Used in
-//!   tests and as an offline fallback; it does not know about `plan_step_runs`.
+//! * [`InMemoryPlanRepository`] — process-local fallback for tests and
+//!   unconfigured runtime wiring. Mirrors the trait contract without reviving
+//!   legacy filesystem persistence.
 //!
 //! # Invariants enforced here
 //!
@@ -29,6 +29,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{MySql, Pool, Row};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 use uuid::Uuid;
 
 // ─── Step-run record ─────────────────────────────────────────────────────────
@@ -818,44 +822,90 @@ impl PlanRepository for CloudPlanRepository {
     }
 }
 
-// ─── Local-cache (filesystem) implementation ─────────────────────────────────
+// ─── In-memory implementation ────────────────────────────────────────────────
 
-/// Filesystem-backed repository — wraps the legacy `~/.astra/plans/*.json`
-/// helpers on [`PlanModeState`]. Used as an offline fallback, in tests, and
-/// as the in-process cache behind [`CloudPlanRepository`].
+#[derive(Debug, Default)]
+struct InMemoryPlanRepositoryState {
+    plans: HashMap<String, PlanModeState>,
+    active_plans: HashMap<String, String>,
+    step_runs: HashMap<String, PlanStepRun>,
+}
+
+/// Process-local repository for tests and unconfigured runtime defaults.
 ///
-/// Does **not** persist `plan_step_runs` or `active_plan_id` — those are
-/// cloud-only concepts. The corresponding trait methods are Ok no-ops so a
-/// CLI running offline can still exercise the same codepaths.
+/// Unlike the removed filesystem cache, this fallback keeps all plan state in
+/// memory, so it cannot leak stale plan files across runs or workspaces.
 #[derive(Debug, Clone, Default)]
-pub struct LocalCachePlanRepository;
+pub struct InMemoryPlanRepository {
+    inner: Arc<RwLock<InMemoryPlanRepositoryState>>,
+}
 
-impl LocalCachePlanRepository {
+impl InMemoryPlanRepository {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+}
+
+fn saved_plan_info(plan_id: &str, state: &PlanModeState) -> SavedPlanInfo {
+    let status = if state.plan.progress_pct() == 100 {
+        "completed"
+    } else if state.plan.items_done() > 0 {
+        "in_progress"
+    } else {
+        "pending"
+    };
+    SavedPlanInfo {
+        name: plan_id.to_string(),
+        goal: state.goal.clone(),
+        progress_pct: state.plan.progress_pct(),
+        subtask_count: state.plan.subtasks.len(),
+        status: status.to_string(),
     }
 }
 
 #[async_trait]
-impl PlanRepository for LocalCachePlanRepository {
+impl PlanRepository for InMemoryPlanRepository {
     async fn save(
         &self,
         plan_id: &str,
         state: &mut PlanModeState,
         expected_version: Option<u64>,
     ) -> Result<(), PlanLoadError> {
-        if let Some(expected) = expected_version
-            && state.version != expected
-        {
-            return Err(PlanLoadError::conflict(expected, state.version));
+        PlanModeState::validate_plan_id(plan_id)?;
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        match (
+            guard.plans.get(plan_id).map(|s| s.version),
+            expected_version,
+        ) {
+            (None, Some(expected)) if expected != 0 => {
+                return Err(PlanLoadError::conflict(expected, 0));
+            }
+            (Some(actual), None) => {
+                return Err(PlanLoadError::conflict(0, actual));
+            }
+            (Some(actual), Some(expected)) if expected != actual => {
+                return Err(PlanLoadError::conflict(expected, actual));
+            }
+            (Some(actual), _) => {
+                state.version = actual + 1;
+            }
+            (None, _) => {
+                state.version = 1;
+            }
         }
-        state
-            .save_to_plans_dir_with_id(plan_id)
-            .map_err(PlanLoadError::Internal)
+        guard.plans.insert(plan_id.to_string(), state.clone());
+        Ok(())
     }
 
     async fn load(&self, plan_id: &str) -> Result<PlanModeState, PlanLoadError> {
-        PlanModeState::load_from_plans_dir(plan_id)
+        PlanModeState::validate_plan_id(plan_id)?;
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .plans
+            .get(plan_id)
+            .cloned()
+            .ok_or_else(|| PlanLoadError::NotFound(plan_id.to_string()))
     }
 
     async fn load_owned(
@@ -873,80 +923,214 @@ impl PlanRepository for LocalCachePlanRepository {
     async fn list_for_user(
         &self,
         user_id: &str,
-        _filter: PlanListFilter<'_>,
+        filter: PlanListFilter<'_>,
     ) -> Result<Vec<SavedPlanInfo>, PlanLoadError> {
-        Ok(PlanModeState::list_saved_plans_for_user(user_id))
+        let guard = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let mut plans = guard
+            .plans
+            .iter()
+            .filter_map(|(plan_id, state)| {
+                let owner = state.created_by.as_deref().unwrap_or(user_id);
+                if owner != user_id {
+                    return None;
+                }
+                if let Some(session_id) = filter.session_id
+                    && state.session_hint.as_deref() != Some(session_id)
+                {
+                    return None;
+                }
+                if let Some(phase) = filter.phase
+                    && infer_phase_for_persist(state) != phase
+                {
+                    return None;
+                }
+                Some(saved_plan_info(plan_id, state))
+            })
+            .collect::<Vec<_>>();
+        plans.sort_by(|a, b| a.name.cmp(&b.name));
+        if let Some(limit) = filter.limit {
+            plans.truncate(limit.max(0) as usize);
+        }
+        Ok(plans)
     }
 
     async fn delete(&self, plan_id: &str) -> Result<(), PlanLoadError> {
-        PlanModeState::delete_saved_plan(plan_id)
+        PlanModeState::validate_plan_id(plan_id)?;
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        guard.plans.remove(plan_id);
+        guard.active_plans.retain(|_, active| active != plan_id);
+        guard.step_runs.retain(|_, run| run.plan_id != plan_id);
+        Ok(())
     }
 
     async fn set_active_plan(
         &self,
-        _session_id: &str,
-        _plan_id: Option<&str>,
+        session_id: &str,
+        plan_id: Option<&str>,
     ) -> Result<(), PlanLoadError> {
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        guard.active_plans.remove(session_id);
+        if let Some(plan_id) = plan_id {
+            PlanModeState::validate_plan_id(plan_id)?;
+            guard.active_plans.retain(|_, active| active != plan_id);
+            guard
+                .active_plans
+                .insert(session_id.to_string(), plan_id.to_string());
+        }
         Ok(())
     }
 
     async fn active_plan_for_session(
         &self,
-        _session_id: &str,
+        session_id: &str,
     ) -> Result<Option<String>, PlanLoadError> {
-        Ok(None)
+        Ok(self
+            .inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .active_plans
+            .get(session_id)
+            .cloned())
     }
 
-    async fn record_step_run(&self, _input: NewStepRun<'_>) -> Result<String, PlanLoadError> {
-        Ok(Uuid::new_v4().to_string())
+    async fn record_step_run(&self, input: NewStepRun<'_>) -> Result<String, PlanLoadError> {
+        let run_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .step_runs
+            .insert(
+                run_id.clone(),
+                PlanStepRun {
+                    run_id: run_id.clone(),
+                    plan_id: input.plan_id.to_string(),
+                    subtask_id: input.subtask_id.to_string(),
+                    attempt: input.attempt,
+                    status: input.status,
+                    session_id: input.session_id.to_string(),
+                    started_at: now,
+                    finished_at: None,
+                    request_id: input.request_id.to_string(),
+                    error: None,
+                    artifact_ref: None,
+                },
+            );
+        Ok(run_id)
     }
 
     async fn record_completed_step_run(
         &self,
-        _input: NewStepRun<'_>,
-        _error: Option<&str>,
-        _artifact_ref: Option<&str>,
+        input: NewStepRun<'_>,
+        error: Option<&str>,
+        artifact_ref: Option<&str>,
     ) -> Result<String, PlanLoadError> {
-        Ok(Uuid::new_v4().to_string())
+        let run_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .step_runs
+            .insert(
+                run_id.clone(),
+                PlanStepRun {
+                    run_id: run_id.clone(),
+                    plan_id: input.plan_id.to_string(),
+                    subtask_id: input.subtask_id.to_string(),
+                    attempt: input.attempt,
+                    status: input.status,
+                    session_id: input.session_id.to_string(),
+                    started_at: now,
+                    finished_at: Some(now),
+                    request_id: input.request_id.to_string(),
+                    error: error.map(str::to_string),
+                    artifact_ref: artifact_ref.map(str::to_string),
+                },
+            );
+        Ok(run_id)
     }
 
     async fn finalize_step_run(
         &self,
-        _plan_id: &str,
-        _run_id: &str,
-        _status: TaskStatus,
-        _error: Option<&str>,
-        _artifact_ref: Option<&str>,
+        plan_id: &str,
+        run_id: &str,
+        status: TaskStatus,
+        error: Option<&str>,
+        artifact_ref: Option<&str>,
     ) -> Result<(), PlanLoadError> {
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let Some(run) = guard.step_runs.get_mut(run_id) else {
+            return Err(PlanLoadError::NotFound(run_id.to_string()));
+        };
+        if run.plan_id != plan_id {
+            return Err(PlanLoadError::NotFound(run_id.to_string()));
+        }
+        run.status = status;
+        run.finished_at = Some(Utc::now());
+        run.error = error.map(str::to_string);
+        run.artifact_ref = artifact_ref.map(str::to_string);
         Ok(())
     }
 
     async fn get_step_run(
         &self,
-        _plan_id: &str,
+        plan_id: &str,
         run_id: &str,
     ) -> Result<PlanStepRun, PlanLoadError> {
-        Err(PlanLoadError::NotFound(format!(
-            "step_run {run_id} (local cache has no step_runs)"
-        )))
+        let guard = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let Some(run) = guard.step_runs.get(run_id) else {
+            return Err(PlanLoadError::NotFound(run_id.to_string()));
+        };
+        if run.plan_id != plan_id {
+            return Err(PlanLoadError::NotFound(run_id.to_string()));
+        }
+        Ok(run.clone())
     }
 
     async fn list_step_runs(
         &self,
-        _plan_id: &str,
-        _subtask_id: Option<&str>,
-        _limit: i32,
+        plan_id: &str,
+        subtask_id: Option<&str>,
+        limit: i32,
     ) -> Result<Vec<PlanStepRun>, PlanLoadError> {
-        Ok(Vec::new())
+        let guard = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let mut runs = guard
+            .step_runs
+            .values()
+            .filter(|run| run.plan_id == plan_id)
+            .filter(|run| subtask_id.is_none_or(|subtask_id| run.subtask_id == subtask_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        runs.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then_with(|| b.run_id.cmp(&a.run_id))
+        });
+        runs.truncate(limit.max(0) as usize);
+        Ok(runs)
     }
 
     async fn abort_open_step_runs(
         &self,
-        _plan_id: &str,
-        _subtask_ids: &[String],
+        plan_id: &str,
+        subtask_ids: &[String],
     ) -> Result<u64, PlanLoadError> {
-        // Local cache doesn't track step_runs, so nothing to abort.
-        Ok(0)
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let now = Utc::now();
+        let mut aborted = 0;
+        for run in guard.step_runs.values_mut() {
+            if run.plan_id == plan_id
+                && run.finished_at.is_none()
+                && subtask_ids
+                    .iter()
+                    .any(|subtask_id| subtask_id == &run.subtask_id)
+            {
+                run.status = TaskStatus::Cancelled;
+                run.finished_at = Some(now);
+                aborted += 1;
+            }
+        }
+        Ok(aborted)
     }
 }
 
@@ -1048,35 +1232,10 @@ pub async fn fork_plan_for_session(
 mod tests {
     use super::*;
     use crate::decompose::ProjectContext;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    /// Global lock for tests that mutate `HOME`. `cargo test` runs these in
-    /// parallel by default, so without serialization two tests can stamp on
-    /// each other's plan directory and observe stale rows from a sibling.
-    fn home_guard() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-    }
-
-    fn temp_plans_dir() -> (tempfile::TempDir, MutexGuard<'static, ()>) {
-        let guard = home_guard();
-        let dir = tempfile::TempDir::new().unwrap();
-        // SAFETY: home_guard() serializes access across tests so only one
-        // holder at a time is writing HOME. Matches the pattern used by
-        // existing filesystem tests in decompose.rs.
-        unsafe {
-            std::env::set_var("HOME", dir.path());
-        }
-        (dir, guard)
-    }
 
     #[tokio::test]
-    async fn local_cache_save_and_load_roundtrip() {
-        let _guard = temp_plans_dir();
-        // _guard holds both TempDir + MutexGuard for the duration of this test.
-        let repo = LocalCachePlanRepository::new();
+    async fn in_memory_save_and_load_roundtrip() {
+        let repo = InMemoryPlanRepository::new();
         let mut state = PlanModeState::new_with_owner(
             "test goal".into(),
             ProjectContext::default(),
@@ -1090,10 +1249,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_cache_load_owned_returns_not_found_for_wrong_user() {
-        let _guard = temp_plans_dir();
-        // _guard holds both TempDir + MutexGuard for the duration of this test.
-        let repo = LocalCachePlanRepository::new();
+    async fn in_memory_load_owned_returns_not_found_for_wrong_user() {
+        let repo = InMemoryPlanRepository::new();
         let mut state =
             PlanModeState::new_with_owner("goal".into(), ProjectContext::default(), "u-1".into());
         repo.save("plan-2", &mut state, None).await.unwrap();
@@ -1103,8 +1260,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_cache_step_run_methods_are_noops() {
-        let repo = LocalCachePlanRepository::new();
+    async fn in_memory_step_run_roundtrip_and_abort() {
+        let repo = InMemoryPlanRepository::new();
         let run_id = repo
             .record_step_run(NewStepRun {
                 plan_id: "p",
@@ -1116,14 +1273,18 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(!run_id.is_empty());
+        let open = repo.get_step_run("p", &run_id).await.unwrap();
+        assert_eq!(open.status, TaskStatus::InProgress);
+        assert!(open.finished_at.is_none());
 
-        // finalize on a noop run just returns Ok.
-        repo.finalize_step_run("p", &run_id, TaskStatus::Completed, None, None)
+        let aborted = repo
+            .abort_open_step_runs("p", &[String::from("s")])
             .await
             .unwrap();
+        assert_eq!(aborted, 1);
 
-        let runs = repo.list_step_runs("p", None, 10).await.unwrap();
-        assert!(runs.is_empty());
+        let closed = repo.get_step_run("p", &run_id).await.unwrap();
+        assert_eq!(closed.status, TaskStatus::Cancelled);
+        assert!(closed.finished_at.is_some());
     }
 }

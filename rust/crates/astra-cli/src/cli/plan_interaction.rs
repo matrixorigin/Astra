@@ -842,9 +842,6 @@ fn abort_plan_mode_after_failure(state: &mut SessionState, stage: &'static str, 
         })),
     );
     state.plan_mode = None;
-    state.pending_plan_resume_digest = None;
-    let path = plan::PlanModeState::state_path();
-    let _ = plan::PlanModeState::clear_saved_state_at(&path);
 }
 
 /// P2: Single-stage analytical-plan generation.
@@ -913,9 +910,6 @@ async fn handle_analytical_goal(
             // Analytical is one-shot: drop plan_mode so the user falls
             // back into normal chat to discuss any of the sub-questions.
             state.plan_mode = None;
-            state.pending_plan_resume_digest = None;
-            let path = plan::PlanModeState::state_path();
-            let _ = plan::PlanModeState::clear_saved_state_at(&path);
             Ok(PlanInputResult::Handled)
         }
         Err(e) => {
@@ -1000,9 +994,8 @@ pub async fn handle_plan_mode_input(
     api: &astra_thin_client::ThinClient,
 ) -> Result<PlanInputResult, String> {
     use plan::{
-        ClarificationAnswer, PlanEntryChoice, PlanModeState, decomposition_prompt,
-        detect_clarification_questions, parse_clarification_response, parse_plan_entry_choice,
-        parse_plan_response,
+        ClarificationAnswer, PlanEntryChoice, decomposition_prompt, detect_clarification_questions,
+        parse_clarification_response, parse_plan_entry_choice, parse_plan_response,
     };
 
     let plan_state = match state.plan_mode.as_mut() {
@@ -1043,7 +1036,6 @@ pub async fn handle_plan_mode_input(
         if let Some(next_q) = pending.next_question() {
             eprintln!();
             eprint_clarification_question(next_q);
-            let _ = plan_state.save_to_file(&PlanModeState::state_path());
             return Ok(PlanInputResult::Handled);
         }
 
@@ -1123,8 +1115,6 @@ pub async fn handle_plan_mode_input(
             Ok(mut plan) => {
                 plan::normalize_simple_greenfield_plan(&plan_state.goal, &mut plan);
                 plan_state.set_plan(plan);
-                let _ = plan_state.save_to_file(&PlanModeState::state_path());
-
                 journal_plan_event(
                     &mut state.journal,
                     session_journal::JournalEventType::PlanEdit,
@@ -1252,8 +1242,6 @@ pub async fn handle_plan_mode_input(
                     title.as_str().magenta(),
                     pct
                 );
-                let _ = plan_state.save_to_file(&PlanModeState::state_path());
-
                 journal_plan_event(
                     &mut state.journal,
                     session_journal::JournalEventType::PlanProgress,
@@ -1392,7 +1380,6 @@ pub async fn handle_plan_mode_input(
         match try_replace_plan_from_llm_json(&llm_text, plan_state) {
             Ok(true) => {
                 plan_state.modified = true;
-                let _ = plan_state.save_to_file(&PlanModeState::state_path());
 
                 journal_plan_event(
                     &mut state.journal,
@@ -1524,7 +1511,7 @@ async fn handle_plan_command(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
 ) -> Result<PlanInputResult, String> {
-    use plan::{PlanExecutionConfig, PlanModeState};
+    use plan::PlanExecutionConfig;
 
     match cmd {
         PlanCommand::Cancel => {
@@ -1537,7 +1524,6 @@ async fn handle_plan_command(
                 Some(serde_json::json!({ "stage": "cancelled" })),
             );
 
-            PlanModeState::clear_saved_state();
             state.plan_mode = None;
             state.executing_plan_goal = None;
             eprintln!();
@@ -1828,8 +1814,6 @@ async fn handle_plan_command(
             state.plan_execution_corrections.clear();
             state.executing_plan = Some(plan);
             state.plan_mode = None;
-            state.pending_plan_resume_digest = None;
-            PlanModeState::clear_saved_state();
             eprintln!(
                 "  {} Left plan mode — execution is now running in background.",
                 "←".magenta(),
@@ -2083,12 +2067,9 @@ async fn handle_goal_submission(
             "goal": goal,
             "stage": "entered",
             // P5: classify the goal at entry so downstream digesters can
-            // distinguish executable vs analytical without re-running the
-            // heuristic.
-            "kind": match plan::classify_plan_suggestion(&goal)
-                .map(|s| s.kind)
-                .unwrap_or(plan::PlanKind::Executable)
-            {
+            // distinguish executable vs analytical without re-running
+            // classification.
+            "kind": match plan::classify_plan_kind(&goal).unwrap_or(plan::PlanKind::Executable) {
                 plan::PlanKind::Executable => "executable",
                 plan::PlanKind::Analytical => "analytical",
             },
@@ -2119,7 +2100,7 @@ async fn handle_goal_submission(
     // one-shot deliverable; we tear down plan_mode after rendering so the
     // user falls back into normal chat to continue the discussion.
     if matches!(
-        plan::classify_plan_suggestion(&goal).map(|s| s.kind),
+        plan::classify_plan_kind(&goal),
         Some(plan::PlanKind::Analytical)
     ) {
         return handle_analytical_goal(goal, tok, state, api).await;
@@ -2300,7 +2281,7 @@ async fn handle_outline_clarifications(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
 ) -> Result<PlanInputResult, String> {
-    use plan::{PendingClarifications, PlanModeState};
+    use plan::PendingClarifications;
     use std::io::IsTerminal;
 
     eprintln!();
@@ -2380,7 +2361,6 @@ async fn handle_outline_clarifications(
                         answers: Vec::new(),
                     };
                     plan_state.pending_clarifications = Some(pending);
-                    let _ = plan_state.save_to_file(&plan::PlanModeState::state_path());
                 }
                 if let Some(first) = questions.first() {
                     eprint_clarification_question(first);
@@ -2408,7 +2388,6 @@ async fn handle_outline_clarifications(
     };
     plan_state.pending_clarifications = Some(pending);
     eprint_clarification_question(&questions[0]);
-    let _ = plan_state.save_to_file(&PlanModeState::state_path());
     Ok(PlanInputResult::Handled)
 }
 
@@ -2604,14 +2583,11 @@ async fn accept_generated_plan(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
 ) -> Result<PlanInputResult, String> {
-    use plan::PlanModeState;
-
     let Some(plan_state) = state.plan_mode.as_mut() else {
         return Ok(PlanInputResult::Handled);
     };
     plan::normalize_simple_greenfield_plan(&plan_state.goal, &mut plan);
     plan_state.set_plan(plan);
-    let _ = plan_state.save_to_file(&PlanModeState::state_path());
 
     let subtask_count = plan_state.plan.subtasks.len();
     let goal = plan_state.goal.clone();
@@ -3127,7 +3103,6 @@ mod tests {
             String::new(),
             plan::ProjectContext::default(),
         ));
-        state.pending_plan_resume_digest = Some("stale digest".into());
 
         let result = handle_goal_submission(
             "Should we split auth middleware?".into(),
@@ -3143,10 +3118,6 @@ mod tests {
             state.plan_mode.is_none(),
             "analytical path should be one-shot"
         );
-        assert!(
-            state.pending_plan_resume_digest.is_none(),
-            "analytical success should clear stale resume hints"
-        );
     }
 
     #[tokio::test]
@@ -3160,7 +3131,6 @@ mod tests {
             String::new(),
             plan::ProjectContext::default(),
         ));
-        state.pending_plan_resume_digest = Some("stale digest".into());
 
         let result = handle_goal_submission(
             "Should we split auth middleware?".into(),
@@ -3175,10 +3145,6 @@ mod tests {
         assert!(
             state.plan_mode.is_none(),
             "analytical parse failure should abort plan mode cleanly"
-        );
-        assert!(
-            state.pending_plan_resume_digest.is_none(),
-            "abort path should clear stale resume hints"
         );
     }
 
@@ -3196,7 +3162,6 @@ mod tests {
             String::new(),
             plan::ProjectContext::default(),
         ));
-        state.pending_plan_resume_digest = Some("stale digest".into());
 
         let result = handle_goal_submission(
             "Implement auth middleware and add tests".into(),
@@ -3213,10 +3178,6 @@ mod tests {
             "executable parse failure should abort plan mode cleanly"
         );
         assert!(
-            state.pending_plan_resume_digest.is_none(),
-            "executable abort path should clear stale resume hints"
-        );
-        assert!(
             state.executing_plan.is_none(),
             "failed generation must not leave a phantom executing plan"
         );
@@ -3225,7 +3186,6 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn slash_plan_goal_then_go_executes_clean_local_journey() {
-        plan::PlanModeState::clear_saved_state();
         let plan_json = serde_json::json!({
             "subtasks": [
                 {"id": "auth-middleware", "title": "Implement auth middleware"},
@@ -3276,7 +3236,6 @@ mod tests {
             state.executing_plan.is_some(),
             "go should promote the approved plan into background execution state"
         );
-        plan::PlanModeState::clear_saved_state();
     }
 
     #[tokio::test]

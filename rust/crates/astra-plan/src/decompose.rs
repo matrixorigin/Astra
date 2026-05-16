@@ -20,15 +20,6 @@ use std::time::Instant;
 // Re-export task types from services
 pub use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
 
-/// First `messages[]` row (`role: system`) for the tools-disabled planning flow.
-/// Edge tools are omitted from the payload; the model should reason and answer with a plan only.
-pub const CHAT_PLAN_ONLY_SYSTEM: &str = "You are in **plan-only** mode.\n\n\
-Rules:\n\
-- Produce a clear, actionable plan: ordered steps, dependencies, risks, and verification.\n\
-- Do **not** assume any tools or shell commands will run. Do not offer to read files, search the repo, or run builds unless the user leaves plan-only mode.\n\
-- If critical information is missing, ask concise questions before the plan.\n\
-- Prefer sections: Goal, Assumptions, Steps, Verification.\n";
-
 /// Project context gathered for plan decomposition.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectContext {
@@ -1965,43 +1956,13 @@ pub enum PlanKind {
     Analytical,
 }
 
-/// Outcome of suggesting whether to enter plan mode for a free-form input.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanSuggestion {
-    pub kind: PlanKind,
-    pub reason: &'static str,
-}
-
-/// Heuristics to detect if user input likely needs a plan.
-/// Returns Some(reason) if plan mode should be suggested.
-///
-/// Returns `None` for analytical/evaluative inputs even when they otherwise
-/// match the length/keyword heuristics, because /plan only knows how to
-/// build executable TaskPlans.
-pub fn should_suggest_plan_mode(input: &str) -> Option<&'static str> {
-    classify_plan_suggestion(input).and_then(|s| match s.kind {
-        PlanKind::Executable => Some(s.reason),
-        // Analytical inputs intentionally do NOT trigger the auto-suggest
-        // prompt today — the CLI has no analytical generator yet, so
-        // suggesting plan mode would lead the user back to the empty-plan
-        // dead-end this refactor is designed to eliminate.
-        PlanKind::Analytical => None,
-    })
-}
-
-/// Classify an input into an executable or analytical plan suggestion.
-/// Returns `None` if the input is too short / too vague to suggest at all.
-pub fn classify_plan_suggestion(input: &str) -> Option<PlanSuggestion> {
+/// Classify an explicit `/plan` goal into executable vs analytical mode.
+/// Returns `None` when the goal is too short or vague to classify confidently.
+pub fn classify_plan_kind(input: &str) -> Option<PlanKind> {
     if looks_analytical(input) {
-        return Some(PlanSuggestion {
-            kind: PlanKind::Analytical,
-            reason: "Analytical / evaluative question detected",
-        });
+        return Some(PlanKind::Analytical);
     }
-    classify_executable(input).map(|reason| PlanSuggestion {
-        kind: PlanKind::Executable,
-        reason,
-    })
+    classify_executable(input).map(|_| PlanKind::Executable)
 }
 
 fn classify_executable(input: &str) -> Option<&'static str> {
@@ -2197,132 +2158,6 @@ impl PlanModeState {
             .map_err(|e| PlanLoadError::Corrupt(format!("parse plan state: {e}")))
     }
 
-    /// Default path for plan state persistence.
-    pub fn state_path() -> std::path::PathBuf {
-        Self::state_path_for_cwd(&std::env::current_dir().unwrap_or_else(|_| ".".into()))
-    }
-
-    /// P6: Workspace-scoped persistence path.
-    ///
-    /// Each unique cwd gets its own state file under
-    /// `~/.astra/plans/<8-char-hash>/plan_state.json`. The hash is a stable
-    /// short blake3 of the canonicalized cwd. Falling back to the hashed
-    /// path means two repos open at the same time no longer race to
-    /// overwrite a single global file, and the workspace guard added in B8
-    /// becomes a defense-in-depth check rather than the only line of
-    /// safety.
-    pub fn state_path_for_cwd(cwd: &std::path::Path) -> std::path::PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let canon = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-        let key = canon.to_string_lossy();
-        // Use the first 16 hex chars of the SHA-1 of the cwd. We avoid
-        // pulling in a new crypto dep by using the std hasher — collisions
-        // here only mean two unrelated repos share a state file (which the
-        // workspace guard then catches) and reduce the path length to
-        // something readable.
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut h);
-        let digest = format!("{:016x}", h.finish());
-        std::path::PathBuf::from(home)
-            .join(".astra")
-            .join("plans")
-            .join(digest)
-            .join("plan_state.json")
-    }
-
-    /// Return true when this saved plan state was captured in (or beneath)
-    /// the current working directory.
-    ///
-    /// B8: prior to this guard, `~/.astra/plan_state.json` was a single
-    /// global file. Opening `astra` in repo B after working in repo A
-    /// would silently restore A's plan and `@resume-plan` would attempt
-    /// to drive A's subtasks against B's project context. We now require
-    /// the saved `context.root` to either equal `current_cwd` or be an
-    /// ancestor of it (so subdirectories of the same project still match).
-    pub fn matches_workspace(&self, current_cwd: &std::path::Path) -> bool {
-        if self.context.root.is_empty() {
-            // Older state files may pre-date this field — be permissive
-            // but log via the caller so it's traceable.
-            return true;
-        }
-        let saved = std::path::Path::new(&self.context.root);
-        let saved_canon = saved.canonicalize().unwrap_or_else(|_| saved.to_path_buf());
-        let cwd_canon = current_cwd
-            .canonicalize()
-            .unwrap_or_else(|_| current_cwd.to_path_buf());
-        cwd_canon == saved_canon || cwd_canon.starts_with(&saved_canon)
-    }
-
-    /// Load plan state with recovery — falls back to last good version
-    /// if primary state file is corrupted.
-    pub fn load_with_recovery(path: &Path) -> Result<Self, PlanLoadError> {
-        match Self::load_from_file(path) {
-            Ok(state) => Ok(state),
-            Err(primary_err) => {
-                let backup = path.with_extension("json.bak");
-                if backup.exists() {
-                    eprintln!("  ⚠ Primary state corrupted, loading backup: {primary_err}");
-                    if let Ok(state) = Self::load_from_file(&backup) {
-                        let _ = state.save_to_file(path);
-                        return Ok(state);
-                    }
-                }
-
-                let plans_dir = Self::plans_dir();
-                if plans_dir.exists() {
-                    let mut candidates: Vec<_> = Self::list_saved_plans().into_iter().collect();
-                    if !candidates.is_empty() {
-                        candidates.sort_by_key(|b| std::cmp::Reverse(b.progress_pct));
-                        let best = &candidates[0];
-                        if let Ok(state) = Self::load_from_plans_dir(&best.name) {
-                            eprintln!("  ⚠ Recovered plan '{}' from plans directory", best.goal);
-                            return Ok(state);
-                        }
-                    }
-                }
-
-                Err(PlanLoadError::Corrupt(format!(
-                    "no recovery possible: {primary_err}"
-                )))
-            }
-        }
-    }
-
-    /// Save with backup — keeps one backup copy for recovery.
-    pub fn save_with_backup(&self, path: &Path) -> Result<(), String> {
-        if path.exists() {
-            let backup = path.with_extension("json.bak");
-            let _ = std::fs::copy(path, &backup);
-        }
-        self.save_to_file(path)
-    }
-
-    /// Remove the saved state file and its backup.
-    ///
-    /// The backup is written as `{path}.json.bak` (see `save_with_backup`),
-    /// not `{path}.bak`. The previous implementation deleted the wrong file,
-    /// leaving a recoverable backup behind that resurrected "ghost" plans on
-    /// the next REPL start.
-    pub fn clear_saved_state() {
-        let path = Self::state_path();
-        Self::clear_saved_state_at(&path);
-    }
-
-    /// Remove the saved state file and its backup at an explicit path
-    /// (test-friendly variant of [`clear_saved_state`]).
-    pub fn clear_saved_state_at(path: &Path) {
-        let _ = std::fs::remove_file(path);
-        let backup = path.with_extension("json.bak");
-        let _ = std::fs::remove_file(backup);
-    }
-
-    /// Directory for storing all plans.
-    pub fn plans_dir() -> std::path::PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        std::path::PathBuf::from(home).join(".astra").join("plans")
-    }
-
     /// Generate a unique plan ID from the goal.
     pub fn generate_plan_id(goal: &str) -> String {
         use std::collections::hash_map::DefaultHasher;
@@ -2354,106 +2189,6 @@ impl PlanModeState {
         } else {
             format!("{}-{:04x}", slug.to_lowercase(), (hash & 0xFFFF) as u16)
         }
-    }
-
-    /// Save this plan to the plans directory with an explicit ID.
-    /// Bumps the version counter for optimistic concurrency control.
-    pub fn save_to_plans_dir_with_id(&mut self, plan_id: &str) -> Result<(), String> {
-        Self::validate_plan_id(plan_id).map_err(|e| e.to_string())?;
-        self.version += 1;
-        let plans_dir = Self::plans_dir();
-        std::fs::create_dir_all(&plans_dir).map_err(|e| format!("create plans dir: {e}"))?;
-        let path = plans_dir.join(format!("{plan_id}.json"));
-        self.save_to_file(&path)
-    }
-    /// Load a plan from the plans directory by ID.
-    /// Returns typed `PlanLoadError` for proper HTTP status mapping.
-    pub fn load_from_plans_dir(plan_id: &str) -> Result<Self, PlanLoadError> {
-        Self::validate_plan_id(plan_id)?;
-        let path = Self::plans_dir().join(format!("{plan_id}.json"));
-        Self::load_from_file(&path)
-    }
-
-    /// List all saved plans in the plans directory.
-    pub fn list_saved_plans() -> Vec<SavedPlanInfo> {
-        Self::list_saved_plans_filtered(None)
-    }
-
-    /// List saved plans owned by the given user. Plans without an owner are included
-    /// for backward compatibility with pre-ownership plans.
-    pub fn list_saved_plans_for_user(user_id: &str) -> Vec<SavedPlanInfo> {
-        Self::list_saved_plans_filtered(Some(user_id))
-    }
-
-    fn list_saved_plans_filtered(user_filter: Option<&str>) -> Vec<SavedPlanInfo> {
-        let plans_dir = Self::plans_dir();
-        let Ok(entries) = std::fs::read_dir(&plans_dir) else {
-            return Vec::new();
-        };
-
-        let mut plans = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let Some(name) = path.file_stem().and_then(|n| n.to_str()) else {
-                continue;
-            };
-
-            if let Ok(state) = Self::load_from_file(&path) {
-                if let Some(uid) = user_filter {
-                    let owner = state.created_by.as_deref().unwrap_or(uid);
-                    if owner != uid {
-                        continue;
-                    }
-                }
-
-                let status = if state.plan.progress_pct() == 100 {
-                    "completed"
-                } else if state.plan.items_done() > 0 {
-                    "in_progress"
-                } else {
-                    "pending"
-                };
-
-                plans.push(SavedPlanInfo {
-                    name: name.to_string(),
-                    goal: state.goal,
-                    progress_pct: state.plan.progress_pct(),
-                    subtask_count: state.plan.subtasks.len(),
-                    status: status.to_string(),
-                });
-            }
-        }
-
-        // Sort by progress (in-progress first, then pending, then completed)
-        plans.sort_by(|a, b| {
-            let order = |s: &str| match s {
-                "in_progress" => 0,
-                "pending" => 1,
-                "completed" => 2,
-                _ => 3,
-            };
-            order(&a.status)
-                .cmp(&order(&b.status))
-                .then_with(|| b.progress_pct.cmp(&a.progress_pct))
-        });
-
-        plans
-    }
-
-    /// Delete a saved plan by ID.
-    pub fn delete_saved_plan(plan_id: &str) -> Result<(), PlanLoadError> {
-        Self::validate_plan_id(plan_id)?;
-        let path = Self::plans_dir().join(format!("{plan_id}.json"));
-        std::fs::remove_file(path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                PlanLoadError::NotFound(plan_id.to_string())
-            } else {
-                PlanLoadError::Internal(format!("delete plan: {e}"))
-            }
-        })
     }
 
     /// Validate that a plan_id is safe for filesystem use (no path traversal).
@@ -4546,59 +4281,6 @@ pub fn instantiate_template(name: &str, goal: &str) -> Option<TaskPlan> {
     Some(plan)
 }
 
-// ─── Plan Listing ───────────────────────────────────────────────────────────
-
-/// List all saved plan state files.
-pub fn list_saved_plans() -> Vec<SavedPlanInfo> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let plans_dir = std::path::PathBuf::from(&home).join(".astra");
-
-    let mut result = Vec::new();
-
-    // Check for active plan state
-    let state_path = plans_dir.join("plan_state.json");
-    if state_path.exists()
-        && let Ok(state) = PlanModeState::load_from_file(&state_path)
-    {
-        result.push(SavedPlanInfo {
-            name: "active".to_string(),
-            goal: state.goal,
-            progress_pct: state.plan.progress_pct(),
-            subtask_count: state.plan.subtasks.len(),
-            status: if state.plan.progress_pct() == 100 {
-                "completed"
-            } else {
-                "active"
-            }
-            .to_string(),
-        });
-    }
-
-    // Check for plan templates in templates dir
-    let templates_dir = plans_dir.join("plan_templates");
-    if templates_dir.exists()
-        && let Ok(entries) = std::fs::read_dir(&templates_dir)
-    {
-        for entry in entries.flatten() {
-            if let Some(ext) = entry.path().extension()
-                && ext == "json"
-                && let Ok(data) = std::fs::read_to_string(entry.path())
-                && let Ok(tmpl) = serde_json::from_str::<PlanTemplate>(&data)
-            {
-                result.push(SavedPlanInfo {
-                    name: tmpl.name,
-                    goal: tmpl.description,
-                    progress_pct: 0,
-                    subtask_count: tmpl.subtasks.len(),
-                    status: "template".to_string(),
-                });
-            }
-        }
-    }
-
-    result
-}
-
 /// Summary info for a saved plan.
 #[derive(Debug, Clone)]
 pub struct SavedPlanInfo {
@@ -6175,37 +5857,6 @@ Done!"#;
         // Note: bare "continue" IS a valid resume signal at the generic
         // detector level (re-added in 3238e16cf). It is rejected upstream by
         // PlanCommand parsing only — see plan.rs and the c0d397728 commit.
-    }
-
-    #[test]
-    fn clear_saved_state_at_removes_both_state_and_json_bak() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("plan_state.json");
-        let backup = path.with_extension("json.bak");
-        std::fs::write(&path, "{}").unwrap();
-        std::fs::write(&backup, "{}").unwrap();
-        assert!(path.exists() && backup.exists());
-
-        PlanModeState::clear_saved_state_at(&path);
-
-        assert!(!path.exists(), "primary state file must be removed");
-        assert!(
-            !backup.exists(),
-            "backup .json.bak must be removed (B7 — was deleting wrong .bak)"
-        );
-    }
-
-    #[test]
-    fn state_path_for_cwd_is_workspace_scoped() {
-        // P6: different cwds map to different files. Same cwd is stable.
-        let a = tempfile::tempdir().unwrap();
-        let b = tempfile::tempdir().unwrap();
-        let pa1 = PlanModeState::state_path_for_cwd(a.path());
-        let pa2 = PlanModeState::state_path_for_cwd(a.path());
-        let pb = PlanModeState::state_path_for_cwd(b.path());
-        assert_eq!(pa1, pa2, "same cwd → same path");
-        assert_ne!(pa1, pb, "different cwds → different paths");
-        assert!(pa1.to_string_lossy().contains("plans"));
     }
 
     #[test]
@@ -7805,154 +7456,19 @@ Done!"#;
     }
 
     #[test]
-    fn should_suggest_plan_mode_multi_step() {
-        // Multi-step with large scope
-        assert!(should_suggest_plan_mode("implement authentication and then add tests").is_some());
-        assert!(
-            should_suggest_plan_mode("refactor the module and then migrate the database").is_some()
+    fn classify_plan_kind_distinguishes_goal_modes() {
+        assert_eq!(
+            classify_plan_kind("客观评价是正确的方向吗？"),
+            Some(PlanKind::Analytical)
         );
-        assert!(should_suggest_plan_mode("重构代码，然后添加测试").is_some());
-    }
-
-    #[test]
-    fn should_suggest_plan_mode_impl_and_test() {
-        // Implementation + testing pattern
-        assert!(
-            should_suggest_plan_mode("implement the API endpoint and write tests for it").is_some()
+        assert_eq!(
+            classify_plan_kind(
+                "refactor the auth module and add comprehensive tests for login/logout"
+            ),
+            Some(PlanKind::Executable)
         );
-        assert!(
-            should_suggest_plan_mode("add user authentication with comprehensive tests").is_some()
-        );
-    }
-
-    #[test]
-    fn should_suggest_plan_mode_large_scope() {
-        // Large scope with multiple files
-        assert!(should_suggest_plan_mode("refactor multiple files in the auth module").is_some());
-        assert!(
-            should_suggest_plan_mode("migrate all services to the new database schema").is_some()
-        );
-    }
-
-    #[test]
-    fn should_suggest_plan_mode_short_input_skipped() {
-        // Short inputs should not trigger plan mode
-        assert!(should_suggest_plan_mode("fix bug").is_none());
-        assert!(should_suggest_plan_mode("add test").is_none());
-        assert!(should_suggest_plan_mode("what is this").is_none());
-    }
-
-    #[test]
-    fn should_suggest_plan_mode_simple_questions_skipped() {
-        // Simple questions should not trigger
-        assert!(should_suggest_plan_mode("how does this work").is_none());
-        assert!(should_suggest_plan_mode("explain the code").is_none());
-    }
-
-    #[test]
-    fn should_suggest_plan_mode_skips_analytical_questions() {
-        // B1: Analytical / evaluative questions are answered by chat, not by
-        // building a TaskPlan with executable subtasks.
-        // The user's actual failing input from session 5544bc3b:
-        assert!(
-            should_suggest_plan_mode(
-                "当前memoria的接口对context管理来说，客观评价是正确的方向吗？需要看内部实现啊"
-            )
-            .is_none(),
-            "evaluative '吗？' question must NOT auto-trigger plan mode"
-        );
-
-        // English equivalents
-        assert!(
-            should_suggest_plan_mode("should we refactor the authentication module to use JWT?")
-                .is_none()
-        );
-        assert!(
-            should_suggest_plan_mode(
-                "evaluate whether the current implementation of services is correct"
-            )
-            .is_none()
-        );
-        assert!(
-            should_suggest_plan_mode("compare the build system with cargo for the new module")
-                .is_none()
-        );
-        assert!(should_suggest_plan_mode("分析当前模块的设计是否合理").is_none());
-        assert!(should_suggest_plan_mode("如何评价这个重构方案").is_none());
-
-        // Sanity: actionable instructions still trigger
-        assert!(
-            should_suggest_plan_mode("refactor the auth module and add comprehensive tests")
-                .is_some(),
-            "imperative instructions still route to plan mode"
-        );
-    }
-
-    #[test]
-    fn classify_plan_suggestion_distinguishes_kinds() {
-        // Analytical: classifier identifies kind even though
-        // should_suggest_plan_mode would suppress the auto-prompt.
-        let s = classify_plan_suggestion("客观评价是正确的方向吗？")
-            .expect("analytical input should classify");
-        assert_eq!(s.kind, PlanKind::Analytical);
-
-        let s = classify_plan_suggestion(
-            "refactor the auth module and add comprehensive tests for login/logout",
-        )
-        .expect("executable input should classify");
-        assert_eq!(s.kind, PlanKind::Executable);
-
-        // Too short or too vague returns None for both kinds.
-        assert!(classify_plan_suggestion("hi").is_none());
-        assert!(classify_plan_suggestion("fix bug").is_none());
-    }
-
-    // Regression: "review local changes" / "review staged" must NOT trigger
-    // plan mode auto-suggest — these are code-review skill invocations.
-    // (classify_plan_suggestion may still classify them as Analytical for /plan
-    // command purposes, but the auto-suggest prompt must not fire.)
-    #[test]
-    fn review_commands_do_not_trigger_plan_mode() {
-        let cases = [
-            "review local changes",
-            "review staged",
-            "review commit:abc1234",
-            "review branch:main",
-            "review the latest commit",
-            "review changes",
-            "review https://github.com/org/repo/pull/42",
-        ];
-        for input in cases {
-            assert!(
-                should_suggest_plan_mode(input).is_none(),
-                "'{input}' must not trigger plan mode auto-suggest"
-            );
-        }
-    }
-
-    #[test]
-    fn matches_workspace_accepts_same_dir_and_subdirs_rejects_unrelated() {
-        // B8: Saved plan_state.json must not silently restore in a foreign
-        // workspace.
-        let dir_a = tempfile::tempdir().expect("tempdir A");
-        let dir_b = tempfile::tempdir().expect("tempdir B");
-        let sub_a = dir_a.path().join("crates/foo");
-        std::fs::create_dir_all(&sub_a).unwrap();
-
-        let mut state = PlanModeState::new("g".into(), ProjectContext::default());
-        state.context.root = dir_a.path().to_string_lossy().into_owned();
-
-        // Same dir matches.
-        assert!(state.matches_workspace(dir_a.path()));
-        // Subdirectory of saved root matches (e.g. running astra from
-        // crates/foo of the original repo).
-        assert!(state.matches_workspace(&sub_a));
-        // Unrelated workspace must NOT match.
-        assert!(!state.matches_workspace(dir_b.path()));
-
-        // Empty saved root → permissive (older state files).
-        state.context.root.clear();
-        assert!(state.matches_workspace(dir_b.path()));
+        assert_eq!(classify_plan_kind("hi"), None);
+        assert_eq!(classify_plan_kind("fix bug"), None);
     }
 
     #[test]
@@ -8991,24 +8507,6 @@ Done!"#;
 
         let loaded = PlanModeState::load_from_file(&path).unwrap();
         assert_eq!(loaded.goal, "Legacy");
-    }
-
-    #[test]
-    fn save_with_backup_creates_bak_file() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("plan.json");
-
-        let ps1 = PlanModeState::new("Version 1".into(), ProjectContext::default());
-        ps1.save_to_file(&path).unwrap();
-
-        let ps2 = PlanModeState::new("Version 2".into(), ProjectContext::default());
-        ps2.save_with_backup(&path).unwrap();
-
-        let backup = path.with_extension("json.bak");
-        assert!(backup.exists());
-
-        let loaded_main = PlanModeState::load_from_file(&path).unwrap();
-        assert_eq!(loaded_main.goal, "Version 2");
     }
 
     #[test]
