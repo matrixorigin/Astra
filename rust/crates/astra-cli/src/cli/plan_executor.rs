@@ -5,9 +5,9 @@
 //! stderr (current behavior); [`ChannelSink`] routes updates through
 //! `tokio::sync::mpsc` for background execution.
 //!
-//! The [`spawn_plan_executor`] function extracts owned data from the REPL,
+//! The [`spawn_plan_executor`] function extracts owned data from the session,
 //! spawns a `tokio` task that iterates subtasks via `stream_chat_sse`, and
-//! returns a [`PlanExecutorHandle`] for the REPL to poll for updates.
+//! returns a [`PlanExecutorHandle`] for the plan monitor/TUI to poll for updates.
 
 use std::time::Duration;
 
@@ -19,7 +19,6 @@ use crate::theme;
 
 /// Events emitted by the plan executor through the mpsc channel.
 #[derive(Debug)]
-#[allow(dead_code)] // Fields read by REPL monitoring loop via pattern match
 pub enum PlanUpdate {
     SubtaskStarted {
         id: String,
@@ -77,7 +76,7 @@ pub enum PlanUpdate {
         title: String,
     },
     /// A subtask's LLM turn completed — carries the StreamResult fields
-    /// needed by the REPL to update history, journal, etc.
+    /// needed by the plan monitor to update history, journal, etc.
     SubtaskTurnResult {
         subtask_id: String,
         full_text: String,
@@ -90,9 +89,9 @@ pub enum PlanUpdate {
     PlanError {
         error: String,
     },
-    /// Journal event to be written by the REPL thread (JournalWriter is !Send).
+    /// Journal event to be written on the main CLI thread (JournalWriter is !Send).
     JournalEvent(Box<session_journal::JournalEvent>),
-    /// History entry from a completed subtask turn — REPL should append to its history.
+    /// History entry from a completed subtask turn — the monitor should append it.
     HistoryEntry {
         user_msg: String,
         assistant_msg: String,
@@ -106,7 +105,7 @@ pub enum PlanUpdate {
     },
     /// Per-subtask verification report with individual criterion results.
     VerificationReport(astra_services::durable_task::SubtaskVerificationReport),
-    /// Tool requires interactive approval — REPL should prompt the user and
+    /// Tool requires interactive approval — the TUI/monitor should prompt the user and
     /// send the response via `response_tx`.
     ApprovalNeeded {
         tool: String,
@@ -115,28 +114,25 @@ pub enum PlanUpdate {
         reason: String,
         response_tx: tokio::sync::oneshot::Sender<super::chat_stream::ApprovalResponse>,
     },
-    /// Sync subtask status back to the REPL so plan_mode stays up-to-date
+    /// Sync subtask status back to the session state so plan_mode stays up-to-date
     /// across re-runs. Sent after each subtask completes or fails.
     SubtaskStatusSync {
         id: String,
         status: astra_services::task_orchestrator::TaskStatus,
     },
-    /// Return the durable task state back to the REPL after execution ends,
+    /// Return the durable task state back to the session state after execution ends,
     /// so re-runs can reuse the contract instead of regenerating it.
     DurableStateReturn(Box<crate::durable_bridge::DurableTaskState>),
 }
 
-/// Commands sent from the REPL to a background plan executor.
+/// Commands sent from the plan monitor to a background plan executor.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Variants used progressively as features are wired
 pub enum PlanCommand {
     Pause,
     Resume {
         corrections: Option<Vec<String>>,
     },
     Cancel,
-    /// Request a progress summary.
-    Status,
     /// Response to a step-by-step prompt.
     UserInput(String),
 }
@@ -145,7 +141,6 @@ pub enum PlanCommand {
 
 /// Abstraction over plan execution output. Implementations decide where
 /// progress updates go — stderr, a channel, a log file, etc.
-#[allow(dead_code)] // Trait methods used selectively by different sink implementations
 pub trait PlanOutputSink {
     /// A subtask is about to start executing.
     fn subtask_started(
@@ -468,7 +463,7 @@ impl PlanOutputSink for ChannelSink {
 
 // ─── Plan Executor Handle ────────────────────────────────────────────────────
 
-/// Handle held by the REPL to interact with a background plan executor.
+/// Handle held by the plan monitor to interact with a background plan executor.
 ///
 /// - `update_rx`: receive progress/completion updates from the executor
 /// - `cmd_tx`: send pause/resume/cancel commands to the executor
@@ -477,7 +472,7 @@ pub struct PlanExecutorHandle {
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<PlanCommand>,
 }
 
-/// Create a linked pair of channels for plan executor ↔ REPL communication.
+/// Create a linked pair of channels for plan executor ↔ plan monitor communication.
 ///
 /// Returns `(handle, update_tx, cmd_rx)`:
 /// Errors that indicate authentication/credential failure — retrying is pointless.
@@ -942,7 +937,7 @@ fn text_has_browser_verification_evidence(text: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-/// - `handle` goes to the REPL loop
+/// - `handle` goes to the plan monitor loop
 /// - `update_tx` is wrapped in a `ChannelSink` for the executor
 /// - `cmd_rx` goes to the executor to receive commands
 pub fn create_plan_channels() -> (
@@ -1090,7 +1085,6 @@ pub(super) async fn record_cloud_step_run(
 ///
 /// All fields are owned (no lifetimes) so the struct is `Send + 'static`.
 /// Created by [`spawn_plan_executor`] which takes these fields from SessionState.
-#[allow(dead_code)] // Some fields reserved for future plan features
 pub(super) struct BackgroundPlanContext {
     pub api: astra_thin_client::ThinClient,
     pub token: String,
@@ -1173,7 +1167,7 @@ pub(super) struct BackgroundPlanContext {
 /// Extracts the plan and related context from `ctx`, creates the executor
 /// channels, and spawns a `tokio` task that iterates subtasks.
 ///
-/// Returns a [`PlanExecutorHandle`] for the REPL to poll for updates and
+/// Returns a [`PlanExecutorHandle`] for the plan monitor to poll for updates and
 /// send commands. The `TaskPlan` is moved into the spawned task and will
 /// be returned via `PlanUpdate::PlanCompleted` when execution finishes.
 pub(super) fn spawn_plan_executor(ctx: BackgroundPlanContext) -> PlanExecutorHandle {
@@ -1224,7 +1218,7 @@ async fn plan_executor_task(
     let mut subtask_durations: Vec<Duration> = Vec::new();
     let sink = ChannelSink::new(update_tx.clone());
 
-    // Helper: emit a journal event via the channel (REPL thread writes it)
+    // Helper: emit a journal event via the channel (main CLI thread writes it)
     // and enqueue cloud ingestion event.
     let emit_event = |tx: &tokio::sync::mpsc::UnboundedSender<PlanUpdate>,
                       ctx: &BackgroundPlanContext,
@@ -1234,7 +1228,7 @@ async fn plan_executor_task(
         if let Some(mc) = ctx.matrix_runtime.as_ref() {
             mc.enqueue_journal_events(user_id, &event);
         }
-        // Forward to REPL for journal file write
+        // Forward to the main CLI thread for journal file write
         let _ = tx.send(PlanUpdate::JournalEvent(Box::new(event)));
     };
 
@@ -1292,7 +1286,7 @@ async fn plan_executor_task(
                                 });
                                 return;
                             }
-                            _ => {} // ignore Status etc. while paused
+                            _ => {} // ignore unrelated commands while paused
                         }
                     }
                 }
@@ -1302,7 +1296,7 @@ async fn plan_executor_task(
                     });
                     return;
                 }
-                _ => {} // Status, UserInput handled elsewhere
+                _ => {} // Resume/UserInput handled in dedicated waits elsewhere
             }
         }
 
@@ -1688,8 +1682,8 @@ async fn plan_executor_task(
             let approval_update_tx = update_tx.clone();
             let approval_forwarder = tokio::spawn(async move {
                 while let Some(req) = approval_rx.recv().await {
-                    // Forward approval request to REPL — the oneshot sender
-                    // travels with the PlanUpdate so the REPL can respond directly.
+                    // Forward approval request to the plan monitor/TUI — the
+                    // oneshot sender travels with the PlanUpdate so it can respond directly.
                     if approval_update_tx
                         .send(PlanUpdate::ApprovalNeeded {
                             tool: req.tool,
@@ -1845,7 +1839,7 @@ async fn plan_executor_task(
                         emit_event(&update_tx, &ctx, turn_event);
                     }
 
-                    // Send turn result back to REPL for token accounting
+                    // Send turn result back to the plan monitor for token accounting
                     let _ = update_tx.send(PlanUpdate::SubtaskTurnResult {
                         subtask_id: next_id.clone(),
                         full_text: assistant_text.clone(),
@@ -2396,7 +2390,7 @@ mod tests {
     fn create_plan_channels_creates_linked_pair() {
         let (mut handle, update_tx, mut cmd_rx) = create_plan_channels();
 
-        // Executor → REPL
+        // Executor → monitor
         update_tx
             .send(PlanUpdate::PlanCompleted {
                 pct: 100,
@@ -2406,7 +2400,7 @@ mod tests {
         let update = handle.try_recv().unwrap();
         assert!(matches!(update, PlanUpdate::PlanCompleted { pct: 100, .. }));
 
-        // REPL → Executor
+        // Monitor → executor
         handle.send_command(PlanCommand::Pause).unwrap();
         let cmd = cmd_rx.try_recv().unwrap();
         assert!(matches!(cmd, PlanCommand::Pause));

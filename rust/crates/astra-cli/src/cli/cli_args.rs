@@ -331,17 +331,6 @@ pub(crate) struct ChatArgs {
     pub stream_events: bool,
 }
 
-#[derive(Args, Debug, Clone)]
-pub(crate) struct ForwardArgs {
-    /// Remaining arguments forwarded to the underlying command handler
-    #[arg(
-        value_name = "ARGS",
-        trailing_var_arg = true,
-        allow_hyphen_values = true
-    )]
-    pub args: Vec<String>,
-}
-
 #[derive(Args, Debug)]
 #[command(
     after_help = "Examples:\n  astra team list\n  astra team create dev Frontend delivery team\n  astra team add-member dev planner Break work into steps\n  astra team run dev 在/tmp下实现一个登录页面"

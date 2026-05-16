@@ -870,7 +870,7 @@ pub(crate) fn flush_plan_updates_between_prompts(state: &mut SessionState) -> bo
     outcome == PlanMonitorOutcome::Finished
 }
 
-/// Clear REPL state when the plan update channel closed without `PlanCompleted` / `PlanError`.
+/// Clear plan-monitor state when the update channel closed without `PlanCompleted` / `PlanError`.
 /// Emits structured journal events so the failure is observable in telemetry.
 fn cleanup_orphan_plan_executor(state: &mut SessionState, plan_spinner: &mut Option<PlanSpinner>) {
     if let Some(s) = plan_spinner.take() {
@@ -935,7 +935,7 @@ fn cleanup_orphan_plan_executor(state: &mut SessionState, plan_spinner: &mut Opt
     );
 }
 
-/// Block the REPL until the plan executor finishes, pauses, or errors.
+/// Block the CLI until the plan executor finishes, pauses, or errors.
 ///
 /// Replaces the old "fire and forget" background model: the user cannot type
 /// at the prompt while a plan is running. First Ctrl+C sends Pause; a second
@@ -977,7 +977,7 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut SessionState) {
         }
 
         if state.pending_approval.is_some() {
-            // Issue #326 P0 (tui-only) / #331: with the REPL gone,
+            // Issue #326 P0 (tui-only) / #331: with the old REPL path gone,
             // plan_monitor no longer prompts on stdin. The approval
             // is owned by the TUI's bottom_pane queue (which receives
             // it via the same response_tx channel pending_approval

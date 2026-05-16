@@ -358,10 +358,6 @@ pub(crate) struct SessionState {
     /// User profile manager for preferences and scenario detection.
     pub user_profile_manager: std::sync::Arc<astra_config::user_profile::UserProfileManager>,
 
-    // ── Auto-Tuning (M6) ──
-    /// Auto-tuning engine for adaptive learning.
-    pub auto_tuning_engine: std::sync::Arc<astra_learning::auto_tuning::AutoTuningEngine>,
-
     // ── Conversation State Log (CSL) ──
     /// Unified CSL manager for persisting/restoring conversation state.
     /// Created lazily when session_id is first known.
@@ -557,14 +553,6 @@ impl Default for SessionState {
                 let store =
                     std::sync::Arc::new(astra_config::user_profile::UserProfileStore::new());
                 std::sync::Arc::new(astra_config::user_profile::UserProfileManager::new(store))
-            },
-            auto_tuning_engine: {
-                let engine = astra_learning::auto_tuning::AutoTuningEngine::new();
-                // Add default evolution rules
-                for rule in astra_learning::auto_tuning::default_rules() {
-                    engine.add_rule(rule);
-                }
-                std::sync::Arc::new(engine)
             },
             csl_manager: None,
             tui_render_policy: None,

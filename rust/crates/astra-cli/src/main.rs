@@ -186,8 +186,6 @@ mod slash_team;
 mod slash_telemetry;
 #[path = "cli/slash_tools.rs"]
 mod slash_tools;
-#[path = "cli/slash_tuning.rs"]
-mod slash_tuning;
 #[path = "cli/spawn_subrun.rs"]
 mod spawn_subrun;
 #[path = "cli/sse_utils.rs"]
