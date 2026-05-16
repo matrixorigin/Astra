@@ -6172,9 +6172,9 @@ Done!"#;
         // "next" is ambiguous with "next subtask".
         assert!(!is_resume_command("go"));
         assert!(!is_resume_command("next"));
-        // Bare "continue" alone is no longer enough — must be paired with
-        // "plan" or use the @resume-plan tag.
-        assert!(!is_resume_command("continue"));
+        // Note: bare "continue" IS a valid resume signal at the generic
+        // detector level (re-added in 3238e16cf). It is rejected upstream by
+        // PlanCommand parsing only — see plan.rs and the c0d397728 commit.
     }
 
     #[test]

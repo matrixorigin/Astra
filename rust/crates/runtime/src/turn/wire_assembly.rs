@@ -350,7 +350,7 @@ pub(crate) fn assemble_llm_messages(
 
     // Prepend volatile content to the last user message so the stable
     // prefix (system + history) stays byte-identical for prefix caching.
-    let mut synthetic_fallback_only = false;
+    let mut synthetic_pair_end: Option<usize> = None;
     if !volatile_preamble.is_empty() {
         let volatile_text: String = volatile_preamble
             .iter()
@@ -372,14 +372,14 @@ pub(crate) fn assemble_llm_messages(
                 last_user["content"] = Value::String(format!("{volatile_text}\n\n{existing}"));
             } else {
                 // No user message yet — insert as a standalone pair (fallback).
-                // Mark as synthetic so cache metadata is not applied: there is
-                // no real history to anchor a cache breakpoint, and annotating
-                // the synthetic assistant turn would falsely signal a cached
-                // prefix to callers that inspect last_message_has_cache_control.
+                // Track its end index: if no real attachment lands after it,
+                // we must skip cache annotation, since the synthetic assistant
+                // turn has no real history to anchor a cache breakpoint and
+                // annotating it would falsely surface as a cached prefix.
                 llm_messages.push(serde_json::json!({"role": "user", "content": volatile_text}));
                 llm_messages
                     .push(serde_json::json!({"role": "assistant", "content": "Understood."}));
-                synthetic_fallback_only = true;
+                synthetic_pair_end = Some(llm_messages.len());
             }
         }
     }
@@ -405,7 +405,12 @@ pub(crate) fn assemble_llm_messages(
         llm_messages.extend(file_messages);
     }
 
-    if !synthetic_fallback_only {
+    // Skip annotation only when the tail is still the synthetic placeholder
+    // (no real attachment landed after it). When attachments extended the
+    // message list past the placeholder, the real tail can be annotated.
+    let last_is_synthetic_placeholder =
+        synthetic_pair_end.is_some_and(|end| end == llm_messages.len());
+    if !last_is_synthetic_placeholder {
         apply_anthropic_cache_metadata(&mut llm_messages, cache_cfg, session_id);
     }
     llm_messages
