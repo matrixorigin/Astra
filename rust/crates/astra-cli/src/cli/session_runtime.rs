@@ -107,8 +107,7 @@ pub(crate) fn install_task_service(
 
 /// Replace the task manager's store (used once at startup when we upgrade
 /// from the synchronous in-memory fallback to a MatrixOne-backed store).
-/// The new manager inherits the current session_id; later `rebind_task_session`
-/// calls keep it current.
+/// The new manager inherits the current session_id.
 pub(crate) fn install_task_store(
     state: &mut SessionState,
     store: std::sync::Arc<dyn astra_tools::task_mgmt::TaskStore>,
@@ -119,13 +118,6 @@ pub(crate) fn install_task_store(
         .unwrap_or_else(|| "no-session".to_string());
     state.task_manager =
         std::sync::Arc::new(astra_tools::task_mgmt::TaskManager::new(session_id, store));
-}
-
-/// Notify the task manager that the session id changed. Cheap — just a
-/// mutex swap inside the manager — so every `state.session_id = ...`
-/// touch-point should call this to keep the session_todos view consistent.
-pub(crate) fn rebind_task_session(state: &SessionState, session_id: &str) {
-    state.task_manager.rebind(session_id);
 }
 
 /// Resolve the durable cloud task runtime (TaskService + lease).

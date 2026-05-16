@@ -2341,10 +2341,6 @@ mod tests {
             pct: 100,
             elapsed: Duration::from_secs(60),
         };
-        let _ = PlanCommand::Pause;
-        let _ = PlanCommand::Resume {
-            corrections: Some(vec!["fix tests".into()]),
-        };
     }
 
     #[test]
