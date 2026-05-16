@@ -72,9 +72,6 @@ pub enum PlanUpdate {
         conflicts: usize,
         groups: usize,
     },
-    StepByStepPrompt {
-        title: String,
-    },
     /// A subtask's LLM turn completed — carries the StreamResult fields
     /// needed by the plan monitor to update history, journal, etc.
     SubtaskTurnResult {
@@ -129,12 +126,7 @@ pub enum PlanUpdate {
 #[derive(Debug, Clone)]
 pub enum PlanCommand {
     Pause,
-    Resume {
-        corrections: Option<Vec<String>>,
-    },
     Cancel,
-    /// Response to a step-by-step prompt.
-    UserInput(String),
 }
 
 // ─── Output Sink Trait ───────────────────────────────────────────────────────
@@ -178,18 +170,6 @@ pub trait PlanOutputSink {
 
     /// Parallel group info line.
     fn parallel_info(&self, parts: &[String]);
-
-    /// Step-by-step prompt.
-    fn step_prompt(&self, title: &str);
-
-    /// Step-by-step user chose to skip.
-    fn step_skipped(&self, title: &str);
-
-    /// Step-by-step user chose to abort.
-    fn step_aborted(&self);
-
-    /// Step-by-step user chose to proceed.
-    fn step_proceeding(&self);
 
     /// Ctrl+C paused during subtask execution.
     fn interrupted_pause(&self, pct: u32, remaining: usize);
@@ -298,23 +278,6 @@ impl PlanOutputSink for StderrSink {
         if !parts.is_empty() {
             eprintln!("\n{}  {}", "║".magenta(), parts.join(" · "));
         }
-    }
-
-    fn step_prompt(&self, _title: &str) {
-        eprintln!();
-        eprintln!("  {}  {}", "❓".yellow(), "Execute this subtask?".bold());
-    }
-
-    fn step_skipped(&self, title: &str) {
-        eprintln!("  {}  Skipping: {}", "→".dim(), title.dim());
-    }
-
-    fn step_aborted(&self) {
-        eprintln!("  {}  {}", "⏹".red(), "Plan execution aborted".bold());
-    }
-
-    fn step_proceeding(&self) {
-        eprintln!("  {}  Proceeding…", "→".magenta());
     }
 
     fn interrupted_pause(&self, pct: u32, remaining: usize) {
@@ -439,16 +402,6 @@ impl PlanOutputSink for ChannelSink {
         }
     }
 
-    fn step_prompt(&self, title: &str) {
-        self.send(PlanUpdate::StepByStepPrompt {
-            title: title.to_string(),
-        });
-    }
-
-    fn step_skipped(&self, _title: &str) {}
-    fn step_aborted(&self) {}
-    fn step_proceeding(&self) {}
-
     fn interrupted_pause(&self, pct: u32, remaining: usize) {
         self.send(PlanUpdate::PlanPaused {
             pct,
@@ -466,7 +419,7 @@ impl PlanOutputSink for ChannelSink {
 /// Handle held by the plan monitor to interact with a background plan executor.
 ///
 /// - `update_rx`: receive progress/completion updates from the executor
-/// - `cmd_tx`: send pause/resume/cancel commands to the executor
+/// - `cmd_tx`: send pause/cancel commands to the executor
 pub struct PlanExecutorHandle {
     pub update_rx: tokio::sync::mpsc::UnboundedReceiver<PlanUpdate>,
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<PlanCommand>,
@@ -1148,8 +1101,6 @@ pub(super) struct BackgroundPlanContext {
     pub ingestion_user_id: Option<String>,
     pub matrix_runtime: Option<Arc<astra_runtime::MatrixCloudRuntime>>,
 
-    // ─── Execution Config ────────────────────────────────────────────────
-    pub plan_execution_config: Option<plan::PlanExecutionConfig>,
     pub turn: u32,
 
     /// Local tracking for LLM turn failures (separate from durable verification retries).
@@ -1271,24 +1222,7 @@ async fn plan_executor_task(
                         .filter(|s| s.status == TaskStatus::Pending)
                         .count();
                     sink.interrupted_pause(pct, remaining);
-                    // Wait for Resume or Cancel
-                    loop {
-                        match cmd_rx.recv().await {
-                            Some(PlanCommand::Resume { corrections }) => {
-                                if let Some(c) = corrections {
-                                    ctx.plan_corrections = c;
-                                }
-                                break;
-                            }
-                            Some(PlanCommand::Cancel) | None => {
-                                let _ = update_tx.send(PlanUpdate::PlanError {
-                                    error: "Plan cancelled by user".into(),
-                                });
-                                return;
-                            }
-                            _ => {} // ignore unrelated commands while paused
-                        }
-                    }
+                    return;
                 }
                 PlanCommand::Cancel => {
                     let _ = update_tx.send(PlanUpdate::PlanError {
@@ -1296,7 +1230,6 @@ async fn plan_executor_task(
                     });
                     return;
                 }
-                _ => {} // Resume/UserInput handled in dedicated waits elsewhere
             }
         }
 
@@ -1365,14 +1298,13 @@ async fn plan_executor_task(
                 });
                 return; // Plan is done — exit the execution loop
             } else {
-                // ── Blocked-deps pause with auto-heal + resume-loop guard ──
+                // ── Blocked-deps pause with auto-heal ──────────────────────
                 //
                 // Bug fix 2026-04-23: Previously, if the ready set was empty
-                // and the plan was <100%, we paused and waited for Resume.
-                // Resume simply `continue`d the outer loop, which re-analysed
-                // deps with *identical* plan state — producing an infinite
-                // 继续→pause→继续→pause loop with no signal to the user
-                // about *why*. Observed in session 26f73ee4.
+                // and the plan was <100%, we paused and pretended a future
+                // interactive resume path would re-enter the executor. That
+                // path no longer exists in the CLI, so a blocked plan must
+                // surface the pause and return control to the caller.
                 //
                 // Defences, cheapest first:
                 //   1. Auto-heal orphan `InProgress` subtasks (e.g. a crashed
@@ -1381,10 +1313,6 @@ async fn plan_executor_task(
                 //      clears the deadlock without user intervention.
                 //   2. Surface the blocked ids in the `PlanPaused` UI event
                 //      so the user can diagnose at a glance.
-                //   3. If Resume is received and re-analysis produces the
-                //      *exact same* blocked set as before, abort with a
-                //      descriptive error rather than looping. The user can
-                //      always `rewind N`, edit the plan, or Cancel to recover.
                 let mut blocked: Vec<String> = ctx
                     .plan
                     .subtasks
@@ -1393,8 +1321,6 @@ async fn plan_executor_task(
                     .map(|s| s.id.clone())
                     .collect();
                 blocked.sort();
-                let blocked_key = blocked.clone();
-
                 // Auto-heal InProgress orphans — they must have been
                 // abandoned (no live worker handle exists at this level of
                 // the executor) so resurrect them as Pending for another
@@ -1444,79 +1370,8 @@ async fn plan_executor_task(
                     plan_start.elapsed(),
                     &blocked.join(", "),
                 );
-                // Wait for Resume (user may fix blocked deps) or Cancel
-                loop {
-                    match cmd_rx.recv().await {
-                        Some(PlanCommand::Resume { corrections }) => {
-                            if let Some(c) = corrections {
-                                ctx.plan_corrections = c;
-                            }
-                            break; // re-enter outer loop to re-check ready subtasks
-                        }
-                        Some(PlanCommand::Cancel) | None => {
-                            let _ = update_tx.send(PlanUpdate::PlanError {
-                                error: "Plan cancelled while blocked".into(),
-                            });
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Anti-loop check: after resume, re-compute ready + blocked.
-                // If the blocked set is identical to what we just paused on,
-                // we'd immediately re-pause. Abort with an actionable error
-                // message instead of producing a user-visible infinite loop.
-                let new_ready = ctx.plan.ready_subtasks();
-                if new_ready.is_empty() {
-                    let mut new_blocked: Vec<String> = ctx
-                        .plan
-                        .subtasks
-                        .iter()
-                        .filter(|s| s.status == TaskStatus::Pending)
-                        .map(|s| s.id.clone())
-                        .collect();
-                    new_blocked.sort();
-                    if new_blocked == blocked_key {
-                        // Build a concise "who-blocks-whom" summary so the
-                        // user can rewind/edit the right subtask.
-                        let summary: Vec<String> = ctx
-                            .plan
-                            .subtasks
-                            .iter()
-                            .filter(|s| s.status == TaskStatus::Pending)
-                            .map(|s| {
-                                let unmet: Vec<&str> = s
-                                    .depends_on
-                                    .iter()
-                                    .filter(|dep| {
-                                        !ctx.plan.subtasks.iter().any(|d| {
-                                            d.id == **dep && d.status == TaskStatus::Completed
-                                        })
-                                    })
-                                    .map(|s| s.as_str())
-                                    .collect();
-                                if unmet.is_empty() {
-                                    format!("{} (no unmet deps — status stuck?)", s.id)
-                                } else {
-                                    format!("{} needs [{}]", s.id, unmet.join(", "))
-                                }
-                            })
-                            .collect();
-                        let _ = update_tx.send(PlanUpdate::PlanError {
-                            error: format!(
-                                "Plan deadlocked: resume would re-pause on the same blocked set. \
-                                 Blocked subtasks:\n  - {}\n\
-                                 Use `rewind <id>` to revise a completed dep, edit the plan, \
-                                 or Cancel to abort.",
-                                summary.join("\n  - ")
-                            ),
-                        });
-                        return;
-                    }
-                }
+                return;
             }
-            continue; // re-check ready subtasks after resume
         }
 
         // ── Show parallel group info ─────────────────────────────────
@@ -1548,60 +1403,6 @@ async fn plan_executor_task(
         let group_size = exec_group.len();
 
         for (group_idx, next_id) in exec_group.iter().enumerate() {
-            // ── Step-by-step mode: ask user before each subtask ──────
-            let step_by_step = ctx
-                .plan_execution_config
-                .as_ref()
-                .is_some_and(|c| c.step_by_step);
-            if step_by_step {
-                let st_title = ctx
-                    .plan
-                    .subtasks
-                    .iter()
-                    .find(|s| s.id == *next_id)
-                    .map(|s| s.title.clone())
-                    .unwrap_or_default();
-                sink.step_prompt(&st_title);
-                // Wait for UserInput or Cancel
-                let mut skip_subtask = false;
-                loop {
-                    match cmd_rx.recv().await {
-                        Some(PlanCommand::UserInput(input)) => {
-                            let lower = input.trim().to_lowercase();
-                            if lower == "skip" || lower == "s" {
-                                sink.step_skipped(&st_title);
-                                if let Some(st) =
-                                    ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id)
-                                {
-                                    st.status = TaskStatus::Completed;
-                                }
-                                skip_subtask = true;
-                                break; // exit inner loop, will break outer for-loop too
-                            } else if lower == "abort" || lower == "q" {
-                                sink.step_aborted();
-                                let _ = update_tx.send(PlanUpdate::PlanError {
-                                    error: "Plan aborted by user in step-by-step mode".into(),
-                                });
-                                return;
-                            }
-                            sink.step_proceeding();
-                            break; // proceed with this subtask
-                        }
-                        Some(PlanCommand::Cancel) | None => {
-                            let _ = update_tx.send(PlanUpdate::PlanError {
-                                error: "Plan cancelled by user".into(),
-                            });
-                            return;
-                        }
-                        Some(PlanCommand::Resume { .. }) => break, // treat as proceed
-                        _ => {}
-                    }
-                }
-                if skip_subtask {
-                    break; // break out of for-loop, re-analyze dependencies
-                }
-            }
-
             // Prepare subtask prompt
             let (prompt, title) = {
                 let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id) else {
@@ -2229,26 +2030,8 @@ async fn plan_executor_task(
                             });
                             return;
                         }
-                        // For Pause: wait for resume
-                        loop {
-                            match cmd_rx.recv().await {
-                                Some(PlanCommand::Resume { corrections }) => {
-                                    if let Some(c) = corrections {
-                                        ctx.plan_corrections = c;
-                                    }
-                                    break;
-                                }
-                                Some(PlanCommand::Cancel) | None => {
-                                    let _ = update_tx.send(PlanUpdate::PlanError {
-                                        error: "Plan cancelled by user".into(),
-                                    });
-                                    return;
-                                }
-                                _ => {}
-                            }
-                        }
+                        return;
                     }
-                    _ => {}
                 }
             }
         }
@@ -2322,7 +2105,6 @@ mod tests {
             harness_trace: None,
             ingestion_user_id: None,
             matrix_runtime: None,
-            plan_execution_config: None,
             turn: 0,
             turn_retry_counts: std::collections::HashMap::new(),
             current_subtask_strategy_hint: None,

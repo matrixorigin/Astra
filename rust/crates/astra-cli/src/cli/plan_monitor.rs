@@ -16,23 +16,19 @@ fn eprint_plan_execution_paused_hints() {
     eprintln!("{}", "  What you can do:".dim());
     eprintln!(
         "    {}",
-        "continue · resume · next · go · 继续 — resume execution from this point".dim()
+        "Slash lines keep the paused plan in memory so you can inspect or edit it.".dim()
     );
     eprintln!(
         "    {}",
-        "Lines starting with / — run a slash command; the paused plan stays in memory".dim()
+        "After edits, start execution again from the current plan state.".dim()
     );
     eprintln!(
         "    {}",
-        "Any other message — abandons the plan and sends it as a normal chat turn".dim()
+        "Any other message — abandons the paused run and sends a normal chat turn".dim()
     );
     eprintln!(
         "    {}",
-        "Step-by-step mode: at \"Execute this subtask?\", use skip to defer one subtask".dim()
-    );
-    eprintln!(
-        "    {}",
-        "correct … / note … / adjust … — stack guidance for upcoming subtasks (correct clear to drop)"
+        "correct … / note … / adjust … — stack guidance for the next run (correct clear to drop)"
             .dim()
     );
     eprintln!(
@@ -133,7 +129,7 @@ fn emit_plan_lifecycle_event(
 enum PlanMonitorOutcome {
     /// Normal drain — more updates may follow.
     Continue,
-    /// `PlanPaused` received — executor is waiting for Resume/Cancel.
+    /// `PlanPaused` received — return control to the caller with the current plan intact.
     Paused,
     /// `PlanCompleted` or `PlanError` received — executor has exited.
     Finished,
@@ -419,12 +415,15 @@ fn display_plan_updates_live(
                 if state.plan_mode.is_some() {
                     eprintln!();
                     eprintln!("{}  {}", "📋".magenta(), "Recovery options:".bold());
-                    eprintln!("{}", "    resume      — retry from where it stopped".dim());
+                    eprintln!("{}", "    go          — run the current plan again".dim());
                     eprintln!(
                         "{}",
                         "    rewind N    — reset subtask N and try again".dim()
                     );
-                    eprintln!("{}", "    correct ... — add guidance before resuming".dim());
+                    eprintln!(
+                        "{}",
+                        "    correct ... — add guidance before the next run".dim()
+                    );
                     eprintln!("{}", "    show        — display current plan state".dim());
                     eprintln!("{}", "    exit        — leave plan mode".dim());
                 }
@@ -958,6 +957,11 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut SessionState) {
                 break;
             }
             PlanMonitorOutcome::Paused => {
+                if state.plan_handle.as_ref().is_some_and(|h| h.is_finished())
+                    && let Some(mut h) = state.plan_handle.take()
+                {
+                    while h.try_recv().is_some() {}
+                }
                 break;
             }
             PlanMonitorOutcome::Continue => {}
@@ -1044,7 +1048,7 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut SessionState) {
         pane.clear();
     }
 
-    if state.plan_handle.is_some() {
+    if state.executing_plan.is_some() {
         eprint_plan_execution_paused_hints();
     }
 }

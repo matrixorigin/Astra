@@ -5092,7 +5092,7 @@ async fn apply_restored_session(
         }
         eprintln!(
             "    {}",
-            "Say continue / resume / next / go to pick up; correct … / rewind N to adjust; slash lines keep the plan; any other line abandons it."
+            "Paused plan restored. Inspect or edit it with slash commands; use correct … / rewind N to adjust; any other line abandons it."
                 .dim()
         );
     }
