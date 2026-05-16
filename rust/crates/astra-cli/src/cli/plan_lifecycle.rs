@@ -106,6 +106,7 @@ pub(crate) async fn enter_remote_plan_mode(
         value.get("plan").cloned(),
         value.get("version").and_then(Value::as_u64),
     ));
+    state.plan_mode_sync_error = None;
     state.pending_plan_resume_digest = None;
     Ok(plan_id)
 }
@@ -146,11 +147,13 @@ pub(crate) async fn exit_remote_plan_mode(
         .filter(|sid| !sid.trim().is_empty())
     else {
         state.plan_mode = None;
+        state.plan_mode_sync_error = None;
         return Ok(None);
     };
 
     let Some(plan_id) = active_remote_planning_plan_id(api, token, session_id).await? else {
         state.plan_mode = None;
+        state.plan_mode_sync_error = None;
         return Ok(None);
     };
 
@@ -165,6 +168,7 @@ pub(crate) async fn exit_remote_plan_mode(
 
     if approved {
         state.plan_mode = None;
+        state.plan_mode_sync_error = None;
     } else {
         sync_remote_plan_mode_state(api, token, state).await?;
     }
@@ -187,11 +191,13 @@ pub(crate) async fn sync_remote_plan_mode_state(
         .filter(|sid| !sid.trim().is_empty())
     else {
         state.plan_mode = None;
+        state.plan_mode_sync_error = None;
         return Ok(());
     };
 
     let Some(plan_id) = active_remote_planning_plan_id(api, token, session_id).await? else {
         state.plan_mode = None;
+        state.plan_mode_sync_error = None;
         return Ok(());
     };
 
@@ -209,6 +215,7 @@ pub(crate) async fn sync_remote_plan_mode_state(
         plan_state.get("plan").cloned(),
         plan_state.get("version").and_then(Value::as_u64),
     ));
+    state.plan_mode_sync_error = None;
     Ok(())
 }
 
@@ -284,6 +291,41 @@ mod tests {
                 .as_ref()
                 .map(|plan| plan.plan.subtasks.len()),
             Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_remote_plan_mode_keeps_bound_session_when_plan_create_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .and(header("authorization", "Bearer token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "sess-1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/plans"))
+            .and(header("authorization", "Bearer token"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "detail": "temporarily unavailable"
+            })))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = crate::SessionState::default();
+
+        let error = enter_remote_plan_mode(&api, None, "token", &mut state, "Ship auth")
+            .await
+            .expect_err("plan create should fail");
+
+        assert!(error.contains("503"), "got: {error}");
+        assert_eq!(state.session_id.as_deref(), Some("sess-1"));
+        assert!(
+            state.plan_mode.is_none(),
+            "failed plan create must not arm local mirror"
         );
     }
 
@@ -376,6 +418,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_remote_plan_mode_state_returns_error_without_clobbering_existing_mirror() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/plans"))
+            .and(header("authorization", "Bearer token"))
+            .and(query_param("session_id", "sess-1"))
+            .and(query_param("phase", "planning"))
+            .and(query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "plans": [
+                    { "plan_id": "plan-9", "goal": "Ship auth" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/plans/plan-9"))
+            .and(header("authorization", "Bearer token"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "detail": "boom"
+            })))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = crate::SessionState::default();
+        state.session_id = Some("sess-1".to_string());
+        state.plan_mode = Some(plan::PlanModeState::new(
+            "stale goal".to_string(),
+            plan::ProjectContext::default(),
+        ));
+
+        let error = sync_remote_plan_mode_state(&api, "token", &mut state)
+            .await
+            .expect_err("plan fetch should fail");
+
+        assert!(error.contains("500"), "got: {error}");
+        assert_eq!(
+            state.plan_mode.as_ref().map(|plan| plan.goal.as_str()),
+            Some("stale goal"),
+            "failed sync must not overwrite the last known local mirror"
+        );
+    }
+
+    #[tokio::test]
     async fn exit_remote_plan_mode_approved_clears_local_mirror() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -418,5 +505,59 @@ mod tests {
 
         assert_eq!(plan_id.as_deref(), Some("plan-2"));
         assert!(state.plan_mode.is_none());
+    }
+
+    #[tokio::test]
+    async fn exit_remote_plan_mode_unapproved_propagates_sync_failure_without_clearing_mirror() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/plans"))
+            .and(header("authorization", "Bearer token"))
+            .and(query_param("session_id", "sess-1"))
+            .and(query_param("phase", "planning"))
+            .and(query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "plans": [
+                    { "plan_id": "plan-2", "goal": "Ship auth" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/plans/plan-2/exit-plan-mode"))
+            .and(header("authorization", "Bearer token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "plan_id": "plan-2",
+                "phase": "planning"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/plans/plan-2"))
+            .and(header("authorization", "Bearer token"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "detail": "boom"
+            })))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = crate::SessionState::default();
+        state.session_id = Some("sess-1".to_string());
+        state.plan_mode = Some(plan::PlanModeState::new(
+            "Ship auth".to_string(),
+            plan::ProjectContext::default(),
+        ));
+
+        let error = exit_remote_plan_mode(&api, "token", &mut state, false)
+            .await
+            .expect_err("follow-up sync should fail");
+
+        assert!(error.contains("500"), "got: {error}");
+        assert_eq!(
+            state.plan_mode.as_ref().map(|plan| plan.goal.as_str()),
+            Some("Ship auth"),
+            "failed unapproved exit sync must keep the last known mirror in place"
+        );
     }
 }

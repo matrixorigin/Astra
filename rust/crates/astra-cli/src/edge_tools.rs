@@ -1132,13 +1132,6 @@ impl ToolExecutor {
         )
     }
 
-    fn redirect_to_plan_mode_tool(old_action: &str, new_tool: &str) -> String {
-        format!(
-            "Error: `session(action='{old_action}')` was removed in the plan-mode cleanup. \
-             Use `{new_tool}` instead. The `session` tool no longer owns plan lifecycle actions."
-        )
-    }
-
     fn task_output_success(output: &str) -> bool {
         if output.starts_with("Error:") {
             return false;
@@ -1296,10 +1289,11 @@ impl ToolExecutor {
         let approved = args
             .get("approved")
             .and_then(Value::as_bool)
-            .unwrap_or(false);
+            .unwrap_or(true);
         let plan_markdown = args
-            .get("plan_markdown")
+            .get("plan")
             .and_then(Value::as_str)
+            .or_else(|| args.get("plan_markdown").and_then(Value::as_str))
             .or_else(|| args.get("plan_md").and_then(Value::as_str))
             .map(str::trim)
             .filter(|plan| !plan.is_empty());
@@ -2916,16 +2910,6 @@ impl ToolExecutor {
                         "list_suppressed" => self.list_suppressed_memories(),
                         "release_context" => self.release_context(args),
                         "list_released" => self.list_released_context(),
-                        // Phase 2 split: plan-mode actions promoted to top-level
-                        // tools (claudecode parity). Stale callers get an
-                        // Error: redirect — same shape as the Phase 1
-                        // task→agent_job split.
-                        "enter_plan" => {
-                            Self::redirect_to_plan_mode_tool("enter_plan", "enter_plan_mode")
-                        }
-                        "exit_plan" => {
-                            Self::redirect_to_plan_mode_tool("exit_plan", "exit_plan_mode")
-                        }
                         "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, compact, rollback_edits, sleep, timeline, summary, history, suppress_memory(memory_id, reason?), unsuppress_memory(memory_id), list_suppressed, release_context(tool_call_id|string[]), list_released. Use the first-class `ask_user` tool for user questions. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools.".to_string(),
                         other => format!("Error: unknown `session` action '{other}'. Valid: config, prioritize, deprioritize, compact, rollback_edits, sleep, timeline, summary, history, suppress_memory, unsuppress_memory, list_suppressed, release_context, list_released. Use the first-class `ask_user` tool for user questions. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools."),
                     }

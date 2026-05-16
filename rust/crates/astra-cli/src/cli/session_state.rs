@@ -174,6 +174,10 @@ pub(crate) struct SessionState {
         Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
     /// Plan Mode state — when Some, REPL is in interactive plan editing mode.
     pub plan_mode: Option<plan::PlanModeState>,
+    /// Last remote mirror-sync failure for the active plan-mode session.
+    /// When set, local plan content may be stale and execution should be blocked
+    /// until the mirror is refreshed by a later successful sync.
+    pub plan_mode_sync_error: Option<String>,
     /// Plan being auto-executed — subtasks sent sequentially through chat.
     pub executing_plan: Option<astra_services::task_orchestrator::TaskPlan>,
     /// Configuration for current plan execution (step-by-step, auto-execute, etc.).
@@ -494,6 +498,7 @@ impl Default for SessionState {
             synced_tool_health_entries: Vec::new(),
             tool_quality_tracker: None,
             plan_mode: None,
+            plan_mode_sync_error: None,
             executing_plan: None,
             plan_execution_config: None,
             executing_plan_goal: None,
@@ -610,6 +615,7 @@ impl SessionState {
     pub fn clear_session_id(&mut self) {
         self.task_manager.rebind("");
         self.session_id = None;
+        self.plan_mode_sync_error = None;
     }
 
     /// Unregister and drop the root mailbox so a subsequent turn can

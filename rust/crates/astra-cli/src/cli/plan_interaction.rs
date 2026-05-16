@@ -1673,6 +1673,16 @@ async fn handle_plan_command(
                 None => return Ok(PlanInputResult::Handled),
             };
 
+            if let Some(error) = state.plan_mode_sync_error.as_deref() {
+                eprintln!(
+                    "  {} Plan mirror is stale ({}). Send another planning turn after the server recovers, or use /plan to exit and re-enter before {}.",
+                    theme::icon_warn(),
+                    error.yellow(),
+                    "go".magenta()
+                );
+                return Ok(PlanInputResult::Handled);
+            }
+
             if plan_execution_ui_active(state) {
                 eprintln!(
                     "  {} A plan is already running. Wait for it to finish, or use {} / {}.",
@@ -3267,6 +3277,35 @@ mod tests {
             "go should promote the approved plan into background execution state"
         );
         plan::PlanModeState::clear_saved_state();
+    }
+
+    #[tokio::test]
+    async fn go_is_blocked_while_plan_mirror_sync_is_stale() {
+        let mut state = SessionState::default();
+        let mut ps = plan::PlanModeState::new("goal".into(), plan::ProjectContext::default());
+        ps.plan.subtasks.push(SubtaskPlan {
+            id: "s1".into(),
+            title: "one".into(),
+            ..Default::default()
+        });
+        state.plan_mode = Some(ps);
+        state.plan_mode_sync_error = Some("server unavailable".into());
+
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+
+        let result = handle_plan_mode_input("go".into(), None, &mut state, &api)
+            .await
+            .unwrap();
+
+        assert!(matches!(result, PlanInputResult::Handled));
+        assert!(
+            state.plan_mode.is_some(),
+            "stale mirror should keep plan mode open instead of starting execution"
+        );
+        assert!(
+            state.executing_plan.is_none(),
+            "go must not execute while the mirrored plan may be stale"
+        );
     }
 
     #[tokio::test]

@@ -2,6 +2,8 @@ use super::*;
 use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
 use astra_services::session_workspace::{self, ContextTraceSignal, WorkspaceMetadata};
 use chrono::Utc;
+use wiremock::matchers::{body_json, header, method, path, query_param};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ── ToolExecutor ──────────────────────────────────────────────────────────
 
@@ -221,6 +223,55 @@ async fn session_enter_exit_plan_actions_are_unknown() {
              TUI shows red. Got: {result}"
         );
     }
+}
+
+#[tokio::test]
+async fn exit_plan_mode_accepts_plan_alias_and_defaults_to_approved() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/plans"))
+        .and(header("authorization", "Bearer token"))
+        .and(query_param("session_id", "sess-1"))
+        .and(query_param("phase", "planning"))
+        .and(query_param("limit", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "plans": [
+                { "plan_id": "plan-2", "goal": "Ship auth" }
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/plans/plan-2/exit-plan-mode"))
+        .and(header("authorization", "Bearer token"))
+        .and(body_json(json!({
+            "approved": true,
+            "plan_md": "1. Ship auth"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "plan_id": "plan-2",
+            "phase": "refining"
+        })))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(temp.path().to_path_buf())
+        .with_active_session_id("sess-1")
+        .with_cloud(server.uri(), "token");
+
+    let result = executor
+        .execute("exit_plan_mode", &json!({"plan": "1. Ship auth"}))
+        .await;
+
+    assert!(
+        result.starts_with("Exited plan mode."),
+        "exit_plan_mode should accept schema-native `plan` and default to approval. Got: {result}"
+    );
+    assert!(
+        result.contains("plan-2"),
+        "result should mention the resolved plan id. Got: {result}"
+    );
 }
 
 /// `agent_job` is the new entry point. It must dispatch the four

@@ -30,6 +30,7 @@ pub(super) async fn handle_plan_command(
     if plan_request.is_empty() && crate::plan_lifecycle::looks_like_pending_local_plan_entry(state)
     {
         state.plan_mode = None;
+        state.plan_mode_sync_error = None;
         eprintln!("  {} Exited plan mode.", theme::icon_ok());
         return Ok(());
     }
@@ -60,6 +61,7 @@ pub(super) async fn handle_plan_command(
 
     if plan_request.is_empty() {
         state.plan_mode = Some(pending_plan_state());
+        state.plan_mode_sync_error = None;
         state.pending_plan_resume_digest = None;
         eprintln!();
         eprintln!(

@@ -316,8 +316,16 @@ pub(super) async fn handle_chat_input_with_ui(
         TurnAttempt::Completed(result) => match *result {
             Ok(result) => {
                 state.last_turn_interrupted = false;
-                apply_turn_success_async(state, ctx.api, ctx.profile, &line, result, turn_start)
-                    .await;
+                apply_turn_success_async(
+                    state,
+                    ctx.api,
+                    ctx.profile,
+                    &line,
+                    result,
+                    turn_start,
+                    ui,
+                )
+                .await;
                 return Ok(());
             }
             Err(failure) => {
@@ -358,6 +366,7 @@ pub(super) async fn handle_chat_input_with_ui(
                                     &line,
                                     result,
                                     turn_start,
+                                    ui,
                                 )
                                 .await;
                                 return Ok(());
@@ -418,6 +427,7 @@ pub(super) async fn handle_chat_input_with_ui(
                                             &line,
                                             result,
                                             turn_start,
+                                            ui,
                                         )
                                         .await;
                                         return Ok(());
@@ -1881,6 +1891,7 @@ async fn apply_turn_success_async(
     line: &str,
     mut result: StreamResult,
     turn_start: Instant,
+    ui: &mut dyn crate::ui_adapter::ReplUiAdapter,
 ) {
     let final_messages = std::mem::take(&mut result.final_messages);
     let csl_checkpoint_fields = extract_csl_fields_from_result(&result);
@@ -1907,6 +1918,10 @@ async fn apply_turn_success_async(
         && let Err(error) =
             crate::plan_lifecycle::sync_remote_plan_mode_state(api, &token, state).await
     {
+        state.plan_mode_sync_error = Some(error.clone());
+        ui.show_warning(&format!(
+            "  Plan mirror sync failed; local plan may be stale. Send another planning turn after the server recovers, or use /plan to exit and re-enter before `go`. ({error})"
+        ));
         astra_core::agent_warn!("plan", "failed to sync mirrored plan mode state: {error}");
     }
     check_skill_improvement_async(state).await;
@@ -3055,7 +3070,16 @@ async fn apply_user_cancelled_turn(
     state.last_turn_interrupted = true;
     match result {
         Ok(stream_result) => {
-            apply_turn_success_async(state, api, profile, line, stream_result, turn_start).await;
+            apply_turn_success_async(
+                state,
+                api,
+                profile,
+                line,
+                stream_result,
+                turn_start,
+                &mut SilentUi,
+            )
+            .await;
             // Re-assert the flag in case anything downstream cleared it.
             state.last_turn_interrupted = true;
         }
@@ -3596,6 +3620,8 @@ mod tests {
     use super::*;
     use astra_pipeline::step_checkpoint::read_composite_snapshot_index;
     use astra_pipeline::step_protocol::StepCheckpoint;
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
         let tmp = tempfile::tempdir().unwrap();
@@ -3619,6 +3645,43 @@ mod tests {
             panic!("poison observability lock");
         }));
         session
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.as_deref() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct CollectingUi {
+        warnings: Vec<String>,
+    }
+
+    impl crate::ui_adapter::ReplUiAdapter for CollectingUi {
+        fn show_error(&mut self, _msg: &str) {}
+        fn show_warning(&mut self, msg: &str) {
+            self.warnings.push(msg.to_string());
+        }
+        fn show_info(&mut self, _msg: &str) {}
+        fn show_status(&mut self, _msg: &str) {}
+        fn blank_line(&mut self) {}
     }
 
     #[test]
@@ -4917,6 +4980,64 @@ mod tests {
                 .as_ref()
                 .map(|suggestion| suggestion.text.as_str()),
             Some("run the tests")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn apply_turn_success_async_warns_and_marks_plan_mirror_stale_when_sync_fails() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let _env = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "token");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/plans"))
+            .and(header("authorization", "Bearer token"))
+            .and(query_param("session_id", "sess-1"))
+            .and(query_param("phase", "planning"))
+            .and(query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "detail": "boom"
+            })))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = SessionState::default();
+        state.session_id = Some("sess-1".to_string());
+        state.plan_mode = Some(astra_runtime::plan::PlanModeState::new(
+            "Ship auth".to_string(),
+            astra_runtime::plan::ProjectContext::default(),
+        ));
+        let result = stub_stream_result("Updated the plan.");
+        let mut ui = CollectingUi::default();
+
+        apply_turn_success_async(
+            &mut state,
+            &api,
+            None,
+            "continue",
+            result,
+            Instant::now(),
+            &mut ui,
+        )
+        .await;
+
+        let error = state
+            .plan_mode_sync_error
+            .as_deref()
+            .expect("sync failure should be recorded");
+        assert!(error.contains("500"), "got: {error}");
+        assert_eq!(
+            state.plan_mode.as_ref().map(|plan| plan.goal.as_str()),
+            Some("Ship auth"),
+            "sync failure should preserve the last known mirror until recovery"
+        );
+        assert!(
+            ui.warnings
+                .iter()
+                .any(|msg| msg.contains("Plan mirror sync failed")),
+            "user should see an actionable warning when plan sync fails: {:?}",
+            ui.warnings
         );
     }
 
