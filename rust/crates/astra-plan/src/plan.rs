@@ -489,7 +489,7 @@ impl PlanCommand {
         if lower == "continue" {
             return None;
         }
-        if crate::plan_resume::message_signals_resume(stripped) {
+        if message_signals_resume(stripped) {
             return Some(PlanCommand::Resume);
         }
 
@@ -580,6 +580,38 @@ fn strip_prefix_ci_local(s: &str, prefix: &str) -> Option<String> {
         return None;
     }
     Some(s.get(prefix.len()..)?.trim_start().to_string())
+}
+
+fn message_signals_resume(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains("@resume-plan") {
+        return true;
+    }
+    if trimmed.chars().count() > 24 {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "继续"
+            | "继续!"
+            | "继续。"
+            | "继续计划"
+            | "继续 plan"
+            | "继续plan"
+            | "恢复"
+            | "恢复计划"
+            | "resume"
+            | "resume."
+            | "resume plan"
+            | "resume-plan"
+            | "continue"
+            | "continue plan"
+            | "continue-plan"
+    )
 }
 
 // ─── PlanCapabilities ────────────────────────────────────────────────────────

@@ -3870,7 +3870,7 @@ impl ServerToolExecutor {
                 // counts as authoring.
                 let authoring =
                     !has_subtasks || (!any_in_progress && !items_done && !progress_complete);
-                let hint = astra_plan::plan_resume_system_prompt_section(&state);
+                let hint = astra_plan::plan_resume_prompt_hint(&state);
                 (authoring, hint)
             }
             Err(_) => (false, None),

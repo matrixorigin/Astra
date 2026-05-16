@@ -9,7 +9,7 @@
 //! - what the last lifecycle event was,
 //! - and what the session task board currently says.
 
-use astra_runtime::plan::{PlanModeState, plan_resume_digest};
+use astra_runtime::plan::PlanModeState;
 use astra_services::{
     durable_task::{SubtaskStage, TaskContract},
     session_journal::{JournalEvent, JournalEventType},
@@ -102,6 +102,40 @@ pub(crate) fn format_summary(input: ExecutionStateSummaryInput<'_>) -> Option<St
         sections.push(task_block);
     }
     Some(sections.join("\n\n"))
+}
+
+fn plan_resume_digest(plan_mode: &PlanModeState) -> Option<String> {
+    let goal = plan_mode.goal.trim();
+    let subtasks = &plan_mode.plan.subtasks;
+    if goal.is_empty() && subtasks.is_empty() {
+        return None;
+    }
+
+    let total = subtasks.len();
+    let done = subtasks
+        .iter()
+        .filter(|subtask| subtask.status == TaskStatus::Completed)
+        .count();
+    let open = subtasks
+        .iter()
+        .filter(|subtask| !subtask.status.is_terminal() && subtask.status != TaskStatus::InProgress)
+        .count();
+    let in_progress_title = subtasks
+        .iter()
+        .find(|subtask| subtask.status == TaskStatus::InProgress)
+        .map(|subtask| preview(&subtask.title, 80));
+
+    let mut out = String::from("[plan-resume]");
+    if !goal.is_empty() {
+        out.push_str(&format!(" goal=\"{}\"", preview(goal, 160)));
+    }
+    if let Some(title) = in_progress_title {
+        out.push_str(&format!(" · in_progress=\"{title}\""));
+    }
+    if total > 0 {
+        out.push_str(&format!(" · open={open} · done={done}/{total}"));
+    }
+    Some(out)
 }
 
 fn render_executing_plan(

@@ -35,6 +35,9 @@ use std::{
 };
 use uuid::Uuid;
 
+const MAX_PLAN_RESUME_GOAL_CHARS: usize = 160;
+const MAX_PLAN_RESUME_SUBTASK_CHARS: usize = 80;
+
 /// Typed errors for plan persistence operations.
 #[derive(Debug, Clone)]
 pub enum PlanLoadError {
@@ -268,6 +271,66 @@ fn infer_phase_for_persist(state: &PlanModeState) -> &'static str {
 
 fn map_sqlx(err: sqlx::Error) -> PlanLoadError {
     PlanLoadError::Internal(format!("sql error: {err}"))
+}
+
+fn truncate_plan_resume_text(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (i, ch) in text.chars().enumerate() {
+        if i >= max_chars {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn plan_resume_digest(state: &PlanModeState) -> Option<String> {
+    let goal = state.goal.trim();
+    let subtasks = &state.plan.subtasks;
+    if goal.is_empty() && subtasks.is_empty() {
+        return None;
+    }
+
+    let total = subtasks.len();
+    let done = subtasks
+        .iter()
+        .filter(|subtask| subtask.status == TaskStatus::Completed)
+        .count();
+    let open = subtasks
+        .iter()
+        .filter(|subtask| !subtask.status.is_terminal() && subtask.status != TaskStatus::InProgress)
+        .count();
+    let in_progress_title = subtasks
+        .iter()
+        .find(|subtask| subtask.status == TaskStatus::InProgress)
+        .map(|subtask| truncate_plan_resume_text(&subtask.title, MAX_PLAN_RESUME_SUBTASK_CHARS));
+
+    let mut out = String::from("[plan-resume]");
+    if !goal.is_empty() {
+        out.push_str(&format!(
+            " goal=\"{}\"",
+            truncate_plan_resume_text(goal, MAX_PLAN_RESUME_GOAL_CHARS)
+        ));
+    }
+    if let Some(title) = in_progress_title {
+        out.push_str(&format!(" · in_progress=\"{title}\""));
+    }
+    if total > 0 {
+        out.push_str(&format!(" · open={open} · done={done}/{total}"));
+    }
+    Some(out)
+}
+
+pub fn plan_resume_prompt_hint(state: &PlanModeState) -> Option<String> {
+    let digest = plan_resume_digest(state)?;
+    Some(format!(
+        "\n\n## Active Plan\n{digest}\n\n\
+         A plan is currently in-flight for this session. Treat the next turn as a \
+         continuation — resume from the in-progress subtask, respect the approved \
+         plan structure, and call `exit_plan_mode` only if the plan needs to be \
+         abandoned before completion."
+    ))
 }
 
 /// Translate the MySQL duplicate-key error (1062) raised by the unique
@@ -1185,7 +1248,7 @@ pub async fn plan_resume_hint_for_session(
         .ok()
         .flatten()?;
     let state = repo.load(&plan_id).await.ok()?;
-    crate::plan_resume::plan_resume_system_prompt_section(&state)
+    plan_resume_prompt_hint(&state)
 }
 
 // ─── Fork helper ─────────────────────────────────────────────────────────────
@@ -1268,6 +1331,44 @@ pub async fn fork_plan_for_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_resume_prompt_hint_returns_none_for_empty_state() {
+        assert!(plan_resume_prompt_hint(&PlanModeState::new(String::new())).is_none());
+    }
+
+    #[test]
+    fn plan_resume_prompt_hint_formats_goal_and_active_subtask() {
+        let mut state = PlanModeState::new("Ship auth overhaul".into());
+        state.plan.subtasks = vec![
+            astra_services::task_orchestrator::SubtaskPlan {
+                id: "a".into(),
+                title: "schema".into(),
+                status: TaskStatus::Completed,
+                ..Default::default()
+            },
+            astra_services::task_orchestrator::SubtaskPlan {
+                id: "b".into(),
+                title: "middleware refactor".into(),
+                status: TaskStatus::InProgress,
+                ..Default::default()
+            },
+            astra_services::task_orchestrator::SubtaskPlan {
+                id: "c".into(),
+                title: "tests".into(),
+                status: TaskStatus::Pending,
+                ..Default::default()
+            },
+        ];
+
+        let hint = plan_resume_prompt_hint(&state).expect("hint");
+        assert!(hint.contains("## Active Plan"), "{hint}");
+        assert!(hint.contains("goal=\"Ship auth overhaul\""), "{hint}");
+        assert!(
+            hint.contains("in_progress=\"middleware refactor\""),
+            "{hint}"
+        );
+    }
 
     #[tokio::test]
     async fn in_memory_save_and_load_roundtrip() {
