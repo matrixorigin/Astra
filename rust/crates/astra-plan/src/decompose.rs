@@ -975,19 +975,6 @@ pub enum ClarificationCategory {
 
 // ── Paused plan: operator corrections + rewind ─────────────────────────────
 
-/// Case-insensitive ASCII prefix strip (`prefix` must be ASCII).
-fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    let s = s.trim_start();
-    if s.len() < prefix.len() {
-        return None;
-    }
-    let head = s.get(..prefix.len())?;
-    if !head.eq_ignore_ascii_case(prefix) {
-        return None;
-    }
-    Some(s.get(prefix.len()..)?.trim_start())
-}
-
 /// Where to rewind when re-running part of a plan (1-based index or id prefix).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanRewindAnchor {
@@ -995,70 +982,6 @@ pub enum PlanRewindAnchor {
     OneBased(usize),
     /// Exact id or unique prefix of `SubtaskPlan.id`.
     IdPrefix(String),
-}
-
-/// Lines typed at `⏸>` (paused execution) that adjust the plan without abandoning it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PlanPausedUserAction {
-    /// Stack guidance to inject into upcoming subtask prompts.
-    Correction(String),
-    /// Drop all stacked guidance.
-    ClearCorrections,
-    /// Mark this subtask and all following ones pending again.
-    Rewind(PlanRewindAnchor),
-}
-
-fn parse_rewind_anchor_rest(rest: &str) -> Option<PlanRewindAnchor> {
-    let rest = rest.trim();
-    if rest.is_empty() {
-        return None;
-    }
-    if let Ok(n) = rest.parse::<usize>() {
-        if n == 0 {
-            return None;
-        }
-        return Some(PlanRewindAnchor::OneBased(n));
-    }
-    Some(PlanRewindAnchor::IdPrefix(rest.to_string()))
-}
-
-/// Parse `correct …`, `rewind N`, `restart from …`, etc. Returns `None` for normal chat.
-pub fn parse_plan_paused_user_line(line: &str) -> Option<PlanPausedUserAction> {
-    let t = line.trim();
-    if t.is_empty() {
-        return None;
-    }
-    let tl = t.to_ascii_lowercase();
-    if matches!(tl.as_str(), "correct clear" | "note clear" | "adjust clear") {
-        return Some(PlanPausedUserAction::ClearCorrections);
-    }
-
-    if let Some(rest) = strip_prefix_ci(t, "rewind ") {
-        return parse_rewind_anchor_rest(rest).map(PlanPausedUserAction::Rewind);
-    }
-    if let Some(rest) = strip_prefix_ci(t, "restart from ") {
-        return parse_rewind_anchor_rest(rest).map(PlanPausedUserAction::Rewind);
-    }
-    if let Some(rest) = strip_prefix_ci(t, "redo from ") {
-        return parse_rewind_anchor_rest(rest).map(PlanPausedUserAction::Rewind);
-    }
-    if let Some(rest) = strip_prefix_ci(t, "restart ") {
-        return parse_rewind_anchor_rest(rest).map(PlanPausedUserAction::Rewind);
-    }
-    if let Some(rest) = strip_prefix_ci(t, "redo ") {
-        return parse_rewind_anchor_rest(rest).map(PlanPausedUserAction::Rewind);
-    }
-
-    for p in ["correct ", "note ", "adjust "] {
-        if let Some(rest) = strip_prefix_ci(t, p) {
-            if rest.is_empty() {
-                return None;
-            }
-            return Some(PlanPausedUserAction::Correction(rest.to_string()));
-        }
-    }
-
-    None
 }
 
 pub fn resolve_rewind_start_index(
@@ -1173,22 +1096,27 @@ pub fn subtask_requires_browser_verification(subtask: &SubtaskPlan) -> bool {
     mentions_browser && mentions_verification
 }
 
-pub fn format_subtask_prompt(subtask: &SubtaskPlan) -> String {
-    let mut prompt = format!("Execute this subtask: {}\n", subtask.title);
+/// Build the executor prompt for a subtask, optionally prefixed with stacked
+/// operator guidance from prior pause/correction turns.
+pub fn format_subtask_prompt_with_operator_notes(
+    subtask: &SubtaskPlan,
+    operator_notes: &[String],
+) -> String {
+    let mut body = format!("Execute this subtask: {}\n", subtask.title);
 
     if let Some(ref desc) = subtask.description {
-        prompt.push_str(&format!("\nDescription: {}\n", desc));
+        body.push_str(&format!("\nDescription: {}\n", desc));
     }
 
     if !subtask.files.is_empty() {
-        prompt.push_str(&format!(
+        body.push_str(&format!(
             "\nFiles to modify: {}\n",
             subtask.files.join(", ")
         ));
     }
 
     if !subtask.acceptance_checks.is_empty() {
-        prompt.push_str("\nAcceptance checks (automated verification will run these):\n");
+        body.push_str("\nAcceptance checks (automated verification will run these):\n");
         for (i, vk) in subtask.acceptance_checks.iter().enumerate() {
             let desc = match vk {
                 astra_services::durable_task::VerifierKind::FileExists { paths } => {
@@ -1228,11 +1156,11 @@ pub fn format_subtask_prompt(subtask: &SubtaskPlan) -> String {
                 }
                 _ => "Automated check".into(),
             };
-            prompt.push_str(&format!("  {}. {}\n", i + 1, desc));
+            body.push_str(&format!("  {}. {}\n", i + 1, desc));
         }
     }
 
-    prompt.push_str(
+    body.push_str(
         "\nPlease implement this change. Read the relevant files first, \
          make the changes, and verify they compile/pass tests.\n\
          Before referencing any project type, function, struct, or API in new code, \
@@ -1253,7 +1181,7 @@ pub fn format_subtask_prompt(subtask: &SubtaskPlan) -> String {
     );
 
     if subtask_requires_browser_verification(subtask) {
-        prompt.push_str(
+        body.push_str(
             "\n\
              IMPORTANT — this subtask explicitly requires browser/UI verification:\n\
              - `curl`, `grep`, `head`, `ps`, or starting a local HTTP server do NOT count as browser verification.\n\
@@ -1265,15 +1193,6 @@ pub fn format_subtask_prompt(subtask: &SubtaskPlan) -> String {
         );
     }
 
-    prompt
-}
-
-/// Same as [`format_subtask_prompt`] but prefixes stacked operator notes (pause / correct …).
-pub fn format_subtask_prompt_with_operator_notes(
-    subtask: &SubtaskPlan,
-    operator_notes: &[String],
-) -> String {
-    let body = format_subtask_prompt(subtask);
     if operator_notes.is_empty() {
         return body;
     }
@@ -1344,49 +1263,6 @@ impl PlanExecutionSummary {
                 .collect(),
             parallel_rounds,
         }
-    }
-
-    /// Format the summary for display.
-    pub fn format(&self) -> String {
-        let mut out = String::new();
-        out.push_str("┌── Execution Summary ────────────────────────────\n");
-        out.push_str(&format!("│ Goal: {}\n", self.goal));
-        out.push_str("│\n");
-
-        let status = if self.completed == self.total_subtasks {
-            "✓ Complete"
-        } else if self.failed > 0 {
-            "✗ Partial (failures)"
-        } else if self.paused > 0 {
-            "⏸ Paused"
-        } else {
-            "· Incomplete"
-        };
-        out.push_str(&format!("│ Status:    {}\n", status));
-        out.push_str(&format!(
-            "│ Subtasks:  {}/{} completed\n",
-            self.completed, self.total_subtasks
-        ));
-        if self.failed > 0 {
-            out.push_str(&format!("│ Failed:    {}\n", self.failed));
-        }
-        if self.paused > 0 {
-            out.push_str(&format!("│ Paused:    {}\n", self.paused));
-        }
-        if self.parallel_rounds > 0 {
-            out.push_str(&format!(
-                "│ Rounds:    {} (parallel-aware)\n",
-                self.parallel_rounds
-            ));
-        }
-        if !self.execution_order.is_empty() {
-            out.push_str(&format!(
-                "│ Order:     {}\n",
-                self.execution_order.join(" → ")
-            ));
-        }
-        out.push_str("└─────────────────────────────────────────────────\n");
-        out
     }
 }
 
@@ -1482,89 +1358,6 @@ impl TimelineEvent {
             event,
         }
     }
-
-    /// Format event for display
-    pub fn format_display(&self) -> String {
-        let icon = match &self.event {
-            TimelineEventKind::PlanCreated { .. } => "📋",
-            TimelineEventKind::ExecutionStarted { .. } => "▶",
-            TimelineEventKind::SubtaskStarted { .. } => "→",
-            TimelineEventKind::SubtaskCompleted { .. } => "✓",
-            TimelineEventKind::SubtaskFailed { .. } => "✗",
-            TimelineEventKind::SubtaskSkipped { .. } => "⏭",
-            TimelineEventKind::Replan { .. } => "🔄",
-            TimelineEventKind::UserRating { .. } => "⭐",
-            TimelineEventKind::ExecutionPaused { .. } => "⏸",
-            TimelineEventKind::ExecutionResumed => "▶",
-            TimelineEventKind::PlanCompleted { success, .. } => {
-                if *success {
-                    "✅"
-                } else {
-                    "❌"
-                }
-            }
-            TimelineEventKind::Discovery { .. } => "⚠",
-            TimelineEventKind::GitCommit { .. } => "📦",
-            TimelineEventKind::SubtaskRewound { .. } => "⏮",
-            TimelineEventKind::SubtaskRedone { .. } => "🔁",
-        };
-
-        let desc = match &self.event {
-            TimelineEventKind::PlanCreated { subtask_count } => {
-                format!("Plan created ({} subtasks)", subtask_count)
-            }
-            TimelineEventKind::ExecutionStarted { mode } => format!("Started {} execution", mode),
-            TimelineEventKind::SubtaskStarted { title, .. } => format!("Started: {}", title),
-            TimelineEventKind::SubtaskCompleted {
-                title,
-                duration_sec,
-                ..
-            } => format!("{} ({} sec)", title, duration_sec),
-            TimelineEventKind::SubtaskFailed { title, error, .. } => {
-                format!("{} - {}", title, error)
-            }
-            TimelineEventKind::SubtaskSkipped { title, reason, .. } => {
-                format!("Skipped: {} ({})", title, reason)
-            }
-            TimelineEventKind::Replan { reason, .. } => format!("Replan: {}", reason),
-            TimelineEventKind::UserRating { rating } => format!("Rating: {}/5", rating),
-            TimelineEventKind::ExecutionPaused { reason } => format!("Paused: {}", reason),
-            TimelineEventKind::ExecutionResumed => "Resumed".to_string(),
-            TimelineEventKind::PlanCompleted {
-                success,
-                duration_sec,
-            } => {
-                if *success {
-                    format!("Completed ({} sec total)", duration_sec)
-                } else {
-                    format!("Failed ({} sec total)", duration_sec)
-                }
-            }
-            TimelineEventKind::Discovery { message } => format!("Discovered: {}", message),
-            TimelineEventKind::GitCommit {
-                commit_hash,
-                message,
-            } => format!(
-                "Commit {}: {}",
-                &commit_hash[..7.min(commit_hash.len())],
-                message
-            ),
-            TimelineEventKind::SubtaskRewound {
-                anchor,
-                reset_count,
-                reason,
-                ..
-            } => match reason {
-                Some(r) => format!("Rewound to {} ({} reset): {}", anchor, reset_count, r),
-                None => format!("Rewound to {} ({} reset)", anchor, reset_count),
-            },
-            TimelineEventKind::SubtaskRedone { title, attempt, .. } => {
-                format!("Redo #{}: {}", attempt, title)
-            }
-        };
-
-        format!("{}  {} {}", self.time_display, icon, desc)
-    }
 }
 
 /// Execution timeline tracking all events during plan execution.
@@ -1595,134 +1388,6 @@ impl ExecutionTimeline {
         }
 
         self.events.push(event);
-    }
-
-    /// Record plan creation.
-    pub fn plan_created(&mut self, subtask_count: usize) {
-        self.record(TimelineEventKind::PlanCreated { subtask_count });
-    }
-
-    /// Record execution start.
-    pub fn execution_started(&mut self, auto_mode: bool) {
-        let mode = if auto_mode {
-            "auto".to_string()
-        } else {
-            "step".to_string()
-        };
-        self.record(TimelineEventKind::ExecutionStarted { mode });
-    }
-
-    /// Record subtask start.
-    pub fn subtask_started(&mut self, subtask_id: &str, title: &str) {
-        self.record(TimelineEventKind::SubtaskStarted {
-            subtask_id: subtask_id.to_string(),
-            title: title.to_string(),
-        });
-    }
-
-    /// Record subtask completion.
-    pub fn subtask_completed(&mut self, subtask_id: &str, title: &str, duration_sec: u64) {
-        self.record(TimelineEventKind::SubtaskCompleted {
-            subtask_id: subtask_id.to_string(),
-            title: title.to_string(),
-            duration_sec,
-        });
-    }
-
-    /// Record subtask failure.
-    pub fn subtask_failed(&mut self, subtask_id: &str, title: &str, error: &str) {
-        self.record(TimelineEventKind::SubtaskFailed {
-            subtask_id: subtask_id.to_string(),
-            title: title.to_string(),
-            error: error.to_string(),
-        });
-    }
-
-    /// Record a discovery/observation.
-    pub fn discovery(&mut self, message: &str) {
-        self.record(TimelineEventKind::Discovery {
-            message: message.to_string(),
-        });
-    }
-
-    /// Record a git commit.
-    pub fn git_commit(&mut self, commit_hash: &str, message: &str) {
-        self.record(TimelineEventKind::GitCommit {
-            commit_hash: commit_hash.to_string(),
-            message: message.to_string(),
-        });
-    }
-
-    /// Record plan completion.
-    pub fn plan_completed(&mut self, success: bool) {
-        let duration_sec = self
-            .start_timestamp
-            .as_ref()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|start| {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                now.saturating_sub(start)
-            })
-            .unwrap_or(0);
-
-        self.record(TimelineEventKind::PlanCompleted {
-            success,
-            duration_sec,
-        });
-    }
-
-    /// Format timeline for display.
-    pub fn format_display(&self) -> String {
-        if self.events.is_empty() {
-            return "  (no events recorded)".to_string();
-        }
-
-        let mut out = String::new();
-        for event in &self.events {
-            out.push_str("  ");
-            out.push_str(&event.format_display());
-            out.push('\n');
-        }
-        out
-    }
-
-    /// Get total duration in seconds (if completed).
-    pub fn total_duration_sec(&self) -> Option<u64> {
-        match (self.start_timestamp.as_ref(), self.end_timestamp.as_ref()) {
-            (Some(start), Some(end)) => {
-                let start_sec = start.parse::<u64>().ok()?;
-                let end_sec = end.parse::<u64>().ok()?;
-                Some(end_sec.saturating_sub(start_sec))
-            }
-            _ => None,
-        }
-    }
-
-    /// Count completed subtasks.
-    pub fn completed_subtask_count(&self) -> usize {
-        self.events
-            .iter()
-            .filter(|e| matches!(e.event, TimelineEventKind::SubtaskCompleted { .. }))
-            .count()
-    }
-
-    /// Count failed subtasks.
-    pub fn failed_subtask_count(&self) -> usize {
-        self.events
-            .iter()
-            .filter(|e| matches!(e.event, TimelineEventKind::SubtaskFailed { .. }))
-            .count()
-    }
-
-    /// Count replans.
-    pub fn replan_count(&self) -> usize {
-        self.events
-            .iter()
-            .filter(|e| matches!(e.event, TimelineEventKind::Replan { .. }))
-            .count()
     }
 }
 
@@ -1956,7 +1621,7 @@ mod tests {
             title: "Add login page".into(),
             ..Default::default()
         };
-        let prompt = format_subtask_prompt(&st);
+        let prompt = format_subtask_prompt_with_operator_notes(&st, &[]);
         assert!(prompt.contains("Add login page"));
         assert!(prompt.contains("implement this change"));
         assert!(!prompt.contains("Description:"));
@@ -1978,7 +1643,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let prompt = format_subtask_prompt(&st);
+        let prompt = format_subtask_prompt_with_operator_notes(&st, &[]);
         assert!(prompt.contains("Add auth middleware"));
         assert!(prompt.contains("JWT token validation"));
         assert!(prompt.contains("src/middleware.rs, src/auth.rs"));
@@ -1998,7 +1663,7 @@ mod tests {
             ),
             ..Default::default()
         };
-        let prompt = format_subtask_prompt(&st);
+        let prompt = format_subtask_prompt_with_operator_notes(&st, &[]);
         assert!(prompt.contains("Extract connection pooling"));
         assert!(prompt.contains("retry logic"));
     }
@@ -2013,7 +1678,7 @@ mod tests {
             ),
             ..Default::default()
         };
-        let prompt = format_subtask_prompt(&st);
+        let prompt = format_subtask_prompt_with_operator_notes(&st, &[]);
         assert!(
             prompt.contains("requires browser/UI verification"),
             "prompt should surface explicit browser-verification guidance: {prompt}"
@@ -2339,35 +2004,6 @@ mod tests {
         let ready = plan.ready_subtasks();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].id, "c");
-    }
-
-    #[test]
-    fn parse_plan_paused_corrections_and_rewind() {
-        assert_eq!(
-            parse_plan_paused_user_line("correct skip tests for now"),
-            Some(PlanPausedUserAction::Correction(
-                "skip tests for now".into()
-            ))
-        );
-        assert_eq!(
-            parse_plan_paused_user_line("note use feature flags"),
-            Some(PlanPausedUserAction::Correction("use feature flags".into()))
-        );
-        assert_eq!(
-            parse_plan_paused_user_line("correct clear"),
-            Some(PlanPausedUserAction::ClearCorrections)
-        );
-        assert_eq!(
-            parse_plan_paused_user_line("rewind 2"),
-            Some(PlanPausedUserAction::Rewind(PlanRewindAnchor::OneBased(2)))
-        );
-        assert_eq!(
-            parse_plan_paused_user_line("restart from st-a"),
-            Some(PlanPausedUserAction::Rewind(PlanRewindAnchor::IdPrefix(
-                "st-a".into()
-            )))
-        );
-        assert!(parse_plan_paused_user_line("hello").is_none());
     }
 
     #[test]
@@ -2732,11 +2368,7 @@ mod tests {
         assert_eq!(summary.completed, 2);
         assert_eq!(summary.total_subtasks, 2);
         assert_eq!(summary.parallel_rounds, 2);
-        let formatted = summary.format();
-        assert!(formatted.contains("Execution Summary"));
-        assert!(formatted.contains("Test goal"));
-        assert!(formatted.contains("Complete"));
-        assert!(formatted.contains("2/2"));
+        assert_eq!(summary.goal, "Test goal");
     }
 
     #[test]
@@ -2767,9 +2399,7 @@ mod tests {
         let summary = PlanExecutionSummary::from_plan(&plan, "Failing goal", 1);
         assert_eq!(summary.completed, 1);
         assert_eq!(summary.failed, 1);
-        let formatted = summary.format();
-        assert!(formatted.contains("Partial (failures)"));
-        assert!(formatted.contains("Failed:"));
+        assert_eq!(summary.goal, "Failing goal");
     }
 
     #[test]
@@ -2793,7 +2423,6 @@ mod tests {
         };
         let summary = PlanExecutionSummary::from_plan(&plan, "Paused goal", 1);
         assert_eq!(summary.paused, 1);
-        assert!(summary.format().contains("Paused"));
     }
 
     #[test]
@@ -2830,88 +2459,6 @@ mod tests {
         };
         let summary = PlanExecutionSummary::from_plan(&plan, "test", 0);
         assert_eq!(summary.execution_order, vec!["x", "z"]);
-        assert!(summary.format().contains("x → z"));
-    }
-
-    // ═══════════════════════ Execution Timeline Tests ════════════════════════
-
-    #[test]
-    fn timeline_records_events() {
-        let mut timeline = ExecutionTimeline::default();
-
-        timeline.plan_created(3);
-        timeline.execution_started(true);
-        timeline.subtask_started("s1", "Setup");
-        timeline.subtask_completed("s1", "Setup", 60);
-        timeline.discovery("Found existing config");
-
-        assert_eq!(timeline.events.len(), 5);
-        assert_eq!(timeline.completed_subtask_count(), 1);
-        assert!(timeline.start_timestamp.is_some());
-    }
-
-    #[test]
-    fn timeline_format_display() {
-        let mut timeline = ExecutionTimeline::default();
-
-        timeline.plan_created(2);
-        timeline.subtask_completed("s1", "First task", 30);
-        timeline.subtask_failed("s2", "Second task", "timeout");
-
-        let display = timeline.format_display();
-        assert!(display.contains("📋"), "should have plan created icon");
-        assert!(display.contains("✓"), "should have completed icon");
-        assert!(display.contains("✗"), "should have failed icon");
-        assert!(display.contains("First task"));
-        assert!(display.contains("Second task"));
-        assert!(display.contains("timeout"));
-    }
-
-    #[test]
-    fn timeline_counts() {
-        let mut timeline = ExecutionTimeline::default();
-
-        timeline.subtask_completed("s1", "A", 10);
-        timeline.subtask_completed("s2", "B", 20);
-        timeline.subtask_failed("s3", "C", "error");
-        timeline.record(TimelineEventKind::Replan {
-            reason: "user request".into(),
-            changes: "added task".into(),
-        });
-        timeline.record(TimelineEventKind::Replan {
-            reason: "conflict".into(),
-            changes: "modified".into(),
-        });
-
-        assert_eq!(timeline.completed_subtask_count(), 2);
-        assert_eq!(timeline.failed_subtask_count(), 1);
-        assert_eq!(timeline.replan_count(), 2);
-    }
-
-    #[test]
-    fn timeline_git_commit() {
-        let mut timeline = ExecutionTimeline::default();
-
-        timeline.git_commit("abc1234567890", "feat: add auth");
-
-        let display = timeline.format_display();
-        assert!(display.contains("📦"), "should have commit icon");
-        assert!(display.contains("abc1234"), "should have short hash");
-        assert!(display.contains("feat: add auth"));
-    }
-
-    #[test]
-    fn timeline_plan_completed() {
-        let mut timeline = ExecutionTimeline::default();
-
-        timeline.plan_created(2);
-        // Simulate some delay (we can't actually delay in tests, but the logic works)
-        timeline.plan_completed(true);
-
-        assert!(timeline.end_timestamp.is_some());
-
-        let display = timeline.format_display();
-        assert!(display.contains("✅"), "should have success icon");
     }
 
     // ═══════════════════════ extract_json Tests ════════════════════════
@@ -3147,121 +2694,6 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&out).expect("escaped embedded quote should parse");
         assert_eq!(v["msg"], "she said \"hi\"");
-    }
-
-    // ═══════════════════════ parse_plan_paused_user_line Tests ════════════════════════
-
-    #[test]
-    fn paused_line_empty() {
-        assert_eq!(parse_plan_paused_user_line(""), None);
-        assert_eq!(parse_plan_paused_user_line("   "), None);
-    }
-
-    #[test]
-    fn paused_line_correction() {
-        let r = parse_plan_paused_user_line("correct Fix the import order");
-        assert_eq!(
-            r,
-            Some(PlanPausedUserAction::Correction(
-                "Fix the import order".to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn paused_line_note_correction() {
-        let r = parse_plan_paused_user_line("note use async version");
-        assert_eq!(
-            r,
-            Some(PlanPausedUserAction::Correction(
-                "use async version".to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn paused_line_adjust_correction() {
-        let r = parse_plan_paused_user_line("adjust something");
-        assert_eq!(
-            r,
-            Some(PlanPausedUserAction::Correction("something".to_string()))
-        );
-    }
-
-    #[test]
-    fn paused_line_clear_corrections() {
-        assert_eq!(
-            parse_plan_paused_user_line("correct clear"),
-            Some(PlanPausedUserAction::ClearCorrections)
-        );
-        assert_eq!(
-            parse_plan_paused_user_line("note clear"),
-            Some(PlanPausedUserAction::ClearCorrections)
-        );
-        assert_eq!(
-            parse_plan_paused_user_line("adjust clear"),
-            Some(PlanPausedUserAction::ClearCorrections)
-        );
-    }
-
-    #[test]
-    fn paused_line_rewind_numeric() {
-        let r = parse_plan_paused_user_line("rewind 3");
-        assert_eq!(
-            r,
-            Some(PlanPausedUserAction::Rewind(PlanRewindAnchor::OneBased(3)))
-        );
-    }
-
-    #[test]
-    fn paused_line_rewind_id_prefix() {
-        let r = parse_plan_paused_user_line("rewind setup");
-        assert_eq!(
-            r,
-            Some(PlanPausedUserAction::Rewind(PlanRewindAnchor::IdPrefix(
-                "setup".to_string()
-            )))
-        );
-    }
-
-    #[test]
-    fn paused_line_restart_from() {
-        let r = parse_plan_paused_user_line("restart from 2");
-        assert_eq!(
-            r,
-            Some(PlanPausedUserAction::Rewind(PlanRewindAnchor::OneBased(2)))
-        );
-    }
-
-    #[test]
-    fn paused_line_redo_from() {
-        let r = parse_plan_paused_user_line("redo from auth");
-        assert_eq!(
-            r,
-            Some(PlanPausedUserAction::Rewind(PlanRewindAnchor::IdPrefix(
-                "auth".to_string()
-            )))
-        );
-    }
-
-    #[test]
-    fn paused_line_rewind_zero_ignored() {
-        assert_eq!(parse_plan_paused_user_line("rewind 0"), None);
-    }
-
-    #[test]
-    fn paused_line_rewind_empty_rest() {
-        assert_eq!(parse_plan_paused_user_line("rewind "), None);
-    }
-
-    #[test]
-    fn paused_line_correction_empty_rest() {
-        assert_eq!(parse_plan_paused_user_line("correct "), None);
-    }
-
-    #[test]
-    fn paused_line_normal_text_returns_none() {
-        assert_eq!(parse_plan_paused_user_line("hello world"), None);
     }
 
     // ═══════════════════════ resolve_rewind_start_index Tests ════════════════════════
