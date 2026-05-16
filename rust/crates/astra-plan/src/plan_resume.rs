@@ -127,7 +127,6 @@ pub fn message_signals_resume(line: &str) -> bool {
             | "resume."
             | "resume plan"
             | "resume-plan"
-            | "continue"
             | "continue plan"
             | "continue-plan"
     )
@@ -212,14 +211,7 @@ mod tests {
 
     #[test]
     fn resume_signal_matches_canonical_phrases() {
-        for phrase in [
-            "继续",
-            "resume",
-            "Resume.",
-            "继续计划",
-            "continue",
-            "CONTINUE PLAN",
-        ] {
+        for phrase in ["继续", "resume", "Resume.", "继续计划", "CONTINUE PLAN"] {
             assert!(
                 message_signals_resume(phrase),
                 "expected resume signal for {phrase:?}"

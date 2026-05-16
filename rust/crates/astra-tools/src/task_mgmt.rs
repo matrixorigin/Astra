@@ -466,9 +466,7 @@ fn reconcile_subtask_completion(task: &mut SessionTask) {
         .subtasks
         .iter()
         .any(|st| matches!(st.status.as_str(), "in_progress" | "completed"));
-    if any_started && task.status == "pending" {
-        task.status = "in_progress".to_string();
-    } else if task.status == "completed" {
+    if (any_started && task.status == "pending") || task.status == "completed" {
         task.status = "in_progress".to_string();
     }
 }
