@@ -545,6 +545,13 @@ impl PlanCommand {
         // Resume commands — delegate to the canonical resume detector so
         // this parser stays in sync with `is_resume_command` /
         // `message_signals_resume`. (Dropped `next` alias.)
+        //
+        // Keep bare "continue" out of the command parser: it is too ambiguous
+        // for a top-level plan command, but the generic resume detector still
+        // recognizes it for paused-plan continuity.
+        if lower == "continue" {
+            return None;
+        }
         if crate::plan_resume::message_signals_resume(stripped) {
             return Some(PlanCommand::Resume);
         }
