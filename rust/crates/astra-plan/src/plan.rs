@@ -155,7 +155,6 @@ impl PlanPhase {
                     corrections: Vec::new(),
                     timeline: state.timeline.clone(),
                     last_turn_interrupted: false,
-                    metrics: crate::metrics::PlanMetrics::default(),
                 };
                 Ok(Executing { state: exec_state })
             }
@@ -259,9 +258,6 @@ pub struct PlanExecutionState {
     /// Whether the last chat turn was interrupted by Ctrl+C.
     #[serde(default)]
     pub last_turn_interrupted: bool,
-    /// Structured metrics for observability.
-    #[serde(default)]
-    pub metrics: crate::metrics::PlanMetrics,
 }
 
 // ─── PlanAction ──────────────────────────────────────────────────────────────
@@ -315,8 +311,6 @@ impl PlanAction {
 #[derive(Debug, Clone)]
 pub enum PlanTransitionError {
     Invalid { from_phase: String, action: String },
-
-    ValidationFailed { reason: String },
 }
 
 impl std::fmt::Display for PlanTransitionError {
@@ -327,9 +321,6 @@ impl std::fmt::Display for PlanTransitionError {
                     f,
                     "invalid plan transition: cannot {action} from {from_phase}"
                 )
-            }
-            Self::ValidationFailed { reason } => {
-                write!(f, "plan validation failed: {reason}")
             }
         }
     }
@@ -345,25 +336,12 @@ impl std::error::Error for PlanTransitionError {}
 pub enum PauseReason {
     /// User pressed Ctrl+C or typed a pause command.
     UserRequest,
-    /// Waiting for user approval of a tool call.
-    ApprovalNeeded { tool: String, request_id: String },
-    /// Subtask failed and requires manual intervention.
-    SubtaskFailed { subtask_id: String, error: String },
-    /// Step-by-step mode: waiting for user to confirm next subtask.
-    StepByStep { next_subtask_id: String },
 }
 
 impl fmt::Display for PauseReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UserRequest => write!(f, "user request"),
-            Self::ApprovalNeeded { tool, .. } => write!(f, "approval needed for {tool}"),
-            Self::SubtaskFailed { subtask_id, error } => {
-                write!(f, "subtask {subtask_id} failed: {error}")
-            }
-            Self::StepByStep { next_subtask_id } => {
-                write!(f, "step-by-step: awaiting {next_subtask_id}")
-            }
         }
     }
 }
@@ -375,10 +353,6 @@ impl fmt::Display for PauseReason {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PlanError {
     LlmFailure { message: String },
-    RetriesExhausted { subtask_id: String, attempts: u32 },
-    DependencyDeadlock { blocked_ids: Vec<String> },
-    ValidationFailed { reason: String },
-    NetworkError { message: String },
     Other { message: String },
 }
 
@@ -386,20 +360,6 @@ impl fmt::Display for PlanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LlmFailure { message } => write!(f, "LLM failure: {message}"),
-            Self::RetriesExhausted {
-                subtask_id,
-                attempts,
-            } => {
-                write!(
-                    f,
-                    "all retries exhausted for subtask {subtask_id} ({attempts} attempts)"
-                )
-            }
-            Self::DependencyDeadlock { blocked_ids } => {
-                write!(f, "dependency deadlock: {blocked_ids:?}")
-            }
-            Self::ValidationFailed { reason } => write!(f, "plan validation failed: {reason}"),
-            Self::NetworkError { message } => write!(f, "network error: {message}"),
             Self::Other { message } => write!(f, "{message}"),
         }
     }
@@ -415,10 +375,6 @@ impl std::error::Error for PlanError {}
 /// `starts_with("step")`, etc.) with a single typed parser.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlanCommand {
-    /// Create a new plan with the given goal.
-    Create { goal: String },
-    /// Edit the current plan with natural-language instruction.
-    Edit { instruction: String },
     /// Start executing the plan.
     Execute { step_by_step: bool },
     /// Pause execution.
@@ -698,103 +654,6 @@ impl PlanCapabilities {
     }
 }
 
-// ─── Error Recovery ─────────────────────────────────────────────────────────
-
-/// Circuit breaker state for plan execution.
-///
-/// Trips after `max_consecutive_failures` consecutive subtask failures,
-/// pausing execution and requiring user intervention to resume.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CircuitBreaker {
-    /// Maximum consecutive failures before tripping.
-    pub max_consecutive_failures: u32,
-    /// Current consecutive failure count.
-    #[serde(default)]
-    pub consecutive_failures: u32,
-    /// Whether the circuit breaker has tripped.
-    #[serde(default)]
-    pub tripped: bool,
-    /// IDs of subtasks that caused the trip.
-    #[serde(default)]
-    pub failed_subtask_ids: Vec<String>,
-}
-
-impl Default for CircuitBreaker {
-    fn default() -> Self {
-        Self {
-            max_consecutive_failures: 3,
-            consecutive_failures: 0,
-            tripped: false,
-            failed_subtask_ids: Vec::new(),
-        }
-    }
-}
-
-impl CircuitBreaker {
-    /// Record a subtask success — resets the failure counter.
-    pub fn record_success(&mut self) {
-        self.consecutive_failures = 0;
-    }
-
-    /// Record a subtask failure — may trip the breaker.
-    /// Returns `true` if the breaker just tripped.
-    pub fn record_failure(&mut self, subtask_id: &str) -> bool {
-        self.consecutive_failures += 1;
-        self.failed_subtask_ids.push(subtask_id.to_string());
-        if self.consecutive_failures >= self.max_consecutive_failures && !self.tripped {
-            self.tripped = true;
-            return true;
-        }
-        false
-    }
-
-    /// Reset the breaker (user chose to resume despite failures).
-    pub fn reset(&mut self) {
-        self.consecutive_failures = 0;
-        self.tripped = false;
-        self.failed_subtask_ids.clear();
-    }
-
-    /// Whether execution should be paused.
-    pub fn should_pause(&self) -> bool {
-        self.tripped
-    }
-}
-
-/// Configurable retry policy for subtask execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryPolicy {
-    /// Maximum retry attempts per subtask.
-    pub max_retries: u32,
-    /// Base delay between retries (ms). Doubles on each attempt (exponential backoff).
-    pub base_delay_ms: u64,
-    /// Maximum delay cap (ms).
-    pub max_delay_ms: u64,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_retries: 2,
-            base_delay_ms: 1000,
-            max_delay_ms: 30_000,
-        }
-    }
-}
-
-impl RetryPolicy {
-    /// Calculate the delay for a given retry attempt (0-indexed).
-    pub fn delay_for_attempt(&self, attempt: u32) -> std::time::Duration {
-        let delay = self.base_delay_ms.saturating_mul(1u64 << attempt.min(10));
-        std::time::Duration::from_millis(delay.min(self.max_delay_ms))
-    }
-
-    /// Whether more retries are allowed.
-    pub fn can_retry(&self, attempt: u32) -> bool {
-        attempt < self.max_retries
-    }
-}
-
 /// Approval policy for tool execution during plan execution.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -860,7 +719,6 @@ mod tests {
             corrections: vec![],
             timeline: ExecutionTimeline::default(),
             last_turn_interrupted: false,
-            metrics: crate::metrics::PlanMetrics::default(),
         };
         let phase = PlanPhase::Executing { state: exec_state };
 
@@ -1024,80 +882,6 @@ mod tests {
         );
     }
 
-    // ── Circuit breaker tests ───────────────────────────────────────────
-
-    #[test]
-    fn circuit_breaker_trips_after_max_failures() {
-        let mut cb = CircuitBreaker {
-            max_consecutive_failures: 3,
-            ..Default::default()
-        };
-        assert!(!cb.record_failure("s1"));
-        assert!(!cb.record_failure("s2"));
-        assert!(cb.record_failure("s3")); // trips
-        assert!(cb.should_pause());
-    }
-
-    #[test]
-    fn circuit_breaker_resets_on_success() {
-        let mut cb = CircuitBreaker {
-            max_consecutive_failures: 3,
-            ..Default::default()
-        };
-        cb.record_failure("s1");
-        cb.record_failure("s2");
-        cb.record_success();
-        assert_eq!(cb.consecutive_failures, 0);
-        assert!(!cb.should_pause());
-    }
-
-    #[test]
-    fn circuit_breaker_reset_clears_state() {
-        let mut cb = CircuitBreaker::default();
-        cb.record_failure("s1");
-        cb.record_failure("s2");
-        cb.record_failure("s3");
-        assert!(cb.tripped);
-        cb.reset();
-        assert!(!cb.tripped);
-        assert_eq!(cb.consecutive_failures, 0);
-        assert!(cb.failed_subtask_ids.is_empty());
-    }
-
-    // ── Retry policy tests ──────────────────────────────────────────────
-
-    #[test]
-    fn retry_policy_exponential_backoff() {
-        let policy = RetryPolicy::default();
-        let d0 = policy.delay_for_attempt(0);
-        let d1 = policy.delay_for_attempt(1);
-        let d2 = policy.delay_for_attempt(2);
-        assert!(d1 > d0);
-        assert!(d2 > d1);
-    }
-
-    #[test]
-    fn retry_policy_caps_at_max() {
-        let policy = RetryPolicy {
-            base_delay_ms: 1000,
-            max_delay_ms: 5000,
-            ..Default::default()
-        };
-        let d10 = policy.delay_for_attempt(10);
-        assert!(d10.as_millis() <= 5000);
-    }
-
-    #[test]
-    fn retry_policy_can_retry_within_limit() {
-        let policy = RetryPolicy {
-            max_retries: 3,
-            ..Default::default()
-        };
-        assert!(policy.can_retry(0));
-        assert!(policy.can_retry(2));
-        assert!(!policy.can_retry(3));
-    }
-
     // ── Additional state transition tests ────────────────────────────────
 
     fn make_exec_state() -> PlanExecutionState {
@@ -1110,7 +894,6 @@ mod tests {
             corrections: vec![],
             timeline: ExecutionTimeline::default(),
             last_turn_interrupted: false,
-            metrics: crate::metrics::PlanMetrics::default(),
         }
     }
 

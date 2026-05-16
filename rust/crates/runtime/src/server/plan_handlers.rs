@@ -20,9 +20,7 @@
 //! source of truth for plan lifecycle state.
 
 use super::*;
-use crate::plan::{
-    ApprovalPolicy, PlanCapabilities, PlanLoadError, PlanModeState, PlanPhase, metrics::PlanMetrics,
-};
+use crate::plan::{ApprovalPolicy, PlanCapabilities, PlanLoadError, PlanModeState, PlanPhase};
 use astra_plan::{PlanListFilter, PlanStepRun};
 use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
 
@@ -207,7 +205,6 @@ pub(super) struct PlanResponse {
     pub version: u64,
     pub plan: Option<TaskPlan>,
     pub capabilities: PlanCapabilities,
-    pub metrics: PlanMetrics,
 }
 
 #[derive(Serialize)]
@@ -220,7 +217,6 @@ pub(super) struct PlanStatusResponse {
     pub subtask_count: usize,
     pub completed_count: usize,
     pub failed_count: usize,
-    pub metrics: PlanMetrics,
     pub capabilities: PlanCapabilities,
 }
 
@@ -494,7 +490,6 @@ pub(super) async fn create_plan_handler(
             version: plan_state.version,
             plan: None,
             capabilities,
-            metrics: PlanMetrics::default(),
         }),
     ))
 }
@@ -555,7 +550,6 @@ pub(super) async fn get_plan_handler(
         version: plan_state.version,
         plan: Some(plan_state.plan),
         capabilities,
-        metrics: PlanMetrics::default(),
     }))
 }
 
@@ -619,7 +613,6 @@ pub(super) async fn update_plan_handler(
         version: plan_state.version,
         plan: Some(plan_state.plan),
         capabilities: PlanCapabilities::planning(),
-        metrics: PlanMetrics::default(),
     }))
 }
 
@@ -726,7 +719,6 @@ pub(super) async fn execute_plan_handler(
         subtask_count: plan_state.plan.subtasks.len(),
         completed_count: completed,
         failed_count: failed,
-        metrics: PlanMetrics::default(),
         capabilities,
     }))
 }
@@ -817,7 +809,6 @@ pub(super) async fn exit_plan_mode_handler(
         version: plan_state.version,
         plan: Some(plan_state.plan),
         capabilities,
-        metrics: PlanMetrics::default(),
     }))
 }
 
@@ -1327,7 +1318,6 @@ pub(super) async fn plan_status_handler(
         subtask_count: plan_state.plan.subtasks.len(),
         completed_count: completed,
         failed_count: failed,
-        metrics: PlanMetrics::default(),
         capabilities,
     }))
 }

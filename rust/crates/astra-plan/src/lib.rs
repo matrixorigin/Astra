@@ -2,7 +2,6 @@
 
 pub mod action_plan;
 pub mod decompose;
-pub mod metrics;
 pub mod plan;
 pub mod repository;
 
