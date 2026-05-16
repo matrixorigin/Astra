@@ -1554,39 +1554,6 @@ mod tests {
         assert_eq!(state.turn, 0);
     }
 
-    #[test]
-    fn initialize_session_state_ignores_saved_plan_state_files() {
-        let (_tmp, _g) = isolated_sessions_dir();
-        let _creds_guard = isolate_credentials();
-        let home = tempdir().unwrap();
-        let _home_guard = EnvGuard::set("HOME", home.path().to_str().unwrap());
-        std::fs::create_dir_all(home.path().join(".astra")).unwrap();
-
-        let mut plan_state = astra_runtime::plan::PlanModeState::new(
-            "Fix auth middleware".to_string(),
-            Default::default(),
-        );
-        plan_state
-            .plan
-            .subtasks
-            .push(astra_services::task_orchestrator::SubtaskPlan {
-                id: "t1".into(),
-                title: "Patch token validation".into(),
-                status: astra_services::task_orchestrator::TaskStatus::InProgress,
-                ..Default::default()
-            });
-        plan_state
-            .save_to_file(&home.path().join(".astra").join("plan_state.json"))
-            .unwrap();
-
-        let state = initialize_session_state(None, Some("gpt-5"));
-        assert!(
-            state.plan_mode.is_none(),
-            "startup must not implicitly restore saved plan files"
-        );
-        assert!(state.pending_recovery.is_none());
-    }
-
     // ── Session display logic ──────────────────────────────────────────────
 
     #[test]

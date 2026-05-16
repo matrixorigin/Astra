@@ -329,7 +329,7 @@ impl PlanRepository for CloudPlanRepository {
                     "INSERT INTO plans \
                          (plan_id, user_id, session_id, goal, phase, version, plan_json, plan_md, \
                           progress_pct, subtask_count, created_by, created_at, updated_at) \
-                     VALUES (?, ?, ?, ?, ?, 1, ?, NULL, ?, ?, ?, NOW(6), NOW(6))",
+                     VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
                 )
                 .bind(plan_id)
                 .bind(&user_id)
@@ -337,6 +337,7 @@ impl PlanRepository for CloudPlanRepository {
                 .bind(&goal)
                 .bind(phase)
                 .bind(&plan_json)
+                .bind(state.plan_md.as_deref())
                 .bind(progress)
                 .bind(subtask_count)
                 .bind(&user_id)
@@ -375,12 +376,12 @@ impl PlanRepository for CloudPlanRepository {
                 // Conditional UPDATE: only succeeds when the stored version
                 // is still `stored`. Concurrent writer that already bumped
                 // the row to `stored + 1` causes our WHERE to miss, and
-                // `rows_affected() == 0` → conflict. Session_id / plan_md /
-                // user_id are intentionally NOT in SET so routine saves
-                // don't clobber hints set via set_active_plan.
+                // `rows_affected() == 0` → conflict. Session_id / user_id are
+                // intentionally NOT in SET so routine saves don't clobber
+                // hints set via set_active_plan.
                 let res = sqlx::query(
                     "UPDATE plans \
-                     SET goal = ?, phase = ?, version = ?, plan_json = ?, \
+                     SET goal = ?, phase = ?, version = ?, plan_json = ?, plan_md = ?, \
                          progress_pct = ?, subtask_count = ?, updated_at = NOW(6) \
                      WHERE plan_id = ? AND version = ?",
                 )
@@ -388,6 +389,7 @@ impl PlanRepository for CloudPlanRepository {
                 .bind(phase)
                 .bind(next_version as i64)
                 .bind(&plan_json)
+                .bind(state.plan_md.as_deref())
                 .bind(progress)
                 .bind(subtask_count)
                 .bind(plan_id)
@@ -419,11 +421,13 @@ impl PlanRepository for CloudPlanRepository {
 
     async fn load(&self, plan_id: &str) -> Result<PlanModeState, PlanLoadError> {
         PlanModeState::validate_plan_id(plan_id)?;
-        let row = sqlx::query("SELECT plan_json, session_id, version FROM plans WHERE plan_id = ?")
-            .bind(plan_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
+        let row = sqlx::query(
+            "SELECT plan_json, plan_md, session_id, version FROM plans WHERE plan_id = ?",
+        )
+        .bind(plan_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         let Some(row) = row else {
             return Err(PlanLoadError::NotFound(plan_id.to_string()));
         };
@@ -433,12 +437,16 @@ impl PlanRepository for CloudPlanRepository {
         let session_hint: Option<String> = row
             .try_get("session_id")
             .map_err(|e| PlanLoadError::Corrupt(format!("read session_id: {e}")))?;
+        let plan_md: Option<String> = row
+            .try_get("plan_md")
+            .map_err(|e| PlanLoadError::Corrupt(format!("read plan_md: {e}")))?;
         let version_col: i64 = row
             .try_get("version")
             .map_err(|e| PlanLoadError::Corrupt(format!("read version: {e}")))?;
         let mut state = serde_json::from_str::<PlanModeState>(&plan_json)
             .map_err(|e| PlanLoadError::Corrupt(format!("parse plan state: {e}")))?;
         state.session_hint = session_hint;
+        state.plan_md = plan_md.or(state.plan_md);
         // `plans.version` is the authoritative optimistic-concurrency value.
         // Old rows written before the save() ordering fix may have a stale
         // version inside plan_json; trust the column.
@@ -1241,11 +1249,13 @@ mod tests {
             ProjectContext::default(),
             "u-1".into(),
         );
+        state.plan_md = Some("# test plan".into());
         repo.save("plan-1", &mut state, None).await.unwrap();
 
         let loaded = repo.load("plan-1").await.unwrap();
         assert_eq!(loaded.goal, "test goal");
         assert_eq!(loaded.created_by.as_deref(), Some("u-1"));
+        assert_eq!(loaded.plan_md.as_deref(), Some("# test plan"));
     }
 
     #[tokio::test]

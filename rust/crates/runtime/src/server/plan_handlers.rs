@@ -9,16 +9,15 @@
 //! - `GET /plans/{plan_id}/status` — get plan status + metrics
 //! - `POST /plans/{plan_id}/exit-plan-mode` — web-agent equivalent of the
 //!   ExitPlanMode tool; flips the phase to `refining`/`planning` based on
-//!   approval and optionally writes `plan_md` alongside the state.
+//!   approval and optionally persists `plan_md` alongside the state.
 //! - `POST /plans/{plan_id}/rewind` — reset one anchor + everything after
 //!   (mirrors the CLI `rewind N` path); distinct from redo-step.
 //! - `POST /plans/{plan_id}/redo-step` — reset one subtask for re-execution.
 //! - `GET /plans/{plan_id}/step-runs` — list `plan_step_runs` rows (paginated).
 //! - `DELETE /plans/{plan_id}` — delete a plan.
 //!
-//! All handlers go through [`AppState::plan_repo`] — the filesystem-backed
-//! helpers on `PlanModeState` are the offline fallback, not the source of
-//! truth.
+//! All handlers go through [`AppState::plan_repo`] — the repository is the
+//! source of truth for plan lifecycle state.
 
 use super::*;
 use crate::plan::{
@@ -544,8 +543,6 @@ pub(super) async fn update_plan_handler(
         ));
     }
 
-    plan_state.add_turn(&instruction, "(pending LLM response)");
-
     let session_hint = plan_state.session_hint.clone();
     let expected = resolve_expected_version(&plan_state, req.expected_version);
     state
@@ -714,11 +711,11 @@ pub(super) async fn exit_plan_mode_handler(
 
     check_version(&plan_state, req.expected_version)?;
 
-    // Stash the rendered markdown inside the state blob so web and CLI see
-    // the same artifact. Stored under a well-known history key so it round-
-    // trips through the existing (user, assistant) log — no schema change.
+    // Persist the rendered markdown alongside plan_json so web, sync, and CLI
+    // consumers can read the same artifact without reviving the removed
+    // turn-history compatibility layer.
     if let Some(md) = req.plan_md {
-        plan_state.add_turn("__plan_md__", &md);
+        plan_state.plan_md = Some(md);
     }
 
     let session_hint = plan_state.session_hint.clone();

@@ -6,7 +6,6 @@
 
 use crate::durable_bridge;
 use crate::plan_executor;
-use crate::plan_interaction;
 
 use crate::session_state::SessionState;
 use crate::theme;
@@ -105,7 +104,7 @@ pub(crate) async fn start_and_monitor_plan(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> Result<(), String> {
-    if plan_interaction::shutdown_plan_executor(state) {
+    if shutdown_plan_executor(state) {
         eprintln!(
             "  {}  Previous plan executor cancelled before starting new run.",
             theme::icon_warn()
@@ -129,6 +128,21 @@ pub(crate) async fn start_and_monitor_plan(
     super::plan_monitor::run_blocking_plan_monitor(state).await;
 
     Ok(())
+}
+
+/// Cleanly shut down a running plan executor handle.
+///
+/// Sends `Cancel`, drains remaining updates, and returns `true` if a handle was
+/// actually present (i.e. an executor was running). Call this before spawning a
+/// new executor or when abandoning an in-flight run.
+pub(crate) fn shutdown_plan_executor(state: &mut SessionState) -> bool {
+    if let Some(mut h) = state.plan_handle.take() {
+        let _ = h.send_command(crate::plan_executor::PlanCommand::Cancel);
+        while h.try_recv().is_some() {}
+        true
+    } else {
+        false
+    }
 }
 
 /// Initialize `durable_task_state` on `SessionState` if it's `None` and a plan
@@ -323,5 +337,23 @@ mod tests {
         };
 
         assert!(engine.validate(&request, "main").await.is_ok());
+    }
+
+    #[test]
+    fn shutdown_plan_executor_returns_false_without_handle() {
+        let mut state = SessionState::default();
+        assert!(!shutdown_plan_executor(&mut state));
+    }
+
+    #[test]
+    fn shutdown_plan_executor_cancels_and_clears_handle() {
+        let mut state = SessionState::default();
+        let (handle, _update_tx, _cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+
+        let had_handle = shutdown_plan_executor(&mut state);
+
+        assert!(had_handle);
+        assert!(state.plan_handle.is_none());
     }
 }

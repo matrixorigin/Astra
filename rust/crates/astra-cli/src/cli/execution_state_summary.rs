@@ -65,12 +65,6 @@ pub(crate) fn format_summary(input: ExecutionStateSummaryInput<'_>) -> Option<St
             plan_resume_digest(plan_mode)
                 .unwrap_or_else(|| format!("goal=\"{}\"", preview(&plan_mode.goal, 160)))
         );
-        if let Some(clarifications) = plan_mode.pending_clarifications.as_ref() {
-            let count = clarifications.questions.len();
-            if count > 0 {
-                line.push_str(&format!(" · clarifications={count}"));
-            }
-        }
         if plan_mode.modified {
             line.push_str(" · modified");
         }
@@ -277,7 +271,7 @@ fn preview(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_runtime::plan::{ClarificationQuestion, PendingClarifications, ProjectContext};
+    use astra_runtime::plan::ProjectContext;
     use astra_services::VerifierKind;
     use astra_services::durable_task::{
         ContractStatus, DurableSubtask, TaskScope, VerificationCriterion,
@@ -356,15 +350,6 @@ mod tests {
     #[test]
     fn summary_includes_resume_authoring_execution_durable_and_last_event() {
         let mut plan_mode = PlanModeState::new("Harden auth".into(), ProjectContext::default());
-        plan_mode.pending_clarifications = Some(PendingClarifications {
-            questions: vec![ClarificationQuestion {
-                question: "Should refresh tokens rotate?".into(),
-                options: Vec::new(),
-                default: None,
-                category: Default::default(),
-            }],
-            answers: Vec::new(),
-        });
         plan_mode.modified = true;
         plan_mode
             .plan
@@ -434,7 +419,8 @@ mod tests {
             out.contains("plan authoring: [plan-resume] goal=\"Harden auth\""),
             "{out}"
         );
-        assert!(out.contains("clarifications=1"), "{out}");
+        assert!(out.contains("open=1"), "{out}");
+        assert!(out.contains("done=0/1"), "{out}");
         assert!(out.contains("modified"), "{out}");
         assert!(
             out.contains("plan execution: goal=\"Ship auth flow\""),

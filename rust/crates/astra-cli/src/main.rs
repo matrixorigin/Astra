@@ -111,17 +111,14 @@ mod notifications;
 mod permission_manager;
 #[path = "cli/plan_executor.rs"]
 mod plan_executor;
-#[path = "cli/plan_interaction.rs"]
-mod plan_interaction;
 #[path = "cli/plan_lifecycle.rs"]
 mod plan_lifecycle;
 #[path = "cli/plan_monitor.rs"]
 mod plan_monitor;
 #[path = "cli/plan_runtime.rs"]
 mod plan_runtime;
-#[cfg(test)]
-#[path = "cli/plan_test_support.rs"]
-mod plan_test_support;
+#[path = "cli/plan_task_board.rs"]
+mod plan_task_board;
 #[path = "cli/preferences_client.rs"]
 mod preferences_client;
 #[path = "cli/project_instructions.rs"]

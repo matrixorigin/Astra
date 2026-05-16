@@ -1167,7 +1167,7 @@ async fn sync_task_board_from_executing_plan(state: &SessionState) {
     };
     if let Some(goal) = state.executing_plan_goal.as_deref()
         && let Err(error) =
-            crate::plan_interaction::mirror_plan_to_task_board(state, goal, plan).await
+            crate::plan_task_board::mirror_plan_to_task_board(state, goal, plan).await
     {
         tracing::warn!(
             goal = %goal,
@@ -1175,7 +1175,7 @@ async fn sync_task_board_from_executing_plan(state: &SessionState) {
             "failed to ensure executing plan is mirrored into task board"
         );
     }
-    let plan_fingerprint = crate::plan_interaction::plan_task_board_fingerprint(plan);
+    let plan_fingerprint = crate::plan_task_board::plan_task_board_fingerprint(plan);
     for subtask in &plan.subtasks {
         if let Err(error) =
             sync_task_board_subtask_status(state, &plan_fingerprint, &subtask.id, subtask.status)
@@ -1247,7 +1247,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let plan_fingerprint = crate::plan_interaction::plan_task_board_fingerprint(&plan);
+        let plan_fingerprint = crate::plan_task_board::plan_task_board_fingerprint(&plan);
         let create = state
             .task_manager
             .create(&serde_json::json!({
@@ -1296,7 +1296,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        crate::plan_interaction::mirror_plan_to_task_board(&state, "same goal", &stale)
+        crate::plan_task_board::mirror_plan_to_task_board(&state, "same goal", &stale)
             .await
             .unwrap();
 
@@ -1309,7 +1309,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        crate::plan_interaction::mirror_plan_to_task_board(&state, "same goal", &current)
+        crate::plan_task_board::mirror_plan_to_task_board(&state, "same goal", &current)
             .await
             .unwrap();
         state.executing_plan = Some(current);
