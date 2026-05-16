@@ -207,11 +207,9 @@ pub(crate) struct SessionState {
     pub skill_improvement_tracker: astra_skills::improvement::ImprovementTracker,
     /// Skills pinned by the user — always included in budget (never truncated).
     pub pinned_skills: std::collections::HashSet<String>,
-    /// Skills surfaced by `discover_skills` during this REPL session.
+    /// Skills surfaced by `discover_skills` during this CLI session.
     pub discovered_skills: std::collections::HashSet<String>,
     pub mcp_manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
-    /// Skill classification cache for LLM-based skill detection.
-    #[allow(dead_code)]
     /// Active durable-task contract for plan execution verification.
     pub durable_task_state: Option<durable_bridge::DurableTaskState>,
     /// Last delivery report — kept after plan completion so `/report` works post-plan.

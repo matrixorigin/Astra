@@ -3809,7 +3809,7 @@ All acceptance checks pass:
     /// The ChannelSink must parse the comma-separated blocked_ids string
     /// the trait contract hands it, and forward it as a Vec<String> on
     /// `PlanUpdate::PlanPaused`. Before the fix, the parameter was
-    /// underscore-prefixed and dropped on the floor, so the REPL monitor
+    /// underscore-prefixed and dropped on the floor, so the TUI monitor
     /// could only show a count, not the actionable ids.
     #[test]
     fn channel_sink_plan_paused_forwards_blocked_ids() {
