@@ -210,7 +210,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   }), [chatListHref, detail.chat.id, isArchived, router]);
 
   return (
-    <div className="relative flex h-full min-h-0 flex-col overflow-hidden bg-bg">
+    <div className="astra-chat-view relative flex h-full min-h-0 flex-col overflow-hidden bg-bg">
       <header className="relative z-10 flex min-h-[58px] shrink-0 items-center gap-4 border-b border-border/60 bg-bg/85 px-7 backdrop-blur">
         <Link
           href={detail.chat.projectId ? `/projects/${detail.chat.projectId}` : '/chats'}
@@ -258,7 +258,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           ))}
         </div>
       </div>
-      <ChatDotNavigator messageCount={detail.messages.length} scrollContainerRef={scrollRef} />
+      <ChatDotNavigator messages={detail.messages} scrollContainerRef={scrollRef} />
 
       <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 bg-gradient-to-t from-bg via-bg/95 to-bg/0 px-7 pb-6 pt-12">
         <div className="pointer-events-auto mx-auto w-full md:w-[70%]">

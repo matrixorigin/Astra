@@ -152,7 +152,7 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
   if (isUser) {
     return (
       <article className="flex justify-end py-4">
-        <div className="max-w-[80%] rounded-[22px] rounded-br-md bg-surface-muted px-[18px] py-3 text-[15px] font-normal leading-[1.55] tracking-[0.06em] text-text [-webkit-text-stroke:0.03px_currentColor]">
+        <div className="astra-chat-user-message max-w-[80%] rounded-[22px] rounded-br-md bg-surface-muted px-[18px] py-3 text-[15px] font-normal leading-[1.55] tracking-[0.06em] text-text [-webkit-text-stroke:0.03px_currentColor]">
           <SkillMentionText
             content={content}
             skills={message.activeSkills}

@@ -66,6 +66,30 @@ a {
   text-decoration: none;
 }
 
+.astra-chat-view {
+  --body-size: 15px;
+  --body-line: 1.78;
+  --chat-reasoning-size: 14px;
+  --chat-user-message-size: 15px;
+}
+
+.astra-chat-view [data-composer-input="true"] {
+  font-size: var(--body-size);
+}
+
+.astra-chat-view .astra-reasoning-markdown {
+  font-size: var(--chat-reasoning-size);
+}
+
+.astra-chat-view .astra-reasoning-markdown {
+  line-height: var(--body-line);
+}
+
+.astra-chat-view .astra-chat-user-message,
+.astra-chat-view .astra-chat-user-message p {
+  font-size: var(--chat-user-message-size);
+}
+
 /* Focus ring for keyboard navigation */
 :focus-visible {
   outline: 2px solid rgb(var(--color-accent));
