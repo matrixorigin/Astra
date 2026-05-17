@@ -101,7 +101,7 @@ pub(crate) async fn enter_remote_plan_mode(
         .map_err(crate::map_thin_err)?;
     let plan_id =
         parse_plan_id(&value).ok_or_else(|| "create plan response missing plan_id".to_string())?;
-    state.plan_mode = Some(build_plan_mode_state(
+    state.cloud_plan_mirror = Some(build_plan_mode_state(
         goal.to_string(),
         value.get("plan").cloned(),
         value.get("version").and_then(Value::as_u64),
@@ -145,13 +145,13 @@ pub(crate) async fn exit_remote_plan_mode(
         .as_ref()
         .filter(|sid| !sid.trim().is_empty())
     else {
-        state.plan_mode = None;
+        state.cloud_plan_mirror = None;
         state.plan_mode_sync_error = None;
         return Ok(None);
     };
 
     let Some(plan_id) = active_remote_planning_plan_id(api, token, session_id).await? else {
-        state.plan_mode = None;
+        state.cloud_plan_mirror = None;
         state.plan_mode_sync_error = None;
         return Ok(None);
     };
@@ -166,7 +166,7 @@ pub(crate) async fn exit_remote_plan_mode(
         .map_err(crate::map_thin_err)?;
 
     if approved {
-        state.plan_mode = None;
+        state.cloud_plan_mirror = None;
         state.plan_mode_sync_error = None;
     } else {
         sync_remote_plan_mode_state(api, token, state).await?;
@@ -189,13 +189,13 @@ pub(crate) async fn sync_remote_plan_mode_state(
         .as_ref()
         .filter(|sid| !sid.trim().is_empty())
     else {
-        state.plan_mode = None;
+        state.cloud_plan_mirror = None;
         state.plan_mode_sync_error = None;
         return Ok(());
     };
 
     let Some(plan_id) = active_remote_planning_plan_id(api, token, session_id).await? else {
-        state.plan_mode = None;
+        state.cloud_plan_mirror = None;
         state.plan_mode_sync_error = None;
         return Ok(());
     };
@@ -209,7 +209,7 @@ pub(crate) async fn sync_remote_plan_mode_state(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    state.plan_mode = Some(build_plan_mode_state(
+    state.cloud_plan_mirror = Some(build_plan_mode_state(
         goal,
         plan_state.get("plan").cloned(),
         plan_state.get("version").and_then(Value::as_u64),
@@ -227,7 +227,7 @@ pub(crate) async fn fresh_token_for_plan(
 
 pub(crate) fn looks_like_pending_local_plan_entry(state: &crate::SessionState) -> bool {
     state
-        .plan_mode
+        .cloud_plan_mirror
         .as_ref()
         .map(|plan| plan.goal.trim().is_empty())
         .unwrap_or(false)
@@ -281,12 +281,12 @@ mod tests {
         assert_eq!(plan_id, "plan-1");
         assert_eq!(state.session_id.as_deref(), Some("sess-1"));
         assert_eq!(
-            state.plan_mode.as_ref().map(|plan| plan.goal.as_str()),
+            state.cloud_plan_mirror.as_ref().map(|plan| plan.goal.as_str()),
             Some("Ship auth")
         );
         assert_eq!(
             state
-                .plan_mode
+                .cloud_plan_mirror
                 .as_ref()
                 .map(|plan| plan.plan.subtasks.len()),
             Some(1)
@@ -323,7 +323,7 @@ mod tests {
         assert!(error.contains("503"), "got: {error}");
         assert_eq!(state.session_id.as_deref(), Some("sess-1"));
         assert!(
-            state.plan_mode.is_none(),
+            state.cloud_plan_mirror.is_none(),
             "failed plan create must not arm local mirror"
         );
     }
@@ -346,12 +346,12 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = crate::SessionState::default();
         state.session_id = Some("sess-1".to_string());
-        state.plan_mode = Some(plan::PlanModeState::new("stale".to_string()));
+        state.cloud_plan_mirror = Some(plan::PlanModeState::new("stale".to_string()));
 
         sync_remote_plan_mode_state(&api, "token", &mut state)
             .await
             .unwrap();
-        assert!(state.plan_mode.is_none());
+        assert!(state.cloud_plan_mirror.is_none());
     }
 
     #[tokio::test]
@@ -407,7 +407,7 @@ mod tests {
             .await
             .unwrap();
 
-        let plan = state.plan_mode.expect("planning plan should be mirrored");
+        let plan = state.cloud_plan_mirror.expect("planning plan should be mirrored");
         assert_eq!(plan.goal, "Ship auth");
         assert_eq!(plan.version, 7);
         assert_eq!(plan.plan.subtasks.len(), 2);
@@ -441,7 +441,7 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = crate::SessionState::default();
         state.session_id = Some("sess-1".to_string());
-        state.plan_mode = Some(plan::PlanModeState::new("stale goal".to_string()));
+        state.cloud_plan_mirror = Some(plan::PlanModeState::new("stale goal".to_string()));
 
         let error = sync_remote_plan_mode_state(&api, "token", &mut state)
             .await
@@ -449,7 +449,7 @@ mod tests {
 
         assert!(error.contains("500"), "got: {error}");
         assert_eq!(
-            state.plan_mode.as_ref().map(|plan| plan.goal.as_str()),
+            state.cloud_plan_mirror.as_ref().map(|plan| plan.goal.as_str()),
             Some("stale goal"),
             "failed sync must not overwrite the last known local mirror"
         );
@@ -487,14 +487,14 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = crate::SessionState::default();
         state.session_id = Some("sess-1".to_string());
-        state.plan_mode = Some(plan::PlanModeState::new("Ship auth".to_string()));
+        state.cloud_plan_mirror = Some(plan::PlanModeState::new("Ship auth".to_string()));
 
         let plan_id = exit_remote_plan_mode(&api, "token", &mut state, true)
             .await
             .unwrap();
 
         assert_eq!(plan_id.as_deref(), Some("plan-2"));
-        assert!(state.plan_mode.is_none());
+        assert!(state.cloud_plan_mirror.is_none());
     }
 
     #[tokio::test]
@@ -534,7 +534,7 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = crate::SessionState::default();
         state.session_id = Some("sess-1".to_string());
-        state.plan_mode = Some(plan::PlanModeState::new("Ship auth".to_string()));
+        state.cloud_plan_mirror = Some(plan::PlanModeState::new("Ship auth".to_string()));
 
         let error = exit_remote_plan_mode(&api, "token", &mut state, false)
             .await
@@ -542,7 +542,7 @@ mod tests {
 
         assert!(error.contains("500"), "got: {error}");
         assert_eq!(
-            state.plan_mode.as_ref().map(|plan| plan.goal.as_str()),
+            state.cloud_plan_mirror.as_ref().map(|plan| plan.goal.as_str()),
             Some("Ship auth"),
             "failed unapproved exit sync must keep the last known mirror in place"
         );

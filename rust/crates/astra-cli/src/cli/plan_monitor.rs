@@ -297,7 +297,7 @@ fn display_plan_updates_live(
                         st.status = status;
                     }
                 }
-                if let Some(ref mut ps) = state.plan_mode {
+                if let Some(ref mut ps) = state.cloud_plan_mirror {
                     if let Some(st) = ps.plan.subtasks.iter_mut().find(|s| s.id == id) {
                         st.status = status;
                     }
@@ -368,7 +368,7 @@ fn display_plan_updates_live(
                     eprintln!();
                     durable_bridge::display_delivery_report(report);
                 }
-                if state.plan_mode.is_some() {
+                if state.plan_mode_active() {
                     eprintln!();
                     eprintln!(
                         "{}",
@@ -412,7 +412,7 @@ fn display_plan_updates_live(
                     &mut state.plan_thinking_pane,
                     msg,
                 );
-                if state.plan_mode.is_some() {
+                if state.plan_mode_active() {
                     eprintln!();
                     eprintln!("{}  {}", "📋".magenta(), "Recovery options:".bold());
                     eprintln!("{}", "    go          — run the current plan again".dim());
@@ -1111,7 +1111,7 @@ fn sync_subtask_status(
             st.status = status;
         }
     }
-    if let Some(ref mut ps) = state.plan_mode {
+    if let Some(ref mut ps) = state.cloud_plan_mirror {
         if let Some(st) = ps.plan.subtasks.iter_mut().find(|s| s.id == subtask_id) {
             st.status = status;
         }

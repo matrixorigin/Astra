@@ -653,6 +653,20 @@ pub struct ToolExecutor {
     /// probed; `Some(true)` = a planning-phase plan exists, mutations
     /// must be blocked; `Some(false)` = no planning plan, writes flow.
     plan_mode_authoring_cache: std::sync::Arc<tokio::sync::RwLock<Option<bool>>>,
+    /// Per-turn ask-user channel — the host swaps a fresh sender in
+    /// before each turn so tools that need to surface a TUI overlay
+    /// (currently `exit_plan_mode` for the Approve / Keep-planning
+    /// dialog) can reach the bottom-pane overlay through the same
+    /// path the `ask_user` tool uses.
+    ask_user_request_tx:
+        std::sync::Mutex<Option<crate::chat_stream::AskUserRequestTx>>,
+    /// Slot recording a permission-mode switch that the user
+    /// confirmed inside a tool overlay (currently `exit_plan_mode`'s
+    /// 4-option dialog). The host drains this slot at the start of
+    /// the next turn — applying mid-turn would race the agentic
+    /// loop's borrow of `perm_manager`.
+    pending_permission_mode_change:
+        std::sync::Mutex<Option<crate::permission_manager::PermissionMode>>,
 }
 
 impl ToolExecutor {
@@ -743,7 +757,34 @@ impl ToolExecutor {
                 },
             ),
             plan_mode_authoring_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            ask_user_request_tx: std::sync::Mutex::new(None),
+            pending_permission_mode_change: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Install the per-turn `ask_user` channel so tools can surface a
+    /// TUI overlay for confirmations (e.g. `exit_plan_mode` approval).
+    /// `None` clears the slot — passed at turn boundaries so a stale
+    /// sender never leaks across turns.
+    pub fn set_ask_user_request_tx(
+        &self,
+        tx: Option<crate::chat_stream::AskUserRequestTx>,
+    ) {
+        if let Ok(mut guard) = self.ask_user_request_tx.lock() {
+            *guard = tx;
+        }
+    }
+
+    /// Drain a permission-mode change recorded by a tool overlay (see
+    /// `pending_permission_mode_change`). Returns the requested mode
+    /// once and clears the slot. Called at turn start by the loop host.
+    pub fn take_pending_permission_mode_change(
+        &self,
+    ) -> Option<crate::permission_manager::PermissionMode> {
+        self.pending_permission_mode_change
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
     }
 
     /// Set the spawn context for agent spawning.
@@ -1279,6 +1320,29 @@ impl ToolExecutor {
     }
 
     async fn enter_plan_mode_remote(&self, args: &Value) -> String {
+        // Symmetric with `exit_plan_mode_remote`: there are two
+        // structurally different paths and we pick by what the
+        // environment supports, not by what the caller requests.
+        //
+        // 1. Cloud path — active session id + cloud token + reachable
+        //    plan client all present → POST `/plans` to create a
+        //    `phase=planning` row so the server-side write guard
+        //    engages and `/plan` UI / multi-client coordination can
+        //    see the authoring state. Used by the `/plan "goal"`
+        //    slash command and any web-agent driven entry.
+        //
+        // 2. Local path — any prerequisite missing (no session id,
+        //    no token, no client, network failure) → fall back to a
+        //    purely local plan-mode pivot. Stages
+        //    `PermissionMode::Plan` on the pending slot so the host
+        //    flips `perm_manager` at the next turn boundary, exactly
+        //    like Shift+Tab. No cloud row is created and no error
+        //    bubbles up: a detached / unauthenticated CLI run still
+        //    gets plan mode.
+        //
+        // Both branches always stage Plan on the pending slot —
+        // single-source-of-truth invariant I6: whichever path runs,
+        // `perm_manager.mode()` becomes `Plan` on the next turn.
         let goal = args
             .get("goal")
             .and_then(Value::as_str)
@@ -1288,18 +1352,42 @@ impl ToolExecutor {
             return "Error: missing required parameter `goal`.".to_string();
         };
 
-        let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty()) else {
-            return "Error: enter_plan_mode requires an active session.".to_string();
-        };
-        let Some(token) = self.cloud_token() else {
-            return "Error: enter_plan_mode requires an authenticated cloud session.".to_string();
-        };
+        let cloud_outcome = self.try_enter_plan_mode_cloud_path(goal).await;
+        match cloud_outcome {
+            Ok(message) => {
+                self.stage_pending_plan_mode();
+                message
+            }
+            Err(_unavailable) => {
+                self.stage_pending_plan_mode();
+                // Local guard cache is informational — there is no
+                // server guard to mirror in this branch. Set it to
+                // `Some(true)` so any cached probe consult sees
+                // "writes gated" while plan mode is active.
+                *self.plan_mode_authoring_cache.write().await = Some(true);
+                format!(
+                    "Entered plan mode (local). goal=\"{goal}\". Write tools are now blocked — investigate read-only, then call exit_plan_mode(plan=\"<markdown>\") when ready."
+                )
+            }
+        }
+    }
 
-        let client = match self.remote_plan_client() {
-            Ok(client) => client,
-            Err(err) => return err,
-        };
-        let response = match client
+    /// Attempt the cloud `enter_plan_mode` flow. Returns `Err(())`
+    /// (with no message) when any prerequisite is missing so the
+    /// caller falls back to the local path silently. Returns
+    /// `Err(message)` semantics are *not* used here — a real cloud
+    /// failure (e.g. server returned 5xx) is also swallowed into the
+    /// local fallback because the user's intent ("enter plan mode")
+    /// must succeed end-to-end.
+    async fn try_enter_plan_mode_cloud_path(&self, goal: &str) -> Result<String, ()> {
+        let session_id = self
+            .active_session_id()
+            .filter(|sid| !sid.is_empty())
+            .ok_or(())?;
+        let token = self.cloud_token().ok_or(())?;
+        let client = self.remote_plan_client().map_err(|_| ())?;
+
+        let response = client
             .post_plans_json(
                 &token,
                 &json!({
@@ -1308,43 +1396,94 @@ impl ToolExecutor {
                 }),
             )
             .await
-        {
-            Ok(value) => value,
-            Err(err) => {
-                return format!(
-                    "Error: failed to enter plan mode: {}",
-                    crate::map_thin_err(err)
-                );
-            }
-        };
+            .map_err(|_| ())?;
 
-        let Some(plan_id) = response.get("plan_id").and_then(Value::as_str) else {
-            return "Error: failed to enter plan mode: create plan response missing plan_id."
-                .to_string();
-        };
-        // The new planning plan flips the write guard; force the cache to
-        // re-probe on the next mutation attempt (or, equivalently, seed
-        // it directly to `true` so the very first post-enter write is
-        // blocked without an extra round-trip).
+        let plan_id = response
+            .get("plan_id")
+            .and_then(Value::as_str)
+            .ok_or(())?
+            .to_string();
         *self.plan_mode_authoring_cache.write().await = Some(true);
-        format!(
+        Ok(format!(
             "Entered plan mode. plan_id={plan_id} goal=\"{goal}\". Write tools are now blocked — author the plan, then call exit_plan_mode when it's ready for execution."
-        )
+        ))
+    }
+
+    /// Stage `PermissionMode::Plan` on the pending slot so the host
+    /// applies it on the next turn boundary. Idempotent — repeated
+    /// calls within the same turn collapse to a single switch.
+    fn stage_pending_plan_mode(&self) {
+        if let Ok(mut slot) = self.pending_permission_mode_change.lock() {
+            *slot = Some(crate::permission_manager::PermissionMode::Plan);
+        }
     }
 
     async fn exit_plan_mode_remote(&self, args: &Value) -> String {
-        let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty()) else {
-            return "Error: exit_plan_mode requires an active session.".to_string();
-        };
-        let Some(token) = self.cloud_token() else {
-            return "Error: exit_plan_mode requires an authenticated cloud session.".to_string();
-        };
+        // `exit_plan_mode` has two structurally different sources of
+        // truth depending on how plan mode was entered:
+        //
+        // 1. Cloud workflow (`/plan "goal"` or the `enter_plan_mode`
+        //    tool): a `plans` row with `phase=planning` exists; the
+        //    server-side write guard depends on it; approving the
+        //    plan must POST `/plans/{id}/exit-plan-mode` so the row
+        //    flips to `refining` and the guard releases.
+        // 2. Shift+Tab / `/allow plan`: only flips the local
+        //    `perm_manager` to `Plan`. There is no cloud row, no
+        //    server-side guard, and the user expects exiting to be
+        //    purely local — zero network calls.
+        //
+        // Conflating both broke session d9b5119f: the user pressed
+        // Shift+Tab, the model produced a plan, called exit_plan_mode,
+        // and the cloud lookup returned "no active planning plan
+        // found" because none was ever created.
+        //
+        // The fix: probe the cloud row only when the prerequisites
+        // are present (active session + cloud token + reachable plan
+        // client + a planning row actually exists). If any of those
+        // are missing, fall through to the local path which uses the
+        // overlay + `pending_permission_mode_change` slot exactly the
+        // same way the cloud path does — it just skips the network
+        // round-trips and the `phase=planning` row update.
+        let plan_markdown = args
+            .get("plan")
+            .and_then(Value::as_str)
+            .or_else(|| args.get("plan_markdown").and_then(Value::as_str))
+            .or_else(|| args.get("plan_md").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|plan| !plan.is_empty())
+            .map(str::to_string);
+        let explicit_approved = args.get("approved").and_then(Value::as_bool);
 
-        let client = match self.remote_plan_client() {
-            Ok(client) => client,
-            Err(err) => return err,
-        };
-        let plans = match client
+        let cloud_plan_id = self.lookup_active_planning_plan_id().await;
+        match cloud_plan_id {
+            Some(plan_id) => {
+                self.exit_plan_mode_cloud_path(
+                    plan_id,
+                    plan_markdown.as_deref(),
+                    explicit_approved,
+                )
+                .await
+            }
+            None => {
+                self.exit_plan_mode_local_path(plan_markdown.as_deref(), explicit_approved)
+                    .await
+            }
+        }
+    }
+
+    /// Best-effort lookup for an active `phase=planning` cloud plan
+    /// for the current session. Returns `None` whenever any of the
+    /// prerequisites for the cloud workflow are absent (no session,
+    /// no token, no client, no row, network failure). The caller
+    /// uses `None` as the signal to fall back to the purely local
+    /// Shift+Tab plan-mode flow.
+    async fn lookup_active_planning_plan_id(&self) -> Option<String> {
+        let session_id = self
+            .active_session_id()
+            .filter(|sid| !sid.is_empty())?;
+        let token = self.cloud_token()?;
+        let client = self.remote_plan_client().ok()?;
+        let plans = client
             .get_plans_query_json(
                 &token,
                 &[
@@ -1354,36 +1493,45 @@ impl ToolExecutor {
                 ],
             )
             .await
-        {
-            Ok(value) => value,
-            Err(err) => {
-                return format!(
-                    "Error: failed to look up active planning session: {}",
-                    crate::map_thin_err(err)
-                );
-            }
-        };
-        let Some(plan_id) = plans
+            .ok()?;
+        plans
             .get("plans")
             .and_then(Value::as_array)
             .and_then(|plans| plans.first())
             .and_then(|plan| plan.get("plan_id"))
             .and_then(Value::as_str)
-        else {
-            return "Error: no active planning plan found for the current session.".to_string();
+            .map(str::to_string)
+    }
+
+    /// Cloud workflow exit path — there is a `phase=planning` row
+    /// in the `plans` table; flipping it to `refining` is the
+    /// authoritative signal that releases the server-side write
+    /// guard. The 4-option overlay still runs locally; only the
+    /// follow-up state mutation goes through the cloud API.
+    async fn exit_plan_mode_cloud_path(
+        &self,
+        plan_id: String,
+        plan_markdown: Option<&str>,
+        explicit_approved: Option<bool>,
+    ) -> String {
+        let Some(token) = self.cloud_token() else {
+            return "Error: exit_plan_mode lost the cloud token mid-flight.".to_string();
+        };
+        let client = match self.remote_plan_client() {
+            Ok(client) => client,
+            Err(err) => return err,
         };
 
-        let approved = args
-            .get("approved")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        let plan_markdown = args
-            .get("plan")
-            .and_then(Value::as_str)
-            .or_else(|| args.get("plan_markdown").and_then(Value::as_str))
-            .or_else(|| args.get("plan_md").and_then(Value::as_str))
-            .map(str::trim)
-            .filter(|plan| !plan.is_empty());
+        let (approved, follow_up_mode) = match explicit_approved {
+            Some(value) => (value, None),
+            None => match self
+                .resolve_exit_plan_mode_via_overlay(plan_markdown)
+                .await
+            {
+                Ok(decision) => decision,
+                Err(message) => return message,
+            },
+        };
 
         let mut body = json!({ "approved": approved });
         if let Some(plan_markdown) = plan_markdown {
@@ -1391,7 +1539,7 @@ impl ToolExecutor {
         }
 
         let response = match client
-            .post_plan_exit_mode_json(&token, plan_id, &body)
+            .post_plan_exit_mode_json(&token, &plan_id, &body)
             .await
         {
             Ok(value) => value,
@@ -1405,23 +1553,180 @@ impl ToolExecutor {
         let resolved_plan_id = response
             .get("plan_id")
             .and_then(Value::as_str)
-            .unwrap_or(plan_id);
+            .unwrap_or(&plan_id)
+            .to_string();
 
         if approved {
-            // Approval flips the guard off — seed the cache so the very
-            // next mutation tool runs without an extra probe.
             *self.plan_mode_authoring_cache.write().await = Some(false);
+            if let Some(mode) = follow_up_mode {
+                if let Ok(mut slot) = self.pending_permission_mode_change.lock() {
+                    *slot = Some(mode);
+                }
+            }
+            let mode_suffix = follow_up_mode
+                .map(|mode| format!(" Next turn will run in {mode} mode."))
+                .unwrap_or_default();
             format!(
-                "Exited plan mode. plan_id={resolved_plan_id} is approved; write tools unlocked. Use /plans/{resolved_plan_id}/execute to run the plan."
+                "Exited plan mode. plan_id={resolved_plan_id} is approved; write tools unlocked.{mode_suffix}"
             )
         } else {
-            // Rejection keeps the plan in `planning`; the guard stays on.
-            // Re-seed `true` to defend against any racy outside change to
-            // the cache state.
             *self.plan_mode_authoring_cache.write().await = Some(true);
             format!(
-                "Plan {resolved_plan_id} left open for another authoring pass. Write tools remain blocked."
+                "Plan {resolved_plan_id} left open for another authoring pass. Write tools remain blocked. Address the user's feedback and call exit_plan_mode again when ready."
             )
+        }
+    }
+
+    /// Local-only exit path (Shift+Tab / `/allow plan` entry). No
+    /// cloud row, no server-side guard, no network calls — purely
+    /// the overlay + `pending_permission_mode_change` slot. This is
+    /// `exit_plan_mode` here is a permission-state pivot driven by
+    /// user choice — no cloud row is required for it to succeed.
+    async fn exit_plan_mode_local_path(
+        &self,
+        plan_markdown: Option<&str>,
+        explicit_approved: Option<bool>,
+    ) -> String {
+        let (approved, follow_up_mode) = match explicit_approved {
+            Some(value) => (value, None),
+            None => match self
+                .resolve_exit_plan_mode_via_overlay(plan_markdown)
+                .await
+            {
+                Ok(decision) => decision,
+                Err(message) => return message,
+            },
+        };
+
+        if approved {
+            // Local guard cache is informational only here — there
+            // is no cloud guard to mirror. Setting it to `Some(false)`
+            // keeps the cached flag consistent with "writes are
+            // unlocked" so any tool that consults it reads the same
+            // outcome the cloud path would have set.
+            *self.plan_mode_authoring_cache.write().await = Some(false);
+            if let Some(mode) = follow_up_mode {
+                if let Ok(mut slot) = self.pending_permission_mode_change.lock() {
+                    *slot = Some(mode);
+                }
+            }
+            let plan_suffix = match plan_markdown {
+                Some(plan) if !plan.is_empty() => {
+                    format!(" Plan recorded:\n{plan}")
+                }
+                _ => String::new(),
+            };
+            let mode_suffix = follow_up_mode
+                .map(|mode| format!(" Next turn will run in {mode} mode."))
+                .unwrap_or_default();
+            format!("Exited plan mode; user approved.{mode_suffix}{plan_suffix}")
+        } else {
+            // Keep planning: the local perm_manager mode is unchanged
+            // (the host never staged a switch). The cache flag
+            // mirrors "writes still gated" for downstream consultation.
+            *self.plan_mode_authoring_cache.write().await = Some(true);
+            "Plan left open for another authoring pass. Address the user's feedback and call exit_plan_mode again when ready.".to_string()
+        }
+    }
+
+    /// Surface the Approve / Keep-planning overlay through the
+    /// per-turn `ask_user` channel. Returns `(approved, next_mode)`
+    /// when the user submits an answer; `Err(message)` when the
+    /// channel is missing (headless context) or the prompt is
+    /// cancelled — in that case the model sees the message as the
+    /// tool result and stays in plan mode.
+    async fn resolve_exit_plan_mode_via_overlay(
+        &self,
+        plan_markdown: Option<&str>,
+    ) -> Result<(bool, Option<crate::permission_manager::PermissionMode>), String> {
+        use crate::chat_stream::{AskUserRequest, AskUserResponse};
+        use crate::permission_manager::PermissionMode;
+
+        let tx = self
+            .ask_user_request_tx
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let Some(tx) = tx else {
+            return Err(
+                "Error: exit_plan_mode requires an interactive TUI overlay. Re-call with `approved=true` or `approved=false` for headless mode."
+                    .to_string(),
+            );
+        };
+
+        const APPROVE_AUTO: &str = "Approve & start in auto";
+        const APPROVE_EDIT: &str = "Approve & start in edit (auto-approve workspace edits)";
+        const APPROVE_DEFAULT: &str = "Approve & start in default (ask before each write)";
+        const KEEP_PLANNING: &str = "Keep planning — let me give feedback";
+        const QUESTION: &str =
+            "Plan ready. Approve and choose execution mode, or keep planning for feedback?";
+
+        let plan_preview = plan_markdown.unwrap_or("(plan body was empty)").to_string();
+        let prompt = astra_tools::AskUserPrompt {
+            context: Some(plan_preview),
+            questions: vec![astra_tools::AskUserQuestion {
+                header: "Plan".to_string(),
+                question: QUESTION.to_string(),
+                options: vec![
+                    astra_tools::AskUserChoice {
+                        label: APPROVE_AUTO.to_string(),
+                        description: Some("All tool calls auto-approved".to_string()),
+                        preview: None,
+                    },
+                    astra_tools::AskUserChoice {
+                        label: APPROVE_EDIT.to_string(),
+                        description: Some(
+                            "Auto-approve workspace edits; still ask for shell and external writes"
+                                .to_string(),
+                        ),
+                        preview: None,
+                    },
+                    astra_tools::AskUserChoice {
+                        label: APPROVE_DEFAULT.to_string(),
+                        description: Some("Ask before write/execute tools".to_string()),
+                        preview: None,
+                    },
+                    astra_tools::AskUserChoice {
+                        label: KEEP_PLANNING.to_string(),
+                        description: Some("Plan stays open; provide feedback to refine".to_string()),
+                        preview: None,
+                    },
+                ],
+                multi_select: false,
+                allow_freeform: false,
+            }],
+        };
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        if tx
+            .send(AskUserRequest {
+                prompt,
+                response_tx,
+            })
+            .is_err()
+        {
+            return Err("Error: exit_plan_mode overlay sink is closed.".to_string());
+        }
+
+        let response = response_rx.await.unwrap_or(AskUserResponse::Cancelled);
+        match response {
+            AskUserResponse::Submitted(answers) => {
+                let label = answers
+                    .answers
+                    .first()
+                    .and_then(|answer| answer.answers.first().cloned())
+                    .unwrap_or_default();
+                match label.as_str() {
+                    APPROVE_AUTO => Ok((true, Some(PermissionMode::Auto))),
+                    APPROVE_EDIT => Ok((true, Some(PermissionMode::AcceptEdits))),
+                    APPROVE_DEFAULT => Ok((true, Some(PermissionMode::Prompt))),
+                    KEEP_PLANNING => Ok((false, None)),
+                    other => Err(format!(
+                        "Error: exit_plan_mode received unexpected overlay choice '{other}'."
+                    )),
+                }
+            }
+            AskUserResponse::Cancelled => Ok((false, None)),
         }
     }
 

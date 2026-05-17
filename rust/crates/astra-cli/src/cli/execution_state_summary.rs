@@ -37,7 +37,7 @@ pub(crate) fn format_for_session_state(
     format_summary(ExecutionStateSummaryInput {
         model: state.model.as_deref(),
         last_turn_interrupted: state.last_turn_interrupted,
-        plan_mode: state.plan_mode.as_ref(),
+        plan_mode: state.cloud_plan_mirror.as_ref(),
         executing_plan: state.executing_plan.as_ref(),
         executing_plan_goal: state.executing_plan_goal.as_deref(),
         plan_execution_rounds: state.plan_execution_rounds,

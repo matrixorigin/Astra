@@ -271,9 +271,9 @@ struct PlanModeUiSnapshot {
 
 fn capture_plan_mode_ui_snapshot(state: &crate::session_state::SessionState) -> PlanModeUiSnapshot {
     PlanModeUiSnapshot {
-        active: state.plan_mode.is_some(),
+        active: state.plan_mode_active(),
         goal: state
-            .plan_mode
+            .cloud_plan_mirror
             .as_ref()
             .map(|ps| ps.goal.trim().to_string())
             .unwrap_or_default(),
@@ -396,6 +396,7 @@ fn refresh_footer_from_state(
         .as_ref()
         .map(|sid| sid[..8.min(sid.len())].to_string());
     bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
+    bottom_pane.footer.plan_mode_active = state.plan_mode_active();
 }
 
 /// Replay a session's JSONL transcript into a fresh `ChatWidget`,
@@ -845,6 +846,20 @@ pub(crate) async fn run_tui_repl(
                             continue;
                         }
                         match bottom_pane.handle_key(key) {
+                            BottomPaneAction::CyclePermissionMode => {
+                                let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                let next_mode = slash_dispatch::next_permission_mode_for_cycle(
+                                    state.perm_manager.mode(),
+                                );
+                                state.perm_manager.set_mode(next_mode);
+                                chat_widget.commit_system(
+                                    crate::tui::history_cell::system::SystemCell::response(
+                                        slash_dispatch::permission_mode_feedback(next_mode),
+                                    ),
+                                );
+                                refresh_footer_from_state(&mut bottom_pane, &state);
+                                flush_chat_widget(&mut guard, &mut chat_widget, w);
+                            }
                             BottomPaneAction::SubmitInput(text) => {
                                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                 let flush_user_immediately =
@@ -1250,7 +1265,7 @@ pub(crate) async fn run_tui_repl(
                                                 }
                                             }
                                             if state.executing_plan.is_some()
-                                                && state.plan_mode.is_none()
+                                                && !state.plan_mode_active()
                                                 && crate::plan_commands::abandon_plan_execution(
                                                     &mut state,
                                                 )

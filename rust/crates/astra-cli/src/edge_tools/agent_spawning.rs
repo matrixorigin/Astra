@@ -216,20 +216,14 @@ pub async fn handle_get_agent_result_tool(args: &Value, ctx: Option<&SpawnAgentC
     // returns as soon as the child finishes (or times out).
     let timeout = std::time::Duration::from_secs(120);
     match ctx.spawner.wait_for_agent(agent_id, timeout).await {
-        Some(AgentStatus::Completed {
-            result,
-            finish_reason,
-        }) => render_completed_agent_result(agent_id, &result, finish_reason.as_deref()),
-        Some(AgentStatus::Failed {
-            error,
-            finish_reason,
-        }) => {
-            let reason = finish_reason.as_deref().unwrap_or("failed");
+        Some(AgentStatus::Completed { result }) => {
+            render_completed_agent_result(agent_id, &result, None)
+        }
+        Some(AgentStatus::Failed { error }) => {
             json!({
                 "status": "failed",
                 "agent_id": agent_id,
                 "error": error,
-                "finish_reason": reason,
             })
             .to_string()
         }
@@ -634,11 +628,9 @@ mod tests {
             AgentStatus::Cancelled,
             AgentStatus::Failed {
                 error: "x".into(),
-                finish_reason: None,
             },
             AgentStatus::Completed {
                 result: "done".into(),
-                finish_reason: None,
             },
         ] {
             let out = render_wait_timeout_outcome("ag", Some(&terminal), Duration::from_secs(30));

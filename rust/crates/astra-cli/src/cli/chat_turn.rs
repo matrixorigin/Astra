@@ -1881,7 +1881,7 @@ async fn apply_turn_success_async(
             astra_core::agent_warn!("csl", "persist failed: {e}");
         }
     }
-    if state.plan_mode.is_some()
+    if state.plan_mode_active()
         && let Some(token) = super::session_runtime::current_access_token(profile)
         && let Err(error) =
             crate::plan_lifecycle::sync_remote_plan_mode_state(api, &token, state).await
@@ -4915,7 +4915,12 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = SessionState::default();
         state.session_id = Some("sess-1".to_string());
-        state.plan_mode = Some(astra_runtime::plan::PlanModeState::new(
+        // Cloud plan-mode entry: both signals are set — perm_manager
+        // gates the sync, mirror holds the goal text.
+        state
+            .perm_manager
+            .set_mode(crate::permission_manager::PermissionMode::Plan);
+        state.cloud_plan_mirror = Some(astra_runtime::plan::PlanModeState::new(
             "Ship auth".to_string(),
         ));
         let result = stub_stream_result("Updated the plan.");
@@ -4938,7 +4943,7 @@ mod tests {
             .expect("sync failure should be recorded");
         assert!(error.contains("500"), "got: {error}");
         assert_eq!(
-            state.plan_mode.as_ref().map(|plan| plan.goal.as_str()),
+            state.cloud_plan_mirror.as_ref().map(|plan| plan.goal.as_str()),
             Some("Ship auth"),
             "sync failure should preserve the last known mirror until recovery"
         );
@@ -5465,9 +5470,15 @@ mod tests {
         let (_tmp, _g) = isolated_sessions_dir();
 
         let mut state = SessionState {
-            plan_mode: Some(astra_runtime::plan::PlanModeState::new("goal".to_string())),
+            cloud_plan_mirror: Some(astra_runtime::plan::PlanModeState::new("goal".to_string())),
             ..Default::default()
         };
+        // Plan-mode follow-up suppression now keys off perm_manager
+        // (single source of truth, invariant I6) instead of the
+        // mirror's presence.
+        state
+            .perm_manager
+            .set_mode(crate::permission_manager::PermissionMode::Plan);
         let result = stub_stream_result("Plan updated.");
 
         apply_turn_success(&mut state, None, "continue", result, Instant::now());

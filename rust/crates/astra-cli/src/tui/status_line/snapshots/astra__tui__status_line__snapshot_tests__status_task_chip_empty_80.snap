@@ -2,4 +2,4 @@
 source: crates/astra-cli/src/tui/status_line/snapshot_tests.rs
 expression: "render_ctx(&ctx, 80)"
 ---
-  / @ $ · Ctrl+O transcript                      sonnet-4.6 · ~/projects/astra
+  / @ $ · ⇧Tab mode · Ctrl+O transcript · defaultsonnet-4.6 · ~/projects/astra

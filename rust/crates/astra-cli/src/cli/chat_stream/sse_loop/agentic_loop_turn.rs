@@ -297,6 +297,10 @@ struct PrepareChatTurnRequest<'a> {
     /// so the per-turn SelfModel ingest can read `hub.tuning().recent_signals()`.
     observability_hub: Option<&'a Arc<astra_runtime::observability_integration::ObservabilityHub>>,
     append_system_prompt: Option<&'a str>,
+    /// Whether the current permission mode is `Plan`. When true the schema-
+    /// preparation step adds every mutating tool to `restricted_tools` so the
+    /// model only sees read-only + plan-control tools (`exit_plan_mode` etc.).
+    plan_mode_active: bool,
 }
 
 pub(crate) fn turn_policy_from_payload_edge_tools(
@@ -525,6 +529,25 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             allowed,
             ctx.all_schemas,
         );
+    }
+
+    // Plan mode: hide every mutating tool from the model. Read-only tools
+    // and the dedicated plan-control tools (`enter_plan_mode` /
+    // `exit_plan_mode`) stay in the schema so the model can investigate
+    // and surface a plan via `exit_plan_mode(plan="...")`.
+    //
+    // We push the names into `restricted_tools` instead of trimming
+    // `turn_schemas` directly so the existing
+    // `attach_filtered_edge_tools` path is the single source of truth
+    // for what reaches the wire — selector hints, skill injection, and
+    // plan-mode all funnel through the same exclusion set.
+    if ctx.plan_mode_active {
+        let category_registry = astra_turn_core::tool_categories::registry();
+        let plan_excluded = astra_turn_core::tool_schema_prune::plan_mode_restrictions(
+            &turn_schemas,
+            |name| category_registry.is_read_only(name),
+        );
+        ctx.restricted_tools.extend(plan_excluded);
     }
 
     let selected_tool_costs: Vec<(String, u32)> = selection_report
@@ -1135,6 +1158,8 @@ pub(crate) async fn fetch_chat_turn_sse(
             recent_rejections: perm_manager.recent_rejections(),
             observability_hub,
             append_system_prompt,
+            plan_mode_active: perm_manager.mode()
+                == crate::permission_manager::PermissionMode::Plan,
         },
     )
     .await?;

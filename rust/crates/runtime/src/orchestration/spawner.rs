@@ -786,12 +786,10 @@ impl DynamicAgentSpawner {
                                     .error
                                     .clone()
                                     .unwrap_or_else(|| "agent run failed".to_string()),
-                                finish_reason: Some(run_result.finish_reason.clone()),
                             },
                             "waiting" => AgentStatus::Idle,
                             _ => AgentStatus::Completed {
                                 result: run_result.output.clone().unwrap_or_default(),
-                                finish_reason: Some(run_result.finish_reason.clone()),
                             },
                         };
                         self.update_status(&agent_id, status).await;
@@ -835,7 +833,6 @@ impl DynamicAgentSpawner {
                             &agent_id,
                             AgentStatus::Failed {
                                 error: e.clone(),
-                                finish_reason: None,
                             },
                         )
                         .await;
@@ -879,12 +876,10 @@ impl DynamicAgentSpawner {
                             .error
                             .clone()
                             .unwrap_or_else(|| "agent run failed".to_string()),
-                        finish_reason: Some(run_result.finish_reason.clone()),
                     },
                     "waiting" => AgentStatus::Idle,
                     _ => AgentStatus::Completed {
                         result: run_result.output.unwrap_or_default(),
-                        finish_reason: Some(run_result.finish_reason.clone()),
                     },
                 };
                 // Persist to journal before updating status
@@ -907,7 +902,6 @@ impl DynamicAgentSpawner {
                     agent_id,
                     AgentStatus::Failed {
                         error: e,
-                        finish_reason: None,
                     },
                 )
                 .await;

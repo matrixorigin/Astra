@@ -753,7 +753,7 @@ pub(super) async fn handle_state_command(
                 state.history.len(),
                 mem_note,
             );
-            if state.plan_mode.is_some() || state.executing_plan.is_some() {
+            if state.plan_mode_active() || state.executing_plan.is_some() {
                 eprintln!(
                     "{}",
                     "  Tip: Plan context was shortened — if steps feel stale, refresh `/plan` or your plan view."

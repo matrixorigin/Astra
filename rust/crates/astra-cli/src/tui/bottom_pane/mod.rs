@@ -30,6 +30,8 @@ mod config_edit_tests;
 #[cfg(test)]
 mod hint_tests;
 #[cfg(test)]
+mod keyboard_tests;
+#[cfg(test)]
 mod mention_integration_tests;
 #[cfg(test)]
 mod slash_integration_tests;
@@ -605,6 +607,9 @@ impl BottomPane {
         if let Some(a) = self.handle_mention_menu_key(key) {
             return a;
         }
+        if key.code == KeyCode::BackTab {
+            return BottomPaneAction::CyclePermissionMode;
+        }
         self.route_to_composer(key)
     }
 
@@ -1084,6 +1089,7 @@ pub(crate) enum ApprovalActivation {
 #[derive(Debug)]
 pub(crate) enum BottomPaneAction {
     SubmitInput(String),
+    CyclePermissionMode,
     ViewCompleted {
         result: Option<String>,
         reopen: Option<String>,

@@ -60,7 +60,7 @@ pub(crate) fn is_plan_command_available(state: &SessionState, command: &ParsedPl
 
 pub(crate) fn render_plan_snapshot(state: &SessionState) -> Result<String, String> {
     if let Some(plan_mode) = state
-        .plan_mode
+        .cloud_plan_mirror
         .as_ref()
         .filter(|plan_mode| !plan_mode.goal.trim().is_empty())
     {
@@ -123,7 +123,7 @@ pub(crate) async fn prepare_plan_execution(
 ) -> Result<(), String> {
     let from_authoring = has_authoring_plan(state);
     let (plan, goal) = if let Some(plan_mode) = state
-        .plan_mode
+        .cloud_plan_mirror
         .as_ref()
         .filter(|plan_mode| !plan_mode.goal.trim().is_empty())
     {
@@ -270,7 +270,7 @@ enum PlanTarget {
 
 fn has_authoring_plan(state: &SessionState) -> bool {
     state
-        .plan_mode
+        .cloud_plan_mirror
         .as_ref()
         .is_some_and(|plan_mode| !plan_mode.goal.trim().is_empty())
 }
@@ -388,7 +388,7 @@ fn rewind_local_plan(
     match target {
         PlanTarget::Authoring => {
             let plan_mode = state
-                .plan_mode
+                .cloud_plan_mirror
                 .as_mut()
                 .ok_or_else(|| "No active plan to rewind.".to_string())?;
             let start_idx = resolve_rewind_start_index(&plan_mode.plan, anchor)?;
@@ -415,7 +415,7 @@ fn apply_rewound_plan(
 ) {
     match target {
         PlanTarget::Authoring => {
-            if let Some(plan_mode) = state.plan_mode.as_mut() {
+            if let Some(plan_mode) = state.cloud_plan_mirror.as_mut() {
                 plan_mode.plan = plan;
                 plan_mode.modified = true;
                 if let Some(version) = version {
@@ -511,7 +511,7 @@ mod tests {
     #[test]
     fn correction_commands_only_intercept_paused_execution() {
         let mut state = crate::SessionState::default();
-        state.plan_mode = Some(sample_plan_mode("Ship auth"));
+        state.cloud_plan_mirror = Some(sample_plan_mode("Ship auth"));
         assert!(is_plan_command_available(&state, &ParsedPlanCommand::Go));
         assert!(!is_plan_command_available(
             &state,
@@ -595,13 +595,13 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = crate::SessionState::default();
         state.session_id = Some("sess-1".into());
-        state.plan_mode = Some(sample_plan_mode("Ship auth"));
+        state.cloud_plan_mirror = Some(sample_plan_mode("Ship auth"));
 
         prepare_plan_execution(&mut state, &api, "token")
             .await
             .unwrap();
 
-        assert!(state.plan_mode.is_none());
+        assert!(state.cloud_plan_mirror.is_none());
         assert_eq!(state.executing_plan_goal.as_deref(), Some("Ship auth"));
         assert_eq!(state.executing_plan_id.as_deref(), Some("plan-7"));
         assert_eq!(state.plan_execution_rounds, 1);

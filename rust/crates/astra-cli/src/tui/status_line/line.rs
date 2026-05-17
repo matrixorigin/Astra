@@ -24,11 +24,11 @@ pub(crate) enum PermissionMode {
 impl PermissionMode {
     pub fn chip_text(self) -> &'static str {
         match self {
-            Self::Ask => "",
+            Self::Ask => "default",
             Self::Auto => "⚡auto",
-            Self::Plan => "plan",
-            Self::AcceptEdits => "✎edits",
-            Self::Deny => "⚡deny",
+            Self::Plan => "🔍plan",
+            Self::AcceptEdits => "✎edit",
+            Self::Deny => "⛔deny",
         }
     }
 }
@@ -48,6 +48,7 @@ pub(crate) struct StatusContext {
     pub git_branch: Option<String>,
     /// Number of approvals currently awaiting a user decision.
     pub pending_approvals: usize,
+    pub plan_mode_active: bool,
     /// `(open, total)` task counts for the footer task-board chip.
     /// `None` when the board has no tasks — chip hides rather than
     /// wasting space with `0/0`.
@@ -96,9 +97,9 @@ pub(crate) struct StatusLine {
 }
 
 /// Full idle hint. Shown when the terminal is wide enough.
-pub(crate) const IDLE_HINT_FULL: &str = "/ @ $ · Ctrl+O transcript";
+pub(crate) const IDLE_HINT_FULL: &str = "/ @ $ · ⇧Tab mode · Ctrl+O transcript";
 /// Tiny idle hint for very narrow terminals.
-pub(crate) const IDLE_HINT_TINY: &str = "/ @ $";
+pub(crate) const IDLE_HINT_TINY: &str = "/ @ $ · ⇧Tab";
 
 /// Threshold below which the budget chip is dim, above which it warns.
 const BUDGET_WARN_PERCENT: f32 = 75.0;
@@ -125,7 +126,10 @@ impl StatusLine {
         out.left.push(Segment::styled(hint_text, dim));
 
         match ctx.permission_mode {
-            PermissionMode::Ask => {}
+            PermissionMode::Ask => {
+                out.left
+                    .push(Segment::styled(PermissionMode::Ask.chip_text(), dim));
+            }
             PermissionMode::Auto => {
                 out.left.push(Segment::styled(
                     PermissionMode::Auto.chip_text(),
@@ -150,6 +154,13 @@ impl StatusLine {
                     Style::default().fg(Color::Red),
                 ));
             }
+        }
+
+        if ctx.plan_mode_active {
+            out.left.push(Segment::styled(
+                "📋plan on",
+                Style::default().fg(Color::Magenta),
+            ));
         }
 
         if ctx.pending_approvals > 0 {

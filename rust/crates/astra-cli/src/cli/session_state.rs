@@ -172,11 +172,22 @@ pub(crate) struct SessionState {
     /// cumulative per-tool selection/quality counters.
     pub tool_quality_tracker:
         Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
-    /// Plan Mode state — when Some, REPL is in interactive plan editing mode.
-    pub plan_mode: Option<plan::PlanModeState>,
-    /// Last remote mirror-sync failure for the active plan-mode session.
-    /// When set, local plan content may be stale and execution should be blocked
-    /// until the mirror is refreshed by a later successful sync.
+    /// Local mirror of the cloud `plans` row when plan mode was
+    /// entered through the cloud workflow (`/plan "goal"` or the
+    /// `enter_plan_mode` tool against an authenticated cloud
+    /// session). `None` for the Shift+Tab / offline path — those
+    /// runs hold no plan goal text and rely entirely on
+    /// `perm_manager.mode() == Plan`.
+    ///
+    /// Step 4 invariant I6: this field is **not** the source of
+    /// truth for "am I in plan mode". Use `state.plan_mode_active()`
+    /// (which reads `perm_manager`) for that. The mirror only
+    /// supplies the goal/plan-text consumers need (status line,
+    /// `execution_state_summary`, plan-monitor UI).
+    pub cloud_plan_mirror: Option<plan::PlanModeState>,
+    /// Last remote mirror-sync failure for the active cloud plan.
+    /// When set, the mirror in `cloud_plan_mirror` may be stale and
+    /// callers that want fresh data should re-sync before reading.
     pub plan_mode_sync_error: Option<String>,
     /// Plan being auto-executed — subtasks sent sequentially through chat.
     pub executing_plan: Option<astra_services::task_orchestrator::TaskPlan>,
@@ -481,7 +492,7 @@ impl Default for SessionState {
             tool_health_entries: Vec::new(),
             synced_tool_health_entries: Vec::new(),
             tool_quality_tracker: None,
-            plan_mode: None,
+            cloud_plan_mirror: None,
             plan_mode_sync_error: None,
             executing_plan: None,
             plan_execution_config: None,
@@ -606,5 +617,55 @@ impl SessionState {
                 );
             }
         }
+    }
+
+    /// Single source of truth for "is the CLI session currently in
+    /// plan mode?".
+    ///
+    /// Step 4 invariant I6/I7: callers must not peek at
+    /// `cloud_plan_mirror.is_some()` to decide plan-mode state —
+    /// that field is the cloud row mirror, present only when entry
+    /// went through the cloud workflow. The Shift+Tab / offline
+    /// path leaves the mirror as `None` while still being in plan
+    /// mode. The permission manager is the only authoritative
+    /// signal; UI / nudge / status-line consumers must call this
+    /// helper.
+    pub fn plan_mode_active(&self) -> bool {
+        self.perm_manager.mode() == crate::permission_manager::PermissionMode::Plan
+    }
+}
+
+#[cfg(test)]
+mod plan_mode_invariant_tests {
+    use super::*;
+
+    /// Invariant I7: TUI / nudge / status-line consumers can ask
+    /// `state.plan_mode_active()` and always get a fresh truth
+    /// derived from `perm_manager.mode()`. No cached field is
+    /// allowed to drift.
+    #[test]
+    fn plan_mode_active_tracks_perm_manager_only() {
+        let mut state = SessionState::default();
+        // Default is `Prompt`, not Plan.
+        assert!(
+            !state.plan_mode_active(),
+            "fresh session must not report plan_mode_active"
+        );
+
+        state
+            .perm_manager
+            .set_mode(crate::permission_manager::PermissionMode::Plan);
+        assert!(
+            state.plan_mode_active(),
+            "switching perm_manager to Plan must immediately surface as plan_mode_active"
+        );
+
+        state
+            .perm_manager
+            .set_mode(crate::permission_manager::PermissionMode::Auto);
+        assert!(
+            !state.plan_mode_active(),
+            "switching back must clear plan_mode_active without any other state change"
+        );
     }
 }

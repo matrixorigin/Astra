@@ -232,105 +232,35 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             use crate::permission_manager::PermissionMode;
             match args {
                 "" => {
-                    let current = ctx.state.perm_manager.mode();
-                    let rules_count = ctx.state.perm_manager.rules_summary().lines().count();
-                    let audit_count = astra_turn_core::permission_audit::counts();
-                    let audit_total = audit_count.0 + audit_count.1 + audit_count.2;
-                    let items = vec![
-                        SelectionItem {
-                            name: "Auto".into(),
-                            description: Some("All tools auto-approved".into()),
-                            is_current: current == PermissionMode::Auto,
-                        },
-                        SelectionItem {
-                            name: "Plan".into(),
-                            description: Some(
-                                "Read-only investigation mode; write and shell mutations are denied"
-                                    .into(),
-                            ),
-                            is_current: current == PermissionMode::Plan,
-                        },
-                        SelectionItem {
-                            name: "Accept Edits".into(),
-                            description: Some(
-                                "Auto-approve workspace-local edits; still ask for shell/external writes"
-                                    .into(),
-                            ),
-                            is_current: current == PermissionMode::AcceptEdits,
-                        },
-                        SelectionItem {
-                            name: "Prompt".into(),
-                            description: Some("Ask before write/execute tools".into()),
-                            is_current: current == PermissionMode::Prompt,
-                        },
-                        SelectionItem {
-                            name: "Deny".into(),
-                            description: Some("Deny all tool calls".into()),
-                            is_current: current == PermissionMode::Deny,
-                        },
-                        SelectionItem {
-                            name: "Rules".into(),
-                            description: Some(format!(
-                                "View permission rules ({rules_count} lines)"
-                            )),
-                            is_current: false,
-                        },
-                        SelectionItem {
-                            name: "Trust Workspace".into(),
-                            description: Some(
-                                "Apply saved workspace rules after hash validation".into(),
-                            ),
-                            is_current: false,
-                        },
-                        SelectionItem {
-                            name: "Untrust Workspace".into(),
-                            description: Some(
-                                "Ignore saved workspace rules for this workspace".into(),
-                            ),
-                            is_current: false,
-                        },
-                        SelectionItem {
-                            name: "Trace".into(),
-                            description: Some(format!(
-                                "View permission audit events ({audit_total})"
-                            )),
-                            is_current: false,
-                        },
-                    ];
-                    ctx.bottom_pane.push_view(Box::new(ListSelectionView::new(
-                        items,
-                        Some(format!("Permission mode: {current}")),
-                    )));
+                    ctx.bottom_pane
+                        .push_view(Box::new(build_permission_mode_picker(
+                            ctx.state.perm_manager.mode(),
+                        )));
                     SlashResult::Handled
                 }
                 "all" | "auto" => {
                     ctx.state.perm_manager.set_mode(PermissionMode::Auto);
-                    ctx.show_response("Permission mode → auto (all tools auto-approved)".into());
+                    ctx.show_response(permission_mode_feedback(PermissionMode::Auto).into());
                     SlashResult::Handled
                 }
                 "plan" => {
                     ctx.state.perm_manager.set_mode(PermissionMode::Plan);
-                    ctx.show_response(
-                        "Permission mode → plan (read-only investigation mode)".into(),
-                    );
+                    ctx.show_response(permission_mode_feedback(PermissionMode::Plan).into());
                     SlashResult::Handled
                 }
-                "accept_edits" | "accept-edits" => {
+                "accept_edits" | "accept-edits" | "edit" => {
                     ctx.state.perm_manager.set_mode(PermissionMode::AcceptEdits);
-                    ctx.show_response(
-                        "Permission mode → accept_edits (workspace-local edits auto-approved)"
-                            .into(),
-                    );
+                    ctx.show_response(permission_mode_feedback(PermissionMode::AcceptEdits).into());
                     SlashResult::Handled
                 }
-                "prompt" => {
+                "prompt" | "default" => {
                     ctx.state.perm_manager.set_mode(PermissionMode::Prompt);
-                    ctx.show_response("Permission mode → prompt".into());
+                    ctx.show_response(permission_mode_feedback(PermissionMode::Prompt).into());
                     SlashResult::Handled
                 }
                 "deny" => {
                     ctx.state.perm_manager.set_mode(PermissionMode::Deny);
-                    ctx.show_response("Permission mode → deny".into());
+                    ctx.show_response(permission_mode_feedback(PermissionMode::Deny).into());
                     SlashResult::Handled
                 }
                 "rules" | "status" => {
@@ -389,7 +319,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 }
                 _ => {
                     ctx.show_error(format!(
-                        "Unknown mode '{args}'. Use: auto, plan, accept_edits, prompt, deny, all, rules, trust, untrust, trace"
+                        "Unknown mode '{args}'. Use: auto, edit, plan, default, deny, all, rules, trust, untrust, trace"
                     ));
                     SlashResult::Handled
                 }
@@ -880,6 +810,81 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
     }
 }
 
+fn build_permission_mode_picker(
+    current: crate::permission_manager::PermissionMode,
+) -> ListSelectionView {
+    let items = vec![
+        SelectionItem {
+            name: "Default".into(),
+            description: Some("Ask before write or execute tools".into()),
+            is_current: current == crate::permission_manager::PermissionMode::Prompt,
+        },
+        SelectionItem {
+            name: "Auto".into(),
+            description: Some("All tools auto-approved".into()),
+            is_current: current == crate::permission_manager::PermissionMode::Auto,
+        },
+        SelectionItem {
+            name: "Edit".into(),
+            description: Some(
+                "Auto-approve workspace edits; still ask for shell and external writes".into(),
+            ),
+            is_current: current == crate::permission_manager::PermissionMode::AcceptEdits,
+        },
+        SelectionItem {
+            name: "Plan".into(),
+            description: Some(
+                "Read-only investigation mode; writes and shell mutations are denied".into(),
+            ),
+            is_current: current == crate::permission_manager::PermissionMode::Plan,
+        },
+        SelectionItem {
+            name: "Deny".into(),
+            description: Some("Deny all tool calls".into()),
+            is_current: current == crate::permission_manager::PermissionMode::Deny,
+        },
+    ];
+    ListSelectionView::new(items, Some("Modes".into())).with_footer_hint(
+        "Shift+Tab cycles default → auto → edit → plan · /allow rules · /allow trust · /allow trace",
+    )
+}
+
+pub(crate) fn next_permission_mode_for_cycle(
+    current: crate::permission_manager::PermissionMode,
+) -> crate::permission_manager::PermissionMode {
+    use crate::permission_manager::PermissionMode;
+
+    match current {
+        PermissionMode::Prompt | PermissionMode::Deny => PermissionMode::Auto,
+        PermissionMode::Auto => PermissionMode::AcceptEdits,
+        PermissionMode::AcceptEdits => PermissionMode::Plan,
+        PermissionMode::Plan => PermissionMode::Prompt,
+    }
+}
+
+pub(crate) fn permission_mode_feedback(
+    mode: crate::permission_manager::PermissionMode,
+) -> &'static str {
+    use crate::permission_manager::PermissionMode;
+
+    match mode {
+        PermissionMode::Prompt => "Mode → default",
+        PermissionMode::Auto => "Mode → auto",
+        PermissionMode::AcceptEdits => "Mode → edit",
+        PermissionMode::Plan => "Mode → plan",
+        PermissionMode::Deny => "Mode → deny",
+    }
+}
+
+fn apply_permission_mode_selection(
+    state: &mut SessionState,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
+    mode: crate::permission_manager::PermissionMode,
+) {
+    state.perm_manager.set_mode(mode);
+    chat_widget.commit_system(SystemCell::response(permission_mode_feedback(mode)));
+}
+
 /// Cheat sheet content for `/panels`. Pure — separate from the
 /// dispatch wiring so it can be snapshot-tested.
 pub(crate) fn build_panels_cheat_sheet_lines() -> Vec<String> {
@@ -1034,33 +1039,43 @@ pub(crate) fn handle_view_result(
     // Permission menu
     match name {
         "Auto" => {
-            use crate::permission_manager::PermissionMode;
-            state.perm_manager.set_mode(PermissionMode::Auto);
-            chat_widget.commit_system(SystemCell::response("Permission mode → auto"));
+            apply_permission_mode_selection(
+                state,
+                chat_widget,
+                crate::permission_manager::PermissionMode::Auto,
+            );
             return;
         }
-        "Accept Edits" => {
-            use crate::permission_manager::PermissionMode;
-            state.perm_manager.set_mode(PermissionMode::AcceptEdits);
-            chat_widget.commit_system(SystemCell::response("Permission mode → accept_edits"));
+        "Edit" => {
+            apply_permission_mode_selection(
+                state,
+                chat_widget,
+                crate::permission_manager::PermissionMode::AcceptEdits,
+            );
+            return;
+        }
+        "Default" => {
+            apply_permission_mode_selection(
+                state,
+                chat_widget,
+                crate::permission_manager::PermissionMode::Prompt,
+            );
             return;
         }
         "Plan" => {
-            use crate::permission_manager::PermissionMode;
-            state.perm_manager.set_mode(PermissionMode::Plan);
-            chat_widget.commit_system(SystemCell::response("Permission mode → plan"));
-            return;
-        }
-        "Prompt" => {
-            use crate::permission_manager::PermissionMode;
-            state.perm_manager.set_mode(PermissionMode::Prompt);
-            chat_widget.commit_system(SystemCell::response("Permission mode → prompt"));
+            apply_permission_mode_selection(
+                state,
+                chat_widget,
+                crate::permission_manager::PermissionMode::Plan,
+            );
             return;
         }
         "Deny" => {
-            use crate::permission_manager::PermissionMode;
-            state.perm_manager.set_mode(PermissionMode::Deny);
-            chat_widget.commit_system(SystemCell::response("Permission mode → deny"));
+            apply_permission_mode_selection(
+                state,
+                chat_widget,
+                crate::permission_manager::PermissionMode::Deny,
+            );
             return;
         }
         "Rules" => {
@@ -2387,7 +2402,7 @@ mod context_history_tests {
 
 #[cfg(test)]
 mod view_result_tests {
-    use super::handle_view_result;
+    use super::{handle_view_result, next_permission_mode_for_cycle};
     use crate::permission_manager::PermissionMode;
     use crate::session_state::SessionState;
     use crate::tui::bottom_pane::BottomPane;
@@ -2431,27 +2446,22 @@ mod view_result_tests {
         assert_eq!(state.perm_manager.mode(), PermissionMode::Auto);
         assert_eq!(
             last_system_message(&chat_widget).as_deref(),
-            Some("Permission mode → auto")
+            Some("Mode → auto")
         );
     }
 
     #[test]
-    fn accept_edits_selection_updates_state_and_commits_feedback() {
+    fn edit_selection_updates_state_and_commits_feedback() {
         let mut state = SessionState::default();
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = ChatWidget::new("");
 
-        handle_view_result(
-            "Accept Edits",
-            &mut state,
-            &mut bottom_pane,
-            &mut chat_widget,
-        );
+        handle_view_result("Edit", &mut state, &mut bottom_pane, &mut chat_widget);
 
         assert_eq!(state.perm_manager.mode(), PermissionMode::AcceptEdits);
         assert_eq!(
             last_system_message(&chat_widget).as_deref(),
-            Some("Permission mode → accept_edits")
+            Some("Mode → edit")
         );
     }
 
@@ -2466,7 +2476,47 @@ mod view_result_tests {
         assert_eq!(state.perm_manager.mode(), PermissionMode::Plan);
         assert_eq!(
             last_system_message(&chat_widget).as_deref(),
-            Some("Permission mode → plan")
+            Some("Mode → plan")
+        );
+    }
+
+    #[test]
+    fn default_selection_updates_state_and_commits_feedback() {
+        let mut state = SessionState::default();
+        state.perm_manager.set_mode(PermissionMode::Auto);
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = ChatWidget::new("");
+
+        handle_view_result("Default", &mut state, &mut bottom_pane, &mut chat_widget);
+
+        assert_eq!(state.perm_manager.mode(), PermissionMode::Prompt);
+        assert_eq!(
+            last_system_message(&chat_widget).as_deref(),
+            Some("Mode → default")
+        );
+    }
+
+    #[test]
+    fn permission_mode_cycle_skips_deny_and_wraps() {
+        assert_eq!(
+            next_permission_mode_for_cycle(PermissionMode::Prompt),
+            PermissionMode::Auto
+        );
+        assert_eq!(
+            next_permission_mode_for_cycle(PermissionMode::Auto),
+            PermissionMode::AcceptEdits
+        );
+        assert_eq!(
+            next_permission_mode_for_cycle(PermissionMode::AcceptEdits),
+            PermissionMode::Plan
+        );
+        assert_eq!(
+            next_permission_mode_for_cycle(PermissionMode::Plan),
+            PermissionMode::Prompt
+        );
+        assert_eq!(
+            next_permission_mode_for_cycle(PermissionMode::Deny),
+            PermissionMode::Auto
         );
     }
 

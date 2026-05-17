@@ -209,6 +209,45 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         }
         let pre_clear = std::mem::take(&mut self.pending_clear_lines);
 
+        // Apply any pending permission-mode change recorded by a tool
+        // overlay during the previous turn (currently
+        // `exit_plan_mode`'s 4-option dialog). Done at turn start
+        // because mid-turn `set_mode` would race the agentic loop's
+        // borrow of `perm_manager`. When a switch did happen we also
+        // tell the model it now runs in the new mode so the next
+        // round's reasoning is grounded in the new permission set.
+        if let Some(new_mode) = self.executor.take_pending_permission_mode_change() {
+            self.perm_manager.set_mode(new_mode);
+            state.push_volatile(
+                astra_runtime::turn::agentic_loop_host::VolatileKind::PlanModeMarker,
+                format!(
+                    "[mode={new_mode}] User approved the plan; you are now executing in `{new_mode}` permission mode. Mutating tools are available — proceed to implement the plan."
+                ),
+            );
+        }
+
+        // Install the per-turn ask_user channel on the shared
+        // ToolExecutor so tools that need a TUI overlay
+        // (currently `exit_plan_mode` for the Approve / Keep
+        // planning dialog) can reach the bottom-pane handler. The
+        // slot is cleared after the turn completes via the
+        // `on_turn_completed` hook so a stale sender never leaks
+        // into background sub-runs.
+        self.executor
+            .set_ask_user_request_tx(self.ask_user_request_tx.clone());
+
+        // Plan mode: surface a one-line mode marker so the model knows
+        // why mutating tools are missing from the schema. Singleton
+        // (`is_singleton` on the kind), so re-pushing every turn keeps
+        // exactly one entry on the lane. Drained alongside other
+        // runtime nudges by the call below.
+        if self.perm_manager.mode() == crate::permission_manager::PermissionMode::Plan {
+            state.push_volatile(
+                astra_runtime::turn::agentic_loop_host::VolatileKind::PlanModeMarker,
+                "[mode=plan] You are in read-only plan mode. Investigate with read-only tools (read_file, grep, glob, web_fetch, …); mutating tools are intentionally absent from the schema. When the plan is ready call `exit_plan_mode(plan=\"<markdown>\")` so the user can approve and choose an execution mode. Do not attempt edits or shell mutations in this mode.",
+            );
+        }
+
         // Session c47c2dca regression fix: drain the structured volatile
         // lane BEFORE subsequent immutable state borrows — the lane
         // holds runtime nudges (stall reflection, circuit-breaker
@@ -645,6 +684,12 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         &mut self,
         state: &astra_runtime::turn::agentic_loop_host::AgenticLoopState,
     ) {
+        // Drop the per-turn ask_user channel so a stale sender from
+        // this turn doesn't leak into background sub-runs that share
+        // the same `Arc<ToolExecutor>` (the channel is reinstalled at
+        // the start of every turn).
+        self.executor.set_ask_user_request_tx(None);
+
         // Bug B step 3: capture the parent turn's cacheable prefix
         // so subsequent spawn_agent / delegate calls can inherit it
         // for prompt-cache reuse. No-op unless:

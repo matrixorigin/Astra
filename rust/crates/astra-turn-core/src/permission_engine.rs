@@ -720,6 +720,31 @@ pub fn evaluate_permission(
             "plan mode ignores mutating allow rules",
         );
         let mode_label = ctx.mode().to_string();
+        // Plan-control tools (`enter_plan_mode` / `exit_plan_mode`)
+        // must remain callable in plan mode — they are the model's
+        // only escape hatch (the `tool_schema_prune` module
+        // deliberately keeps them in the visible schema for the same
+        // reason). Without this exemption schema and runtime
+        // disagree: the model sees `exit_plan_mode`, calls it to
+        // surface its plan, runtime denies it as "denied by permission
+        // mode", and the agent is stuck in plan mode forever.
+        // Regression: session 4cb6b459.
+        if crate::tool_schema_prune::PLAN_MODE_REQUIRED_TOOLS.contains(&tool_name) {
+            let decision = HardDecision::Allow;
+            push_matched(
+                &mut trace,
+                EvaluationStep::Mode,
+                &decision,
+                "plan-control tool — exempt from plan-mode deny",
+            );
+            return envelope(
+                decision,
+                DecisionSource::Mode { mode: mode_label },
+                trace,
+                will_save,
+                risk_tags,
+            );
+        }
         let decision = HardDecision::Deny {
             reason: format!("Tool '{tool_name}' denied by permission mode"),
         };
@@ -1494,6 +1519,32 @@ mod tests {
             &ctx,
         );
         assert!(matches!(mutating_bash.decision, HardDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn plan_mode_allows_plan_control_tools_so_model_can_exit() {
+        // Regression for session 4cb6b459: in plan mode the model
+        // saw `exit_plan_mode` in its schema (kept by
+        // `tool_schema_prune::PLAN_MODE_REQUIRED_TOOLS`), called it
+        // to surface the authored plan, but the permission engine's
+        // fallback denied it as "denied by permission mode" — leaving
+        // the agent stuck in plan mode forever. The two layers must
+        // agree: anything kept in the plan-mode schema must also pass
+        // the runtime gate.
+        let ctx = crate::permission_types::PermissionSyncContext::new(
+            crate::permission_types::InheritedPermissions {
+                mode: crate::permission_types::PermissionMode::Plan,
+                ..Default::default()
+            },
+        );
+        for tool in crate::tool_schema_prune::PLAN_MODE_REQUIRED_TOOLS {
+            let envelope = evaluate_permission(tool, &serde_json::json!({}), &ctx);
+            assert!(
+                matches!(envelope.decision, HardDecision::Allow),
+                "plan mode must allow `{tool}` so the agent can leave plan mode; got {:?}",
+                envelope.decision
+            );
+        }
     }
 
     #[test]

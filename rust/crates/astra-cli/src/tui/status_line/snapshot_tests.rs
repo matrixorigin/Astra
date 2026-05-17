@@ -54,6 +54,15 @@ fn snapshot_auto_mode() {
 }
 
 #[test]
+fn snapshot_plan_authoring_mode() {
+    let ctx = StatusContext {
+        plan_mode_active: true,
+        ..base_ctx()
+    };
+    insta::assert_snapshot!("status_plan_authoring_mode_80", render_ctx(&ctx, 80));
+}
+
+#[test]
 fn snapshot_deny_mode() {
     let ctx = StatusContext {
         permission_mode: PermissionMode::Deny,

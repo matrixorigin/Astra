@@ -6,12 +6,6 @@
 use std::time::SystemTime;
 
 /// Current status of a spawned agent.
-///
-/// `Completed` is reused for every terminal state where progress
-/// was preserved — including budget-exhaustion early-exit paths
-/// that the loop reports as "resumable" interruptions. Callers that
-/// need to distinguish "child finished the task" from "child ran
-/// out of turns while still working" should look at `finish_reason`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentStatus {
     Initializing,
@@ -21,18 +15,9 @@ pub enum AgentStatus {
     Idle,
     Completed {
         result: String,
-        /// Structured finish signal (e.g. `"normal"`,
-        /// `"budget_exhausted"`, `"token_budget_exceeded"`,
-        /// `"context_overflow"`). `None` means the producer
-        /// didn't populate it — treat as equivalent to
-        /// `"normal"` for backward compat.
-        #[allow(dead_code)]
-        finish_reason: Option<String>,
     },
     Failed {
         error: String,
-        #[allow(dead_code)]
-        finish_reason: Option<String>,
     },
     Cancelled,
 }

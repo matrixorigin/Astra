@@ -711,6 +711,11 @@ pub enum VolatileKind {
     /// tool call actually produced. See
     /// [`astra_turn_core::hallucination_tripwire`] for the detector.
     HallucinationTripwire,
+    /// Plan-mode marker: a single short reminder that the current
+    /// turn is read-only investigation and the model must surface
+    /// its plan via `exit_plan_mode(plan="…")` for user approval.
+    /// Singleton — only the latest one ever rides the wire.
+    PlanModeMarker,
     /// Catch-all for producers we haven't categorized yet. Prefer
     /// adding a new variant over reusing this — introspect reports
     /// by kind and a generic bucket degrades the signal.
@@ -731,7 +736,8 @@ impl VolatileKind {
                 | Self::AlreadyFetched
                 | Self::ExplorationBudget
                 | Self::Mailbox
-                | Self::CompactResume,
+                | Self::CompactResume
+                | Self::PlanModeMarker,
         )
     }
 
@@ -762,6 +768,7 @@ impl VolatileKind {
             | Self::ToolBatchCoaching
             | Self::TacticalAdaptation
             | Self::Mailbox
+            | Self::PlanModeMarker
             | Self::Other => "system",
         }
     }

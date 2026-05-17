@@ -4552,7 +4552,7 @@ fn reset_state_for_session_restore(state: &mut SessionState) {
     state.total_completion_tokens = 0;
     state.total_cache_read_tokens = 0;
     state.total_cache_creation_tokens = 0;
-    state.plan_mode = None;
+    state.cloud_plan_mirror = None;
     state.executing_plan = None;
     state.plan_execution_config = None;
     state.executing_plan_goal = None;

@@ -27,13 +27,13 @@ pub(super) async fn handle_plan_command(
 
     if plan_request.is_empty() && crate::plan_lifecycle::looks_like_pending_local_plan_entry(state)
     {
-        state.plan_mode = None;
+        state.cloud_plan_mirror = None;
         state.plan_mode_sync_error = None;
         eprintln!("  {} Exited plan mode.", theme::icon_ok());
         return Ok(());
     }
 
-    if plan_request.is_empty() && state.plan_mode.is_some() {
+    if plan_request.is_empty() && state.cloud_plan_mirror.is_some() {
         let Some(token) = resolve_plan_token(api, profile, token).await else {
             eprintln!("{}", "  Not logged in. Use /login.".yellow());
             return Ok(());
@@ -58,7 +58,7 @@ pub(super) async fn handle_plan_command(
     };
 
     if plan_request.is_empty() {
-        state.plan_mode = Some(pending_plan_state());
+        state.cloud_plan_mirror = Some(pending_plan_state());
         state.plan_mode_sync_error = None;
         eprintln!();
         eprintln!(
@@ -109,13 +109,13 @@ mod tests {
     async fn bare_plan_exits_pending_local_entry_without_remote_call() {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         let mut state = SessionState::default();
-        state.plan_mode = Some(plan::PlanModeState::new(String::new()));
+        state.cloud_plan_mirror = Some(plan::PlanModeState::new(String::new()));
 
         handle_plan_command("", &api, None, &mut state, None)
             .await
             .unwrap();
 
-        assert!(state.plan_mode.is_none());
+        assert!(state.cloud_plan_mirror.is_none());
     }
 
     #[tokio::test]
@@ -150,13 +150,13 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = SessionState::default();
         state.session_id = Some("sess-1".to_string());
-        state.plan_mode = Some(plan::PlanModeState::new("Ship auth".to_string()));
+        state.cloud_plan_mirror = Some(plan::PlanModeState::new("Ship auth".to_string()));
 
         handle_plan_command("", &api, None, &mut state, Some("token"))
             .await
             .unwrap();
 
-        assert!(state.plan_mode.is_none());
+        assert!(state.cloud_plan_mirror.is_none());
     }
 
     #[test]

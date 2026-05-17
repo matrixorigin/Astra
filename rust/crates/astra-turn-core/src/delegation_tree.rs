@@ -268,7 +268,6 @@ mod tests {
                 "run-1",
                 AgentStatus::Completed {
                     result: "ok".into(),
-                    finish_reason: None,
                 },
             ),
             make_agent(
@@ -304,7 +303,6 @@ mod tests {
                 "run-1",
                 AgentStatus::Completed {
                     result: "ok".into(),
-                    finish_reason: None,
                 },
             ),
             make_agent(
