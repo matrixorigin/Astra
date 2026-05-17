@@ -1,3 +1,5 @@
+mod test_support;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +24,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 use sqlx::Row;
+use test_support::parse_sse_events;
 use tokio::sync::RwLock;
 use tower::util::ServiceExt;
 use uuid::Uuid;
@@ -474,13 +477,6 @@ fn build_phase1_http_app(
         .with_session_service(Arc::new(Phase1HttpSession { user_id }))
         .with_run_lifecycle_service(Arc::new(Phase1HttpRunLifecycle { store }));
     build_app(state)
-}
-
-fn parse_sse_events(body: &str) -> Vec<Value> {
-    body.lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter_map(|json| serde_json::from_str::<Value>(json).ok())
-        .collect()
 }
 
 async fn http_get_run_stream(app: &Router, run_id: &str, last_index: u32) -> Vec<Value> {

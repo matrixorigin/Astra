@@ -40,7 +40,7 @@ pub(super) async fn set_resource_limits_handler(
     Path(user_id): Path<String>,
     Json(limits): Json<astra_services::resource_governor::ResourceLimits>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    state.admin_authorizer.require_admin(&headers).await?;
+    state.admin.authorizer.require_admin(&headers).await?;
     state
         .resource_governor
         .set_limits(&user_id, limits.clone())

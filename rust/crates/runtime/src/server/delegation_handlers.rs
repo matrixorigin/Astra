@@ -15,6 +15,7 @@ pub(super) async fn delegate_run_handler(
     let user = state.auth_service.current_user(&headers).await?;
     // Verify the authenticated user owns this run (IDOR prevention).
     state
+        .execution
         .run_lifecycle_service
         .get_run_status(run_id.clone(), user.user_id)
         .await?;
@@ -64,6 +65,7 @@ pub(super) async fn list_delegations_handler(
 ) -> Result<Json<DelegationListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     state
+        .execution
         .run_lifecycle_service
         .get_run_status(run_id.clone(), user.user_id)
         .await?;
@@ -150,6 +152,7 @@ pub(super) async fn pause_delegations_handler(
 ) -> Result<Json<DelegationMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     state
+        .execution
         .run_lifecycle_service
         .get_run_status(run_id.clone(), user.user_id)
         .await?;
@@ -178,6 +181,7 @@ pub(super) async fn resume_delegations_handler(
 ) -> Result<Json<DelegationMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     state
+        .execution
         .run_lifecycle_service
         .get_run_status(run_id.clone(), user.user_id)
         .await?;

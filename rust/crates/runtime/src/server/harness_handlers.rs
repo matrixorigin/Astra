@@ -304,7 +304,7 @@ mod enabled {
         headers: HeaderMap,
         Query(params): Query<AdminListParams>,
     ) -> Result<Json<Vec<ActiveSessionSnapshot>>, (StatusCode, Json<ErrorResponse>)> {
-        state.admin_authorizer.require_admin(&headers).await?;
+        state.admin.authorizer.require_admin(&headers).await?;
         let registry = &state.harness_registry;
         let sessions = registry.active_sessions();
         let result: Vec<ActiveSessionSnapshot> = sessions

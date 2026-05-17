@@ -158,7 +158,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     // Clone the matrix runtime handle before moving `state` into `build_app`
     // so we can drain ingestion + sync sidecars after axum returns.
     let matrix_runtime = state.matrix_cloud_runtime.clone();
-    let run_lifecycle = state.run_lifecycle_service.clone();
+    let run_lifecycle = state.execution.run_lifecycle_service.clone();
 
     axum::serve(listener, build_app(state))
         .with_graceful_shutdown(http_shutdown_signal())

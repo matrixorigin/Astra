@@ -42,9 +42,10 @@ pub async fn list_admin_config_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<AdminConfigListResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _admin = state.admin_authorizer.require_admin(&headers).await?;
+    let _admin = state.admin.authorizer.require_admin(&headers).await?;
     let rows = state
-        .admin_config_service
+        .admin
+        .config_service
         .list()
         .await
         .map_err(internal_error)?;
@@ -61,9 +62,10 @@ pub async fn get_admin_config_handler(
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<AdminConfigGetResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _admin = state.admin_authorizer.require_admin(&headers).await?;
+    let _admin = state.admin.authorizer.require_admin(&headers).await?;
     let value = state
-        .admin_config_service
+        .admin
+        .config_service
         .get(&key)
         .await
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, e))?;
@@ -85,9 +87,10 @@ pub async fn set_admin_config_handler(
     headers: HeaderMap,
     Json(request): Json<AdminConfigSetRequest>,
 ) -> Result<Json<AdminConfigEntry>, (StatusCode, Json<ErrorResponse>)> {
-    let admin = state.admin_authorizer.require_admin(&headers).await?;
+    let admin = state.admin.authorizer.require_admin(&headers).await?;
     state
-        .admin_config_service
+        .admin
+        .config_service
         .set(&key, &request.value, Some(&admin.user_id))
         .await
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, e))?;
@@ -102,9 +105,10 @@ pub async fn delete_admin_config_handler(
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<AdminConfigDeleteResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _admin = state.admin_authorizer.require_admin(&headers).await?;
+    let _admin = state.admin.authorizer.require_admin(&headers).await?;
     let deleted = state
-        .admin_config_service
+        .admin
+        .config_service
         .unset(&key)
         .await
         .map_err(internal_error)?;

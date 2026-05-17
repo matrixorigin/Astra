@@ -13,18 +13,20 @@
 //! cargo test -p astra-runtime --test bridge_e2e_comprehensive --features bridge-e2e-hooks
 //! ```
 
+mod test_support;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
-    AuthTokenRecord, AuthUserRecord, ErrorResponse, FernetTokenEncryptor, HealthChecker,
-    MatrixOneSettings, PERSIST_FAIL_COUNT, PERSIST_OK_COUNT, ServiceInfo, SessionActivityRecord,
-    SessionActivityUpdatePlan, SessionCreateRequestData, SessionListFilter, SessionListRecord,
-    SessionRecord, SessionService, SessionUpdateRequestData, TurnAuxiliaryEventRecord,
-    TurnAuxiliaryEventWriter, TurnCoreEventWriter, TurnCorePersistOutcome, TurnCorePersistPlan,
-    TurnHookDbPersistPlan, TurnHookDbWriter, TurnSessionActivityWriter, TurnToolEventPersistPlan,
-    TurnToolEventWriter, build_app, turn::bridge_inprocess::InProcessChatTurnBridge,
+    AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, PERSIST_FAIL_COUNT,
+    PERSIST_OK_COUNT, ServiceInfo, SessionActivityRecord, SessionActivityUpdatePlan,
+    SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
+    SessionUpdateRequestData, TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter,
+    TurnCoreEventWriter, TurnCorePersistOutcome, TurnCorePersistPlan, TurnHookDbPersistPlan,
+    TurnHookDbWriter, TurnSessionActivityWriter, TurnToolEventPersistPlan, TurnToolEventWriter,
+    build_app, turn::bridge_inprocess::InProcessChatTurnBridge,
 };
 use astra_services::session_journal::{JournalEventType, journal_file_path, read_journal};
 use async_trait::async_trait;
@@ -36,6 +38,10 @@ use axum::{
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tower::util::ServiceExt;
+
+use crate::test_support::{
+    parse_sse_events, test_fernet_encryptor, test_matrixone_settings, tool_call, tool_schema,
+};
 
 // ── Env setup ────────────────────────────────────────────────────────────────
 
@@ -343,8 +349,6 @@ impl TurnHookDbWriter for CapHookWriter {
 // ── App builder ──────────────────────────────────────────────────────────────
 
 fn build_test_app(cap: AllCaptures) -> Router {
-    let enc =
-        Arc::new(FernetTokenEncryptor::new("comp-e2e-fernet-key-32chars!").expect("fernet key"));
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
         .with_session_service(Arc::new(StubSession))
@@ -354,14 +358,8 @@ fn build_test_app(cap: AllCaptures) -> Router {
         .with_turn_session_activity_writer(Arc::new(CapActivityWriter(cap.clone())))
         .with_turn_hook_db_writer(Arc::new(CapHookWriter(cap)));
     let bridge = InProcessChatTurnBridge::new(
-        MatrixOneSettings {
-            host: "127.0.0.1".into(),
-            port: 0,
-            user: "x".into(),
-            password: "x".into(),
-            database: "x".into(),
-        },
-        enc,
+        test_matrixone_settings(),
+        test_fernet_encryptor("comp-e2e-fernet-key-32chars!"),
     )
     .with_edge_callback_ledger(base.edge_callback_ledger());
     let state = base
@@ -371,31 +369,6 @@ fn build_test_app(cap: AllCaptures) -> Router {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-fn tool_schema(name: &str) -> Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": format!("{name} tool"),
-            "parameters": {
-                "type": "object",
-                "properties": { "path": { "type": "string" } }
-            }
-        }
-    })
-}
-
-fn tool_call(id: &str, name: &str, args: Value) -> Value {
-    json!({
-        "id": id,
-        "type": "function",
-        "function": {
-            "name": name,
-            "arguments": serde_json::to_string(&args).unwrap()
-        }
-    })
-}
 
 async fn chat_turn(app: &Router, payload: Value) -> (StatusCode, String) {
     let req = Request::builder()
@@ -445,13 +418,6 @@ async fn chat_turn_no_secret(app: &Router, payload: Value) -> (StatusCode, Strin
         .await
         .unwrap();
     (st, String::from_utf8_lossy(&bytes).into_owned())
-}
-
-fn parse_sse_events(raw: &str) -> Vec<Value> {
-    raw.lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter_map(|data| serde_json::from_str(data).ok())
-        .collect()
 }
 
 fn events_of_type<'a>(events: &'a [Value], ty: &str) -> Vec<&'a Value> {
@@ -3694,8 +3660,6 @@ async fn session_id_persisted_in_core_events_matches_created_session() {
 async fn unhappy_core_persist_failure_still_completes_sse() {
     init_env();
     let cap = AllCaptures::default();
-    let enc =
-        Arc::new(FernetTokenEncryptor::new("comp-e2e-fernet-key-32chars!").expect("fernet key"));
 
     // Build app with a FAILING core writer
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
@@ -3707,14 +3671,8 @@ async fn unhappy_core_persist_failure_still_completes_sse() {
         .with_turn_session_activity_writer(Arc::new(CapActivityWriter(cap.clone())))
         .with_turn_hook_db_writer(Arc::new(CapHookWriter(cap.clone())));
     let bridge = InProcessChatTurnBridge::new(
-        MatrixOneSettings {
-            host: "127.0.0.1".into(),
-            port: 0,
-            user: "x".into(),
-            password: "x".into(),
-            database: "x".into(),
-        },
-        enc,
+        test_matrixone_settings(),
+        test_fernet_encryptor("comp-e2e-fernet-key-32chars!"),
     )
     .with_edge_callback_ledger(base.edge_callback_ledger());
     let app = build_app(
@@ -3756,8 +3714,6 @@ async fn unhappy_core_persist_failure_still_completes_sse() {
 async fn unhappy_tool_persist_failure_core_still_persists() {
     init_env();
     let cap = AllCaptures::default();
-    let enc =
-        Arc::new(FernetTokenEncryptor::new("comp-e2e-fernet-key-32chars!").expect("fernet key"));
 
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
@@ -3768,14 +3724,8 @@ async fn unhappy_tool_persist_failure_core_still_persists() {
         .with_turn_session_activity_writer(Arc::new(CapActivityWriter(cap.clone())))
         .with_turn_hook_db_writer(Arc::new(CapHookWriter(cap.clone())));
     let bridge = InProcessChatTurnBridge::new(
-        MatrixOneSettings {
-            host: "127.0.0.1".into(),
-            port: 0,
-            user: "x".into(),
-            password: "x".into(),
-            database: "x".into(),
-        },
-        enc,
+        test_matrixone_settings(),
+        test_fernet_encryptor("comp-e2e-fernet-key-32chars!"),
     )
     .with_edge_callback_ledger(base.edge_callback_ledger());
     let app = build_app(
@@ -3854,8 +3804,6 @@ async fn unhappy_empty_content_both_sides_no_persist() {
 async fn unhappy_activity_writer_failure() {
     init_env();
     let cap = AllCaptures::default();
-    let enc =
-        Arc::new(FernetTokenEncryptor::new("comp-e2e-fernet-key-32chars!").expect("fernet key"));
 
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
@@ -3866,14 +3814,8 @@ async fn unhappy_activity_writer_failure() {
         .with_turn_session_activity_writer(Arc::new(FailActivityWriter))
         .with_turn_hook_db_writer(Arc::new(CapHookWriter(cap.clone())));
     let bridge = InProcessChatTurnBridge::new(
-        MatrixOneSettings {
-            host: "127.0.0.1".into(),
-            port: 0,
-            user: "x".into(),
-            password: "x".into(),
-            database: "x".into(),
-        },
-        enc,
+        test_matrixone_settings(),
+        test_fernet_encryptor("comp-e2e-fernet-key-32chars!"),
     )
     .with_edge_callback_ledger(base.edge_callback_ledger());
     let app = build_app(

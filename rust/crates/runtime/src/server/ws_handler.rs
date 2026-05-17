@@ -705,6 +705,7 @@ async fn handle_chat_message(
 
     // Try RunLifecycleService first (server-side agentic loop)
     match state
+        .execution
         .run_lifecycle_service
         .create_run(conn.user.user_id.clone(), request)
         .await
@@ -747,6 +748,7 @@ async fn handle_cancel_run(
     run_id: &str,
 ) {
     match state
+        .execution
         .run_lifecycle_service
         .cancel_run(run_id.to_string(), conn.user.user_id.clone())
         .await
@@ -768,6 +770,7 @@ async fn handle_pause_run(
     emit_ack: bool,
 ) {
     match state
+        .execution
         .run_lifecycle_service
         .pause_run(run_id.to_string(), conn.user.user_id.clone())
         .await
@@ -797,6 +800,7 @@ async fn handle_resume_run(
     emit_ack: bool,
 ) {
     match state
+        .execution
         .run_lifecycle_service
         .resume_run(run_id.to_string(), conn.user.user_id.clone())
         .await
@@ -1180,6 +1184,7 @@ fn lifecycle_events_to_ws_payloads(
 
 async fn best_effort_cancel_run(state: &AppState, conn: &WsConnection, run_id: &str) {
     let _ = state
+        .execution
         .run_lifecycle_service
         .cancel_run(run_id.to_string(), conn.user.user_id.clone())
         .await;
@@ -1332,6 +1337,7 @@ async fn stream_run_over_websocket(
             _ = poll.tick() => {
                 // ── Phase E: Forward pending approval requests to client ──
                 for req in state
+                    .execution
                     .run_lifecycle_service
                     .drain_approval_requests(run_id)
                     .await
@@ -1354,6 +1360,7 @@ async fn stream_run_over_websocket(
                 }
 
                 for req in state
+                    .execution
                     .run_lifecycle_service
                     .drain_user_prompt_requests(run_id)
                     .await
@@ -1384,6 +1391,7 @@ async fn stream_run_over_websocket(
 
                 // ── Phase F.3: Forward pending progress events to client ──
                 for evt in state
+                    .execution
                     .run_lifecycle_service
                     .drain_progress_events(run_id)
                     .await
@@ -1469,6 +1477,7 @@ async fn stream_run_over_websocket(
                 }
 
                 let events = match state
+                    .execution
                     .run_lifecycle_service
                     .stream_run(run_id.to_string(), conn.user.user_id.clone(), last_index)
                     .await
@@ -1577,6 +1586,7 @@ async fn stream_run_over_websocket(
                 }
 
                 let status = match state
+                    .execution
                     .run_lifecycle_service
                     .get_run_status(run_id.to_string(), conn.user.user_id.clone())
                     .await

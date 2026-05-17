@@ -26,6 +26,79 @@ pub trait MemoriaForwarder: Send + Sync {
 }
 
 #[derive(Clone)]
+pub(crate) struct TurnPersistenceState {
+    pub(crate) core_event_writer: Arc<dyn TurnCoreEventWriter>,
+    pub(crate) tool_event_writer: Arc<dyn TurnToolEventWriter>,
+    pub(crate) hook_db_writer: Arc<dyn TurnHookDbWriter>,
+    pub(crate) reflection_state_store: Arc<dyn TurnReflectionStateStore>,
+    pub(crate) reflection_lesson_writer: Arc<dyn TurnReflectionLessonWriter>,
+    pub(crate) observer_worker: Arc<dyn TurnObserverWorker>,
+    pub(crate) auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
+    pub(crate) session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
+}
+
+impl Default for TurnPersistenceState {
+    fn default() -> Self {
+        Self {
+            core_event_writer: Arc::new(NoopTurnCoreEventWriter),
+            tool_event_writer: Arc::new(NoopTurnToolEventWriter),
+            hook_db_writer: Arc::new(NoopTurnHookDbWriter),
+            reflection_state_store: Arc::new(InMemoryTurnReflectionStateStore::default()),
+            reflection_lesson_writer: Arc::new(NoopTurnReflectionLessonWriter),
+            observer_worker: Arc::new(NoopTurnObserverWorker),
+            auxiliary_event_writer: Arc::new(NoopTurnAuxiliaryEventWriter),
+            session_activity_writer: Arc::new(NoopTurnSessionActivityWriter),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AdminState {
+    pub(crate) authorizer: Arc<dyn AdminAuthorizer>,
+    pub(crate) initializer: Arc<dyn AdminInitializer>,
+    pub(crate) token_reader: Arc<dyn AdminTokenReader>,
+    pub(crate) token_writer: Arc<dyn AdminTokenWriter>,
+    pub(crate) audit_reader: Arc<dyn AdminAuditReader>,
+    pub(crate) feedback_stats_reader: Arc<dyn AdminFeedbackStatsReader>,
+    pub(crate) user_role_manager: Arc<dyn AdminUserRoleManager>,
+    pub(crate) config_service: Arc<dyn astra_services::AdminConfigService>,
+}
+
+impl Default for AdminState {
+    fn default() -> Self {
+        Self {
+            authorizer: Arc::new(auth::UnconfiguredAdminAuthorizer),
+            initializer: Arc::new(auth::UnconfiguredAdminInitializer),
+            token_reader: Arc::new(auth::UnconfiguredAdminTokenReader),
+            token_writer: Arc::new(auth::UnconfiguredAdminTokenWriter),
+            audit_reader: Arc::new(auth::UnconfiguredAdminAuditReader),
+            feedback_stats_reader: Arc::new(auth::UnconfiguredAdminFeedbackStatsReader),
+            user_role_manager: Arc::new(auth::UnconfiguredAdminUserRoleManager),
+            config_service: Arc::new(astra_services::UnconfiguredAdminConfigService),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ExecutionServicesState {
+    pub(crate) task_service: Arc<dyn TaskService>,
+    pub(crate) edge_registry_service: Arc<dyn EdgeRegistryService>,
+    pub(crate) task_lease_service: Arc<dyn TaskLeaseService>,
+    pub(crate) run_lifecycle_service: Arc<dyn RunLifecycleService>,
+}
+
+impl Default for ExecutionServicesState {
+    fn default() -> Self {
+        Self {
+            task_service: Arc::new(UnconfiguredTaskService),
+            edge_registry_service: Arc::new(UnconfiguredEdgeRegistryService),
+            task_lease_service: Arc::new(UnconfiguredTaskLeaseService),
+            run_lifecycle_service: Arc::new(UnconfiguredRunLifecycleService),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct AppState {
     pub(crate) service_info: ServiceInfo,
     pub(crate) health_checker: Arc<dyn HealthChecker>,
@@ -55,26 +128,9 @@ pub struct AppState {
     pub(crate) reflect_service: Arc<dyn ReflectService>,
     pub(crate) learning_feedback_service: Arc<dyn LearningFeedbackService>,
     pub(crate) fernet_encryptor: FernetTokenEncryptor,
-    pub(crate) turn_core_event_writer: Arc<dyn TurnCoreEventWriter>,
-    pub(crate) turn_tool_event_writer: Arc<dyn TurnToolEventWriter>,
-    pub(crate) turn_hook_db_writer: Arc<dyn TurnHookDbWriter>,
-    pub(crate) turn_reflection_state_store: Arc<dyn TurnReflectionStateStore>,
-    pub(crate) turn_reflection_lesson_writer: Arc<dyn TurnReflectionLessonWriter>,
-    pub(crate) turn_observer_worker: Arc<dyn TurnObserverWorker>,
-    pub(crate) turn_auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
-    pub(crate) turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
-    pub(crate) task_service: Arc<dyn TaskService>,
-    pub(crate) edge_registry_service: Arc<dyn EdgeRegistryService>,
-    pub(crate) task_lease_service: Arc<dyn TaskLeaseService>,
-    pub(crate) run_lifecycle_service: Arc<dyn RunLifecycleService>,
-    pub(crate) admin_authorizer: Arc<dyn AdminAuthorizer>,
-    pub(crate) admin_initializer: Arc<dyn AdminInitializer>,
-    pub(crate) admin_token_reader: Arc<dyn AdminTokenReader>,
-    pub(crate) admin_token_writer: Arc<dyn AdminTokenWriter>,
-    pub(crate) admin_audit_reader: Arc<dyn AdminAuditReader>,
-    pub(crate) admin_feedback_stats_reader: Arc<dyn AdminFeedbackStatsReader>,
-    pub(crate) admin_user_role_manager: Arc<dyn AdminUserRoleManager>,
-    pub(crate) admin_config_service: Arc<dyn astra_services::AdminConfigService>,
+    pub(crate) turn_persistence: TurnPersistenceState,
+    pub(crate) execution: ExecutionServicesState,
+    pub(crate) admin: AdminState,
     pub(crate) chat_turn_bridge:
         Option<Arc<crate::turn::bridge_inprocess::InProcessChatTurnBridge>>,
     pub(crate) chat_turn_bridge_secret: String,
@@ -167,26 +223,9 @@ impl AppState {
                     // Last resort: use a deterministic key so the app doesn't crash.
                     FernetTokenEncryptor::new("abcdefghijklmnop").expect("hardcoded key must work")
                 }),
-            turn_core_event_writer: Arc::new(NoopTurnCoreEventWriter),
-            turn_tool_event_writer: Arc::new(NoopTurnToolEventWriter),
-            turn_hook_db_writer: Arc::new(NoopTurnHookDbWriter),
-            turn_reflection_state_store: Arc::new(InMemoryTurnReflectionStateStore::default()),
-            turn_reflection_lesson_writer: Arc::new(NoopTurnReflectionLessonWriter),
-            turn_observer_worker: Arc::new(NoopTurnObserverWorker),
-            turn_auxiliary_event_writer: Arc::new(NoopTurnAuxiliaryEventWriter),
-            turn_session_activity_writer: Arc::new(NoopTurnSessionActivityWriter),
-            task_service: Arc::new(UnconfiguredTaskService),
-            edge_registry_service: Arc::new(UnconfiguredEdgeRegistryService),
-            task_lease_service: Arc::new(UnconfiguredTaskLeaseService),
-            run_lifecycle_service: Arc::new(UnconfiguredRunLifecycleService),
-            admin_authorizer: Arc::new(auth::UnconfiguredAdminAuthorizer),
-            admin_initializer: Arc::new(auth::UnconfiguredAdminInitializer),
-            admin_token_reader: Arc::new(auth::UnconfiguredAdminTokenReader),
-            admin_token_writer: Arc::new(auth::UnconfiguredAdminTokenWriter),
-            admin_audit_reader: Arc::new(auth::UnconfiguredAdminAuditReader),
-            admin_feedback_stats_reader: Arc::new(auth::UnconfiguredAdminFeedbackStatsReader),
-            admin_user_role_manager: Arc::new(auth::UnconfiguredAdminUserRoleManager),
-            admin_config_service: Arc::new(astra_services::UnconfiguredAdminConfigService),
+            turn_persistence: TurnPersistenceState::default(),
+            execution: ExecutionServicesState::default(),
+            admin: AdminState::default(),
             chat_turn_bridge: None,
             chat_turn_bridge_secret: "dev-bridge-secret-change-me".to_string(),
             chat_turn_bridge_cache,
@@ -257,7 +296,7 @@ impl AppState {
     }
 
     pub fn with_admin_authorizer(mut self, admin_authorizer: Arc<dyn AdminAuthorizer>) -> Self {
-        self.admin_authorizer = admin_authorizer;
+        self.admin.authorizer = admin_authorizer;
         self
     }
 
@@ -265,7 +304,7 @@ impl AppState {
         mut self,
         admin_config_service: Arc<dyn astra_services::AdminConfigService>,
     ) -> Self {
-        self.admin_config_service = admin_config_service;
+        self.admin.config_service = admin_config_service;
         self
     }
 
@@ -425,7 +464,7 @@ impl AppState {
         mut self,
         turn_auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
     ) -> Self {
-        self.turn_auxiliary_event_writer = turn_auxiliary_event_writer;
+        self.turn_persistence.auxiliary_event_writer = turn_auxiliary_event_writer;
         self
     }
 
@@ -433,7 +472,7 @@ impl AppState {
         mut self,
         turn_core_event_writer: Arc<dyn TurnCoreEventWriter>,
     ) -> Self {
-        self.turn_core_event_writer = turn_core_event_writer;
+        self.turn_persistence.core_event_writer = turn_core_event_writer;
         self
     }
 
@@ -441,7 +480,7 @@ impl AppState {
         mut self,
         turn_tool_event_writer: Arc<dyn TurnToolEventWriter>,
     ) -> Self {
-        self.turn_tool_event_writer = turn_tool_event_writer;
+        self.turn_persistence.tool_event_writer = turn_tool_event_writer;
         self
     }
 
@@ -449,14 +488,14 @@ impl AppState {
         mut self,
         turn_hook_db_writer: Arc<dyn TurnHookDbWriter>,
     ) -> Self {
-        self.turn_hook_db_writer = turn_hook_db_writer;
+        self.turn_persistence.hook_db_writer = turn_hook_db_writer;
         self
     }
     pub fn with_turn_reflection_lesson_writer(
         mut self,
         turn_reflection_lesson_writer: Arc<dyn TurnReflectionLessonWriter>,
     ) -> Self {
-        self.turn_reflection_lesson_writer = turn_reflection_lesson_writer;
+        self.turn_persistence.reflection_lesson_writer = turn_reflection_lesson_writer;
         self
     }
 
@@ -464,7 +503,7 @@ impl AppState {
         mut self,
         turn_observer_worker: Arc<dyn TurnObserverWorker>,
     ) -> Self {
-        self.turn_observer_worker = turn_observer_worker;
+        self.turn_persistence.observer_worker = turn_observer_worker;
         self
     }
 
@@ -472,7 +511,7 @@ impl AppState {
         mut self,
         turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
     ) -> Self {
-        self.turn_session_activity_writer = turn_session_activity_writer;
+        self.turn_persistence.session_activity_writer = turn_session_activity_writer;
         self
     }
 
@@ -480,12 +519,12 @@ impl AppState {
         mut self,
         run_lifecycle_service: Arc<dyn RunLifecycleService>,
     ) -> Self {
-        self.run_lifecycle_service = run_lifecycle_service;
+        self.execution.run_lifecycle_service = run_lifecycle_service;
         self
     }
 
     pub fn with_task_service(mut self, task_service: Arc<dyn TaskService>) -> Self {
-        self.task_service = task_service;
+        self.execution.task_service = task_service;
         self
     }
 
@@ -493,7 +532,7 @@ impl AppState {
         mut self,
         edge_registry_service: Arc<dyn EdgeRegistryService>,
     ) -> Self {
-        self.edge_registry_service = edge_registry_service;
+        self.execution.edge_registry_service = edge_registry_service;
         self
     }
 
@@ -501,12 +540,12 @@ impl AppState {
         mut self,
         task_lease_service: Arc<dyn TaskLeaseService>,
     ) -> Self {
-        self.task_lease_service = task_lease_service;
+        self.execution.task_lease_service = task_lease_service;
         self
     }
 
     pub fn with_admin_initializer(mut self, admin_initializer: Arc<dyn AdminInitializer>) -> Self {
-        self.admin_initializer = admin_initializer;
+        self.admin.initializer = admin_initializer;
         self
     }
 
@@ -514,7 +553,7 @@ impl AppState {
         mut self,
         admin_token_reader: Arc<dyn AdminTokenReader>,
     ) -> Self {
-        self.admin_token_reader = admin_token_reader;
+        self.admin.token_reader = admin_token_reader;
         self
     }
 
@@ -522,7 +561,7 @@ impl AppState {
         mut self,
         admin_token_writer: Arc<dyn AdminTokenWriter>,
     ) -> Self {
-        self.admin_token_writer = admin_token_writer;
+        self.admin.token_writer = admin_token_writer;
         self
     }
 
@@ -530,7 +569,7 @@ impl AppState {
         mut self,
         admin_audit_reader: Arc<dyn AdminAuditReader>,
     ) -> Self {
-        self.admin_audit_reader = admin_audit_reader;
+        self.admin.audit_reader = admin_audit_reader;
         self
     }
 
@@ -538,7 +577,7 @@ impl AppState {
         mut self,
         admin_feedback_stats_reader: Arc<dyn AdminFeedbackStatsReader>,
     ) -> Self {
-        self.admin_feedback_stats_reader = admin_feedback_stats_reader;
+        self.admin.feedback_stats_reader = admin_feedback_stats_reader;
         self
     }
 
@@ -546,7 +585,7 @@ impl AppState {
         mut self,
         admin_user_role_manager: Arc<dyn AdminUserRoleManager>,
     ) -> Self {
-        self.admin_user_role_manager = admin_user_role_manager;
+        self.admin.user_role_manager = admin_user_role_manager;
         self
     }
 
@@ -771,6 +810,16 @@ impl HealthChecker for MatrixOneHealthChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    struct AlwaysHealthy;
+
+    #[async_trait]
+    impl HealthChecker for AlwaysHealthy {
+        async fn database_healthy(&self) -> bool {
+            true
+        }
+    }
 
     /// audit-A1: ReqwestMemoriaForwarder must set connect_timeout and timeout
     /// so a hung Memoria server cannot block the Axum handler indefinitely.
@@ -838,5 +887,46 @@ mod tests {
             impl_body.contains("self.client") || impl_body.contains("self\n            .client"),
             "forward() must use the shared self.client"
         );
+    }
+
+    #[tokio::test]
+    async fn edge_callback_ledger_accessor_shares_backing_store() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(AlwaysHealthy));
+        let ledger = state.edge_callback_ledger();
+        ledger
+            .lock()
+            .await
+            .insert("req-1".into(), serde_json::json!({ "status": "queued" }));
+
+        let snapshot = state.edge_callback_ledger();
+        assert_eq!(
+            snapshot.lock().await.get("req-1"),
+            Some(&serde_json::json!({ "status": "queued" }))
+        );
+    }
+
+    #[test]
+    fn metrics_registry_accessor_returns_same_arc_and_no_delegation_by_default() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(AlwaysHealthy));
+        let first = state.metrics_registry();
+        let second = state.metrics_registry();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(state.delegation_engine().is_none());
+    }
+
+    #[tokio::test]
+    async fn default_memoria_forwarder_is_noop_until_configured() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(AlwaysHealthy));
+        let err = state
+            .memoria_forwarder
+            .forward(
+                "/v1/memories/retrieve",
+                serde_json::json!({ "query": "test" }),
+            )
+            .await
+            .expect_err("default AppState should not talk to Memoria");
+
+        assert!(err.contains("Memoria not configured"));
     }
 }

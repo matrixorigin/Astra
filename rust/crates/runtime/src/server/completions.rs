@@ -94,7 +94,7 @@ pub(super) async fn completions_handler(
         astra_services::resolve_reasoning_model(
             &matrixone,
             &state.fernet_encryptor,
-            state.admin_config_service.as_ref(),
+            state.admin.config_service.as_ref(),
             pool_ref,
         )
         .await

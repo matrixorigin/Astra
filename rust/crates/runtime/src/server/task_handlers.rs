@@ -55,6 +55,7 @@ pub(super) async fn list_tasks_handler(
     let status_filter = query.status.and_then(|s| parse_task_status(&s));
 
     let tasks = state
+        .execution
         .task_service
         .list_tasks(&user.user_id, status_filter)
         .await
@@ -73,6 +74,7 @@ pub(super) async fn get_task_handler(
     let user = state.auth_service.current_user(&headers).await?;
 
     let task = state
+        .execution
         .task_service
         .get_task(&task_id)
         .await
@@ -97,6 +99,7 @@ pub(super) async fn task_progress_handler(
     let user = state.auth_service.current_user(&headers).await?;
 
     let task = state
+        .execution
         .task_service
         .get_task(&task_id)
         .await
@@ -144,12 +147,14 @@ pub(super) async fn create_task_handler(
 
     let session_id = payload.session_id.unwrap_or_default();
     let task_id = state
+        .execution
         .task_service
         .create_task(&user.user_id, &session_id, req)
         .await
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, e))?;
 
     let task = state
+        .execution
         .task_service
         .get_task(&task_id)
         .await
@@ -174,6 +179,7 @@ pub(super) async fn update_task_status_handler(
     let user = state.auth_service.current_user(&headers).await?;
 
     let task = state
+        .execution
         .task_service
         .get_task(&task_id)
         .await
@@ -191,6 +197,7 @@ pub(super) async fn update_task_status_handler(
     })?;
 
     state
+        .execution
         .task_service
         .update_status(&task_id, status)
         .await
@@ -224,6 +231,7 @@ pub(super) async fn get_task_lease_handler(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let task = state
+        .execution
         .task_service
         .get_task(&task_id)
         .await
@@ -234,6 +242,7 @@ pub(super) async fn get_task_lease_handler(
     }
 
     let view = state
+        .execution
         .task_lease_service
         .get_lease(&user.user_id, &task_id)
         .await
@@ -259,6 +268,7 @@ pub(super) async fn post_task_lease_claim_handler(
         ));
     }
     let task = state
+        .execution
         .task_service
         .get_task(&task_id)
         .await
@@ -271,6 +281,7 @@ pub(super) async fn post_task_lease_claim_handler(
     let edge_id = edge_id_header(&headers);
     let ttl = body.ttl_sec.unwrap_or(300);
     let result = state
+        .execution
         .task_lease_service
         .try_claim_lease(&user.user_id, &task_id, &body.edge_agent_id, &edge_id, ttl)
         .await
@@ -295,6 +306,7 @@ pub(super) async fn post_task_lease_release_handler(
         ));
     }
     let task = state
+        .execution
         .task_service
         .get_task(&task_id)
         .await
@@ -305,6 +317,7 @@ pub(super) async fn post_task_lease_release_handler(
     }
 
     let released = state
+        .execution
         .task_lease_service
         .release_lease(&user.user_id, &task_id, &body.edge_agent_id)
         .await
@@ -327,6 +340,7 @@ pub(super) async fn post_task_lease_renew_handler(
         ));
     }
     let task = state
+        .execution
         .task_service
         .get_task(&task_id)
         .await
@@ -339,6 +353,7 @@ pub(super) async fn post_task_lease_renew_handler(
     let edge_id = edge_id_header(&headers);
     let ttl = body.ttl_sec.unwrap_or(300);
     let view = state
+        .execution
         .task_lease_service
         .renew_lease(&user.user_id, &task_id, &body.edge_agent_id, &edge_id, ttl)
         .await
@@ -435,7 +450,7 @@ pub(super) struct TaskRpcResponse {
 
 /// `POST /tasks:rpc` — proxy entry point for `TaskService` trait
 /// methods. CLI's `HttpTaskService` impl posts here; server-side
-/// `state.task_service` (MatrixOneTaskService in production) does
+/// `state.execution.task_service` (MatrixOneTaskService in production) does
 /// the work. Every method scopes to the authenticated user; methods
 /// that take a `task_id` verify ownership before mutating.
 pub(super) async fn task_rpc_handler(
@@ -457,6 +472,7 @@ pub(super) async fn task_rpc_handler(
             .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "missing 'task_id' in args"))?
             .to_string();
         let task = state
+            .execution
             .task_service
             .get_task(&task_id)
             .await
@@ -480,6 +496,7 @@ pub(super) async fn task_rpc_handler(
             )
             .map_err(|e| error_response(StatusCode::BAD_REQUEST, format!("decode req: {e}")))?;
             let id = state
+                .execution
                 .task_service
                 .create_task(&user.user_id, session_id, create_req)
                 .await
@@ -493,6 +510,7 @@ pub(super) async fn task_rpc_handler(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "missing 'task_id'"))?;
             let task = state
+                .execution
                 .task_service
                 .get_task(task_id)
                 .await
@@ -514,6 +532,7 @@ pub(super) async fn task_rpc_handler(
                 .and_then(|v| v.as_str())
                 .and_then(parse_task_status);
             let tasks = state
+                .execution
                 .task_service
                 .list_tasks(&user.user_id, status_filter)
                 .await
@@ -534,6 +553,7 @@ pub(super) async fn task_rpc_handler(
                 )
             })?;
             state
+                .execution
                 .task_service
                 .update_status(&task_id, status)
                 .await
@@ -558,6 +578,7 @@ pub(super) async fn task_rpc_handler(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32;
             state
+                .execution
                 .task_service
                 .update_progress(&task_id, pct, done, total)
                 .await
@@ -572,6 +593,7 @@ pub(super) async fn task_rpc_handler(
                         error_response(StatusCode::BAD_REQUEST, format!("decode checkpoint: {e}"))
                     })?;
             state
+                .execution
                 .task_service
                 .save_checkpoint(&task_id, &checkpoint)
                 .await
@@ -585,6 +607,7 @@ pub(super) async fn task_rpc_handler(
             )
             .map_err(|e| error_response(StatusCode::BAD_REQUEST, format!("decode plan: {e}")))?;
             state
+                .execution
                 .task_service
                 .update_plan(&task_id, &plan)
                 .await
@@ -599,6 +622,7 @@ pub(super) async fn task_rpc_handler(
                 .and_then(|v| v.as_str())
                 .unwrap_or("(no error message)");
             state
+                .execution
                 .task_service
                 .fail_task(&task_id, error_msg)
                 .await
@@ -608,6 +632,7 @@ pub(super) async fn task_rpc_handler(
         "complete_task" => {
             let task_id = require_owned_task(&state, &user.user_id, &req.args).await?;
             state
+                .execution
                 .task_service
                 .complete_task(&task_id)
                 .await
@@ -637,6 +662,7 @@ pub(super) async fn task_rpc_handler(
                         error_response(StatusCode::BAD_REQUEST, format!("decode outcome: {e}"))
                     })?;
             state
+                .execution
                 .task_service
                 .complete_plan_run(&task_id, pct, done, total, outcome)
                 .await
@@ -657,6 +683,7 @@ pub(super) async fn task_rpc_handler(
                 .and_then(|v| v.as_i64())
                 .map(|i| i as i32);
             state
+                .execution
                 .task_service
                 .record_feedback(&task_id, rating, outcome, completion_time_sec)
                 .await
@@ -666,6 +693,7 @@ pub(super) async fn task_rpc_handler(
         "increment_replan_count" => {
             let task_id = require_owned_task(&state, &user.user_id, &req.args).await?;
             state
+                .execution
                 .task_service
                 .increment_replan_count(&task_id)
                 .await
@@ -680,6 +708,7 @@ pub(super) async fn task_rpc_handler(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let template_id = state
+                .execution
                 .task_service
                 .extract_template(&task_id, goal_pattern)
                 .await
@@ -698,6 +727,7 @@ pub(super) async fn task_rpc_handler(
             let project_type = req.args.get("project_type").and_then(|v| v.as_str());
             let limit = req.args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
             let recs = state
+                .execution
                 .task_service
                 .recommend_templates(&user.user_id, goal, project_type, limit)
                 .await
@@ -711,6 +741,7 @@ pub(super) async fn task_rpc_handler(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "missing 'goal_pattern'"))?;
             let stats = state
+                .execution
                 .task_service
                 .get_learning_stats(&user.user_id, goal_pattern)
                 .await
@@ -727,6 +758,7 @@ pub(super) async fn task_rpc_handler(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "missing 'template_id'"))?;
             state
+                .execution
                 .task_service
                 .record_template_usage(template_id)
                 .await

@@ -14,7 +14,7 @@ pub(super) async fn list_llm_trusted_domains_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<LlmTrustedDomainRecord>>, (StatusCode, Json<ErrorResponse>)> {
-    state.admin_authorizer.require_admin(&headers).await?;
+    state.admin.authorizer.require_admin(&headers).await?;
     let records = state
         .llm_trusted_domain_service
         .list_trusted_domains()
@@ -27,7 +27,7 @@ pub(super) async fn upsert_llm_trusted_domain_handler(
     headers: HeaderMap,
     Json(body): Json<LlmTrustedDomainUpsertRequest>,
 ) -> Result<Json<LlmTrustedDomainRecord>, (StatusCode, Json<ErrorResponse>)> {
-    let authenticated = state.admin_authorizer.require_admin(&headers).await?;
+    let authenticated = state.admin.authorizer.require_admin(&headers).await?;
     let request = LlmTrustedDomainUpsertRequestData {
         domain_host: body.domain_host,
         domain_port: body.domain_port,
@@ -46,7 +46,7 @@ pub(super) async fn delete_llm_trusted_domain_handler(
     headers: HeaderMap,
     Path(domain_id): Path<String>,
 ) -> Result<Json<LlmTrustedDomainDeleteResponse>, (StatusCode, Json<ErrorResponse>)> {
-    state.admin_authorizer.require_admin(&headers).await?;
+    state.admin.authorizer.require_admin(&headers).await?;
     let response = state
         .llm_trusted_domain_service
         .delete_trusted_domain(&domain_id)

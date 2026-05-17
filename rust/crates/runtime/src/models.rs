@@ -13,7 +13,7 @@ pub async fn create_model_handler(
     headers: HeaderMap,
     Json(request): Json<ModelCreateRequest>,
 ) -> Result<(StatusCode, Json<ModelResponse>), (StatusCode, Json<ErrorResponse>)> {
-    let admin = state.admin_authorizer.require_admin(&headers).await?;
+    let admin = state.admin.authorizer.require_admin(&headers).await?;
 
     let model = state
         .model_service
@@ -45,7 +45,7 @@ pub async fn list_models_handler(
     headers: HeaderMap,
 ) -> Result<Json<Vec<ModelListItemResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let is_admin = state.admin_authorizer.require_admin(&headers).await.is_ok();
+    let is_admin = state.admin.authorizer.require_admin(&headers).await.is_ok();
     let models = state
         .model_service
         .list_models(user.user_id, is_admin)
@@ -74,7 +74,7 @@ pub async fn update_model_handler(
     headers: HeaderMap,
     Json(request): Json<ModelUpdateRequest>,
 ) -> Result<Json<ModelResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _admin = state.admin_authorizer.require_admin(&headers).await?;
+    let _admin = state.admin.authorizer.require_admin(&headers).await?;
     let model = state
         .model_service
         .update_model(
@@ -105,7 +105,7 @@ pub async fn delete_model_handler(
     Path(model_name): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    let _admin = state.admin_authorizer.require_admin(&headers).await?;
+    let _admin = state.admin.authorizer.require_admin(&headers).await?;
     state.model_service.delete_model(model_name).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -115,7 +115,7 @@ pub async fn check_model_handler(
     Path(model_name): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<ModelResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _admin = state.admin_authorizer.require_admin(&headers).await?;
+    let _admin = state.admin.authorizer.require_admin(&headers).await?;
     let model = state.model_service.check_model(model_name).await?;
     Ok(Json(ModelResponse::from(model)))
 }

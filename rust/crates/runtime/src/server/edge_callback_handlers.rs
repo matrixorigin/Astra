@@ -277,6 +277,7 @@ pub(super) async fn post_agents_edge_register_handler(
     }
     let edge_id = edge_id_from_headers(&headers);
     let rec = state
+        .execution
         .edge_registry_service
         .register_or_update(
             &user.user_id,
@@ -309,6 +310,7 @@ pub(super) async fn post_agents_edge_heartbeat_handler(
     }
     let edge_id = edge_id_from_headers(&headers);
     state
+        .execution
         .edge_registry_service
         .heartbeat(&user.user_id, &body.edge_agent_id, &edge_id)
         .await

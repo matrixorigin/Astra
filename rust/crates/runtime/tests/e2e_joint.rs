@@ -1,3 +1,5 @@
+mod test_support;
+
 use std::{collections::BTreeSet, net::SocketAddr, sync::Arc, time::Duration};
 
 use astra_core::SharedPool;
@@ -22,6 +24,7 @@ use axum::{Json, Router, http::HeaderMap, http::StatusCode};
 use reqwest::Client;
 use serde_json::{Value, json};
 use sqlx::Row;
+use test_support::parse_sse_events;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -532,13 +535,6 @@ fn local_client() -> Client {
         .no_proxy()
         .build()
         .expect("reqwest Client::builder().no_proxy() must build")
-}
-
-fn parse_sse_events(body: &str) -> Vec<Value> {
-    body.lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter_map(|json| serde_json::from_str::<Value>(json).ok())
-        .collect()
 }
 
 async fn get_stream(

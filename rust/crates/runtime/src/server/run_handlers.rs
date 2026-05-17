@@ -137,6 +137,7 @@ pub(super) async fn get_run_status_handler(
 ) -> Result<Json<RunStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let run = state
+        .execution
         .run_lifecycle_service
         .get_run_status(run_id, user.user_id)
         .await?;
@@ -155,6 +156,7 @@ pub(super) async fn stream_run_handler(
     };
 
     match state
+        .execution
         .run_lifecycle_service
         .stream_run_live(run_id.clone(), user.user_id, query.last_index)
         .await
@@ -180,6 +182,7 @@ pub(super) async fn cancel_run_handler(
 ) -> Result<Json<CancelRunResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let result = state
+        .execution
         .run_lifecycle_service
         .cancel_run(run_id, user.user_id)
         .await?;
@@ -193,6 +196,7 @@ pub(super) async fn list_runs_handler(
 ) -> Result<Json<RunListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let runs = state
+        .execution
         .run_lifecycle_service
         .list_runs(user.user_id, query.limit, query.offset)
         .await?;
@@ -206,6 +210,7 @@ pub(super) async fn pause_run_handler(
 ) -> Result<Json<RunMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let result = state
+        .execution
         .run_lifecycle_service
         .pause_run(run_id, user.user_id)
         .await?;
@@ -219,6 +224,7 @@ pub(super) async fn resume_run_handler(
 ) -> Result<Json<RunMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let result = state
+        .execution
         .run_lifecycle_service
         .resume_run(run_id, user.user_id)
         .await?;
@@ -247,6 +253,7 @@ pub(super) async fn submit_run_input_handler(
 ) -> Result<Json<RunInputResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let result = state
+        .execution
         .run_lifecycle_service
         .submit_run_input(
             run_id,
