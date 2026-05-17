@@ -1008,6 +1008,7 @@ pub(crate) async fn run_tui_repl(
                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
                                     }
                                 } else {
+                                    let submit_was_inline_plan_goal = inline_chat_submit.is_some();
                                     let submit_text = inline_chat_submit.unwrap_or(text);
                                     if crate::plan_lifecycle::looks_like_pending_local_plan_entry(
                                         &state,
@@ -1063,7 +1064,214 @@ pub(crate) async fn run_tui_repl(
                                                 continue;
                                             }
                                         }
-                                    } else if looks_like_implicit_plan_request(&submit_text) {
+                                    } else {
+                                        if !submit_was_inline_plan_goal {
+                                            if let Some(plan_command) =
+                                                crate::plan_commands::parse_plan_command(&submit_text)
+                                                    .filter(|command| {
+                                                        crate::plan_commands::is_plan_command_available(
+                                                            &state, command,
+                                                        )
+                                                    })
+                                            {
+                                                match plan_command {
+                                                    crate::plan_commands::ParsedPlanCommand::Go => {
+                                                        let go_result = guard
+                                                            .with_restored(|| async {
+                                                                let Some(token) =
+                                                                    crate::plan_lifecycle::fresh_token_for_plan(
+                                                                        api, profile,
+                                                                    )
+                                                                    .await
+                                                                else {
+                                                                    return Err(
+                                                                        "Not logged in. Use /login."
+                                                                            .to_string(),
+                                                                    );
+                                                                };
+                                                                crate::plan_commands::prepare_plan_execution(
+                                                                    &mut state, api, &token,
+                                                                )
+                                                                .await?;
+                                                                crate::plan_runtime::start_and_monitor_plan(
+                                                                    &mut state,
+                                                                    Some(&token),
+                                                                    api,
+                                                                    profile,
+                                                                )
+                                                                .await
+                                                            })
+                                                            .await;
+                                                        match go_result {
+                                                            Ok(Ok(())) => {
+                                                                let message = if state
+                                                                    .executing_plan
+                                                                    .is_some()
+                                                                {
+                                                                    "Plan run paused. Use `show`, `rewind …`, `correct …`, or `go` to continue.".to_string()
+                                                                } else if state
+                                                                    .plan_run_task_last_error
+                                                                    .is_some()
+                                                                {
+                                                                    "Plan run ended with an error. Rewind or adjust it before trying `go` again.".to_string()
+                                                                } else {
+                                                                    "Plan run finished. Back in normal chat.".to_string()
+                                                                };
+                                                                chat_widget.commit_system(
+                                                                    history_cell::system::SystemCell::response(
+                                                                        message,
+                                                                    ),
+                                                                );
+                                                            }
+                                                            Ok(Err(error)) => {
+                                                                chat_widget.commit_system(
+                                                                    history_cell::system::SystemCell::error(
+                                                                        error,
+                                                                    ),
+                                                                );
+                                                            }
+                                                            Err(error) => {
+                                                                chat_widget.commit_system(
+                                                                    history_cell::system::SystemCell::error(
+                                                                        format!(
+                                                                            "Terminal restore failed: {error}"
+                                                                        ),
+                                                                    ),
+                                                                );
+                                                            }
+                                                        }
+                                                        refresh_footer_from_state(
+                                                            &mut bottom_pane,
+                                                            &state,
+                                                        );
+                                                        flush_chat_widget(
+                                                            &mut guard,
+                                                            &mut chat_widget,
+                                                            w,
+                                                        );
+                                                        frame_requester.schedule_frame();
+                                                        continue;
+                                                    }
+                                                    crate::plan_commands::ParsedPlanCommand::Show => {
+                                                        match crate::plan_commands::render_plan_snapshot(
+                                                            &state,
+                                                        ) {
+                                                            Ok(message) => chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::response(
+                                                                    message,
+                                                                ),
+                                                            ),
+                                                            Err(error) => chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::error(
+                                                                    error,
+                                                                ),
+                                                            ),
+                                                        }
+                                                        refresh_footer_from_state(
+                                                            &mut bottom_pane,
+                                                            &state,
+                                                        );
+                                                        flush_chat_widget(
+                                                            &mut guard,
+                                                            &mut chat_widget,
+                                                            w,
+                                                        );
+                                                        frame_requester.schedule_frame();
+                                                        continue;
+                                                    }
+                                                    crate::plan_commands::ParsedPlanCommand::Rewind {
+                                                        anchor,
+                                                    } => {
+                                                        let token =
+                                                            crate::plan_lifecycle::fresh_token_for_plan(
+                                                                api, profile,
+                                                            )
+                                                            .await;
+                                                        match crate::plan_commands::rewind_plan(
+                                                            &mut state,
+                                                            api,
+                                                            token.as_deref(),
+                                                            &anchor,
+                                                        )
+                                                        .await
+                                                        {
+                                                            Ok(message) => chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::response(
+                                                                    message,
+                                                                ),
+                                                            ),
+                                                            Err(error) => chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::error(
+                                                                    error,
+                                                                ),
+                                                            ),
+                                                        }
+                                                        refresh_footer_from_state(
+                                                            &mut bottom_pane,
+                                                            &state,
+                                                        );
+                                                        flush_chat_widget(
+                                                            &mut guard,
+                                                            &mut chat_widget,
+                                                            w,
+                                                        );
+                                                        frame_requester.schedule_frame();
+                                                        continue;
+                                                    }
+                                                    crate::plan_commands::ParsedPlanCommand::AddCorrection { .. }
+                                                    | crate::plan_commands::ParsedPlanCommand::ClearCorrections => {
+                                                        match crate::plan_commands::apply_plan_correction(
+                                                            &mut state,
+                                                            &plan_command,
+                                                        ) {
+                                                            Ok(message) => chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::response(
+                                                                    message,
+                                                                ),
+                                                            ),
+                                                            Err(error) => chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::error(
+                                                                    error,
+                                                                ),
+                                                            ),
+                                                        }
+                                                        refresh_footer_from_state(
+                                                            &mut bottom_pane,
+                                                            &state,
+                                                        );
+                                                        flush_chat_widget(
+                                                            &mut guard,
+                                                            &mut chat_widget,
+                                                            w,
+                                                        );
+                                                        frame_requester.schedule_frame();
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                            if state.executing_plan.is_some()
+                                                && state.plan_mode.is_none()
+                                                && crate::plan_commands::abandon_plan_execution(
+                                                    &mut state,
+                                                )
+                                            {
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::info(
+                                                        "Paused plan abandoned — continuing with normal chat.".to_string(),
+                                                    ),
+                                                );
+                                                refresh_footer_from_state(
+                                                    &mut bottom_pane,
+                                                    &state,
+                                                );
+                                                flush_chat_widget(
+                                                    &mut guard,
+                                                    &mut chat_widget,
+                                                    w,
+                                                );
+                                            }
+                                        }
+                                        if looks_like_implicit_plan_request(&submit_text) {
                                         let before = capture_plan_mode_ui_snapshot(&state);
                                         let Some(token) =
                                             crate::plan_lifecycle::fresh_token_for_plan(api, profile)
@@ -1116,6 +1324,7 @@ pub(crate) async fn run_tui_repl(
                                                 frame_requester.schedule_frame();
                                                 continue;
                                             }
+                                        }
                                         }
                                     }
 
@@ -2633,6 +2842,28 @@ mod tests {
             arm.contains("crate::plan_lifecycle::looks_like_pending_local_plan_entry(")
                 && arm.contains("crate::plan_lifecycle::enter_remote_plan_mode("),
             "the first plain message after bare /plan should bind remote plan mode and continue as chat"
+        );
+    }
+
+    #[test]
+    fn submit_input_handles_plan_text_commands_before_normal_chat() {
+        let source = include_str!("event_loop.rs");
+        let arm_start = source
+            .find("BottomPaneAction::SubmitInput(text) => {")
+            .expect("SubmitInput arm must exist");
+        let arm_end = source[arm_start..]
+            .find("BottomPaneAction::ViewCompleted { result, reopen } => {")
+            .expect("SubmitInput arm must end before ViewCompleted");
+        let arm = &source[arm_start..arm_start + arm_end];
+
+        assert!(
+            arm.contains("crate::plan_commands::parse_plan_command(&submit_text)")
+                && arm.contains("crate::plan_runtime::start_and_monitor_plan("),
+            "plain TUI submits should intercept go/show/rewind/correct plan commands and wire `go` into the real plan runtime"
+        );
+        assert!(
+            arm.contains("crate::plan_commands::abandon_plan_execution("),
+            "ordinary prose after a paused plan should abandon the paused execution instead of keeping stale state around"
         );
     }
 

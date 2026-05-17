@@ -110,7 +110,7 @@ pub(crate) async fn enter_remote_plan_mode(
     Ok(plan_id)
 }
 
-async fn active_remote_planning_plan_id(
+pub(crate) async fn active_remote_planning_plan_id(
     api: &astra_thin_client::ThinClient,
     token: &str,
     session_id: &str,

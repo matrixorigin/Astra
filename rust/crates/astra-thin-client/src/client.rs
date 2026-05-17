@@ -512,6 +512,23 @@ impl ThinClient {
         Self::json_or_error(resp).await
     }
 
+    pub async fn post_plan_rewind_json(
+        &self,
+        token: &str,
+        plan_id: &str,
+        body: &Value,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::plan_rewind(plan_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(Self::bearer_headers(token)?)
+            .json(body)
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
     pub async fn get_session_artifact_latest_text(
         &self,
         token: &str,
@@ -1688,6 +1705,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(exited["phase"], "refining");
+
+        Mock::given(method("POST"))
+            .and(path("/plans/plan-1/rewind"))
+            .and(header("authorization", "Bearer tkn"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "plan_id": "plan-1",
+                "reset_count": 2,
+                "version": 8,
+                "plan": { "subtasks": [] }
+            })))
+            .mount(&srv)
+            .await;
+
+        let rewound = client
+            .post_plan_rewind_json("tkn", "plan-1", &serde_json::json!({"anchor": "2"}))
+            .await
+            .unwrap();
+        assert_eq!(rewound["reset_count"], 2);
     }
 
     #[tokio::test]
