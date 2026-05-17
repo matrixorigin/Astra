@@ -242,11 +242,24 @@ fn approval_lookup_fingerprint_candidates(
         cloud_gated_tool_kind_with_args(name, Some(args)),
         Some(CloudGatedToolKind::Write)
     ) && let Some(path) = path_hint_from_args(args)
-        && let Some(resolved) = resolved_write_path(&path)
     {
-        let resolved_fp = ApprovalFingerprint::file_op_exact(name, Some(&resolved));
-        if resolved_fp != primary {
-            candidates.push(resolved_fp);
+        if astra_turn_core::tool_categories::registry().is_file_op(name) {
+            push_unique_fingerprint(
+                &mut candidates,
+                ApprovalFingerprint::file_op_exact("edit", Some(&path)),
+            );
+        }
+        if let Some(resolved) = resolved_write_path(&path) {
+            push_unique_fingerprint(
+                &mut candidates,
+                ApprovalFingerprint::file_op_exact(name, Some(&resolved)),
+            );
+            if astra_turn_core::tool_categories::registry().is_file_op(name) {
+                push_unique_fingerprint(
+                    &mut candidates,
+                    ApprovalFingerprint::file_op_exact("edit", Some(&resolved)),
+                );
+            }
         }
     }
     candidates
@@ -262,14 +275,36 @@ fn cloud_detail_lookup_fingerprint_candidates(
     let mut candidates = vec![primary.clone()];
     if matches!(cloud_gated_tool_kind(tool), Some(CloudGatedToolKind::Write))
         && let Some(path) = detail
-        && let Some(resolved) = resolved_write_path(path)
     {
-        let resolved_fp = ApprovalFingerprint::file_op_exact(tool, Some(&resolved));
-        if resolved_fp != primary {
-            candidates.push(resolved_fp);
+        if astra_turn_core::tool_categories::registry().is_file_op(tool) {
+            push_unique_fingerprint(
+                &mut candidates,
+                ApprovalFingerprint::file_op_exact("edit", Some(path)),
+            );
+        }
+        if let Some(resolved) = resolved_write_path(path) {
+            push_unique_fingerprint(
+                &mut candidates,
+                ApprovalFingerprint::file_op_exact(tool, Some(&resolved)),
+            );
+            if astra_turn_core::tool_categories::registry().is_file_op(tool) {
+                push_unique_fingerprint(
+                    &mut candidates,
+                    ApprovalFingerprint::file_op_exact("edit", Some(&resolved)),
+                );
+            }
         }
     }
     candidates
+}
+
+fn push_unique_fingerprint(
+    candidates: &mut Vec<astra_turn_core::approval_fingerprint::ApprovalFingerprint>,
+    candidate: astra_turn_core::approval_fingerprint::ApprovalFingerprint,
+) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
 }
 
 fn cloud_detail_is_sensitive(tool: &str, detail: Option<&str>) -> bool {
@@ -5453,13 +5488,20 @@ mod tests {
     fn make_allow_rule_file_write_uses_path_rule() {
         let args = serde_json::json!({"path": "/tmp/foo"});
         let rule = PermissionManager::make_allow_rule("write_file", &args);
-        assert_eq!(rule, r#"write_file(path_glob="/tmp/foo", op="write")"#);
+        assert_eq!(rule, r#"Edit(path_glob="/tmp/foo", op="write")"#);
 
         let parsed = PermissionRule::parse(&rule);
         assert!(parsed.matches_with_context(
             "write_file",
             &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
                 "write_file",
+                &args
+            )
+        ));
+        assert!(parsed.matches_with_context(
+            "str_replace",
+            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                "str_replace",
                 &args
             )
         ));
@@ -5473,7 +5515,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_write_file_rule_does_not_widen_beyond_fingerprint() {
+    fn persisted_write_file_rule_covers_file_edit_family_inside_workspace() {
         let mut pm = PermissionManager::new(false);
         let approved_args = serde_json::json!({"path": "zzzz3.md", "content": "# zzzz3"});
         let rule = PermissionManager::make_allow_rule("write_file", &approved_args);
@@ -5481,6 +5523,10 @@ mod tests {
         pm.cached_allow = pm.settings.parsed_allow_rules();
 
         assert!(pm.check_allow_rules("write_file", &approved_args));
+        assert!(pm.check_allow_rules(
+            "str_replace",
+            &serde_json::json!({"path": "zzzz4.md", "old_str": "a", "new_str": "b"})
+        ));
         assert!(!pm.check_allow_rules(
             "write_file",
             &serde_json::json!({"path": "/tmp/zzzz4.md", "content": "# zzzz4"})
@@ -5500,7 +5546,7 @@ mod tests {
         assert_eq!(
             rule,
             format!(
-                r#"write_file(path_prefix="{workspace_root}", op="write", cwd_root="{workspace_root}")"#
+                r#"Edit(path_prefix="{workspace_root}", op="write", cwd_root="{workspace_root}")"#
             )
         );
     }
@@ -6314,6 +6360,11 @@ mod tests {
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         let args_a = serde_json::json!({"path": "src/foo.rs", "content": "a"});
         let args_b = serde_json::json!({"path": "tests/bar.rs", "content": "b"});
+        let replace_args = serde_json::json!({
+            "path": "tests/bar.rs",
+            "old_str": "b",
+            "new_str": "c"
+        });
         let workspace_root = std::env::current_dir()
             .unwrap()
             .canonicalize()
@@ -6335,6 +6386,12 @@ mod tests {
         assert!(
             matches!(decision, PermissionDecision::Allow),
             "workspace write trust should cover later safe file edits anywhere in the workspace"
+        );
+
+        let decision = pm.check_nonblocking("str_replace", &replace_args);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "workspace write trust should cover sibling file-edit tools, got {decision:?}"
         );
     }
 

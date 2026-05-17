@@ -1270,14 +1270,36 @@ fn content_aware_fingerprint_candidates(tool_name: &str, args: &Value) -> Vec<Ap
         cloud_gated_tool_kind(tool_name),
         Some(CloudGatedToolKind::Write)
     ) && let Some(path) = path_hint_from_args(args)
-        && let Some(resolved) = resolved_write_path(&path)
     {
-        let resolved_fp = ApprovalFingerprint::file_op_exact(tool_name, Some(&resolved));
-        if resolved_fp != primary {
-            candidates.push(resolved_fp);
+        if crate::tool_categories::registry().is_file_op(tool_name) {
+            push_unique_fingerprint(
+                &mut candidates,
+                ApprovalFingerprint::file_op_exact("edit", Some(&path)),
+            );
+        }
+        if let Some(resolved) = resolved_write_path(&path) {
+            push_unique_fingerprint(
+                &mut candidates,
+                ApprovalFingerprint::file_op_exact(tool_name, Some(&resolved)),
+            );
+            if crate::tool_categories::registry().is_file_op(tool_name) {
+                push_unique_fingerprint(
+                    &mut candidates,
+                    ApprovalFingerprint::file_op_exact("edit", Some(&resolved)),
+                );
+            }
         }
     }
     candidates
+}
+
+fn push_unique_fingerprint(
+    candidates: &mut Vec<ApprovalFingerprint>,
+    candidate: ApprovalFingerprint,
+) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
 }
 
 fn risk_tags_for_request(tool_name: &str, args: &Value) -> Vec<RiskTag> {
@@ -1439,7 +1461,7 @@ mod tests {
             .into_owned();
         assert_eq!(
             rule,
-            format!(r#"write_file(path_prefix="{cwd}", op="write", cwd_root="{cwd}")"#)
+            format!(r#"Edit(path_prefix="{cwd}", op="write", cwd_root="{cwd}")"#)
         );
     }
 
@@ -1450,7 +1472,7 @@ mod tests {
             &serde_json::json!({"path": "/tmp/zzzz3.md", "content": "# zzzz3"}),
         );
 
-        assert_eq!(rule, r#"write_file(path_glob="/tmp/zzzz3.md", op="write")"#);
+        assert_eq!(rule, r#"Edit(path_glob="/tmp/zzzz3.md", op="write")"#);
     }
 
     #[test]
