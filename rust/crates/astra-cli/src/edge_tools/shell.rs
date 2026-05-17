@@ -4290,16 +4290,17 @@ impl ToolExecutor {
     }
 
     pub(crate) fn glob(&self, args: &Value) -> String {
-        let pattern = match args.get("pattern").and_then(Value::as_str) {
+        let raw_pattern = match args.get("pattern").and_then(Value::as_str) {
             Some(p) => p,
             None => return "Error: missing 'pattern'".to_string(),
         };
-        let base = match args.get("path").and_then(Value::as_str) {
-            Some(p) => match self.resolve_checked(p) {
-                Ok(safe) => safe,
-                Err(e) => return e,
-            },
-            None => self.project_root.clone(),
+        let (requested_path, pattern) = match normalize_glob_path_and_pattern(args, raw_pattern) {
+            Ok(normalized) => normalized,
+            Err(e) => return e,
+        };
+        let base = match self.resolve_checked(&requested_path) {
+            Ok(safe) => safe,
+            Err(e) => return e,
         };
 
         // Validate base path exists
@@ -4310,18 +4311,13 @@ impl ToolExecutor {
             );
         }
 
-        // Security: reject glob patterns with path traversal sequences
-        if pattern.contains("..") || pattern.starts_with('/') || pattern.contains("~/") {
-            return "Error: glob pattern must not contain '..', start with '/', or contain '~/' (path traversal risk)".to_string();
-        }
-
         // Use fd if available (faster, respects .gitignore), fall back to find
         let shell_cmd = format!(
             "cd {} && {{ fd --type f --glob {} 2>/dev/null || find . {} -o -name {} -print | sed 's|^./||'; }} | head -100",
             shell_escape(base.to_string_lossy().as_ref()),
-            shell_escape(pattern),
+            shell_escape(&pattern),
             default_find_prune_clause(),
-            shell_escape(pattern.split('/').next_back().unwrap_or(pattern))
+            shell_escape(pattern.split('/').next_back().unwrap_or(&pattern))
         );
         let mut cmd = Command::new("bash");
         cmd.arg("-c").arg(&shell_cmd);
@@ -4351,6 +4347,64 @@ impl ToolExecutor {
             Err(e) => e,
         }
     }
+}
+
+fn normalize_glob_path_and_pattern(
+    args: &Value,
+    pattern: &str,
+) -> Result<(String, String), String> {
+    if std::path::Path::new(pattern).is_absolute() {
+        return split_absolute_glob_pattern(pattern);
+    }
+    if pattern.contains("..") || pattern.contains("~/") {
+        return Err(glob_path_traversal_error());
+    }
+    Ok((
+        args.get("path")
+            .and_then(Value::as_str)
+            .unwrap_or(".")
+            .to_string(),
+        pattern.to_string(),
+    ))
+}
+
+fn split_absolute_glob_pattern(pattern: &str) -> Result<(String, String), String> {
+    if pattern.contains("~/") || pattern.split(['/', '\\']).any(|part| part == "..") {
+        return Err(glob_path_traversal_error());
+    }
+
+    let normalized = pattern.replace('\\', "/");
+    let parts: Vec<&str> = normalized.split('/').skip(1).collect();
+    let first_glob = parts.iter().position(|part| glob_part_has_meta(part));
+
+    match first_glob {
+        Some(0) => Ok(("/".to_string(), parts.join("/"))),
+        Some(index) => Ok((
+            format!("/{}", parts[..index].join("/")),
+            parts[index..].join("/"),
+        )),
+        None => {
+            let path = std::path::Path::new(pattern);
+            let base = path
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| "/".to_string());
+            let rel_pattern = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "*".to_string());
+            Ok((base, rel_pattern))
+        }
+    }
+}
+
+fn glob_part_has_meta(part: &str) -> bool {
+    part.contains('*') || part.contains('?') || part.contains('[') || part.contains('{')
+}
+
+fn glob_path_traversal_error() -> String {
+    "Error: glob pattern must not contain '..' or '~/' (path traversal risk)".to_string()
 }
 
 /// Annotate grep results with tree-sitter scope context.
@@ -5160,6 +5214,25 @@ mod tests {
     }
 
     #[test]
+    fn glob_accepts_absolute_pattern_under_allowed_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        std::fs::create_dir_all(external.path().join("game3d")).unwrap();
+        std::fs::write(external.path().join("game3d").join("index.html"), "").unwrap();
+
+        let result = executor.glob(&serde_json::json!({
+            "pattern": format!("{}/**/*.html", external.path().display())
+        }));
+
+        assert!(
+            result.contains("game3d/index.html") || result.contains("index.html"),
+            "absolute glob under /tmp should find file: {result}"
+        );
+        assert!(!result.contains("path traversal"), "got: {result}");
+    }
+
+    #[test]
     fn glob_nonexistent_path_returns_error() {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
@@ -5205,8 +5278,8 @@ mod tests {
         // Absolute path
         let result = executor.glob(&serde_json::json!({"pattern": "/etc/*.conf"}));
         assert!(
-            result.contains("path traversal"),
-            "should reject /: {result}"
+            result.contains("SANDBOX_DENIED") || result.contains("Sandbox"),
+            "should reject /etc outside sandbox: {result}"
         );
         // Tilde expansion
         let result = executor.glob(&serde_json::json!({"pattern": "~/.*"}));

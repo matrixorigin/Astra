@@ -1034,19 +1034,15 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
 /// Find files matching a glob pattern without blocking the async executor.
 pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     let workspace_root = ctx.workspace_root.as_path();
-    let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
+    let raw_pattern = match args.get("pattern").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => return ToolResult::error("Error: Missing 'pattern' parameter".into()),
     };
-    if contains_path_traversal(pattern) {
-        return ToolResult::error(
-            "Error: glob pattern must not contain '..', start with '/', or contain '~/' (path traversal risk)"
-                .into(),
-        );
-    }
-
-    let requested_path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-    let resolved = match resolve_existing_search_path(workspace_root, requested_path) {
+    let (requested_path, pattern) = match normalize_glob_path_and_pattern(args, raw_pattern) {
+        Ok(normalized) => normalized,
+        Err(e) => return ToolResult::error(e),
+    };
+    let resolved = match resolve_existing_search_path(workspace_root, &requested_path) {
         Ok(path) => path,
         Err(e) => return ToolResult::error(e),
     };
@@ -1066,7 +1062,7 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     };
 
     if resolved.is_file() {
-        return if glob_matches_path(pattern, &target)
+        return if glob_matches_path(&pattern, &target)
             && !should_ignore_search_path(&target, &ignore_rules)
         {
             ToolResult::text(target)
@@ -1078,7 +1074,7 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     let command_output = run_glob_with_preferred_backend(
         workspace_root,
         &target,
-        pattern,
+        &pattern,
         ctx.cancel_token.as_deref(),
         ripgrep_available(),
     )
@@ -1109,7 +1105,7 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         .lines()
         .map(strip_current_dir_prefix)
         .filter(|line| !line.is_empty())
-        .filter(|line| glob_matches_path(pattern, line))
+        .filter(|line| glob_matches_path(&pattern, line))
         .filter(|line| !should_ignore_search_path(line, &ignore_rules))
         .collect();
     let gitignored_paths = match load_gitignored_search_paths(workspace_root, &files).await {
@@ -1382,6 +1378,65 @@ fn shell_safe_search_target(target: &str) -> String {
     } else {
         target.to_string()
     }
+}
+
+fn normalize_glob_path_and_pattern(
+    args: &Value,
+    pattern: &str,
+) -> Result<(String, String), String> {
+    if Path::new(pattern).is_absolute() {
+        return split_absolute_glob_pattern(pattern);
+    }
+    if contains_path_traversal(pattern) {
+        return Err(glob_path_traversal_error());
+    }
+    Ok((
+        args.get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".")
+            .to_string(),
+        pattern.to_string(),
+    ))
+}
+
+fn split_absolute_glob_pattern(pattern: &str) -> Result<(String, String), String> {
+    if pattern.contains("~/") || pattern.split(['/', '\\']).any(|part| part == "..") {
+        return Err(glob_path_traversal_error());
+    }
+
+    let normalized = pattern.replace('\\', "/");
+    let parts: Vec<&str> = normalized.split('/').skip(1).collect();
+    let first_glob = parts.iter().position(|part| glob_part_has_meta(part));
+
+    match first_glob {
+        Some(0) => Ok(("/".to_string(), parts.join("/"))),
+        Some(index) => {
+            let base = format!("/{}", parts[..index].join("/"));
+            let rel_pattern = parts[index..].join("/");
+            Ok((base, rel_pattern))
+        }
+        None => {
+            let path = Path::new(pattern);
+            let base = path
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| "/".to_string());
+            let rel_pattern = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "*".to_string());
+            Ok((base, rel_pattern))
+        }
+    }
+}
+
+fn glob_part_has_meta(part: &str) -> bool {
+    part.contains('*') || part.contains('?') || part.contains('[') || part.contains('{')
+}
+
+fn glob_path_traversal_error() -> String {
+    "Error: glob pattern must not contain '..' or '~/' (path traversal risk)".to_string()
 }
 
 fn parse_search_output_mode(args: &Value) -> Result<SearchOutputMode, String> {
@@ -3805,6 +3860,35 @@ printf 'probe.txt:1:needle\n'
         assert!(
             !result.output.contains("target/cached.rs"),
             "default glob should skip generated dirs: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_accepts_absolute_pattern_under_allowed_tmp() {
+        let workspace = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(workspace.path());
+        std::fs::create_dir_all(external.path().join("game3d")).unwrap();
+        std::fs::write(external.path().join("game3d").join("index.html"), "").unwrap();
+
+        let result = glob(
+            &ctx,
+            &serde_json::json!({
+                "pattern": format!("{}/**/*.html", external.path().display()),
+                "sort_by": "path"
+            }),
+        )
+        .await;
+
+        assert!(
+            !result.is_error,
+            "absolute glob under /tmp should succeed: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("index.html"),
+            "expected matched file, got: {}",
             result.output
         );
     }
