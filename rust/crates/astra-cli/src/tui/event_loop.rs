@@ -16,7 +16,7 @@
 //! The draw pipeline lives in `super::draw`; priority is
 //! `Active > TaskBoard > Status > NextHint > Empty`.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
@@ -74,35 +74,29 @@ fn flush_chat_widget(
     if new_cells.is_empty() {
         return;
     }
-    // Batch layout: each cell renders its lines then gets a trailing
-    // blank for visual separation. Response cells (`⎿ Set model to …`)
-    // want to hug the `› /cmd` line above —
-    // both when paired in the same batch (no blank between them)
-    // and when the UserCell flushed in an earlier event (the
-    // picker-return path). For the former we detect the pair here
-    // and skip its separator; for the latter we also skip the
-    // response's OWN leading and trailing blanks so the reply
-    // stacks tight onto the previous flush's `› /cmd`.
-    let mut batch: Vec<ratatui::text::Line<'static>> = Vec::new();
-    for (i, cell) in new_cells.iter().enumerate() {
-        batch.extend(cell.display_lines(width));
-        let is_last = i + 1 == new_cells.len();
-        let next_is_response = !is_last && is_response_cell(new_cells[i + 1].as_ref());
-        let this_is_slash_user = is_slash_user_cell(cell.as_ref());
-        let this_is_response = is_response_cell(cell.as_ref());
+    let batch = render_history_batch_lines(&new_cells, width);
+    guard.queue_history_lines(batch);
+}
 
-        // Skip the trailing blank in two cases:
-        //   1. This cell is a slash UserCell and the next is a
-        //      response — they're a visual pair.
-        //   2. This cell is a response — its reply should stack
-        //      tight onto whatever came next, and nothing in the
-        //      current batch should push air below it.
-        let suppress_blank = (this_is_slash_user && next_is_response) || this_is_response;
+fn render_history_batch_lines(
+    cells: &[Arc<dyn history_cell::HistoryCell>],
+    width: u16,
+) -> Vec<ratatui::text::Line<'static>> {
+    // Batch layout: each cell renders its lines then usually gets a trailing
+    // blank for visual separation. Slash user cells must stay tight to the
+    // slash outcome even when a deferred picker/view causes the paired
+    // response to flush in a later batch, so `/cmd` suppresses its own
+    // trailing blank unconditionally. Response cells (`⎿ Set model to …`)
+    // also suppress their trailing blank so the pair stays compact.
+    let mut batch: Vec<ratatui::text::Line<'static>> = Vec::new();
+    for cell in cells {
+        batch.extend(cell.display_lines(width));
+        let suppress_blank = is_slash_user_cell(cell.as_ref()) || is_response_cell(cell.as_ref());
         if !suppress_blank {
             batch.push(ratatui::text::Line::default());
         }
     }
-    guard.queue_history_lines(batch);
+    batch
 }
 
 fn surface_status_line_system_cell(event: &TuiAppEvent, chat_widget: &mut chat_widget::ChatWidget) {
@@ -3286,5 +3280,54 @@ mod tests {
         assert!(next_pending_deferred_slash_flush(
             &slash_dispatch::SlashResult::Deferred
         ));
+    }
+
+    #[test]
+    fn render_history_batch_lines_keeps_prose_gap() {
+        let cells: Vec<Arc<dyn history_cell::HistoryCell>> =
+            vec![Arc::new(history_cell::user::UserCell::new("hi"))];
+        let lines = render_history_batch_lines(&cells, 80);
+
+        assert_eq!(lines.len(), 2, "prose cells should keep one separator row");
+        assert!(lines[1].spans.is_empty(), "separator should be blank");
+    }
+
+    #[test]
+    fn render_history_batch_lines_omits_slash_user_gap() {
+        let cells: Vec<Arc<dyn history_cell::HistoryCell>> =
+            vec![Arc::new(history_cell::user::UserCell::new("/allow"))];
+        let lines = render_history_batch_lines(&cells, 80);
+
+        assert_eq!(
+            lines.len(),
+            1,
+            "slash command should not emit a trailing blank row"
+        );
+    }
+
+    #[test]
+    fn render_history_batch_lines_keeps_slash_pair_tight() {
+        let cells: Vec<Arc<dyn history_cell::HistoryCell>> = vec![
+            Arc::new(history_cell::user::UserCell::new("/allow")),
+            Arc::new(history_cell::system::SystemCell::response("Mode → auto")),
+        ];
+        let lines = render_history_batch_lines(&cells, 80);
+
+        assert_eq!(
+            lines.len(),
+            2,
+            "slash command and response should hug with no blank row"
+        );
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert!(rendered[0].contains("/allow"));
+        assert!(rendered[1].contains("Mode → auto"));
     }
 }
