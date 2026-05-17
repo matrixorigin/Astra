@@ -364,7 +364,9 @@ impl HybridRestoreService {
                 if recent_tools.is_empty() {
                     recent_tools = recent_tools_from_context_trace(last_context_trace.as_ref());
                 }
-                let latest_model: Option<String> = row.try_get("latest_model").ok().flatten();
+                let latest_model = astra_core::model_override::normalize_model_override_owned(
+                    row.try_get("latest_model").ok().flatten(),
+                );
                 let model = metadata_state.model.clone().or(latest_model);
 
                 // Load active contract from task_contracts table
@@ -888,7 +890,7 @@ fn restored_session_from_workspace(
         checkpoint_count,
         last_status: ws.status,
         git_branch: ws.git_branch,
-        model: Some(ws.model),
+        model: ws.model,
         title: None,
         restored_from_cloud,
         executing_plan_json: ws.executing_plan_json,
@@ -1152,7 +1154,9 @@ impl SessionRestoreService for HybridRestoreService {
                 .as_deref()
                 .map(extract_session_state_from_metadata)
                 .unwrap_or_default();
-            let latest_model: Option<String> = row.try_get("latest_model").ok().flatten();
+            let latest_model = astra_core::model_override::normalize_model_override_owned(
+                row.try_get("latest_model").ok().flatten(),
+            );
             let model = metadata_state.model.clone().or(latest_model);
 
             sessions.push(RestoredSession {
@@ -1781,7 +1785,7 @@ fn merge_session_state_metadata(
         metadata.remove("git_branch");
     }
 
-    if let Some(model) = model {
+    if let Some(model) = astra_core::model_override::normalize_model_override(model) {
         metadata.insert(
             "model".to_string(),
             serde_json::Value::String(model.to_string()),
@@ -1854,7 +1858,8 @@ pub fn extract_session_state_from_metadata(metadata_json: &str) -> SessionMetada
         model: obj
             .get("model")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+            .and_then(|s| astra_core::model_override::normalize_model_override(Some(s)))
+            .map(str::to_string),
     }
 }
 
@@ -2377,6 +2382,21 @@ mod tests {
     }
 
     #[test]
+    fn merge_session_state_metadata_does_not_persist_symbolic_default_model() {
+        let merged = merge_session_state_metadata(
+            Some(r#"{"agent_id":"astra-server"}"#),
+            None,
+            None,
+            None,
+            0,
+            None,
+            Some(" default "),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert!(parsed.get("model").is_none());
+    }
+
+    #[test]
     fn merge_session_state_metadata_clears_absent_plan_fields() {
         let merged = merge_session_state_metadata(
             Some(
@@ -2426,6 +2446,12 @@ mod tests {
         assert_eq!(state.plan_execution_rounds, 0);
         assert_eq!(state.git_branch.as_deref(), Some("feature/cloud-sync"));
         assert_eq!(state.model.as_deref(), Some("gpt-5.4"));
+    }
+
+    #[test]
+    fn extract_session_state_from_metadata_drops_symbolic_default_model() {
+        let state = extract_session_state_from_metadata(r#"{"model":"default"}"#);
+        assert_eq!(state.model, None);
     }
 
     #[test]

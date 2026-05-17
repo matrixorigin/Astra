@@ -776,8 +776,10 @@ pub(super) async fn handle_session_command(
             if sid != "none" {
                 if let Some(ref ws) = persisted_ws {
                     print_workspace_metadata(ws, sid);
-                    if ws.model != mdl {
-                        eprintln!("  {:<16} {}", "started as:".dim(), ws.model.as_str().dim());
+                    if let Some(started_model) = ws.model.as_deref()
+                        && started_model != mdl
+                    {
+                        eprintln!("  {:<16} {}", "started as:".dim(), started_model.dim());
                     }
                 } else {
                     eprintln!(
@@ -3703,7 +3705,7 @@ fn handle_session_analyze(arg: &str, state: &SessionState) {
 
     let model = ws
         .as_ref()
-        .map(|w| w.model.as_str())
+        .and_then(|w| w.model.as_deref())
         .or_else(|| events.first().and_then(|e| e.model.as_deref()))
         .unwrap_or("unknown");
     let total_tok_in: u64 = turns.iter().filter_map(|t| t.tokens_in).sum();
@@ -4945,16 +4947,19 @@ async fn apply_restored_session(
         }
     }
 
-    if let Some(m) = normalize_model_override(restored.model.as_deref()) {
-        state.model = Some(m.to_string());
-        let base = astra_turn_core::thinking_config::resolve_model_thinking(m).0;
-        state.cached_pricing = slash_stats::fallback_pricing(base);
-        state.context_budget =
-            prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(base));
-    } else if restored.model.is_some() {
-        state.model = None;
-        state.context_budget =
-            prompts::ContextBudget::from_runtime_config(&state.runtime_config, None);
+    match normalize_model_override(restored.model.as_deref()) {
+        Some(m) => {
+            state.model = Some(m.to_string());
+            let base = astra_turn_core::thinking_config::resolve_model_thinking(m).0;
+            state.cached_pricing = slash_stats::fallback_pricing(base);
+            state.context_budget =
+                prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(base));
+        }
+        None => {
+            state.model = None;
+            state.context_budget =
+                prompts::ContextBudget::from_runtime_config(&state.runtime_config, None);
+        }
     }
 
     restore_journal_history_if_available(state, &restored.session_id).await;
@@ -5045,9 +5050,8 @@ async fn apply_restored_session(
         if let Some(ref branch) = restored.git_branch {
             ws.git_branch = Some(branch.clone());
         }
-        if let Some(ref model) = restored.model {
-            ws.model = model.clone();
-        }
+        ws.model =
+            astra_core::model_override::normalize_model_override_owned(restored.model.clone());
         ws.executing_plan_json = restored.executing_plan_json.clone();
         ws.plan_goal = restored.plan_goal.clone();
         ws.plan_config_json = restored.plan_config_json.clone();
@@ -5236,7 +5240,7 @@ pub(super) async fn handle_resume_command(
             let model = s
                 .model
                 .clone()
-                .or_else(|| ws.as_ref().map(|w| w.model.clone()))
+                .or_else(|| ws.as_ref().and_then(|w| w.model.clone()))
                 .or_else(|| peek.as_ref().and_then(|p| p.model.clone()));
 
             // cwd: shorten to last 2 path components
@@ -5432,7 +5436,7 @@ pub(super) async fn handle_resume_command(
         // Model
         let model = ws
             .as_ref()
-            .map(|w| w.model.clone())
+            .and_then(|w| w.model.clone())
             .or_else(|| peek.as_ref().and_then(|p| p.model.clone()))
             .unwrap_or_else(|| "?".to_string());
         eprintln!("  {:<14} {}", "model:".dim(), model.magenta());
@@ -6042,7 +6046,7 @@ mod resume_tests {
         let session_id = format!("resume-default-model-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 2);
         let mut ws = session_workspace::read_workspace(&session_id).unwrap();
-        ws.model = "default".to_string();
+        ws.model = Some("default".to_string());
         session_workspace::write_workspace(&ws).unwrap();
         write_profile_with_token(&session_id);
 

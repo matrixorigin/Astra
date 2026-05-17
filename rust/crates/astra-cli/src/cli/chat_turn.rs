@@ -1544,11 +1544,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                 let config = ws.plan_config_json.clone();
                 let rounds = ws.plan_execution_rounds;
                 let git_branch = ws.git_branch.clone();
-                let model = if ws.model.is_empty() {
-                    None
-                } else {
-                    Some(ws.model.clone())
-                };
+                let model = ws.model.clone();
                 mc.spawn_session_sync_task(async move {
                     if let Err(e) = svc
                         .push_session_state(
@@ -2860,10 +2856,11 @@ fn initialize_journal(state: &mut SessionState, session_id: &str) {
     }
     // Preserve the workspace model for existing sessions so `/session` can report
     // what the session originally started as even if the live model changes later.
-    if let Some(model) = state.model.as_deref()
-        && (ws.model.is_empty() || (!workspace_existed && ws.model != model))
+    if let Some(model) =
+        astra_core::model_override::normalize_model_override(state.model.as_deref())
+        && (ws.model.is_none() || (!workspace_existed && ws.model.as_deref() != Some(model)))
     {
-        ws.model = model.to_string();
+        ws.model = Some(model.to_string());
         dirty = true;
     }
     if dirty {
@@ -4020,7 +4017,7 @@ mod tests {
         initialize_journal(&mut state, sid);
 
         let persisted = astra_services::session_workspace::read_workspace(sid).unwrap();
-        assert_eq!(persisted.model, "old-model");
+        assert_eq!(persisted.model.as_deref(), Some("old-model"));
         assert_eq!(persisted.turn_count, 7);
         assert_eq!(
             persisted

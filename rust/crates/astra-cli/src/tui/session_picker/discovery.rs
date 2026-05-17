@@ -76,7 +76,7 @@ impl SessionSource for FsSessionSource {
                     cost_usd: None,
                     summary: ws.summary,
                     status: ws.status,
-                    model: ws.model,
+                    model: ws.model.unwrap_or_else(|| "default".to_string()),
                     updated_at: ws.updated_at,
                     checkpoints: ws.checkpoints.len() as u32,
                     plan_goal: ws.plan_goal,

@@ -65,16 +65,11 @@ pub(super) fn profile_name(cli_profile: Option<&str>, data: &CredentialsFile) ->
 }
 
 pub(super) fn normalize_model_override(model: Option<&str>) -> Option<&str> {
-    let model = model?.trim();
-    if model.is_empty() || model.eq_ignore_ascii_case("default") {
-        None
-    } else {
-        Some(model)
-    }
+    astra_core::model_override::normalize_model_override(model)
 }
 
 pub(super) fn normalize_model_override_owned(model: Option<String>) -> Option<String> {
-    normalize_model_override(model.as_deref()).map(str::to_string)
+    astra_core::model_override::normalize_model_override_owned(model)
 }
 
 pub(super) fn get_profile_and_token(

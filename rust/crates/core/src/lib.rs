@@ -15,6 +15,7 @@ pub mod drift;
 pub mod durable_task_store;
 pub mod error_kind;
 pub mod log;
+pub mod model_override;
 pub mod net;
 pub mod runtime_limits;
 

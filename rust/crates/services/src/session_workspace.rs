@@ -8,7 +8,7 @@
 //! - Context for session resumption and debugging
 //! - Foundation for checkpoint-based rewind
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -217,8 +217,17 @@ pub struct WorkspaceMetadata {
     /// Git HEAD commit at session start.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_head: Option<String>,
-    /// LLM model used.
-    pub model: String,
+    /// Concrete LLM model override used to start the session.
+    ///
+    /// `None` means the runtime used the server/API default. Symbolic values
+    /// such as `default` are normalized away at this persistence boundary.
+    #[serde(
+        default,
+        skip_serializing_if = "is_model_override_none",
+        serialize_with = "serialize_model_override",
+        deserialize_with = "deserialize_model_override"
+    )]
+    pub model: Option<String>,
     /// ISO 8601 creation timestamp.
     pub created_at: String,
     /// ISO 8601 last-updated timestamp.
@@ -307,6 +316,27 @@ pub struct WorkspaceMetadata {
     pub tuned_config_json: Option<String>,
 }
 
+fn deserialize_model_override<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(astra_core::model_override::normalize_model_override_owned(
+        raw,
+    ))
+}
+
+fn serialize_model_override<S>(model: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    astra_core::model_override::normalize_model_override(model.as_deref()).serialize(serializer)
+}
+
+fn is_model_override_none(model: &Option<String>) -> bool {
+    astra_core::model_override::normalize_model_override(model.as_deref()).is_none()
+}
+
 impl WorkspaceMetadata {
     /// Create initial metadata for a new session.
     pub fn new(session_id: &str, model: &str) -> Self {
@@ -365,7 +395,8 @@ impl WorkspaceMetadata {
             git_root,
             git_branch,
             git_head,
-            model: model.to_string(),
+            model: astra_core::model_override::normalize_model_override(Some(model))
+                .map(str::to_string),
             created_at: now.clone(),
             updated_at: now,
             turn_count: 0,
@@ -411,7 +442,8 @@ impl WorkspaceMetadata {
             git_root: None,
             git_branch: git_branch.map(|s| s.to_string()),
             git_head: None,
-            model: model.to_string(),
+            model: astra_core::model_override::normalize_model_override(Some(model))
+                .map(str::to_string),
             created_at: now.clone(),
             updated_at: now,
             turn_count: 0,
@@ -490,7 +522,7 @@ pub fn to_remote_artifact_record(
         round: None,
         content: serde_json::to_value(metadata)?,
         metadata: Some(json!({
-            "model": metadata.model,
+            "model": astra_core::model_override::normalize_model_override(metadata.model.as_deref()),
             "status": metadata.status,
             "git_branch": metadata.git_branch,
         })),
@@ -577,7 +609,7 @@ pub fn workspace_dir_for(session_id: &str) -> PathBuf {
 pub struct ProjectSessionSummary {
     pub session_id: String,
     pub summary: Option<String>,
-    pub model: String,
+    pub model: Option<String>,
     pub turn_count: u32,
     pub status: String,
     pub updated_at: String,
@@ -767,7 +799,7 @@ mod tests {
         let ws =
             WorkspaceMetadata::with_context("sess-1", "gpt-4", "/home/user/project", Some("main"));
         assert_eq!(ws.session_id, "sess-1");
-        assert_eq!(ws.model, "gpt-4");
+        assert_eq!(ws.model.as_deref(), Some("gpt-4"));
         assert_eq!(ws.cwd, "/home/user/project");
         assert_eq!(ws.git_branch, Some("main".to_string()));
         assert_eq!(ws.turn_count, 0);
@@ -830,6 +862,20 @@ mod tests {
         assert!(yaml.contains("status: active"));
         // Optional empty fields should be omitted
         assert!(!yaml.contains("summary"));
+    }
+
+    #[test]
+    fn workspace_does_not_persist_symbolic_default_model() {
+        let ws = WorkspaceMetadata::with_context("sess-1", " default ", "/home/user", Some("main"));
+        let yaml = serde_yaml_ng::to_string(&ws).unwrap();
+        assert!(!yaml.contains("model:"));
+    }
+
+    #[test]
+    fn workspace_legacy_default_model_deserializes_as_no_override() {
+        let yaml = "session_id: s\ncwd: /tmp\nmodel: default\ncreated_at: '2025-01-01T00:00:00Z'\nupdated_at: '2025-01-01T00:00:00Z'\nturn_count: 0\ntotal_tokens_in: 0\ntotal_tokens_out: 0\nstatus: active\n";
+        let ws: WorkspaceMetadata = serde_yaml_ng::from_str(yaml).unwrap();
+        assert!(ws.model.is_none());
     }
 
     #[test]
@@ -1057,7 +1103,7 @@ mod tests {
             ProjectSessionSummary {
                 session_id: "s1".into(),
                 summary: Some("Fixed auth bug".into()),
-                model: "gpt-4".into(),
+                model: Some("gpt-4".into()),
                 turn_count: 15,
                 status: "completed".into(),
                 updated_at: "2025-01-15T10:00:00Z".into(),
@@ -1066,7 +1112,7 @@ mod tests {
             ProjectSessionSummary {
                 session_id: "s2".into(),
                 summary: None,
-                model: "claude".into(),
+                model: Some("claude".into()),
                 turn_count: 3,
                 status: "active".into(),
                 updated_at: "2025-01-14T08:00:00Z".into(),
@@ -1087,7 +1133,7 @@ mod tests {
         let summaries = vec![ProjectSessionSummary {
             session_id: "s1".into(),
             summary: Some(long_summary),
-            model: "gpt-4".into(),
+            model: Some("gpt-4".into()),
             turn_count: 5,
             status: "completed".into(),
             updated_at: "2025-01-15T10:00:00Z".into(),
@@ -1111,7 +1157,7 @@ mod tests {
         let summaries = vec![ProjectSessionSummary {
             session_id: "s1".into(),
             summary: Some("Short summary".into()),
-            model: "m".into(),
+            model: Some("m".into()),
             turn_count: 1,
             status: "active".into(),
             updated_at: "2025".into(), // only 4 chars
