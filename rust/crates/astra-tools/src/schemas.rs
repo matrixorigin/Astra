@@ -119,13 +119,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Execute a shell command in the project root. For builds, tests, installs, and CLI tasks. Use dedicated tools for: file reading (read_file), search (grep), file finding (glob), editing (str_replace), git operations (git).",
+                "description": "Execute a shell command in the project root. Use for builds, tests, installs, and CLI tasks; prefer dedicated read/search/edit/git tools when possible.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "command": {"type": "string", "description": "Shell command to run"},
-                        "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites)."},
-                        "force": {"type": "boolean", "description": "If true, bypass the per-session identical-command cache and execute even when the same command already succeeded."}
+                        "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Use a larger value for long builds/tests, e.g. cargo build or full test suites."},
+                        "force": {"type": "boolean", "description": "Bypass the per-session identical-command cache."}
                     },
                     "required": ["command"]
                 }
@@ -152,13 +152,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create, overwrite, or delete a file. For writes, provide both path and content. For deletes, provide path with delete=true instead of content. Retry write_file with corrected arguments; do not switch to bash or python just to write a file.",
+                "description": "Create, overwrite, or delete a file. For writes, provide `path` and `content`. For deletes, set `delete=true` and omit `content`. Retry `write_file` with corrected args; do not switch to bash or python just to write a file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
-                        "content": {"type": "string", "description": "File content. Required when delete is absent or false."},
-                        "delete": {"type": "boolean", "description": "Set to true to delete the file instead of writing. When true, content must be omitted."}
+                        "content": {"type": "string", "description": "File content. Required unless deleting."},
+                        "delete": {"type": "boolean", "description": "Delete instead of write. Omit content when true."}
                     },
                     "required": ["path"],
                     "x-astra-per-action-required": {
@@ -172,16 +172,16 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "str_replace",
-                "description": "Replace text in a file. Exact match with fuzzy fallback. Use edits array for batch replacements.",
+                "description": "Replace text in a file. Supports single replacement or batched `edits`.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
-                        "old_str": {"type": "string", "description": "Exact string to replace (single-edit mode)"},
-                        "new_str": {"type": "string", "description": "Replacement string (single-edit mode)"},
+                        "old_str": {"type": "string", "description": "String to replace (single-edit mode)."},
+                        "new_str": {"type": "string", "description": "Replacement text (single-edit mode)."},
                         "edits": {
                             "type": "array",
-                            "description": "Array of {old_str, new_str} pairs applied atomically. Mutually exclusive with old_str/new_str.",
+                            "description": "Atomic array of {old_str, new_str} pairs. Mutually exclusive with old_str/new_str.",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -191,9 +191,9 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "required": ["old_str", "new_str"]
                             }
                         },
-                        "dry_run": {"type": "boolean", "description": "Preview diff without applying (default: false)"},
-                        "replace_all": {"type": "boolean", "description": "Replace ALL occurrences (default: false)"},
-                        "allow_structural_change": {"type": "boolean", "description": "Bypass structural safety checks for intentional syntax-breaking or comment-removing edits (default: false)"}
+                        "dry_run": {"type": "boolean", "description": "Preview without applying."},
+                        "replace_all": {"type": "boolean", "description": "Replace all occurrences."},
+                        "allow_structural_change": {"type": "boolean", "description": "Bypass structural safety checks for intentional syntax-breaking edits."}
                     },
                     "required": ["path"]
                 }
@@ -218,17 +218,17 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Search for a regex pattern in files. Returns matching lines with file:line format. Respects .gitignore.",
+                "description": "Search file contents with a regex pattern. Respects .gitignore.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "pattern": {"type": "string", "description": "Regex pattern to search for"},
-                        "path": {"type": "string", "description": "Directory or file to search (default: project root)"},
-                        "include": {"type": "string", "description": "File glob filter e.g. '*.rs'"},
-                        "case_sensitive": {"type": "boolean", "description": "Case sensitive (default false)"},
-                        "fixed_strings": {"type": "boolean", "description": "Treat pattern as literal string (like grep -F)"},
+                        "path": {"type": "string", "description": "Directory or file to search."},
+                        "include": {"type": "string", "description": "Optional file glob filter, e.g. '*.rs'."},
+                        "case_sensitive": {"type": "boolean", "description": "Case-sensitive search."},
+                        "fixed_strings": {"type": "boolean", "description": "Treat pattern as a literal string."},
                         "max_matches": {"type": "integer", "description": "Max matches per file"},
-                        "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Output: content (default), files_with_matches, or count"}
+                        "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "content, files_with_matches, or count."}
                     },
                     "required": ["pattern"]
                 }
@@ -238,15 +238,15 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "glob",
-                "description": "Find files matching a glob pattern. Respects .gitignore/.astraignore when present and supports pagination via offset/head_limit.",
+                "description": "Find files matching a glob pattern. Supports pagination via offset/head_limit.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "pattern": {"type": "string", "description": "Glob pattern e.g. '**/*.rs'"},
-                        "path": {"type": "string", "description": "Root directory (default: project root)"},
-                        "sort_by": {"type": "string", "enum": ["mtime", "path"], "description": "Sort matching files by newest modified time first (default 'mtime') or alphabetically by path."},
+                        "path": {"type": "string", "description": "Root directory."},
+                        "sort_by": {"type": "string", "enum": ["mtime", "path"], "description": "Sort by newest mtime or by path."},
                         "offset": {"type": "integer", "minimum": 0, "description": "Skip first N matching files (for pagination)"},
-                        "head_limit": {"type": "integer", "minimum": 0, "description": "Max matching files to return after offset. Defaults to 100; set 0 for unlimited."}
+                        "head_limit": {"type": "integer", "minimum": 0, "description": "Max files after offset. Default 100; 0 = unlimited."}
                     },
                     "required": ["pattern"]
                 }
@@ -471,86 +471,73 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory",
-                "description": "Cognitive memory operations. Actions (model-facing verbs): \
-                    `remember` (persist a fact for future turns/sessions), \
-                    `recall` (retrieve relevant memories by query — combines keyword + vector + temporal + confidence), \
-                    `expand` (drill into one memory by id to get overview/detail + linked related memories), \
-                    `forget` (soft-delete by id), \
-                    `update` (correct or enrich an existing memory), \
-                    `focus` (session-scoped attention boost: subsequent `recall` weights the given topic/tag higher for ttl_secs), \
-                    `reflect` (cross-memory pattern synthesis; consolidates recent memories into higher-level scenes), \
-                    `profile` (return the user profile summary), \
-                    `feedback` (signal that a recalled memory was useful/irrelevant/outdated/wrong — shapes future recall ranking). \
-                    Supports `agent_type` scoping for per-agent-type memory isolation. \
-                    Visibility: `visibility=\"private\"` (default) keeps the memory to your account; \
-                    `visibility=\"team\"` tags it for team sharing (requires `team_id`), and on recall \
-                    the union includes the current user's team-tagged memories.",
+                "description": "Memory operations: `remember` (store), `recall` (search), `expand` (open by id), `forget` (soft-delete), `update` (correct), `focus` (temporary recall boost), `reflect` (synthesize patterns), `profile` (user profile), `feedback` (mark quality). `visibility=\"team\"` shares within a team; `agent_type` scopes by persona.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
                             "enum": ["remember","recall","expand","forget","update","focus","reflect","profile","feedback"],
-                            "description": "Cognitive memory verb."
+                            "description": "Memory operation."
                         },
-                        "content": {"type": "string", "description": "remember: the fact to store. update: replacement content."},
-                        "query": {"type": "string", "description": "recall: the natural-language query. update: also accepted as a selector when memory_id is unknown."},
-                        "memory_id": {"type": "string", "description": "expand / forget / update / feedback: target memory id."},
+                        "content": {"type": "string", "description": "Fact to store or replacement content."},
+                        "query": {"type": "string", "description": "Search query or update selector."},
+                        "memory_id": {"type": "string", "description": "Target memory id."},
                         "memory_type": {
                             "type": "string",
                             "enum": ["semantic","profile","procedural","working","episodic"],
-                            "description": "remember: memory category. Defaults to `semantic`."
+                            "description": "Memory category."
                         },
-                        "top_k": {"type": "integer", "description": "recall: max number of memories (default 10)."},
-                        "min_confidence": {"type": "number", "description": "recall: filter out memories below this confidence (0.0-1.0)."},
+                        "top_k": {"type": "integer", "description": "Max results."},
+                        "min_confidence": {"type": "number", "description": "Confidence filter (0.0-1.0)."},
                         "scope": {
                             "type": "string",
                             "enum": ["all","session"],
-                            "description": "recall: `session` restricts to current session; `all` includes cross-session (default `all`)."
+                            "description": "Recall scope."
                         },
                         "view": {
                             "type": "string",
                             "enum": ["compact","overview","full"],
-                            "description": "recall: response detail level. `compact` (default) returns abstracts; `overview` adds summaries; `full` adds linked memories."
+                            "description": "Recall detail level."
                         },
-                        "importance": {"type": "number", "description": "remember / update: importance score (0.0-1.0)."},
-                        "trust_tier": {"type": "string", "description": "remember / update: provenance trust tier."},
-                        "tags": {"type": "array", "items": {"type": "string"}, "description": "remember: tags to attach."},
-                        "tags_add": {"type": "array", "items": {"type": "string"}, "description": "update: tags to append."},
-                        "tags_remove": {"type": "array", "items": {"type": "string"}, "description": "update: tags to detach."},
+                        "importance": {"type": "number", "description": "Importance score."},
+                        "trust_tier": {"type": "string", "description": "Trust tier."},
+                        "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags."},
+                        "tags_add": {"type": "array", "items": {"type": "string"}, "description": "Tags to add."},
+                        "tags_remove": {"type": "array", "items": {"type": "string"}, "description": "Tags to remove."},
                         "visibility": {
                             "type": "string",
                             "enum": ["private","team"],
-                            "description": "remember: who else should see this memory. `private` (default) — only you on this account. `team` — shared with other agents that belong to the same team (`team_id` required). recall: when set to `team`, the retrieval union includes team-tagged memories in addition to your private ones."
+                            "description": "Visibility."
                         },
                         "team_id": {
                             "type": "string",
-                            "description": "remember with visibility=team: the team to tag (encoded as `astra:team:<id>` in the memory's tag set). recall with visibility=team: union with the given team's shared pool. Omit to fall back to the executor's default team from session context."
+                            "description": "Team id for team visibility."
                         },
-                        "reason": {"type": "string", "description": "forget / update: REQUIRED — non-empty explanation for the audit trail (why this memory is being changed). feedback: optional."},
+                        "reason": {"type": "string", "description": "Audit reason."},
                         "level": {
                             "type": "string",
                             "enum": ["abstract","overview","detail","linked"],
-                            "description": "expand: how deep to unfold (`abstract` < `overview` < `detail` < `linked`)."
+                            "description": "expand depth."
                         },
                         "focus_type": {
                             "type": "string",
                             "enum": ["topic","tag","memory_id","session"],
-                            "description": "focus: what kind of attention to boost."
+                            "description": "focus target type."
                         },
-                        "focus_value": {"type": "string", "description": "focus: the topic / tag / id / session to boost."},
-                        "boost": {"type": "number", "description": "focus: multiplier applied to matching memories (default 1.5)."},
-                        "ttl_secs": {"type": "integer", "description": "focus: how long the boost lasts (default 3600s)."},
+                        "focus_value": {"type": "string", "description": "Focus target value."},
+                        "boost": {"type": "number", "description": "Boost multiplier."},
+                        "ttl_secs": {"type": "integer", "description": "Boost TTL seconds."},
                         "signal": {
                             "type": "string",
                             "enum": ["useful","irrelevant","outdated","wrong"],
-                            "description": "feedback: quality signal for the recalled memory."
+                            "description": "feedback quality signal."
                         },
-                        "context": {"type": "string", "description": "feedback: optional free-form context on why the signal was given."},
+                        "context": {"type": "string", "description": "Optional context."},
                         "agent_type": {
                             "type": "string",
                             "enum": ["explore","code-review","task","general-purpose"],
-                            "description": "remember / recall: scope to a specific agent type. On remember it tags; on recall it filters to that type + unscoped globals."
+                            "description": "Persona scope."
                         }
                     },
                     "required": ["action"],
@@ -678,12 +665,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "introspect",
-                "description": "Query own runtime state. Subtopics: 'session' (default — token pressure, cache hit rate, tool health, alerts, working memory, and host-provided plan/task/session lifecycle context such as restore/resume state and last lifecycle event when available); 'cache' (cache-regression diagnosis over recent LLM captures); 'recent' (last N LLM-round summaries from in-memory ring — tokens, tool calls, duration); 'volatile' (what runtime nudges / working-set / coaching are about to be injected); 'stall' (loop-guard state — nudge count, stall events, forced corrections); 'all' (session + recent + volatile + stall).",
+                "description": "Query runtime state. Subtopics: `session` (default: token pressure, cache hit rate, tool health, alerts, working memory, and plan/task/session lifecycle context including restore/resume state and last lifecycle event when available), `cache` (cache-regression diagnosis), `recent` (recent LLM-round summaries), `volatile` (runtime nudges / working-set / coaching queued for next turn), `stall` (loop-guard state), `all` (session + recent + volatile + stall).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "subtopic": {"type": "string", "enum": ["session","cache","recent","volatile","stall","noise","all"], "description": "Which diagnostic to run (default: session). `noise`: per-channel freshness of runtime-injected prompt signals — flags channels re-rendered unchanged for many turns."},
-                        "detail": {"type": "string", "enum": ["full","summary","minimal"], "description": "Output detail level for the session topic (default: auto from budget). Ignored for other subtopics."}
+                        "subtopic": {"type": "string", "enum": ["session","cache","recent","volatile","stall","noise","all"], "description": "Diagnostic to run. `noise` reports stale runtime-injected prompt channels."},
+                        "detail": {"type": "string", "enum": ["full","summary","minimal"], "description": "Detail level for session output."}
                     }
                 }
             }
@@ -693,24 +680,21 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "function": {
                 "name": "tool_search",
                 "description":
-                    "Search and activate deferred tools. Pass `query` to find tools by \
-                     keyword, OR pass `query=\"select:NAME\"` (or `select:NAME1,NAME2`) to \
-                     retrieve the full schema for one or more deferred tools listed in \
-                     `<deferred_tools>`. After calling with `select:`, you may invoke the \
-                     selected tool(s) directly on the next turn — runtime accepts calls \
-                     for any dispatchable name, not just names currently in `tools[]`.",
+                    "Search deferred tools. Use keyword queries to find matches, or \
+                     `query=\"select:NAME\"` / `select:NAME1,NAME2` to fetch full schemas \
+                     for specific deferred tools. After `select:`, invoke the chosen tool \
+                     directly on the next turn.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
                             "description":
-                                "Keyword query, or `select:NAME` / `select:NAME1,NAME2` for \
-                                 direct activation."
+                                "Keyword query, or `select:NAME` / `select:NAME1,NAME2`."
                         },
                         "max_results": {
                             "type": "integer",
-                            "description": "Maximum results for keyword mode (default 5, max 20)."
+                            "description": "Keyword-mode result limit (default 5, max 20)."
                         }
                     },
                     "required": ["query"]
@@ -786,130 +770,65 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task",
-                "description": "Durable session task list. Use this tool proactively to track progress for multi-step coding work and surface it to the user via the task board.\n\
+                "description": "Durable session task list. Use this tool proactively to track multi-step coding work and show progress in the task board.\n\
         \n\
-        Actions: create, update, list, get, stop. Supports subtasks, blocking dependencies, ownership, metadata.\n\
+        Actions: create, update, list, get, stop, list_user, adopt, archive. Checklist only — use `agent_job` for background shell or sub-agent work.\n\
         \n\
-        For background processes (long-running shell jobs, durable sub-agents) use `agent_job` instead — `task` is the checklist, not the runner.\n\
+        ## When to Use\n\
+        - 3 or more distinct outcomes, files, phases, or deliverables.\n\
+        - Approved plan execution or delegated/background work that still needs visible ownership.\n\
+        - Scope expands mid-flight and the user should see the new work.\n\
         \n\
-        ## When to Use This Tool\n\
-        Use `task` when progress tracking will make the work clearer to the user:\n\
-        - Complex multi-step coding work with 3 or more distinct outcomes, files, phases, or deliverables.\n\
-        - Plan-mode execution, where approved plan items should become visible progress.\n\
-        - Work delegated to sub-agents or background jobs that still needs user-visible ownership and completion state.\n\
-        - New requirements discovered while implementing, where the task board should show the expanded scope.\n\
-        \n\
-        When you decide tracking is useful, your FIRST action this turn MUST be:\n\
-        1. Create one task per meaningful outcome or phase. Use subtasks for ordered internal steps.\n\
+        When tracking is useful:\n\
+        1. Create one task per meaningful outcome or phase.\n\
         2. Mark the first actionable task as `in_progress` BEFORE beginning work.\n\
-        3. THEN start the actual work.\n\
+        3. Keep exactly ONE task as `in_progress` at a time.\n\
+        4. Mark tasks completed immediately; on failure set `failed` with `error_message`.\n\
         \n\
-        ## When NOT to Use This Tool\n\
-        Skip task tracking when it would add noise rather than clarity:\n\
+        ## When NOT to Use\n\
         - Single edit / single command / single answer.\n\
-        - Pure information request (\"what does X do?\").\n\
-        - Triviality (\"add a comment\", \"fix this typo\").\n\
-        \n\
-        ## ONGOING OBLIGATIONS while tasks exist:\n\
-        - Exactly ONE task as `in_progress` at any moment. Flip the current one to `completed` BEFORE flipping the next one to `in_progress`.\n\
-        - Mark `completed` IMMEDIATELY after finishing — do not batch closures.\n\
-        - Discovered new work mid-flight? Create a new task rather than expanding an existing one.\n\
-        - Failed? Mark `failed` with `error_message` so the user sees what blocked it; don't silently abandon.\n\
-        \n\
-        ## Examples of When to Use the Task Tool\n\
-        \n\
-        <example>\n\
-        User: I want to add a dark mode toggle to the application settings. Make sure you run the tests and build when you're done!\n\
-        Assistant: *Calls task(action='create') five times, one per step:*\n\
-          1. Create dark mode toggle component in Settings page\n\
-          2. Add dark mode state management (context/store)\n\
-          3. Implement CSS-in-JS styles for dark theme\n\
-          4. Update existing components to support theme switching\n\
-          5. Run tests and build, addressing any failures\n\
-        *Then calls task(action='update', task_id='task-1', new_status='in_progress') and starts on the first step.*\n\
-        \n\
-        <reasoning>The assistant created tasks because: (1) it's a multi-step feature spanning UI, state, and styling; (2) the user explicitly asked for tests + build; (3) tracking lets the user see progress across all five steps.</reasoning>\n\
-        </example>\n\
-        \n\
-        <example>\n\
-        User: Help me rename the function getCwd to getCurrentWorkingDirectory across my project.\n\
-        Assistant: *Uses grep to locate all occurrences first.* I found 15 instances across 8 files. *Creates one task per file plus a final 'verify with cargo check' task.*\n\
-        \n\
-        <reasoning>Search-then-plan: the assistant scoped the work first, then created tasks because the work crossed multiple files and needed systematic tracking to avoid missed instances.</reasoning>\n\
-        </example>\n\
-        \n\
-        <example>\n\
-        User: I need to implement these features for my e-commerce site: user registration, product catalog, shopping cart, and checkout flow.\n\
-        Assistant: *Creates four parent tasks, one per feature, each with subtasks for db model + API + frontend.* Let's start with user registration.\n\
-        \n\
-        <reasoning>The user asked for four large features. Separate parent tasks make the scope and progress visible; subtasks encode the implementation steps each feature needs.</reasoning>\n\
-        </example>\n\
-        \n\
-        ## Examples of When NOT to Use the Task Tool\n\
-        \n\
-        <example>\n\
-        User: How do I print 'Hello World' in Python?\n\
-        Assistant: `print(\"Hello World\")`\n\
-        \n\
-        <reasoning>Single, trivial, informational. No tracking needed.</reasoning>\n\
-        </example>\n\
-        \n\
-        <example>\n\
-        User: Can you add a comment to the calculateTotal function?\n\
-        Assistant: *Uses str_replace once.* Done.\n\
-        \n\
-        <reasoning>Single edit in one location — tracking adds noise.</reasoning>\n\
-        </example>\n\
-        \n\
-        ## Task States and Management\n\
-        \n\
-        - **States**: `pending` → `in_progress` → `completed` (or `failed` / `cancelled`). The `deleted` action hard-removes a task.\n\
-        - **Exactly one in_progress at a time**: flip the next task to `in_progress` only after marking the current one `completed`.\n\
-        - **Mark complete IMMEDIATELY** after finishing — do not batch.\n\
-        - **Add follow-ups as they appear**: if you discover new work mid-implementation, create new tasks rather than expanding existing ones.\n\
+        - Pure information request.\n\
+        - Trivial change.\n\
         \n\
         ## Field Conventions\n\
-        - `title`: imperative, specific outcome (e.g. 'Fix auth redirect on Safari', not 'fix bug')\n\
-        - `active_form`: present-continuous shown on the spinner while in_progress (e.g. 'Fixing auth redirect'). Omit → spinner shows title.\n\
-        - `description`: what 'done' looks like. More detail helps if another agent might take over.\n\
-        - `subtasks`: pre-plan nested work at create time; use `depends_on` to encode subtask order.\n\
-        - `add_blocked_by [taskA, taskB]` → this task won't be next-actionable until A and B are done.\n\
-        - `metadata`: free-form; later `update` with `{key: null}` deletes a specific key.\n\
+        - `title`: specific outcome.\n\
+        - `active_form`: spinner text while in_progress.\n\
+        - `description`: what done looks like.\n\
+        - `subtasks`: optional nested steps; use `depends_on` for order.\n\
+        - `metadata`: free-form state; on update, `{key: null}` deletes that key.\n\
         \n\
         ## Cross-Session Awareness\n\
-        - `list_user` returns the user's open tasks across ALL their sessions, not just the current one. Each row includes `session_started_at` (when that session began) and `session_title` (optional) so you can tell the user which session each task comes from (e.g. \"the session from 2 days ago\"). Useful when the user references prior work (\"what was I doing yesterday?\") or before creating new tasks to avoid duplicating work from another session.\n\
-        - `adopt` brings a task from another session of the same user into the current session: `task(action='adopt', source_session_id='<sid>', task_id='<tid>')`. The original is marked migrated; a fresh task with new id is created locally with metadata `{forked_from: '<sid>:<tid>'}`.\n\
+        - `list_user` shows the user's tasks across sessions.\n\
+        - `adopt` copies a task from another session into the current one.\n\
         \n\
-        ## Tips\n\
-        - Call `list` with `status_filter: 'active'` before creating new tasks to avoid dupes.\n\
-        - Call `list_user` if the user mentions resuming work from a prior conversation.\n\
-        - Auto-completion: completing the last remaining subtask auto-completes the parent (only if parent is still active).\n\
-        - Cascade: completing a parent cascades to pending/in_progress subtasks but preserves failed/cancelled.\n\
-        - Rollback: task state is journaled per-turn; a /rollback undoes the most recent mutation batch.",
+        <example>\n\
+        User: Add dark mode toggle and run tests.\n\
+        Assistant: Create one task per outcome, then mark the first task `in_progress` BEFORE beginning work.\n\
+        </example>",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["create","update","list","get","stop","list_user","adopt","archive"], "description": "Operation to perform"},
-                        "source_session_id": {"type": "string", "description": "(adopt) The session id holding the task you want to bring into the current session."},
-                        "older_than_days": {"type": "integer", "description": "(archive bulk mode) Mark completed tasks older than N days as archived. Default 30. Ignored when `task_id` is provided — single-task archive bypasses the age check."},
-                        "user_status": {"type": "string", "enum": ["active","completed","failed","all"], "description": "(list_user) Filter for cross-session list. Default 'active'."},
-                        "title": {"type": "string", "description": "(create/update) Brief imperative title"},
-                        "description": {"type": "string", "description": "(create/update) What needs to be done"},
-                        "task_id": {"type": "string", "description": "(update/get/stop/adopt/archive) Task ID (e.g. 'task-1'). For `archive`, providing this archives just that one row regardless of age."},
-                        "new_status": {"type": "string", "enum": ["pending","in_progress","completed","failed","cancelled","deleted"], "description": "(update) New status to assign. 'deleted' permanently removes the task."},
-                        "status": {"type": "string", "enum": ["pending","in_progress","completed","failed","cancelled","deleted"], "description": "(update, legacy alias for new_status) New status to assign."},
-                        "status_filter": {"type": "string", "enum": ["pending","in_progress","completed","failed","all","active"], "description": "(list) Restrict results. 'active' = pending+in_progress. Default 'all'."},
-                        "subtask_id": {"type": "string", "description": "(update) Update a specific subtask"},
-                        "active_form": {"type": "string", "description": "(create/update) Present-continuous form shown while in_progress (e.g. 'Running tests')"},
-                        "owner": {"type": "string", "description": "(create/update) Agent or user that owns this task"},
-                        "metadata": {"type": "object", "description": "(create/update) Arbitrary key-value pairs. On update: set key to null to delete it."},
-                        "add_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Task IDs that THIS task blocks (they can't start until this completes)"},
-                        "add_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Task IDs that must complete before THIS task can start"},
-                        "remove_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Remove entries from this task's blocks list"},
-                        "remove_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Remove entries from this task's blocked_by list"},
+                        "source_session_id": {"type": "string", "description": "(adopt) Source session id."},
+                        "older_than_days": {"type": "integer", "description": "(archive bulk) Archive completed tasks older than N days. Default 30."},
+                        "user_status": {"type": "string", "enum": ["active","completed","failed","all"], "description": "(list_user) Cross-session filter. Default active."},
+                        "title": {"type": "string", "description": "(create/update) Imperative title."},
+                        "description": {"type": "string", "description": "(create/update) Definition of done."},
+                        "task_id": {"type": "string", "description": "(update/get/stop/adopt/archive) Task id."},
+                        "new_status": {"type": "string", "enum": ["pending","in_progress","completed","failed","cancelled","deleted"], "description": "(update) New status. `deleted` permanently removes the task."},
+                        "status": {"type": "string", "enum": ["pending","in_progress","completed","failed","cancelled","deleted"], "description": "(update) Legacy alias for new_status."},
+                        "status_filter": {"type": "string", "enum": ["pending","in_progress","completed","failed","all","active"], "description": "(list) Result filter. `active` = pending + in_progress."},
+                        "subtask_id": {"type": "string", "description": "(update) Specific subtask id."},
+                        "active_form": {"type": "string", "description": "(create/update) Spinner text while in_progress."},
+                        "owner": {"type": "string", "description": "(create/update) Task owner."},
+                        "metadata": {"type": "object", "description": "(create/update) Arbitrary key-value pairs; null deletes a key on update."},
+                        "add_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Task ids blocked by this task."},
+                        "add_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Task ids that must finish before this task starts."},
+                        "remove_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Remove entries from blocks."},
+                        "remove_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Remove entries from blocked_by."},
                         "subtasks": {
                             "type": "array",
-                            "description": "(create) Optional sub-steps",
+                            "description": "(create) Optional subtasks.",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -921,8 +840,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "required": ["id", "title"]
                             }
                         },
-                        "reason": {"type": "string", "description": "(stop) Why the task is being stopped"},
-                        "error_message": {"type": "string", "description": "(update) Reason for failure"}
+                        "reason": {"type": "string", "description": "(stop) Why the task is being stopped."},
+                        "error_message": {"type": "string", "description": "(update) Failure reason."}
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {
@@ -1127,6 +1046,13 @@ mod tests {
             .collect()
     }
 
+    fn schema_token_cost(schema: &Value) -> usize {
+        serde_json::to_string(schema)
+            .expect("schema must serialize")
+            .len()
+            .div_ceil(4)
+    }
+
     // execute_code has been deleted. The only hallucination-prevention
     // concern now is ensuring run_script is advertised on Unix, and that
     // `execute_code` is NOT in the schema list (so the model doesn't
@@ -1251,6 +1177,24 @@ mod tests {
                 || desc.contains("one in_progress at a time"),
             "task description must enforce single-active to prevent the model from \
              flipping every task to in_progress at once"
+        );
+    }
+
+    #[test]
+    fn memory_and_task_schemas_stay_compact() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let memory = find_schema(&schemas, "memory").expect("memory schema must exist");
+        let task = find_schema(&schemas, "task").expect("task schema must exist");
+        let memory_tokens = schema_token_cost(memory);
+        let task_tokens = schema_token_cost(task);
+
+        assert!(
+            memory_tokens <= 700,
+            "memory schema regressed to {memory_tokens} tokens; keep it compact"
+        );
+        assert!(
+            task_tokens <= 1100,
+            "task schema regressed to {task_tokens} tokens; keep it compact"
         );
     }
 

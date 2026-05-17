@@ -46,6 +46,7 @@ pub struct SpawnAgentInput {
 
     /// Agent type: "explore", "code-review", "task", "general-purpose".
     #[serde(default = "default_agent_type")]
+    #[serde(alias = "type")]
     pub agent_type: String,
 
     /// Optional model override.
@@ -61,6 +62,7 @@ pub struct SpawnAgentInput {
     pub name: Option<String>,
 
     /// Max turns before auto-stopping.
+    #[serde(default, deserialize_with = "deserialize_option_u32_lenient")]
     pub max_turns: Option<u32>,
 
     /// Max output tokens for the child's first API call. When a
@@ -69,6 +71,7 @@ pub struct SpawnAgentInput {
     /// clamp the effective thinking budget below the captured
     /// parent value (cache key drift).
     #[serde(default)]
+    #[serde(deserialize_with = "deserialize_option_u32_lenient")]
     pub max_output_tokens: Option<u32>,
 
     /// Create isolated git worktree for this agent.
@@ -168,6 +171,55 @@ where
         }
     }
     deserializer.deserialize_any(BoolVisitor)
+}
+
+/// Lenient optional-u32 deserializer: accepts bare integers, quoted
+/// decimal strings like `"10"`, null, or absence.
+///
+/// Models sometimes stringify numeric inputs (`"max_turns":"10"`)
+/// which default serde rejects with `invalid type: string "10",
+/// expected u32`, failing the whole spawn call before the child can
+/// launch. Accept only canonical non-negative integer strings; reject
+/// floats, negatives, empty strings, and non-scalar types.
+fn deserialize_option_u32_lenient<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(number) => {
+            let raw = number
+                .as_u64()
+                .ok_or_else(|| Error::custom("expected a non-negative integer"))?;
+            let parsed = u32::try_from(raw)
+                .map_err(|_| Error::custom(format!("integer out of range for u32: {raw}")))?;
+            Ok(Some(parsed))
+        }
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Err(Error::custom(
+                    "unrecognized integer string: \"\" (expected decimal digits)",
+                ));
+            }
+            let raw = trimmed.parse::<u64>().map_err(|_| {
+                Error::custom(format!(
+                    "unrecognized integer string: \"{trimmed}\" (expected decimal digits)"
+                ))
+            })?;
+            let parsed = u32::try_from(raw)
+                .map_err(|_| Error::custom(format!("integer out of range for u32: {raw}")))?;
+            Ok(Some(parsed))
+        }
+        serde_json::Value::Bool(_) => Err(Error::custom("expected integer; got bool")),
+        serde_json::Value::Array(_) => Err(Error::custom("expected integer; got array")),
+        serde_json::Value::Object(_) => Err(Error::custom("expected integer; got object")),
+    }
 }
 
 /// Lenient deserializer for `inherit_prefix`: accepts a JSON object
@@ -511,6 +563,13 @@ mod tests {
     }
 
     #[test]
+    fn agent_type_accepts_legacy_type_alias() {
+        let json = r#"{"description":"Test","prompt":"Do the thing","type":"task"}"#;
+        let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.agent_type, "task");
+    }
+
+    #[test]
     fn run_in_background_default_is_false() {
         let input = SpawnAgentInput::default();
         assert!(
@@ -821,5 +880,45 @@ mod bool_lenient_tests {
             serde_json::from_str(r#"{"description":"test","prompt":"p","run_in_background":1}"#)
                 .expect("integer 1 must deserialize to true");
         assert!(input.run_in_background);
+    }
+}
+
+#[cfg(test)]
+mod u32_lenient_tests {
+    use super::SpawnAgentInput;
+
+    #[test]
+    fn max_turns_accepts_string_integer() {
+        let input: SpawnAgentInput =
+            serde_json::from_str(r#"{"description":"test","prompt":"p","max_turns":"10"}"#)
+                .expect("string '10' must deserialize");
+        assert_eq!(input.max_turns, Some(10));
+    }
+
+    #[test]
+    fn max_output_tokens_accepts_string_integer() {
+        let input: SpawnAgentInput = serde_json::from_str(
+            r#"{"description":"test","prompt":"p","max_output_tokens":"8000"}"#,
+        )
+        .expect("string max_output_tokens must deserialize");
+        assert_eq!(input.max_output_tokens, Some(8000));
+    }
+
+    #[test]
+    fn max_turns_rejects_empty_string() {
+        let err = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"test","prompt":"p","max_turns":""}"#,
+        )
+        .expect_err("empty string must not silently coerce");
+        assert!(err.to_string().contains("unrecognized integer string"));
+    }
+
+    #[test]
+    fn max_turns_rejects_float_string() {
+        let err = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"test","prompt":"p","max_turns":"10.5"}"#,
+        )
+        .expect_err("float string must not deserialize as u32");
+        assert!(err.to_string().contains("unrecognized integer string"));
     }
 }

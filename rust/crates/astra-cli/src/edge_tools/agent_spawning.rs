@@ -477,7 +477,7 @@ mod tests {
     #[async_trait::async_trait]
     impl SpawnAgentExecutor for CapturingModelExecutor {
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
-            *self.captured_model.lock().unwrap() = Some(config.model.clone());
+            *self.captured_model.lock().unwrap() = config.model.clone();
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
@@ -559,6 +559,43 @@ mod tests {
             executor.take_captured_model().as_deref(),
             Some("claude-sonnet-4.6")
         );
+    }
+
+    #[tokio::test]
+    async fn handle_spawn_agent_tool_accepts_string_max_turns_and_type_alias() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let args = json!({
+            "description": "API contract review",
+            "prompt": "Review the latest 3 commits for API stability risks.",
+            "type": "task",
+            "max_turns": "10",
+            "run_in_background": "true"
+        });
+
+        let result = handle_spawn_agent_tool(&args, Some(&ctx)).await;
+
+        assert!(
+            result.contains("\"status\":\"launched\""),
+            "stringified numeric/bool fields and legacy type alias must not fail spawn parsing: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_spawn_agent_tool_without_override_keeps_server_default_model() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner, None);
+        let args = json!({
+            "description": "API contract review",
+            "prompt": "Review the latest 3 commits for API stability risks."
+        });
+
+        let result = handle_spawn_agent_tool(&args, Some(&ctx)).await;
+
+        assert!(result.contains("\"status\":\"completed\""), "{result}");
+        assert_eq!(executor.take_captured_model(), None);
     }
 
     #[tokio::test]

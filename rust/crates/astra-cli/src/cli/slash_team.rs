@@ -1812,7 +1812,7 @@ pub(super) async fn handle_team_command(
                 eprintln!(
                     "    {} {} | {} {} | {}",
                     "Model:".dim(),
-                    def.default_model.as_str(),
+                    def.default_model.as_deref().unwrap_or("server default"),
                     "Max turns:".dim(),
                     def.max_turns,
                     if def.read_only {

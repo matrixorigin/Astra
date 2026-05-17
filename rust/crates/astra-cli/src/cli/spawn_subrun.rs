@@ -425,8 +425,11 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 
         // Use the working directory from config (may be a worktree)
         let effective_root = config.working_dir.clone();
-        let compact_strategy =
-            astra_turn_core::microcompact::CompactStrategy::from_provider_hint(&config.model);
+        let compact_strategy = config
+            .model
+            .as_deref()
+            .map(astra_turn_core::microcompact::CompactStrategy::from_provider_hint)
+            .unwrap_or_default();
 
         // Resolve the freshest token at spawn time. Without this,
         // sub-agents fail with 401 in long-running sessions after the
@@ -457,12 +460,12 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         // `SubRunHost::tool_cache` and the `AgenticLoopState` below.
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_selection
-            .resolve_for_model(Some(&config.model));
+            .resolve_for_model(config.model.as_deref());
 
         let mut host = SubRunHost {
             api: self.api.clone(),
             token: token.clone(),
-            model: Some(config.model.clone()),
+            model: config.model.clone(),
             project_root: effective_root.clone(),
             executor: std::sync::Arc::new(executor),
             all_schemas,
@@ -1090,7 +1093,7 @@ mod tests {
                 agent_type: "task".into(),
                 task: "review".into(),
                 system_prompt_addendum: String::new(),
-                model: "test-model".into(),
+                model: Some("test-model".into()),
                 max_turns: 1,
                 allowed_tools: Vec::new(),
                 read_only: true,

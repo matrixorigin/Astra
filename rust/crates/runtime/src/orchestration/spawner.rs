@@ -124,8 +124,9 @@ pub struct SpawnRunConfig {
     pub task: String,
     /// System prompt addendum from agent type definition.
     pub system_prompt_addendum: String,
-    /// Model to use (from agent type or override).
-    pub model: String,
+    /// Explicit model override to use. `None` means "inherit the
+    /// session/server default" instead of forcing a built-in alias.
+    pub model: Option<String>,
     /// Max turns allowed.
     pub max_turns: u32,
     /// Allowed tools for this agent type.
@@ -468,7 +469,7 @@ impl DynamicAgentSpawner {
         let model = input
             .model
             .clone()
-            .unwrap_or_else(|| agent_def.default_model.clone());
+            .or_else(|| agent_def.default_model.clone());
         // Budget resolution: explicit `max_turns` wins, else the
         // `complexity` hint scales the agent-type default, else the
         // default is used as-is. See `resolve_turn_budget`.
@@ -487,34 +488,36 @@ impl DynamicAgentSpawner {
         // The resolver itself is a pure function over a store; if no
         // store is configured we skip even building the context
         // (saves a clone + RwLock write in the common path).
-        let resolve_outcome = if let Some(store) = self.prefix_store.as_ref() {
-            // Infer the child's provider from the model string via
-            // the same normalization scheme PR 1 uses for capture
-            // (`ProviderKind::from_provider_hint`). Ensures the
-            // child's resolve context matches the provider that
-            // captured the parent prefix, so
-            // Anthropic-captured prefixes resolve for Anthropic
-            // children, OpenAI-captured for OpenAI, etc. Providers
-            // that astra doesn't yet wire-compatibly reconstruct
-            // for (OpenAI / Bedrock / Other) will still resolve
-            // against a matching capture and carry the prefix into
-            // SpawnRunConfig; executor-side consumption is gated
-            // by the sink the caller installs.
-            let child_provider =
-                astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model);
-            let resolve_ctx = SpawnResolveContext {
-                caller_run_id: Some(context.parent_run_id.clone()),
-                child_provider,
-                child_model_id: model.clone(),
-                child_max_output_tokens: input.max_output_tokens,
+        let resolve_outcome =
+            if let (Some(store), Some(model)) = (self.prefix_store.as_ref(), model.as_ref()) {
+                // Infer the child's provider from the model string via
+                // the same normalization scheme PR 1 uses for capture
+                // (`ProviderKind::from_provider_hint`). Ensures the
+                // child's resolve context matches the provider that
+                // captured the parent prefix, so
+                // Anthropic-captured prefixes resolve for Anthropic
+                // children, OpenAI-captured for OpenAI, etc. Providers
+                // that astra doesn't yet wire-compatibly reconstruct
+                // for (OpenAI / Bedrock / Other) will still resolve
+                // against a matching capture and carry the prefix into
+                // SpawnRunConfig; executor-side consumption is gated
+                // by the sink the caller installs.
+                let child_provider =
+                    astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(model);
+                let resolve_ctx = SpawnResolveContext {
+                    caller_run_id: Some(context.parent_run_id.clone()),
+                    child_provider,
+                    child_model_id: model.clone(),
+                    child_max_output_tokens: input.max_output_tokens,
+                };
+                resolve_inherit_prefix(input.inherit_prefix.as_ref(), &resolve_ctx, store.as_ref())
+            } else {
+                // No prefix store, or no concrete child model to validate
+                // provider/model compatibility against. In both cases the
+                // child proceeds without inherited prefix and relies on the
+                // session/server default model.
+                PrefixResolveOutcome::Disabled
             };
-            resolve_inherit_prefix(input.inherit_prefix.as_ref(), &resolve_ctx, store.as_ref())
-        } else {
-            // No store configured — inherit_prefix is silently
-            // ignored. Record Disabled so observability is uniform
-            // regardless of store presence.
-            PrefixResolveOutcome::Disabled
-        };
         if let PrefixResolveOutcome::Failed { reason } = &resolve_outcome {
             return Err(SpawnError::PrefixInheritanceRequired {
                 reason: format!("{reason:?}"),
@@ -675,7 +678,7 @@ impl DynamicAgentSpawner {
                 &context.parent_run_id,
                 &run_config.agent_type,
                 &input.description,
-                &run_config.model,
+                run_config.model.as_deref(),
                 run_config.inherited_prefix.is_some(),
             );
             if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
@@ -2490,9 +2493,10 @@ mod tests {
             description: "child".into(),
             prompt: "work".into(),
             agent_type: "explore".into(),
-            // Match the captured parent's model/thinking. Default
-            // "explore" agent uses whatever model is in agent_def —
-            // the test's captured prefix must match that model.
+            // Match the captured parent's model/thinking. Keep this
+            // explicit so the test stays stable even though built-in
+            // agent types now inherit the server default model.
+            model: Some(TEST_CHILD_MODEL.into()),
             inherit_prefix: Some(InheritPrefixSpec {
                 from_run_id: None, // use caller's run id
                 required,
@@ -2501,17 +2505,7 @@ mod tests {
         }
     }
 
-    /// Extract the default model an "explore" agent uses. Tests need
-    /// to capture prefixes under this model name so validate_spawn
-    /// sees a match.
-    fn explore_agent_model(spawner: &DynamicAgentSpawner) -> String {
-        spawner
-            .agent_registry()
-            .get("explore")
-            .expect("explore agent must exist")
-            .default_model
-            .clone()
-    }
+    const TEST_CHILD_MODEL: &str = "claude-test-model";
 
     #[tokio::test]
     async fn spawn_without_prefix_store_is_backwards_compatible() {
@@ -2534,8 +2528,7 @@ mod tests {
     async fn spawn_resolves_matching_captured_prefix() {
         let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
         let spawner = DynamicAgentSpawner::new(mock_router()).with_prefix_store(store.clone());
-        let model = explore_agent_model(&spawner);
-        capture_parent_for(&*store, "run-parent-A", &model);
+        capture_parent_for(&*store, "run-parent-A", TEST_CHILD_MODEL);
 
         let input = child_with_inherit(false);
         let ctx = parent_context("run-parent-A");
@@ -2627,8 +2620,7 @@ mod tests {
             .with_prefix_store(store.clone())
             .with_executor(exec.clone() as Arc<dyn SpawnAgentExecutor>);
 
-        let model = explore_agent_model(&spawner);
-        capture_parent_for(&*store, "run-parent-A", &model);
+        capture_parent_for(&*store, "run-parent-A", TEST_CHILD_MODEL);
 
         // Sync spawn (background=false) so the executor runs before
         // spawn() returns and we can read the captured config.
@@ -2714,8 +2706,7 @@ mod tests {
         let spawner = DynamicAgentSpawner::new(mock_router())
             .with_prefix_store(store.clone())
             .with_executor(exec.clone() as Arc<dyn SpawnAgentExecutor>);
-        let model = explore_agent_model(&spawner);
-        capture_parent_for(&*store, "run-parent-bid", &model);
+        capture_parent_for(&*store, "run-parent-bid", TEST_CHILD_MODEL);
 
         // Grab the captured prefix bytes from the sink directly so we
         // can diff against what the executor eventually sees.
