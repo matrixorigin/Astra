@@ -7401,6 +7401,31 @@ mod tests {
     // directions of the contract.
 
     #[test]
+    fn mode_mirror_encode_decode_covers_all_modes_without_collisions() {
+        let all_modes = [
+            PermissionMode::Prompt,
+            PermissionMode::Auto,
+            PermissionMode::Plan,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Deny,
+        ];
+        let mut seen = std::collections::HashSet::new();
+
+        for mode in all_modes {
+            let encoded = encode_mode_for_mirror(mode);
+            assert!(
+                seen.insert(encoded),
+                "mode {mode:?} collides with another mirror encoding"
+            );
+            assert_eq!(
+                decode_mode_for_mirror(encoded),
+                mode,
+                "mode mirror encoding must round-trip for {mode:?}"
+            );
+        }
+    }
+
+    #[test]
     fn mode_mirror_reflects_set_mode() {
         let mut pm = PermissionManager::new(false);
         let mirror = pm.mode_mirror_handle();

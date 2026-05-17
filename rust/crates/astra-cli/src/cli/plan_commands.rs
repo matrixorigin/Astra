@@ -66,7 +66,7 @@ pub(crate) fn render_plan_snapshot(state: &SessionState) -> Result<String, Strin
             .is_some_and(|plan_mode| !plan_mode.goal.trim().is_empty())
     {
         return Err(format!(
-            "Plan mirror is stale: {sync_error}. Refresh plan mode before using `show`."
+            "Plan mirror is stale: {sync_error}. Send another planning turn after the server recovers, or use `/plan` to exit and re-enter before using `show`."
         ));
     }
 
@@ -140,7 +140,7 @@ pub(crate) async fn prepare_plan_execution(
     {
         if let Some(sync_error) = state.plan_mode_sync_error.as_deref() {
             return Err(format!(
-                "Plan mirror is stale: {sync_error}. Refresh plan mode before running `go`."
+                "Plan mirror is stale: {sync_error}. Send another planning turn after the server recovers, or use `/plan` to exit and re-enter before running `go`."
             ));
         }
         (plan_mode.plan.clone(), Some(plan_mode.goal.clone()))
@@ -554,9 +554,39 @@ mod tests {
             "go must not start from stale authoring state when sync failed"
         );
         assert!(
-            render_plan_snapshot(&state).unwrap_err().contains("stale"),
-            "snapshot should explain why the authoring plan cannot be shown"
+            render_plan_snapshot(&state)
+                .unwrap_err()
+                .contains("Send another planning turn"),
+            "snapshot should explain why the authoring plan cannot be shown and how to recover"
         );
+    }
+
+    #[test]
+    fn transient_sync_failure_blocks_commands_until_recovery() {
+        let mut state = crate::SessionState::default();
+        state.cloud_plan_mirror = Some(sample_plan_mode("Ship auth"));
+
+        assert!(is_plan_command_available(&state, &ParsedPlanCommand::Show));
+        assert!(render_plan_snapshot(&state).is_ok());
+
+        state.plan_mode_sync_error = Some("network timeout".into());
+        assert!(
+            !is_plan_command_available(&state, &ParsedPlanCommand::Show),
+            "transient sync failures must block stale authoring reads"
+        );
+        let stale_message = render_plan_snapshot(&state).unwrap_err();
+        assert!(stale_message.contains("network timeout"));
+        assert!(
+            stale_message.contains("/plan"),
+            "stale mirror errors must include a concrete escape hatch: {stale_message}"
+        );
+
+        state.plan_mode_sync_error = None;
+        assert!(
+            is_plan_command_available(&state, &ParsedPlanCommand::Show),
+            "clearing the sync error after recovery should restore authoring commands"
+        );
+        assert!(render_plan_snapshot(&state).is_ok());
     }
 
     #[test]

@@ -1221,7 +1221,9 @@ impl ToolExecutor {
         let active = self
             .recompute_plan_mode_authoring_for_session(session_id.as_str())
             .await;
-        *self.plan_mode_authoring_cache.write().await = Some((session_id, active));
+        if self.active_session_id().as_deref() == Some(session_id.as_str()) {
+            *self.plan_mode_authoring_cache.write().await = Some((session_id, active));
+        }
         active
     }
 

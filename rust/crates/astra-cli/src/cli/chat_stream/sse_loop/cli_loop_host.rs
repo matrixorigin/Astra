@@ -190,6 +190,59 @@ impl CliAgenticLoopHost<'_> {
     }
 }
 
+fn permission_mode_change_audit_event(
+    session_id: Option<&str>,
+    turn: u32,
+    from_mode: PermissionMode,
+    to_mode: PermissionMode,
+    source: &str,
+) -> astra_services::session_journal::JournalEvent {
+    astra_services::session_journal::JournalEvent::permission_audit(
+        session_id,
+        Some(turn),
+        serde_json::json!({
+            "kind": "permission_mode_changed",
+            "from_mode": from_mode.to_string(),
+            "to_mode": to_mode.to_string(),
+            "source": source,
+            "changed": from_mode != to_mode,
+        }),
+    )
+}
+
+fn append_permission_mode_change_audit(
+    session_id: Option<&str>,
+    turn: u32,
+    from_mode: PermissionMode,
+    to_mode: PermissionMode,
+    source: &str,
+) {
+    let Some(session_id) = session_id.filter(|sid| !sid.trim().is_empty()) else {
+        tracing::warn!(
+            source,
+            from_mode = %from_mode,
+            to_mode = %to_mode,
+            "permission mode changed without session_id; journal event skipped"
+        );
+        return;
+    };
+    let event =
+        permission_mode_change_audit_event(Some(session_id), turn, from_mode, to_mode, source);
+    match astra_services::session_journal::JournalWriter::new(session_id)
+        .and_then(|writer| writer.append(&event))
+    {
+        Ok(()) => {}
+        Err(error) => tracing::warn!(
+            session_id,
+            source,
+            from_mode = %from_mode,
+            to_mode = %to_mode,
+            error = %error,
+            "failed to journal permission mode change"
+        ),
+    }
+}
+
 #[async_trait]
 impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     async fn execute_turn(
@@ -222,7 +275,15 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // tell the model it now runs in the new mode so the next
         // round's reasoning is grounded in the new permission set.
         if let Some(new_mode) = self.executor.take_pending_permission_mode_change() {
+            let old_mode = self.perm_manager.mode();
             self.perm_manager.set_mode(new_mode);
+            append_permission_mode_change_audit(
+                state.current_session_id.as_deref(),
+                self.chat_turn_index,
+                old_mode,
+                new_mode,
+                "plan_approval_overlay",
+            );
             state.push_volatile(
                 astra_runtime::turn::agentic_loop_host::VolatileKind::PlanModeMarker,
                 format!(
@@ -241,6 +302,13 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         self.perm_manager.pull_mode_from_mirror();
         let mode_after = self.perm_manager.mode();
         if mode_before != mode_after {
+            append_permission_mode_change_audit(
+                state.current_session_id.as_deref(),
+                self.chat_turn_index,
+                mode_before,
+                mode_after,
+                "mid_turn_ui",
+            );
             state.push_volatile(
                 astra_runtime::turn::agentic_loop_host::VolatileKind::PlanModeMarker,
                 format!(
@@ -811,8 +879,8 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 ///
 /// Heuristic — intentionally conservative:
 ///   * Look at the most recent assistant message in `messages`.
-///   * It must contain at least one numbered-step or bulleted list,
-///     OR an explicit `## Plan` / `### Steps` markdown header.
+///   * It must contain an explicit `## Plan` / `### Steps` markdown
+///     header, OR a plan marker plus at least three numbered steps.
 ///   * The same assistant message must NOT carry a `tool_calls`
 ///     entry whose name is `exit_plan_mode` (already-exited turns
 ///     don't need the nudge).
@@ -897,12 +965,20 @@ fn plan_mode_restriction_names(
 fn looks_plan_shaped(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     // Markdown plan headers — strongest signal.
-    if lower.contains("## plan")
+    let has_markdown_plan_header = lower.contains("## plan")
         || lower.contains("### plan")
         || lower.contains("## steps")
-        || lower.contains("### steps")
-    {
+        || lower.contains("### steps");
+    if has_markdown_plan_header {
         return true;
+    }
+    let has_plan_marker = lower.contains("plan:")
+        || lower.contains("here's the plan")
+        || lower.contains("here is the plan")
+        || lower.contains("proposed plan")
+        || lower.contains("implementation plan");
+    if !has_plan_marker {
+        return false;
     }
     // Numbered list with at least three items: 1. … 2. … 3. …
     let mut numbered_hits = 0;
@@ -923,6 +999,28 @@ fn looks_plan_shaped(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_services::session_journal::JournalEventType;
+
+    #[test]
+    fn permission_mode_change_audit_event_carries_source_and_modes() {
+        let event = permission_mode_change_audit_event(
+            Some("sess-audit"),
+            7,
+            PermissionMode::Plan,
+            PermissionMode::Auto,
+            "plan_approval_overlay",
+        );
+
+        assert_eq!(event.event_type, JournalEventType::PermissionAudit);
+        assert_eq!(event.session_id.as_deref(), Some("sess-audit"));
+        assert_eq!(event.turn, Some(7));
+        let metadata = event.metadata.expect("permission audit metadata");
+        assert_eq!(metadata["kind"], "permission_mode_changed");
+        assert_eq!(metadata["from_mode"], "plan");
+        assert_eq!(metadata["to_mode"], "auto");
+        assert_eq!(metadata["source"], "plan_approval_overlay");
+        assert_eq!(metadata["changed"], true);
+    }
 
     #[test]
     fn derive_turn_interaction_mode_maps_permission_mode_with_native_prompt_sink() {
@@ -1190,6 +1288,18 @@ mod tests {
             "content": "The auth module lives in `src/auth.rs`; it uses bcrypt.",
         })];
         assert!(plan_mode_missed_exit_reminder(&messages).is_none());
+    }
+
+    #[test]
+    fn plan_nudge_skipped_for_analytical_numbered_list_without_plan_marker() {
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "I'll analyze this in three stages:\n1. Read the module\n2. Trace the call graph\n3. Summarize the risk",
+        })];
+        assert!(
+            plan_mode_missed_exit_reminder(&messages).is_none(),
+            "ordinary analytical numbered lists should not force a plan approval nudge"
+        );
     }
 
     #[test]
