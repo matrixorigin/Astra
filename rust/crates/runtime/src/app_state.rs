@@ -499,6 +499,14 @@ impl AppState {
         self
     }
 
+    pub fn with_turn_reflection_state_store(
+        mut self,
+        turn_reflection_state_store: Arc<dyn TurnReflectionStateStore>,
+    ) -> Self {
+        self.turn_persistence.reflection_state_store = turn_reflection_state_store;
+        self
+    }
+
     pub fn with_turn_observer_worker(
         mut self,
         turn_observer_worker: Arc<dyn TurnObserverWorker>,
