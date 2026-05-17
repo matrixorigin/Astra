@@ -153,11 +153,30 @@ fn normalize_spawn_agent_args(args: &Value) -> Result<Value, String> {
             .to_string());
     }
 
-    if obj.contains_key("task") {
-        return Err("unsupported deprecated `task` field for agent.spawn. \
-             Use top-level `prompt` for the full child task brief and \
-             `description` for the short UI summary."
-            .to_string());
+    let legacy_task_prompt = match obj.remove("task") {
+        Some(Value::String(task)) if !task.trim().is_empty() => Some(task.trim().to_string()),
+        Some(_) => {
+            return Err(
+                "deprecated `task` alias for agent.spawn must be a non-empty string. \
+                 Use top-level `prompt` for the full child task brief and \
+                 `description` for the short UI summary."
+                    .to_string(),
+            );
+        }
+        None => None,
+    };
+    if let Some(task_prompt) = legacy_task_prompt {
+        match non_empty_string(obj.get("prompt")) {
+            Some(prompt) if prompt != task_prompt => {
+                return Err("conflicting `task` and `prompt` fields for agent.spawn. \
+                     Keep one canonical top-level `prompt` value."
+                    .to_string());
+            }
+            Some(_) => {}
+            None => {
+                obj.insert("prompt".to_string(), Value::String(task_prompt));
+            }
+        }
     }
 
     let description = non_empty_string(obj.get("description")).map(str::to_string);
@@ -394,29 +413,50 @@ mod tests {
     }
 
     #[test]
-    fn spawn_arg_normalization_rejects_legacy_task_field() {
-        let err = normalize_spawn_agent_args(&json!({
+    fn spawn_arg_normalization_maps_legacy_task_to_prompt() {
+        let normalized = normalize_spawn_agent_args(&json!({
             "description": "Audit auth flow",
             "task": "Read src/auth and report token refresh bugs."
         }))
-        .expect_err("deprecated task field must be rejected");
+        .expect("legacy task alias should recover to prompt");
+
+        assert_eq!(
+            normalized["prompt"],
+            "Read src/auth and report token refresh bugs."
+        );
         assert!(
-            err.contains("deprecated `task` field") && err.contains("prompt"),
-            "migration error must tell callers to move to prompt. Got: {err}"
+            normalized.get("task").is_none(),
+            "task alias must be removed"
         );
     }
 
     #[test]
-    fn spawn_arg_normalization_rejects_task_even_when_prompt_is_present() {
+    fn spawn_arg_normalization_allows_matching_task_and_prompt() {
+        let normalized = normalize_spawn_agent_args(&json!({
+            "description": "Audit auth flow",
+            "prompt": "Use the canonical prompt field.",
+            "task": "Use the canonical prompt field."
+        }))
+        .expect("duplicate legacy alias should be ignored when it matches prompt");
+
+        assert_eq!(normalized["prompt"], "Use the canonical prompt field.");
+        assert!(
+            normalized.get("task").is_none(),
+            "task alias must be removed"
+        );
+    }
+
+    #[test]
+    fn spawn_arg_normalization_rejects_conflicting_task_and_prompt() {
         let err = normalize_spawn_agent_args(&json!({
             "description": "Audit auth flow",
             "prompt": "Use the new prompt field.",
             "task": "Do not use this deprecated alias."
         }))
-        .expect_err("deprecated task field must stay forbidden even when prompt exists");
+        .expect_err("conflicting prompt/task payloads must still fail");
         assert!(
-            err.contains("deprecated `task` field"),
-            "mixed prompt/task payloads must still hard-fail. Got: {err}"
+            err.contains("conflicting `task` and `prompt`"),
+            "mixed prompt/task payloads must explain the conflict. Got: {err}"
         );
     }
 
