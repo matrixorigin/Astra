@@ -362,11 +362,12 @@ impl BottomPane {
         header: String,
         detail: Option<String>,
         reason: String,
+        args: serde_json::Value,
         response_tx: oneshot::Sender<ApprovalResponse>,
     ) -> u64 {
         let id = self
             .approval_queue
-            .push(tool, header, detail, reason, response_tx);
+            .push(tool, header, detail, reason, args, response_tx);
         self.footer.pending_approvals = self.approval_queue.len();
         id
     }
@@ -380,6 +381,7 @@ impl BottomPane {
         header: String,
         detail: Option<String>,
         reason: String,
+        args: serde_json::Value,
         response_tx: oneshot::Sender<ApprovalResponse>,
         metadata: crate::tui::approval::queue::ApprovalMetadata,
     ) -> u64 {
@@ -388,11 +390,49 @@ impl BottomPane {
             header,
             detail,
             reason,
+            args,
             response_tx,
             metadata,
         );
         self.footer.pending_approvals = self.approval_queue.len();
         id
+    }
+
+    /// Re-evaluate every pending approval against `new_mode` and
+    /// auto-approve the ones the new mode would not gate. Used when
+    /// the user pivots permission modes (Shift+Tab, `/permissions`,
+    /// or the `exit_plan_mode` overlay) so the approval queue does
+    /// not lag behind the chip.
+    ///
+    /// Returns the number of entries auto-approved. Footer counter
+    /// is refreshed so the chip reads the new pending count.
+    pub fn reevaluate_approvals_for_mode(
+        &mut self,
+        new_mode: crate::permission_manager::PermissionMode,
+    ) -> usize {
+        use astra_turn_core::permission_engine::{HardDecision, evaluate_permission};
+        use astra_turn_core::permission_types::{InheritedPermissions, PermissionSyncContext};
+
+        let ctx = PermissionSyncContext::new(InheritedPermissions::new(new_mode));
+        let released = self.approval_queue.drain_now_allowed(|entry| {
+            // Cloud / sandbox-expand entries arrive without args
+            // (Value::Null). We can't safely re-evaluate those —
+            // the cloud path owns its own gate — so leave them in
+            // the queue and let the user resolve them explicitly.
+            if entry.args.is_null() {
+                return true;
+            }
+            let envelope = evaluate_permission(&entry.tool, &entry.args, &ctx);
+            // Keep the entry only if the new mode still needs an
+            // external approval. Allow / Deny outcomes mean "no
+            // user-facing prompt is required any more"; they are
+            // dropped from the queue (Deny is the rarer path —
+            // historically the approval card stayed open even for
+            // a guaranteed-deny call which was just noise).
+            matches!(envelope.decision, HardDecision::NeedExternal { .. })
+        });
+        self.footer.pending_approvals = self.approval_queue.len();
+        released
     }
 
     /// Snapshot of pending approvals (safe to pass to rendering code).

@@ -203,6 +203,14 @@ pub struct ApprovalRequest {
     pub header: String,
     pub detail: Option<String>,
     pub reason: String,
+    /// Original tool-call arguments. Carried alongside the request
+    /// so the approval queue can re-run `permission_engine::evaluate`
+    /// when the user pivots permission modes (e.g. Edit → Auto)
+    /// while the request is still pending. Without this we would
+    /// have no way to ask "would this same call still need approval
+    /// now?" without round-tripping through the model. `Value::Null`
+    /// when the caller has no structured args (rare).
+    pub args: serde_json::Value,
     pub response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
     /// Optional enriched metadata. Stored as `Option<Box<…>>` so
     /// the empty case stays cheap on the message channel.
@@ -216,6 +224,7 @@ impl ApprovalRequest {
         header: String,
         detail: Option<String>,
         reason: String,
+        args: serde_json::Value,
         response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
     ) -> Self {
         Self {
@@ -223,6 +232,7 @@ impl ApprovalRequest {
             header,
             detail,
             reason,
+            args,
             response_tx,
             metadata: None,
         }

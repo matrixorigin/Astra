@@ -26,7 +26,8 @@ fn enqueue(
         format!("{tool} needs approval"),
         None,
         "risk: unknown".into(),
-        tx,
+        serde_json::Value::Null,
+            tx,
     );
     (id, rx)
 }

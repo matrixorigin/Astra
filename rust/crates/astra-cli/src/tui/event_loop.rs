@@ -865,6 +865,25 @@ pub(crate) async fn run_tui_repl(
                                         slash_dispatch::permission_mode_feedback(next_mode),
                                     ),
                                 );
+                                // Re-evaluate the pending approval queue
+                                // so the chip and pending count agree.
+                                // Without this, an approval generated
+                                // under the previous (more restrictive)
+                                // mode lingers in the queue while the
+                                // chip says e.g. `auto` — see session
+                                // 6953d1da regression note on
+                                // `BottomPane::reevaluate_approvals_for_mode`.
+                                let released = bottom_pane
+                                    .reevaluate_approvals_for_mode(next_mode);
+                                if released > 0 {
+                                    chat_widget.commit_system(
+                                        crate::tui::history_cell::system::SystemCell::response(
+                                            format!(
+                                                "  ✓ {released} pending approval(s) auto-resolved by the new mode",
+                                            ),
+                                        ),
+                                    );
+                                }
                                 refresh_footer_from_state(&mut bottom_pane, &state);
                                 flush_chat_widget(&mut guard, &mut chat_widget, w);
                             }
@@ -1427,6 +1446,22 @@ pub(crate) async fn run_tui_repl(
                                                                 perm_mode_mirror.stage(next_mode);
                                                                 bottom_pane.footer.permission_mode =
                                                                     Some(format!("{}", next_mode));
+                                                                // Reflect the staged mode in the approval queue
+                                                                // immediately so the chip and pending count
+                                                                // agree. perm_manager.mode() will catch up at
+                                                                // the next turn boundary, but the queue's
+                                                                // visible state shouldn't lag.
+                                                                let released = bottom_pane
+                                                                    .reevaluate_approvals_for_mode(next_mode);
+                                                                if released > 0 {
+                                                                    chat_widget.commit_system(
+                                                                        history_cell::system::SystemCell::response(
+                                                                            format!(
+                                                                                "  ✓ {released} pending approval(s) auto-resolved by the new mode",
+                                                                            ),
+                                                                        ),
+                                                                    );
+                                                                }
                                                                 chat_widget.commit_system(
                                                                     history_cell::system::SystemCell::response(
                                                                         slash_dispatch::permission_mode_feedback(next_mode),
@@ -1806,6 +1841,7 @@ pub(crate) async fn run_tui_repl(
                                                             req.header,
                                                             req.detail,
                                                             req.reason,
+                                                            req.args,
                                                             req.response_tx,
                                                             *metadata,
                                                         )
@@ -1815,6 +1851,7 @@ pub(crate) async fn run_tui_repl(
                                                             req.header,
                                                             req.detail,
                                                             req.reason,
+                                                            req.args,
                                                             req.response_tx,
                                                         )
                                                     };
@@ -2569,9 +2606,27 @@ pub(crate) async fn run_tui_repl(
                 // instead of waiting for the next turn boundary that
                 // happens to call `refresh_footer_from_state`. Cheap:
                 // a string format and an Option<u64> compare per 50ms.
-                let live_mode = format!("{}", state.perm_manager.mode());
+                let live_mode_enum = state.perm_manager.mode();
+                let live_mode = format!("{live_mode_enum}");
                 if bottom_pane.footer.permission_mode.as_deref() != Some(live_mode.as_str()) {
                     bottom_pane.footer.permission_mode = Some(live_mode);
+                    // Mode just shifted (driven by host-side
+                    // pull_mode_from_mirror after exit_plan_mode
+                    // overlay or mid-turn Shift+Tab). Re-evaluate
+                    // the approval queue against the new mode so
+                    // any pending entries the new mode would
+                    // auto-approve are released — same machinery
+                    // the keystroke paths use.
+                    let released = bottom_pane.reevaluate_approvals_for_mode(live_mode_enum);
+                    if released > 0 {
+                        chat_widget.commit_system(
+                            crate::tui::history_cell::system::SystemCell::response(
+                                format!(
+                                    "  ✓ {released} pending approval(s) auto-resolved by the new mode",
+                                ),
+                            ),
+                        );
+                    }
                     frame_requester.schedule_frame();
                 }
                 // Pulse the chat-widget scrollback so if any async

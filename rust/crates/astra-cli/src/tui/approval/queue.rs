@@ -92,6 +92,13 @@ pub(crate) struct PendingApproval {
     /// broadcasts to all waiting senders. None for legacy
     /// callers that don't compute the key.
     pub request_key: Option<astra_turn_core::approval_request_key::ApprovalRequestKey>,
+    /// Original tool-call arguments. Carried so the queue can
+    /// re-evaluate the request through `permission_engine` after
+    /// the user pivots permission modes (e.g. Edit → Auto). Empty
+    /// `Value::Null` means "args weren't propagated by this caller"
+    /// and re-evaluation will keep the entry pending unchanged
+    /// (conservative — better to ask twice than to silently allow).
+    pub args: serde_json::Value,
     /// Issue #326 P4 / R2 Major 1: the wide UI-grouping key.
     /// Entries that share `batch_group_key` render as one
     /// batch card with per-item rows. None means "render as a
@@ -382,6 +389,7 @@ impl ApprovalQueue {
         header: String,
         detail: Option<String>,
         reason: String,
+        args: serde_json::Value,
         response_tx: oneshot::Sender<ApprovalResponse>,
     ) -> ApprovalId {
         self.push_with_metadata(
@@ -389,6 +397,7 @@ impl ApprovalQueue {
             header,
             detail,
             reason,
+            args,
             response_tx,
             ApprovalMetadata::default(),
         )
@@ -407,6 +416,7 @@ impl ApprovalQueue {
         header: String,
         detail: Option<String>,
         reason: String,
+        args: serde_json::Value,
         response_tx: oneshot::Sender<ApprovalResponse>,
         metadata: ApprovalMetadata,
     ) -> ApprovalId {
@@ -451,6 +461,7 @@ impl ApprovalQueue {
             unsafe_rule_shape: metadata.unsafe_rule_shape,
             base_digest: metadata.base_digest,
             request_key: metadata.request_key,
+            args,
             batch_group_key: metadata.batch_group_key,
         });
         // Promote pre-existing entries too — they now share the queue
@@ -466,6 +477,45 @@ impl ApprovalQueue {
 
     pub fn focused(&self) -> Option<&PendingApproval> {
         self.entries.get(self.focus)
+    }
+
+    /// Re-evaluate every pending entry against the predicate `still_needs_approval`.
+    /// For each entry the predicate returns `false` for, drain it from the
+    /// queue and broadcast `ApprovalResponse::AllowOnce` to all of its
+    /// waiting senders. The focus cursor is normalised so it points at a
+    /// surviving entry (or to 0 if the queue is empty afterwards).
+    ///
+    /// This is the post-mode-pivot cleanup path: when the user flips
+    /// permission modes (e.g. Edit → Auto), pending entries that the
+    /// new mode would auto-approve must be released immediately.
+    /// Without this, the chip flips to Auto but the approval card
+    /// lingers and the model stalls waiting for the user.
+    ///
+    /// Returns the number of entries auto-approved.
+    pub fn drain_now_allowed<F>(&mut self, mut still_needs_approval: F) -> usize
+    where
+        F: FnMut(&PendingApproval) -> bool,
+    {
+        let mut released = 0usize;
+        let mut idx = 0usize;
+        while idx < self.entries.len() {
+            if still_needs_approval(&self.entries[idx]) {
+                idx += 1;
+                continue;
+            }
+            // Take this entry out and broadcast Allow to its waiters.
+            let mut entry = self.entries.remove(idx).expect("index in range");
+            for tx in entry.response_txs.drain(..) {
+                let _ = tx.send(ApprovalResponse::AllowOnce);
+            }
+            released += 1;
+            // Don't advance idx: the next entry slid into this slot.
+        }
+        // Normalise focus cursor to a valid index.
+        if self.focus >= self.entries.len() {
+            self.focus = self.entries.len().saturating_sub(1);
+        }
+        released
     }
 
     pub fn focus_index(&self) -> Option<usize> {
@@ -679,7 +729,7 @@ mod tests {
     fn push_records_no_source_agent_by_default() {
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
-        q.push("bash".into(), "h".into(), None, "r".into(), tx);
+        q.push("bash".into(), "h".into(), None, "r".into(), serde_json::Value::Null, tx);
         let view = q.focused_view().unwrap();
         assert!(view.source_agent.is_none());
     }
@@ -696,6 +746,7 @@ mod tests {
             "h".into(),
             None,
             "r".into(),
+            serde_json::Value::Null,
             tx,
             ApprovalMetadata::default().with_source_agent("review-subagent"),
         );
@@ -718,6 +769,7 @@ mod tests {
             "h".into(),
             None,
             "r".into(),
+            serde_json::Value::Null,
             tx,
             ApprovalMetadata::default().with_mcp_capability(meta.clone()),
         );
@@ -737,6 +789,7 @@ mod tests {
             "edit /etc/hosts".into(),
             None,
             "write".into(),
+            serde_json::Value::Null,
             tx,
             ApprovalMetadata::default().with_host("ssh:bastion-prod"),
         );
@@ -756,6 +809,7 @@ mod tests {
             "npm test".into(),
             None,
             "execute".into(),
+            serde_json::Value::Null,
             tx,
             ApprovalMetadata::default()
                 .with_risk_tags(vec![RiskTag::BashExecute])
@@ -781,7 +835,7 @@ mod tests {
         // just runs the comparison.
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
-        q.push("write_file".into(), "h".into(), None, "r".into(), tx);
+        q.push("write_file".into(), "h".into(), None, "r".into(), serde_json::Value::Null, tx);
         let path = std::env::temp_dir().join("definitely-does-not-exist-326-test");
         let _ = std::fs::remove_file(&path); // best-effort
         let result = q.focused_stale_check(&path).unwrap().unwrap();
@@ -818,6 +872,7 @@ mod tests {
             "h".into(),
             None,
             "r".into(),
+            serde_json::Value::Null,
             tx,
             ApprovalMetadata::default().with_base_digest(digest),
         );
@@ -847,6 +902,7 @@ mod tests {
             "h".into(),
             None,
             "r".into(),
+            serde_json::Value::Null,
             tx,
             ApprovalMetadata::default().with_base_digest(digest),
         );
@@ -894,6 +950,7 @@ mod tests {
             "npm test".into(),
             None,
             "execute".into(),
+            serde_json::Value::Null,
             tx_a,
             ApprovalMetadata::default().with_request_key(key.clone()),
         );
@@ -908,6 +965,7 @@ mod tests {
             "npm test".into(),
             None,
             "execute".into(),
+            serde_json::Value::Null,
             tx_b,
             ApprovalMetadata::default().with_request_key(key.clone()),
         );
@@ -925,6 +983,7 @@ mod tests {
             "npm test".into(),
             None,
             "execute".into(),
+            serde_json::Value::Null,
             tx_a,
             ApprovalMetadata::default().with_request_key(fixed_request_key("a")),
         );
@@ -934,6 +993,7 @@ mod tests {
             "npm test".into(),
             None,
             "execute".into(),
+            serde_json::Value::Null,
             tx_b,
             ApprovalMetadata::default().with_request_key(fixed_request_key("b")),
         );
@@ -955,6 +1015,7 @@ mod tests {
             "npm test".into(),
             None,
             "execute".into(),
+            serde_json::Value::Null,
             tx_a,
             ApprovalMetadata::default().with_request_key(key.clone()),
         );
@@ -963,6 +1024,7 @@ mod tests {
             "npm test".into(),
             None,
             "execute".into(),
+            serde_json::Value::Null,
             tx_b,
             ApprovalMetadata::default().with_request_key(key.clone()),
         );
@@ -971,6 +1033,7 @@ mod tests {
             "npm test".into(),
             None,
             "execute".into(),
+            serde_json::Value::Null,
             tx_c,
             ApprovalMetadata::default().with_request_key(key),
         );
@@ -999,6 +1062,7 @@ mod tests {
             "h".into(),
             None,
             "r".into(),
+            serde_json::Value::Null,
             tx,
             ApprovalMetadata::default().with_batch_group_key(group.clone()),
         );
@@ -1019,6 +1083,7 @@ mod tests {
             "a".into(),
             None,
             "read".into(),
+            serde_json::Value::Null,
             tx_a,
             ApprovalMetadata::default().with_batch_group_key(group_a.clone()),
         );
@@ -1028,6 +1093,7 @@ mod tests {
             "b".into(),
             None,
             "read".into(),
+            serde_json::Value::Null,
             tx_b,
             ApprovalMetadata::default().with_batch_group_key(group_b),
         );
@@ -1037,6 +1103,7 @@ mod tests {
             "c".into(),
             None,
             "read".into(),
+            serde_json::Value::Null,
             tx_c,
             ApprovalMetadata::default().with_batch_group_key(group_a),
         );
@@ -1056,11 +1123,11 @@ mod tests {
     fn respond_focused_group_without_key_resolves_only_focused_entry() {
         let mut q = ApprovalQueue::new();
         let (tx_a, mut rx_a) = oneshot::channel();
-        q.push("bash".into(), "a".into(), None, "run".into(), tx_a);
+        q.push("bash".into(), "a".into(), None, "run".into(), serde_json::Value::Null, tx_a);
         let (tx_b, mut rx_b) = oneshot::channel();
-        q.push("bash".into(), "b".into(), None, "run".into(), tx_b);
+        q.push("bash".into(), "b".into(), None, "run".into(), serde_json::Value::Null, tx_b);
         let (tx_c, mut rx_c) = oneshot::channel();
-        q.push("bash".into(), "c".into(), None, "run".into(), tx_c);
+        q.push("bash".into(), "c".into(), None, "run".into(), serde_json::Value::Null, tx_c);
 
         assert_eq!(q.respond_focused_group(ApprovalResponse::AllowOnce), 1);
         assert_eq!(q.len(), 2);
@@ -1086,6 +1153,7 @@ mod tests {
             "rm a".into(),
             None,
             "execute".into(),
+            serde_json::Value::Null,
             tx_a,
             ApprovalMetadata::default().with_batch_group_key(group.clone()),
         );
@@ -1095,6 +1163,7 @@ mod tests {
             "rm b".into(),
             None,
             "execute".into(),
+            serde_json::Value::Null,
             tx_b,
             ApprovalMetadata::default().with_batch_group_key(group),
         );
@@ -1127,6 +1196,7 @@ mod tests {
             "rm a".into(),
             None,
             "execute".into(),
+            serde_json::Value::Null,
             tx_a,
             ApprovalMetadata::default().with_batch_group_key(group.clone()),
         );
@@ -1136,6 +1206,7 @@ mod tests {
             "rm b".into(),
             None,
             "execute".into(),
+            serde_json::Value::Null,
             tx_b,
             ApprovalMetadata::default().with_batch_group_key(group),
         );
@@ -1168,6 +1239,7 @@ mod tests {
             "npm test".into(),
             None,
             "execute".into(),
+            serde_json::Value::Null,
             tx,
             ApprovalMetadata::default().with_workspace_untrusted(true),
         );
@@ -1201,6 +1273,7 @@ mod tests {
             "cd rust && cargo test".into(),
             None,
             "execute".into(),
+            serde_json::Value::Null,
             tx,
             ApprovalMetadata::default().with_scope_shape(true, false),
         );
@@ -1221,6 +1294,7 @@ mod tests {
             "bash".into(),
             None,
             "execute".into(),
+            serde_json::Value::Null,
             tx,
             ApprovalMetadata::default().with_unsafe_rule_shape(true),
         );
@@ -1241,6 +1315,7 @@ mod tests {
             "Git show HEAD".into(),
             None,
             "This command needs your approval before it runs.".into(),
+            serde_json::Value::Null,
             tx,
             ApprovalMetadata::default().with_workspace_untrusted(true),
         );
@@ -1255,6 +1330,148 @@ mod tests {
             Some(
                 "Always remembers for this session only. Choose Trust Workspace or run `/allow trust` to save workspace rules."
             )
+        );
+    }
+
+    // ── drain_now_allowed: post-mode-pivot cleanup ────────────────
+    //
+    // Regression for session 6953d1da: pending approvals from a
+    // restrictive mode (Edit / Plan) hung around in the queue after
+    // the user pivoted to Auto, leaving the "auto · ⏸ 1 pending"
+    // visual contradiction on the status line. Mode pivots must
+    // re-evaluate every entry and drain those the new mode would
+    // not gate.
+
+    #[test]
+    fn drain_now_allowed_releases_entries_predicate_drops() {
+        let mut q = ApprovalQueue::new();
+        let (tx_keep, _rx_keep) = oneshot::channel();
+        let (tx_drop, mut rx_drop) = oneshot::channel();
+        q.push(
+            "write_file".into(),
+            "h1".into(),
+            None,
+            "r1".into(),
+            serde_json::Value::Null,
+            tx_keep,
+        );
+        q.push(
+            "bash".into(),
+            "h2".into(),
+            None,
+            "r2".into(),
+            serde_json::Value::Null,
+            tx_drop,
+        );
+
+        // Predicate: keep write_file, drop bash.
+        let released = q.drain_now_allowed(|entry| entry.tool == "write_file");
+
+        assert_eq!(released, 1, "exactly one entry should be released");
+        assert_eq!(q.len(), 1, "the kept entry must remain in the queue");
+        assert_eq!(
+            rx_drop.try_recv().unwrap(),
+            crate::chat_stream::ApprovalResponse::AllowOnce,
+            "released entries must broadcast AllowOnce to their senders"
+        );
+    }
+
+    #[test]
+    fn drain_now_allowed_normalises_focus_when_focused_entry_drops() {
+        let mut q = ApprovalQueue::new();
+        let (tx_a, _rx_a) = oneshot::channel();
+        let (tx_b, _rx_b) = oneshot::channel();
+        q.push(
+            "a".into(),
+            "h".into(),
+            None,
+            "r".into(),
+            serde_json::Value::Null,
+            tx_a,
+        );
+        q.push(
+            "b".into(),
+            "h".into(),
+            None,
+            "r".into(),
+            serde_json::Value::Null,
+            tx_b,
+        );
+        // Focus the second (b)
+        q.move_focus_down();
+        assert_eq!(q.focus_index(), Some(1));
+
+        // Drop b; focus should re-anchor onto a.
+        q.drain_now_allowed(|entry| entry.tool == "a");
+        assert_eq!(q.len(), 1);
+        assert_eq!(
+            q.focus_index(),
+            Some(0),
+            "focus must clamp into the surviving entries after a drop"
+        );
+    }
+
+    #[test]
+    fn drain_now_allowed_zero_when_predicate_keeps_everything() {
+        let mut q = ApprovalQueue::new();
+        let (tx, _rx) = oneshot::channel();
+        q.push(
+            "bash".into(),
+            "h".into(),
+            None,
+            "r".into(),
+            serde_json::Value::Null,
+            tx,
+        );
+        let released = q.drain_now_allowed(|_| true);
+        assert_eq!(released, 0);
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn drain_now_allowed_broadcasts_to_every_sender_on_a_deduped_entry() {
+        let mut q = ApprovalQueue::new();
+        let key = astra_turn_core::approval_request_key::ApprovalRequestKey {
+            tool: "bash".into(),
+            args_hash: [9; 32],
+            payload_hash: None,
+            canonical_cwd: "/tmp".into(),
+            source_agent: None,
+            turn_id: uuid::Uuid::nil(),
+        };
+        let (tx_a, mut rx_a) = oneshot::channel();
+        let (tx_b, mut rx_b) = oneshot::channel();
+        // Same request_key triggers dedup → both senders ride a single entry.
+        q.push_with_metadata(
+            "bash".into(),
+            "h".into(),
+            None,
+            "r".into(),
+            serde_json::Value::Null,
+            tx_a,
+            ApprovalMetadata::default().with_request_key(key.clone()),
+        );
+        q.push_with_metadata(
+            "bash".into(),
+            "h".into(),
+            None,
+            "r".into(),
+            serde_json::Value::Null,
+            tx_b,
+            ApprovalMetadata::default().with_request_key(key),
+        );
+        assert_eq!(q.len(), 1, "dedup should keep one entry");
+
+        let released = q.drain_now_allowed(|_| false);
+        assert_eq!(released, 1);
+        // Both waiters get the same Allow.
+        assert_eq!(
+            rx_a.try_recv().unwrap(),
+            crate::chat_stream::ApprovalResponse::AllowOnce,
+        );
+        assert_eq!(
+            rx_b.try_recv().unwrap(),
+            crate::chat_stream::ApprovalResponse::AllowOnce,
         );
     }
 }
