@@ -18,7 +18,7 @@ export function UserBadge({ user, collapsed }: { user: UserSummary; collapsed?: 
     return (
       <Link
         href="/login?next=/"
-        className="flex items-center gap-3 rounded-control border border-border bg-surface px-3 py-2 hover:bg-surface-muted"
+        className="astra-sidebar-account flex items-center gap-3 rounded-control px-3 py-2"
       >
         <Avatar name="Sign in" />
         {collapsed ? null : (
@@ -58,7 +58,7 @@ export function UserBadge({ user, collapsed }: { user: UserSummary; collapsed?: 
     <button
       type="button"
       className={cn(
-        'flex w-full items-center gap-3 rounded-control border border-border bg-surface px-3 py-2 text-left hover:bg-surface-muted',
+        'astra-sidebar-account flex w-full items-center gap-3 rounded-control px-3 py-2 text-left',
         collapsed && 'justify-center px-0',
       )}
       aria-label="Account menu"

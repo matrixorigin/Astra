@@ -16,16 +16,16 @@ export function SidebarSection({
 }) {
   const [collapsed, setCollapsed] = useState(defaultCollapsed);
   return (
-    <section className="mt-4">
+    <section className="astra-sidebar-section mt-4">
       <button
         type="button"
         onClick={() => setCollapsed((value) => !value)}
-        className="flex w-full items-center justify-between px-3 text-xs font-medium text-text-muted hover:text-text-secondary"
+        className="astra-sidebar-section-toggle flex w-full items-center justify-between px-3 text-xs font-medium"
       >
         <span>{label}</span>
         <ChevronDown className={cn('size-3', collapsed && '-rotate-90')} />
       </button>
-      {collapsed ? null : <div className="mt-2 space-y-1">{children}</div>}
+      {collapsed ? null : <div className="astra-sidebar-section-content mt-2 space-y-1">{children}</div>}
     </section>
   );
 }

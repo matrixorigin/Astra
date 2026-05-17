@@ -1,9 +1,9 @@
 'use client';
 
 import { Command } from 'cmdk';
-import { Folder, MessageSquare } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { useEffect, useMemo, useState } from 'react';
+import { TuiEntityMark } from '@/components/app/tui-entity-mark';
 import { Modal } from '@/components/ui/modal';
 import { searchWorkspace } from '@/lib/api/search';
 import type { SearchResponse } from '@/lib/api/types';
@@ -58,7 +58,7 @@ export function SearchModal({ open, onOpenChange }: { open: boolean; onOpenChang
   }
 
   return (
-    <Modal open={open} onOpenChange={onOpenChange} width={720}>
+    <Modal open={open} onOpenChange={onOpenChange} title="Search workspace" titleHidden width={720}>
       <Command className="bg-surface p-3">
         <Command.Input
           autoFocus
@@ -81,7 +81,7 @@ export function SearchModal({ open, onOpenChange }: { open: boolean; onOpenChang
                   onSelect={() => go(`/projects/${project.id}`)}
                   className="flex cursor-default items-center gap-3 rounded-control px-3 py-2 text-sm text-text outline-none aria-selected:bg-surface-muted"
                 >
-                  <Folder className="size-4 text-text-muted" />
+                  <TuiEntityMark kind="project" />
                   <span className="min-w-0 flex-1 truncate">{project.name}</span>
                   <span className="text-xs text-text-muted">{compactRelativeTime(project.updatedAt)}</span>
                 </Command.Item>
@@ -98,7 +98,7 @@ export function SearchModal({ open, onOpenChange }: { open: boolean; onOpenChang
                   onSelect={() => go(chat.projectId ? `/projects/${chat.projectId}/chats/${chat.id}` : `/chats/${chat.id}`)}
                   className="flex cursor-default items-center gap-3 rounded-control px-3 py-2 text-sm text-text outline-none aria-selected:bg-surface-muted"
                 >
-                  <MessageSquare className="size-4 text-text-muted" />
+                  <TuiEntityMark kind="chat" />
                   <span className="min-w-0 flex-1 truncate">{chat.title ?? 'Untitled'}</span>
                   <span className="text-xs text-text-muted">{compactRelativeTime(chat.updatedAt)}</span>
                 </Command.Item>

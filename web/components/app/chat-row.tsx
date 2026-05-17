@@ -1,8 +1,9 @@
 'use client';
 
 import Link from 'next/link';
-import { CheckSquare, MessageSquare, MoreHorizontal, Square } from 'lucide-react';
+import { CheckSquare, MoreHorizontal, Square } from 'lucide-react';
 import { ChatActionsMenu } from '@/components/app/chat-actions-menu';
+import { TuiEntityMark } from '@/components/app/tui-entity-mark';
 import { cn } from '@/lib/utils/cn';
 
 export function ChatRow({
@@ -28,7 +29,7 @@ export function ChatRow({
 }) {
   const content = (
     <>
-      <MessageSquare className="mt-0.5 size-4 shrink-0 text-text-muted" />
+      <TuiEntityMark kind="chat" className="mt-0.5" />
       <span className="min-w-0 flex-1">
         <span className="block truncate text-sm font-medium">{title}</span>
         <span className="block truncate text-xs text-text-muted">{subtitle}</span>
