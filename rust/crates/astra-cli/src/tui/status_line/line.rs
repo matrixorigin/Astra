@@ -48,7 +48,6 @@ pub(crate) struct StatusContext {
     pub git_branch: Option<String>,
     /// Number of approvals currently awaiting a user decision.
     pub pending_approvals: usize,
-    pub plan_mode_active: bool,
     /// `(open, total)` task counts for the footer task-board chip.
     /// `None` when the board has no tasks — chip hides rather than
     /// wasting space with `0/0`.
@@ -154,13 +153,6 @@ impl StatusLine {
                     Style::default().fg(Color::Red),
                 ));
             }
-        }
-
-        if ctx.plan_mode_active {
-            out.left.push(Segment::styled(
-                "📋plan on",
-                Style::default().fg(Color::Magenta),
-            ));
         }
 
         if ctx.pending_approvals > 0 {

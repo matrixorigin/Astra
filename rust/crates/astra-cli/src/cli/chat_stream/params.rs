@@ -252,6 +252,32 @@ pub struct AskUserRequest {
 
 pub type AskUserRequestTx = mpsc::UnboundedSender<AskUserRequest>;
 
+/// Outcome of the plan-review overlay surfaced when the model calls
+/// `exit_plan_mode` without an explicit `approved` field.
+///
+/// The CLI side maps the user's choice into a permission mode (or
+/// keeps plan mode active) before the next turn boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanReviewDecision {
+    /// User approved and chose an execution mode.
+    Approve {
+        mode: crate::permission_manager::PermissionMode,
+    },
+    /// User wants to keep planning — provide feedback on next turn.
+    KeepPlanning,
+    /// Overlay was dismissed (Esc / channel closed).
+    Cancelled,
+}
+
+pub struct PlanReviewRequest {
+    /// Markdown body of the proposed plan, surfaced as scrollable
+    /// read-only content in the overlay.
+    pub plan_markdown: String,
+    pub response_tx: tokio::sync::oneshot::Sender<PlanReviewDecision>,
+}
+
+pub type PlanReviewRequestTx = mpsc::UnboundedSender<PlanReviewRequest>;
+
 /// Parameters for a single agentic chat turn — groups the many arguments
 /// to `stream_chat_sse` into a named struct to reduce cognitive load.
 pub(crate) struct ChatTurnParams<'a> {
@@ -319,6 +345,11 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) approval_request_tx: Option<ApprovalRequestTx>,
     /// Optional channel for native TUI ask_user prompts.
     pub(crate) ask_user_request_tx: Option<AskUserRequestTx>,
+    /// Optional channel for the dedicated `exit_plan_mode` overlay
+    /// (scrollable plan body + 4-way radio). Separate from
+    /// `ask_user_request_tx` so plan markdown does not have to be
+    /// shoehorned into the question/option layout.
+    pub(crate) plan_review_request_tx: Option<PlanReviewRequestTx>,
     /// MCP client manager for external tool servers.
     pub(crate) mcp_manager:
         Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
@@ -501,6 +532,7 @@ impl<'a> ChatTurnParams<'a> {
             agent_live_event_sink: None,
             approval_request_tx: None,
             ask_user_request_tx: None,
+            plan_review_request_tx: None,
             mcp_manager: None,
             skill_search: ctx.skill_search,
             skill_quality_tracker,

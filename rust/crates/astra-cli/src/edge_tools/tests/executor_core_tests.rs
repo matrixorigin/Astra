@@ -285,11 +285,11 @@ async fn exit_plan_mode_accepts_plan_alias_and_explicit_approved_skips_overlay()
 async fn exit_plan_mode_overlay_approve_auto_records_pending_mode_change() {
     // End-to-end of the Approve / Keep-planning dialog: model calls
     // exit_plan_mode without `approved`; the executor surfaces the
-    // 4-option dialog through `ask_user_request_tx`; the user picks
-    // "Approve & start in auto"; the executor should commit the plan
-    // with `approved=true` and stash `PermissionMode::Auto` in the
-    // pending-mode slot for the host to apply on the next turn.
-    use crate::chat_stream::{AskUserAnswers, AskUserQuestionAnswer, AskUserResponse};
+    // 4-option dialog through `plan_review_request_tx`; the test
+    // auto-answers with PermissionMode::Auto so the executor commits
+    // the plan and stages Auto in the pending-mode slot.
+    use crate::chat_stream::PlanReviewDecision;
+    use crate::permission_manager::PermissionMode;
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -320,24 +320,15 @@ async fn exit_plan_mode_overlay_approve_auto_records_pending_mode_change() {
         .with_active_session_id("sess-1")
         .with_cloud(server.uri(), "token");
 
-    // Wire a fake overlay sink: spawn a task that auto-answers the
-    // first ask_user request with "Approve & start in auto" so the
-    // tool can complete without a real TUI.
     let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::AskUserRequest>();
-    executor.set_ask_user_request_tx(Some(tx));
+        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::PlanReviewRequest>();
+    executor.set_plan_review_request_tx(Some(tx));
 
     let overlay_task = tokio::spawn(async move {
         let request = rx.recv().await.expect("overlay request");
-        let question = request.prompt.questions[0].question.clone();
-        let _ = request.response_tx.send(AskUserResponse::Submitted(AskUserAnswers {
-            answers: vec![AskUserQuestionAnswer {
-                question,
-                answers: vec!["Approve & start in auto".to_string()],
-                multi_select: false,
-                annotation: None,
-            }],
-        }));
+        let _ = request.response_tx.send(PlanReviewDecision::Approve {
+            mode: PermissionMode::Auto,
+        });
     });
 
     let result = executor
@@ -456,7 +447,8 @@ async fn exit_plan_mode_local_path_makes_zero_cloud_calls() {
     //
     // GREEN once Step 4 finishes (already partially correct via
     // dual-path Step 3 work).
-    use crate::chat_stream::{AskUserAnswers, AskUserQuestionAnswer, AskUserResponse};
+    use crate::chat_stream::PlanReviewDecision;
+    use crate::permission_manager::PermissionMode;
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -475,20 +467,14 @@ async fn exit_plan_mode_local_path_makes_zero_cloud_calls() {
         .with_cloud(server.uri(), "token");
 
     let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::AskUserRequest>();
-    executor.set_ask_user_request_tx(Some(tx));
+        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::PlanReviewRequest>();
+    executor.set_plan_review_request_tx(Some(tx));
 
     let overlay_task = tokio::spawn(async move {
         let request = rx.recv().await.expect("overlay request");
-        let question = request.prompt.questions[0].question.clone();
-        let _ = request.response_tx.send(AskUserResponse::Submitted(AskUserAnswers {
-            answers: vec![AskUserQuestionAnswer {
-                question,
-                answers: vec!["Approve & start in default (ask before each write)".to_string()],
-                multi_select: false,
-                annotation: None,
-            }],
-        }));
+        let _ = request.response_tx.send(PlanReviewDecision::Approve {
+            mode: PermissionMode::Prompt,
+        });
     });
 
     let result = executor
@@ -518,8 +504,6 @@ async fn enter_plan_mode_then_exit_full_cycle_offline() {
     //   4. host applies → perm_manager simulated as Auto
     //
     // RED until Step 4-3 lets enter_plan_mode work offline.
-    use crate::chat_stream::{AskUserAnswers, AskUserQuestionAnswer, AskUserResponse};
-
     let temp = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(temp.path().to_path_buf())
         .with_active_session_id("sess-cycle");
@@ -540,20 +524,16 @@ async fn enter_plan_mode_then_exit_full_cycle_offline() {
 
     // Step 2-4: exit through overlay, choose Auto
     let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::AskUserRequest>();
-    executor.set_ask_user_request_tx(Some(tx));
+        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::PlanReviewRequest>();
+    executor.set_plan_review_request_tx(Some(tx));
 
     let overlay_task = tokio::spawn(async move {
         let request = rx.recv().await.expect("overlay request");
-        let question = request.prompt.questions[0].question.clone();
-        let _ = request.response_tx.send(AskUserResponse::Submitted(AskUserAnswers {
-            answers: vec![AskUserQuestionAnswer {
-                question,
-                answers: vec!["Approve & start in auto".to_string()],
-                multi_select: false,
-                annotation: None,
-            }],
-        }));
+        let _ = request
+            .response_tx
+            .send(crate::chat_stream::PlanReviewDecision::Approve {
+                mode: crate::permission_manager::PermissionMode::Auto,
+            });
     });
 
     let exit_result = executor
@@ -578,7 +558,7 @@ async fn exit_plan_mode_overlay_keep_planning_leaves_plan_open() {
     // phase (server call body `approved: false`), no permission-mode
     // change should be staged, and the message must tell the model
     // to address feedback before re-calling.
-    use crate::chat_stream::{AskUserAnswers, AskUserQuestionAnswer, AskUserResponse};
+    use crate::chat_stream::PlanReviewDecision;
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -610,20 +590,12 @@ async fn exit_plan_mode_overlay_keep_planning_leaves_plan_open() {
         .with_cloud(server.uri(), "token");
 
     let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::AskUserRequest>();
-    executor.set_ask_user_request_tx(Some(tx));
+        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::PlanReviewRequest>();
+    executor.set_plan_review_request_tx(Some(tx));
 
     let overlay_task = tokio::spawn(async move {
         let request = rx.recv().await.expect("overlay request");
-        let question = request.prompt.questions[0].question.clone();
-        let _ = request.response_tx.send(AskUserResponse::Submitted(AskUserAnswers {
-            answers: vec![AskUserQuestionAnswer {
-                question,
-                answers: vec!["Keep planning — let me give feedback".to_string()],
-                multi_select: false,
-                annotation: None,
-            }],
-        }));
+        let _ = request.response_tx.send(PlanReviewDecision::KeepPlanning);
     });
 
     let result = executor
@@ -661,7 +633,8 @@ async fn exit_plan_mode_shift_tab_path_works_without_cloud_plan_record() {
     // through to the overlay + `pending_permission_mode_change` slot
     // exactly like the cloud path does, and never hit any
     // `/plans/*/exit-plan-mode` endpoint.
-    use crate::chat_stream::{AskUserAnswers, AskUserQuestionAnswer, AskUserResponse};
+    use crate::chat_stream::PlanReviewDecision;
+    use crate::permission_manager::PermissionMode;
 
     let server = MockServer::start().await;
     // Probe returns an empty plans array — that's the trigger for
@@ -683,20 +656,14 @@ async fn exit_plan_mode_shift_tab_path_works_without_cloud_plan_record() {
         .with_cloud(server.uri(), "token");
 
     let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::AskUserRequest>();
-    executor.set_ask_user_request_tx(Some(tx));
+        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::PlanReviewRequest>();
+    executor.set_plan_review_request_tx(Some(tx));
 
     let overlay_task = tokio::spawn(async move {
         let request = rx.recv().await.expect("overlay request");
-        let question = request.prompt.questions[0].question.clone();
-        let _ = request.response_tx.send(AskUserResponse::Submitted(AskUserAnswers {
-            answers: vec![AskUserQuestionAnswer {
-                question,
-                answers: vec!["Approve & start in edit (auto-approve workspace edits)".to_string()],
-                multi_select: false,
-                annotation: None,
-            }],
-        }));
+        let _ = request.response_tx.send(PlanReviewDecision::Approve {
+            mode: PermissionMode::AcceptEdits,
+        });
     });
 
     let result = executor

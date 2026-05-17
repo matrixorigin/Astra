@@ -1,5 +1,0 @@
----
-source: crates/astra-cli/src/tui/status_line/snapshot_tests.rs
-expression: "render_ctx(&ctx, 80)"
----
-  / @ $ · ⇧Tab mode · Ctrl+O transcript · default · 📋 plan on       sonnet-4.6

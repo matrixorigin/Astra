@@ -654,12 +654,18 @@ pub struct ToolExecutor {
     /// must be blocked; `Some(false)` = no planning plan, writes flow.
     plan_mode_authoring_cache: std::sync::Arc<tokio::sync::RwLock<Option<bool>>>,
     /// Per-turn ask-user channel — the host swaps a fresh sender in
-    /// before each turn so tools that need to surface a TUI overlay
-    /// (currently `exit_plan_mode` for the Approve / Keep-planning
-    /// dialog) can reach the bottom-pane overlay through the same
-    /// path the `ask_user` tool uses.
+    /// before each turn so the `ask_user` tool can reach the
+    /// bottom-pane overlay.
     ask_user_request_tx:
         std::sync::Mutex<Option<crate::chat_stream::AskUserRequestTx>>,
+    /// Per-turn plan-review channel — installed by the host before
+    /// each turn so `exit_plan_mode` can surface the dedicated
+    /// plan-review overlay (scrollable plan body + 4-way radio).
+    /// Separate from `ask_user_request_tx` because the plan overlay
+    /// renders a markdown body, not the question/option layout
+    /// `ask_user` needs.
+    plan_review_request_tx:
+        std::sync::Mutex<Option<crate::chat_stream::PlanReviewRequestTx>>,
     /// Slot recording a permission-mode switch that the user
     /// confirmed inside a tool overlay (currently `exit_plan_mode`'s
     /// 4-option dialog). The host drains this slot at the start of
@@ -758,12 +764,13 @@ impl ToolExecutor {
             ),
             plan_mode_authoring_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             ask_user_request_tx: std::sync::Mutex::new(None),
+            plan_review_request_tx: std::sync::Mutex::new(None),
             pending_permission_mode_change: std::sync::Mutex::new(None),
         }
     }
 
     /// Install the per-turn `ask_user` channel so tools can surface a
-    /// TUI overlay for confirmations (e.g. `exit_plan_mode` approval).
+    /// TUI overlay for confirmations.
     /// `None` clears the slot — passed at turn boundaries so a stale
     /// sender never leaks across turns.
     pub fn set_ask_user_request_tx(
@@ -771,6 +778,19 @@ impl ToolExecutor {
         tx: Option<crate::chat_stream::AskUserRequestTx>,
     ) {
         if let Ok(mut guard) = self.ask_user_request_tx.lock() {
+            *guard = tx;
+        }
+    }
+
+    /// Install the per-turn plan-review channel so `exit_plan_mode`
+    /// can surface the dedicated plan-approval overlay. Cleared at
+    /// turn boundaries to keep stale senders from leaking into
+    /// background sub-runs that share the same `Arc<ToolExecutor>`.
+    pub fn set_plan_review_request_tx(
+        &self,
+        tx: Option<crate::chat_stream::PlanReviewRequestTx>,
+    ) {
+        if let Ok(mut guard) = self.plan_review_request_tx.lock() {
             *guard = tx;
         }
     }
@@ -1639,11 +1659,10 @@ impl ToolExecutor {
         &self,
         plan_markdown: Option<&str>,
     ) -> Result<(bool, Option<crate::permission_manager::PermissionMode>), String> {
-        use crate::chat_stream::{AskUserRequest, AskUserResponse};
-        use crate::permission_manager::PermissionMode;
+        use crate::chat_stream::{PlanReviewDecision, PlanReviewRequest};
 
         let tx = self
-            .ask_user_request_tx
+            .plan_review_request_tx
             .lock()
             .ok()
             .and_then(|guard| guard.clone());
@@ -1654,53 +1673,14 @@ impl ToolExecutor {
             );
         };
 
-        const APPROVE_AUTO: &str = "Approve & start in auto";
-        const APPROVE_EDIT: &str = "Approve & start in edit (auto-approve workspace edits)";
-        const APPROVE_DEFAULT: &str = "Approve & start in default (ask before each write)";
-        const KEEP_PLANNING: &str = "Keep planning — let me give feedback";
-        const QUESTION: &str =
-            "Plan ready. Approve and choose execution mode, or keep planning for feedback?";
-
-        let plan_preview = plan_markdown.unwrap_or("(plan body was empty)").to_string();
-        let prompt = astra_tools::AskUserPrompt {
-            context: Some(plan_preview),
-            questions: vec![astra_tools::AskUserQuestion {
-                header: "Plan".to_string(),
-                question: QUESTION.to_string(),
-                options: vec![
-                    astra_tools::AskUserChoice {
-                        label: APPROVE_AUTO.to_string(),
-                        description: Some("All tool calls auto-approved".to_string()),
-                        preview: None,
-                    },
-                    astra_tools::AskUserChoice {
-                        label: APPROVE_EDIT.to_string(),
-                        description: Some(
-                            "Auto-approve workspace edits; still ask for shell and external writes"
-                                .to_string(),
-                        ),
-                        preview: None,
-                    },
-                    astra_tools::AskUserChoice {
-                        label: APPROVE_DEFAULT.to_string(),
-                        description: Some("Ask before write/execute tools".to_string()),
-                        preview: None,
-                    },
-                    astra_tools::AskUserChoice {
-                        label: KEEP_PLANNING.to_string(),
-                        description: Some("Plan stays open; provide feedback to refine".to_string()),
-                        preview: None,
-                    },
-                ],
-                multi_select: false,
-                allow_freeform: false,
-            }],
-        };
+        let plan_body = plan_markdown
+            .unwrap_or("(plan body was empty — pass a `plan` argument so the user can review it)")
+            .to_string();
 
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if tx
-            .send(AskUserRequest {
-                prompt,
+            .send(PlanReviewRequest {
+                plan_markdown: plan_body,
                 response_tx,
             })
             .is_err()
@@ -1708,25 +1688,9 @@ impl ToolExecutor {
             return Err("Error: exit_plan_mode overlay sink is closed.".to_string());
         }
 
-        let response = response_rx.await.unwrap_or(AskUserResponse::Cancelled);
-        match response {
-            AskUserResponse::Submitted(answers) => {
-                let label = answers
-                    .answers
-                    .first()
-                    .and_then(|answer| answer.answers.first().cloned())
-                    .unwrap_or_default();
-                match label.as_str() {
-                    APPROVE_AUTO => Ok((true, Some(PermissionMode::Auto))),
-                    APPROVE_EDIT => Ok((true, Some(PermissionMode::AcceptEdits))),
-                    APPROVE_DEFAULT => Ok((true, Some(PermissionMode::Prompt))),
-                    KEEP_PLANNING => Ok((false, None)),
-                    other => Err(format!(
-                        "Error: exit_plan_mode received unexpected overlay choice '{other}'."
-                    )),
-                }
-            }
-            AskUserResponse::Cancelled => Ok((false, None)),
+        match response_rx.await.unwrap_or(PlanReviewDecision::Cancelled) {
+            PlanReviewDecision::Approve { mode } => Ok((true, Some(mode))),
+            PlanReviewDecision::KeepPlanning | PlanReviewDecision::Cancelled => Ok((false, None)),
         }
     }
 

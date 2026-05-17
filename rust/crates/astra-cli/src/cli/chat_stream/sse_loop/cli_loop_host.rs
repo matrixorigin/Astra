@@ -69,6 +69,11 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub approval_request_tx: Option<super::super::ApprovalRequestTx>,
     /// Optional channel for native TUI ask_user prompts.
     pub ask_user_request_tx: Option<super::super::AskUserRequestTx>,
+    /// Per-turn channel into the dedicated plan-review overlay used
+    /// by `exit_plan_mode`. Lives next to `ask_user_request_tx` but
+    /// stays separate so plan markdown does not have to be smuggled
+    /// through the question/option layout `ask_user` expects.
+    pub plan_review_request_tx: Option<super::super::PlanReviewRequestTx>,
     /// Root-level messaging context used when the current turn has no mailbox.
     pub root_send_message_context:
         Option<crate::edge_tools::agent_messaging::SendMessageRuntimeContext>,
@@ -235,6 +240,8 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // into background sub-runs.
         self.executor
             .set_ask_user_request_tx(self.ask_user_request_tx.clone());
+        self.executor
+            .set_plan_review_request_tx(self.plan_review_request_tx.clone());
 
         // Plan mode: surface a one-line mode marker so the model knows
         // why mutating tools are missing from the schema. Singleton
@@ -246,6 +253,19 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 astra_runtime::turn::agentic_loop_host::VolatileKind::PlanModeMarker,
                 "[mode=plan] You are in read-only plan mode. Investigate with read-only tools (read_file, grep, glob, web_fetch, …); mutating tools are intentionally absent from the schema. When the plan is ready call `exit_plan_mode(plan=\"<markdown>\")` so the user can approve and choose an execution mode. Do not attempt edits or shell mutations in this mode.",
             );
+
+            // Plan-mode nudge: if the previous turn produced a
+            // plan-shaped response but the model did not actually
+            // call `exit_plan_mode`, the user never sees an approval
+            // overlay and the agent silently stalls. Inject a
+            // corrective so the next round either tightens the plan
+            // and submits via the tool, or asks the user a question.
+            if let Some(reminder) = plan_mode_missed_exit_reminder(&state.messages) {
+                state.push_volatile(
+                    astra_runtime::turn::agentic_loop_host::VolatileKind::Corrective,
+                    reminder,
+                );
+            }
         }
 
         // Session c47c2dca regression fix: drain the structured volatile
@@ -689,6 +709,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // the same `Arc<ToolExecutor>` (the channel is reinstalled at
         // the start of every turn).
         self.executor.set_ask_user_request_tx(None);
+        self.executor.set_plan_review_request_tx(None);
 
         // Bug B step 3: capture the parent turn's cacheable prefix
         // so subsequent spawn_agent / delegate calls can inherit it
@@ -743,6 +764,99 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         };
         let _ = astra_turn_core::fork_capture::capture_parent_prefix(req, store.as_ref());
     }
+}
+
+/// Detect the "model wrote a plan but forgot to call `exit_plan_mode`"
+/// failure mode. Returns the reminder text to push as a Corrective
+/// volatile, or `None` when the previous turn either did not look
+/// plan-shaped or already exited the plan via the tool.
+///
+/// Heuristic — intentionally conservative:
+///   * Look at the most recent assistant message in `messages`.
+///   * It must contain at least one numbered-step or bulleted list,
+///     OR an explicit `## Plan` / `### Steps` markdown header.
+///   * The same assistant message must NOT carry a `tool_calls`
+///     entry whose name is `exit_plan_mode` (already-exited turns
+///     don't need the nudge).
+///
+/// Rationale: if the heuristic is too eager it spams the model on
+/// every analytical answer; if it's too cautious it leaves the user
+/// stuck. We err toward "don't nudge" — the cost of a missed nudge
+/// is one stale turn; the cost of a false nudge is repeated
+/// scolding the model takes literally.
+fn plan_mode_missed_exit_reminder(messages: &[serde_json::Value]) -> Option<String> {
+    let last_assistant = messages.iter().rev().find(|m| {
+        m.get("role").and_then(|v| v.as_str()) == Some("assistant")
+    })?;
+
+    if assistant_called_exit_plan_mode(last_assistant) {
+        return None;
+    }
+
+    let content = assistant_text(last_assistant)?;
+    if !looks_plan_shaped(&content) {
+        return None;
+    }
+
+    Some(
+        "[plan-nudge] Your last response looked like a plan but you did not call `exit_plan_mode`. Surface the plan for user approval by calling `exit_plan_mode(plan=\"<markdown>\")`. Without that call the user has no way to approve and unlock execution.".to_string()
+    )
+}
+
+fn assistant_called_exit_plan_mode(message: &serde_json::Value) -> bool {
+    let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    tool_calls.iter().any(|call| {
+        call.get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            == Some("exit_plan_mode")
+    })
+}
+
+fn assistant_text(message: &serde_json::Value) -> Option<String> {
+    if let Some(text) = message.get("content").and_then(|v| v.as_str()) {
+        return Some(text.to_string());
+    }
+    // OpenAI-style content arrays: [{type: "text", text: "…"}, …]
+    if let Some(parts) = message.get("content").and_then(|v| v.as_array()) {
+        let collected: String = parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !collected.is_empty() {
+            return Some(collected);
+        }
+    }
+    None
+}
+
+fn looks_plan_shaped(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    // Markdown plan headers — strongest signal.
+    if lower.contains("## plan")
+        || lower.contains("### plan")
+        || lower.contains("## steps")
+        || lower.contains("### steps")
+    {
+        return true;
+    }
+    // Numbered list with at least three items: 1. … 2. … 3. …
+    let mut numbered_hits = 0;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix(|c: char| c.is_ascii_digit()) {
+            if rest.starts_with('.') || rest.starts_with(')') {
+                numbered_hits += 1;
+                if numbered_hits >= 3 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -961,5 +1075,80 @@ mod tests {
             "execute_turn must pass an augmented messages_slice to \
              fetch_chat_turn_sse, not raw state.messages (session c47c2dca)"
         );
+    }
+
+    #[test]
+    fn plan_nudge_fires_on_numbered_plan_without_exit_call() {
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "Sure. Plan:\n1. Read auth.rs\n2. Add tests\n3. Submit PR",
+        })];
+        let nudge = plan_mode_missed_exit_reminder(&messages)
+            .expect("numbered plan without exit_plan_mode call must trigger nudge");
+        assert!(
+            nudge.contains("exit_plan_mode"),
+            "nudge must point the model at exit_plan_mode. Got: {nudge}"
+        );
+    }
+
+    #[test]
+    fn plan_nudge_fires_on_markdown_plan_header() {
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "## Plan\n\nWe will read the file then add tests.",
+        })];
+        assert!(plan_mode_missed_exit_reminder(&messages).is_some());
+    }
+
+    #[test]
+    fn plan_nudge_skipped_when_assistant_called_exit_plan_mode() {
+        // The model already submitted the plan via the tool — no
+        // need to nag.
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "Submitting the plan for approval.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "exit_plan_mode",
+                        "arguments": "{\"plan\":\"1. step\"}"
+                    }
+                }
+            ]
+        })];
+        assert!(plan_mode_missed_exit_reminder(&messages).is_none());
+    }
+
+    #[test]
+    fn plan_nudge_skipped_for_short_analytical_answer() {
+        // A one-paragraph answer is not plan-shaped and must not
+        // trigger the nudge — false positives spam the model.
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "The auth module lives in `src/auth.rs`; it uses bcrypt.",
+        })];
+        assert!(plan_mode_missed_exit_reminder(&messages).is_none());
+    }
+
+    #[test]
+    fn plan_nudge_handles_openai_content_array_shape() {
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Plan:"},
+                {"type": "text", "text": "1. read\n2. test\n3. ship"},
+            ]
+        })];
+        assert!(plan_mode_missed_exit_reminder(&messages).is_some());
+    }
+
+    #[test]
+    fn plan_nudge_skipped_when_no_assistant_message_yet() {
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "Investigate the auth module"
+        })];
+        assert!(plan_mode_missed_exit_reminder(&messages).is_none());
     }
 }

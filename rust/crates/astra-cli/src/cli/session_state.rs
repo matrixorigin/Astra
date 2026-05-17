@@ -388,6 +388,12 @@ pub(crate) struct SessionState {
     pub tui_approval_request_tx: Option<crate::chat_stream::ApprovalRequestTx>,
     /// When set, ask_user requests are rendered by the native TUI overlay.
     pub tui_ask_user_request_tx: Option<crate::chat_stream::AskUserRequestTx>,
+    /// When set, `exit_plan_mode` surfaces its 4-way plan-review
+    /// overlay through the native TUI instead of headless / inquire
+    /// prompts. Independent of `tui_ask_user_request_tx` because the
+    /// plan-review overlay renders a markdown body, not the
+    /// question/option layout `ask_user` expects.
+    pub tui_plan_review_request_tx: Option<crate::chat_stream::PlanReviewRequestTx>,
 
     /// Notifications from background tasks (completed/failed/stalled)
     /// queued for injection into the model's next turn context.
@@ -570,6 +576,7 @@ impl Default for SessionState {
             tui_cancel_token: None,
             tui_approval_request_tx: None,
             tui_ask_user_request_tx: None,
+            tui_plan_review_request_tx: None,
             pending_bg_notifications: Vec::new(),
             turns_since_task_use: 0,
             turns_since_task_reminder: 0,

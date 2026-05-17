@@ -144,21 +144,6 @@ fn deny_mode_renders_red_chip() {
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Red));
 }
 
-#[test]
-fn authoring_plan_mode_renders_separate_chip() {
-    let c = StatusContext {
-        plan_mode_active: true,
-        ..ctx()
-    };
-    let s = StatusLine::from_context(&c);
-    let chip = s
-        .left
-        .iter()
-        .find(|seg| seg.text.contains("📋plan on"))
-        .expect("plan on chip");
-    assert_eq!(chip.style.fg, Some(ratatui::style::Color::Magenta));
-}
-
 // ─── Right-side segments: model · dir · tokens · cost · branch ────
 
 #[test]

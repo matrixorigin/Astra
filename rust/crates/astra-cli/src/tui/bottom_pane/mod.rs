@@ -11,6 +11,7 @@ pub(crate) mod info_view;
 pub(crate) mod list_selection_view;
 pub(crate) mod login_view;
 pub(crate) mod paste_burst;
+pub(crate) mod plan_review_view;
 pub(crate) mod session_picker_view;
 pub(crate) mod skill_popup;
 pub(crate) mod table_view;
@@ -199,6 +200,22 @@ impl BottomPane {
     ) {
         self.view_stack
             .push(Box::new(AskUserView::new(prompt, response_tx)));
+    }
+
+    /// Surface the plan-review overlay used by `exit_plan_mode`.
+    /// Pushes a dedicated `PlanReviewView` onto the view stack — the
+    /// overlay self-resolves on submit/cancel and is popped via the
+    /// usual `is_complete()` cleanup path.
+    pub fn enqueue_plan_review(
+        &mut self,
+        plan_markdown: String,
+        response_tx: oneshot::Sender<crate::chat_stream::PlanReviewDecision>,
+    ) {
+        self.view_stack
+            .push(Box::new(plan_review_view::PlanReviewView::new(
+                plan_markdown,
+                response_tx,
+            )));
     }
 
     pub fn refresh_task_detail(

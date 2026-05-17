@@ -396,7 +396,6 @@ fn refresh_footer_from_state(
         .as_ref()
         .map(|sid| sid[..8.min(sid.len())].to_string());
     bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
-    bottom_pane.footer.plan_mode_active = state.plan_mode_active();
 }
 
 /// Replay a session's JSONL transcript into a fresh `ChatWidget`,
@@ -517,6 +516,9 @@ pub(crate) async fn run_tui_repl(
     let (ask_user_tx, mut ask_user_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::AskUserRequest>();
     state.tui_ask_user_request_tx = Some(ask_user_tx);
+    let (plan_review_tx, mut plan_review_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::PlanReviewRequest>();
+    state.tui_plan_review_request_tx = Some(plan_review_tx);
 
     // ── Enter TUI ───────────────────────────────────────────────────────
     let mut guard = TerminalGuard::init().map_err(|e| format!("TUI init failed: {e}"))?;
@@ -1817,6 +1819,22 @@ pub(crate) async fn run_tui_repl(
                                     let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                 }
                                                 }
+                                                Some(req) = plan_review_rx.recv() => {
+                                                    bottom_pane.enqueue_plan_review(req.plan_markdown, req.response_tx);
+                                                    frame_requester.schedule_frame();
+                                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                                    let frame = active_viewport(
+                                                        &chat_widget,
+                                                        &status_indicator,
+                                                        Some(&*task_board),
+                                                        board_expanded,
+                                                        board_user_pin,
+                                                        w,
+                                                        guard.terminal.size().map(|s| s.height).unwrap_or(24),
+                                                    );
+                                                    board_expanded = frame.resolved_board_expanded;
+                                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                                }
                                                 _ = &mut itick => {
                                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                                     let frame = active_viewport(
@@ -2499,6 +2517,18 @@ pub(crate) async fn run_tui_repl(
                 }
             }
             _ = &mut tick => {
+                // Re-derive permission-mode chip from live state so
+                // mode pivots driven by the agentic loop (e.g. the
+                // `exit_plan_mode` overlay handing the next turn back
+                // to Auto) reach the status line within one tick
+                // instead of waiting for the next turn boundary that
+                // happens to call `refresh_footer_from_state`. Cheap:
+                // a string format and an Option<u64> compare per 50ms.
+                let live_mode = format!("{}", state.perm_manager.mode());
+                if bottom_pane.footer.permission_mode.as_deref() != Some(live_mode.as_str()) {
+                    bottom_pane.footer.permission_mode = Some(live_mode);
+                    frame_requester.schedule_frame();
+                }
                 // Pulse the chat-widget scrollback so if any async
                 // event was handled since the last draw the new
                 // cells land promptly instead of waiting for the
