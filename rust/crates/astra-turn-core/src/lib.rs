@@ -216,6 +216,7 @@ pub mod agentic_prepare_payload;
 pub mod hallucination_tripwire;
 pub mod routing_engine;
 pub mod tool_categories;
+pub mod tool_workaround;
 pub mod tool_registry_plugin;
 pub mod tool_registry_selection_edge_hints;
 pub mod turn_guard;
