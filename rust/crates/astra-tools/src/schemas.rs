@@ -629,6 +629,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
         - **Background**: pass `run_in_background: true` to return immediately with `{agent_id}`. Use this for fire-and-forget or long-running work you don't need to await; follow up with `get_result` later. Durable-task store persists the run across session death so it survives `astra` restarts.\n\n\
         ## Parallel sub-agent fan-out\n\
         To run N sub-agents in parallel (e.g. multi-angle code review), emit N `agent` tool calls **in a single assistant message**, each with `action='spawn'` and `run_in_background: true`. They run concurrently. After all are spawned, call `agent(action='get_result', agent_id=...)` for each one — `get_result` blocks until that child finishes. This is the ONLY way to fan out parallel agents; do not use `action='delegate'` (removed: it had no execution backend).\n\
+        For plan lifecycle, call `enter_plan_mode` / `exit_plan_mode` directly. Do NOT wrap them inside `agent(action='run_chain', ...)`.\n\
         Do NOT pass an `agents:[...]` payload and do NOT wrap spawn arguments under a `spawn` field. Each child must be its own `agent(...)` tool call.",
                 "parameters": {
                     "type": "object",
@@ -770,25 +771,26 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task",
-                "description": "Durable session task list. Use this tool proactively to track multi-step coding work and show progress in the task board.\n\
+                "description": "Durable task list. Use this tool proactively for multi-step work and progress.\n\
         \n\
-        Actions: create, update, list, get, stop, list_user, adopt, archive. Checklist only — use `agent_job` for background shell or sub-agent work.\n\
+        Actions: create, update, list, get, stop, list_user, adopt, archive. Checklist only — use `agent_job` for background shell/sub-agent work.\n\
         \n\
         ## When to Use\n\
         - 3 or more distinct outcomes, files, phases, or deliverables.\n\
-        - Approved plan execution or delegated/background work that still needs visible ownership.\n\
-        - Scope expands mid-flight and the user should see the new work.\n\
+        - Approved plan execution or delegated/background work.\n\
+        - Scope expands mid-flight.\n\
         \n\
         When tracking is useful:\n\
-        1. Create one task per meaningful outcome or phase.\n\
-        2. Mark the first actionable task as `in_progress` BEFORE beginning work.\n\
-        3. Keep exactly ONE task as `in_progress` at a time.\n\
-        4. Mark tasks completed immediately; on failure set `failed` with `error_message`.\n\
+        1. Create one task per concrete outcome or phase — NOT one umbrella task for the whole request.\n\
+        2. For broad work, split into 3-7 leaf tasks sized to one artifact, API surface, or validation step.\n\
+        3. Mark the first actionable task as `in_progress` BEFORE beginning work.\n\
+        4. Keep exactly ONE task as `in_progress` at a time.\n\
+        5. Mark tasks completed immediately; on failure set `failed` with `error_message`.\n\
         \n\
         ## When NOT to Use\n\
-        - Single edit / single command / single answer.\n\
+        - Single edit / single command / answer.\n\
         - Pure information request.\n\
-        - Trivial change.\n\
+        - Trivial work.\n\
         \n\
         ## Field Conventions\n\
         - `title`: specific outcome.\n\
@@ -797,13 +799,11 @@ fn all_tool_schemas_core() -> Vec<Value> {
         - `subtasks`: optional nested steps; use `depends_on` for order.\n\
         - `metadata`: free-form state; on update, `{key: null}` deletes that key.\n\
         \n\
-        ## Cross-Session Awareness\n\
-        - `list_user` shows the user's tasks across sessions.\n\
-        - `adopt` copies a task from another session into the current one.\n\
+        - `list_user` shows cross-session tasks; `adopt` copies one into the current session.\n\
         \n\
         <example>\n\
-        User: Add dark mode toggle and run tests.\n\
-        Assistant: Create one task per outcome, then mark the first task `in_progress` BEFORE beginning work.\n\
+        User: Build an employee reimbursement system.\n\
+        Assistant: Create separate tasks like `scaffold backend`, `implement expense API`, `build frontend flows`, `verify startup`; do NOT create one umbrella task `build reimbursement system`. Mark the first task `in_progress` BEFORE beginning work.\n\
         </example>",
                 "parameters": {
                     "type": "object",
@@ -969,8 +969,9 @@ fn all_tool_schemas_core() -> Vec<Value> {
         When you enter plan mode:\n\
         1. Edits are blocked by design.\n\
         2. Explore with read tools and identify existing patterns to follow.\n\
-        3. Consider trade-offs, choose an approach, and write a concrete plan.\n\
-        4. Call `exit_plan_mode(plan='<markdown>', approved=true)` to surface the plan for user approval. Approval unlocks edits and seeds executable plan items.\n\
+        3. Produce executable leaf steps: each step should map to one concrete artifact, API surface, or validation target.\n\
+        4. Avoid umbrella steps like \"build the whole system\" when code, API, UI, and verification are separate outcomes.\n\
+        5. Call `exit_plan_mode(plan='<markdown>', approved=true)` to surface the plan for user approval. Approval unlocks edits and seeds executable plan items.\n\
         \n\
         ## When NOT to Use This Tool\n\
         Do not enter plan mode when normal execution is clearer:\n\
@@ -1007,6 +1008,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
         ## Important\n\
         - Do NOT call this tool to ask 'is the plan ready?' — that's exactly what THIS tool does. It inherently requests approval.\n\
         - Pass the FULL plan as a single markdown string in `plan`. The user sees this verbatim.\n\
+        - Prefer executable leaf steps over umbrella phases so approval seeds actionable tasks instead of one coarse catch-all item.\n\
         - Only call this when the plan is concrete and unambiguous. If you have unresolved decisions, use `ask_user` first.",
                 "parameters": {
                     "type": "object",
@@ -1130,6 +1132,10 @@ mod tests {
             desc.contains("agents"),
             "agent description must name the unsupported `agents` payload so the model stops retrying it"
         );
+        assert!(
+            desc.contains("exit_plan_mode") && desc.contains("run_chain"),
+            "agent description should steer plan lifecycle away from run_chain"
+        );
     }
 
     #[test]
@@ -1195,6 +1201,22 @@ mod tests {
         assert!(
             task_tokens <= 1100,
             "task schema regressed to {task_tokens} tokens; keep it compact"
+        );
+    }
+
+    #[test]
+    fn task_schema_discourages_single_umbrella_task() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let task = find_schema(&schemas, "task").expect("task schema must exist");
+        let desc = task["function"]["description"].as_str().unwrap();
+
+        assert!(
+            desc.contains("umbrella task"),
+            "task schema should explicitly forbid one giant catch-all task: {desc}"
+        );
+        assert!(
+            desc.contains("3-7 leaf tasks") || desc.contains("separate tasks"),
+            "task schema should steer complex work toward multiple actionable tasks: {desc}"
         );
     }
 

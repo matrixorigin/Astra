@@ -1050,7 +1050,6 @@ pub(crate) async fn run_tui_repl(
                                     if crate::plan_lifecycle::looks_like_pending_local_plan_entry(
                                         &state,
                                     ) {
-                                        let before = capture_plan_mode_ui_snapshot(&state);
                                         let Some(token) =
                                             crate::plan_lifecycle::fresh_token_for_plan(api, profile)
                                                 .await
@@ -1075,12 +1074,10 @@ pub(crate) async fn run_tui_repl(
                                         .await
                                         {
                                             Ok(_) => {
-                                                commit_plan_transition_notice(
-                                                    &mut chat_widget,
-                                                    &before,
-                                                    &state,
-                                                    false,
-                                                );
+                                                // After bare `/plan`, the first plain message is
+                                                // the user's real planning goal. Don't insert a
+                                                // synthetic `Plan goal set ...` system line above
+                                                // the actual planning/model output.
                                                 if let Some(ref sid) = state.session_id
                                                     && chat_widget.session_id() != sid
                                                 {
@@ -2982,6 +2979,24 @@ mod tests {
             arm.contains("crate::plan_lifecycle::looks_like_pending_local_plan_entry(")
                 && arm.contains("crate::plan_lifecycle::enter_remote_plan_mode("),
             "the first plain message after bare /plan should bind remote plan mode and continue as chat"
+        );
+    }
+
+    #[test]
+    fn pending_local_plan_goal_binding_does_not_emit_synthetic_notice() {
+        let source = include_str!("event_loop.rs");
+        let branch_start = source
+            .find("if crate::plan_lifecycle::looks_like_pending_local_plan_entry(")
+            .expect("pending local plan entry branch must exist");
+        let branch_end = source[branch_start..]
+            .find("} else {")
+            .map(|offset| branch_start + offset)
+            .expect("pending local plan entry branch must end before the generic else");
+        let branch = &source[branch_start..branch_end];
+
+        assert!(
+            !branch.contains("commit_plan_transition_notice("),
+            "the first real goal after bare /plan should flow directly to model output"
         );
     }
 

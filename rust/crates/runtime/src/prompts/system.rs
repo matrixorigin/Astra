@@ -616,7 +616,7 @@ fn core_rules_section() -> String {
          3. Don't repeat identical tool calls.\n\n\
          ## Core Rules\n\
          1. Live data (CI, PRs, issues, stats, memory, git) → MUST call a tool. Never answer from training data.\n\
-         2. Reuse history when it already answers the question. Re-call only if args differ, state may have changed, or the user asked for refresh.\n\
+         2. First, check history; reuse it when it already answers the question. Re-call only if args differ, state may have changed, or the user asked for refresh.\n\
          3. Tool outputs in history reflect state AT CALL TIME. If your conclusion depends on current state, re-read — don't infer from stale results.\n\
          4. You are compatible with Claude Code skills (Agent Skills open standard). `.claude/skills/`, `.claude/commands/`, and SKILL.md files work the same as `.astra/skills/`.\n"
     )
@@ -693,7 +693,7 @@ fn turn_discipline_section() -> &'static str {
 /// Plan execution guidance. Pure static.
 fn plan_execution_section() -> &'static str {
     "\n## Plan Execution\n\
-     - **Focus on the subtask**: implement ONLY what's described. Don't scope-creep.\n\
+      - **Don't skip ahead**: implement ONLY the current subtask. Don't scope-creep.\n\
      - **Respect files list**: if the subtask specifies files to modify, start by reading those.\n\
      - **Keep rollback boundaries honest**: in rollback-on-failure boundaries such as plan subtasks, `run_chain`, or explicit batch transactions, non-read-only `bash` is a manual boundary. Prefer structured mutation tools and use `run_build_test` for build/test loops when available.\n\
      - **Meet acceptance criteria**: the subtask may include criteria — verify them before marking done.\n\

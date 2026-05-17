@@ -5,6 +5,22 @@ fn pending_plan_state() -> plan::PlanModeState {
     plan::PlanModeState::new(String::new())
 }
 
+pub(crate) fn enter_local_plan_mode(state: &mut SessionState) {
+    state.cloud_plan_mirror = Some(pending_plan_state());
+    state.plan_mode_sync_error = None;
+    state
+        .perm_manager
+        .set_mode(crate::permission_manager::PermissionMode::Plan);
+}
+
+pub(crate) fn exit_local_plan_mode(state: &mut SessionState) {
+    state.cloud_plan_mirror = None;
+    state.plan_mode_sync_error = None;
+    state
+        .perm_manager
+        .set_mode(crate::permission_manager::PermissionMode::Auto);
+}
+
 async fn resolve_plan_token(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
@@ -27,8 +43,7 @@ pub(super) async fn handle_plan_command(
 
     if plan_request.is_empty() && crate::plan_lifecycle::looks_like_pending_local_plan_entry(state)
     {
-        state.cloud_plan_mirror = None;
-        state.plan_mode_sync_error = None;
+        exit_local_plan_mode(state);
         eprintln!("  {} Exited plan mode.", theme::icon_ok());
         return Ok(());
     }
@@ -49,6 +64,9 @@ pub(super) async fn handle_plan_command(
         } else {
             eprintln!("  {} Exited plan mode.", theme::icon_ok());
         }
+        state
+            .perm_manager
+            .set_mode(crate::permission_manager::PermissionMode::Auto);
         return Ok(());
     }
 
@@ -58,8 +76,7 @@ pub(super) async fn handle_plan_command(
     };
 
     if plan_request.is_empty() {
-        state.cloud_plan_mirror = Some(pending_plan_state());
-        state.plan_mode_sync_error = None;
+        enter_local_plan_mode(state);
         eprintln!();
         eprintln!(
             "  {} Plan mode active. Describe your goal.",
@@ -70,6 +87,9 @@ pub(super) async fn handle_plan_command(
 
     crate::plan_lifecycle::enter_remote_plan_mode(api, profile, &token, state, plan_request)
         .await?;
+    state
+        .perm_manager
+        .set_mode(crate::permission_manager::PermissionMode::Plan);
     eprintln!(
         "  {} Plan mode active. Goal: {}",
         theme::icon_ok(),
@@ -103,6 +123,10 @@ mod tests {
         assert!(crate::plan_lifecycle::looks_like_pending_local_plan_entry(
             &state
         ));
+        assert!(
+            state.plan_mode_active(),
+            "bare /plan should switch UI into plan mode"
+        );
     }
 
     #[tokio::test]
@@ -110,12 +134,19 @@ mod tests {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         let mut state = SessionState::default();
         state.cloud_plan_mirror = Some(plan::PlanModeState::new(String::new()));
+        state
+            .perm_manager
+            .set_mode(crate::permission_manager::PermissionMode::Plan);
 
         handle_plan_command("", &api, None, &mut state, None)
             .await
             .unwrap();
 
         assert!(state.cloud_plan_mirror.is_none());
+        assert!(
+            !state.plan_mode_active(),
+            "exiting bare /plan should restore normal-chat mode"
+        );
     }
 
     #[tokio::test]
@@ -151,12 +182,19 @@ mod tests {
         let mut state = SessionState::default();
         state.session_id = Some("sess-1".to_string());
         state.cloud_plan_mirror = Some(plan::PlanModeState::new("Ship auth".to_string()));
+        state
+            .perm_manager
+            .set_mode(crate::permission_manager::PermissionMode::Plan);
 
         handle_plan_command("", &api, None, &mut state, Some("token"))
             .await
             .unwrap();
 
         assert!(state.cloud_plan_mirror.is_none());
+        assert!(
+            !state.plan_mode_active(),
+            "remote /plan exit should restore normal-chat mode"
+        );
     }
 
     #[test]

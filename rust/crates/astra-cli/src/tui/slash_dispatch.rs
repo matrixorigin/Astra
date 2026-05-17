@@ -155,6 +155,47 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
         }
 
+        "/plan" => {
+            let trimmed = args.trim();
+            if !trimmed.is_empty() {
+                return SlashResult::Fallback;
+            }
+
+            if crate::plan_lifecycle::looks_like_pending_local_plan_entry(ctx.state) {
+                crate::slash_plan::exit_local_plan_mode(ctx.state);
+                return SlashResult::Handled;
+            }
+
+            if ctx.state.cloud_plan_mirror.is_some() {
+                let Some(token) =
+                    crate::plan_lifecycle::fresh_token_for_plan(ctx.api, ctx.profile).await
+                else {
+                    ctx.show_error("Not logged in. Use /login.".into());
+                    return SlashResult::Handled;
+                };
+                if let Err(error) =
+                    crate::plan_lifecycle::exit_remote_plan_mode(ctx.api, &token, ctx.state, true)
+                        .await
+                {
+                    ctx.show_error(error);
+                    return SlashResult::Handled;
+                }
+                ctx.state
+                    .perm_manager
+                    .set_mode(crate::permission_manager::PermissionMode::Auto);
+                return SlashResult::Handled;
+            }
+
+            let Some(_token) =
+                crate::plan_lifecycle::fresh_token_for_plan(ctx.api, ctx.profile).await
+            else {
+                ctx.show_error("Not logged in. Use /login.".into());
+                return SlashResult::Handled;
+            };
+            crate::slash_plan::enter_local_plan_mode(ctx.state);
+            SlashResult::Handled
+        }
+
         // ── Stats ───────────────────────────────────────────────────
         "/stats" => {
             if !args.is_empty() {
