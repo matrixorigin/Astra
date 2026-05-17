@@ -1097,10 +1097,6 @@ pub(super) struct BackgroundPlanContext {
     #[cfg(feature = "harness")]
     pub harness_trace: Option<std::sync::Arc<std::sync::RwLock<astra_harness::SessionTrace>>>,
 
-    // ─── Cloud Integration ──────────────────────────────────────────────
-    pub ingestion_user_id: Option<String>,
-    pub matrix_runtime: Option<Arc<astra_runtime::MatrixCloudRuntime>>,
-
     pub turn: u32,
 
     /// Local tracking for LLM turn failures (separate from durable verification retries).
@@ -1155,7 +1151,7 @@ async fn cleanup_plan_root_mailbox(ctx: &mut BackgroundPlanContext) {
 /// 4. Sends `PlanUpdate::SubtaskCompleted` or `SubtaskRetry`
 /// 5. Checks command channel for Pause/Cancel between subtasks
 ///
-/// Emits journal events and cloud ingestion events for each subtask transition.
+/// Emits journal events for each subtask transition.
 /// On completion, sends `PlanUpdate::PlanCompleted`. On error, sends
 /// `PlanUpdate::PlanError`.
 async fn plan_executor_task(
@@ -1169,17 +1165,9 @@ async fn plan_executor_task(
     let mut subtask_durations: Vec<Duration> = Vec::new();
     let sink = ChannelSink::new(update_tx.clone());
 
-    // Helper: emit a journal event via the channel (main CLI thread writes it)
-    // and enqueue cloud ingestion event.
+    // Helper: emit a journal event via the channel (main CLI thread writes it).
     let emit_event = |tx: &tokio::sync::mpsc::UnboundedSender<PlanUpdate>,
-                      ctx: &BackgroundPlanContext,
                       event: session_journal::JournalEvent| {
-        // Cloud ingestion
-        let user_id = ctx.ingestion_user_id.as_deref().unwrap_or("anonymous");
-        if let Some(mc) = ctx.matrix_runtime.as_ref() {
-            mc.enqueue_journal_events(user_id, &event);
-        }
-        // Forward to the main CLI thread for journal file write
         let _ = tx.send(PlanUpdate::JournalEvent(Box::new(event)));
     };
 
@@ -1196,7 +1184,7 @@ async fn plan_executor_task(
             total,
             0,
         );
-        emit_event(&update_tx, &ctx, event);
+        emit_event(&update_tx, event);
     }
     // Issue #326 P5b: plan_executor is a headless sub-run; project
     // allow rules from .kiro/permissions.json must NOT escalate the
@@ -1285,7 +1273,7 @@ async fn plan_executor_task(
                     total,
                     total,
                 );
-                emit_event(&update_tx, &ctx, event);
+                emit_event(&update_tx, event);
 
                 // Return durable state so re-runs can reuse the contract
                 if let Some(durable) = ctx.durable_task_state.take() {
@@ -1358,7 +1346,7 @@ async fn plan_executor_task(
                             .count(),
                         ctx.plan.subtasks.len(),
                     );
-                    emit_event(&update_tx, &ctx, event);
+                    emit_event(&update_tx, event);
                     eprintln!("  ℹ  {healed_msg}");
                     // After healing, don't pause — jump back to re-analyse.
                     continue;
@@ -1583,7 +1571,7 @@ async fn plan_executor_task(
                     for evt in &result.turn_observability_events {
                         let mut e = evt.clone();
                         annotate_plan_subtask_event(&mut e, next_id);
-                        emit_event(&update_tx, &ctx, e);
+                        emit_event(&update_tx, e);
                     }
 
                     // Write a turn event so plan executor turns appear in digest.
@@ -1638,7 +1626,7 @@ async fn plan_executor_task(
                             super::cli_utils::git_snapshot(git_root.as_deref());
                         turn_event = turn_event.with_git_snapshot(git_head, git_branch);
                         annotate_plan_subtask_event(&mut turn_event, next_id);
-                        emit_event(&update_tx, &ctx, turn_event);
+                        emit_event(&update_tx, turn_event);
                     }
 
                     // Send turn result back to the plan monitor for token accounting
@@ -1675,7 +1663,7 @@ async fn plan_executor_task(
                             total,
                             done,
                         );
-                        emit_event(&update_tx, &ctx, event);
+                        emit_event(&update_tx, event);
                     }
 
                     // Update recent_tools from result
@@ -1773,7 +1761,7 @@ async fn plan_executor_task(
                                 total,
                                 done,
                             );
-                            emit_event(&update_tx, &ctx, event);
+                            emit_event(&update_tx, event);
                             // Mirror the attempt to cloud plan_step_runs when
                             // we have a plan_id + session_id + request_id.
                             // Fire-and-forget — executor keeps running on failure.
@@ -1867,7 +1855,7 @@ async fn plan_executor_task(
                                 false,
                                 &serde_json::json!({"retries_exhausted": durable_bridge::subtask_retries_exhausted(durable, next_id)}),
                             );
-                            emit_event(&update_tx, &ctx, event);
+                            emit_event(&update_tx, event);
                         } else {
                             let (failure_status, retries_exhausted, _) =
                                 failed_verification_status(None, next_id, browser_verification_gap);
@@ -1911,7 +1899,7 @@ async fn plan_executor_task(
                         &failure.partial,
                     );
                     annotate_plan_subtask_event(&mut event, next_id);
-                    emit_event(&update_tx, &ctx, event);
+                    emit_event(&update_tx, event);
 
                     // Bail immediately on authentication/credential errors — retrying is pointless.
                     if is_credential_error(&failure.error) {
@@ -2104,8 +2092,6 @@ mod tests {
             harness_sink: None,
             #[cfg(feature = "harness")]
             harness_trace: None,
-            ingestion_user_id: None,
-            matrix_runtime: None,
             turn: 0,
             turn_retry_counts: std::collections::HashMap::new(),
             current_subtask_strategy_hint: None,

@@ -270,14 +270,14 @@ Auto-tuning status and history.
 | `reset` | Reset tuning state |
 
 ### `/sync [subcommand]`
-Cloud sync status and operations.
+Cloud sync status hint. Sync orchestration is server-owned; the CLI no longer opens MatrixOne connections or forces sync domains directly.
 
 | Subcommand | Description |
 |------------|-------------|
-| (none) | Show sync status |
-| `log` | Recent sync events |
-| `push` | Force push to cloud |
-| `pull` | Pull from cloud |
+| (none) | Explain server-owned sync status |
+| `log` | Point to server/API diagnostics |
+| `push` | Deprecated; no direct CLI DB operation |
+| `pull` | Deprecated; no direct CLI DB operation |
 
 ### `/context`
 Show context window and token budget summary.

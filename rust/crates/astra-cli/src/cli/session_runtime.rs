@@ -106,7 +106,7 @@ pub(crate) fn install_task_service(
 }
 
 /// Replace the task manager's store (used once at startup when we upgrade
-/// from the synchronous in-memory fallback to a MatrixOne-backed store).
+/// from the synchronous in-memory fallback to an API-backed durable store).
 /// The new manager inherits the current session_id.
 pub(crate) fn install_task_store(
     state: &mut SessionState,
@@ -129,7 +129,7 @@ pub(crate) fn install_task_store(
 ///
 /// `profile` is forwarded to the access-token resolver so a logged-in
 /// CLI invocation gets bearer auth.
-pub(crate) async fn resolve_matrixone_task_runtime(
+pub(crate) async fn resolve_cloud_task_runtime(
     profile: Option<&str>,
 ) -> Result<
     (
@@ -599,7 +599,7 @@ pub(crate) fn initialize_session_state(
     }
 
     // Initialize a durable task service synchronously; startup paths that can
-    // await upgrade this to MatrixOne via `resolve_task_service`.
+    // Startup may upgrade this to an API-backed store via `resolve_task_store`.
     install_task_service(&mut state, local_task_service());
 
     // Initialize observability hub for M1-M6 integration
@@ -1002,7 +1002,7 @@ fn banner_session_display(state: &SessionState) -> String {
     }
 }
 
-pub(super) fn current_access_token(profile: Option<&str>) -> Option<String> {
+pub(crate) fn current_access_token(profile: Option<&str>) -> Option<String> {
     // Gateway-injected env tokens still win, but only while locally usable.
     if let Some(token) = active_env_access_token(chrono::Utc::now().timestamp()) {
         return Some(token);

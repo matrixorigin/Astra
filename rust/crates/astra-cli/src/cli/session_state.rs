@@ -160,8 +160,6 @@ pub(crate) struct SessionState {
     pub perm_manager: PermissionManager,
     /// User ID for event ingestion attribution.
     pub ingestion_user_id: Option<String>,
-    /// Matrix pool + journal ingestion + sync orchestrator (None if MatrixOne unavailable).
-    pub matrix_runtime: Option<std::sync::Arc<astra_runtime::MatrixCloudRuntime>>,
     /// Local task service for /task commands.
     pub task_service: Option<std::sync::Arc<dyn astra_services::TaskService>>,
     /// Cross-session tool health data for error budget persistence.
@@ -235,7 +233,7 @@ pub(crate) struct SessionState {
         Option<std::sync::Arc<astra_runtime::server::delegation_engine::DelegationEngine>>,
     /// Team coordination registry for multi-agent team patterns.
     pub team_registry: slash_team::TeamRegistry,
-    /// Shared team persistence service (in-memory or MatrixOne-backed).
+    /// Shared team persistence service (in-memory or API-backed).
     /// Used for execution history and snapshot persistence.
     pub team_store: std::sync::Arc<dyn astra_services::team_persistence::TeamPersistenceService>,
     /// Handle for communicating with the plan executor.
@@ -293,7 +291,7 @@ pub(crate) struct SessionState {
     pub drift_original_query: Option<String>,
 
     /// Cross-session lessons loaded once at first-turn bootstrap. Empty
-    /// until a turn runs with `matrix_runtime` + `ingestion_user_id` set.
+    /// until a turn loads lessons for the current session.
     /// Passed through to every turn's ToolExecutor so the LLM sees prior
     /// session's advice on every SelfModel snapshot.
     pub session_lessons: Vec<astra_runtime::self_model::LessonHint>,
@@ -310,11 +308,9 @@ pub(crate) struct SessionState {
     pub memory_model_params: Option<astra_runtime::memory_relevance::LlmConnParams>,
     /// Background memory extraction agent.
     pub memory_extractor: super::memory_extraction::MemoryExtractor,
-    /// Background session-memory.md extraction coordinator. Cloned
-    /// from `matrix_runtime` at REPL startup once the encryptor is
-    /// installed; `None` means no cloud runtime is attached (local-only
-    /// CLI paths) and extraction runs silently with no LLM and no
-    /// events.
+    /// Background session-memory.md extraction coordinator. `None` means
+    /// the current CLI path has no API-backed extraction service, so
+    /// extraction stays local-only with no LLM/events.
     pub session_memory_extractor:
         Option<std::sync::Arc<astra_runtime::session_memory::MemoryExtractionService>>,
 
@@ -493,7 +489,6 @@ impl Default for SessionState {
                 &std::env::current_dir().unwrap_or_default(),
             ),
             ingestion_user_id: None,
-            matrix_runtime: None,
             task_service: None,
             tool_health_entries: Vec::new(),
             synced_tool_health_entries: Vec::new(),

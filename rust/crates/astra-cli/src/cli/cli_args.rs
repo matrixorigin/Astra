@@ -449,10 +449,10 @@ pub(crate) enum TaskSubcommand {
     Status(TaskQueryArgs),
     /// Run a headless task with the agent
     Run(TaskRunArgs),
-    /// Queue a MatrixOne-backed cloud task without executing it locally (cloud-agent ops)
+    /// Queue an API-backed cloud task without executing it locally (cloud-agent ops)
     #[command(hide = true)]
     Queue(TaskQueueArgs),
-    /// Claim and execute queued MatrixOne-backed cloud tasks (cloud-agent ops)
+    /// Claim and execute queued API-backed cloud tasks (cloud-agent ops)
     #[command(hide = true)]
     Worker(TaskWorkerArgs),
     /// Show the result of a task run
@@ -1268,7 +1268,7 @@ pub(crate) enum ConfigVersionCmd {
     Diff(ConfigVersionDiffArgs),
     /// Print the id of the config the current process would run under.
     Current,
-    /// Pull cloud-mirrored versions into the local store.
+    /// Deprecated: config version pull is server-owned.
     Pull(ConfigVersionPullArgs),
 }
 

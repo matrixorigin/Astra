@@ -241,11 +241,7 @@ pub(super) async fn finalize_session(state: &mut SessionState) {
     if let (Some(hub), Some(session_id)) = (&state.observability_hub, &state.session_id) {
         let _ = hub.end_session(session_id);
     }
-    // 4. Graceful ingestion shutdown: await worker flush
-    if let Some(mc) = state.matrix_runtime.as_ref() {
-        mc.shutdown_ingestion_and_wait().await;
-    }
-    // 5. Await Memoria maintenance (bounded 5s so we don't hang on exit)
+    // 4. Await Memoria maintenance (bounded 5s so we don't hang on exit)
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         let _ = gov_handle.await;
         let _ = con_handle.await;
@@ -254,7 +250,7 @@ pub(super) async fn finalize_session(state: &mut SessionState) {
     if let Some(sid) = state.session_id.as_deref() {
         astra_tools::memoria::MemoriaClient::reset_session_process_state(sid);
     }
-    // 6. Clear panic guard
+    // 5. Clear panic guard
     clear_panic_guard();
 }
 

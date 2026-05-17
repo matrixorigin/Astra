@@ -23,7 +23,6 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use astra_core::SharedPool;
 use astra_runtime::{prompts, tool_registry};
 use astra_services::session_journal;
 use clap::Parser;
@@ -93,6 +92,8 @@ mod file_history;
 mod followup_suggestion;
 #[path = "cli/http_task_service.rs"]
 mod http_task_service;
+#[path = "cli/http_team_store.rs"]
+mod http_team_store;
 #[path = "cli/idle_agent_messages.rs"]
 mod idle_agent_messages;
 #[path = "cli/journal_diff.rs"]
@@ -1694,8 +1695,6 @@ total_tokens_out: 500
     async fn slash_health_offline_shows_cloud_section() {
         let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
         let mut state = SessionState::default();
-        // No matrix runtime — should show "Offline" in cloud section
-        assert!(state.matrix_runtime.is_none());
         let exit = handle_slash_command("/health", &api, None, &mut state, None)
             .await
             .unwrap();

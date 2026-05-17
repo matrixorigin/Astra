@@ -1399,7 +1399,7 @@ pub(super) async fn handle_team_command(
 
         "history" => {
             // /team history <team>
-            // Currently reads from in-memory TeamRegistry. When MatrixOne backend is active,
+            // Currently reads from in-memory TeamRegistry. When API-backed persistence is active,
             // state.team_store.list_executions() becomes the primary source.
             let name = sub_arg.trim();
             if name.is_empty() {

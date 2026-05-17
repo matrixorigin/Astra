@@ -452,6 +452,11 @@ fn parse_aggregation(s: &str) -> AggregationStrategy {
 pub trait TeamPersistenceService: Send + Sync {
     async fn save_team(&self, team: &TeamDefinition) -> Result<(), String>;
     async fn load_team(&self, user_id: &str, name: &str) -> Result<Option<TeamDefinition>, String>;
+    async fn load_team_by_id(
+        &self,
+        user_id: &str,
+        team_id: &str,
+    ) -> Result<Option<TeamDefinition>, String>;
     async fn list_teams(&self, user_id: &str) -> Result<Vec<TeamDefinition>, String>;
     async fn delete_team(&self, user_id: &str, name: &str) -> Result<bool, String>;
 
@@ -572,6 +577,18 @@ impl TeamPersistenceService for InMemoryTeamStore {
         let key = format!("{user_id}:{name}");
         let map = self.teams.read().map_err(|e| e.to_string())?;
         Ok(map.get(&key).cloned())
+    }
+
+    async fn load_team_by_id(
+        &self,
+        user_id: &str,
+        team_id: &str,
+    ) -> Result<Option<TeamDefinition>, String> {
+        let map = self.teams.read().map_err(|e| e.to_string())?;
+        Ok(map
+            .values()
+            .find(|team| team.user_id == user_id && team.team_id == team_id)
+            .cloned())
     }
 
     async fn list_teams(&self, user_id: &str) -> Result<Vec<TeamDefinition>, String> {
@@ -851,6 +868,32 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| format!("team SELECT failed: {e}"))?;
+
+        match row {
+            None => Ok(None),
+            Some(row) => {
+                let team = row_to_team_definition(&row)?;
+                Ok(Some(team))
+            }
+        }
+    }
+
+    async fn load_team_by_id(
+        &self,
+        user_id: &str,
+        team_id: &str,
+    ) -> Result<Option<TeamDefinition>, String> {
+        let row = sqlx::query(
+            "SELECT team_id, user_id, name, description, coordination, \
+                    members_json, context_json, worktree_mode, \
+                    budget_json, max_parallel, created_at, updated_at \
+             FROM team_definitions WHERE user_id = ? AND team_id = ?",
+        )
+        .bind(user_id)
+        .bind(team_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("team SELECT by id failed: {e}"))?;
 
         match row {
             None => Ok(None),

@@ -80,8 +80,6 @@ fn take_plan_context(
         harness_sink: Some(state.harness_sink.clone()),
         #[cfg(feature = "harness")]
         harness_trace: Some(state.harness_trace.clone()),
-        ingestion_user_id: state.ingestion_user_id.clone(),
-        matrix_runtime: state.matrix_runtime.clone(),
         turn: state.turn,
         turn_retry_counts: std::collections::HashMap::new(),
         current_subtask_strategy_hint: None,
@@ -198,44 +196,24 @@ async fn ensure_durable_task_state(
             None
         };
 
-    let ingestion_sender = state
-        .matrix_runtime
-        .as_ref()
-        .and_then(|mc| mc.clone_ingestion_sender());
     // Judge runs server-side via server_proxy_judge (the server resolves the reasoning model
     // from admin_config + infra_llm_models). No local cloud judge.
     let cloud_judge: Option<std::sync::Arc<dyn astra_services::LlmJudge>> = None;
 
-    let lifecycle = if let Some(pool) = state
-        .matrix_runtime
+    let session_dir = state
+        .session_id
         .as_ref()
-        .map(|mc| mc.shared_pool().get().clone())
-    {
-        durable_bridge::create_cloud_lifecycle_full(
-            pool,
-            &work_dir,
-            ingestion_sender,
-            Some(session_id),
-            Some(user_id),
-            cloud_judge,
-            server_proxy_judge,
-        )
-    } else {
-        let session_dir = state
-            .session_id
-            .as_ref()
-            .map(|sid| astra_services::session_workspace::workspace_dir_for(sid))
-            .unwrap_or_else(|| work_dir.join(".mo-session"));
-        durable_bridge::create_local_lifecycle_full(
-            &session_dir,
-            &work_dir,
-            ingestion_sender,
-            Some(session_id),
-            Some(user_id),
-            cloud_judge,
-            server_proxy_judge,
-        )
-    };
+        .map(|sid| astra_services::session_workspace::workspace_dir_for(sid))
+        .unwrap_or_else(|| work_dir.join(".mo-session"));
+    let lifecycle = durable_bridge::create_local_lifecycle_full(
+        &session_dir,
+        &work_dir,
+        None,
+        Some(session_id),
+        Some(user_id),
+        cloud_judge,
+        server_proxy_judge,
+    );
 
     if let Some(contract) =
         durable_bridge::generate_contract(&lifecycle, plan, goal, user_id, session_id, &work_dir)

@@ -182,53 +182,11 @@ pub(crate) async fn complete_session_startup(
         state.synced_tool_health_entries = cross_session_health_entries;
     }
 
-    if let Ok(settings) = astra_runtime::matrix_settings_from_env().map_err(|e| {
-        eprintln!("[startup] cloud sync disabled: {e}. Set MATRIXONE_PASSWORD to enable.");
-        state.matrix_runtime = None;
-    }) {
-        state.matrix_runtime = match SharedPool::new(&settings).await {
-            Ok(pool) => {
-                let user_id = astra_core::cli_user_id();
-                let lease = std::sync::Arc::new(astra_services::TaskLeaseHoldCache::default());
-                let mut runtime = astra_runtime::MatrixCloudRuntime::attach(
-                    pool,
-                    profile.unwrap_or("default"),
-                    &user_id,
-                    lease,
-                );
-                if let Ok(enc) = astra_services::FernetTokenEncryptor::from_env() {
-                    runtime = runtime.with_encryptor(std::sync::Arc::new(enc));
-                }
-                Some(std::sync::Arc::new(runtime))
-            }
-            Err(e) => {
-                // Log the error so users know cloud sync won't work for this session.
-                // This is a common cause of missing checkpoint/event sync in diagnostics.
-                astra_core::agent_warn!(
-                    "matrix_pool",
-                    "Cloud sync disabled for this session: failed to connect to MatrixOne — {e}"
-                );
-                eprintln!(
-                    "  {} Cloud sync disabled: MatrixOne connection failed",
-                    theme::icon_warn()
-                );
-                None
-            }
-        };
-        if let Some(ref mc) = state.matrix_runtime {
-            let pool = mc.shared_pool().get().clone();
-            let user_id = astra_core::cli_user_id();
-            let mo_team_store = astra_services::team_persistence::MatrixOneTeamStore::new(pool);
-            if let Err(e) = mo_team_store.ensure_builtins(&user_id).await {
-                eprintln!("  {} team store builtins: {e}", theme::icon_warn());
-            }
-            state.team_store = std::sync::Arc::new(mo_team_store);
-            // Session-memory.md background extractor. Shares broker +
-            // ingestion with the rest of the runtime so events land in
-            // agent_events and the CLI can bridge UX signals.
-            state.session_memory_extractor = mc.clone_memory_extraction_service();
-        }
-    }
+    state.session_memory_extractor = None;
+    state.team_store = std::sync::Arc::new(crate::http_team_store::HttpTeamStore::new(
+        api.api_origin(),
+        profile,
+    ));
     tracer.phase("matrix_pool");
 
     state.unified_skill_registry = pipeline_modules.unified_skill_registry.clone();

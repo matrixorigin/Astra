@@ -1,7 +1,8 @@
 use astra_services::models::*;
+use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use astra_core::ErrorResponse;
+use astra_core::{ErrorResponse, error_response};
 use axum::{
     Json,
     extract::{Path, State},
@@ -66,6 +67,36 @@ pub async fn get_model_handler(
     let _user = state.auth_service.current_user(&headers).await?;
     let model = state.model_service.get_model(model_name).await?;
     Ok(Json(ModelResponse::from(model)))
+}
+
+pub async fn get_memory_model_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<MemoryModelResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let _user = state.auth_service.current_user(&headers).await?;
+    let matrixone = crate::matrix_cloud_runtime::matrix_settings_from_env().map_err(|e| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("MatrixOne configuration unavailable: {e}"),
+        )
+    })?;
+    let pool_ref = state.shared_pool.as_ref().map(|sp| sp.get());
+    let resolved = resolve_memory_model(&matrixone, &state.fernet_encryptor, pool_ref)
+        .await
+        .map_err(|e| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Memory model resolution failed: {e}"),
+            )
+        })?;
+    Ok(Json(MemoryModelResponse {
+        model_name: resolved.model_name,
+    }))
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryModelResponse {
+    pub model_name: String,
 }
 
 pub async fn update_model_handler(

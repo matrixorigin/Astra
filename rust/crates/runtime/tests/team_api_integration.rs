@@ -611,11 +611,17 @@ async fn scenario_execution_history_via_api() {
     let (s, body) = post(app.clone(), "/teams", user, fanout_research_payload()).await;
     assert_eq!(s, StatusCode::OK);
     let team_name = body["name"].as_str().unwrap();
+    let team_id = body["team_id"].as_str().unwrap();
 
     // No executions yet
     let (s, body) = get(app.clone(), &format!("/teams/{team_name}/executions"), user).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["executions"].as_array().unwrap().len(), 0);
+    assert_eq!(body["team_name"], team_name);
+
+    let (s, body) = get(app.clone(), &format!("/teams/{team_id}/executions"), user).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["team_id"], team_id);
     assert_eq!(body["team_name"], team_name);
 }
 

@@ -166,6 +166,11 @@ pub fn model(name: &str) -> String {
 }
 
 #[inline]
+pub fn model_memory() -> &'static str {
+    "/models/memory"
+}
+
+#[inline]
 pub fn model_check(model_name: &str) -> String {
     format!("/models/{model_name}/check")
 }

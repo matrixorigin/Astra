@@ -351,6 +351,7 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/models",
             post(models::create_model_handler).get(models::list_models_handler),
         )
+        .route("/models/memory", get(models::get_memory_model_handler))
         .route(
             "/models/{model_name}",
             get(models::get_model_handler)

@@ -141,9 +141,9 @@ const STATS_SUBCOMMANDS: &[(&str, &str)] = &[
 ];
 
 const SYNC_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("log", "Recent sync event log"),
-    ("pull", "Pull all domains from cloud"),
-    ("push", "Force push dirty domains to cloud"),
+    ("log", "Server-owned sync log hint"),
+    ("pull", "Deprecated: server-owned"),
+    ("push", "Deprecated: server-owned"),
 ];
 
 const REVIEW_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -542,7 +542,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_arg_hint("[show|paths|sources|diff|export [path]]"),
     CommandMeta::new(
         "/sync",
-        "Cloud sync status and push",
+        "Cloud sync status (server-owned)",
         CommandGroup::Observability,
     )
     .with_subcommands(SYNC_SUBCOMMANDS)

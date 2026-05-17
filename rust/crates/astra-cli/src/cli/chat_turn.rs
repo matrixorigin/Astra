@@ -11,13 +11,8 @@ pub(super) struct TurnContext<'a> {
     pub(super) profile: Option<&'a str>,
 }
 
-/// Enqueue a journal event for async cloud ingestion (if matrix runtime is available).
-fn enqueue_ingestion(state: &SessionState, event: &session_journal::JournalEvent) {
-    let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
-    if let Some(mc) = state.matrix_runtime.as_ref() {
-        mc.enqueue_journal_events(user_id, event);
-    }
-}
+/// Cloud journal ingestion is server-owned; CLI keeps the local journal path.
+fn enqueue_ingestion(_state: &SessionState, _event: &session_journal::JournalEvent) {}
 
 /// Public wrapper for enqueue_ingestion — used by main.rs for session_end.
 pub(super) fn enqueue_ingestion_pub(state: &SessionState, event: &session_journal::JournalEvent) {
@@ -622,17 +617,12 @@ fn maybe_checkpoint_lessons(state: &mut SessionState) {
 }
 
 /// Filter lessons through a cheap selector model for relevance.
-/// Resolves the selector model from the DB model registry via `MatrixCloudRuntime`.
-/// Falls back to returning all lessons if no selector model is configured or on error.
+/// Falls back to returning all lessons if no selector model is configured.
 async fn filter_lessons_by_relevance(
     user_message: &str,
     lessons: Vec<astra_runtime::self_model::LessonHint>,
-    matrix_runtime: Option<&std::sync::Arc<astra_runtime::MatrixCloudRuntime>>,
+    params: Option<&astra_runtime::memory_relevance::LlmConnParams>,
 ) -> Vec<astra_runtime::self_model::LessonHint> {
-    let params = match matrix_runtime {
-        Some(rt) => rt.resolve_memory_model().await,
-        None => None,
-    };
     let Some(params) = params else {
         return lessons;
     };
@@ -652,6 +642,45 @@ async fn filter_lessons_by_relevance(
         .into_iter()
         .filter(|l| filtered_set.contains(l.action.as_str()))
         .collect()
+}
+
+async fn maybe_load_memory_model_params(
+    state: &mut SessionState,
+    ctx: &TurnContext<'_>,
+    token: &str,
+) {
+    #[derive(serde::Deserialize)]
+    struct MemoryModelWire {
+        model_name: String,
+    }
+
+    if state.memory_model_params.is_some() {
+        return;
+    }
+    let body = match ctx
+        .api
+        .get_authed_path_text(token, astra_thin_client::paths::model_memory())
+        .await
+    {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::debug!("memory model fetch skipped: {error}");
+            return;
+        }
+    };
+    match serde_json::from_str::<MemoryModelWire>(&body) {
+        Ok(response) => {
+            state.memory_model_params = Some(astra_runtime::memory_relevance::LlmConnParams {
+                base_url: format!("{}/v1", ctx.api.api_origin()),
+                api_key: token.to_string(),
+                model_name: response.model_name,
+                provider: "openai".to_string(),
+            });
+        }
+        Err(error) => {
+            tracing::warn!("memory model decode failed: {error}");
+        }
+    }
 }
 
 fn should_bootstrap_lessons(state: &SessionState) -> bool {
@@ -931,11 +960,7 @@ async fn run_chat_turn(
     // Protocol L3). agent_lessons table is no longer used for bootstrap.
     if should_bootstrap_lessons(state) {
         // Resolve memory model on first bootstrap (cached for future turns).
-        if state.memory_model_params.is_none() {
-            if let Some(ref rt) = state.matrix_runtime {
-                state.memory_model_params = rt.resolve_memory_model().await;
-            }
-        }
+        maybe_load_memory_model_params(state, ctx, token).await;
 
         let lessons = tokio::time::timeout(
             std::time::Duration::from_secs(3),
@@ -946,7 +971,7 @@ async fn run_chat_turn(
         // Relevance filter: if we have lessons AND a selector model, filter noise.
         // Best-effort: timeout or model unavailable → keep all lessons.
         state.session_lessons = if lessons.len() > 1 {
-            filter_lessons_by_relevance(message, lessons, state.matrix_runtime.as_ref()).await
+            filter_lessons_by_relevance(message, lessons, state.memory_model_params.as_ref()).await
         } else {
             lessons
         };
@@ -1414,29 +1439,6 @@ fn commit_turn_journal_workspace_and_sidecars(
                 };
                 let _ = astra_services::session_checkpoint::write_checkpoint(sid, &cp);
 
-                // Push checkpoint to MatrixOne for cross-device availability
-                if let Some(ref mc) = state.matrix_runtime {
-                    let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
-                    let svc = std::sync::Arc::clone(mc.sync_service());
-                    let sid_owned = sid.to_string();
-                    let user_id_owned = user_id.to_string();
-                    let cp_clone = cp.clone();
-                    let cp_number = cp.number;
-                    mc.spawn_session_sync_task(async move {
-                        if let Err(e) = svc.push_checkpoint(
-                            &sid_owned,
-                            &user_id_owned,
-                            &cp_clone,
-                        )
-                        .await
-                        {
-                            astra_core::agent_warn!(
-                                "checkpoint_sync",
-                                "failed to push checkpoint {cp_number} to cloud for session {sid_owned}: {e}"
-                            );
-                        }
-                    });
-                }
                 let cp_event = session_journal::JournalEvent::checkpoint(
                     Some(sid),
                     ws.turn_count,
@@ -1446,125 +1448,6 @@ fn commit_turn_journal_workspace_and_sidecars(
                 );
                 let _ = journal.append(&cp_event);
                 enqueue_ingestion(state, &cp_event);
-            }
-
-            // Push Step Protocol heavy checkpoint to MatrixOne (full state for recovery)
-            if let Some(ref mc) = state.matrix_runtime
-                && let Some(ref step_cp) = result.last_heavy_checkpoint
-                && let Ok(state_json) = serde_json::to_string(step_cp)
-            {
-                let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
-                let svc = std::sync::Arc::clone(mc.sync_service());
-                let sid_owned = sid.to_string();
-                let user_id_owned = user_id.to_string();
-                let cp_number = result
-                    .step_recorder_summary
-                    .as_ref()
-                    .map(|s| s.checkpoints)
-                    .unwrap_or(0);
-                let (tier, turn, title, tools_json): (String, u32, String, String) = match step_cp {
-                    astra_pipeline::step_protocol::StepCheckpoint::Light(l) => (
-                        "light".to_string(),
-                        0u32,
-                        format!("step:{}", l.step_id),
-                        "[]".to_string(),
-                    ),
-                    astra_pipeline::step_protocol::StepCheckpoint::Heavy(h) => {
-                        let tools = serde_json::to_string(&h.recent_tools)
-                            .unwrap_or_else(|_| "[]".to_string());
-                        (
-                            "heavy".to_string(),
-                            0u32,
-                            format!("step:{}", h.light.step_id),
-                            tools,
-                        )
-                    }
-                };
-                mc.spawn_session_sync_task(async move {
-                    if let Err(e) = svc.push_step_checkpoint(
-                        &sid_owned,
-                        &user_id_owned,
-                        cp_number,
-                        turn,
-                        &tier,
-                        &title,
-                        &tools_json,
-                        &state_json,
-                    )
-                    .await
-                    {
-                        astra_core::agent_warn!(
-                            "checkpoint_sync",
-                            "failed to push step checkpoint {cp_number} to cloud for session {sid_owned}: {e}"
-                        );
-                    }
-                });
-            }
-
-            if let Some(ref mc) = state.matrix_runtime
-                && let Some(ref trace_signal) = ws.last_context_trace
-            {
-                let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
-                let svc = std::sync::Arc::clone(mc.sync_service());
-                let sid_owned = sid.to_string();
-                let user_id_owned = user_id.to_string();
-                let trace_signal = trace_signal.clone();
-                mc.spawn_session_sync_task(async move {
-                    if let Err(e) = svc.push_context_trace_signal(
-                        &sid_owned,
-                        &user_id_owned,
-                        &trace_signal,
-                    )
-                    .await
-                    {
-                        astra_core::agent_warn!(
-                            "context_trace_sync",
-                            "failed to push context trace signal to cloud for session {sid_owned}: {e}"
-                        );
-                    }
-                });
-            }
-
-            // Push plan state to cloud at checkpoint boundaries
-            if let Some(ref mc) = state.matrix_runtime
-                && astra_services::session_checkpoint::should_checkpoint(
-                    ws.turn_count,
-                    astra_services::session_checkpoint::CHECKPOINT_INTERVAL,
-                )
-            {
-                let svc = std::sync::Arc::clone(mc.sync_service());
-                let sid_owned = sid.to_string();
-                let user_id = state
-                    .ingestion_user_id
-                    .as_deref()
-                    .unwrap_or("anonymous")
-                    .to_string();
-                let plan_json = ws.executing_plan_json.clone();
-                let goal = ws.plan_goal.clone();
-                let config = ws.plan_config_json.clone();
-                let rounds = ws.plan_execution_rounds;
-                let git_branch = ws.git_branch.clone();
-                let model = ws.model.clone();
-                mc.spawn_session_sync_task(async move {
-                    if let Err(e) = svc
-                        .push_session_state(
-                            &sid_owned,
-                            &user_id,
-                            plan_json.as_deref(),
-                            goal.as_deref(),
-                            config.as_deref(),
-                            rounds,
-                            git_branch.as_deref(),
-                            model.as_deref(),
-                        )
-                        .await
-                    {
-                        astra_core::agent_warn!(
-                            "session_state_sync",
-                            "failed to push session state to cloud for session {sid_owned}: {e}"
-                        );
-                    }
-                });
             }
 
             if let Err(e) = astra_services::session_workspace::write_workspace(&ws) {
@@ -2806,7 +2689,7 @@ fn initialize_journal(state: &mut SessionState, session_id: &str) {
         let start_event =
             session_journal::JournalEvent::session_start(Some(session_id), state.model.as_deref());
         let _ = journal.append(&start_event);
-        // enqueue_ingestion skips if matrix_runtime is None
+        // enqueue_ingestion is server-owned and remains a local no-op.
         enqueue_ingestion(state, &start_event);
 
         // Resolve the content-addressed version of the config this
@@ -3461,47 +3344,7 @@ fn spawn_manual_checkpoint_cloud_uploads(
     title: &str,
     step_cp: &astra_pipeline::step_protocol::StepCheckpoint,
 ) {
-    let Some(ref mc) = state.matrix_runtime else {
-        return;
-    };
-    let user_id = state
-        .ingestion_user_id
-        .as_deref()
-        .unwrap_or("anonymous")
-        .to_string();
-    let user_id_step = user_id.clone();
-    let svc = std::sync::Arc::clone(mc.sync_service());
-    let svc2 = std::sync::Arc::clone(&svc);
-    let sid_owned = sid.to_string();
-    let cp_clone = session_cp.clone();
-    mc.spawn_session_sync_task(async move {
-        if let Err(e) = svc.push_checkpoint(&sid_owned, &user_id, &cp_clone).await {
-            astra_core::agent_warn!("checkpoint", "cloud push session checkpoint: {e}");
-        }
-    });
-
-    let sid_step = sid.to_string();
-    let title_owned = title.to_string();
-    let state_json = serde_json::to_string(step_cp).unwrap_or_default();
-    let tools_json =
-        serde_json::to_string(&state.recent_tools).unwrap_or_else(|_| "[]".to_string());
-    mc.spawn_session_sync_task(async move {
-        if let Err(e) = svc2
-            .push_step_checkpoint(
-                &sid_step,
-                &user_id_step,
-                next_step,
-                turn,
-                "heavy",
-                &title_owned,
-                &tools_json,
-                &state_json,
-            )
-            .await
-        {
-            astra_core::agent_warn!("checkpoint", "cloud push step checkpoint: {e}");
-        }
-    });
+    let _ = (state, sid, session_cp, next_step, turn, title, step_cp);
 }
 
 /// User-initiated checkpoint: heavy JSON + composite index first, then session markdown,
@@ -3568,7 +3411,7 @@ pub(super) fn create_manual_checkpoint(
         turn,
         checkpoint_path: cp_path,
         heavy_path,
-        cloud_sync_queued: state.matrix_runtime.is_some(),
+        cloud_sync_queued: false,
     })
 }
 
@@ -6810,7 +6653,7 @@ mod tests {
     // ─── filter_lessons_by_relevance: no env vars ─────────────────────────
 
     #[test]
-    fn filter_lessons_uses_matrix_runtime_not_env_vars() {
+    fn filter_lessons_uses_api_model_not_env_vars() {
         let source = include_str!("chat_turn.rs");
         // Exclude the test module itself (everything after #[cfg(test)])
         let prod_code = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
@@ -6822,11 +6665,11 @@ mod tests {
     }
 
     #[test]
-    fn filter_lessons_resolves_via_matrix_runtime() {
+    fn filter_lessons_resolves_via_memory_model_endpoint() {
         let source = include_str!("chat_turn.rs");
         assert!(
-            source.contains("resolve_memory_model"),
-            "filter_lessons_by_relevance should resolve model from matrix_runtime"
+            source.contains("model_memory()"),
+            "filter_lessons_by_relevance should use API-backed memory model loading"
         );
         assert!(
             source.contains("filter_memories"),

@@ -4125,62 +4125,12 @@ fn handle_session_verify(state: &SessionState) {
     );
     eprintln!("    {:<20} {}", "file:".dim(), journal_path.dim());
 
-    // Cloud ingestion stats
-    if let Some(ref mc) = state.matrix_runtime {
-        eprintln!();
-        eprintln!("  {}", "Cloud ingestion".dim());
-        if let Some(stats) = mc.ingestion_stats() {
-            let lag = stats.events_received.saturating_sub(stats.events_flushed);
-            eprintln!(
-                "    {:<20} {}",
-                "received:".dim(),
-                stats.events_received.to_string().magenta()
-            );
-            eprintln!(
-                "    {:<20} {}",
-                "flushed:".dim(),
-                stats.events_flushed.to_string().magenta()
-            );
-            eprintln!(
-                "    {:<20} {}",
-                "flushes:".dim(),
-                stats.flush_count.to_string().magenta()
-            );
-            let overflow = mc.ingestion_overflow_count();
-            if lag > 0 {
-                eprintln!("    {:<20} {}", "pending:".dim(), lag.to_string().yellow());
-            } else {
-                eprintln!("    {:<20} {}", "pending:".dim(), "0 (synced)".green());
-            }
-            if overflow > 0 {
-                eprintln!(
-                    "    {:<20} {}",
-                    "dropped:".dim(),
-                    overflow.to_string().red()
-                );
-            }
-            if stats.errors > 0 {
-                eprintln!(
-                    "    {:<20} {}",
-                    "errors:".dim(),
-                    stats.errors.to_string().red()
-                );
-                if let Some(ref last_err) = stats.last_error {
-                    let truncated = if last_err.len() > 80 {
-                        format!("{}…", last_err.chars().take(80).collect::<String>())
-                    } else {
-                        last_err.clone()
-                    };
-                    eprintln!("    {:<20} {}", "last error:".dim(), truncated.red());
-                }
-            }
-        } else {
-            eprintln!("    {}", "stats unavailable (lock contention)".dim());
-        }
-    } else {
-        eprintln!();
-        eprintln!("  {} Cloud not connected", theme::icon_warn());
-    }
+    eprintln!();
+    eprintln!("  {}", "Cloud ingestion".dim());
+    eprintln!(
+        "    {}",
+        "server-owned; CLI does not enqueue MatrixOne ingestion events".dim()
+    );
 
     // Session disk usage summary
     if sid != "none" {
@@ -4535,10 +4485,8 @@ mod export_tests {
 // ═══════════════════════════════════════════════════════════ Resume ═══════
 
 fn resume_restore_service(state: &SessionState) -> HybridRestoreService {
-    match &state.matrix_runtime {
-        Some(mc) => HybridRestoreService::new(mc.shared_pool().get().clone()),
-        None => HybridRestoreService::local_only(),
-    }
+    let _ = state;
+    HybridRestoreService::local_only()
 }
 
 fn reset_state_for_session_restore(state: &mut SessionState) {
@@ -4898,53 +4846,6 @@ async fn apply_restored_session(
             restored.compaction_state.as_ref(),
         );
         eprintln!("  {} Restored step checkpoint from cloud", "☁".magenta());
-    } else if let Some(ref mc) = state.matrix_runtime {
-        let pool = mc.shared_pool().get();
-        match astra_services::session_restore::pull_step_checkpoint_from_cloud(
-            pool,
-            &restored.session_id,
-        )
-        .await
-        {
-            Ok(Some(state_json)) => {
-                match astra_services::session_restore::parse_cloud_heavy_checkpoint_state(
-                    &state_json,
-                ) {
-                    Ok(Some(heavy)) => {
-                        apply_heavy_state_fallback(
-                            state,
-                            &heavy.blocked_tools,
-                            &heavy.recent_tools,
-                            &heavy.messages,
-                            heavy.approval_overrides.as_ref(),
-                        );
-                        apply_resume_recovery_state(
-                            state,
-                            heavy.interruption.as_ref(),
-                            heavy.compaction_state.as_ref(),
-                        );
-                        eprintln!("  {} Restored step checkpoint from cloud", "☁".magenta());
-                    }
-                    Ok(None) => {
-                        eprintln!(
-                            "  {} Cloud checkpoint corrupted, skipping",
-                            theme::icon_warn()
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "skipping cloud step checkpoint"
-                        );
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                eprintln!("  {} Cloud checkpoint unavailable", theme::icon_warn());
-                eprintln!("{}", format!("     ({e})").dim());
-            }
-        }
     }
 
     match normalize_model_override(restored.model.as_deref()) {
@@ -4990,10 +4891,6 @@ async fn apply_restored_session(
         && let Ok(contract) = serde_json::from_str::<astra_services::TaskContract>(json)
     {
         let work_dir = std::env::current_dir().unwrap_or_default();
-        let ingestion_sender = state
-            .matrix_runtime
-            .as_ref()
-            .and_then(|mc| mc.clone_ingestion_sender());
         // Verification judge runs server-side via server_proxy_judge; the server resolves
         // the reasoning model via admin_config.reasoning_model_name → cheapest active
         // fallback. No local cloud judge.
@@ -5006,33 +4903,17 @@ async fn apply_restored_session(
                 Err(_) => None,
             };
 
-        let lifecycle = if let Some(pool) = state
-            .matrix_runtime
-            .as_ref()
-            .map(|mc| mc.shared_pool().get().clone())
-        {
-            durable_bridge::create_cloud_lifecycle_full(
-                pool,
-                &work_dir,
-                ingestion_sender,
-                Some(&restored.session_id),
-                state.ingestion_user_id.as_deref(),
-                cloud_judge,
-                server_proxy_judge,
-            )
-        } else {
-            let session_dir =
-                astra_services::session_workspace::workspace_dir_for(&restored.session_id);
-            durable_bridge::create_local_lifecycle_full(
-                &session_dir,
-                &work_dir,
-                ingestion_sender,
-                Some(&restored.session_id),
-                state.ingestion_user_id.as_deref(),
-                cloud_judge,
-                server_proxy_judge,
-            )
-        };
+        let session_dir =
+            astra_services::session_workspace::workspace_dir_for(&restored.session_id);
+        let lifecycle = durable_bridge::create_local_lifecycle_full(
+            &session_dir,
+            &work_dir,
+            None,
+            Some(&restored.session_id),
+            state.ingestion_user_id.as_deref(),
+            cloud_judge,
+            server_proxy_judge,
+        );
         state.durable_task_state = Some(durable_bridge::DurableTaskState {
             contract,
             lifecycle,
