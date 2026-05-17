@@ -94,21 +94,140 @@ pub(super) async fn learning_trigger_handler(
 
 #[cfg(test)]
 mod tests {
-    /// P0-D: Learning handlers must use current_user (JWT validation),
-    /// not require_bearer_auth (header-only check).
-    #[test]
-    fn learning_handlers_use_current_user() {
-        let source = include_str!("learning_handlers.rs");
-        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
-        let prod_code = &source[..test_start];
-        assert!(
-            !prod_code.contains("require_bearer_auth"),
-            "learning handlers must not use require_bearer_auth (no JWT validation)"
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use astra_core::{ErrorResponse, error_response};
+    use astra_services::{
+        AuthRefreshRequestData, AuthRegisterRequestData, AuthService, AuthTokenRecord,
+        AuthUserRecord,
+    };
+    use async_trait::async_trait;
+    use axum::{
+        Json,
+        extract::State,
+        http::{HeaderMap, HeaderValue, StatusCode},
+    };
+
+    use crate::{AppState, HealthChecker, ServiceInfo};
+
+    #[derive(Clone)]
+    struct AlwaysHealthy;
+
+    #[async_trait]
+    impl HealthChecker for AlwaysHealthy {
+        async fn database_healthy(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingAuthService {
+        current_user_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AuthService for RecordingAuthService {
+        async fn register(
+            &self,
+            _request: AuthRegisterRequestData,
+        ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("register is not used in learning handler tests")
+        }
+
+        async fn login(
+            &self,
+            _request: astra_services::AuthLoginRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("login is not used in learning handler tests")
+        }
+
+        async fn refresh(
+            &self,
+            _request: AuthRefreshRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("refresh is not used in learning handler tests")
+        }
+
+        async fn logout(
+            &self,
+            _request: AuthRefreshRequestData,
+        ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("logout is not used in learning handler tests")
+        }
+
+        async fn current_user(
+            &self,
+            headers: &HeaderMap,
+        ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.current_user_calls.fetch_add(1, Ordering::SeqCst);
+            if headers.get("authorization").is_none() {
+                return Err(error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "missing authorization",
+                ));
+            }
+            Ok(AuthUserRecord {
+                user_id: "learning-user".into(),
+                username: "learning-user".into(),
+                email: "learning@example.com".into(),
+                display_name: None,
+            })
+        }
+    }
+
+    fn build_state(auth_service: Arc<dyn AuthService>) -> AppState {
+        AppState::new(ServiceInfo::default(), Arc::new(AlwaysHealthy))
+            .with_auth_service(auth_service)
+    }
+
+    fn auth_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer learning-test-token"),
         );
-        let current_user_count = prod_code.matches("current_user").count();
-        assert!(
-            current_user_count >= 3,
-            "all 3 authenticated learning handlers must use current_user, found {current_user_count}"
+        headers
+    }
+
+    /// P0-D: Authenticated learning handlers must consult AuthService::current_user
+    /// before returning data or trigger results.
+    #[tokio::test]
+    async fn authenticated_learning_handlers_use_current_user() {
+        let auth = Arc::new(RecordingAuthService::default());
+        let state = build_state(auth.clone());
+
+        let Json(signals) = learning_signals_handler(State(state.clone()), auth_headers())
+            .await
+            .expect("signals handler should succeed");
+        assert_eq!(signals.signal_types.len(), 4);
+
+        let Json(stats) = learning_stats_handler(State(state.clone()), auth_headers())
+            .await
+            .expect("stats handler should succeed");
+        assert_eq!(stats.total_learnings, 0);
+
+        let Json(trigger) = learning_trigger_handler(
+            State(state),
+            auth_headers(),
+            Json(LearningTriggerRequest {
+                days: 7,
+                force: false,
+                signal_types: Vec::new(),
+                weights: None,
+            }),
+        )
+        .await
+        .expect("trigger handler should succeed");
+        assert_eq!(trigger.status, "error");
+
+        assert_eq!(
+            auth.current_user_calls.load(Ordering::SeqCst),
+            3,
+            "all authenticated learning handlers should call current_user once"
         );
     }
 }

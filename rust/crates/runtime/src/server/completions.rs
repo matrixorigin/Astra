@@ -29,6 +29,13 @@ fn default_temperature() -> f64 {
     0.1
 }
 
+fn completion_response_id(upstream: &serde_json::Value) -> String {
+    upstream["id"]
+        .as_str()
+        .unwrap_or("chatcmpl-proxy")
+        .to_string()
+}
+
 /// OpenAI-compatible chat completion response (subset).
 #[derive(Debug, Serialize)]
 pub(super) struct CompletionResponse {
@@ -182,10 +189,7 @@ pub(super) async fn completions_handler(
     let completion_tokens = usage.output_tokens;
 
     Ok(Json(CompletionResponse {
-        id: upstream["id"]
-            .as_str()
-            .unwrap_or("chatcmpl-proxy")
-            .to_string(),
+        id: completion_response_id(&upstream),
         object: "chat.completion".to_string(),
         model: resolved.model_name,
         choices: vec![CompletionChoice {
@@ -254,16 +258,12 @@ mod tests {
         assert!(messages[0].get("tool_calls").is_none(), "{messages:?}");
     }
 
-    /// audit-C2: completions handler must not use .expect("json object") —
-    /// panicking in a request handler crashes the connection.
     #[test]
-    fn completions_handler_does_not_expect_json_object() {
-        let source = include_str!("completions.rs");
-        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
-        let prod_code = &source[..test_start];
+    fn completion_response_id_defaults_for_non_object_upstream_payloads() {
+        let upstream = serde_json::json!(["not-an-object"]);
         assert!(
-            !prod_code.contains(".expect(\"json object\")"),
-            "completions handler must not panic on json object access"
+            completion_response_id(&upstream) == "chatcmpl-proxy",
+            "non-object upstream payloads should fall back to the proxy completion id"
         );
     }
 }

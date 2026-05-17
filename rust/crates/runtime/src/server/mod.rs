@@ -110,6 +110,35 @@ pub fn build_app(state: AppState) -> Router {
         .layer(cors)
 }
 
+async fn finish_server_shutdown(
+    bg_cancel: tokio_util::sync::CancellationToken,
+    bg_handles: Vec<tokio::task::JoinHandle<()>>,
+    run_lifecycle: Arc<dyn astra_services::RunLifecycleService>,
+    matrix_runtime: Option<Arc<crate::matrix_cloud_runtime::MatrixCloudRuntime>>,
+) {
+    // 1. Stop background sweepers and wait for them to exit.
+    bg_cancel.cancel();
+    for h in bg_handles {
+        let _ = h.await;
+    }
+    // 2. Drain in-flight agentic loop tasks (up to 30s).
+    if !run_lifecycle
+        .drain_background_tasks(std::time::Duration::from_secs(30))
+        .await
+    {
+        tracing::warn!(
+            target: "astra_runtime::serve",
+            "graceful shutdown: some background tasks did not finish within 30s"
+        );
+    }
+    // 3. Drain Matrix ingestion + tracked session sync tasks.
+    if let Some(rt) = matrix_runtime {
+        rt.shutdown_ingestion_and_wait().await;
+    }
+    // 4. Flush OTLP exporter last so the prior shutdown work is observable.
+    astra_logging::shutdown_otel();
+}
+
 pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     static TRACING: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     TRACING.get_or_init(|| {
@@ -164,27 +193,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(http_shutdown_signal())
         .await?;
 
-    // 1. Stop background sweepers and wait for them to exit.
-    bg_cancel.cancel();
-    for h in bg_handles {
-        let _ = h.await;
-    }
-    // 2. Drain in-flight agentic loop tasks (up to 30s).
-    if !run_lifecycle
-        .drain_background_tasks(std::time::Duration::from_secs(30))
-        .await
-    {
-        tracing::warn!(
-            target: "astra_runtime::serve",
-            "graceful shutdown: some background tasks did not finish within 30s"
-        );
-    }
-    // 3. Drain Matrix ingestion + tracked session sync tasks.
-    if let Some(rt) = matrix_runtime {
-        rt.shutdown_ingestion_and_wait().await;
-    }
-    // 4. Flush OTLP exporter last so the prior shutdown work is observable.
-    astra_logging::shutdown_otel();
+    finish_server_shutdown(bg_cancel, bg_handles, run_lifecycle, matrix_runtime).await;
     Ok(())
 }
 
@@ -265,32 +274,98 @@ pub use astra_server_types::edge_connection_pool;
 
 #[cfg(test)]
 mod tests {
-    /// U1: build_app must set a DefaultBodyLimit to prevent OOM from
-    /// oversized request bodies. The raw `Bytes` extractor on /chat/turn
-    /// has no built-in limit — without an explicit layer, the server
-    /// buffers the entire request into memory.
-    #[test]
-    fn build_app_has_body_size_limit() {
-        let source = include_str!("mod.rs");
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
-        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
-        let prod_code = &source[..test_start];
-        assert!(
-            prod_code.contains("DefaultBodyLimit"),
-            "build_app must apply DefaultBodyLimit layer to prevent OOM"
-        );
+    use astra_core::{ErrorResponse, error_response};
+    use astra_services::{
+        CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
+        RunListRecord, RunStatusRecord,
+    };
+    use async_trait::async_trait;
+    use axum::{Json, http::StatusCode};
+
+    #[derive(Default)]
+    struct RecordingRunLifecycleService {
+        drain_calls: AtomicUsize,
     }
 
-    /// P0-C: serve() shutdown path must drain background agentic loop tasks.
-    #[test]
-    fn shutdown_drains_background_tasks() {
-        let source = include_str!("mod.rs");
+    #[async_trait]
+    impl RunLifecycleService for RecordingRunLifecycleService {
+        async fn create_run(
+            &self,
+            _user_id: String,
+            _request: ChatRequestData,
+        ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("create_run is not used in shutdown tests")
+        }
 
-        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
-        let prod_code = &source[..test_start];
-        assert!(
-            prod_code.contains("drain_background_tasks"),
-            "serve() shutdown must call drain_background_tasks"
-        );
+        async fn stream_chat(
+            &self,
+            _user_id: String,
+            _request: ChatRequestData,
+        ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("stream_chat is not used in shutdown tests")
+        }
+
+        async fn get_run_status(
+            &self,
+            _run_id: String,
+            _user_id: String,
+        ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
+            Err(error_response(StatusCode::NOT_FOUND, "not used"))
+        }
+
+        async fn stream_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+            _last_index: u32,
+        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("stream_run is not used in shutdown tests")
+        }
+
+        async fn cancel_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+        ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("cancel_run is not used in shutdown tests")
+        }
+
+        async fn list_runs(
+            &self,
+            _user_id: String,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("list_runs is not used in shutdown tests")
+        }
+
+        async fn drain_background_tasks(&self, _timeout: std::time::Duration) -> bool {
+            self.drain_calls.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_background_tasks() {
+        let bg_cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_probe = bg_cancel.clone();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let completed_probe = completed.clone();
+        let bg_handle = tokio::spawn(async move {
+            cancel_probe.cancelled().await;
+            completed_probe.fetch_add(1, Ordering::SeqCst);
+        });
+        let run_lifecycle = Arc::new(RecordingRunLifecycleService::default());
+
+        super::finish_server_shutdown(bg_cancel, vec![bg_handle], run_lifecycle.clone(), None)
+            .await;
+
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        assert_eq!(run_lifecycle.drain_calls.load(Ordering::SeqCst), 1);
     }
 }

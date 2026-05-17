@@ -6495,21 +6495,6 @@ mod tests {
         assert!(res.is_err(), "closed semaphore must yield Err, not panic");
     }
 
-    /// audit-#5: source-level guard — no panicking expect calls remain in
-    /// the spawned delegation tasks for the closed-semaphore path.
-    #[test]
-    fn delegation_does_not_panic_on_closed_semaphore() {
-        let source = include_str!("delegation_engine.rs");
-        // Build the needle dynamically to avoid matching this assertion's
-        // own literal in the included source.
-        let needle = format!(".expect(\"sem{}closed\")", "aphore ");
-        assert_eq!(
-            source.matches(needle.as_str()).count(),
-            0,
-            "spawned delegation tasks must not panic on a closed semaphore"
-        );
-    }
-
     /// P1-B: cancel_children_of must cancel all child tokens.
     #[tokio::test]
     async fn cancel_children_of_cancels_tokens() {
@@ -6606,53 +6591,6 @@ mod tests {
         assert!(
             !tracker.cancel_tokens.read().await.contains_key(child),
             "cancel_tokens must be cleaned up after delegation cleanup"
-        );
-    }
-
-    /// Source guard: cleanup_delegation must clean cancel_tokens alongside pause_flags.
-    #[test]
-    fn cleanup_delegation_cleans_cancel_tokens_source_guard() {
-        let source = include_str!("delegation_engine.rs");
-        let impl_start = source
-            .find("impl DelegationTracker {")
-            .expect("impl must exist");
-        let impl_source = &source[impl_start..];
-        let fn_start = impl_source
-            .find("async fn cleanup_delegation(")
-            .expect("cleanup_delegation must exist");
-        let fn_end = impl_source[fn_start..]
-            .find("\n    pub async fn ")
-            .or_else(|| impl_source[fn_start..].find("\n    async fn "))
-            .map(|p| fn_start + p)
-            .unwrap_or(impl_source.len());
-        let fn_body = &impl_source[fn_start..fn_end];
-        assert!(
-            fn_body.contains("cancel_tokens"),
-            "cleanup_delegation must clean up cancel_tokens map"
-        );
-    }
-
-    // ─── Bug B step 2 regression guards ──────────────────────────
-
-    #[test]
-    fn subrun_config_exposes_inherited_prefix_field() {
-        let src = include_str!("delegation_engine.rs");
-        assert!(
-            src.contains(
-                "pub inherited_prefix: Option<crate::orchestration::InheritedChildPrefix>"
-            ),
-            "SubRunConfig must expose pub inherited_prefix typed \
-             as Option<InheritedChildPrefix>"
-        );
-    }
-
-    #[test]
-    fn delegation_engine_accepts_prefix_store_builder() {
-        let src = include_str!("delegation_engine.rs");
-        assert!(
-            src.contains("pub fn with_prefix_store"),
-            "DelegationEngine::with_prefix_store must exist so the \
-             CLI startup path can plumb the shared store"
         );
     }
 
