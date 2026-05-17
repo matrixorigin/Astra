@@ -39,6 +39,11 @@ pub struct SpawnContext {
     pub parent_agent_id: String,
     /// Current nested agent/sub-run depth of the parent.
     pub recursion_depth: u8,
+    /// Whether the parent is itself a fork child. Fork children must
+    /// not request another inherited prefix; their prompt already
+    /// contains an inherited parent prefix, so recursively forking
+    /// would drift from the byte-exact cache chain.
+    pub parent_is_fork_child: bool,
     /// Working directory for the spawned agent.
     pub working_dir: PathBuf,
     /// Permissions inherited from the parent agent.
@@ -447,6 +452,10 @@ impl DynamicAgentSpawner {
         input: SpawnAgentInput,
         context: &SpawnContext,
     ) -> Result<SpawnAgentOutput, SpawnError> {
+        if context.parent_is_fork_child && input.inherit_prefix.is_some() {
+            return Err(SpawnError::NestedForkInheritanceRejected);
+        }
+
         // 1. Validate agent type
         let agent_def = self
             .agent_registry
@@ -1289,6 +1298,12 @@ pub enum SpawnError {
     #[error("Delegation failed: {0}")]
     DelegationFailed(String),
 
+    /// Fork children are allowed to spawn normal children, but not
+    /// another inherit-prefix fork. This mirrors Claude Code's
+    /// `isInForkChild()` guard and prevents recursive cache-key drift.
+    #[error("Nested fork inheritance is not allowed from a fork child")]
+    NestedForkInheritanceRejected,
+
     /// Fired when `inherit_prefix.required=true` but the resolver
     /// could not attach a matching prefix (missing, incompatible,
     /// or feature-disabled). Soft failures (`required=false`)
@@ -1352,11 +1367,26 @@ pub(crate) fn build_inherited_child_prefix(
                 provider: prefix.provider.clone(),
                 prefix_messages: r.messages,
                 frozen_tool_schemas: frozen_tools,
-                expected_cache_read_tokens: 0,
+                expected_cache_read_tokens: estimate_cache_read_tokens(prefix),
             })
         }
         Err(_) => None,
     }
+}
+
+fn estimate_cache_read_tokens(prefix: &astra_turn_core::fork_prefix::ForkPrefix) -> u64 {
+    fn bytes_to_tokens(bytes: usize) -> u64 {
+        // Conservative, provider-neutral approximation: four bytes per
+        // token, rounded up. The probe only needs a nonzero baseline
+        // good enough to distinguish full misses from useful reuse.
+        u64::try_from(bytes.div_ceil(4)).unwrap_or(u64::MAX)
+    }
+
+    // `size_bytes()` is already the canonical serialized prefix region
+    // (system + tools + messages). Re-adding system/tool payload sizes
+    // would double-count those bytes and systematically understate the
+    // observed/expected cache-hit ratio in telemetry.
+    bytes_to_tokens(prefix.size_bytes()).max(1)
 }
 
 /// Build permission summary from spawn context.
@@ -1445,6 +1475,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
             recursion_depth: 0,
+            parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
             inherited_skills: vec![],
@@ -1468,6 +1499,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
             recursion_depth: 0,
+            parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
             inherited_skills: vec![],
@@ -1485,6 +1517,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
             recursion_depth: 0,
+            parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
             inherited_skills: vec![],
@@ -1530,6 +1563,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
             recursion_depth: 0,
+            parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
             inherited_skills: vec![],
@@ -1575,6 +1609,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             recursion_depth: 0,
+            parent_is_fork_child: false,
             inherited_permissions: None,
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
@@ -1753,6 +1788,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             recursion_depth: 0,
+            parent_is_fork_child: false,
             inherited_permissions: None,
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
@@ -1796,6 +1832,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             recursion_depth: 2,
+            parent_is_fork_child: false,
             inherited_permissions: None,
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
@@ -1821,6 +1858,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             recursion_depth: astra_turn_core::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
+            parent_is_fork_child: false,
             inherited_permissions: None,
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
@@ -1851,6 +1889,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             recursion_depth: 0,
+            parent_is_fork_child: false,
             inherited_permissions: None,
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
@@ -1920,6 +1959,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
             recursion_depth: 0,
+            parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
             inherited_skills: vec!["review-changes".to_string(), "analyze-session".to_string()],
@@ -1943,6 +1983,7 @@ mod tests {
             parent_run_id: "run-1".to_string(),
             parent_agent_id: "agent-1".to_string(),
             recursion_depth: 0,
+            parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
             inherited_skills: Vec::new(),
@@ -2013,6 +2054,7 @@ mod tests {
             parent_run_id: "root".to_string(),
             parent_agent_id: "root".to_string(),
             recursion_depth: 0,
+            parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
             inherited_skills: vec![],
@@ -2481,6 +2523,7 @@ mod tests {
             parent_run_id: run_id.to_string(),
             parent_agent_id: "parent".to_string(),
             recursion_depth: 0,
+            parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
             inherited_skills: vec![],
@@ -2728,6 +2771,80 @@ mod tests {
             reserialized.as_slice(),
             captured_canonical.as_slice(),
             "re-serialized prefix_messages must equal captured canonical bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_child_cannot_request_nested_prefix_inheritance() {
+        let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
+        let spawner = DynamicAgentSpawner::new(mock_router()).with_prefix_store(store.clone());
+        capture_parent_for(&*store, "run-fork-parent", TEST_CHILD_MODEL);
+
+        let mut ctx = parent_context("run-fork-parent");
+        ctx.parent_is_fork_child = true;
+
+        let result = spawner.spawn(child_with_inherit(false), &ctx).await;
+        match result {
+            Err(SpawnError::NestedForkInheritanceRejected) => {}
+            other => panic!("expected nested fork inheritance rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_child_can_still_spawn_fresh_child_without_inheritance() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let mut ctx = parent_context("run-fork-parent");
+        ctx.parent_is_fork_child = true;
+        let input = SpawnAgentInput {
+            description: "fresh child".into(),
+            prompt: "do unrelated work".into(),
+            agent_type: "explore".into(),
+            ..Default::default()
+        };
+
+        let result = spawner.spawn(input, &ctx).await;
+        assert!(
+            matches!(result, Ok(SpawnAgentOutput::Launched { .. })),
+            "fork children must still be able to spawn ordinary non-inheriting children: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inherited_prefix_expected_cache_read_tokens_uses_nonzero_estimate() {
+        let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
+        let exec = Arc::new(CapturingPrefixExecutor::new());
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_prefix_store(store.clone())
+            .with_executor(exec.clone() as Arc<dyn SpawnAgentExecutor>);
+        capture_parent_for(&*store, "run-parent-estimate", TEST_CHILD_MODEL);
+
+        let mut input = child_with_inherit(false);
+        input.run_in_background = false;
+        let _ = spawner
+            .spawn(input, &parent_context("run-parent-estimate"))
+            .await
+            .unwrap();
+
+        let inherited = exec.take_captured().unwrap().unwrap();
+        assert!(
+            inherited.expected_cache_read_tokens > 0,
+            "resolved fork children need a nonzero expected cache-read baseline"
+        );
+    }
+
+    #[test]
+    fn inherited_prefix_expected_cache_read_tokens_matches_canonical_prefix_size() {
+        let store = InMemoryPrefixStore::new();
+        capture_parent_for(&store, "run-parent-estimate-shape", TEST_CHILD_MODEL);
+        let prefix = store
+            .get_prefix("run-parent-estimate-shape")
+            .expect("capture must have persisted");
+
+        let expected = u64::try_from(prefix.size_bytes().div_ceil(4)).unwrap_or(u64::MAX);
+        assert_eq!(
+            estimate_cache_read_tokens(&prefix),
+            expected,
+            "cache-read estimate should be derived from the canonical serialized prefix once"
         );
     }
 }

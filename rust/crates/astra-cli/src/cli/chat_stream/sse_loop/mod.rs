@@ -276,6 +276,7 @@ pub(crate) async fn stream_chat_sse(
                 agent_id: root_agent_id.to_string(),
                 current_model: p.model.map(str::to_string),
                 recursion_depth: 0,
+                is_fork_child: false,
                 working_dir: project_root.clone(),
                 spawner: spawner.clone(),
                 inherited_permissions: p.perm_manager.inherited_permissions_for_child(false),

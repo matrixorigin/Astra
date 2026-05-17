@@ -41,6 +41,8 @@ pub struct SpawnAgentContext {
     pub current_model: Option<String>,
     /// Current nested agent/sub-run depth of the agent.
     pub recursion_depth: u8,
+    /// Whether this agent is already a fork child.
+    pub is_fork_child: bool,
     /// Working directory
     pub working_dir: PathBuf,
     /// The spawner instance
@@ -95,6 +97,7 @@ pub async fn handle_spawn_agent_tool(args: &Value, ctx: Option<&SpawnAgentContex
         parent_run_id: ctx.run_id.clone(),
         parent_agent_id: ctx.agent_id.clone(),
         recursion_depth: ctx.recursion_depth,
+        parent_is_fork_child: ctx.is_fork_child,
         working_dir: ctx.working_dir.clone(),
         inherited_permissions: Some(inherited_permissions),
         inherited_skills: ctx.active_skills.clone(),
@@ -552,6 +555,7 @@ mod tests {
             agent_id: "root-agent".into(),
             current_model: current_model.map(str::to_string),
             recursion_depth: 0,
+            is_fork_child: false,
             working_dir: PathBuf::from("."),
             spawner,
             inherited_permissions: InheritedPermissions::auto_approve(),
@@ -636,6 +640,27 @@ mod tests {
 
         assert!(result.contains("\"status\":\"completed\""), "{result}");
         assert_eq!(executor.take_captured_model(), None);
+    }
+
+    #[tokio::test]
+    async fn handle_spawn_agent_tool_rejects_nested_fork_inheritance() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor);
+        let mut ctx = test_spawn_context(spawner, Some("claude-test-model"));
+        ctx.is_fork_child = true;
+        let args = json!({
+            "description": "Nested fork",
+            "prompt": "Try to fork again",
+            "inherit_context": {}
+        });
+
+        let result = handle_spawn_agent_tool(&args, Some(&ctx)).await;
+
+        assert!(result.contains("\"status\":\"failed\""), "{result}");
+        assert!(
+            result.contains("Nested fork inheritance"),
+            "nested fork guard error should surface to the model: {result}"
+        );
     }
 
     #[tokio::test]

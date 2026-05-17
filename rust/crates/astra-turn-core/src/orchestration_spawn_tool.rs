@@ -92,7 +92,11 @@ pub struct SpawnAgentInput {
     /// spec instead of the whole tool call failing with a schema
     /// validation error. Proper JSON objects continue to parse as
     /// before.
-    #[serde(default, deserialize_with = "deserialize_inherit_prefix_lenient")]
+    #[serde(
+        default,
+        alias = "inherit_context",
+        deserialize_with = "deserialize_inherit_prefix_lenient"
+    )]
     pub inherit_prefix: Option<InheritPrefixSpec>,
 
     /// Optional task-complexity hint used to scale the default
@@ -527,6 +531,21 @@ pub fn spawn_agent_schema() -> serde_json::Value {
                                 "default": false
                             }
                         }
+                    },
+                    "inherit_context": {
+                        "type": "object",
+                        "description": "Alias for inherit_prefix. Prefer inherit_prefix in generated calls; accepted for product-facing P0 wording.",
+                        "properties": {
+                            "from_run_id": {
+                                "type": "string",
+                                "description": "Parent run id. Omit to use the caller's run."
+                            },
+                            "required": {
+                                "type": "boolean",
+                                "description": "If true, fail when the prefix is missing or incompatible. Default false.",
+                                "default": false
+                            }
+                        }
                     }
                 },
                 "required": ["description", "prompt"]
@@ -654,7 +673,66 @@ mod tests {
         let schema = spawn_agent_schema();
         let props = &schema["function"]["parameters"]["properties"];
         assert!(props["inherit_prefix"].is_object());
+        assert!(
+            props["inherit_context"].is_object(),
+            "schema must expose the product-facing inherit_context alias"
+        );
         assert!(props["max_output_tokens"].is_object());
+    }
+
+    #[test]
+    fn inherit_context_alias_populates_inherit_prefix() {
+        let json = r#"{
+            "description": "D",
+            "prompt": "P",
+            "inherit_context": {"required": true}
+        }"#;
+        let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
+        let spec = input
+            .inherit_prefix
+            .expect("inherit_context must opt into prefix inheritance");
+        assert!(spec.required);
+        assert_eq!(spec.from_run_id, None);
+    }
+
+    #[test]
+    fn inherit_context_conflicts_with_inherit_prefix() {
+        let err = serde_json::from_str::<SpawnAgentInput>(
+            r#"{
+                "description": "D",
+                "prompt": "P",
+                "inherit_prefix": {"required": false},
+                "inherit_context": {"required": true}
+            }"#,
+        )
+        .expect_err("ambiguous dual inheritance fields must fail");
+        assert!(
+            err.to_string().contains("duplicate field"),
+            "error should reject conflicting inheritance aliases as duplicate fields, got: {err}"
+        );
+    }
+
+    #[test]
+    fn inherit_context_alias_accepts_empty_object_string() {
+        let input: SpawnAgentInput =
+            serde_json::from_str(r#"{"description":"d","prompt":"p","inherit_context":"{}"}"#)
+                .unwrap();
+        let spec = input
+            .inherit_prefix
+            .expect("inherit_context alias should use the same lenient parser");
+        assert_eq!(spec.from_run_id, None);
+        assert!(!spec.required);
+    }
+
+    #[test]
+    fn inherit_context_alias_accepts_null() {
+        let input: SpawnAgentInput =
+            serde_json::from_str(r#"{"description":"d","prompt":"p","inherit_context":null}"#)
+                .unwrap();
+        assert!(
+            input.inherit_prefix.is_none(),
+            "null alias should behave like null inherit_prefix"
+        );
     }
 
     #[test]
