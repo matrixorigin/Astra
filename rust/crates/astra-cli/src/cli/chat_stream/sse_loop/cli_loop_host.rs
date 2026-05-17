@@ -231,6 +231,24 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             );
         }
 
+        // Pull mid-turn UI-staged mode pivots into `self.mode`. The
+        // user can press Shift+Tab while a turn is running; the TUI
+        // cannot borrow `perm_manager` then, so it writes the new
+        // mode through the lock-free mirror. Reading it here makes
+        // the new mode authoritative for this turn's schema and
+        // gating decisions. No-op when nothing was staged.
+        let mode_before = self.perm_manager.mode();
+        self.perm_manager.pull_mode_from_mirror();
+        let mode_after = self.perm_manager.mode();
+        if mode_before != mode_after {
+            state.push_volatile(
+                astra_runtime::turn::agentic_loop_host::VolatileKind::PlanModeMarker,
+                format!(
+                    "[mode={mode_after}] User pressed Shift+Tab; permission mode is now `{mode_after}`. Adjust your tool selection accordingly."
+                ),
+            );
+        }
+
         // Install the per-turn ask_user channel on the shared
         // ToolExecutor so tools that need a TUI overlay
         // (currently `exit_plan_mode` for the Approve / Keep
@@ -292,6 +310,23 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         state
             .restricted_tools
             .extend(interaction_scoped_restrictions.iter().cloned());
+
+        // Plan-mode restrictions follow the same turn-scoped pattern:
+        // computed at the start of the turn from the current
+        // perm_manager state, removed unconditionally at the end.
+        // Owning the lifecycle here (instead of inside
+        // `prepare_chat_turn_payload`) is what keeps the
+        // restrictions from leaking into later turns — regression
+        // for session 19298aea, where `extend` without a matching
+        // `remove` left `write_file` / `bash` permanently
+        // restricted after the model called `exit_plan_mode`.
+        let plan_scoped_restrictions = plan_mode_restriction_names(
+            self.perm_manager.mode() == crate::permission_manager::PermissionMode::Plan,
+            &self.all_schemas,
+        );
+        state
+            .restricted_tools
+            .extend(plan_scoped_restrictions.iter().cloned());
 
         // Propagate skill sandbox policy to the tool executor for this turn.
         // Saved/restored so it doesn't persist after the skill deactivates.
@@ -414,6 +449,9 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         .await;
 
         for name in &interaction_scoped_restrictions {
+            state.restricted_tools.remove(name);
+        }
+        for name in &plan_scoped_restrictions {
             state.restricted_tools.remove(name);
         }
 
@@ -833,6 +871,25 @@ fn assistant_text(message: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// Compute the set of tool names that plan mode wants hidden, based
+/// on the current turn's schema view. Pure: hand it the schemas the
+/// turn would have shown and the plan-active flag, get back the
+/// names to add to `restricted_tools` (empty when plan mode is off).
+///
+/// Centralised here so the `add at turn start, remove at turn end`
+/// flow is symmetric — see `apply_plan_mode_restrictions` /
+/// `clear_plan_mode_restrictions`. Mirrors the existing
+/// `interaction_scoped_tool_restrictions` lifecycle.
+fn plan_mode_restriction_names(plan_active: bool, schemas: &[serde_json::Value]) -> HashSet<String> {
+    if !plan_active {
+        return HashSet::new();
+    }
+    let registry = astra_turn_core::tool_categories::registry();
+    astra_turn_core::tool_schema_prune::plan_mode_restrictions(schemas, |name| {
+        registry.is_read_only(name)
+    })
+}
+
 fn looks_plan_shaped(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     // Markdown plan headers — strongest signal.
@@ -1150,5 +1207,122 @@ mod tests {
             "content": "Investigate the auth module"
         })];
         assert!(plan_mode_missed_exit_reminder(&messages).is_none());
+    }
+
+    // ── Plan-mode restriction lifecycle ─────────────────────────
+    //
+    // Regression for session 19298aea-06de-49bf-a1b5-2873c7e87b9e:
+    // the model entered plan mode, called `exit_plan_mode`, the
+    // overlay flipped perm_manager to Auto on the next turn — but
+    // `restricted_tools` had been `extend()`-ed with the plan-mode
+    // mutating tools and never cleared. The whole rest of the
+    // session, write_file / bash / str_replace stayed restricted,
+    // and the model was reduced to telling the user "please run
+    // these commands yourself".
+    //
+    // The contract the lifecycle helpers below pin: plan-mode
+    // restrictions are *turn-scoped* — added when the turn opens
+    // with plan-mode active, removed unconditionally when the turn
+    // ends. Same shape as `interaction_scoped_tool_restrictions`.
+
+    fn schema(name: &str) -> serde_json::Value {
+        serde_json::json!({"function": {"name": name}})
+    }
+
+    #[test]
+    fn plan_mode_restriction_names_lists_mutating_only_in_plan_mode() {
+        let schemas = vec![
+            schema("read_file"),
+            schema("grep"),
+            schema("write_file"),
+            schema("str_replace"),
+            schema("bash"),
+            schema("exit_plan_mode"),
+            schema("enter_plan_mode"),
+        ];
+        let plan_off = plan_mode_restriction_names(false, &schemas);
+        assert!(
+            plan_off.is_empty(),
+            "plan-mode restrictions must be empty when plan mode is off"
+        );
+
+        let plan_on = plan_mode_restriction_names(true, &schemas);
+        // Mutating tools restricted.
+        assert!(plan_on.contains("write_file"));
+        assert!(plan_on.contains("str_replace"));
+        assert!(plan_on.contains("bash"));
+        // Read-only and plan-control tools survive.
+        assert!(!plan_on.contains("read_file"));
+        assert!(!plan_on.contains("grep"));
+        assert!(!plan_on.contains("exit_plan_mode"));
+        assert!(!plan_on.contains("enter_plan_mode"));
+    }
+
+    #[test]
+    fn plan_mode_restrictions_are_cleared_after_turn_ends() {
+        // Simulates the per-turn lifecycle the host runs:
+        //   turn N: plan_active=true, add restrictions
+        //   turn N ends, restrictions removed
+        //   turn N+1: plan_active=false (user/agent exited plan
+        //             mode), restrictions empty so write_file flows
+        //             through normally.
+        let schemas = vec![
+            schema("read_file"),
+            schema("write_file"),
+            schema("bash"),
+            schema("exit_plan_mode"),
+        ];
+        let mut restricted: HashSet<String> = HashSet::new();
+
+        // Turn N: enter plan mode.
+        let plan_set = plan_mode_restriction_names(true, &schemas);
+        restricted.extend(plan_set.iter().cloned());
+        assert!(restricted.contains("write_file"));
+        assert!(restricted.contains("bash"));
+
+        // Turn N ends — host removes the names it added.
+        for name in &plan_set {
+            restricted.remove(name);
+        }
+        assert!(
+            restricted.is_empty(),
+            "after turn ends, plan-mode restrictions must be gone — they are turn-scoped, not session-scoped (regression: session 19298aea)"
+        );
+
+        // Turn N+1: plan mode off after exit_plan_mode → no restrictions.
+        let plan_off = plan_mode_restriction_names(false, &schemas);
+        restricted.extend(plan_off.iter().cloned());
+        assert!(
+            !restricted.contains("write_file"),
+            "next turn after exit_plan_mode must let write_file through"
+        );
+        assert!(
+            !restricted.contains("bash"),
+            "next turn after exit_plan_mode must let bash through"
+        );
+    }
+
+    #[test]
+    fn plan_mode_restrictions_do_not_clobber_caller_existing_entries() {
+        // The host shares `restricted_tools` between several lifecycle
+        // owners (interaction-scoped, plan-scoped, stall-scoped, etc.).
+        // Removing plan-scoped names must leave entries that other
+        // owners added in place.
+        let schemas = vec![schema("write_file"), schema("bash"), schema("read_file")];
+        let mut restricted: HashSet<String> = HashSet::new();
+        // Pretend an unrelated subsystem already restricted `ask_user`.
+        restricted.insert("ask_user".to_string());
+
+        let plan_set = plan_mode_restriction_names(true, &schemas);
+        restricted.extend(plan_set.iter().cloned());
+        for name in &plan_set {
+            restricted.remove(name);
+        }
+
+        assert!(
+            restricted.contains("ask_user"),
+            "plan-mode cleanup must not delete entries it never owned"
+        );
+        assert_eq!(restricted.len(), 1);
     }
 }

@@ -361,6 +361,56 @@ fn sensitive_path_match(args: &serde_json::Value) -> Option<String> {
 pub(super) use astra_turn_core::permission_types::PermissionMode;
 pub(super) use astra_turn_core::permission_types::PermissionRule;
 
+/// Atomic encoding of [`PermissionMode`] for the lock-free mirror
+/// the TUI inner-tick path consumes. Keeps the mapping local and
+/// stable; widening the enum requires updating both directions.
+fn encode_mode_for_mirror(mode: PermissionMode) -> u8 {
+    match mode {
+        PermissionMode::Prompt => 0,
+        PermissionMode::Auto => 1,
+        PermissionMode::Plan => 2,
+        PermissionMode::AcceptEdits => 3,
+        PermissionMode::Deny => 4,
+    }
+}
+
+fn decode_mode_for_mirror(value: u8) -> PermissionMode {
+    match value {
+        1 => PermissionMode::Auto,
+        2 => PermissionMode::Plan,
+        3 => PermissionMode::AcceptEdits,
+        4 => PermissionMode::Deny,
+        _ => PermissionMode::Prompt,
+    }
+}
+
+/// Read-only handle to the live permission mode held by a
+/// [`PermissionManager`]. Cheap to clone; cheap to read. Used by
+/// the status-line refresh path where the TUI can't borrow the
+/// manager while the agentic loop holds `&mut state`.
+#[derive(Clone, Debug)]
+pub(crate) struct PermissionModeMirror {
+    inner: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl PermissionModeMirror {
+    pub(crate) fn current(&self) -> PermissionMode {
+        decode_mode_for_mirror(self.inner.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Stage a new mode without borrowing the `PermissionManager`.
+    /// The owning manager picks this up on its next turn boundary
+    /// via [`PermissionManager::pull_mode_from_mirror`]. Used by
+    /// mid-turn Shift+Tab where the agentic loop holds `&mut state`
+    /// and the UI cannot reach the manager directly.
+    pub(crate) fn stage(&self, mode: PermissionMode) {
+        self.inner.store(
+            encode_mode_for_mirror(mode),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SideEffect {
     Read,
@@ -921,6 +971,14 @@ fn parse_rule_with_grammar_v2(s: &str) -> PermissionRule {
 
 pub(super) struct PermissionManager {
     mode: PermissionMode,
+    /// Atomic mirror of `mode` for read-only consumers that hold no
+    /// borrow of the `PermissionManager`. The TUI's inner-tick path
+    /// uses this to refresh the status-line chip while the agentic
+    /// loop holds `&mut state` — without this mirror, mid-turn
+    /// pivots (e.g. `exit_plan_mode` flipping Plan → Auto on the
+    /// next-turn boundary) would not reach the chip until the
+    /// outer select woke up. Updated atomically inside `set_mode`.
+    mode_mirror: std::sync::Arc<std::sync::atomic::AtomicU8>,
     session_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides,
     turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides,
     denial_tracker: astra_turn_core::approval_fingerprint::DenialTracker,
@@ -1115,6 +1173,31 @@ impl PermissionManager {
     /// Switch the permission mode at runtime (e.g., via `/allow` command).
     pub(super) fn set_mode(&mut self, mode: PermissionMode) {
         self.mode = mode;
+        self.mode_mirror
+            .store(encode_mode_for_mirror(mode), std::sync::atomic::Ordering::Release);
+    }
+
+    /// Hand out a cheap clone of the mode mirror so an external
+    /// observer (the TUI status line) can read the current mode
+    /// without holding any borrow of the `PermissionManager`.
+    /// The handle stays valid for the lifetime of the manager.
+    pub(super) fn mode_mirror_handle(&self) -> PermissionModeMirror {
+        PermissionModeMirror {
+            inner: std::sync::Arc::clone(&self.mode_mirror),
+        }
+    }
+
+    /// Re-sync `self.mode` from the atomic mirror. Used at turn
+    /// boundaries when a UI event (mid-turn Shift+Tab) wrote to the
+    /// mirror without being able to borrow `&mut self`. Cheap; no-op
+    /// when already in sync.
+    pub(super) fn pull_mode_from_mirror(&mut self) {
+        let mirror = decode_mode_for_mirror(
+            self.mode_mirror.load(std::sync::atomic::Ordering::Acquire),
+        );
+        if self.mode != mirror {
+            self.mode = mirror;
+        }
     }
 
     pub(super) fn set_active_session_id(&mut self, session_id: &str) {
@@ -1206,6 +1289,7 @@ impl PermissionManager {
         };
         Self {
             mode,
+            mode_mirror: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(encode_mode_for_mirror(mode))),
             session_overrides:
                 astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
             turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(
@@ -1337,6 +1421,7 @@ impl PermissionManager {
         let cached_user_deny = user_settings.parsed_deny_rules();
         Self {
             mode,
+            mode_mirror: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(encode_mode_for_mirror(mode))),
             session_overrides:
                 astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
             turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(
@@ -1429,6 +1514,7 @@ impl PermissionManager {
 
         Self {
             mode,
+            mode_mirror: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(encode_mode_for_mirror(mode))),
             session_overrides,
             turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(
             ),
@@ -7298,5 +7384,74 @@ mod tests {
             Some(astra_thin_client::ApprovalDecision::Allow),
             "quiet + session override must Allow; got {decision:?}"
         );
+    }
+
+    // ── Mode mirror lifecycle ──────────────────────────────────
+    //
+    // The mirror lets the TUI inner-tick path read the live mode
+    // and lets mid-turn Shift+Tab stage a new mode while the
+    // agentic loop holds `&mut state`. These tests pin both
+    // directions of the contract.
+
+    #[test]
+    fn mode_mirror_reflects_set_mode() {
+        let mut pm = PermissionManager::new(false);
+        let mirror = pm.mode_mirror_handle();
+        assert_eq!(mirror.current(), PermissionMode::Prompt);
+
+        pm.set_mode(PermissionMode::Plan);
+        assert_eq!(
+            mirror.current(),
+            PermissionMode::Plan,
+            "set_mode must publish to the mirror so chip readers see it instantly"
+        );
+
+        pm.set_mode(PermissionMode::Auto);
+        assert_eq!(mirror.current(), PermissionMode::Auto);
+    }
+
+    #[test]
+    fn mode_mirror_stage_then_pull_round_trips() {
+        // Mid-turn Shift+Tab path: TUI calls stage() while the
+        // agentic loop holds &mut state. The host calls
+        // pull_mode_from_mirror() at the next turn boundary, and
+        // self.mode catches up.
+        let mut pm = PermissionManager::new(false);
+        let mirror = pm.mode_mirror_handle();
+        assert_eq!(pm.mode(), PermissionMode::Prompt);
+
+        mirror.stage(PermissionMode::Plan);
+        // pm.mode() hasn't been pulled yet — the field still holds Prompt.
+        assert_eq!(
+            pm.mode(),
+            PermissionMode::Prompt,
+            "stage alone must not mutate self.mode; the host must pull explicitly"
+        );
+
+        pm.pull_mode_from_mirror();
+        assert_eq!(
+            pm.mode(),
+            PermissionMode::Plan,
+            "pull_mode_from_mirror must adopt the staged mode"
+        );
+    }
+
+    #[test]
+    fn mode_mirror_pull_is_noop_when_already_in_sync() {
+        let mut pm = PermissionManager::new(false);
+        // Without any stage(), pull is a no-op and leaves state
+        // untouched. Idempotent.
+        pm.pull_mode_from_mirror();
+        assert_eq!(pm.mode(), PermissionMode::Prompt);
+    }
+
+    #[test]
+    fn mode_mirror_handle_is_clonable_and_independent() {
+        let pm = PermissionManager::new(false);
+        let h1 = pm.mode_mirror_handle();
+        let h2 = pm.mode_mirror_handle();
+        // Both handles see the same mirror.
+        h1.stage(PermissionMode::Auto);
+        assert_eq!(h2.current(), PermissionMode::Auto);
     }
 }

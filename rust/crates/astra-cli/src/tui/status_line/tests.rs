@@ -89,12 +89,12 @@ fn auto_mode_renders_yellow_chip() {
         ..ctx()
     };
     let s = StatusLine::from_context(&c);
-    assert!(s.plain().contains("⚡auto"));
+    assert!(s.plain().contains("auto"));
     // The chip should carry a yellow style to draw the eye.
     let chip = s
         .left
         .iter()
-        .find(|seg| seg.text.contains("⚡auto"))
+        .find(|seg| seg.text== "auto")
         .expect("auto chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Yellow));
 }
@@ -109,7 +109,7 @@ fn accept_edits_mode_renders_cyan_chip() {
     let chip = s
         .left
         .iter()
-        .find(|seg| seg.text.contains("✎edit"))
+        .find(|seg| seg.text== "edit")
         .expect("accept_edits chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Cyan));
 }
@@ -124,7 +124,7 @@ fn plan_mode_renders_blue_chip() {
     let chip = s
         .left
         .iter()
-        .find(|seg| seg.text.contains("🔍plan"))
+        .find(|seg| seg.text == "plan")
         .expect("plan chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Blue));
 }
@@ -139,7 +139,7 @@ fn deny_mode_renders_red_chip() {
     let chip = s
         .left
         .iter()
-        .find(|seg| seg.text.contains("⛔deny"))
+        .find(|seg| seg.text== "deny")
         .expect("deny chip");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Red));
 }

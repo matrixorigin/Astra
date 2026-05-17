@@ -534,6 +534,12 @@ pub(crate) async fn run_tui_repl(
         bottom_pane.footer.session_id = Some(sid[..8.min(sid.len())].to_string());
     }
     bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
+    // Lock-free observer of `perm_manager.mode()` so the inner-tick
+    // path can refresh the status-line chip while the agentic loop
+    // holds `&mut state`. Without this, mid-turn pivots
+    // (`exit_plan_mode` flipping Plan → Auto on the next-turn
+    // boundary) only land on screen when the outer select wakes up.
+    let perm_mode_mirror = state.perm_manager.mode_mirror_handle();
 
     // Load skill items for $ mention popup
     {
@@ -1402,6 +1408,33 @@ pub(crate) async fn run_tui_repl(
                                                 Some(tev) = event_stream.next() => {
                                                     match tev {
                                                         TuiEvent::Key(k) => {
+                                                            // Shift+Tab cycles permission mode mid-turn.
+                                                            // The current turn keeps running with the
+                                                            // schema it was assembled with (Invariant
+                                                            // I8); only the next turn picks up the new
+                                                            // mode. We refresh the chip via the lock-free
+                                                            // mirror so the user sees the pivot land
+                                                            // immediately.
+                                                            if k.code == crossterm::event::KeyCode::BackTab {
+                                                                let next_mode = slash_dispatch::next_permission_mode_for_cycle(
+                                                                    perm_mode_mirror.current(),
+                                                                );
+                                                                // Mid-turn: agentic loop holds &mut state, so we
+                                                                // cannot borrow perm_manager. Stage on the
+                                                                // mirror; the host calls pull_mode_from_mirror
+                                                                // at the next turn boundary so `self.mode`
+                                                                // catches up.
+                                                                perm_mode_mirror.stage(next_mode);
+                                                                bottom_pane.footer.permission_mode =
+                                                                    Some(format!("{}", next_mode));
+                                                                chat_widget.commit_system(
+                                                                    history_cell::system::SystemCell::response(
+                                                                        slash_dispatch::permission_mode_feedback(next_mode),
+                                                                    ),
+                                                                );
+                                                                frame_requester.schedule_frame();
+                                                                continue;
+                                                            }
                                                             // Ctrl+B: foreground bash → background promotion.
                                                             // If a bash invocation is currently in flight and
                                                             // listening on the detach signal, fire it: the
@@ -1836,6 +1869,18 @@ pub(crate) async fn run_tui_repl(
                                                     let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                                 }
                                                 _ = &mut itick => {
+                                                    // Refresh the permission-mode chip via the
+                                                    // lock-free mirror — the agentic loop holds
+                                                    // `&mut state` so reading `state.perm_manager`
+                                                    // here would clash. Catches turn-boundary
+                                                    // pivots (e.g. exit_plan_mode → Auto) within
+                                                    // one inner tick.
+                                                    let live_mode = format!("{}", perm_mode_mirror.current());
+                                                    if bottom_pane.footer.permission_mode.as_deref()
+                                                        != Some(live_mode.as_str())
+                                                    {
+                                                        bottom_pane.footer.permission_mode = Some(live_mode);
+                                                    }
                                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                                     let frame = active_viewport(
                                         &chat_widget,

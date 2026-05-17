@@ -23,12 +23,16 @@ pub(crate) enum PermissionMode {
 
 impl PermissionMode {
     pub fn chip_text(self) -> &'static str {
+        // Plain words — emojis varied wildly across themes and got
+        // flagged as visually noisy ("🔍" and "✎" never landed). The
+        // chip's colour already carries the urgency signal: blue for
+        // plan, cyan for edit, yellow for auto, red for deny.
         match self {
             Self::Ask => "default",
-            Self::Auto => "⚡auto",
-            Self::Plan => "🔍plan",
-            Self::AcceptEdits => "✎edit",
-            Self::Deny => "⛔deny",
+            Self::Auto => "auto",
+            Self::Plan => "plan",
+            Self::AcceptEdits => "edit",
+            Self::Deny => "deny",
         }
     }
 }
@@ -163,6 +167,14 @@ impl StatusLine {
                 ));
             }
         }
+
+        // Hint that the chip itself is the cycle anchor — without
+        // this the user has no surface clue that ⇧Tab moves between
+        // modes (the previous global "⇧Tab mode" hint was deleted
+        // for being repetitive and unanchored). Dim so it reads as
+        // metadata of the chip, not an action of its own.
+        out.left
+            .push(Segment::styled("⇧Tab", dim));
 
         if ctx.pending_approvals > 0 {
             let text = if ctx.pending_approvals == 1 {

@@ -531,24 +531,13 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         );
     }
 
-    // Plan mode: hide every mutating tool from the model. Read-only tools
-    // and the dedicated plan-control tools (`enter_plan_mode` /
-    // `exit_plan_mode`) stay in the schema so the model can investigate
-    // and surface a plan via `exit_plan_mode(plan="...")`.
-    //
-    // We push the names into `restricted_tools` instead of trimming
-    // `turn_schemas` directly so the existing
-    // `attach_filtered_edge_tools` path is the single source of truth
-    // for what reaches the wire — selector hints, skill injection, and
-    // plan-mode all funnel through the same exclusion set.
-    if ctx.plan_mode_active {
-        let category_registry = astra_turn_core::tool_categories::registry();
-        let plan_excluded = astra_turn_core::tool_schema_prune::plan_mode_restrictions(
-            &turn_schemas,
-            |name| category_registry.is_read_only(name),
-        );
-        ctx.restricted_tools.extend(plan_excluded);
-    }
+    // Plan-mode tool restrictions are owned by the host
+    // (`CliAgenticLoopHost::execute_turn`) using the same
+    // turn-scoped add-then-remove pattern as
+    // `interaction_scoped_tool_restrictions`. Doing it here as a
+    // raw `extend` on the shared `state.restricted_tools` set
+    // leaked names into later turns — see the regression note on
+    // session 19298aea in `cli_loop_host::plan_mode_restriction_names`.
 
     let selected_tool_costs: Vec<(String, u32)> = selection_report
         .tools_selected
