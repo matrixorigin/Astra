@@ -38,6 +38,7 @@ use astra_tools::{
 };
 use async_trait::async_trait;
 
+use crate::orchestration::AgentToolContext;
 use crate::tool_sandbox::{
     IsolatedOutput, IsolationConfig, SandboxMode, SandboxPolicy, ToolTier, effective_tier,
     execute_isolated, filter_environment,
@@ -918,6 +919,8 @@ pub struct ServerToolExecutor {
     /// deferred activation reaches plugin tools. Populated by the server
     /// loop host once MCP servers have been refreshed.
     plugin_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
+    /// Shared dynamic-agent tool context for `agent.spawn/get_result`.
+    agent_tool_context: Option<AgentToolContext>,
 }
 
 /// Snapshot used by the plan-mode write guard and the system-prompt
@@ -1002,6 +1005,7 @@ impl ServerToolExecutor {
             plan_mode_cache: Arc::new(tokio::sync::RwLock::new(PlanModeSnapshot::default())),
             plan_resume_hint_handle: None,
             plugin_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
+            agent_tool_context: None,
         }
     }
 
@@ -1082,6 +1086,11 @@ impl ServerToolExecutor {
 
     pub fn set_context_manifest_pool(&mut self, pool: SharedPool) {
         self.context_manifest_pool = Some(pool);
+    }
+
+    /// Attach the shared dynamic-agent tool context.
+    pub fn set_agent_tool_context(&mut self, ctx: AgentToolContext) {
+        self.agent_tool_context = Some(ctx);
     }
 
     async fn server_run_script(&self, args: &Value) -> astra_tools::ToolResult {
@@ -1994,27 +2003,33 @@ impl ServerToolExecutor {
                          the engine.".to_string(),
                     ),
                     "run_chain" => self.default_executor.execute("run_chain", args).await,
+                    "spawn" | "get_result" | "send_message" => tool_result_from_output(
+                        crate::orchestration::handle_agent_tool(
+                            args,
+                            self.agent_tool_context.as_ref(),
+                        )
+                        .await,
+                    ),
                     other if other.is_empty() && args.get("spawn").is_some() => {
                         tool_result_from_output(
-                            "Error: invalid agent call shape. Use the top-level \
-                             `action='spawn'` field, not a `spawn` wrapper key. \
-                             Example: agent(action='spawn', description='...', prompt='...')."
-                                .to_string(),
+                            crate::orchestration::handle_agent_tool(
+                                args,
+                                self.agent_tool_context.as_ref(),
+                            )
+                            .await,
                         )
                     }
                     other if other.is_empty() && args.get("agents").is_some() => {
                         tool_result_from_output(
-                            "Error: unsupported `agents` batch payload for `agent`. \
-                             Each `agent(action='spawn', ...)` call launches exactly one \
-                             child. To fan out in parallel, emit N separate spawn calls \
-                             in a single assistant message."
-                                .to_string(),
+                            crate::orchestration::handle_agent_tool(
+                                args,
+                                self.agent_tool_context.as_ref(),
+                            )
+                            .await,
                         )
                     }
                     other => tool_result_from_output(format!(
-                        "Unknown agent action: '{other}'. Use: spawn, get_result, run_chain. \
-                         (Server-side execution does not handle spawn/get_result here — \
-                         those route through the agent_spawning module on the CLI/edge side.)"
+                        "Unknown agent action: '{other}'. Use: spawn, get_result, run_chain."
                     )),
                 }
             }
@@ -4949,6 +4964,61 @@ esac
                 "publish_current_workspace(\"server_tool_executor:rollback_session_state\")"
             ),
             "rollback_session_state should publish remote workspace artifacts after local restore"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_spawn_without_context_uses_shared_hard_error() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute_with_metadata(
+                "agent",
+                &json!({
+                    "action": "spawn",
+                    "description": "Review code",
+                    "prompt": "Review the current diff"
+                }),
+            )
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        let value: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(value["status"], "failed");
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Agent spawning not available"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_spawn_wrapper_rejection_comes_from_shared_handler() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute_with_metadata(
+                "agent",
+                &json!({
+                    "spawn": {
+                        "description": "Review code",
+                        "prompt": "Review the current diff"
+                    }
+                }),
+            )
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        let value: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(value["status"], "failed");
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("top-level `action='spawn'`"),
+            "{}",
+            result.output
         );
     }
 

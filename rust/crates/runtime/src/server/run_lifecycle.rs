@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use astra_core::{ErrorResponse, SharedPool, connect_matrixone, error_response};
-use astra_services::EdgeContext;
+use astra_services::coordination::{AgentProfile, AgentTier};
 use astra_services::runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunRecord,
     RunInputData, RunInputRecord, RunLifecycleService, RunListRecord, RunMutationRecord,
@@ -38,11 +38,16 @@ use astra_services::skills::SkillService;
 use astra_services::{
     DatabaseContextManifestStore, DatabaseStateProjectionStore, RetrievalStage, StateItemUpsert,
 };
+use astra_services::{EdgeContext, LlmTokenServiceConfig};
 use sqlx::Row;
 
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 use crate::observability_integration::ObservabilityHub;
+use crate::orchestration::{
+    AgentToolContext, DynamicAgentSpawner, InheritedPermissions, ProgressBroadcaster,
+    SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult,
+};
 use crate::turn::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CancellationState,
     ContextTracePersistenceContext, EvaluationPersistenceContext, MessagingState,
@@ -1781,6 +1786,28 @@ struct RunState {
     waiting_for: Option<String>,
 }
 
+#[derive(Clone)]
+struct ServerAgentSpawnerEntry {
+    spawner: Arc<DynamicAgentSpawner>,
+    executor: Arc<ServerSpawnAgentExecutor>,
+}
+
+#[derive(Clone)]
+struct ServerSpawnRuntimeContext {
+    parent_run_id: String,
+    user_id: String,
+    session_id: String,
+    forward_headers: HashMap<String, String>,
+    llm_token_service: Option<LlmTokenServiceConfig>,
+    request_constraints: RequestConstraints,
+    pause_flag: Option<Arc<AtomicBool>>,
+    cancel_token: Option<Arc<CancellationToken>>,
+    #[cfg(feature = "bridge-e2e-hooks")]
+    test_child_llm_rounds: Vec<Value>,
+    #[cfg(feature = "harness")]
+    harness_sink: Option<Arc<dyn astra_harness::SnapshotSink>>,
+}
+
 // ─── Service ────────────────────────────────────────────────────────────────
 
 /// Production [`RunLifecycleService`] that executes agentic loops via
@@ -1802,6 +1829,14 @@ pub struct AgenticRunLifecycleService {
     run_engine: Option<RunEngine>,
     /// Optional delegation engine for multi-agent coordination.
     delegation_engine: Option<Arc<crate::server::delegation_engine::DelegationEngine>>,
+    /// Session-scoped dynamic-agent spawners used by Web/server `agent.spawn`.
+    server_agent_spawners: Arc<RwLock<HashMap<String, ServerAgentSpawnerEntry>>>,
+    /// Fallback progress broadcaster for dynamic spawn when no delegation
+    /// engine is configured. Normal production wiring uses the delegation
+    /// engine broadcaster so Web SSE sees one agent tree stream.
+    server_agent_progress_broadcaster: Arc<ProgressBroadcaster>,
+    /// Shared mailbox router for Web/server dynamic spawned agents.
+    server_agent_mailbox_router: Arc<astra_messaging::router::AgentMailboxRouter>,
     /// Per-user resource governor (Phase 5).
     resource_governor:
         Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
@@ -1855,6 +1890,12 @@ impl AgenticRunLifecycleService {
             edge_callback_ledger,
             run_engine: None,
             delegation_engine: None,
+            server_agent_spawners: Arc::new(RwLock::new(HashMap::new())),
+            server_agent_progress_broadcaster: Arc::new(ProgressBroadcaster::default()),
+            server_agent_mailbox_router: Arc::new(astra_messaging::AgentMailboxRouter::new(
+                Arc::new(astra_messaging::InProcessTransport::new()),
+                Arc::new(crate::server::delegation_engine::DelegationTracker::new()),
+            )),
             resource_governor: None,
             edge_connection_pool: None,
             skill_service: None,
@@ -1949,6 +1990,138 @@ impl AgenticRunLifecycleService {
     ) -> Self {
         self.auxiliary_event_writer = Some(writer);
         self
+    }
+
+    fn dynamic_agent_progress_broadcaster(&self) -> Arc<ProgressBroadcaster> {
+        self.delegation_engine
+            .as_ref()
+            .and_then(|engine| engine.progress_broadcaster().cloned())
+            .unwrap_or_else(|| Arc::clone(&self.server_agent_progress_broadcaster))
+    }
+
+    async fn server_agent_spawner_for_session(&self, session_id: &str) -> ServerAgentSpawnerEntry {
+        if let Some(entry) = self
+            .server_agent_spawners
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+        {
+            return entry;
+        }
+
+        let mut guard = self.server_agent_spawners.write().await;
+        if let Some(entry) = guard.get(session_id).cloned() {
+            return entry;
+        }
+
+        let executor = Arc::new(
+            ServerSpawnAgentExecutor::new(
+                self.matrixone.clone(),
+                Arc::clone(&self.encryptor),
+                Arc::clone(&self.edge_callback_ledger),
+            )
+            .with_pool(self.shared_pool.clone())
+            .with_edge_connection_pool(self.edge_connection_pool.clone())
+            .with_skill_service(self.skill_service.clone())
+            .with_memory_extraction_service(self.memory_extraction_service.clone()),
+        );
+        let executor_for_spawner: Arc<dyn SpawnAgentExecutor> = executor.clone();
+        let mut spawner = DynamicAgentSpawner::with_broadcaster(
+            Arc::clone(&self.server_agent_mailbox_router),
+            self.dynamic_agent_progress_broadcaster(),
+        )
+        .with_executor(executor_for_spawner)
+        .with_session(session_id.to_string());
+        if let Some(store) = self
+            .delegation_engine
+            .as_ref()
+            .and_then(|engine| engine.prefix_store().cloned())
+        {
+            spawner = spawner.with_prefix_store(store);
+        }
+
+        let entry = ServerAgentSpawnerEntry {
+            spawner: Arc::new(spawner),
+            executor,
+        };
+        guard.insert(session_id.to_string(), entry.clone());
+        entry
+    }
+
+    fn request_constraints_from_request(request: &ChatRequestData) -> RequestConstraints {
+        RequestConstraints::new(
+            normalize_request_allowlist(request.allow_tools.as_deref(), "allow_tools")
+                .expect("request allow_tools should be validated before state build"),
+            normalize_request_allowlist(request.allow_skills.as_deref(), "allow_skills")
+                .expect("request allow_skills should be validated before state build"),
+        )
+    }
+
+    fn inherited_permissions_from_constraints(
+        constraints: &RequestConstraints,
+    ) -> InheritedPermissions {
+        let mut inherited = InheritedPermissions::auto_approve();
+        inherited.allowed_tools = constraints.allowed_tools.clone();
+        inherited
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn wire_server_dynamic_agent_tools(
+        &self,
+        executor: &mut super::server_tool_executor::ServerToolExecutor,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        request: &ChatRequestData,
+        workspace: &std::path::Path,
+        pause_flag: Option<Arc<AtomicBool>>,
+        cancel_token: Option<Arc<CancellationToken>>,
+        #[cfg(feature = "harness")] harness_sink: Option<Arc<dyn astra_harness::SnapshotSink>>,
+    ) {
+        let entry = self.server_agent_spawner_for_session(session_id).await;
+        let request_constraints = Self::request_constraints_from_request(request);
+        entry
+            .executor
+            .set_runtime_context(ServerSpawnRuntimeContext {
+                parent_run_id: run_id.to_string(),
+                user_id: user_id.to_string(),
+                session_id: session_id.to_string(),
+                forward_headers: request.forward_headers.clone(),
+                llm_token_service: request.llm_token_service.clone(),
+                request_constraints: request_constraints.clone(),
+                pause_flag,
+                cancel_token,
+                #[cfg(feature = "bridge-e2e-hooks")]
+                test_child_llm_rounds: request
+                    .context
+                    .as_ref()
+                    .and_then(|ctx| ctx.get("test_spawn_child_llm_rounds"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+                #[cfg(feature = "harness")]
+                harness_sink,
+            })
+            .await;
+
+        let agent_id = request
+            .agent_id
+            .clone()
+            .unwrap_or_else(|| "root-agent".to_string());
+        executor.set_agent_tool_context(AgentToolContext {
+            run_id: run_id.to_string(),
+            agent_id,
+            current_model: request.model.clone(),
+            recursion_depth: 0,
+            working_dir: workspace.to_path_buf(),
+            spawner: entry.spawner,
+            inherited_permissions: Self::inherited_permissions_from_constraints(
+                &request_constraints,
+            ),
+            active_skills: Vec::new(),
+            live_event_sink: None,
+        });
     }
 
     fn build_csl_store(&self) -> Option<Arc<dyn astra_turn_core::conversation_log::CslStore>> {
@@ -2499,11 +2672,10 @@ impl AgenticRunLifecycleService {
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
         }
-        // Wire progress broadcaster from delegation engine for SSE agent tree events
+        // Wire one shared agent-progress broadcaster for delegation and
+        // dynamic `agent.spawn` trees so Web SSE observes a single lineage.
+        builder = builder.with_progress_broadcaster(self.dynamic_agent_progress_broadcaster());
         if let Some(ref de) = self.delegation_engine {
-            if let Some(broadcaster) = de.progress_broadcaster() {
-                builder = builder.with_progress_broadcaster(Arc::clone(broadcaster));
-            }
             // G2: share the delegation engine's fork-prefix store with
             // the parent loop host so `on_turn_completed` captures land
             // in the same store the delegate path reads from. Without
@@ -3122,7 +3294,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 self.shared_pool.as_ref().map(|p| p.get().clone()),
             );
             let mut executor = super::server_tool_executor::ServerToolExecutor::new(
-                workspace,
+                workspace.clone(),
                 user_id.clone(),
                 session_id.clone(),
                 memoria_base,
@@ -3164,6 +3336,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             if let Some(writer) = self.auxiliary_event_writer.clone() {
                 executor.set_auxiliary_event_writer(writer);
             }
+
+            self.wire_server_dynamic_agent_tools(
+                &mut executor,
+                &user_id,
+                &session_id,
+                &run_id,
+                &request,
+                workspace.as_path(),
+                Some(pause_flag.clone()),
+                Some(llm_cancel_token.clone()),
+                #[cfg(feature = "harness")]
+                loop_state.harness.sink.clone(),
+            )
+            .await;
 
             // ── Phase E: Wire WebSocket approval gate ───────────────
             let (approval_tx, approval_rx) = mpsc::unbounded_channel();
@@ -3574,7 +3760,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 self.shared_pool.as_ref().map(|p| p.get().clone()),
             );
             let mut executor = super::server_tool_executor::ServerToolExecutor::new(
-                workspace,
+                workspace.clone(),
                 user_id.clone(),
                 session_id.clone(),
                 memoria_base,
@@ -3610,6 +3796,19 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             if let Some(writer) = self.auxiliary_event_writer.clone() {
                 executor.set_auxiliary_event_writer(writer);
             }
+            self.wire_server_dynamic_agent_tools(
+                &mut executor,
+                &user_id,
+                &session_id,
+                &run_id,
+                &request,
+                workspace.as_path(),
+                Some(pause_flag.clone()),
+                Some(llm_cancel_token.clone()),
+                #[cfg(feature = "harness")]
+                state.harness.sink.clone(),
+            )
+            .await;
             state.server_tool_executor = Some(std::sync::Arc::new(executor));
         }
 
@@ -4292,6 +4491,281 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
 use crate::server::delegation_engine::{SubRunConfig, SubRunExecutor};
 
+/// Server-side executor for dynamic `agent.spawn` children.
+///
+/// It reuses the production sub-run loop executor so Web dynamic agents run
+/// with the same server host, tool backend, skill resolver, memory plumbing,
+/// and observe-only harness path as delegated children. Spawn-specific
+/// semantics stay in `DynamicAgentSpawner` and `agent_tool`.
+pub struct ServerSpawnAgentExecutor {
+    matrixone: MatrixOneSettings,
+    encryptor: Arc<FernetTokenEncryptor>,
+    shared_pool: Option<SharedPool>,
+    edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
+    edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
+    skill_service: Option<Arc<dyn SkillService>>,
+    memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    runtime_contexts: Arc<RwLock<HashMap<String, ServerSpawnRuntimeContext>>>,
+}
+
+impl ServerSpawnAgentExecutor {
+    pub fn new(
+        matrixone: MatrixOneSettings,
+        encryptor: Arc<FernetTokenEncryptor>,
+        edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
+    ) -> Self {
+        Self {
+            matrixone,
+            encryptor,
+            shared_pool: None,
+            edge_callback_ledger,
+            edge_connection_pool: None,
+            skill_service: None,
+            memory_extraction_service: None,
+            runtime_contexts: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn with_pool(mut self, pool: Option<SharedPool>) -> Self {
+        self.shared_pool = pool;
+        self
+    }
+
+    pub fn with_edge_connection_pool(
+        mut self,
+        pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
+    ) -> Self {
+        self.edge_connection_pool = pool;
+        self
+    }
+
+    pub fn with_skill_service(mut self, service: Option<Arc<dyn SkillService>>) -> Self {
+        self.skill_service = service;
+        self
+    }
+
+    pub fn with_memory_extraction_service(
+        mut self,
+        svc: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    ) -> Self {
+        self.memory_extraction_service = svc;
+        self
+    }
+
+    async fn set_runtime_context(&self, context: ServerSpawnRuntimeContext) {
+        self.runtime_contexts
+            .write()
+            .await
+            .insert(context.parent_run_id.clone(), context);
+    }
+
+    async fn runtime_context_for_config(
+        &self,
+        config: &SpawnRunConfig,
+    ) -> Result<ServerSpawnRuntimeContext, String> {
+        let parent_run_id = config
+            .parent_address
+            .as_ref()
+            .map(|address| address.run_id.as_str())
+            .ok_or_else(|| {
+                "server dynamic agent executor requires parent run lineage".to_string()
+            })?;
+
+        self.runtime_contexts
+            .read()
+            .await
+            .get(parent_run_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "server dynamic agent executor has no runtime context for parent run {parent_run_id}"
+                )
+            })
+    }
+
+    fn build_subrun_executor(&self) -> ServerSubRunExecutor {
+        let mut executor = ServerSubRunExecutor::new(
+            self.matrixone.clone(),
+            Arc::clone(&self.encryptor),
+            Arc::clone(&self.edge_callback_ledger),
+        );
+        if let Some(pool) = self.shared_pool.clone() {
+            executor = executor.with_pool(pool);
+        }
+        if let Some(pool) = self.edge_connection_pool.clone() {
+            executor = executor.with_edge_connection_pool(pool);
+        }
+        if let Some(service) = self.skill_service.clone() {
+            executor = executor.with_skill_service(service);
+        }
+        if let Some(svc) = self.memory_extraction_service.clone() {
+            executor = executor.with_memory_extraction_service(svc);
+        }
+        executor
+    }
+}
+
+fn spawn_child_request_constraints(
+    parent: &RequestConstraints,
+    config: &SpawnRunConfig,
+) -> RequestConstraints {
+    let child_allowed = if config.allowed_tools.iter().any(|tool| tool == "*") {
+        if config.read_only {
+            Some(
+                ["bash", "glob", "grep", "list_dir", "read_file"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<HashSet<_>>(),
+            )
+        } else {
+            None
+        }
+    } else {
+        Some(
+            config
+                .allowed_tools
+                .iter()
+                .map(|tool| tool.trim().to_ascii_lowercase())
+                .filter(|tool| !tool.is_empty())
+                .collect::<HashSet<_>>(),
+        )
+    };
+
+    let allowed_tools = match (&parent.allowed_tools, child_allowed) {
+        (Some(parent), Some(child)) => Some(parent.intersection(&child).cloned().collect()),
+        (Some(parent), None) => Some(parent.clone()),
+        (None, Some(child)) => Some(child),
+        (None, None) => None,
+    };
+
+    RequestConstraints::new(allowed_tools, parent.allowed_skills.clone())
+}
+
+fn spawn_system_prompt(config: &SpawnRunConfig) -> String {
+    if config.system_prompt_addendum.trim().is_empty() {
+        format!(
+            "You are '{}', a specialized sub-agent. Complete the task thoroughly.",
+            config.agent_id
+        )
+    } else {
+        format!(
+            "You are '{}', a specialized sub-agent.\n\n{}\n\nComplete the task thoroughly.",
+            config.agent_id, config.system_prompt_addendum
+        )
+    }
+}
+
+fn spawn_status_to_finish_reason(status: &str) -> &'static str {
+    match status {
+        STATUS_COMPLETED => "normal",
+        STATUS_WAITING => "waiting",
+        STATUS_CANCELLED => "cancelled",
+        STATUS_FAILED => "failed",
+        STATUS_PAUSED => "paused",
+        _ => "unknown",
+    }
+}
+
+#[async_trait]
+impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
+    async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+        let context = self.runtime_context_for_config(&config).await?;
+
+        let mut profile =
+            AgentProfile::new(&config.agent_id, &config.agent_type, AgentTier::System);
+        profile.system_prompt = Some(spawn_system_prompt(&config));
+        profile.model_override = Some(config.model.clone());
+        profile.skill_filter = config.allowed_tools.clone();
+        profile.metadata.insert(
+            "spawn_agent_type".to_string(),
+            json!(config.agent_type.clone()),
+        );
+        profile
+            .metadata
+            .insert("spawn_read_only".to_string(), json!(config.read_only));
+
+        let mut subrun_context = HashMap::new();
+        subrun_context.insert(
+            "workspace_root".to_string(),
+            json!(config.working_dir.to_string_lossy().to_string()),
+        );
+        subrun_context.insert(
+            "cwd".to_string(),
+            json!(config.working_dir.to_string_lossy().to_string()),
+        );
+        subrun_context.insert("spawn_agent_id".to_string(), json!(config.agent_id.clone()));
+        subrun_context.insert(
+            "spawn_agent_type".to_string(),
+            json!(config.agent_type.clone()),
+        );
+
+        let request_constraints =
+            spawn_child_request_constraints(&context.request_constraints, &config);
+        let subrun = SubRunConfig {
+            run_id: config.run_id.clone(),
+            agent_profile: profile,
+            task: config.task.clone(),
+            session_id: context.session_id.clone(),
+            user_id: context.user_id.clone(),
+            previous_output: None,
+            context: subrun_context,
+            forward_headers: context.forward_headers.clone(),
+            llm_token_service: context.llm_token_service.clone(),
+            request_constraints,
+            recursion_depth: config.recursion_depth,
+            pause_flag: context.pause_flag.clone(),
+            checkpoint_gate: None,
+            mailbox: config.mailbox,
+            cancel_token: context.cancel_token.clone(),
+            inherited_prefix: config.inherited_prefix,
+            #[cfg(feature = "harness")]
+            harness_sink: context.harness_sink.clone(),
+        };
+
+        let executor = self.build_subrun_executor();
+        #[cfg(feature = "bridge-e2e-hooks")]
+        let executor = if !context.test_child_llm_rounds.is_empty() {
+            executor.with_test_llm_rounds(context.test_child_llm_rounds.clone())
+        } else {
+            executor
+        };
+        let result = executor.execute(subrun).await?;
+        let finish_reason = spawn_status_to_finish_reason(&result.status).to_string();
+        let status = match result.status.as_str() {
+            STATUS_COMPLETED => "completed",
+            STATUS_WAITING => "waiting",
+            STATUS_CANCELLED => "cancelled",
+            STATUS_FAILED => "failed",
+            STATUS_PAUSED => "completed",
+            _ => "failed",
+        }
+        .to_string();
+        let error = if status == "failed" {
+            result
+                .error
+                .or_else(|| Some(format!("server spawned agent ended with {}", result.status)))
+        } else {
+            result.error
+        };
+
+        Ok(SpawnRunResult {
+            agent_id: result.agent_id,
+            run_id: result.run_id,
+            status,
+            finish_reason,
+            output: result.output,
+            error,
+            prompt_tokens: result.prompt_tokens,
+            completion_tokens: result.completion_tokens,
+            tool_calls: result.tool_calls,
+            permission_summary: None,
+            permission_requests: 0,
+            permission_requests_approved: 0,
+            tools_blocked: 0,
+        })
+    }
+}
+
 /// Production sub-run executor backed by [`ServerAgenticLoopHost`].
 ///
 /// Creates a real agentic loop for each sub-run with the agent's system prompt,
@@ -4304,6 +4778,8 @@ pub struct ServerSubRunExecutor {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     skill_service: Option<Arc<dyn SkillService>>,
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    #[cfg(feature = "bridge-e2e-hooks")]
+    test_llm_rounds: Vec<Value>,
 }
 
 impl ServerSubRunExecutor {
@@ -4320,6 +4796,8 @@ impl ServerSubRunExecutor {
             edge_connection_pool: None,
             skill_service: None,
             memory_extraction_service: None,
+            #[cfg(feature = "bridge-e2e-hooks")]
+            test_llm_rounds: Vec::new(),
         }
     }
 
@@ -4346,6 +4824,12 @@ impl ServerSubRunExecutor {
 
     pub fn with_skill_service(mut self, service: Arc<dyn SkillService>) -> Self {
         self.skill_service = Some(service);
+        self
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    pub fn with_test_llm_rounds(mut self, rounds: Vec<Value>) -> Self {
+        self.test_llm_rounds = rounds;
         self
     }
 }
@@ -4423,6 +4907,10 @@ impl SubRunExecutor for ServerSubRunExecutor {
 
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
+        }
+        #[cfg(feature = "bridge-e2e-hooks")]
+        if !self.test_llm_rounds.is_empty() {
+            builder = builder.with_test_llm_rounds(self.test_llm_rounds.clone());
         }
         // NOTE on grandchild inheritance: delegated children don't get
         // a prefix_store wired here because this sub-run executor
@@ -4900,6 +5388,161 @@ mod tests {
             AgenticRunLifecycleService::blocks_new_session_run(&run, "session-1"),
             "waiting run must still block a concurrent turn"
         );
+    }
+
+    fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunConfig {
+        SpawnRunConfig {
+            run_id: "child-run".to_string(),
+            agent_id: "child@1234".to_string(),
+            recursion_depth: 1,
+            agent_type: "test".to_string(),
+            task: "do work".to_string(),
+            system_prompt_addendum: String::new(),
+            model: "test-model".to_string(),
+            max_turns: 3,
+            allowed_tools: allowed_tools.into_iter().map(String::from).collect(),
+            read_only,
+            working_dir: std::path::PathBuf::from("/tmp"),
+            mailbox: None,
+            progress_emitter: None,
+            context_cache: None,
+            inherited_permissions: None,
+            parent_address: None,
+            permission_context: None,
+            inherited_skills: Vec::new(),
+            live_event_sink: None,
+            inherited_prefix: None,
+            is_fork_child: false,
+        }
+    }
+
+    fn test_spawn_runtime_context(parent_run_id: &str, user_id: &str) -> ServerSpawnRuntimeContext {
+        ServerSpawnRuntimeContext {
+            parent_run_id: parent_run_id.to_string(),
+            user_id: user_id.to_string(),
+            session_id: "session-1".to_string(),
+            forward_headers: HashMap::new(),
+            llm_token_service: None,
+            request_constraints: RequestConstraints::default(),
+            pause_flag: None,
+            cancel_token: None,
+            #[cfg(feature = "bridge-e2e-hooks")]
+            test_child_llm_rounds: Vec::new(),
+            #[cfg(feature = "harness")]
+            harness_sink: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn server_spawn_runtime_context_is_keyed_by_parent_run() {
+        let executor = ServerSpawnAgentExecutor::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+        );
+        executor
+            .set_runtime_context(test_spawn_runtime_context("parent-run-a", "user-a"))
+            .await;
+        executor
+            .set_runtime_context(test_spawn_runtime_context("parent-run-b", "user-b"))
+            .await;
+
+        let mut config = test_spawn_run_config(vec!["*"], false);
+        config.parent_address = Some(astra_messaging::types::AgentAddress::new(
+            "parent-run-b",
+            "root-agent",
+        ));
+
+        let context = executor.runtime_context_for_config(&config).await.unwrap();
+
+        assert_eq!(context.parent_run_id, "parent-run-b");
+        assert_eq!(context.user_id, "user-b");
+    }
+
+    #[tokio::test]
+    async fn server_spawn_runtime_context_requires_parent_lineage() {
+        let executor = ServerSpawnAgentExecutor::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+        );
+        executor
+            .set_runtime_context(test_spawn_runtime_context("parent-run-a", "user-a"))
+            .await;
+
+        let config = test_spawn_run_config(vec!["*"], false);
+        let err = match executor.runtime_context_for_config(&config).await {
+            Ok(_) => panic!("server dynamic spawn must not run without parent lineage"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("parent run lineage"), "{err}");
+    }
+
+    #[test]
+    fn spawn_child_constraints_intersect_parent_and_agent_allowlists() {
+        let parent = RequestConstraints::new(
+            Some(
+                ["bash", "read_file", "write_file"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            ),
+            Some(["review"].into_iter().map(String::from).collect()),
+        );
+        let config = test_spawn_run_config(vec!["bash", "read_file"], true);
+
+        let constraints = spawn_child_request_constraints(&parent, &config);
+
+        assert_eq!(
+            constraints.allowed_tools.unwrap(),
+            ["bash", "read_file"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
+        assert_eq!(
+            constraints.allowed_skills.unwrap(),
+            ["review"].into_iter().map(String::from).collect()
+        );
+    }
+
+    #[test]
+    fn spawn_child_constraints_preserve_parent_when_child_allows_all() {
+        let parent = RequestConstraints::new(
+            Some(
+                ["bash", "write_file"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            ),
+            None,
+        );
+        let config = test_spawn_run_config(vec!["*"], false);
+
+        let constraints = spawn_child_request_constraints(&parent, &config);
+
+        assert_eq!(
+            constraints.allowed_tools.unwrap(),
+            ["bash", "write_file"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn spawn_child_constraints_read_only_wildcard_gets_read_only_tools() {
+        let parent = RequestConstraints::default();
+        let config = test_spawn_run_config(vec!["*"], true);
+
+        let constraints = spawn_child_request_constraints(&parent, &config);
+        let allowed = constraints.allowed_tools.unwrap();
+
+        assert!(allowed.contains("read_file"));
+        assert!(allowed.contains("grep"));
+        assert!(!allowed.contains("write_file"));
+        assert!(!allowed.contains("str_replace"));
     }
 
     #[test]

@@ -662,6 +662,63 @@ fn find_event_type<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> 
         .collect()
 }
 
+#[tokio::test]
+async fn web_agent_executes_sync_dynamic_spawn_with_server_executor() {
+    init_env();
+    let (app, _ledger) = build_test_app();
+
+    let events = chat_stream_collect(
+        &app,
+        json!({
+            "message": "Use a child agent to review the code.",
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "tool_calls": [
+                            tool_call("call-spawn-reviewer", "agent", json!({
+                                "action": "spawn",
+                                "description": "sync child review",
+                                "prompt": "Review src/lib.rs and summarize one issue.",
+                                "agent_type": "code-review",
+                                "run_in_background": false
+                            }))
+                        ]
+                    },
+                    {
+                        "full_text": "parent synthesis after child review"
+                    }
+                ],
+                "test_spawn_child_llm_rounds": [
+                    {
+                        "full_text": "child review result: no critical issues"
+                    }
+                ]
+            }
+        }),
+    )
+    .await;
+
+    assert!(
+        find_events(&events, "text_delta")
+            .iter()
+            .any(|event| event["content"].as_str() == Some("parent synthesis after child review")),
+        "parent should synthesize after dynamic child spawn: {events:?}"
+    );
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(
+        serialized.contains("child review result: no critical issues"),
+        "spawn tool output should include child result: {serialized}"
+    );
+    assert!(
+        !find_event_type(&events, "agent_spawned").is_empty(),
+        "server dynamic spawn should emit agent_spawned progress: {serialized}"
+    );
+    assert!(
+        !find_event_type(&events, "agent_completed").is_empty(),
+        "server dynamic spawn should emit agent_completed progress: {serialized}"
+    );
+}
+
 // ── Event-driven synchronization helpers ─────────────────────────────────────
 
 use tokio::sync::mpsc;
