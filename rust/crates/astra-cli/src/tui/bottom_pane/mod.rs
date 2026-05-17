@@ -27,6 +27,8 @@ mod approval_integration_tests;
 #[cfg(test)]
 mod ask_user_integration_tests;
 #[cfg(test)]
+mod plan_review_integration_tests;
+#[cfg(test)]
 mod config_edit_tests;
 #[cfg(test)]
 mod hint_tests;

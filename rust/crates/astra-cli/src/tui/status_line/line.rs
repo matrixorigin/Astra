@@ -95,10 +95,19 @@ pub(crate) struct StatusLine {
     pub right: Vec<Segment>,
 }
 
-/// Full idle hint. Shown when the terminal is wide enough.
-pub(crate) const IDLE_HINT_FULL: &str = "/ @ $ · ⇧Tab mode · Ctrl+O transcript";
-/// Tiny idle hint for very narrow terminals.
-pub(crate) const IDLE_HINT_TINY: &str = "/ @ $ · ⇧Tab";
+/// Idle hint: input-prefix legend only. The `⇧Tab mode` /
+/// `Ctrl+O transcript` cheatsheet that used to live here was
+/// duplicating signal already conveyed by the permission-mode chip
+/// to the right (default / auto / edit / plan); once a user knows
+/// the shortcut the hint is permanent noise. The remaining `/ @ $`
+/// triplet stays because those characters change the *meaning* of
+/// the next keystroke (slash command / mention / shell), which is
+/// not visible from any other chip.
+pub(crate) const IDLE_HINT_FULL: &str = "/ @ $";
+/// Same hint at narrow widths — `IDLE_HINT_FULL` already fits in
+/// most terminals; keep an alias so existing layout code that
+/// distinguishes the two has a tiny form to fall back to.
+pub(crate) const IDLE_HINT_TINY: &str = "/ @ $";
 
 /// Threshold below which the budget chip is dim, above which it warns.
 const BUDGET_WARN_PERCENT: f32 = 75.0;

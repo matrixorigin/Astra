@@ -2,4 +2,4 @@
 source: crates/astra-cli/src/tui/status_line/snapshot_tests.rs
 expression: "render_ctx(&ctx, 80)"
 ---
-  / @ $ · ⇧Tab · default                          …ect/path/that/exceeds/limit
+  / @ $ · default                                 …ect/path/that/exceeds/limit
