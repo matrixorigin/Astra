@@ -205,3 +205,76 @@ export type SkillListResponse = {
   offset: number;
   nextOffset: number | null;
 };
+
+export type HarnessTemplate = {
+  template_id: string;
+  name: string;
+  description: string;
+  built_in: boolean;
+  input_schema_json: unknown;
+  workflow_json: unknown;
+};
+
+export type HarnessNodeCatalogItem = {
+  node_type: string;
+  description: string;
+  input_schema_json: unknown;
+  output_schema_json: unknown;
+};
+
+export type HarnessRun = {
+  harness_run_id: string;
+  harness_id: string;
+  version_id: string;
+  user_id: string;
+  session_id: string | null;
+  status: string;
+  input_json: Record<string, unknown>;
+  output_json: Record<string, unknown>;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type HarnessItem = {
+  item_id: string;
+  harness_run_id: string;
+  item_type: string;
+  locator_json: Record<string, unknown>;
+  input_json: Record<string, unknown>;
+  proposed_output_json: Record<string, unknown>;
+  final_output_json: Record<string, unknown>;
+  status: string;
+  confidence: number | null;
+  assigned_to: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type SkillifyRunRequest = {
+  session_ids: string[];
+  skill_name?: string | null;
+  topic?: string | null;
+  target_scope?: 'personal' | 'project';
+};
+
+export type HarnessDecisionRequest = {
+  decision: 'approve' | 'reject' | 'edit' | 'request_revision';
+  after_json?: Record<string, unknown>;
+  reason?: string;
+  idempotency_key?: string;
+};
+
+export type SkillifyDraftRequest = {
+  skill_name?: string | null;
+  version?: string | null;
+  description?: string | null;
+};
+
+export type SkillifyDraft = {
+  harness_run_id: string;
+  skill_name: string;
+  version_id: string;
+  content_markdown: string;
+  approved_item_count: number;
+};

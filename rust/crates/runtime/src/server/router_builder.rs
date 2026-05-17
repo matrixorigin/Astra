@@ -410,6 +410,35 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/workflows/runs/{run_id}/resolve",
             post(workflows::resolve_workflow_wait_handler),
         )
+        // Product harnesses
+        .route(
+            "/harnesses/templates",
+            get(product_harness_handlers::list_harness_templates_handler),
+        )
+        .route(
+            "/harnesses/node-catalog",
+            get(product_harness_handlers::list_harness_node_catalog_handler),
+        )
+        .route(
+            "/harnesses/skillify/runs",
+            post(product_harness_handlers::create_skillify_harness_run_handler),
+        )
+        .route(
+            "/harnesses/runs/{harness_run_id}",
+            get(product_harness_handlers::get_harness_run_handler),
+        )
+        .route(
+            "/harnesses/runs/{harness_run_id}/items",
+            get(product_harness_handlers::list_harness_run_items_handler),
+        )
+        .route(
+            "/harnesses/runs/{harness_run_id}/items/{item_id}/decision",
+            post(product_harness_handlers::decide_harness_item_handler),
+        )
+        .route(
+            "/harnesses/runs/{harness_run_id}/skillify/draft",
+            post(product_harness_handlers::create_skillify_draft_handler),
+        )
         // Sandbox
         .route(
             "/sandbox",
@@ -889,6 +918,8 @@ mod tests {
             "/sessions/{session_id}/artifacts",
             "/sessions/{session_id}/artifacts/latest/{artifact_kind}",
             "/sessions/{session_id}/artifacts/{artifact_id}/download",
+            "/harnesses/templates",
+            "/harnesses/skillify/runs",
             "/admin/init",
             "/skills",
             "/evaluation/drift",
@@ -919,6 +950,7 @@ mod tests {
             ("marketplace", "/marketplace/"),
             ("sandbox", "/sandbox"),
             ("workflows", "/workflows"),
+            ("harnesses", "/harnesses"),
             ("platform", "/platform/"),
             ("runs", "/runs"),
             ("tasks", "/tasks"),

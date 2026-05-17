@@ -38,7 +38,9 @@ pub async fn build_server_state(
 
     let state = AppState::new(
         ServiceInfo::default(),
-        Arc::new(MatrixOneHealthChecker::new(settings.matrixone.clone())),
+        Arc::new(
+            MatrixOneHealthChecker::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
+        ),
     )
     .with_cors_origins(settings.api.cors_origins.clone())
     .with_shared_pool(shared_pool.clone())
@@ -74,6 +76,7 @@ pub async fn build_server_state(
     .with_workflow_service(Arc::new(
         DatabaseWorkflowService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
+    .with_harness_service(Arc::new(DatabaseHarnessService::new(shared_pool.clone())))
     .with_sandbox_service(Arc::new(
         DatabaseSandboxService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))

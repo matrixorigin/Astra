@@ -156,6 +156,11 @@ pub use astra_services::{
         DatabaseEventService, EventCreateRequestData, EventListFilter, EventListRecord,
         EventRecord, EventService, UnconfiguredEventService,
     },
+    harness::{
+        DatabaseHarnessService, HarnessDecisionRequest, HarnessItemRecord,
+        HarnessNodeCatalogRecord, HarnessRunRecord, HarnessService, HarnessTemplateRecord,
+        SkillifyDraftRecord, SkillifyDraftRequest, SkillifyRunRequest, UnconfiguredHarnessService,
+    },
     jobs::{
         InMemoryJobService, JobRecord, JobService, JobSubmitRequestData, UnconfiguredJobService,
     },

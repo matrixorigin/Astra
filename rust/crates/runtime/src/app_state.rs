@@ -39,6 +39,7 @@ pub struct AppState {
     pub(crate) job_service: Arc<dyn JobService>,
     pub(crate) trigger_service: Arc<dyn TriggerService>,
     pub(crate) workflow_service: Arc<dyn WorkflowService>,
+    pub(crate) harness_service: Arc<dyn HarnessService>,
     pub(crate) sandbox_service: Arc<dyn SandboxService>,
     pub(crate) branch_service: Arc<dyn BranchService>,
     pub(crate) data_versioning_service: Arc<dyn DataVersioningService>,
@@ -140,6 +141,7 @@ impl AppState {
             job_service: Arc::new(UnconfiguredJobService),
             trigger_service: Arc::new(UnconfiguredTriggerService),
             workflow_service: Arc::new(UnconfiguredWorkflowService),
+            harness_service: Arc::new(UnconfiguredHarnessService),
             sandbox_service: Arc::new(UnconfiguredSandboxService),
             branch_service: Arc::new(UnconfiguredBranchService),
             data_versioning_service: Arc::new(UnconfiguredDataVersioningService),
@@ -316,6 +318,11 @@ impl AppState {
 
     pub fn with_workflow_service(mut self, workflow_service: Arc<dyn WorkflowService>) -> Self {
         self.workflow_service = workflow_service;
+        self
+    }
+
+    pub fn with_harness_service(mut self, harness_service: Arc<dyn HarnessService>) -> Self {
+        self.harness_service = harness_service;
         self
     }
 
@@ -741,17 +748,30 @@ impl MemoriaForwarder for NoopMemoriaForwarder {
 #[derive(Clone, Debug)]
 pub struct MatrixOneHealthChecker {
     settings: MatrixOneSettings,
+    shared_pool: Option<SharedPool>,
 }
 
 impl MatrixOneHealthChecker {
     pub fn new(settings: MatrixOneSettings) -> Self {
-        Self { settings }
+        Self {
+            settings,
+            shared_pool: None,
+        }
+    }
+
+    pub fn with_pool(mut self, shared_pool: SharedPool) -> Self {
+        self.shared_pool = Some(shared_pool);
+        self
     }
 }
 
 #[async_trait]
 impl HealthChecker for MatrixOneHealthChecker {
     async fn database_healthy(&self) -> bool {
+        if let Some(shared_pool) = &self.shared_pool {
+            return query("SELECT 1").execute(shared_pool.get()).await.is_ok();
+        }
+
         let pool = match MySqlPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(2))

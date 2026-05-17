@@ -226,7 +226,10 @@ impl MatrixOneSettings {
     pub fn database_url(&self) -> String {
         format!(
             "mysql://{}:[REDACTED]@{}:{}/{}",
-            self.user, self.host, self.port, self.database
+            encode_mysql_url_component(&self.user),
+            self.host,
+            self.port,
+            encode_mysql_url_component(&self.database)
         )
     }
 
@@ -235,9 +238,29 @@ impl MatrixOneSettings {
     pub fn database_url_with_password(&self) -> String {
         format!(
             "mysql://{}:{}@{}:{}/{}",
-            self.user, self.password, self.host, self.port, self.database
+            encode_mysql_url_component(&self.user),
+            encode_mysql_url_component(&self.password),
+            self.host,
+            self.port,
+            encode_mysql_url_component(&self.database)
         )
     }
+}
+
+fn encode_mysql_url_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push_str(&format!("{byte:02X}"));
+            }
+        }
+    }
+    encoded
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -496,6 +519,26 @@ mod tests {
         assert_eq!(
             settings.database_url_with_password(),
             "mysql://alice:secret@db:3306/agent"
+        );
+    }
+
+    #[test]
+    fn matrixone_settings_escapes_mysql_url_userinfo() {
+        let settings = MatrixOneSettings {
+            host: "db".into(),
+            port: 3306,
+            user: "account:user:role".into(),
+            password: "p@ss:word/with?chars".into(),
+            database: "agent/db".into(),
+        };
+
+        assert_eq!(
+            settings.database_url(),
+            "mysql://account%3Auser%3Arole:[REDACTED]@db:3306/agent%2Fdb"
+        );
+        assert_eq!(
+            settings.database_url_with_password(),
+            "mysql://account%3Auser%3Arole:p%40ss%3Aword%2Fwith%3Fchars@db:3306/agent%2Fdb"
         );
     }
 

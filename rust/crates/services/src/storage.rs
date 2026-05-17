@@ -1431,6 +1431,191 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
+    // Product harness workflow state. This is separate from the diagnostic
+    // `harness_snapshots` table above: these rows are the durable product model
+    // for reusable user workflows such as Skillify.
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_runs (
+            harness_run_id VARCHAR(128) PRIMARY KEY,
+            harness_id VARCHAR(128) NOT NULL,
+            version_id VARCHAR(128) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NULL,
+            workflow_run_id VARCHAR(128) NULL,
+            agent_run_id VARCHAR(128) NULL,
+            parent_agent_run_id VARCHAR(128) NULL,
+            status VARCHAR(64) NOT NULL,
+            input_json LONGTEXT NOT NULL,
+            output_json LONGTEXT NOT NULL,
+            error TEXT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_harness_runs_user_status_updated (user_id, status, updated_at),
+            INDEX idx_harness_runs_harness_user (harness_id, user_id, updated_at),
+            INDEX idx_harness_runs_session (session_id, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_sources (
+            source_id VARCHAR(128) PRIMARY KEY,
+            harness_run_id VARCHAR(128) NOT NULL,
+            source_type VARCHAR(64) NOT NULL,
+            source_ref VARCHAR(255) NOT NULL,
+            snapshot_ref VARCHAR(255) NULL,
+            content_hash VARCHAR(128) NULL,
+            metadata_json LONGTEXT NOT NULL,
+            status VARCHAR(64) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_harness_sources_run (harness_run_id, source_type, status)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_items (
+            item_id VARCHAR(128) PRIMARY KEY,
+            harness_run_id VARCHAR(128) NOT NULL,
+            parent_item_id VARCHAR(128) NULL,
+            item_type VARCHAR(64) NOT NULL,
+            locator_json LONGTEXT NOT NULL,
+            input_json LONGTEXT NOT NULL,
+            proposed_output_json LONGTEXT NOT NULL,
+            final_output_json LONGTEXT NOT NULL,
+            status VARCHAR(64) NOT NULL,
+            confidence DOUBLE NULL,
+            assigned_to VARCHAR(128) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_harness_items_run_status (harness_run_id, status, updated_at),
+            INDEX idx_harness_items_assigned (assigned_to, status, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_citations (
+            citation_id VARCHAR(128) PRIMARY KEY,
+            harness_run_id VARCHAR(128) NOT NULL,
+            item_id VARCHAR(128) NOT NULL,
+            source_id VARCHAR(128) NULL,
+            source_locator_json LONGTEXT NOT NULL,
+            artifact_id VARCHAR(128) NULL,
+            quote_hash VARCHAR(128) NULL,
+            evidence_text_preview TEXT NULL,
+            relevance_score DOUBLE NULL,
+            created_by_node_id VARCHAR(128) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_harness_citations_item (item_id, created_at),
+            INDEX idx_harness_citations_run (harness_run_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_decisions (
+            decision_id VARCHAR(128) PRIMARY KEY,
+            harness_run_id VARCHAR(128) NOT NULL,
+            item_id VARCHAR(128) NOT NULL,
+            reviewer_user_id VARCHAR(128) NOT NULL,
+            decision VARCHAR(64) NOT NULL,
+            before_json LONGTEXT NOT NULL,
+            after_json LONGTEXT NOT NULL,
+            reason TEXT NULL,
+            idempotency_key VARCHAR(255) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_harness_decision_idempotency (harness_run_id, idempotency_key),
+            INDEX idx_harness_decisions_item (item_id, created_at),
+            INDEX idx_harness_decisions_reviewer (reviewer_user_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_artifacts (
+            harness_artifact_id VARCHAR(128) PRIMARY KEY,
+            harness_run_id VARCHAR(128) NOT NULL,
+            artifact_id VARCHAR(128) NULL,
+            artifact_kind VARCHAR(64) NOT NULL,
+            status VARCHAR(64) NOT NULL,
+            metadata_json LONGTEXT NOT NULL,
+            created_by_node_id VARCHAR(128) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_harness_artifacts_run_kind (harness_run_id, artifact_kind, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_agent_roles (
+            agent_role_id VARCHAR(128) PRIMARY KEY,
+            version_id VARCHAR(128) NOT NULL,
+            role_name VARCHAR(128) NOT NULL,
+            purpose TEXT NULL,
+            input_schema_json LONGTEXT NOT NULL,
+            output_schema_json LONGTEXT NOT NULL,
+            tool_scope_json LONGTEXT NOT NULL,
+            source_scope_json LONGTEXT NOT NULL,
+            assertion_policy_json LONGTEXT NOT NULL,
+            max_parallelism INT NOT NULL DEFAULT 1,
+            timeout_ms BIGINT NULL,
+            model_policy_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_harness_agent_roles_version (version_id, role_name)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_subagent_runs (
+            subagent_run_id VARCHAR(128) PRIMARY KEY,
+            harness_run_id VARCHAR(128) NOT NULL,
+            node_id VARCHAR(128) NOT NULL,
+            item_id VARCHAR(128) NULL,
+            agent_role_id VARCHAR(128) NOT NULL,
+            parent_agent_run_id VARCHAR(128) NULL,
+            child_agent_run_id VARCHAR(128) NOT NULL,
+            status VARCHAR(64) NOT NULL,
+            input_ref VARCHAR(255) NULL,
+            output_ref VARCHAR(255) NULL,
+            failure_reason TEXT NULL,
+            started_at DATETIME(6) NULL,
+            completed_at DATETIME(6) NULL,
+            INDEX idx_harness_subagents_run (harness_run_id, node_id, status),
+            INDEX idx_harness_subagents_child_run (child_agent_run_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_blackboard_entries (
+            blackboard_entry_id VARCHAR(128) PRIMARY KEY,
+            harness_run_id VARCHAR(128) NOT NULL,
+            item_id VARCHAR(128) NULL,
+            created_by_node_id VARCHAR(128) NULL,
+            created_by_agent_role_id VARCHAR(128) NULL,
+            entry_kind VARCHAR(64) NOT NULL,
+            payload_json LONGTEXT NOT NULL,
+            citation_ids LONGTEXT NOT NULL,
+            confidence DOUBLE NULL,
+            status VARCHAR(64) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_harness_blackboard_run_item (harness_run_id, item_id, entry_kind, status),
+            INDEX idx_harness_blackboard_role (created_by_agent_role_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // Context / decisions / evaluation essentials used by turn persistence
     query(
         "CREATE TABLE IF NOT EXISTS ctx_snapshots (

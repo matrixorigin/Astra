@@ -41,6 +41,7 @@ mod meta_handlers;
 mod plan_handlers;
 mod platform_handlers;
 mod preferences_handlers;
+mod product_harness_handlers;
 mod reflect_handlers;
 mod request_trace;
 mod resource_handlers;

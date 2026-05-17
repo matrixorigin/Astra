@@ -17,6 +17,7 @@ pub mod edge_context;
 pub mod evaluation;
 pub mod event_ingestion;
 pub mod events;
+pub mod harness;
 pub mod introspection;
 pub mod jobs;
 pub mod learning;
@@ -135,6 +136,11 @@ pub use evaluation::{DatabaseEvaluationService, EvaluationService, UnconfiguredE
 pub use events::{
     DatabaseEventService, EventCreateRequestData, EventListFilter, EventListRecord, EventRecord,
     EventService, UnconfiguredEventService,
+};
+pub use harness::{
+    DatabaseHarnessService, HarnessDecisionRequest, HarnessItemRecord, HarnessNodeCatalogRecord,
+    HarnessRunRecord, HarnessService, HarnessTemplateRecord, SkillifyDraftRecord,
+    SkillifyDraftRequest, SkillifyRunRequest, UnconfiguredHarnessService,
 };
 pub use introspection::{
     DatabaseIntrospectionService, IntrospectionService, UnconfiguredIntrospectionService,
