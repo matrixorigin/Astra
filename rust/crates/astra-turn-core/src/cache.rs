@@ -1,76 +1,64 @@
-use std::collections::HashMap;
-
 use serde_json::{Map, Value};
+
+use crate::lru_map::LruMap;
 
 #[derive(Clone, Debug, Default)]
 pub struct SessionCache {
-    maxsize: usize,
     ttl: f64,
-    order: Vec<String>,
-    entries: HashMap<String, Map<String, Value>>,
+    entries: LruMap<String, CacheEntry>,
+}
+
+#[derive(Clone, Debug)]
+struct CacheEntry {
+    value: Map<String, Value>,
+    touched_at: f64,
 }
 
 impl SessionCache {
     pub fn new(maxsize: usize, ttl: f64) -> Self {
         Self {
-            maxsize,
             ttl,
-            order: Vec::new(),
-            entries: HashMap::new(),
+            entries: LruMap::new(maxsize),
         }
     }
 
-    pub fn insert(&mut self, key: impl Into<String>, mut value: Map<String, Value>, now: f64) {
+    pub fn insert(&mut self, key: impl Into<String>, value: Map<String, Value>, now: f64) {
         let key = key.into();
-        value.entry("ts".to_string()).or_insert(Value::from(now));
-
-        self.remove_order_key(&key);
-        self.order.push(key.clone());
-        self.entries.insert(key.clone(), value);
-
-        while self.order.len() > self.maxsize {
-            if let Some(oldest) = self.order.first().cloned() {
-                self.order.remove(0);
-                self.entries.remove(&oldest);
-            }
-        }
+        self.entries.insert(
+            key,
+            CacheEntry {
+                value,
+                touched_at: now,
+            },
+        );
     }
 
     pub fn get(&mut self, key: &str, now: f64) -> Option<Map<String, Value>> {
-        let expired = match self.entries.get(key) {
-            Some(entry) => now - entry.get("ts").and_then(Value::as_f64).unwrap_or(0.0) > self.ttl,
+        let key = key.to_string();
+        let expired = match self.entries.get(&key) {
+            Some(entry) => now - entry.touched_at > self.ttl,
             None => return None,
         };
 
         if expired {
-            self.entries.remove(key);
-            self.remove_order_key(key);
+            self.entries.remove(&key);
             return None;
         }
 
-        let entry = self
+        let mut entry = self
             .entries
-            .get_mut(key)
+            .remove(&key)
             .expect("entry exists after expiry check");
-        entry.insert("ts".to_string(), Value::from(now));
-        let cloned = entry.clone();
-        self.remove_order_key(key);
-        self.order.push(key.to_string());
-        Some(cloned)
-    }
-
-    fn remove_order_key(&mut self, key: &str) {
-        if let Some(index) = self.order.iter().position(|existing| existing == key) {
-            self.order.remove(index);
-        }
+        entry.touched_at = now;
+        let value = entry.value.clone();
+        self.entries.insert(key, entry);
+        Some(value)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
     fn empty_map() -> Map<String, Value> {
         Map::new()
     }
@@ -85,20 +73,20 @@ mod tests {
     }
 
     #[test]
-    fn insert_sets_ts_if_missing() {
+    fn insert_does_not_mutate_value_with_cache_metadata() {
         let mut cache = SessionCache::new(3, 60.0);
         cache.insert("a", empty_map(), 42.0);
         let entry = cache.get("a", 42.0).unwrap();
-        assert_eq!(entry["ts"].as_f64().unwrap(), 42.0);
+        assert!(!entry.contains_key("ts"));
     }
 
     #[test]
-    fn insert_preserves_existing_ts() {
+    fn insert_preserves_domain_ts_field() {
         let mut cache = SessionCache::new(3, 60.0);
         let mut m = Map::new();
-        m.insert("ts".to_string(), json!(10.0));
+        m.insert("ts".to_string(), Value::from(10.0));
         cache.insert("a", m, 42.0);
-        let entry = cache.entries.get("a").unwrap();
+        let entry = cache.get("a", 42.0).unwrap();
         assert_eq!(entry["ts"].as_f64().unwrap(), 10.0);
     }
 
@@ -119,7 +107,7 @@ mod tests {
         cache.insert("a", empty_map(), 1.0);
         cache.insert("b", empty_map(), 2.0);
         cache.insert("a", empty_map(), 3.0);
-        assert_eq!(cache.order, vec!["b", "a"]);
+        assert_eq!(cache.entries.order(), vec!["b", "a"]);
     }
 
     // --- get ---
@@ -136,15 +124,16 @@ mod tests {
         cache.insert("a", empty_map(), 0.0);
         assert!(cache.get("a", 61.0).is_none());
         // entry should be removed
-        assert!(!cache.entries.contains_key("a"));
+        assert!(!cache.entries.contains_key(&"a".to_string()));
     }
 
     #[test]
-    fn get_valid_updates_ts() {
+    fn get_valid_refreshes_ttl_without_mutating_value() {
         let mut cache = SessionCache::new(3, 60.0);
         cache.insert("a", empty_map(), 10.0);
         let entry = cache.get("a", 20.0).unwrap();
-        assert_eq!(entry["ts"].as_f64().unwrap(), 20.0);
+        assert!(!entry.contains_key("ts"));
+        assert!(cache.get("a", 79.0).is_some());
     }
 
     #[test]
@@ -154,7 +143,7 @@ mod tests {
         cache.insert("b", empty_map(), 2.0);
         cache.insert("c", empty_map(), 3.0);
         cache.get("a", 4.0);
-        assert_eq!(cache.order.last().unwrap(), "a");
+        assert_eq!(cache.entries.order().last().unwrap(), "a");
     }
 
     #[test]

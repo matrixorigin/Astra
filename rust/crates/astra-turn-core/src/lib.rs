@@ -19,6 +19,7 @@ pub mod boost_domain_hints;
 pub mod cache;
 pub mod cache_diagnostics;
 pub mod cache_placement;
+mod canonical_json;
 pub mod capability;
 pub mod chat_history_openai;
 pub mod chat_turn_api_error;
@@ -173,6 +174,7 @@ pub mod complete;
 pub mod edge_prompt_context;
 pub mod hydrate_reflect;
 pub mod loop_circuit_breaker;
+mod lru_map;
 pub mod stall;
 pub mod tool_registry_state;
 

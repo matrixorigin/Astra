@@ -303,9 +303,7 @@ pub use astra_turn_core::{
     retrieval::{
         RETRIEVAL_BUDGET_CHARS, enhanced_extraction, format_retrieved_events, rule_based_extraction,
     },
-    routing::{
-        MAX_TOOL_ROUNDS, build_routing_metadata, build_skipped_routing_metadata, detect_correction,
-    },
+    routing::{build_skipped_routing_metadata, detect_correction},
     stall::{
         DIVERGENCE_CORRECTION, DivergenceStatus, SERVER_STALL_WINDOW, canonical_tool_args,
         detect_divergence, detect_server_stall, record_server_tool_signatures,
