@@ -31,8 +31,15 @@ pub(crate) async fn execute_tool_pure(
     if !execution.is_edge_tool && execution.result_str.starts_with(EDGE_PROTOCOL_ERROR_PREFIX) {
         if let Some(executor) = server_tool_executor {
             executor.set_turn_index(turn_index.min(u32::MAX as usize) as u32);
+            let mut server_args = execution.args.clone();
+            if let Some(obj) = server_args.as_object_mut() {
+                obj.insert(
+                    "_tool_call_id".to_string(),
+                    serde_json::Value::String(execution.id.clone()),
+                );
+            }
             let result = executor
-                .execute_with_metadata(&execution.name, &execution.args)
+                .execute_with_metadata(&execution.name, &server_args)
                 .await;
             execution.tool_result_fields = result.metadata;
             execution.result_str = result.output;

@@ -13,6 +13,7 @@ use std::time::Duration;
 use super::{
     DynamicAgentSpawner, InheritedPermissions, SpawnAgentInput, SpawnContext, spawn_agent_schema,
 };
+use astra_turn_core::trace_event::TraceContext;
 
 /// Context for executing `agent` tool lifecycle actions.
 #[derive(Clone)]
@@ -36,6 +37,8 @@ pub struct AgentToolContext {
     pub active_skills: Vec<String>,
     /// Optional sink for live child token/tool/status events.
     pub live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
+    /// DB trace identity shared with the current Web turn.
+    pub trace_context: Option<TraceContext>,
 }
 
 /// Handle the consolidated `agent` tool for shared dynamic-agent actions.
@@ -111,6 +114,11 @@ pub async fn handle_agent_spawn_tool(args: &Value, ctx: Option<&AgentToolContext
         inherited_permissions: Some(inherited_permissions),
         inherited_skills: ctx.active_skills.clone(),
         live_event_sink: ctx.live_event_sink.clone(),
+        trace_context: ctx.trace_context.clone(),
+        spawn_tool_call_id: args
+            .get("_tool_call_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
     };
 
     match ctx.spawner.spawn(input, &spawn_ctx).await {
@@ -228,7 +236,19 @@ pub async fn handle_agent_get_result_tool(args: &Value, ctx: Option<&AgentToolCo
     use astra_turn_core::orchestration_types::AgentStatus;
 
     let timeout = Duration::from_secs(120);
-    match ctx.spawner.wait_for_agent(agent_id, timeout).await {
+    let status = ctx.spawner.wait_for_agent(agent_id, timeout).await;
+    if let Some(ref status) = status {
+        ctx.spawner
+            .record_agent_result_collected(
+                &ctx.run_id,
+                &ctx.agent_id,
+                agent_id,
+                args.get("_tool_call_id").and_then(Value::as_str),
+                status,
+            )
+            .await;
+    }
+    match status {
         Some(AgentStatus::Completed {
             result,
             finish_reason,
@@ -548,6 +568,7 @@ mod tests {
             inherited_permissions: InheritedPermissions::auto_approve(),
             active_skills: Vec::new(),
             live_event_sink: None,
+            trace_context: None,
         }
     }
 

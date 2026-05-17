@@ -436,6 +436,10 @@ pub struct SelectionTrace {
 /// Per-tool-call audit record, embedded in turn events for granular tracking.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolCallRecord {
+    /// Provider/model tool call id. Stable linkage between assistant tool call,
+    /// tool result, DB trace row, and any child-agent lifecycle event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     /// Tool name.
     pub name: String,
     /// Whether the call succeeded.

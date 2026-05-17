@@ -538,6 +538,14 @@ pub async fn ensure_core_schema(
             content LONGTEXT NULL,
             parent_event_id VARCHAR(64) NULL,
             causal_chain_id VARCHAR(64) NULL,
+            run_id VARCHAR(64) NULL,
+            parent_run_id VARCHAR(64) NULL,
+            turn_id VARCHAR(64) NULL,
+            turn_seq BIGINT NULL,
+            round_index BIGINT NULL,
+            tool_call_id VARCHAR(128) NULL,
+            parent_agent_id VARCHAR(128) NULL,
+            trace_kind VARCHAR(64) NULL,
             token_usage JSON NULL,
             llm_model_used VARCHAR(128) NULL,
             llm_params JSON NULL,
@@ -560,11 +568,73 @@ pub async fn ensure_core_schema(
             INDEX idx_agent_events_causal_chain_id (causal_chain_id),
             INDEX idx_agent_events_skill_created (skill_name, created_at),
             INDEX idx_agent_events_created_at (created_at),
-            INDEX idx_agent_events_tool_name (meta_tool_name)
+            INDEX idx_agent_events_tool_name (meta_tool_name),
+            INDEX idx_agent_events_trace (session_id, turn_id, created_at),
+            INDEX idx_agent_events_run (session_id, run_id, created_at),
+            INDEX idx_agent_events_parent_run (session_id, parent_run_id, created_at),
+            INDEX idx_agent_events_tool_call (session_id, tool_call_id)
         )",
     )
     .execute(&pool)
     .await?;
+
+    for (column, ddl) in [
+        (
+            "run_id",
+            "ALTER TABLE agent_events ADD COLUMN run_id VARCHAR(64) NULL",
+        ),
+        (
+            "parent_run_id",
+            "ALTER TABLE agent_events ADD COLUMN parent_run_id VARCHAR(64) NULL",
+        ),
+        (
+            "turn_id",
+            "ALTER TABLE agent_events ADD COLUMN turn_id VARCHAR(64) NULL",
+        ),
+        (
+            "turn_seq",
+            "ALTER TABLE agent_events ADD COLUMN turn_seq BIGINT NULL",
+        ),
+        (
+            "round_index",
+            "ALTER TABLE agent_events ADD COLUMN round_index BIGINT NULL",
+        ),
+        (
+            "tool_call_id",
+            "ALTER TABLE agent_events ADD COLUMN tool_call_id VARCHAR(128) NULL",
+        ),
+        (
+            "parent_agent_id",
+            "ALTER TABLE agent_events ADD COLUMN parent_agent_id VARCHAR(128) NULL",
+        ),
+        (
+            "trace_kind",
+            "ALTER TABLE agent_events ADD COLUMN trace_kind VARCHAR(64) NULL",
+        ),
+    ] {
+        add_column_if_missing(&pool, &settings.database, "agent_events", column, ddl).await?;
+    }
+
+    for (index, ddl) in [
+        (
+            "idx_agent_events_trace",
+            "ALTER TABLE agent_events ADD INDEX idx_agent_events_trace (session_id, turn_id, created_at)",
+        ),
+        (
+            "idx_agent_events_run",
+            "ALTER TABLE agent_events ADD INDEX idx_agent_events_run (session_id, run_id, created_at)",
+        ),
+        (
+            "idx_agent_events_parent_run",
+            "ALTER TABLE agent_events ADD INDEX idx_agent_events_parent_run (session_id, parent_run_id, created_at)",
+        ),
+        (
+            "idx_agent_events_tool_call",
+            "ALTER TABLE agent_events ADD INDEX idx_agent_events_tool_call (session_id, tool_call_id)",
+        ),
+    ] {
+        add_index_if_missing(&pool, &settings.database, "agent_events", index, ddl).await?;
+    }
 
     // ── Durable web-agent run state (Phase 1 / G15 + G19) ────────────────
     query(
@@ -2901,6 +2971,14 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
         13,
         "widen session_todo_counters.next_id for exhausted task id sentinel",
         "ALTER TABLE session_todo_counters MODIFY COLUMN next_id BIGINT NOT NULL",
+    )
+    .await?;
+
+    run_migration(
+        pool,
+        14,
+        "add DB traceability columns and indexes to agent_events",
+        "SELECT 1",
     )
     .await?;
 

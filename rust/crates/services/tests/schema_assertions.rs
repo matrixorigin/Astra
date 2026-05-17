@@ -2,6 +2,39 @@ mod common;
 
 use sqlx::Row;
 
+#[test]
+fn web_traceability_agent_events_schema_source_contract() {
+    let source = include_str!("../src/storage.rs");
+    for column in [
+        "run_id VARCHAR(64) NULL",
+        "parent_run_id VARCHAR(64) NULL",
+        "turn_id VARCHAR(64) NULL",
+        "turn_seq BIGINT NULL",
+        "round_index BIGINT NULL",
+        "tool_call_id VARCHAR(128) NULL",
+        "parent_agent_id VARCHAR(128) NULL",
+        "trace_kind VARCHAR(64) NULL",
+    ] {
+        assert!(source.contains(column), "agent_events missing {column}");
+    }
+    for index in [
+        "idx_agent_events_trace (session_id, turn_id, created_at)",
+        "idx_agent_events_run (session_id, run_id, created_at)",
+        "idx_agent_events_parent_run (session_id, parent_run_id, created_at)",
+        "idx_agent_events_tool_call (session_id, tool_call_id)",
+    ] {
+        assert!(source.contains(index), "agent_events missing {index}");
+    }
+    assert!(
+        source.contains("add_column_if_missing(&pool, &settings.database, \"agent_events\""),
+        "trace columns must be added idempotently on existing schemas"
+    );
+    assert!(
+        source.contains("add_index_if_missing(&pool, &settings.database, \"agent_events\""),
+        "trace indexes must be added idempotently on existing schemas"
+    );
+}
+
 async fn current_schema(pool: &astra_core::SharedPool) -> String {
     let row = sqlx::query("SELECT DATABASE() AS db")
         .fetch_one(pool.get())

@@ -1,4 +1,8 @@
+use crate::storage::{
+    insert_trace_event, load_agent_event_count, upsert_agent_session_event_count,
+};
 use crate::*;
+use astra_turn_core::trace_event::{TraceEvent, TraceEventWriter, TraceWriteError};
 
 #[derive(Clone, Debug)]
 pub struct DatabaseTurnSessionActivityWriter {
@@ -22,6 +26,11 @@ pub struct DatabaseTurnAuxiliaryEventWriter {
 
 #[derive(Clone, Debug)]
 pub struct DatabaseTurnCoreEventWriter {
+    pool: Option<SharedPool>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DatabaseTraceEventWriter {
     pool: Option<SharedPool>,
 }
 
@@ -107,6 +116,23 @@ impl DatabaseTurnCoreEventWriter {
             .as_ref()
             .map(|p| p.get().clone())
             .ok_or_else(|| "shared pool not configured".to_string())
+    }
+}
+
+impl DatabaseTraceEventWriter {
+    pub fn new(_matrixone: MatrixOneSettings) -> Self {
+        Self { pool: None }
+    }
+    pub fn with_pool(mut self, pool: SharedPool) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, TraceWriteError> {
+        self.pool
+            .as_ref()
+            .map(|p| p.get().clone())
+            .ok_or_else(|| TraceWriteError::Unavailable("shared pool not configured".to_string()))
     }
 }
 
@@ -197,6 +223,57 @@ impl TurnToolEventWriter for DatabaseTurnToolEventWriter {
             .map_err(|error| error.to_string())?;
         }
         tx.commit().await.map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl TraceEventWriter for DatabaseTraceEventWriter {
+    async fn write(&self, event: TraceEvent) -> Result<(), TraceWriteError> {
+        self.write_many(vec![event]).await
+    }
+
+    async fn write_many(&self, events: Vec<TraceEvent>) -> Result<(), TraceWriteError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let pool = self.get_pool()?;
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
+        let mut touched_sessions = std::collections::BTreeMap::<String, (String, String)>::new();
+        for event in &events {
+            insert_trace_event(&mut tx, event)
+                .await
+                .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
+            touched_sessions.insert(
+                event.session_id.clone(),
+                (event.user_id.clone(), event.event_id.clone()),
+            );
+        }
+        for (session_id, (user_id, last_event_id)) in touched_sessions {
+            let event_count = load_agent_event_count(&mut *tx, &session_id)
+                .await
+                .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
+            upsert_agent_session_event_count(&mut *tx, &session_id, &user_id, event_count)
+                .await
+                .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
+            query(
+                "UPDATE agent_sessions \
+                 SET last_event_id = COALESCE(?, last_event_id), \
+                     last_active_at = NOW(), updated_at = NOW() \
+                 WHERE session_id = ?",
+            )
+            .bind(last_event_id)
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
         Ok(())
     }
 }

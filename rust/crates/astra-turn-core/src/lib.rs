@@ -109,6 +109,7 @@ pub mod tool_result_storage;
 pub mod tool_schema_prune;
 pub mod tool_selection;
 pub mod trace_alert;
+pub mod trace_event;
 pub mod unified_timeline;
 pub mod view;
 pub mod working_memory;

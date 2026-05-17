@@ -54,7 +54,7 @@ use crate::turn::agentic_loop_host::{
     RequestConstraints, SkillState, StopHookState, run_agentic_loop_with_host,
 };
 use crate::{
-    DatabaseEvaluationService, DatabaseEventService, DatabaseTurnCoreEventWriter,
+    DatabaseEvaluationService, DatabaseEventService, DatabaseTraceEventWriter,
     EventCreateRequestData, EventService,
 };
 use astra_pipeline::step_recorder::StepRecorder;
@@ -63,6 +63,7 @@ use astra_turn_core::contracts::{
     TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker,
     TurnSkillSelectionRecord, TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
 };
+use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
 
 use astra_core::{
     STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_RUNNING,
@@ -863,14 +864,33 @@ impl PostLoopPersistContext {
             &self.user_id,
             &self.session_id,
             &self.run_id,
+            None,
             self.agent_id.as_deref(),
+            None,
+            None,
             &self.user_message,
             state,
             self.model_name.as_deref(),
         )
         .await;
 
-        // 2. Persist tool_call events for session_audit metrics.
+        // 2. Persist DB-first trace detail events.
+        persist_server_loop_trace_events(
+            &self.matrixone,
+            self.shared_pool.as_ref(),
+            &self.user_id,
+            &self.session_id,
+            &self.run_id,
+            None,
+            self.agent_id.as_deref(),
+            None,
+            None,
+            state,
+            self.model_name.as_deref(),
+        )
+        .await;
+
+        // 3. Persist compatibility aggregate tool_call events for session_audit metrics.
         if let Some(ref writer) = self.tool_event_writer {
             persist_server_loop_tool_events(
                 writer.as_ref(),
@@ -882,7 +902,7 @@ impl PostLoopPersistContext {
             .await;
         }
 
-        // 3. Persist decision audit + skill selection to hook DB.
+        // 4. Persist decision audit + skill selection to hook DB.
         if let Some(ref writer) = self.hook_db_writer {
             persist_server_loop_hook_events(
                 writer.as_ref(),
@@ -1157,6 +1177,104 @@ fn server_loop_causal_chain_id(kind: &str) -> String {
     chain_id
 }
 
+fn trace_hash(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    digest[..12]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+}
+
+fn trace_event_id(kind: &str, parts: &[&str]) -> String {
+    format!("trace:{kind}:{}", trace_hash(parts))
+}
+
+fn server_turn_id(run_id: &str) -> String {
+    let prefix: String = run_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(16)
+        .collect();
+    format!(
+        "turn-{}",
+        if prefix.is_empty() {
+            "unknown"
+        } else {
+            &prefix
+        }
+    )
+}
+
+fn server_trace_context(
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    turn_seq: u32,
+) -> TraceContext {
+    let turn_id = server_turn_id(run_id);
+    TraceContext {
+        root_event_id: trace_event_id("user", &[session_id, &turn_id]),
+        causal_chain_id: trace_event_id("chain", &[session_id, &turn_id]),
+        session_id: session_id.to_string(),
+        user_id: user_id.to_string(),
+        turn_id,
+        turn_seq: i64::from(turn_seq.max(1)),
+    }
+}
+
+fn trace_context_from_subrun_context(context: &HashMap<String, Value>) -> Option<TraceContext> {
+    Some(TraceContext {
+        session_id: context.get("trace_session_id")?.as_str()?.to_string(),
+        user_id: context.get("trace_user_id")?.as_str()?.to_string(),
+        turn_id: context.get("trace_turn_id")?.as_str()?.to_string(),
+        turn_seq: context.get("trace_turn_seq")?.as_i64()?,
+        causal_chain_id: context.get("trace_causal_chain_id")?.as_str()?.to_string(),
+        root_event_id: context.get("trace_root_event_id")?.as_str()?.to_string(),
+    })
+}
+
+async fn persist_trace_degraded_event(
+    writer: &dyn TraceEventWriter,
+    trace: &TraceContext,
+    run_id: &str,
+    agent_id: Option<&str>,
+    parent_run_id: Option<&str>,
+    parent_agent_id: Option<&str>,
+    stage: &str,
+    error: &str,
+) {
+    let mut event = TraceEvent::new(
+        trace_event_id("degraded", &[run_id, stage, error]),
+        trace.session_id.clone(),
+        trace.user_id.clone(),
+        "trace_persistence_degraded",
+        "trace_health",
+    )
+    .with_turn_context(trace);
+    event.run_id = Some(run_id.to_string());
+    event.parent_run_id = parent_run_id.map(ToString::to_string);
+    event.agent_id = Some(agent_id.unwrap_or("root-agent").to_string());
+    event.parent_agent_id = parent_agent_id.map(ToString::to_string);
+    event.parent_event_id = Some(trace.root_event_id.clone());
+    event.metadata = json!({
+        "stage": stage,
+        "error": truncate_for_audit(error, 500),
+    });
+    if let Err(error) = writer.write(event).await {
+        astra_core::agent_error!(
+            "server-loop",
+            "failed to persist trace_persistence_degraded for session {}: {}",
+            trace.session_id,
+            error
+        );
+    }
+}
+
 async fn infer_session_turn(shared_pool: Option<&SharedPool>, session_id: &str) -> u32 {
     let Some(shared_pool) = shared_pool else {
         return 1;
@@ -1182,7 +1300,10 @@ async fn persist_server_loop_core_events(
     user_id: &str,
     session_id: &str,
     run_id: &str,
+    parent_run_id: Option<&str>,
     agent_id: Option<&str>,
+    parent_agent_id: Option<&str>,
+    trace_context: Option<TraceContext>,
     user_message: &str,
     state: &AgenticLoopState,
     model_name: Option<&str>,
@@ -1199,71 +1320,132 @@ async fn persist_server_loop_core_events(
         return;
     };
 
-    let writer = DatabaseTurnCoreEventWriter::new(matrixone.clone()).with_pool(pool.clone());
-
-    let chain_id = server_loop_causal_chain_id("server-loop");
-    let user_query_event_id = Uuid::now_v7().to_string();
+    let writer = DatabaseTraceEventWriter::new(matrixone.clone()).with_pool(pool.clone());
+    let trace = trace_context
+        .unwrap_or_else(|| server_trace_context(user_id, session_id, run_id, state.session_turn));
 
     let user_query_event = if !user_message.is_empty() {
-        Some(TurnCoreEventRecord {
-            event_id: user_query_event_id.clone(),
-            user_id: user_id.to_string(),
-            session_id: session_id.to_string(),
-            agent_id: agent_id.map(|s| s.to_string()),
-            event_type: "user_query".to_string(),
-            content: user_message.to_string(),
-            parent_event_id: None,
-            parent_event_ids: Vec::new(),
-            causal_chain_id: chain_id.clone(),
-            llm_model_used: None,
-            token_usage: None,
-            llm_params: None,
-            reasoning_content: None,
-        })
+        let mut event = TraceEvent::new(
+            trace.root_event_id.clone(),
+            session_id,
+            user_id,
+            "user_query",
+            "turn",
+        )
+        .with_turn_context(&trace);
+        event.run_id = Some(run_id.to_string());
+        event.parent_run_id = parent_run_id.map(ToString::to_string);
+        event.agent_id = Some(agent_id.unwrap_or("root-agent").to_string());
+        event.parent_agent_id = parent_agent_id.map(ToString::to_string);
+        event.content = Some(user_message.to_string());
+        Some(event)
     } else {
         None
     };
 
     let llm_response_event = if !state.final_text.is_empty() {
-        let usage = if state.total_prompt > 0 || state.total_completion > 0 {
+        let usage = if state.total_prompt > 0
+            || state.total_completion > 0
+            || state.total_cache_read > 0
+            || state.total_cache_creation > 0
+        {
             Some(json!({
                 "prompt": state.total_prompt,
                 "completion": state.total_completion,
-                "total": state.total_prompt + state.total_completion,
+                "cache_read_tokens": state.total_cache_read,
+                "cache_creation_tokens": state.total_cache_creation,
+                "total": state.total_prompt
+                    + state.total_completion
+                    + state.total_cache_read
+                    + state.total_cache_creation,
             }))
         } else {
             None
         };
-        Some(TurnCoreEventRecord {
-            event_id: Uuid::now_v7().to_string(),
-            user_id: user_id.to_string(),
-            session_id: session_id.to_string(),
-            agent_id: agent_id.map(|s| s.to_string()),
-            event_type: "llm_response".to_string(),
-            content: state.final_text.clone(),
-            parent_event_id: Some(user_query_event_id.clone()),
-            parent_event_ids: vec![user_query_event_id],
-            causal_chain_id: chain_id,
-            llm_model_used: model_name.map(|s| s.to_string()),
-            token_usage: usage,
-            llm_params: None,
-            reasoning_content: None,
-        })
+        let mut event = TraceEvent::new(
+            trace_event_id("response", &[run_id, &trace.turn_id]),
+            session_id,
+            user_id,
+            "llm_response",
+            "turn",
+        )
+        .with_turn_context(&trace);
+        event.run_id = Some(run_id.to_string());
+        event.parent_run_id = parent_run_id.map(ToString::to_string);
+        event.agent_id = Some(agent_id.unwrap_or("root-agent").to_string());
+        event.parent_agent_id = parent_agent_id.map(ToString::to_string);
+        event.content = Some(state.final_text.clone());
+        event.parent_event_id = user_query_event
+            .as_ref()
+            .map(|event| event.event_id.clone())
+            .or_else(|| Some(trace.root_event_id.clone()));
+        event.llm_model_used = model_name.map(ToString::to_string);
+        event.token_usage = usage;
+        Some(event)
     } else {
         None
     };
 
+    let mut events = Vec::with_capacity(2);
+    if let Some(event) = user_query_event.clone() {
+        events.push(event);
+    }
+    if let Some(event) = llm_response_event.clone() {
+        events.push(event);
+    }
+
     let plan = TurnCorePersistPlan {
-        user_query_event,
-        llm_response_event,
+        user_query_event: user_query_event.as_ref().map(|event| TurnCoreEventRecord {
+            event_id: event.event_id.clone(),
+            user_id: event.user_id.clone(),
+            session_id: event.session_id.clone(),
+            agent_id: event.agent_id.clone(),
+            event_type: "user_query".to_string(),
+            content: event.content.clone().unwrap_or_default(),
+            parent_event_id: None,
+            parent_event_ids: Vec::new(),
+            causal_chain_id: trace.causal_chain_id.clone(),
+            llm_model_used: None,
+            token_usage: None,
+            llm_params: None,
+            reasoning_content: None,
+        }),
+        llm_response_event: llm_response_event
+            .as_ref()
+            .map(|event| TurnCoreEventRecord {
+                event_id: event.event_id.clone(),
+                user_id: event.user_id.clone(),
+                session_id: event.session_id.clone(),
+                agent_id: event.agent_id.clone(),
+                event_type: "llm_response".to_string(),
+                content: event.content.clone().unwrap_or_default(),
+                parent_event_id: event.parent_event_id.clone(),
+                parent_event_ids: event.parent_event_id.iter().cloned().collect(),
+                causal_chain_id: trace.causal_chain_id.clone(),
+                llm_model_used: event.llm_model_used.clone(),
+                token_usage: event.token_usage.clone(),
+                llm_params: None,
+                reasoning_content: None,
+            }),
         snapshot_link_plan: None,
     };
     let transcript_items = transcript_items_from_core_plan(&plan, run_id);
-    if let Err(e) = writer.persist(plan).await {
+    if let Err(e) = writer.write_many(events).await {
         astra_core::agent_error!(
             "server-loop",
             "failed to persist core events for session {session_id}: {e}"
         );
+        persist_trace_degraded_event(
+            &writer,
+            &trace,
+            run_id,
+            agent_id,
+            parent_run_id,
+            parent_agent_id,
+            "core_events",
+            &e.to_string(),
+        )
+        .await;
     }
     persist_session_transcript_items(pool, user_id, session_id, &transcript_items).await;
 }
@@ -1315,6 +1497,289 @@ async fn persist_session_transcript_items(
             "server-loop",
             "failed to persist transcript items for session {session_id}: {error}"
         );
+    }
+}
+
+fn truncate_trace_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        let prefix: String = text.chars().take(max_chars).collect();
+        format!("{prefix}...")
+    }
+}
+
+fn redact_trace_value(value: &Value) -> Value {
+    const SECRET_KEYS: &[&str] = &[
+        "api_key",
+        "apikey",
+        "authorization",
+        "cookie",
+        "password",
+        "secret",
+        "token",
+    ];
+    match value {
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (key, value) in map {
+                let key_lc = key.to_ascii_lowercase();
+                if SECRET_KEYS.iter().any(|needle| key_lc.contains(needle)) {
+                    out.insert(key.clone(), Value::String("[REDACTED]".to_string()));
+                } else {
+                    out.insert(key.clone(), redact_trace_value(value));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(values) => Value::Array(values.iter().map(redact_trace_value).collect()),
+        Value::String(text) if text.chars().count() > 2_000 => {
+            Value::String(truncate_trace_text(text, 2_000))
+        }
+        other => other.clone(),
+    }
+}
+
+fn parse_json_str(input: Option<&String>) -> Option<Value> {
+    input.and_then(|text| serde_json::from_str::<Value>(text).ok())
+}
+
+fn redacted_json_preview(value: Option<Value>) -> Option<Value> {
+    value.map(|value| redact_trace_value(&value))
+}
+
+fn tool_action_from_args(args: Option<&Value>) -> Option<String> {
+    args.and_then(|value| value.get("action"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn child_agent_id_from_tool_result(result: Option<&Value>) -> Option<String> {
+    result
+        .and_then(|value| value.get("agent_id"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn child_run_id_from_tool_result(result: Option<&Value>) -> Option<String> {
+    result
+        .and_then(|value| value.get("run_id").or_else(|| value.get("child_run_id")))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn build_llm_round_trace_events(
+    trace: &TraceContext,
+    run_id: &str,
+    parent_run_id: Option<&str>,
+    agent_id: Option<&str>,
+    parent_agent_id: Option<&str>,
+    model_name: Option<&str>,
+    rounds: &[crate::turn::agentic_loop_host::RecentRoundSummary],
+) -> Vec<TraceEvent> {
+    rounds
+        .iter()
+        .enumerate()
+        .map(|(idx, round)| {
+            let round_index = i64::from(round.round);
+            let round_key = round_index.to_string();
+            let mut event = TraceEvent::new(
+                trace_event_id("round_done", &[run_id, &round_key, &trace.turn_id]),
+                trace.session_id.clone(),
+                trace.user_id.clone(),
+                "llm_round_completed",
+                "llm_round",
+            )
+            .with_turn_context(trace);
+            event.run_id = Some(run_id.to_string());
+            event.parent_run_id = parent_run_id.map(ToString::to_string);
+            event.agent_id = Some(agent_id.unwrap_or("root-agent").to_string());
+            event.parent_agent_id = parent_agent_id.map(ToString::to_string);
+            event.round_index = Some(round_index);
+            event.llm_model_used = (!round.model.is_empty())
+                .then(|| round.model.clone())
+                .or_else(|| model_name.map(ToString::to_string));
+            event.meta_duration_ms = i32::try_from(round.duration_ms).ok();
+            event.token_usage = Some(json!({
+                "prompt": round.prompt_tokens,
+                "completion": round.completion_tokens,
+                "cache_read_tokens": round.cache_read_tokens,
+                "cache_creation_tokens": round.cache_creation_tokens,
+                "total": round.prompt_tokens
+                    + round.completion_tokens
+                    + round.cache_read_tokens
+                    + round.cache_creation_tokens,
+            }));
+            event.parent_event_id = Some(trace.root_event_id.clone());
+            event.metadata = json!({
+                "finish_reason": round.finish_reason,
+                "tool_calls_returned": round.tool_calls_returned,
+                "tool_call_names": round.tool_call_names,
+                "round_event_index": idx,
+            });
+            event
+        })
+        .collect()
+}
+
+fn tool_trace_call_id(
+    run_id: &str,
+    index: usize,
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> String {
+    record.tool_call_id.clone().unwrap_or_else(|| {
+        let round = record.round.map(|v| v.to_string()).unwrap_or_default();
+        format!(
+            "tool-{}",
+            trace_hash(&[run_id, &round, &index.to_string(), &record.name])
+        )
+    })
+}
+
+fn build_tool_trace_events(
+    trace: &TraceContext,
+    run_id: &str,
+    parent_run_id: Option<&str>,
+    agent_id: Option<&str>,
+    parent_agent_id: Option<&str>,
+    records: &[astra_services::session_journal::ToolCallRecord],
+) -> Vec<TraceEvent> {
+    let mut events = Vec::with_capacity(records.len().saturating_mul(2));
+    for (index, record) in records.iter().enumerate() {
+        if record.is_synthetic_placeholder() {
+            continue;
+        }
+        let call_id = tool_trace_call_id(run_id, index, record);
+        let args_json = parse_json_str(record.args_full.as_ref());
+        let result_json = parse_json_str(record.result_full.as_ref());
+        let action = if record.name == "agent" {
+            tool_action_from_args(args_json.as_ref())
+        } else {
+            None
+        };
+        let child_agent_id = child_agent_id_from_tool_result(result_json.as_ref());
+        let child_run_id = child_run_id_from_tool_result(result_json.as_ref());
+        let round_index = record.round.map(i64::from);
+        let started_at = chrono::Utc::now();
+
+        let mut started = TraceEvent::new(
+            trace_event_id("tool_start", &[run_id, &call_id]),
+            trace.session_id.clone(),
+            trace.user_id.clone(),
+            "tool_call_started",
+            "tool_call",
+        )
+        .with_turn_context(trace);
+        started.run_id = Some(run_id.to_string());
+        started.parent_run_id = parent_run_id.map(ToString::to_string);
+        started.agent_id = Some(agent_id.unwrap_or("root-agent").to_string());
+        started.parent_agent_id = parent_agent_id.map(ToString::to_string);
+        started.round_index = round_index;
+        started.tool_call_id = Some(call_id.clone());
+        started.meta_tool_name = Some(record.name.clone());
+        started.parent_event_id = Some(trace.root_event_id.clone());
+        started.created_at = started_at;
+        started.metadata = json!({
+            "args_preview": record.args_preview,
+            "tool_args_json_redacted": redacted_json_preview(args_json.clone()),
+            "action": action,
+            "start_offset_ms": record.start_offset_ms,
+        });
+        events.push(started);
+
+        let terminal_type = if record.ok {
+            "tool_call_completed"
+        } else {
+            "tool_call_failed"
+        };
+        let mut completed = TraceEvent::new(
+            trace_event_id(terminal_type, &[run_id, &call_id]),
+            trace.session_id.clone(),
+            trace.user_id.clone(),
+            terminal_type,
+            "tool_call",
+        )
+        .with_turn_context(trace);
+        completed.run_id = Some(run_id.to_string());
+        completed.parent_run_id = parent_run_id.map(ToString::to_string);
+        completed.agent_id = Some(agent_id.unwrap_or("root-agent").to_string());
+        completed.parent_agent_id = parent_agent_id.map(ToString::to_string);
+        completed.round_index = round_index;
+        completed.tool_call_id = Some(call_id);
+        completed.meta_tool_name = Some(record.name.clone());
+        completed.meta_duration_ms = i32::try_from(record.ms).ok();
+        completed.parent_event_id = Some(trace.root_event_id.clone());
+        completed.metadata = json!({
+            "ok": record.ok,
+            "action": action,
+            "args_preview": record.args_preview,
+            "result_preview": record.result_preview,
+            "tool_args_json_redacted": redacted_json_preview(args_json),
+            "tool_result_json_redacted": redacted_json_preview(result_json),
+            "child_agent_id": child_agent_id,
+            "child_run_id": child_run_id,
+            "error": record.error,
+        });
+        events.push(completed);
+    }
+    events
+}
+
+async fn persist_server_loop_trace_events(
+    matrixone: &MatrixOneSettings,
+    shared_pool: Option<&SharedPool>,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    parent_run_id: Option<&str>,
+    agent_id: Option<&str>,
+    parent_agent_id: Option<&str>,
+    trace_context: Option<TraceContext>,
+    state: &AgenticLoopState,
+    model_name: Option<&str>,
+) {
+    let Some(pool) = shared_pool else {
+        return;
+    };
+    let writer = DatabaseTraceEventWriter::new(matrixone.clone()).with_pool(pool.clone());
+    let trace = trace_context
+        .unwrap_or_else(|| server_trace_context(user_id, session_id, run_id, state.session_turn));
+    let mut events = build_llm_round_trace_events(
+        &trace,
+        run_id,
+        parent_run_id,
+        agent_id,
+        parent_agent_id,
+        model_name,
+        &state.recent_rounds,
+    );
+    events.extend(build_tool_trace_events(
+        &trace,
+        run_id,
+        parent_run_id,
+        agent_id,
+        parent_agent_id,
+        &state.stall.tool_call_records,
+    ));
+    if events.is_empty() {
+        return;
+    }
+    if let Err(e) = writer.write_many(events).await {
+        astra_core::agent_error!(
+            "server-loop",
+            "failed to persist trace detail events for session {session_id}: {e}"
+        );
+        persist_trace_degraded_event(
+            &writer,
+            &trace,
+            run_id,
+            agent_id,
+            parent_run_id,
+            parent_agent_id,
+            "detail_events",
+            &e.to_string(),
+        )
+        .await;
     }
 }
 
@@ -1797,6 +2262,7 @@ struct ServerSpawnRuntimeContext {
     parent_run_id: String,
     user_id: String,
     session_id: String,
+    trace_context: TraceContext,
     forward_headers: HashMap<String, String>,
     llm_token_service: Option<LlmTokenServiceConfig>,
     request_constraints: RequestConstraints,
@@ -2033,6 +2499,11 @@ impl AgenticRunLifecycleService {
         )
         .with_executor(executor_for_spawner)
         .with_session(session_id.to_string());
+        if let Some(pool) = self.shared_pool.clone() {
+            spawner = spawner.with_trace_writer(Arc::new(
+                DatabaseTraceEventWriter::new(self.matrixone.clone()).with_pool(pool),
+            ));
+        }
         if let Some(store) = self
             .delegation_engine
             .as_ref()
@@ -2073,6 +2544,7 @@ impl AgenticRunLifecycleService {
         user_id: &str,
         session_id: &str,
         run_id: &str,
+        turn_seq: u32,
         request: &ChatRequestData,
         workspace: &std::path::Path,
         pause_flag: Option<Arc<AtomicBool>>,
@@ -2087,6 +2559,7 @@ impl AgenticRunLifecycleService {
                 parent_run_id: run_id.to_string(),
                 user_id: user_id.to_string(),
                 session_id: session_id.to_string(),
+                trace_context: server_trace_context(user_id, session_id, run_id, turn_seq),
                 forward_headers: request.forward_headers.clone(),
                 llm_token_service: request.llm_token_service.clone(),
                 request_constraints: request_constraints.clone(),
@@ -2121,6 +2594,7 @@ impl AgenticRunLifecycleService {
             ),
             active_skills: Vec::new(),
             live_event_sink: None,
+            trace_context: Some(server_trace_context(user_id, session_id, run_id, turn_seq)),
         });
     }
 
@@ -3342,6 +3816,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &user_id,
                 &session_id,
                 &run_id,
+                loop_state.session_turn,
                 &request,
                 workspace.as_path(),
                 Some(pause_flag.clone()),
@@ -3729,11 +4204,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         self.persist_run_start_if_configured(&run_id, &user_id, &session_id)
             .await;
         if let Some(pool) = &self.shared_pool {
+            let trace = server_trace_context(&user_id, &session_id, &run_id, state.session_turn);
             let user_transcript = TranscriptPersistItem {
                 run_id: run_id.clone(),
                 role: "user",
                 content: request.message.clone(),
-                source_event_id: format!("run:{run_id}:user"),
+                source_event_id: trace.root_event_id,
             };
             persist_session_transcript_items(pool, &user_id, &session_id, &[user_transcript]).await;
         }
@@ -3801,6 +4277,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &user_id,
                 &session_id,
                 &run_id,
+                state.session_turn,
                 &request,
                 workspace.as_path(),
                 Some(pause_flag.clone()),
@@ -4698,6 +5175,44 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             "spawn_agent_type".to_string(),
             json!(config.agent_type.clone()),
         );
+        subrun_context.insert(
+            "parent_run_id".to_string(),
+            json!(context.parent_run_id.clone()),
+        );
+        subrun_context.insert(
+            "parent_agent_id".to_string(),
+            json!(
+                config
+                    .parent_address
+                    .as_ref()
+                    .map(|address| address.agent_id.clone())
+                    .unwrap_or_else(|| "root-agent".to_string())
+            ),
+        );
+        subrun_context.insert(
+            "trace_session_id".to_string(),
+            json!(context.trace_context.session_id.clone()),
+        );
+        subrun_context.insert(
+            "trace_user_id".to_string(),
+            json!(context.trace_context.user_id.clone()),
+        );
+        subrun_context.insert(
+            "trace_turn_id".to_string(),
+            json!(context.trace_context.turn_id.clone()),
+        );
+        subrun_context.insert(
+            "trace_turn_seq".to_string(),
+            json!(context.trace_context.turn_seq),
+        );
+        subrun_context.insert(
+            "trace_causal_chain_id".to_string(),
+            json!(context.trace_context.causal_chain_id.clone()),
+        );
+        subrun_context.insert(
+            "trace_root_event_id".to_string(),
+            json!(context.trace_context.root_event_id.clone()),
+        );
 
         let request_constraints =
             spawn_child_request_constraints(&context.request_constraints, &config);
@@ -5107,6 +5622,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 }
             },
         };
+        if let Some(trace_context) = trace_context_from_subrun_context(&config.context) {
+            loop_state.session_turn = u32::try_from(trace_context.turn_seq).unwrap_or(0);
+        }
 
         // ── Wire ServerToolExecutor for sub-run tool execution ──────────
         // Without this, the headless pipeline fallback cannot execute tools
@@ -5193,8 +5711,31 @@ impl SubRunExecutor for ServerSubRunExecutor {
             &config.user_id,
             &config.session_id,
             &config.run_id,
+            config.context.get("parent_run_id").and_then(Value::as_str),
             Some(config.agent_profile.agent_id.as_str()),
+            config
+                .context
+                .get("parent_agent_id")
+                .and_then(Value::as_str),
+            trace_context_from_subrun_context(&config.context),
             &config.task,
+            &loop_state,
+            config.agent_profile.model_override.as_deref(),
+        )
+        .await;
+        persist_server_loop_trace_events(
+            &self.matrixone,
+            self.shared_pool.as_ref(),
+            &config.user_id,
+            &config.session_id,
+            &config.run_id,
+            config.context.get("parent_run_id").and_then(Value::as_str),
+            Some(config.agent_profile.agent_id.as_str()),
+            config
+                .context
+                .get("parent_agent_id")
+                .and_then(Value::as_str),
+            trace_context_from_subrun_context(&config.context),
             &loop_state,
             config.agent_profile.model_override.as_deref(),
         )
@@ -5287,6 +5828,81 @@ mod tests {
     use uuid::Uuid;
 
     // ── extract_prev_assistant_text + implicit feedback wiring ──
+
+    #[test]
+    fn trace_redaction_removes_nested_secrets_and_truncates_long_text() {
+        let redacted = redact_trace_value(&json!({
+            "Authorization": "Bearer secret",
+            "nested": {
+                "api_key": "abc123",
+                "safe": "visible"
+            },
+            "items": [
+                {"cookie": "session=abc"},
+                {"text": "x".repeat(2_050)}
+            ]
+        }));
+
+        assert_eq!(redacted["Authorization"], "[REDACTED]");
+        assert_eq!(redacted["nested"]["api_key"], "[REDACTED]");
+        assert_eq!(redacted["nested"]["safe"], "visible");
+        assert_eq!(redacted["items"][0]["cookie"], "[REDACTED]");
+        assert!(
+            redacted["items"][1]["text"]
+                .as_str()
+                .expect("string")
+                .ends_with("...")
+        );
+    }
+
+    #[test]
+    fn tool_trace_events_populate_columns_and_redacted_payloads() {
+        let trace = TraceContext {
+            session_id: "session-1".to_string(),
+            user_id: "user-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            turn_seq: 7,
+            causal_chain_id: "chain-1".to_string(),
+            root_event_id: "trace:root".to_string(),
+        };
+        let record = ToolCallRecord {
+            tool_call_id: Some("tool-call-1".to_string()),
+            name: "agent".to_string(),
+            ok: true,
+            ms: 42,
+            args_preview: Some("agent.spawn: child".to_string()),
+            result_preview: Some("launched child".to_string()),
+            round: Some(2),
+            args_full: Some(r#"{"action":"spawn","token":"secret"}"#.to_string()),
+            result_full: Some(
+                r#"{"agent_id":"child@run","run_id":"child-run","result":"ok"}"#.to_string(),
+            ),
+            ..Default::default()
+        };
+
+        let events = build_tool_trace_events(
+            &trace,
+            "root-run",
+            None,
+            Some("root-agent"),
+            None,
+            &[record],
+        );
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "tool_call_started");
+        assert_eq!(events[0].tool_call_id.as_deref(), Some("tool-call-1"));
+        assert_eq!(events[0].round_index, Some(2));
+        assert_eq!(events[0].meta_tool_name.as_deref(), Some("agent"));
+        assert_eq!(
+            events[0].metadata["tool_args_json_redacted"]["token"],
+            "[REDACTED]"
+        );
+        assert_eq!(events[1].event_type, "tool_call_completed");
+        assert_eq!(events[1].meta_duration_ms, Some(42));
+        assert_eq!(events[1].metadata["action"], "spawn");
+        assert_eq!(events[1].metadata["child_run_id"], "child-run");
+    }
 
     #[test]
     fn extract_prev_assistant_text_picks_latest_assistant_string() {
@@ -5426,6 +6042,7 @@ mod tests {
             request_constraints: RequestConstraints::default(),
             pause_flag: None,
             cancel_token: None,
+            trace_context: server_trace_context(user_id, "session-1", parent_run_id, 1),
             #[cfg(feature = "bridge-e2e-hooks")]
             test_child_llm_rounds: Vec::new(),
             #[cfg(feature = "harness")]

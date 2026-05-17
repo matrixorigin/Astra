@@ -55,6 +55,7 @@ mod session_handlers;
 mod session_quota;
 mod session_todo_handlers;
 pub mod session_todo_sweeper;
+mod session_trace;
 mod state_builder;
 mod task_handlers;
 mod team_handlers;

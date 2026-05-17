@@ -13,7 +13,9 @@ use astra_turn_core::orchestration_progress::{
     AgentProgressEvent, ProgressBroadcaster, ProgressEventType,
 };
 use astra_turn_core::orchestration_spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
+use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
 
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,6 +49,10 @@ pub struct SpawnContext {
     pub inherited_skills: Vec<String>,
     /// Optional live-event sink for child token/tool/status mirroring.
     pub live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
+    /// DB trace identity shared with the parent Web turn.
+    pub trace_context: Option<TraceContext>,
+    /// Tool call id of the parent `agent.spawn` invocation.
+    pub spawn_tool_call_id: Option<String>,
 }
 
 // ─── Agent Status ───────────────────────────────────────────────────────────
@@ -88,6 +94,10 @@ pub struct SpawnedAgentState {
     pub metrics: SpawnedAgentMetrics,
     /// Permission summary for this agent.
     pub permission_summary: PermissionSummary,
+    pub parent_agent_id: String,
+    pub trace_context: Option<TraceContext>,
+    pub spawn_tool_call_id: Option<String>,
+    pub run_in_background: bool,
 }
 
 // SpawnedAgentInfo is re-exported from orchestration_types above.
@@ -322,6 +332,8 @@ pub struct DynamicAgentSpawner {
     /// should evict entries via `clear_prefix_resolve` when the
     /// corresponding agent completes.
     prefix_resolve_outcomes: Arc<RwLock<HashMap<String, PrefixResolveOutcome>>>,
+    /// Optional DB-first trace writer for Web/server lifecycle events.
+    trace_writer: Option<Arc<dyn TraceEventWriter>>,
 }
 
 impl DynamicAgentSpawner {
@@ -342,6 +354,7 @@ impl DynamicAgentSpawner {
             completion_notifiers: Arc::new(RwLock::new(HashMap::new())),
             prefix_store: None,
             prefix_resolve_outcomes: Arc::new(RwLock::new(HashMap::new())),
+            trace_writer: None,
         }
     }
 
@@ -383,6 +396,11 @@ impl DynamicAgentSpawner {
         self
     }
 
+    pub fn with_trace_writer(mut self, writer: Arc<dyn TraceEventWriter>) -> Self {
+        self.trace_writer = Some(writer);
+        self
+    }
+
     /// Read-only access to the installed prefix store. Exposed so
     /// callers (e.g. the CLI loop host that captures parent turns)
     /// can share the same Arc the spawner already holds, guaranteeing
@@ -417,6 +435,108 @@ impl DynamicAgentSpawner {
     pub fn with_session(mut self, session_id: String) -> Self {
         self.session_id = Some(session_id);
         self
+    }
+
+    fn trace_event_id(kind: &str, parts: &[&str]) -> String {
+        let mut hasher = Sha256::new();
+        for part in parts {
+            hasher.update(part.as_bytes());
+            hasher.update([0]);
+        }
+        let digest = hasher.finalize();
+        let hash = digest[..12]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        format!("trace:{kind}:{hash}")
+    }
+
+    async fn write_trace_event(&self, event: TraceEvent) {
+        let Some(writer) = self.trace_writer.as_ref() else {
+            return;
+        };
+        if let Err(error) = writer.write(event).await {
+            astra_core::agent_error!(
+                "spawner",
+                "failed to persist agent lifecycle trace: {error}"
+            );
+        }
+    }
+
+    async fn emit_agent_spawned_trace(&self, state: &SpawnedAgentState) {
+        let Some(trace) = state.trace_context.as_ref() else {
+            return;
+        };
+        let mut event = TraceEvent::new(
+            Self::trace_event_id("agent_spawned", &[&state.run_id]),
+            trace.session_id.clone(),
+            trace.user_id.clone(),
+            "agent_spawned",
+            "agent_lifecycle",
+        )
+        .with_turn_context(trace);
+        event.run_id = Some(state.run_id.clone());
+        event.parent_run_id = Some(state.parent_run_id.clone());
+        event.agent_id = Some(state.agent_id.clone());
+        event.parent_agent_id = Some(state.parent_agent_id.clone());
+        event.tool_call_id = state.spawn_tool_call_id.clone();
+        event.parent_event_id = Some(trace.root_event_id.clone());
+        event.metadata = serde_json::json!({
+            "agent_type": &state.agent_type,
+            "description": &state.description,
+            "status": "spawned",
+            "spawn_tool_call_id": &state.spawn_tool_call_id,
+            "run_in_background": state.run_in_background,
+        });
+        self.write_trace_event(event).await;
+    }
+
+    async fn emit_agent_terminal_trace(
+        &self,
+        state: &SpawnedAgentState,
+        status: &str,
+        finish_reason: Option<&str>,
+        output: Option<&str>,
+        error: Option<&str>,
+    ) {
+        let Some(trace) = state.trace_context.as_ref() else {
+            return;
+        };
+        let event_type = match status {
+            "cancelled" => "agent_cancelled",
+            "failed" => "agent_failed",
+            _ => "agent_completed",
+        };
+        let duration_ms = state
+            .started_at
+            .elapsed()
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut event = TraceEvent::new(
+            Self::trace_event_id("agent_terminal", &[&state.run_id, event_type]),
+            trace.session_id.clone(),
+            trace.user_id.clone(),
+            event_type,
+            "agent_lifecycle",
+        )
+        .with_turn_context(trace);
+        event.run_id = Some(state.run_id.clone());
+        event.parent_run_id = Some(state.parent_run_id.clone());
+        event.agent_id = Some(state.agent_id.clone());
+        event.parent_agent_id = Some(state.parent_agent_id.clone());
+        event.tool_call_id = state.spawn_tool_call_id.clone();
+        event.meta_duration_ms = i32::try_from(duration_ms).ok();
+        event.parent_event_id = Some(trace.root_event_id.clone());
+        event.metadata = serde_json::json!({
+            "status": status,
+            "finish_reason": finish_reason,
+            "prompt_tokens": state.metrics.prompt_tokens,
+            "completion_tokens": state.metrics.completion_tokens,
+            "tool_calls": state.metrics.tool_calls,
+            "result_preview": output.map(|text| text.chars().take(500).collect::<String>()),
+            "error": error.map(|text| text.chars().take(500).collect::<String>()),
+        });
+        self.write_trace_event(event).await;
     }
     /// Get a reference to the agent registry.
     pub fn agent_registry(&self) -> &astra_turn_core::orchestration_team_config::AgentRegistry {
@@ -588,12 +708,19 @@ impl DynamicAgentSpawner {
             started_at: SystemTime::now(),
             metrics: Default::default(),
             permission_summary,
+            parent_agent_id: context.parent_agent_id.clone(),
+            trace_context: context.trace_context.clone(),
+            spawn_tool_call_id: context.spawn_tool_call_id.clone(),
+            run_in_background: input.background,
         };
+        let spawned_state_for_trace = state.clone();
 
         self.active_agents
             .write()
             .await
             .insert(agent_id.clone(), state);
+        self.emit_agent_spawned_trace(&spawned_state_for_trace)
+            .await;
 
         // 6b. Reconstruct the inherited prefix payload for the
         // executor BEFORE moving resolve_outcome into the outcomes
@@ -778,6 +905,17 @@ impl DynamicAgentSpawner {
                                 state.permission_summary = summary;
                             }
                         }
+                        if let Some(state) = self.active_agents.read().await.get(&agent_id).cloned()
+                        {
+                            self.emit_agent_terminal_trace(
+                                &state,
+                                &run_result.status,
+                                Some(run_result.finish_reason.as_str()),
+                                run_result.output.as_deref(),
+                                run_result.error.as_deref(),
+                            )
+                            .await;
+                        }
 
                         let status = match run_result.status.as_str() {
                             "cancelled" => AgentStatus::Cancelled,
@@ -831,6 +969,17 @@ impl DynamicAgentSpawner {
                         }
                     }
                     Err(e) => {
+                        if let Some(state) = self.active_agents.read().await.get(&agent_id).cloned()
+                        {
+                            self.emit_agent_terminal_trace(
+                                &state,
+                                "failed",
+                                None,
+                                None,
+                                Some(e.as_str()),
+                            )
+                            .await;
+                        }
                         self.update_status(
                             &agent_id,
                             AgentStatus::Failed {
@@ -871,6 +1020,16 @@ impl DynamicAgentSpawner {
                         state.permission_summary = summary;
                     }
                 }
+                if let Some(state) = self.active_agents.read().await.get(agent_id).cloned() {
+                    self.emit_agent_terminal_trace(
+                        &state,
+                        &run_result.status,
+                        Some(run_result.finish_reason.as_str()),
+                        run_result.output.as_deref(),
+                        run_result.error.as_deref(),
+                    )
+                    .await;
+                }
 
                 let status = match run_result.status.as_str() {
                     "cancelled" => AgentStatus::Cancelled,
@@ -901,6 +1060,10 @@ impl DynamicAgentSpawner {
                 self.notify_completion(agent_id).await;
             }
             Err(e) => {
+                if let Some(state) = self.active_agents.read().await.get(agent_id).cloned() {
+                    self.emit_agent_terminal_trace(&state, "failed", None, None, Some(e.as_str()))
+                        .await;
+                }
                 self.persist_agent_terminated(agent_id, "failed", None)
                     .await;
                 self.update_status(
@@ -998,6 +1161,55 @@ impl DynamicAgentSpawner {
         }
     }
 
+    fn agent_status_trace_label(status: &AgentStatus) -> &'static str {
+        match status {
+            AgentStatus::Initializing => "initializing",
+            AgentStatus::Running { .. } => "running",
+            AgentStatus::Idle => "idle",
+            AgentStatus::Completed { .. } => "completed",
+            AgentStatus::Failed { .. } => "failed",
+            AgentStatus::Cancelled => "cancelled",
+        }
+    }
+
+    pub async fn record_agent_result_collected(
+        &self,
+        parent_run_id: &str,
+        parent_agent_id: &str,
+        agent_id: &str,
+        tool_call_id: Option<&str>,
+        child_status: &AgentStatus,
+    ) {
+        let state = self.get_agent_state_any(agent_id).await;
+        let Some(state) = state else {
+            return;
+        };
+        let Some(trace) = state.trace_context.as_ref() else {
+            return;
+        };
+        let tool_key = tool_call_id.unwrap_or("");
+        let mut event = TraceEvent::new(
+            Self::trace_event_id("agent_collect", &[parent_run_id, tool_key, agent_id]),
+            trace.session_id.clone(),
+            trace.user_id.clone(),
+            "agent_result_collected",
+            "agent_lifecycle",
+        )
+        .with_turn_context(trace);
+        event.run_id = Some(parent_run_id.to_string());
+        event.parent_run_id = None;
+        event.agent_id = Some(parent_agent_id.to_string());
+        event.parent_agent_id = None;
+        event.tool_call_id = tool_call_id.map(ToString::to_string);
+        event.parent_event_id = Some(trace.root_event_id.clone());
+        event.metadata = serde_json::json!({
+            "child_agent_id": agent_id,
+            "child_run_id": &state.run_id,
+            "child_status": Self::agent_status_trace_label(child_status),
+        });
+        self.write_trace_event(event).await;
+    }
+
     /// Wait for a background agent to complete. Returns immediately if
     /// already completed. Uses `tokio::sync::Notify` — zero polling.
     pub async fn wait_for_agent(
@@ -1066,6 +1278,7 @@ impl DynamicAgentSpawner {
             // itself already, so cloning the Option just bumps refcount.
             prefix_store: self.prefix_store.clone(),
             prefix_resolve_outcomes: Arc::clone(&self.prefix_resolve_outcomes),
+            trace_writer: self.trace_writer.clone(),
         }
     }
 
@@ -1462,6 +1675,8 @@ mod tests {
             inherited_permissions: None,
             inherited_skills: vec![],
             live_event_sink: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
         };
 
         let result = spawner.spawn(input, &context).await.unwrap();
@@ -1485,6 +1700,8 @@ mod tests {
             inherited_permissions: None,
             inherited_skills: vec![],
             live_event_sink: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
         };
 
         let result = spawner.spawn(input, &context).await;
@@ -1502,6 +1719,8 @@ mod tests {
             inherited_permissions: None,
             inherited_skills: vec![],
             live_event_sink: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
         };
 
         // Spawn two agents
@@ -1547,6 +1766,8 @@ mod tests {
             inherited_permissions: None,
             inherited_skills: vec![],
             live_event_sink: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
         };
 
         // Spawn an agent in background mode
@@ -1592,6 +1813,8 @@ mod tests {
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
         };
         let input = SpawnAgentInput {
             description: "Named agent".to_string(),
@@ -1770,6 +1993,8 @@ mod tests {
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
         };
         let input = SpawnAgentInput {
             description: "Background agent".to_string(),
@@ -1813,6 +2038,8 @@ mod tests {
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
         };
         let input = SpawnAgentInput {
             description: "Depth test".to_string(),
@@ -1838,6 +2065,8 @@ mod tests {
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
         };
         let input = SpawnAgentInput {
             description: "Depth reject".to_string(),
@@ -1868,6 +2097,8 @@ mod tests {
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
         };
         let input = SpawnAgentInput {
             description: "Sync agent".to_string(),
@@ -1937,6 +2168,8 @@ mod tests {
             inherited_permissions: None,
             inherited_skills: vec!["review-changes".to_string(), "analyze-session".to_string()],
             live_event_sink: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
         };
         let input = SpawnAgentInput {
             description: "Test with skills".to_string(),
@@ -1960,6 +2193,8 @@ mod tests {
             inherited_permissions: None,
             inherited_skills: Vec::new(),
             live_event_sink: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
         };
         assert!(context.inherited_skills.is_empty());
     }
@@ -2030,6 +2265,8 @@ mod tests {
             inherited_permissions: None,
             inherited_skills: vec![],
             live_event_sink: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
         }
     }
 
@@ -2498,6 +2735,8 @@ mod tests {
             inherited_permissions: None,
             inherited_skills: vec![],
             live_event_sink: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
         }
     }
 

@@ -10,6 +10,7 @@ use astra_turn_core::contracts::{
     TurnSkillSelectionRecord, TurnToolEventRecord,
 };
 use astra_turn_core::hook_plans::SnapshotLinkPlan;
+use astra_turn_core::trace_event::TraceEvent;
 
 fn metadata_tool_name(metadata: Option<&serde_json::Value>) -> Option<String> {
     metadata
@@ -24,6 +25,89 @@ fn metadata_duration_ms(metadata: Option<&serde_json::Value>) -> Option<i32> {
         .and_then(|v| v.get("duration_ms"))
         .and_then(|v| v.as_i64())
         .and_then(|v| i32::try_from(v).ok())
+}
+
+fn mysql_datetime(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+}
+
+pub(crate) async fn insert_trace_event(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    event: &TraceEvent,
+) -> Result<(), sqlx::Error> {
+    query(
+        "INSERT IGNORE INTO agent_events \
+         (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
+          parent_event_id, causal_chain_id, run_id, parent_run_id, turn_id, turn_seq, \
+          round_index, tool_call_id, parent_agent_id, trace_kind, token_usage, \
+          llm_model_used, reasoning_content, token_input, token_output, token_total, \
+          meta_tool_name, meta_duration_ms, metadata, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&event.event_id)
+    .bind(&event.session_id)
+    .bind(&event.user_id)
+    .bind(event.agent_id.as_deref().unwrap_or("astra-server"))
+    .bind(env!("CARGO_PKG_VERSION"))
+    .bind(&event.event_type)
+    .bind(&event.content)
+    .bind(&event.parent_event_id)
+    .bind(&event.causal_chain_id)
+    .bind(&event.run_id)
+    .bind(&event.parent_run_id)
+    .bind(&event.turn_id)
+    .bind(event.turn_seq)
+    .bind(event.round_index)
+    .bind(&event.tool_call_id)
+    .bind(&event.parent_agent_id)
+    .bind(&event.trace_kind)
+    .bind(event.token_usage.as_ref().map(serde_json::Value::to_string))
+    .bind(&event.llm_model_used)
+    .bind(&event.reasoning_content)
+    .bind(event.token_usage.as_ref().and_then(|v| {
+        let prompt = v
+            .get("prompt")
+            .or_else(|| v.get("input_tokens"))
+            .and_then(Value::as_i64)?;
+        let cached = v
+            .get("cached_input_tokens")
+            .or_else(|| v.get("cache_read_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let creation = v
+            .get("cache_creation_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        Some(prompt + cached + creation)
+    }))
+    .bind(event.token_usage.as_ref().and_then(|v| {
+        v.get("completion")
+            .or_else(|| v.get("output_tokens"))
+            .and_then(Value::as_i64)
+    }))
+    .bind(event.token_usage.as_ref().and_then(|v| {
+        v.get("total")
+            .or_else(|| v.get("total_tokens"))
+            .and_then(Value::as_i64)
+    }))
+    .bind(&event.meta_tool_name)
+    .bind(event.meta_duration_ms)
+    .bind(Some(event.metadata.to_string()))
+    .bind(mysql_datetime(event.created_at))
+    .execute(&mut **tx)
+    .await?;
+    insert_agent_event_edges(
+        &mut **tx,
+        &event.event_id,
+        event.parent_event_id.as_deref(),
+        event
+            .parent_event_id
+            .as_ref()
+            .map(|id| std::slice::from_ref(id))
+            .unwrap_or(&[]),
+    )
+    .await?;
+    Ok(())
 }
 
 pub(crate) async fn insert_core_turn_event(

@@ -71,10 +71,25 @@ fn record_early_exit_llm_round(
 ) {
     let agentic_step = current_agentic_step(state);
     let run_id = state.current_run_id.clone();
+    let duration_ms = turn_start.elapsed().as_millis() as u64;
+    state.push_recent_round(super::agentic_loop_host::RecentRoundSummary {
+        turn: state.session_turn,
+        round: state.current_round_index,
+        provider: String::new(),
+        model: String::new(),
+        prompt_tokens: turn_result.accum.prompt_tokens,
+        cache_read_tokens: turn_result.accum.cache_read_tokens,
+        cache_creation_tokens: turn_result.accum.cache_creation_tokens,
+        completion_tokens: turn_result.accum.completion_tokens,
+        tool_calls_returned: 0,
+        tool_call_names: Vec::new(),
+        duration_ms,
+        finish_reason: finish_reason.map(ToString::to_string),
+    });
     if let Some(ref mut buf) = state.turn_event_buffer {
         buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
             ttft_ms: turn_result.ttft_ms,
-            duration_ms: turn_start.elapsed().as_millis() as u64,
+            duration_ms,
             prompt_tokens: turn_result.accum.prompt_tokens,
             completion_tokens: turn_result.accum.completion_tokens,
             cache_read_tokens: turn_result.accum.cache_read_tokens,
@@ -3855,6 +3870,7 @@ mod tests {
         // the shape `should_escalate_execution` counts.
         for i in 0..EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD {
             state.stall.tool_call_records.push(ToolCallRecord {
+                tool_call_id: None,
                 name: "read_file".to_string(),
                 ok: true,
                 ms: 10,

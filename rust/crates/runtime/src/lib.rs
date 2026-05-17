@@ -260,8 +260,8 @@ pub use astra_turn_core::contracts::{
 };
 
 pub use turn::services::{
-    DatabaseTurnAuxiliaryEventWriter, DatabaseTurnCoreEventWriter, DatabaseTurnHookDbWriter,
-    DatabaseTurnSessionActivityWriter, DatabaseTurnToolEventWriter,
+    DatabaseTraceEventWriter, DatabaseTurnAuxiliaryEventWriter, DatabaseTurnCoreEventWriter,
+    DatabaseTurnHookDbWriter, DatabaseTurnSessionActivityWriter, DatabaseTurnToolEventWriter,
 };
 
 pub use astra_turn_core::{

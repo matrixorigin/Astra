@@ -2311,6 +2311,8 @@ mod tests {
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
         };
         let input = SpawnAgentInput {
             description: "watch test agent".to_string(),
