@@ -7237,22 +7237,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn edge_tool_result_401_refreshes_and_retries_without_terminal_auth_failure() {
-        static CREDENTIALS_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-            std::sync::OnceLock::new();
-        let _guard = CREDENTIALS_ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("credentials env lock");
-
-        let credentials_dir = tempdir().expect("credentials dir");
-        unsafe { std::env::set_var("ASTRA_CREDENTIALS_DIR", credentials_dir.path()) };
-        struct CredentialsEnvGuard;
-        impl Drop for CredentialsEnvGuard {
-            fn drop(&mut self) {
-                unsafe { std::env::remove_var("ASTRA_CREDENTIALS_DIR") };
-            }
-        }
-        let _env_guard = CredentialsEnvGuard;
+        let _creds_guard = crate::tests::isolate_credentials();
 
         let mut creds = CredentialsFile {
             current_profile: Some("test".to_string()),

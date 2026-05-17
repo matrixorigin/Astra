@@ -4945,12 +4945,16 @@ async fn apply_restored_session(
         }
     }
 
-    if let Some(ref m) = restored.model {
-        state.model = Some(m.clone());
+    if let Some(m) = normalize_model_override(restored.model.as_deref()) {
+        state.model = Some(m.to_string());
         let base = astra_turn_core::thinking_config::resolve_model_thinking(m).0;
         state.cached_pricing = slash_stats::fallback_pricing(base);
         state.context_budget =
             prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(base));
+    } else if restored.model.is_some() {
+        state.model = None;
+        state.context_budget =
+            prompts::ContextBudget::from_runtime_config(&state.runtime_config, None);
     }
 
     restore_journal_history_if_available(state, &restored.session_id).await;
@@ -6029,6 +6033,41 @@ mod resume_tests {
         assert_eq!(state.turn, 2);
         assert_eq!(state.total_prompt_tokens, 15);
         assert_eq!(state.total_completion_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn restore_session_into_state_treats_default_model_as_server_default() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = format!("resume-default-model-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 2);
+        let mut ws = session_workspace::read_workspace(&session_id).unwrap();
+        ws.model = "default".to_string();
+        session_workspace::write_workspace(&ws).unwrap();
+        write_profile_with_token(&session_id);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "status": "active"
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let mut state = SessionState {
+            model: Some("default".to_string()),
+            ..SessionState::default()
+        };
+        restore_session_into_state(&session_id, None, &api, &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(state.model, None);
     }
 
     #[tokio::test]

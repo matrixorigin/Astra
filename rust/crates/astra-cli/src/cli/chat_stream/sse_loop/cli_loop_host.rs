@@ -57,6 +57,7 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub file_context: Vec<String>,
     pub perm_manager: &'a mut PermissionManager,
     pub valid_tool_names: HashSet<String>,
+    pub capabilities: astra_turn_core::capability::CapabilitySet,
     /// Lines written to stderr between SSE turns (headless tool output, etc.)
     /// that the next `consume_turn_sse` must clear before streaming.
     pub pending_clear_lines: usize,
@@ -761,6 +762,10 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 
     fn valid_tool_names(&self) -> &HashSet<String> {
         &self.valid_tool_names
+    }
+
+    fn capabilities(&self) -> astra_turn_core::capability::CapabilitySet {
+        self.capabilities.clone()
     }
 
     fn inject_tool_schema(&mut self, schema: Value) {

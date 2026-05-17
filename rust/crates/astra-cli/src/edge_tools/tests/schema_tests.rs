@@ -100,8 +100,8 @@ fn every_catalog_tool_has_schema() {
     // Tools with dynamically constructed schemas (not in static all_tool_schemas).
     // This list is self-validated below — if a tool listed here gains a static
     // schema or is removed from the catalog, the test will catch it.
-    // After tool consolidation, all catalog tools have static schemas.
-    const DYNAMIC_SCHEMA_TOOLS: &[&str] = &[];
+    // `skill` embeds the live skill catalog and is generated per session.
+    const DYNAMIC_SCHEMA_TOOLS: &[&str] = &["skill"];
 
     let schemas = all_tool_schemas();
     let schema_names: std::collections::HashSet<&str> = schemas
@@ -577,19 +577,29 @@ fn local_cli_catalog_includes_plan_mode_wrappers() {
 }
 
 #[test]
-fn enter_plan_mode_and_exit_plan_mode_listed_in_executor_tool_names() {
-    // SERVER_EXECUTOR_TOOL_NAMES is the source of truth for which tools the
-    // server-side executor will dispatch. Without these entries, the server
-    // sees the tool name and routes to the unknown-tool fallback.
-    use astra_tools::schemas::SERVER_EXECUTOR_TOOL_NAMES;
+fn enter_plan_mode_and_exit_plan_mode_surface_with_plan_lifecycle() {
+    use astra_turn_core::capability::{Capability, CapabilitySet};
+    use astra_turn_core::tool_surface::{Surface, resolve};
+
+    let pool = astra_tools::schemas::all_tool_schemas();
+    let caps = CapabilitySet::empty().with(Capability::PlanLifecycle);
+    let names: Vec<String> = resolve(Surface::Web, &caps, &pool)
+        .into_iter()
+        .filter_map(|schema| {
+            schema
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(|name| name.as_str())
+                .map(str::to_string)
+        })
+        .collect();
     assert!(
-        SERVER_EXECUTOR_TOOL_NAMES.contains(&"enter_plan_mode"),
-        "SERVER_EXECUTOR_TOOL_NAMES must include `enter_plan_mode` so the \
-         server dispatcher routes the call. Got: {SERVER_EXECUTOR_TOOL_NAMES:?}"
+        names.contains(&"enter_plan_mode".to_string()),
+        "PlanLifecycle capability must surface enter_plan_mode. Got: {names:?}"
     );
     assert!(
-        SERVER_EXECUTOR_TOOL_NAMES.contains(&"exit_plan_mode"),
-        "SERVER_EXECUTOR_TOOL_NAMES must include `exit_plan_mode`."
+        names.contains(&"exit_plan_mode".to_string()),
+        "PlanLifecycle capability must surface exit_plan_mode."
     );
 }
 

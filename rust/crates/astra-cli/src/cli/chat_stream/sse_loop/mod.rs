@@ -344,10 +344,12 @@ pub(crate) async fn stream_chat_sse(
     } else {
         Vec::new()
     };
+    let cli_capabilities = edge_tools::cli_default_capabilities(p.agent_spawner.is_some());
     let all_schemas: (Vec<Value>, Vec<Value>) = (
         astra_runtime::capabilities::cli_local_tool_schemas(
             edge_tools::local_tool_schemas(),
             mcp_schemas.clone(),
+            &cli_capabilities,
         ),
         mcp_schemas,
     );
@@ -499,6 +501,7 @@ pub(crate) async fn stream_chat_sse(
         file_context,
         perm_manager: p.perm_manager,
         valid_tool_names,
+        capabilities: cli_capabilities,
         pending_clear_lines: 0,
         is_plan_subtask: p.is_plan_subtask,
         plan_subtask_id: p.plan_subtask_id,

@@ -298,7 +298,7 @@ async fn initialize_session_state_marks_workspace_session_as_pending_recovery() 
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn crash_recovery_short_continue_restores_and_replays_context_online() {
+async fn crash_recovery_short_continue_starts_fresh_session_without_auto_restore() {
     let _creds = isolate_credentials();
     let temp = tempfile::tempdir().unwrap();
     let _sessions = session_journal::JournalDirGuard::new(temp.path());
@@ -497,47 +497,31 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
 
     let requests = mock_state.requests.lock().await.clone();
     assert!(
-        requests.len() >= 2,
-        "expected retry after stale session recovery, got {} requests",
+        !requests.is_empty(),
+        "expected a fresh chat request, got {} requests",
         requests.len()
     );
-    let resumed = requests
-        .iter()
-        .find(|req| req.get("session_id").and_then(serde_json::Value::as_str) == Some(sid.as_str()))
-        .expect("expected first recovered request to target stale session id");
-    let resumed_text = resumed.to_string();
-    assert!(resumed_text.contains("rate_limited"));
-    assert!(resumed_text.contains("继续"));
-    // Session-memory resume-guidance content is no longer tested here:
-    // after the unified Memoria-backed rewrite, resume guidance reads
-    // the last L1 from Memoria instead of a local markdown file, and
-    // this test uses an HTTP mock (no Memoria endpoint). See
-    // `session_memory::MemoryExtractionService` for the canonical
-    // integration tests around L1 content.
-
-    let retried = requests.last().unwrap();
+    assert!(
+        requests.iter().all(
+            |req| req.get("session_id").and_then(serde_json::Value::as_str) != Some(sid.as_str())
+        ),
+        "ordinary chat input must not silently restore pending session {sid}: {requests:?}"
+    );
+    let fresh = requests.last().unwrap();
     assert_ne!(
-        retried
-            .get("session_id")
-            .and_then(serde_json::Value::as_str),
+        fresh.get("session_id").and_then(serde_json::Value::as_str),
         Some(sid.as_str())
     );
-    let retried_text = retried.to_string();
-    assert!(retried_text.contains("rate_limited"));
-    // Memory-content injection assertion removed with the Memoria
-    // unification — see note at resumed_text assertions above.
     assert_eq!(state.pending_recovery, None);
     assert_eq!(
         state.session_id.as_deref(),
         Some(recovered_session_id.as_str())
     );
-    assert_eq!(state.history.len(), 2);
-    assert_eq!(state.history.last().unwrap().0, "继续");
     assert!(state.resume_guidance.is_none());
 }
 
 #[tokio::test]
-async fn crash_recovery_low_information_repair_followup_rebuilds_attachment() {
+async fn crash_recovery_low_information_repair_followup_does_not_auto_restore() {
     let _creds = isolate_credentials();
     let temp = tempfile::tempdir().unwrap();
     let _sessions = session_journal::JournalDirGuard::new(temp.path());
@@ -653,39 +637,15 @@ async fn crash_recovery_low_information_repair_followup_rebuilds_attachment() {
     .unwrap();
 
     let requests = mock_state.requests.lock().await.clone();
-    let resumed = requests
-        .iter()
-        .find(|req| req.get("session_id").and_then(serde_json::Value::as_str) == Some(sid.as_str()))
-        .expect("expected first recovered request to target stale session id");
-    let resumed_text = resumed.to_string();
-    assert!(resumed_text.contains("[Active task attachment]"));
-    assert!(resumed_text.contains("review 这个: aa1f419bc040003f5de8cdfa6b414225ade82e2b"));
-    assert!(resumed_text.contains("Two independent fixes in one commit. Let me review each."));
-    assert!(resumed_text.contains("thread leak on timeout"));
-    assert!(resumed_text.contains("[User follow-up]\\n修复?"));
-    let edge_tool_names: std::collections::HashSet<String> = resumed
-        .get("edge_tools")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|tool| {
-            tool.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string)
-        })
-        .collect();
-    // With all tools pinned (no dynamic selection), every tool is always
-    // available. The repair follow-up just needs to have the core tools.
     assert!(
-        edge_tool_names.contains("str_replace"),
-        "repair follow-up must keep str_replace available: {:?}",
-        edge_tool_names
+        !requests.is_empty(),
+        "expected a fresh chat request, got no requests"
     );
     assert!(
-        edge_tool_names.contains("bash"),
-        "repair follow-up must keep bash available: {:?}",
-        edge_tool_names
+        requests.iter().all(
+            |req| req.get("session_id").and_then(serde_json::Value::as_str) != Some(sid.as_str())
+        ),
+        "repair follow-up must not silently restore pending session {sid}: {requests:?}"
     );
     assert_eq!(state.pending_recovery, None);
     assert_eq!(

@@ -190,6 +190,12 @@ pub trait AgenticLoopHost: Send {
     /// Valid tool names from the host's tool schemas.
     fn valid_tool_names(&self) -> &HashSet<String>;
 
+    /// Active capability set for this host. Prompt rendering should read this
+    /// rather than inferring capabilities from the resolved tool list.
+    fn capabilities(&self) -> astra_turn_core::capability::CapabilitySet {
+        astra_turn_core::capability::CapabilitySet::all()
+    }
+
     /// Inject an additional tool schema into the host's tool list.
     ///
     /// Called by the runtime in the loop preamble to auto-register tools

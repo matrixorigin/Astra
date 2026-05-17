@@ -27,8 +27,6 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - name: Run clippy
         run: make lint
-      - name: Server tool schema guards (astra-tools)
-        run: make check-server-tool-schemas
       - name: Check formatting
         run: make format-check
       - uses: taiki-e/install-action@v2

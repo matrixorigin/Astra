@@ -62,7 +62,7 @@ use astra_tools::passive_tsc_check;
 #[allow(clippy::needless_range_loop)]
 mod shell;
 use astra_tools::env_tools;
-use astra_tools::schemas::{all_tool_schemas as full_tool_schemas, default_executor_tool_schemas};
+use astra_tools::schemas::all_tool_schemas as full_tool_schemas;
 pub use env_tools::apply_overlay as apply_env_overlay;
 #[path = "edge_tools/code_analysis.rs"]
 mod code_analysis;
@@ -75,24 +75,30 @@ pub fn all_tool_schemas() -> Vec<Value> {
     full_tool_schemas()
 }
 
-fn function_schema_name(schema: &Value) -> Option<&str> {
-    schema
-        .get("function")
-        .and_then(|function| function.get("name"))
-        .and_then(Value::as_str)
+/// Construct the CLI's session-wide `CapabilitySet`.
+pub fn cli_default_capabilities(
+    has_agent_spawner: bool,
+) -> astra_turn_core::capability::CapabilitySet {
+    use astra_turn_core::capability::{Capability, CapabilitySet};
+    CapabilitySet::empty()
+        .with(Capability::MemoryService)
+        .with(Capability::Database)
+        .with(Capability::GitHubAuth)
+        .with(Capability::LSPServer)
+        .with(Capability::SkillsCatalog)
+        .with_if(has_agent_spawner, Capability::AgentSpawner)
+}
+
+struct CliCapabilityView {
+    active_names: Vec<String>,
+    inactive_names: Vec<String>,
+    dropped_by_capability: Vec<Value>,
+    dropped_by_surface: Vec<String>,
+    mcp_pass_through: Vec<String>,
 }
 
 pub fn local_tool_schemas() -> Vec<Value> {
-    let mut schemas = default_executor_tool_schemas();
-    for schema in full_tool_schemas() {
-        if matches!(
-            function_schema_name(&schema),
-            Some("enter_plan_mode" | "exit_plan_mode")
-        ) {
-            schemas.push(schema);
-        }
-    }
-    schemas
+    full_tool_schemas()
 }
 
 /// Plan-mode write guard tool list (CLI parity with
@@ -2426,6 +2432,10 @@ impl ToolExecutor {
     }
 
     fn handle_introspect(&self, args: &Value) -> String {
+        if args.get("dimension").and_then(Value::as_str) == Some("capability") {
+            return self.capability_info_json().to_string();
+        }
+
         // `subtopic` routes to a specialized diagnostic. Default behavior
         // (session health: token pressure, tool health, alerts) remains
         // unchanged when `subtopic` is missing, empty, or "session".
@@ -3703,32 +3713,7 @@ impl ToolExecutor {
 
         let self_model = self.build_self_model_snapshot();
         match dimension {
-            "capability" => {
-                if let Some(ref model) = self_model {
-                    serde_json::json!({
-                        "tools": model.capabilities.tool_names,
-                        "tool_count": model.capabilities.total_tools,
-                        "deprioritized_tools": model.capabilities.deprioritized_tools,
-                        "skills": model.capabilities.skills,
-                        "pinned_tools": model.capabilities.pinned_tools,
-                        "tool_health": model.capabilities.tool_health.iter().map(|t| {
-                            serde_json::json!({
-                                "name": t.name,
-                                "total_calls": t.total_calls,
-                                "success_rate": t.success_rate,
-                                "deprioritized": t.deprioritized,
-                            })
-                        }).collect::<Vec<_>>(),
-                    })
-                    .to_string()
-                } else {
-                    serde_json::json!({
-                        "tools": self.tool_names(),
-                        "tool_count": self.tool_count(),
-                    })
-                    .to_string()
-                }
-            }
+            "capability" => self.capability_info_json().to_string(),
             "state" => {
                 if let Some(ref model) = self_model {
                     serde_json::json!({
@@ -3785,12 +3770,156 @@ impl ToolExecutor {
         }
     }
 
+    fn capability_info_json(&self) -> Value {
+        let caps = self.cli_capability_view();
+        if let Some(ref model) = self.build_self_model_snapshot() {
+            json!({
+                "surface": "CliLocal",
+                "capabilities_active": caps.active_names,
+                "capabilities_inactive": caps.inactive_names,
+                "tools_visible": model.capabilities.tool_names,
+                "tools_dropped_by_capability": caps.dropped_by_capability,
+                "tools_dropped_by_surface": caps.dropped_by_surface,
+                "tools_pass_through_mcp": caps.mcp_pass_through,
+                "tool_count": model.capabilities.total_tools,
+                "deprioritized_tools": model.capabilities.deprioritized_tools,
+                "skills": model.capabilities.skills,
+                "pinned_tools": model.capabilities.pinned_tools,
+                "tool_health": model.capabilities.tool_health.iter().map(|t| {
+                    json!({
+                        "name": t.name,
+                        "total_calls": t.total_calls,
+                        "success_rate": t.success_rate,
+                        "deprioritized": t.deprioritized,
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        } else {
+            json!({
+                "surface": "CliLocal",
+                "capabilities_active": caps.active_names,
+                "capabilities_inactive": caps.inactive_names,
+                "tools_visible": self.tool_names(),
+                "tools_dropped_by_capability": caps.dropped_by_capability,
+                "tools_dropped_by_surface": caps.dropped_by_surface,
+                "tools_pass_through_mcp": caps.mcp_pass_through,
+                "tool_count": self.tool_count(),
+            })
+        }
+    }
+
+    fn cli_capability_view(&self) -> CliCapabilityView {
+        use astra_turn_core::capability::Capability;
+
+        let caps = cli_default_capabilities(self.spawn_context.is_some());
+        let mut active_names = Vec::new();
+        let mut inactive_names = Vec::new();
+        for capability in [
+            Capability::AgentSpawner,
+            Capability::MemoryService,
+            Capability::Database,
+            Capability::SkillsCatalog,
+            Capability::GitHubAuth,
+            Capability::LSPServer,
+            Capability::PlanLifecycle,
+        ] {
+            if caps.has(capability) {
+                active_names.push(format!("{capability:?}"));
+            } else {
+                inactive_names.push(format!("{capability:?}"));
+            }
+        }
+
+        let mut pool = full_tool_schemas();
+        let plugins = self.plugin_schemas.read().unwrap_or_else(|poisoned| {
+            tracing::warn!("CLI plugin_schemas RwLock poisoned on capability view; recovering.");
+            poisoned.into_inner()
+        });
+        pool.extend(plugins.iter().cloned());
+        drop(plugins);
+
+        let outcome = astra_turn_core::tool_surface::resolve_with_diagnostics(
+            astra_turn_core::tool_surface::Surface::CliLocal,
+            &caps,
+            &pool,
+        );
+        let visible_names: std::collections::HashSet<String> = outcome
+            .schemas
+            .iter()
+            .filter_map(|schema| {
+                schema
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+
+        let mut dropped_by_capability = Vec::new();
+        for meta in astra_turn_core::tool_registry_meta::TOOL_CATALOG {
+            if visible_names.contains(meta.name) {
+                continue;
+            }
+            let missing: Vec<String> = meta
+                .requires
+                .iter()
+                .filter(|capability| !caps.has(**capability))
+                .map(|capability| format!("{capability:?}"))
+                .collect();
+            if !missing.is_empty() {
+                dropped_by_capability.push(json!({
+                    "name": meta.name,
+                    "missing": missing,
+                }));
+            }
+        }
+
+        let mcp_pass_through = visible_names
+            .into_iter()
+            .filter(|name| {
+                !astra_turn_core::tool_registry_meta::TOOL_CATALOG
+                    .iter()
+                    .any(|meta| meta.name == name.as_str())
+            })
+            .filter(|name| name.starts_with("mcp__"))
+            .collect();
+        let dropped_by_surface = outcome
+            .dropped_by_surface
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        CliCapabilityView {
+            active_names,
+            inactive_names,
+            dropped_by_capability,
+            dropped_by_surface,
+            mcp_pass_through,
+        }
+    }
+
     /// Build a SelfModel snapshot from available observability session data.
     pub fn build_self_model_snapshot(&self) -> Option<astra_runtime::self_model::SelfModel> {
         let obs_session = self.observability_session.as_ref()?;
         let session = obs_session.read().ok()?;
 
-        let tool_name_strs = self.tool_names();
+        let selected_tools: Vec<String> = session
+            .context_traces
+            .last()
+            .map(|trace| {
+                trace
+                    .tools
+                    .tools_selected
+                    .iter()
+                    .map(|tool| tool.tool_name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let tool_name_strs = if selected_tools.is_empty() {
+            self.tool_names()
+        } else {
+            selected_tools
+        };
         let tool_name_refs: Vec<&str> = tool_name_strs.iter().map(|s| s.as_str()).collect();
         let pinned_tools = self
             .self_mod_pinned_tools
@@ -4012,7 +4141,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_search_select_github_is_missing_on_cli_path() {
+    async fn tool_search_select_github_resolves_on_cli_path() {
         let executor = test_executor();
         let out = executor
             .execute(
@@ -4022,20 +4151,17 @@ mod tests {
             .await;
         let parsed: serde_json::Value =
             serde_json::from_str(&out).expect("tool_search must return valid JSON");
-        let missing = parsed["missing"].as_array().expect("missing field");
-        assert!(
-            missing.iter().any(|value| value.as_str() == Some("github")),
-            "CLI tool_search(select:github) should stay missing because github is not in the local CLI surface; got: {out}"
-        );
         let matches = parsed["matches"].as_array().expect("matches field");
         assert!(
-            matches.is_empty(),
-            "server-only tools should not be returned on the local CLI path; got: {out}"
+            matches
+                .iter()
+                .any(|m| m.get("name").and_then(|n| n.as_str()) == Some("github")),
+            "CLI must resolve github when GitHubAuth is in the capability set; got: {out}"
         );
     }
 
     #[tokio::test]
-    async fn tool_search_select_memory_is_missing_on_cli_path() {
+    async fn tool_search_select_memory_resolves_on_cli_path() {
         let executor = test_executor();
         let out = executor
             .execute(
@@ -4044,14 +4170,53 @@ mod tests {
             )
             .await;
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let matches = parsed["matches"].as_array().expect("matches field");
         assert!(
-            parsed["missing"]
-                .as_array()
-                .unwrap()
+            matches
                 .iter()
-                .any(|value| value.as_str() == Some("memory"))
+                .any(|m| m.get("name").and_then(|n| n.as_str()) == Some("memory")),
+            "CLI must resolve memory when MemoryService is in the capability set; got: {out}"
         );
-        assert!(parsed["matches"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn introspect_capability_reports_inactive_agent_spawner() {
+        let executor = test_executor();
+        let out = executor
+            .execute(
+                "introspect",
+                &serde_json::json!({"dimension": "capability"}),
+            )
+            .await;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("introspect must return JSON");
+
+        let inactive: Vec<&str> = parsed["capabilities_inactive"]
+            .as_array()
+            .map(|values| values.iter().filter_map(|value| value.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            inactive.contains(&"AgentSpawner"),
+            "bare executor must report AgentSpawner inactive; got {out}"
+        );
+        assert!(
+            inactive.contains(&"PlanLifecycle"),
+            "PlanLifecycle is server-owned on the CLI; got {out}"
+        );
+
+        let dropped = parsed["tools_dropped_by_capability"]
+            .as_array()
+            .expect("tools_dropped_by_capability");
+        let agent_drop = dropped.iter().find(|entry| entry["name"] == "agent");
+        assert!(
+            agent_drop.is_some(),
+            "agent must be reported as capability-dropped; got {out}"
+        );
+        let missing: Vec<&str> = agent_drop.unwrap()["missing"]
+            .as_array()
+            .map(|values| values.iter().filter_map(|value| value.as_str()).collect())
+            .unwrap_or_default();
+        assert!(missing.contains(&"AgentSpawner"));
     }
 
     #[tokio::test]

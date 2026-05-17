@@ -2491,6 +2491,9 @@ impl AgenticRunLifecycleService {
         .with_llm_token_service(request.llm_token_service.clone())
         .with_full_llm_capture(request.full_llm_capture)
         .with_edge_tools(edge_tools)
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            self.shared_pool.is_some(),
+        ))
         .with_edge_profile(edge_profile)
         .with_edge_callback_ledger(self.edge_callback_ledger.clone())
         .with_interactive_client(request.interactive_client)
@@ -3128,6 +3131,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 memoria_base,
                 None,
             )
+            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                self.shared_pool.is_some(),
+            ))
             .with_cancel_token(loop_state.cancellation.token.clone())
             .with_task_store(task_store);
             if let Some(pool) = &self.edge_connection_pool {
@@ -3580,6 +3586,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 memoria_base,
                 None,
             )
+            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                self.shared_pool.is_some(),
+            ))
             .with_cancel_token(state.cancellation.token.clone())
             .with_task_store(task_store);
             if let Some(pool) = &self.edge_connection_pool {
@@ -4418,6 +4427,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
         )
         .with_model(config.agent_profile.model_override.clone())
         .with_llm_token_service(config.llm_token_service.clone())
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            self.shared_pool.is_some(),
+        ))
         .with_edge_profile(edge_profile)
         .with_edge_callback_ledger(self.edge_callback_ledger.clone());
 
@@ -4636,6 +4648,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 memoria_base,
                 None,
             )
+            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                self.shared_pool.is_some(),
+            ))
             .with_cancel_token(config.cancel_token.clone())
             .with_task_store(task_store);
             if let Some(pool) = self.shared_pool.as_ref() {

@@ -30,18 +30,7 @@ use crate::skills::{BundledSkillProvider, LocalSkillProvider, UnifiedSkillRegist
 const REMOTE_SKILL_PAGE_SIZE: u32 = 500;
 const REMOTE_SKILL_MAX_ROWS: u32 = 5_000;
 
-/// User-facing execution surface for capability resolution.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CapabilitySurface {
-    /// Browser-driven Web agent. All tool execution is server-side.
-    Web,
-    /// CLI operating as a thin client against the API server. Server-side
-    /// execution and visibility match Web exactly.
-    CliRemote,
-    /// CLI operating as a local edge client. Local project tools/skills are
-    /// visible in addition to the authenticated server catalog.
-    CliLocal,
-}
+pub use astra_turn_core::tool_surface::Surface as CapabilitySurface;
 
 /// Source bucket used for deterministic tool visibility and tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -137,34 +126,95 @@ pub fn resolve_tool_schemas(request: ToolCatalogRequest) -> Vec<Value> {
     resolved
 }
 
+/// Full capability set for tests that need the complete catalog. Production
+/// callers must derive capabilities from actual service wiring instead.
+pub fn full_server_capabilities_for_tests() -> astra_turn_core::capability::CapabilitySet {
+    astra_turn_core::capability::CapabilitySet::all()
+}
+
+/// Production-truth `CapabilitySet` for an agentic-run lifecycle.
+pub fn lifecycle_server_capabilities(
+    database_pool_present: bool,
+) -> astra_turn_core::capability::CapabilitySet {
+    use astra_turn_core::capability::{Capability, CapabilitySet};
+    CapabilitySet::empty()
+        .with(Capability::MemoryService)
+        .with_if(database_pool_present, Capability::Database)
+        .with(Capability::SkillsCatalog)
+        .with(Capability::GitHubAuth)
+        .with(Capability::PlanLifecycle)
+}
+
+/// Production-truth server `CapabilitySet` derived from [`crate::app_state::AppState`].
+///
+/// `AgentSpawner` intentionally stays off until `ServerToolExecutor` has a
+/// wired dispatch path for `agent(action='spawn'|'get_result')`.
+pub fn server_capabilities_from(
+    state: &crate::app_state::AppState,
+) -> astra_turn_core::capability::CapabilitySet {
+    lifecycle_server_capabilities(state.shared_pool.is_some())
+}
+
 /// Tool schemas for Web agent / server-executed turns.
-pub fn server_runtime_tool_schemas() -> Vec<Value> {
-    resolve_tool_schemas(ToolCatalogRequest::new(CapabilitySurface::Web).with_source(
-        ToolCapabilitySource::ServerBuiltin,
-        astra_tools::schemas::server_executor_tool_schemas(),
-    ))
+///
+/// Capability-driven (see `astra_turn_core::tool_surface`). The catalog,
+/// the `requires` metadata, and the active server `CapabilitySet` together
+/// decide what the model sees.
+pub fn server_runtime_tool_schemas(
+    capabilities: &astra_turn_core::capability::CapabilitySet,
+) -> Vec<Value> {
+    let mut schemas = astra_turn_core::tool_surface::resolve(
+        CapabilitySurface::Web,
+        capabilities,
+        &astra_tools::schemas::all_tool_schemas(),
+    );
+    #[cfg(unix)]
+    {
+        astra_tools::schemas::narrow_run_script_for_server(&mut schemas);
+    }
+    schemas
 }
 
 /// Tool schemas for local CLI turns.
-pub fn cli_local_tool_schemas(client_builtin: Vec<Value>, client_mcp: Vec<Value>) -> Vec<Value> {
-    resolve_tool_schemas(
-        ToolCatalogRequest::new(CapabilitySurface::CliLocal)
-            .with_source(ToolCapabilitySource::ClientBuiltin, client_builtin)
-            .with_source(ToolCapabilitySource::ClientMcp, client_mcp),
-    )
+pub fn cli_local_tool_schemas(
+    client_builtin: Vec<Value>,
+    client_mcp: Vec<Value>,
+    capabilities: &astra_turn_core::capability::CapabilitySet,
+) -> Vec<Value> {
+    let mut pool = client_builtin;
+    let mut seen: HashSet<String> = pool
+        .iter()
+        .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+        .collect();
+    for schema in client_mcp {
+        if let Some(name) = tool_schema_name(&schema)
+            && seen.insert(name.to_string())
+        {
+            pool.push(schema);
+        }
+    }
+    astra_turn_core::tool_surface::resolve(CapabilitySurface::CliLocal, capabilities, &pool)
 }
 
-/// Tool schemas for future remote/thin CLI turns. This intentionally matches
-/// Web so the same API server account sees the same server-side tools.
-pub fn cli_remote_tool_schemas(server_mcp: Vec<Value>) -> Vec<Value> {
-    resolve_tool_schemas(
-        ToolCatalogRequest::new(CapabilitySurface::CliRemote)
-            .with_source(
-                ToolCapabilitySource::ServerBuiltin,
-                astra_tools::schemas::server_executor_tool_schemas(),
-            )
-            .with_source(ToolCapabilitySource::ServerMcp, server_mcp),
-    )
+/// Tool schemas for remote/thin CLI turns. Mirrors Web because execution
+/// happens on the API server.
+pub fn cli_remote_tool_schemas(
+    server_mcp: Vec<Value>,
+    capabilities: &astra_turn_core::capability::CapabilitySet,
+) -> Vec<Value> {
+    let mut pool = astra_tools::schemas::all_tool_schemas();
+    let mut seen: HashSet<String> = pool
+        .iter()
+        .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+        .collect();
+    for schema in server_mcp {
+        if let Some(name) = tool_schema_name(&schema)
+            && seen.insert(name.to_string())
+        {
+            pool.push(schema);
+        }
+    }
+    astra_turn_core::tool_surface::resolve(CapabilitySurface::CliRemote, capabilities, &pool)
 }
 
 /// Return the skill source policy for a surface.
@@ -536,24 +586,27 @@ mod tests {
 
     #[test]
     fn real_plan_lifecycle_tools_are_server_only() {
-        let server_builtins = server_runtime_tool_schemas();
-        let local = names(resolve_tool_schemas(
-            ToolCatalogRequest::new(CapabilitySurface::CliLocal)
-                .with_source(ToolCapabilitySource::ServerBuiltin, server_builtins.clone()),
-        ));
-        let web = names(resolve_tool_schemas(
-            ToolCatalogRequest::new(CapabilitySurface::Web)
-                .with_source(ToolCapabilitySource::ServerBuiltin, server_builtins.clone()),
-        ));
-        let remote = names(resolve_tool_schemas(
-            ToolCatalogRequest::new(CapabilitySurface::CliRemote)
-                .with_source(ToolCapabilitySource::ServerBuiltin, server_builtins),
-        ));
+        use astra_turn_core::capability::{Capability, CapabilitySet};
+        use astra_turn_core::tool_surface::{Surface, resolve};
+
+        let pool = astra_tools::schemas::all_tool_schemas();
+        let without_plan = CapabilitySet::empty()
+            .with(Capability::AgentSpawner)
+            .with(Capability::MemoryService)
+            .with(Capability::Database)
+            .with(Capability::SkillsCatalog)
+            .with(Capability::GitHubAuth)
+            .with(Capability::LSPServer);
+        let with_plan = without_plan.clone().with(Capability::PlanLifecycle);
+
+        let local = names(resolve(Surface::CliLocal, &without_plan, &pool));
+        let web = names(resolve(Surface::Web, &with_plan, &pool));
+        let remote = names(resolve(Surface::CliRemote, &with_plan, &pool));
 
         assert!(
             !local.contains(&"enter_plan_mode".to_string())
                 && !local.contains(&"exit_plan_mode".to_string()),
-            "local CLI must not expose server-owned plan lifecycle tools"
+            "local CLI must not expose plan lifecycle tools without PlanLifecycle"
         );
         assert!(
             web.contains(&"enter_plan_mode".to_string())
@@ -563,6 +616,41 @@ mod tests {
         assert_eq!(
             remote, web,
             "remote/thin CLI should expose the same server-owned lifecycle tools as web"
+        );
+    }
+
+    #[test]
+    fn lifecycle_capabilities_omit_agent_spawner_until_dispatch_exists() {
+        let caps = lifecycle_server_capabilities(true);
+        assert!(
+            !caps.has(astra_turn_core::capability::Capability::AgentSpawner),
+            "server lifecycle must not advertise AgentSpawner until server executor dispatches agent.spawn"
+        );
+    }
+
+    #[test]
+    fn lifecycle_capabilities_gate_database_on_pool() {
+        let without_pool = lifecycle_server_capabilities(false);
+        let with_pool = lifecycle_server_capabilities(true);
+        assert!(!without_pool.has(astra_turn_core::capability::Capability::Database));
+        assert!(with_pool.has(astra_turn_core::capability::Capability::Database));
+    }
+
+    #[test]
+    fn web_resolve_with_lifecycle_caps_does_not_advertise_agent() {
+        let caps = lifecycle_server_capabilities(true);
+        let names = names(server_runtime_tool_schemas(&caps));
+        assert!(
+            !names.contains(&"agent".to_string()),
+            "production lifecycle must not advertise agent — got {names:?}"
+        );
+    }
+
+    #[test]
+    fn full_server_capabilities_for_tests_includes_agent_spawner() {
+        assert!(
+            full_server_capabilities_for_tests()
+                .has(astra_turn_core::capability::Capability::AgentSpawner)
         );
     }
 

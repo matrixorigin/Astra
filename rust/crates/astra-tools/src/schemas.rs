@@ -5,62 +5,11 @@
 
 use serde_json::{Value, json};
 
-pub const DEFAULT_EXECUTOR_TOOL_NAMES: &[&str] = &[
-    "bash",
-    "read_file",
-    "write_file",
-    "str_replace",
-    "list_dir",
-    "grep",
-    "glob",
-    "git",
-    "web_fetch",
-    "web_search",
-    "run_script",
-    "notify",
-    "ask_user",
-    "task",
-    "agent_job",
-];
-
-pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
-    "bash",
-    "read_file",
-    "write_file",
-    "str_replace",
-    "list_dir",
-    "grep",
-    "glob",
-    "git",
-    "github",
-    "memory",
-    "session",
-    "mo",
-    "agent",
-    "introspect",
-    "tool_search",
-    "lsp",
-    "web_fetch",
-    "web_search",
-    "publish_artifact",
-    "symbols",
-    "run_script",
-    "notify",
-    "ask_user",
-    "task",
-    "agent_job",
-    "enter_plan_mode",
-    "exit_plan_mode",
-];
-
 /// RPC tools exposed inside server-side `run_script`.
 ///
 /// This is intentionally narrower than [`crate::run_script::RPC_ALLOWED_TOOLS`]:
 /// the web/API server must only advertise sub-tools that the
-/// `ServerToolExecutor` can actually route in-process. Keeping this list next
-/// to `SERVER_EXECUTOR_TOOL_NAMES` makes capability drift visible during code
-/// review and prevents the LLM from being told to call a Python-side helper
-/// that will later fail at runtime.
+/// `ServerToolExecutor` can actually route in-process.
 pub const SERVER_RUN_SCRIPT_RPC_TOOL_NAMES: &[&str] = &[
     "read_file",
     "write_file",
@@ -70,42 +19,22 @@ pub const SERVER_RUN_SCRIPT_RPC_TOOL_NAMES: &[&str] = &[
     "bash",
 ];
 
-fn filter_tool_schemas_by_name(allowed_names: &[&str]) -> Vec<Value> {
-    all_tool_schemas()
-        .into_iter()
-        .filter(|schema| {
-            schema
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-                .is_some_and(|name| allowed_names.contains(&name))
-        })
-        .collect()
-}
-
-pub fn default_executor_tool_schemas() -> Vec<Value> {
-    filter_tool_schemas_by_name(DEFAULT_EXECUTOR_TOOL_NAMES)
-}
-
-pub fn server_executor_tool_schemas() -> Vec<Value> {
-    let mut schemas = filter_tool_schemas_by_name(SERVER_EXECUTOR_TOOL_NAMES);
-    #[cfg(unix)]
-    {
-        if let Some(slot) = schemas.iter_mut().find(|schema| {
-            schema
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-                == Some("run_script")
-        }) {
-            *slot = run_script_schema_for(SERVER_RUN_SCRIPT_RPC_TOOL_NAMES);
-        }
-    }
-    schemas
-}
-
 pub fn all_tool_schemas() -> Vec<Value> {
     all_tool_schemas_with_env(|k| std::env::var(k).ok())
+}
+
+/// Replace the `run_script` schema with the narrowed server-side variant.
+#[cfg(unix)]
+pub fn narrow_run_script_for_server(schemas: &mut [Value]) {
+    if let Some(slot) = schemas.iter_mut().find(|schema| {
+        schema
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            == Some("run_script")
+    }) {
+        *slot = run_script_schema_for(SERVER_RUN_SCRIPT_RPC_TOOL_NAMES);
+    }
 }
 
 /// Like `all_tool_schemas()` but reads env via a caller-supplied closure.
@@ -1429,7 +1358,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn server_run_script_schema_lists_only_server_routable_rpc_tools() {
-        let schemas = server_executor_tool_schemas();
+        let mut schemas = all_tool_schemas();
+        narrow_run_script_for_server(&mut schemas);
         let rs = schemas
             .iter()
             .find(|s| {
@@ -1461,74 +1391,6 @@ mod tests {
             !names.contains(&"run_script"),
             "run_script requires Unix domain sockets — must not appear on other platforms"
         );
-    }
-
-    #[test]
-    fn default_executor_tool_schemas_match_supported_surface() {
-        let schemas = default_executor_tool_schemas();
-        let names = schema_names(&schemas);
-        for &name in DEFAULT_EXECUTOR_TOOL_NAMES {
-            assert!(
-                names.contains(&name),
-                "{name} should have a default executor schema"
-            );
-        }
-        assert!(!names.contains(&"tool_search"));
-        assert!(!names.contains(&"github_list_prs"));
-        assert!(!names.contains(&"symbols"));
-        assert!(!names.contains(&"rollback_file_edits"));
-        assert!(!names.contains(&"memory_store"));
-        assert!(!names.contains(&"powershell"));
-        assert!(!names.contains(&"multi_edit"));
-        // Legacy top-level tool names removed in dd556ec — these actions now
-        // live under the consolidated `session` / `write_file` / `str_replace`
-        // surfaces. Catch any accidental re-registration.
-        assert!(!names.contains(&"delete_file"));
-        assert!(!names.contains(&"enter_plan_mode"));
-        assert!(!names.contains(&"exit_plan_mode"));
-        // ask_user is now a first-class tool (P2 completion)
-        assert!(names.contains(&"ask_user"));
-        assert!(!names.contains(&"sleep"));
-    }
-
-    #[test]
-    fn server_allowlist_each_name_has_function_schema() {
-        let schemas = all_tool_schemas();
-        let names = schema_names(&schemas);
-        let set: HashSet<&str> = names.into_iter().collect();
-        for &name in SERVER_EXECUTOR_TOOL_NAMES {
-            assert!(
-                set.contains(name),
-                "SERVER_EXECUTOR_TOOL_NAMES contains `{name}` but all_tool_schemas() has no matching function.name"
-            );
-        }
-    }
-
-    /// Catches the opposite drift class: a `memory_*` schema exists but the tool was never added to the server allowlist.
-
-    /// Default CLI/edge executor names must remain promotable to the server allowlist without
-    /// forgetting to add new defaults when expanding server coverage.
-    #[test]
-    fn default_executor_tool_names_are_subset_of_server_allowlist() {
-        let allow: HashSet<&str> = SERVER_EXECUTOR_TOOL_NAMES.iter().copied().collect();
-        for name in DEFAULT_EXECUTOR_TOOL_NAMES {
-            assert!(
-                allow.contains(name),
-                "`{name}` is in DEFAULT_EXECUTOR_TOOL_NAMES but missing from SERVER_EXECUTOR_TOOL_NAMES"
-            );
-        }
-    }
-
-    #[test]
-    fn default_executor_tool_schemas_are_subset_of_server_executor_schemas() {
-        let server_schemas = server_executor_tool_schemas();
-        let server_names: HashSet<&str> = schema_names(&server_schemas).into_iter().collect();
-        for name in schema_names(&default_executor_tool_schemas()) {
-            assert!(
-                server_names.contains(name),
-                "default executor exposes `{name}` but server_executor_tool_schemas() omits it"
-            );
-        }
     }
 
     #[test]

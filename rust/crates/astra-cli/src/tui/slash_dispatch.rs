@@ -1564,6 +1564,13 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
         ctx.show_error("Model name cannot be empty — try `/model list`.".into());
         return;
     }
+    let Some(name) = crate::cli_utils::normalize_model_override(Some(name)) else {
+        ctx.state.model = None;
+        crate::slash_config::set_active_model_for_display(None);
+        ctx.bottom_pane.footer.model = None;
+        ctx.show_response("Model override cleared — using API default.".into());
+        return;
+    };
     ctx.state.model = Some(name.to_string());
     crate::slash_config::set_active_model_for_display(Some(name.to_string()));
     ctx.bottom_pane.footer.model = Some(name.to_string());

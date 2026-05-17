@@ -1,150 +1,113 @@
 # Tool Architecture Consolidation
 
-> ⚠ **Partially landed.** The `memory_*` family (`memory_store`,
-> `memory_search`, `memory_retrieve`, `memory_correct`, etc.) has been
-> collapsed into a single `memory(action=...)` tool with nine cognitive
-> verbs. See [memory-runtime.md §3](memory-runtime.md#3-the-memory-tool)
-> for the current shape. The Phase 2 unified `MemoriaClient` has also
-> landed (see `rust/crates/astra-tools/src/memoria.rs`). The broader
-> `ToolHandler` trait (Phase 3) remains future work. This doc is kept
-> as the original motivation document.
+This design defines Astra's tool-visibility model. Tool schemas may be
+implemented in different crates today, but what the model sees must be derived
+from one rule:
 
-## Problem
-
-Adding or modifying a tool requires synchronized changes across 5-7 files in 4 crates.
-No compile-time enforcement ensures consistency. Proven by `memory_search → memory_retrieve`
-rename which took 5 commits to fully propagate, and the type mapping bug which was fixed in
-one dispatch path but missed the other.
-
-## Current Architecture (5 change points per tool)
-
-```
-             TOOL_CATALOG                 CLI Schema              Server Schema
-         (tool_registry_meta.rs)     (edge_tools/schemas.rs)  (astra-tools/schemas.rs)
-          triggers, intents,            JSON function def         JSON function def
-          pinned, scope                 (different set!)          (different set!)
-                 │                           │                         │
-                 │                           │                         │
-                 ▼                           ▼                         ▼
-          Tool Selection              CLI Dispatch               Server Dispatch
-        (tool_registry/scoring)    (edge_tools.rs:1778L)     (server_tool_executor:5290L)
-                                    match arm per tool          match arm per tool
-                                         │                          │
-                                         │                          │
-                                         ▼                          ▼
-                                   CLI Memoria Client         Server Memoria Client
-                                  (edge_tools/memoria:784L)  (astra-tools/memoria:551L)
-                                   build_direct_request        build_direct_request
-                                   cloud proxy dispatch        direct dispatch
-                                   circuit breaker             circuit breaker
+```text
+visible(tool) = surface_admits(tool.scope, surface)
+              && capabilities.has_all(tool.requires)
 ```
 
-### Consequences
+## Phase 0: capability-driven tool surface
 
-1. **Schema drift**: CLI and server tool lists diverge silently (86 vs 91 defs)
-2. **Logic duplication**: `build_direct_request` duplicated with subtle differences
-3. **Rename propagation**: 5+ files, no compiler help, found via session analysis
-4. **Behavior inconsistency**: cloud proxy path vs direct path handle args differently
-5. **Test duplication**: same contract tests written separately in both crates
+The current implementation lives in:
 
-## Proposed Architecture
+- `astra_turn_core::capability::{Capability, CapabilitySet}`
+- `astra_turn_core::tool_surface::{Surface, resolve, resolve_with_diagnostics}`
+- `astra_turn_core::tool_registry_meta::ToolMeta::requires`
+- `astra_runtime::capabilities::{server_runtime_tool_schemas, cli_local_tool_schemas}`
 
-### Principle: Tool Definition = Single Source of Truth
+`DEFAULT_EXECUTOR_TOOL_NAMES` and `SERVER_EXECUTOR_TOOL_NAMES` are removed.
+There is no second allowlist to synchronize with `TOOL_CATALOG`.
 
-One struct per tool, co-located with its execution logic. Schema, triggers, dispatch, 
-and type mapping all derived from the same definition.
+## Surfaces
 
-### Phase 1: Unified Tool Schema (astra-tools)
+| Surface | Execution location | Tool source |
+| --- | --- | --- |
+| `Web` | API server | capability-resolved server catalog + server MCP/plugins |
+| `CliRemote` | API server | same policy as `Web` |
+| `CliLocal` | CLI process | capability-resolved local catalog + local MCP/plugins |
 
-Move ALL tool JSON schemas into `astra-tools`. Both CLI and server already depend on it.
+`Scope` describes where a tool runs relative to its executor. It does not mean
+"CLI-only". For example, `read_file` is `Scope::Local`, but Web can still
+execute it against the server-side workspace.
 
-```rust
-// astra-tools/src/tool_defs.rs
-pub struct ToolDef {
-    pub name: &'static str,
-    pub schema: serde_json::Value,      // JSON schema (single copy)
-    pub triggers: &'static [&'static str],  // for selector scoring
-    pub intents: &'static [IntentType],
-    pub pinned: bool,
-    pub scope: Scope,
-}
+## Capabilities
 
-pub static TOOL_DEFS: &[ToolDef] = &[
-    ToolDef {
-        name: "memory_store",
-        schema: json!({ ... }),           // defined once
-        triggers: &["remember", "记住", ...],
-        intents: &[IntentType::Memory],
-        pinned: true,
-        scope: Scope::CrossSession,
-    },
-    // ...
-];
-```
+Capabilities are session-invariant. They are fixed before the tool list and
+capability-conditioned prompt text are rendered, preserving prompt-cache
+stability within a session.
 
-**Eliminates**: CLI schemas.rs + server schemas.rs + TOOL_CATALOG duplication.
-**Cost**: astra-turn-core would depend on astra-tools (or the shared definition moves to astra-core).
+| Capability | Gates |
+| --- | --- |
+| `AgentSpawner` | `agent` spawn/result collection |
+| `MemoryService` | `memory` |
+| `Database` | `mo` |
+| `SkillsCatalog` | dynamic `skill` schema |
+| `GitHubAuth` | `github` |
+| `LSPServer` | `lsp` |
+| `PlanLifecycle` | `enter_plan_mode`, `exit_plan_mode` |
 
-### Phase 2: Unified Memoria Client (astra-tools)
+Production server/web-agent capabilities are derived from actual service wiring
+and intentionally do **not** include `AgentSpawner` until server-side dispatch
+for `agent(action='spawn'|'get_result')` is implemented. Tests that need the
+entire catalog use the explicitly named `full_server_capabilities_for_tests()`.
 
-Merge CLI `edge_tools/memoria.rs` into `astra-tools::memoria::MemoriaClient`.
+CLI local capabilities include the local tool services it can route. The
+`AgentSpawner` capability is included only when a `DynamicAgentSpawner` is
+wired for the session.
 
-```rust
-// astra-tools/src/memoria.rs
-pub struct MemoriaClient {
-    cloud_base: Option<String>,
-    cloud_token: Option<String>,
-    direct_base: String,
-    direct_key: Option<String>,
-    // single circuit breaker, single build_direct_request
-}
+## MCP and plugin tools
 
-impl MemoriaClient {
-    pub async fn call(&self, op: &str, args: &Value) -> String {
-        let args = self.normalize_args(op, args);  // type mapping here, once
-        if let Some(ref cloud) = self.cloud_base {
-            self.cloud_dispatch(cloud, op, &args).await
-        } else {
-            self.direct_dispatch(op, &args).await
-        }
-    }
-}
-```
+Static catalog tools are filtered by `ToolMeta::requires`. Runtime plugin/MCP
+schemas whose names are not in `TOOL_CATALOG` pass through after catalog tools,
+preserving deterministic catalog order and stable prompt-cache prefixes.
 
-**Eliminates**: 784L CLI client + 551L server client → one ~600L shared client.
-**Cost**: CLI's `ToolExecutor` wraps `MemoriaClient` instead of reimplementing.
+MCP tools should use the `mcp__<server>__<tool>` naming convention. If a plugin
+schema collides with a catalog name, the catalog filter wins: a capability-gated
+catalog tool cannot bypass filtering via plugin pass-through.
 
-### Phase 3: Unified Tool Dispatch (astra-tools)
+## Prompt and provider contract
 
-Each tool implements a trait:
+`tools[]` ordering is deterministic:
 
-```rust
-pub trait ToolHandler: Send + Sync {
-    fn name(&self) -> &str;
-    async fn execute(&self, args: &Value, ctx: &ToolContext) -> ToolResult;
-}
-```
+1. Catalog tools in `TOOL_CATALOG` order when admitted by surface/capabilities.
+2. Non-catalog plugin/MCP schemas in source order after dedupe.
 
-CLI and server both iterate `Vec<Box<dyn ToolHandler>>` instead of maintaining
-parallel match arms.
+For identical `(surface, CapabilitySet, schema_pool)`, `resolve` output must be
+byte-stable. Capability changes mid-session are not allowed because they would
+change both `tools[]` and capability-dependent system prompt text.
 
-**Eliminates**: CLI 72 match arms + server 73 match arms → single registration.
-**Cost**: Larger refactor, trait-object overhead (negligible).
+Providers that support many tools can receive the resolved list directly.
+Deferred-tool flows (`tool_search(select:NAME)`) must search the same
+post-capability pool plus plugin schemas, not a legacy static allowlist.
 
-## Migration Path
+## Observability
 
-| Phase | Files Eliminated | Risk | Effort |
-|-------|-----------------|------|--------|
-| 1. Unified schema | 2 files (~3700L → 1 file ~2000L) | Low | 2 days |
-| 2. Unified Memoria client | 1 file (~784L → 0L, shared grows ~100L) | Medium | 2 days |
-| 3. Unified dispatch | 2 match blocks (~145 arms → trait registration) | High | 4 days |
+`introspect(dimension="capability")` should explain:
 
-Recommend: Phase 1 + 2 on a dedicated branch. Phase 3 can be incremental.
+- active and inactive capabilities,
+- visible tools,
+- catalog tools dropped because required capabilities are missing,
+- plugin/MCP tools that passed through,
+- the actual emitted tool count when a turn selection report is available.
 
-## Evidence (bugs caused by duplication)
+## Guardrail tests
 
-1. `memory_search` schema removed from CLI but not server (5 commits to fix)
-2. Type mapping added to `build_direct_request` but missed cloud proxy path
-3. `memory_retrieve` triggers defined in TOOL_CATALOG but not in CLI schema
-4. System prompt mode detection checked `memory_search` after rename
-5. Tool description said "Prefer memory_search" after removal
+Required invariants:
+
+- `agent` is absent when `AgentSpawner` is absent.
+- production server/web-agent capabilities do not advertise `agent`.
+- `resolve` is byte-stable for identical inputs.
+- catalog ordering is stable.
+- plugin pass-through does not bypass catalog capability filters.
+- plan lifecycle tools require `PlanLifecycle`.
+- prompt fan-out guidance is hidden when `AgentSpawner` is absent.
+
+## Later phases
+
+Phase 1 should move schema and metadata definitions into a single shared
+definition type. Phase 2 should continue consolidating duplicated clients.
+Phase 3 can replace parallel CLI/server dispatch match arms with registered
+tool handlers once schema/metadata drift is fully eliminated.

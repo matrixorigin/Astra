@@ -13,6 +13,7 @@
 //! `server_tool_executor` field. When present, the headless round
 //! calls it directly instead of waiting for edge POST callbacks.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -562,8 +563,19 @@ fn persist_manual_compression(
     writer.append(&event).map_err(|e| e.to_string())
 }
 
-fn supports_server_tool_name(tool: &str) -> bool {
-    astra_tools::schemas::SERVER_EXECUTOR_TOOL_NAMES.contains(&tool)
+fn resolved_server_tool_names(
+    capabilities: &astra_turn_core::capability::CapabilitySet,
+) -> HashSet<String> {
+    crate::capabilities::server_runtime_tool_schemas(capabilities)
+        .iter()
+        .filter_map(|schema| {
+            schema
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 fn json_str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -918,6 +930,8 @@ pub struct ServerToolExecutor {
     /// deferred activation reaches plugin tools. Populated by the server
     /// loop host once MCP servers have been refreshed.
     plugin_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
+    capabilities: astra_turn_core::capability::CapabilitySet,
+    server_tool_names: HashSet<String>,
 }
 
 /// Snapshot used by the plan-mode write guard and the system-prompt
@@ -969,6 +983,9 @@ impl ServerToolExecutor {
         let task_store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
         let task_manager = Arc::new(TaskManager::new(session_id.clone(), task_store));
 
+        let capabilities = crate::capabilities::full_server_capabilities_for_tests();
+        let server_tool_names = resolved_server_tool_names(&capabilities);
+
         Self {
             workspace_root,
             user_id,
@@ -1002,7 +1019,18 @@ impl ServerToolExecutor {
             plan_mode_cache: Arc::new(tokio::sync::RwLock::new(PlanModeSnapshot::default())),
             plan_resume_hint_handle: None,
             plugin_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
+            capabilities,
+            server_tool_names,
         }
+    }
+
+    pub fn with_capabilities(
+        mut self,
+        capabilities: astra_turn_core::capability::CapabilitySet,
+    ) -> Self {
+        self.server_tool_names = resolved_server_tool_names(&capabilities);
+        self.capabilities = capabilities;
+        self
     }
 
     /// Install plugin-registered schemas (MCP, etc.) so
@@ -1021,6 +1049,10 @@ impl ServerToolExecutor {
             poisoned.into_inner()
         });
         *guard = schemas;
+    }
+
+    fn supports_server_tool_name(&self, tool: &str) -> bool {
+        self.server_tool_names.contains(tool)
     }
 
     /// Inject the plan repository so plan-mode tools and the write-tool guard
@@ -1768,11 +1800,11 @@ impl ServerToolExecutor {
             //
             // Lets the LLM look up schemas by name via
             // `tool_search(query="select:NAME")`.
-            // Schema pool = static server allowlist + plugin schemas
+            // Schema pool = capability-resolved server tools + plugin schemas
             // installed via `set_plugin_schemas`. Without the union,
             // MCP/skill-backed tools would never resolve.
             "tool_search" => {
-                let mut pool = astra_tools::schemas::server_executor_tool_schemas();
+                let mut pool = crate::capabilities::server_runtime_tool_schemas(&self.capabilities);
                 // Poison recovery: recover inner so deferred activation
                 // survives a prior panic. See set_plugin_schemas doc.
                 let guard = self.plugin_schemas.read().unwrap_or_else(|poisoned| {
@@ -3141,7 +3173,7 @@ impl ServerToolExecutor {
             })
         };
         let capability = || {
-            let schemas = crate::capabilities::server_runtime_tool_schemas();
+            let schemas = crate::capabilities::server_runtime_tool_schemas(&self.capabilities);
             let tool_names: Vec<&str> = schemas
                 .iter()
                 .filter_map(|t| {
@@ -3469,7 +3501,7 @@ impl ServerToolExecutor {
         let Some(tool) = extract_tool_name(args) else {
             return json!({"error": "Missing required parameter: tool"}).to_string();
         };
-        if !supports_server_tool_name(&tool) {
+        if !self.supports_server_tool_name(&tool) {
             return json!({"error": format!("Unknown tool: {tool}")}).to_string();
         }
 
@@ -3539,7 +3571,7 @@ impl ServerToolExecutor {
         let Some(tool) = extract_tool_name(args) else {
             return json!({"error": "Missing required parameter: tool"}).to_string();
         };
-        if !supports_server_tool_name(&tool) {
+        if !self.supports_server_tool_name(&tool) {
             return json!({"error": format!("Unknown tool: {tool}")}).to_string();
         }
 
@@ -4704,7 +4736,7 @@ impl ToolExecutor for ServerToolExecutor {
     }
 
     fn tool_schemas(&self) -> Vec<Value> {
-        crate::capabilities::server_runtime_tool_schemas()
+        crate::capabilities::server_runtime_tool_schemas(&self.capabilities)
     }
 
     fn project_root(&self) -> &Path {
@@ -4766,31 +4798,34 @@ mod tests {
     #[test]
     fn session_history_actions_are_advertised_on_session_tool() {
         let names: std::collections::HashSet<String> =
-            crate::capabilities::server_runtime_tool_schemas()
-                .into_iter()
-                .filter_map(|schema| {
-                    schema
-                        .pointer("/function/name")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .collect();
+            crate::capabilities::server_runtime_tool_schemas(
+                &crate::capabilities::full_server_capabilities_for_tests(),
+            )
+            .into_iter()
+            .filter_map(|schema| {
+                schema
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
 
         assert!(
             names.contains("session"),
             "session must be advertised to the web-agent LLM"
         );
         assert!(
-            supports_server_tool_name("session"),
+            resolved_server_tool_names(&crate::capabilities::full_server_capabilities_for_tests())
+                .contains("session"),
             "session must be accepted by ServerToolExecutor"
         );
 
-        let session_schema = crate::capabilities::server_runtime_tool_schemas()
-            .into_iter()
-            .find(|schema| {
-                schema.pointer("/function/name").and_then(Value::as_str) == Some("session")
-            })
-            .expect("session schema should exist");
+        let session_schema = crate::capabilities::server_runtime_tool_schemas(
+            &crate::capabilities::full_server_capabilities_for_tests(),
+        )
+        .into_iter()
+        .find(|schema| schema.pointer("/function/name").and_then(Value::as_str) == Some("session"))
+        .expect("session schema should exist");
         let actions = session_schema
             .pointer("/function/parameters/properties/action/enum")
             .and_then(Value::as_array)

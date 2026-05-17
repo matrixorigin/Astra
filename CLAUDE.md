@@ -156,6 +156,6 @@ Skill discovery order (high → low): `{ancestor}/.astra/skills/` → `{ancestor
 
 - **MatrixOne SQL discipline**: cosine index ⇒ cosine query (never L2); avoid JSON-column WHERE filters (full-table scan); vector/full-text tables prefer append + soft-delete over UPDATE/DELETE.
 - **DB name resolution**: effective database = `${ASTRA_DATABASE_PREFIX}${ASTRA_DATABASE}` via `astra_core::resolve_database_name`. Don't hardcode names.
-- **Server tool schemas guard**: changes to tool allowlists must keep `DEFAULT_EXECUTOR_TOOL_NAMES ⊆ SERVER_EXECUTOR_TOOL_NAMES` and server allowlist ⊆ `all_tool_schemas()`. `make check-server-tool-schemas` enforces this.
+- **Capability-driven tool surface**: tool visibility is `surface_admits(scope, surface) ∧ caps.has_all(requires)` via `astra-turn-core::tool_surface`. New catalog tools declare `requires: &[Capability::...]`; do not add parallel tool-name allowlists.
 - **Test isolation**: every test owns its IDs and cleans up; never depend on order or share state. E2E tests must verify DB state directly after mutation, not trust HTTP responses alone.
 - **Per-case test budget**: 30s. If a single case approaches this, the contention is the bug — don't paper over with longer timeouts.

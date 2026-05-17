@@ -282,6 +282,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         .with_model(effective_model)
         .with_llm_token_service(self.llm_token_service.clone())
         .with_edge_tools(self.edge_tools.clone())
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            self.shared_pool.is_some(),
+        ))
         .with_edge_profile(self.edge_profile.clone())
         .with_edge_callback_ledger(Arc::new(TokioMutex::new(HashMap::new())));
 
@@ -498,6 +501,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 memoria_base,
                 None,
             )
+            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                self.shared_pool.is_some(),
+            ))
             .with_cancel_token(self.cancel_token.clone());
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());

@@ -160,14 +160,30 @@ pub fn build_skill_listing_section_for_model(
     skills: &[astra_skills::traits::SkillToolInfo],
     model: Option<&str>,
 ) -> Option<PromptSection> {
+    build_skill_listing_section_with_caps(skills, model, true)
+}
+
+pub fn build_skill_listing_section_with_caps(
+    skills: &[astra_skills::traits::SkillToolInfo],
+    model: Option<&str>,
+    agent_spawn_available: bool,
+) -> Option<PromptSection> {
     let context_window = u32::try_from(crate::prompts::budget_for_model(model).model_limit).ok();
-    build_skill_listing_section_with_budget(skills, context_window)
+    build_skill_listing_section_with_budget_and_caps(skills, context_window, agent_spawn_available)
 }
 
 /// Build skill listing with explicit context window size for budget calculation.
 pub fn build_skill_listing_section_with_budget(
     skills: &[astra_skills::traits::SkillToolInfo],
     context_window_tokens: Option<u32>,
+) -> Option<PromptSection> {
+    build_skill_listing_section_with_budget_and_caps(skills, context_window_tokens, true)
+}
+
+fn build_skill_listing_section_with_budget_and_caps(
+    skills: &[astra_skills::traits::SkillToolInfo],
+    context_window_tokens: Option<u32>,
+    agent_spawn_available: bool,
 ) -> Option<PromptSection> {
     if skills.is_empty() {
         return None;
@@ -241,17 +257,26 @@ pub fn build_skill_listing_section_with_budget(
          When a user request matches a skill above, prefer calling the \
          `skill` tool with that skill's name before any other tool. On \
          seeing `<skill-loaded name=\"...\"/>` in a tool result, follow \
-         that skill's instructions — do not re-invoke it.\n\
-         \n\
-         EXCEPTION: when the user explicitly asks for parallel / \
-         multi-agent / multiple-agent fan-out (e.g. \"多agents\", \"N \
-         agents\", \"parallel review\", \"different angles in parallel\"), \
-         route through `agent.spawn` instead — emit N spawn calls in a \
-         single assistant message, each with `run_in_background: true`, \
-         then collect with `agent.get_result`. Skills usually run \
-         sequentially inside the parent turn, which contradicts the \
-         user's explicit fan-out intent.",
+          that skill's instructions — do not re-invoke it.\n\n",
     );
+    if agent_spawn_available {
+        body.push_str(
+            "EXCEPTION: when the user explicitly asks for parallel / \
+             multi-agent / multiple-agent fan-out (e.g. \"多agents\", \"N \
+             agents\", \"parallel review\", \"different angles in parallel\"), \
+             route through `agent.spawn` instead — emit N spawn calls in a \
+             single assistant message, each with `run_in_background: true`, \
+             then collect with `agent.get_result`. Skills usually run \
+             sequentially inside the parent turn, which contradicts the \
+             user's explicit fan-out intent.",
+        );
+    } else {
+        body.push_str(
+            "This session does not provide sub-agent fan-out. When the user \
+             asks for parallel or multi-agent work, execute the relevant skills \
+             sequentially in this parent turn instead of calling `agent.spawn`.",
+        );
+    }
 
     Some(PromptSection::stable(body, CacheScope::Session))
 }
@@ -3364,6 +3389,21 @@ mod tests {
             section.text.contains("WHEN: When user asks to review code"),
             "when_to_use must be surfaced in the listing"
         );
+    }
+
+    #[test]
+    fn skill_listing_hides_agent_spawn_guidance_when_unavailable() {
+        let skills = vec![astra_skills::traits::SkillToolInfo {
+            name: "review_code".to_string(),
+            description: "Review code".to_string(),
+            ..Default::default()
+        }];
+        let section = build_skill_listing_section_with_caps(&skills, None, false)
+            .expect("non-empty skill catalog");
+
+        assert!(!section.text.contains("route through `agent.spawn` instead"));
+        assert!(section.text.contains("does not provide sub-agent fan-out"));
+        assert!(section.text.contains("sequentially"));
     }
 
     #[test]

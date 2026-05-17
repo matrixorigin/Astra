@@ -594,7 +594,7 @@ pub(crate) fn initialize_session_state(
 ) -> SessionState {
     let mut state = SessionState::default();
     state.pending_recovery = detect_pending_recovery_session(profile);
-    if let Some(m) = initial_model {
+    if let Some(m) = normalize_model_override(initial_model) {
         state.model = Some(m.to_string());
     }
 
@@ -1409,6 +1409,16 @@ mod tests {
         assert_eq!(state.pending_recovery, None);
         assert!(state.history.is_empty());
         assert_eq!(state.turn, 0);
+    }
+
+    #[test]
+    fn initialize_session_state_treats_default_model_as_server_default() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let _creds_guard = isolate_credentials();
+
+        let state = initialize_session_state(None, Some("default"));
+
+        assert_eq!(state.model, None);
     }
 
     #[test]

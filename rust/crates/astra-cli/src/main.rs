@@ -228,8 +228,9 @@ use cli_utils::save_credentials;
 use cli_utils::{
     SessionResumePreflight, clear_profile_last_session_if_matches, compact_or_raw,
     credential_store, get_profile_and_token, interactive_select, load_credentials, map_thin_err,
-    mutate_credentials, persist_profile_last_session, persist_profile_memoria_api_key,
-    prefix_chars, preflight_remote_resume_session, print_json_or_raw, profile_name, prompt_or,
+    mutate_credentials, normalize_model_override, normalize_model_override_owned,
+    persist_profile_last_session, persist_profile_memoria_api_key, prefix_chars,
+    preflight_remote_resume_session, print_json_or_raw, profile_name, prompt_or,
     prompt_password_masked, resumable_last_session_id, truncate_str, urlencoding,
     validated_resumable_last_session_id,
 };
@@ -566,8 +567,9 @@ async fn main() {
     }
 
     // Resolve model: --model flag > config default_model > None
-    let resolved_model =
-        cli_model.or_else(|| command_router::read_config_default_model().ok().flatten());
+    let resolved_model = normalize_model_override_owned(
+        cli_model.or_else(|| command_router::read_config_default_model().ok().flatten()),
+    );
 
     // Make the resolved model available to slash commands that print
     // model-aware diagnostics without mutating the process environment.
