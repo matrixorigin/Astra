@@ -410,6 +410,7 @@ impl ApprovalQueue {
     /// is **deduplicated**: the new sender is appended to the
     /// existing entry's `response_txs` and no new prompt is
     /// rendered. Returns the surviving entry's id.
+    #[allow(clippy::too_many_arguments)]
     pub fn push_with_metadata(
         &mut self,
         tool: String,
@@ -729,7 +730,14 @@ mod tests {
     fn push_records_no_source_agent_by_default() {
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
-        q.push("bash".into(), "h".into(), None, "r".into(), serde_json::Value::Null, tx);
+        q.push(
+            "bash".into(),
+            "h".into(),
+            None,
+            "r".into(),
+            serde_json::Value::Null,
+            tx,
+        );
         let view = q.focused_view().unwrap();
         assert!(view.source_agent.is_none());
     }
@@ -835,7 +843,14 @@ mod tests {
         // just runs the comparison.
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
-        q.push("write_file".into(), "h".into(), None, "r".into(), serde_json::Value::Null, tx);
+        q.push(
+            "write_file".into(),
+            "h".into(),
+            None,
+            "r".into(),
+            serde_json::Value::Null,
+            tx,
+        );
         let path = std::env::temp_dir().join("definitely-does-not-exist-326-test");
         let _ = std::fs::remove_file(&path); // best-effort
         let result = q.focused_stale_check(&path).unwrap().unwrap();
@@ -1123,11 +1138,32 @@ mod tests {
     fn respond_focused_group_without_key_resolves_only_focused_entry() {
         let mut q = ApprovalQueue::new();
         let (tx_a, mut rx_a) = oneshot::channel();
-        q.push("bash".into(), "a".into(), None, "run".into(), serde_json::Value::Null, tx_a);
+        q.push(
+            "bash".into(),
+            "a".into(),
+            None,
+            "run".into(),
+            serde_json::Value::Null,
+            tx_a,
+        );
         let (tx_b, mut rx_b) = oneshot::channel();
-        q.push("bash".into(), "b".into(), None, "run".into(), serde_json::Value::Null, tx_b);
+        q.push(
+            "bash".into(),
+            "b".into(),
+            None,
+            "run".into(),
+            serde_json::Value::Null,
+            tx_b,
+        );
         let (tx_c, mut rx_c) = oneshot::channel();
-        q.push("bash".into(), "c".into(), None, "run".into(), serde_json::Value::Null, tx_c);
+        q.push(
+            "bash".into(),
+            "c".into(),
+            None,
+            "run".into(),
+            serde_json::Value::Null,
+            tx_c,
+        );
 
         assert_eq!(q.respond_focused_group(ApprovalResponse::AllowOnce), 1);
         assert_eq!(q.len(), 2);

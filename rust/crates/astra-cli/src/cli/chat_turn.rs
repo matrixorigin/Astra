@@ -4944,7 +4944,10 @@ mod tests {
             .expect("sync failure should be recorded");
         assert!(error.contains("500"), "got: {error}");
         assert_eq!(
-            state.cloud_plan_mirror.as_ref().map(|plan| plan.goal.as_str()),
+            state
+                .cloud_plan_mirror
+                .as_ref()
+                .map(|plan| plan.goal.as_str()),
             Some("Ship auth"),
             "sync failure should preserve the last known mirror until recovery"
         );

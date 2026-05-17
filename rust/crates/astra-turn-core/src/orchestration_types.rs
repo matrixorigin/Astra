@@ -9,16 +9,10 @@ use std::time::SystemTime;
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentStatus {
     Initializing,
-    Running {
-        activity: String,
-    },
+    Running { activity: String },
     Idle,
-    Completed {
-        result: String,
-    },
-    Failed {
-        error: String,
-    },
+    Completed { result: String },
+    Failed { error: String },
     Cancelled,
 }
 

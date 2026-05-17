@@ -219,14 +219,12 @@ pub async fn handle_get_agent_result_tool(args: &Value, ctx: Option<&SpawnAgentC
         Some(AgentStatus::Completed { result }) => {
             render_completed_agent_result(agent_id, &result, None)
         }
-        Some(AgentStatus::Failed { error }) => {
-            json!({
-                "status": "failed",
-                "agent_id": agent_id,
-                "error": error,
-            })
-            .to_string()
-        }
+        Some(AgentStatus::Failed { error }) => json!({
+            "status": "failed",
+            "agent_id": agent_id,
+            "error": error,
+        })
+        .to_string(),
         Some(status) => json!({
             "status": "unknown",
             "agent_id": agent_id,
@@ -626,9 +624,7 @@ mod tests {
         // still want the decision to be clear.
         for terminal in [
             AgentStatus::Cancelled,
-            AgentStatus::Failed {
-                error: "x".into(),
-            },
+            AgentStatus::Failed { error: "x".into() },
             AgentStatus::Completed {
                 result: "done".into(),
             },

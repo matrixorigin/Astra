@@ -200,12 +200,15 @@ async fn task_background_actions_are_rejected_with_redirect_to_agent_job() {
     }
 }
 
-/// Local CLI keeps plan mode on `/plan`; stale session sub-actions should
-/// simply be rejected as unknown instead of redirecting to hidden tools.
+/// Stale session sub-actions are rejected, but the error must still name
+/// the dedicated tools so the model can self-correct on the next call.
 #[tokio::test]
-async fn session_enter_exit_plan_actions_are_unknown() {
+async fn session_enter_exit_plan_actions_redirect_to_top_level_tools() {
     let executor = test_executor();
-    for action in &["enter_plan", "exit_plan"] {
+    for (action, redirect_tool) in &[
+        ("enter_plan", "enter_plan_mode"),
+        ("exit_plan", "exit_plan_mode"),
+    ] {
         let result = executor
             .execute("session", &json!({"action": action}))
             .await;
@@ -216,6 +219,10 @@ async fn session_enter_exit_plan_actions_are_unknown() {
         assert!(
             result.contains("unknown `session` action"),
             "session.{action} should be rejected as unknown. Got: {result}"
+        );
+        assert!(
+            result.contains(redirect_tool),
+            "session.{action} error must name `{redirect_tool}` so the model can recover. Got: {result}"
         );
         assert!(
             astra_turn_core::tool_result_semantics::is_tool_error(&result),
@@ -278,6 +285,53 @@ async fn exit_plan_mode_accepts_plan_alias_and_explicit_approved_skips_overlay()
     assert!(
         result.contains("plan-2"),
         "result should mention the resolved plan id. Got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn plan_mode_write_guard_cache_is_invalidated_when_session_changes() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/plans"))
+        .and(query_param("session_id", "sess-plan"))
+        .and(query_param("phase", "planning"))
+        .and(query_param("limit", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "plans": [{ "plan_id": "plan-1", "goal": "Ship auth" }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/plans"))
+        .and(query_param("session_id", "sess-normal"))
+        .and(query_param("phase", "planning"))
+        .and(query_param("limit", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "plans": []
+        })))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(temp.path().to_path_buf())
+        .with_active_session_id("sess-plan")
+        .with_cloud(server.uri(), "token");
+
+    let blocked = executor
+        .execute("bash", &json!({ "command": "true" }))
+        .await;
+    assert!(
+        blocked.contains("blocked while plan mode is active"),
+        "first session should populate the authoring cache as blocked. Got: {blocked}"
+    );
+
+    executor.set_active_session_id("sess-normal");
+    let allowed = executor
+        .execute("bash", &json!({ "command": "true" }))
+        .await;
+    assert!(
+        !allowed.contains("blocked while plan mode is active"),
+        "switching sessions must not reuse the prior session's plan-mode cache. Got: {allowed}"
     );
 }
 
@@ -370,8 +424,8 @@ async fn enter_plan_mode_falls_back_to_local_when_cloud_unavailable() {
     //
     // RED until Step 4-3 lands.
     let temp = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-offline");
+    let executor =
+        ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-offline");
     // Deliberately no `with_cloud(...)` — simulates Shift+Tab in a
     // detached CLI run.
 
@@ -505,8 +559,8 @@ async fn enter_plan_mode_then_exit_full_cycle_offline() {
     //
     // RED until Step 4-3 lets enter_plan_mode work offline.
     let temp = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-cycle");
+    let executor =
+        ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-cycle");
 
     // Step 1: enter
     let enter_result = executor

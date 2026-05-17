@@ -1532,7 +1532,7 @@ async fn plan_executor_task(
                     agent_live_event_sink: None,
                     approval_request_tx: Some(approval_tx),
                     ask_user_request_tx: None,
-            plan_review_request_tx: None,
+                    plan_review_request_tx: None,
                     mcp_manager: None,
                     skill_search: &ctx.skill_search,
                     skill_quality_tracker: &mut skill_qt,

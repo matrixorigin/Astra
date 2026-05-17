@@ -886,6 +886,7 @@ pub(crate) async fn run_tui_repl(
                                 }
                                 refresh_footer_from_state(&mut bottom_pane, &state);
                                 flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                frame_requester.schedule_frame();
                             }
                             BottomPaneAction::SubmitInput(text) => {
                                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
@@ -927,7 +928,7 @@ pub(crate) async fn run_tui_repl(
                                     else {
                                         chat_widget.commit_system(
                                             history_cell::system::SystemCell::error(
-                                                "Not logged in. Use /login.".to_string(),
+                                                "Not logged in. Use /login.",
                                             ),
                                         );
                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
@@ -1062,7 +1063,7 @@ pub(crate) async fn run_tui_repl(
                                         else {
                                             chat_widget.commit_system(
                                                 history_cell::system::SystemCell::error(
-                                                    "Not logged in. Use /login.".to_string(),
+                                                    "Not logged in. Use /login.",
                                                 ),
                                             );
                                             refresh_footer_from_state(&mut bottom_pane, &state);
@@ -1321,7 +1322,7 @@ pub(crate) async fn run_tui_repl(
                                         else {
                                             chat_widget.commit_system(
                                                 history_cell::system::SystemCell::error(
-                                                    "Not logged in. Use /login.".to_string(),
+                                                    "Not logged in. Use /login.",
                                                 ),
                                             );
                                             refresh_footer_from_state(&mut bottom_pane, &state);

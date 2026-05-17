@@ -86,10 +86,7 @@ pub(crate) struct PlanReviewView {
 }
 
 impl PlanReviewView {
-    pub fn new(
-        plan_markdown: String,
-        response_tx: oneshot::Sender<PlanReviewDecision>,
-    ) -> Self {
+    pub fn new(plan_markdown: String, response_tx: oneshot::Sender<PlanReviewDecision>) -> Self {
         let plan_lines = plan_markdown
             .split('\n')
             .map(str::to_string)
@@ -105,7 +102,12 @@ impl PlanReviewView {
 
     fn submit(&mut self, decision: PlanReviewDecision) {
         if let Some(tx) = self.response_tx.take() {
-            let _ = tx.send(decision);
+            if tx.send(decision).is_err() {
+                tracing::warn!(
+                    target: "astra_cli::plan_review",
+                    "plan review decision receiver dropped before submission"
+                );
+            }
         }
         self.completed = true;
     }
@@ -179,14 +181,19 @@ impl PlanReviewView {
                     Span::styled(marker, style),
                     Span::raw(" "),
                     Span::styled(*label, style),
-                    Span::styled(
-                        format!("   {desc}"),
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(format!("   {desc}"), Style::default().fg(Color::DarkGray)),
                 ])
             })
             .collect();
         Paragraph::new(lines).render(area, buf);
+    }
+}
+
+impl Drop for PlanReviewView {
+    fn drop(&mut self) {
+        if let Some(tx) = self.response_tx.take() {
+            let _ = tx.send(PlanReviewDecision::Cancelled);
+        }
     }
 }
 
@@ -253,9 +260,7 @@ impl BottomPaneView for PlanReviewView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        Some(
-            "j/k scroll · Tab/← → choice · 1..4 jump · Enter submit · Esc cancel".to_string(),
-        )
+        Some("j/k scroll · Tab/← → choice · 1..4 jump · Enter submit · Esc cancel".to_string())
     }
 }
 
@@ -298,14 +303,20 @@ mod tests {
         view.handle_key(key(KeyCode::Tab));
         // Now on "Keep planning"
         view.handle_key(key(KeyCode::Enter));
-        assert_eq!(rx.try_recv().expect("decision sent"), PlanReviewDecision::KeepPlanning);
+        assert_eq!(
+            rx.try_recv().expect("decision sent"),
+            PlanReviewDecision::KeepPlanning
+        );
     }
 
     #[test]
     fn esc_returns_cancelled() {
         let (mut view, mut rx) = make_view();
         view.handle_key(key(KeyCode::Esc));
-        assert_eq!(rx.try_recv().expect("decision sent"), PlanReviewDecision::Cancelled);
+        assert_eq!(
+            rx.try_recv().expect("decision sent"),
+            PlanReviewDecision::Cancelled
+        );
     }
 
     #[test]
@@ -327,7 +338,20 @@ mod tests {
         view.handle_key(key(KeyCode::Char('j')));
         view.handle_key(key(KeyCode::Char('j')));
         view.handle_key(key(KeyCode::Char('k')));
-        assert!(rx.try_recv().is_err(), "scroll keys must not dispatch a decision");
+        assert!(
+            rx.try_recv().is_err(),
+            "scroll keys must not dispatch a decision"
+        );
         assert!(!view.is_complete());
+    }
+
+    #[test]
+    fn dropping_pending_view_sends_cancelled_decision() {
+        let (view, mut rx) = make_view();
+        drop(view);
+        assert_eq!(
+            rx.try_recv().expect("decision sent"),
+            PlanReviewDecision::Cancelled
+        );
     }
 }

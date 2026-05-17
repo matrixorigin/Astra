@@ -59,6 +59,17 @@ pub(crate) fn is_plan_command_available(state: &SessionState, command: &ParsedPl
 }
 
 pub(crate) fn render_plan_snapshot(state: &SessionState) -> Result<String, String> {
+    if let Some(sync_error) = state.plan_mode_sync_error.as_deref()
+        && state
+            .cloud_plan_mirror
+            .as_ref()
+            .is_some_and(|plan_mode| !plan_mode.goal.trim().is_empty())
+    {
+        return Err(format!(
+            "Plan mirror is stale: {sync_error}. Refresh plan mode before using `show`."
+        ));
+    }
+
     if let Some(plan_mode) = state
         .cloud_plan_mirror
         .as_ref()
@@ -269,10 +280,9 @@ enum PlanTarget {
 }
 
 fn has_authoring_plan(state: &SessionState) -> bool {
-    state
-        .cloud_plan_mirror
-        .as_ref()
-        .is_some_and(|plan_mode| !plan_mode.goal.trim().is_empty())
+    state.cloud_plan_mirror.as_ref().is_some_and(|plan_mode| {
+        !plan_mode.goal.trim().is_empty() && state.plan_mode_sync_error.is_none()
+    })
 }
 
 fn has_executing_plan(state: &SessionState) -> bool {
@@ -527,6 +537,26 @@ mod tests {
                 note: "keep logs".into()
             }
         ));
+    }
+
+    #[test]
+    fn stale_authoring_mirror_blocks_plan_commands_that_read_or_run_it() {
+        let mut state = crate::SessionState::default();
+        state.cloud_plan_mirror = Some(sample_plan_mode("Ship auth"));
+        state.plan_mode_sync_error = Some("server returned 409".into());
+
+        assert!(
+            !is_plan_command_available(&state, &ParsedPlanCommand::Show),
+            "show must not render stale authoring state when sync failed"
+        );
+        assert!(
+            !is_plan_command_available(&state, &ParsedPlanCommand::Go),
+            "go must not start from stale authoring state when sync failed"
+        );
+        assert!(
+            render_plan_snapshot(&state).unwrap_err().contains("stale"),
+            "snapshot should explain why the authoring plan cannot be shown"
+        );
     }
 
     #[test]

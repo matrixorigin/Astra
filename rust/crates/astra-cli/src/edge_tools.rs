@@ -646,26 +646,26 @@ pub struct ToolExecutor {
     /// activation can reach plugin tools. Populated by the TUI after
     /// `PluginRegistry::register` loads the user's skill manifests.
     plugin_schemas: std::sync::RwLock<Vec<Value>>,
-    /// Cached plan-mode authoring flag for the active session. Mirrors the
-    /// server-side write guard so a CLI run that talks to the same plan
-    /// store cannot bypass plan mode by routing mutations through the
-    /// local executor (session b4cef5bb regression). `None` = not yet
-    /// probed; `Some(true)` = a planning-phase plan exists, mutations
-    /// must be blocked; `Some(false)` = no planning plan, writes flow.
-    plan_mode_authoring_cache: std::sync::Arc<tokio::sync::RwLock<Option<bool>>>,
+    /// Cached plan-mode authoring flag keyed by the session it was
+    /// computed for. Mirrors the server-side write guard so a CLI run
+    /// that talks to the same plan store cannot bypass plan mode by
+    /// routing mutations through the local executor (session b4cef5bb
+    /// regression). The session key is load-bearing: web-agent and
+    /// scripted callers may reuse one executor across sessions, so a
+    /// `Some(true)` probe for session A must never block writes in
+    /// session B.
+    plan_mode_authoring_cache: std::sync::Arc<tokio::sync::RwLock<Option<(String, bool)>>>,
     /// Per-turn ask-user channel — the host swaps a fresh sender in
     /// before each turn so the `ask_user` tool can reach the
     /// bottom-pane overlay.
-    ask_user_request_tx:
-        std::sync::Mutex<Option<crate::chat_stream::AskUserRequestTx>>,
+    ask_user_request_tx: std::sync::Mutex<Option<crate::chat_stream::AskUserRequestTx>>,
     /// Per-turn plan-review channel — installed by the host before
     /// each turn so `exit_plan_mode` can surface the dedicated
     /// plan-review overlay (scrollable plan body + 4-way radio).
     /// Separate from `ask_user_request_tx` because the plan overlay
     /// renders a markdown body, not the question/option layout
     /// `ask_user` needs.
-    plan_review_request_tx:
-        std::sync::Mutex<Option<crate::chat_stream::PlanReviewRequestTx>>,
+    plan_review_request_tx: std::sync::Mutex<Option<crate::chat_stream::PlanReviewRequestTx>>,
     /// Slot recording a permission-mode switch that the user
     /// confirmed inside a tool overlay (currently `exit_plan_mode`'s
     /// 4-option dialog). The host drains this slot at the start of
@@ -773,10 +773,7 @@ impl ToolExecutor {
     /// TUI overlay for confirmations.
     /// `None` clears the slot — passed at turn boundaries so a stale
     /// sender never leaks across turns.
-    pub fn set_ask_user_request_tx(
-        &self,
-        tx: Option<crate::chat_stream::AskUserRequestTx>,
-    ) {
+    pub fn set_ask_user_request_tx(&self, tx: Option<crate::chat_stream::AskUserRequestTx>) {
         if let Ok(mut guard) = self.ask_user_request_tx.lock() {
             *guard = tx;
         }
@@ -786,10 +783,7 @@ impl ToolExecutor {
     /// can surface the dedicated plan-approval overlay. Cleared at
     /// turn boundaries to keep stale senders from leaking into
     /// background sub-runs that share the same `Arc<ToolExecutor>`.
-    pub fn set_plan_review_request_tx(
-        &self,
-        tx: Option<crate::chat_stream::PlanReviewRequestTx>,
-    ) {
+    pub fn set_plan_review_request_tx(&self, tx: Option<crate::chat_stream::PlanReviewRequestTx>) {
         if let Ok(mut guard) = self.plan_review_request_tx.lock() {
             *guard = tx;
         }
@@ -1215,18 +1209,23 @@ impl ToolExecutor {
     // break every offline `astra` invocation.
 
     async fn plan_mode_authoring_active(&self) -> bool {
-        if let Some(cached) = *self.plan_mode_authoring_cache.read().await {
-            return cached;
-        }
-        let active = self.recompute_plan_mode_authoring().await;
-        *self.plan_mode_authoring_cache.write().await = Some(active);
-        active
-    }
-
-    async fn recompute_plan_mode_authoring(&self) -> bool {
         let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty()) else {
             return false;
         };
+        if let Some((cached_session_id, cached)) =
+            self.plan_mode_authoring_cache.read().await.as_ref()
+            && cached_session_id == &session_id
+        {
+            return *cached;
+        }
+        let active = self
+            .recompute_plan_mode_authoring_for_session(session_id.as_str())
+            .await;
+        *self.plan_mode_authoring_cache.write().await = Some((session_id, active));
+        active
+    }
+
+    async fn recompute_plan_mode_authoring_for_session(&self, session_id: &str) -> bool {
         let Some(token) = self.cloud_token() else {
             return false;
         };
@@ -1237,7 +1236,7 @@ impl ToolExecutor {
             .get_plans_query_json(
                 &token,
                 &[
-                    ("session_id", session_id),
+                    ("session_id", session_id.to_string()),
                     ("phase", "planning".to_string()),
                     ("limit", "1".to_string()),
                 ],
@@ -1255,6 +1254,14 @@ impl ToolExecutor {
 
     pub(crate) async fn invalidate_plan_mode_cache(&self) {
         *self.plan_mode_authoring_cache.write().await = None;
+    }
+
+    async fn set_plan_mode_authoring_cache_for_active_session(&self, active: bool) {
+        if let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty()) {
+            *self.plan_mode_authoring_cache.write().await = Some((session_id, active));
+        } else {
+            self.invalidate_plan_mode_cache().await;
+        }
     }
 
     // ─── Task management methods (delegated to task_mgmt module) ────────────
@@ -1384,7 +1391,8 @@ impl ToolExecutor {
                 // server guard to mirror in this branch. Set it to
                 // `Some(true)` so any cached probe consult sees
                 // "writes gated" while plan mode is active.
-                *self.plan_mode_authoring_cache.write().await = Some(true);
+                self.set_plan_mode_authoring_cache_for_active_session(true)
+                    .await;
                 format!(
                     "Entered plan mode (local). goal=\"{goal}\". Write tools are now blocked — investigate read-only, then call exit_plan_mode(plan=\"<markdown>\") when ready."
                 )
@@ -1423,7 +1431,8 @@ impl ToolExecutor {
             .and_then(Value::as_str)
             .ok_or(())?
             .to_string();
-        *self.plan_mode_authoring_cache.write().await = Some(true);
+        self.set_plan_mode_authoring_cache_for_active_session(true)
+            .await;
         Ok(format!(
             "Entered plan mode. plan_id={plan_id} goal=\"{goal}\". Write tools are now blocked — author the plan, then call exit_plan_mode when it's ready for execution."
         ))
@@ -1477,12 +1486,8 @@ impl ToolExecutor {
         let cloud_plan_id = self.lookup_active_planning_plan_id().await;
         match cloud_plan_id {
             Some(plan_id) => {
-                self.exit_plan_mode_cloud_path(
-                    plan_id,
-                    plan_markdown.as_deref(),
-                    explicit_approved,
-                )
-                .await
+                self.exit_plan_mode_cloud_path(plan_id, plan_markdown.as_deref(), explicit_approved)
+                    .await
             }
             None => {
                 self.exit_plan_mode_local_path(plan_markdown.as_deref(), explicit_approved)
@@ -1498,9 +1503,7 @@ impl ToolExecutor {
     /// uses `None` as the signal to fall back to the purely local
     /// Shift+Tab plan-mode flow.
     async fn lookup_active_planning_plan_id(&self) -> Option<String> {
-        let session_id = self
-            .active_session_id()
-            .filter(|sid| !sid.is_empty())?;
+        let session_id = self.active_session_id().filter(|sid| !sid.is_empty())?;
         let token = self.cloud_token()?;
         let client = self.remote_plan_client().ok()?;
         let plans = client
@@ -1544,10 +1547,7 @@ impl ToolExecutor {
 
         let (approved, follow_up_mode) = match explicit_approved {
             Some(value) => (value, None),
-            None => match self
-                .resolve_exit_plan_mode_via_overlay(plan_markdown)
-                .await
-            {
+            None => match self.resolve_exit_plan_mode_via_overlay(plan_markdown).await {
                 Ok(decision) => decision,
                 Err(message) => return message,
             },
@@ -1577,7 +1577,8 @@ impl ToolExecutor {
             .to_string();
 
         if approved {
-            *self.plan_mode_authoring_cache.write().await = Some(false);
+            self.set_plan_mode_authoring_cache_for_active_session(false)
+                .await;
             if let Some(mode) = follow_up_mode {
                 if let Ok(mut slot) = self.pending_permission_mode_change.lock() {
                     *slot = Some(mode);
@@ -1590,7 +1591,8 @@ impl ToolExecutor {
                 "Exited plan mode. plan_id={resolved_plan_id} is approved; write tools unlocked.{mode_suffix}"
             )
         } else {
-            *self.plan_mode_authoring_cache.write().await = Some(true);
+            self.set_plan_mode_authoring_cache_for_active_session(true)
+                .await;
             format!(
                 "Plan {resolved_plan_id} left open for another authoring pass. Write tools remain blocked. Address the user's feedback and call exit_plan_mode again when ready."
             )
@@ -1609,10 +1611,7 @@ impl ToolExecutor {
     ) -> String {
         let (approved, follow_up_mode) = match explicit_approved {
             Some(value) => (value, None),
-            None => match self
-                .resolve_exit_plan_mode_via_overlay(plan_markdown)
-                .await
-            {
+            None => match self.resolve_exit_plan_mode_via_overlay(plan_markdown).await {
                 Ok(decision) => decision,
                 Err(message) => return message,
             },
@@ -1624,7 +1623,8 @@ impl ToolExecutor {
             // keeps the cached flag consistent with "writes are
             // unlocked" so any tool that consults it reads the same
             // outcome the cloud path would have set.
-            *self.plan_mode_authoring_cache.write().await = Some(false);
+            self.set_plan_mode_authoring_cache_for_active_session(false)
+                .await;
             if let Some(mode) = follow_up_mode {
                 if let Ok(mut slot) = self.pending_permission_mode_change.lock() {
                     *slot = Some(mode);
@@ -1644,7 +1644,8 @@ impl ToolExecutor {
             // Keep planning: the local perm_manager mode is unchanged
             // (the host never staged a switch). The cache flag
             // mirrors "writes still gated" for downstream consultation.
-            *self.plan_mode_authoring_cache.write().await = Some(true);
+            self.set_plan_mode_authoring_cache_for_active_session(true)
+                .await;
             "Plan left open for another authoring pass. Address the user's feedback and call exit_plan_mode again when ready.".to_string()
         }
     }

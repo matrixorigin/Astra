@@ -29,7 +29,7 @@ fn enqueue(bp: &mut BottomPane, tool: &str) -> oneshot::Receiver<ApprovalRespons
         None,
         "unknown".into(),
         serde_json::Value::Null,
-            tx,
+        tx,
     );
     rx
 }
@@ -56,7 +56,7 @@ fn enqueue_grouped(
         None,
         "unknown".into(),
         serde_json::Value::Null,
-            tx,
+        tx,
         ApprovalMetadata::default().with_batch_group_key(group),
     );
     rx

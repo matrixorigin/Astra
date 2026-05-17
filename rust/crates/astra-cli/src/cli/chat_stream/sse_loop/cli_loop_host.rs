@@ -823,9 +823,10 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 /// is one stale turn; the cost of a false nudge is repeated
 /// scolding the model takes literally.
 fn plan_mode_missed_exit_reminder(messages: &[serde_json::Value]) -> Option<String> {
-    let last_assistant = messages.iter().rev().find(|m| {
-        m.get("role").and_then(|v| v.as_str()) == Some("assistant")
-    })?;
+    let last_assistant = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))?;
 
     if assistant_called_exit_plan_mode(last_assistant) {
         return None;
@@ -880,7 +881,10 @@ fn assistant_text(message: &serde_json::Value) -> Option<String> {
 /// flow is symmetric — see `apply_plan_mode_restrictions` /
 /// `clear_plan_mode_restrictions`. Mirrors the existing
 /// `interaction_scoped_tool_restrictions` lifecycle.
-fn plan_mode_restriction_names(plan_active: bool, schemas: &[serde_json::Value]) -> HashSet<String> {
+fn plan_mode_restriction_names(
+    plan_active: bool,
+    schemas: &[serde_json::Value],
+) -> HashSet<String> {
     if !plan_active {
         return HashSet::new();
     }

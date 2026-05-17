@@ -27,7 +27,7 @@ fn enqueue(
         None,
         "risk: unknown".into(),
         serde_json::Value::Null,
-            tx,
+        tx,
     );
     (id, rx)
 }

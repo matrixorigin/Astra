@@ -829,13 +829,8 @@ impl DynamicAgentSpawner {
                         }
                     }
                     Err(e) => {
-                        self.update_status(
-                            &agent_id,
-                            AgentStatus::Failed {
-                                error: e.clone(),
-                            },
-                        )
-                        .await;
+                        self.update_status(&agent_id, AgentStatus::Failed { error: e.clone() })
+                            .await;
                         self.unregister_mailbox(&agent_id).await;
 
                         Ok(SpawnAgentOutput::Failed { error: e })
@@ -898,13 +893,8 @@ impl DynamicAgentSpawner {
             Err(e) => {
                 self.persist_agent_terminated(agent_id, "failed", None)
                     .await;
-                self.update_status(
-                    agent_id,
-                    AgentStatus::Failed {
-                        error: e,
-                    },
-                )
-                .await;
+                self.update_status(agent_id, AgentStatus::Failed { error: e })
+                    .await;
                 // Unregister mailbox before archive removes the agent from active_agents.
                 self.unregister_mailbox(agent_id).await;
                 self.archive_agent(agent_id).await;

@@ -62,11 +62,9 @@ pub fn restricted_tool_workaround_message(
              read-only inspector. Use it to re-confirm the state, then \
              describe the change and ask the user to run it directly."
         ),
-        FallbackChoice::None => {
-            "No equivalent tool is available either. Describe what you need \
+        FallbackChoice::None => "No equivalent tool is available either. Describe what you need \
              in plain text and ask the user to run the command on your behalf."
-                .to_string()
-        }
+            .to_string(),
     };
 
     format!("{why}\n\n{next}")
@@ -143,7 +141,7 @@ mod tests {
         // the same task directly" — feeding the model a self-referential
         // suggestion that just made it call bash again.
         let available = set(&["bash", "read_file", "grep"]);
-        let msg = restricted_tool_workaround_message("bash", &available, &registry());
+        let msg = restricted_tool_workaround_message("bash", &available, registry());
         assert!(
             !msg.contains("`bash`"),
             "must not recommend `bash` when bash is the blocked tool. Got: {msg}"
@@ -156,7 +154,7 @@ mod tests {
         // but shell is available, suggest shell — same effect class,
         // not a degraded read-only stand-in.
         let available = set(&["bash", "shell", "read_file"]);
-        let msg = restricted_tool_workaround_message("bash", &available, &registry());
+        let msg = restricted_tool_workaround_message("bash", &available, registry());
         assert!(
             msg.contains("`shell`"),
             "should suggest `shell` (same Shell category). Got: {msg}"
@@ -169,7 +167,7 @@ mod tests {
         // remain. Must not suggest write_file even though
         // historically the template might have.
         let available = set(&["read_file", "grep"]);
-        let msg = restricted_tool_workaround_message("bash", &available, &registry());
+        let msg = restricted_tool_workaround_message("bash", &available, registry());
         assert!(
             !msg.contains("`write_file`"),
             "must not recommend write_file when it isn't in the available set. Got: {msg}"
@@ -187,7 +185,7 @@ mod tests {
         // message degrades to "use the read tool to re-confirm
         // state, then ask the user".
         let available = set(&["read_file", "grep"]);
-        let msg = restricted_tool_workaround_message("write_file", &available, &registry());
+        let msg = restricted_tool_workaround_message("write_file", &available, registry());
         assert!(
             msg.contains("`read_file`") || msg.contains("`grep`"),
             "must reference the available read-only tool. Got: {msg}"
@@ -202,7 +200,7 @@ mod tests {
     fn falls_back_to_ask_user_when_nothing_meaningful_remains() {
         // Empty available set — model has nothing left.
         let available = set(&[]);
-        let msg = restricted_tool_workaround_message("write_file", &available, &registry());
+        let msg = restricted_tool_workaround_message("write_file", &available, registry());
         assert!(
             msg.contains("ask the user"),
             "no available tools means the only recourse is asking the user. Got: {msg}"
@@ -219,7 +217,7 @@ mod tests {
         // the same call (won't help if it's a session restriction)
         // versus rephrasing arguments.
         let available = set(&["read_file"]);
-        let msg = restricted_tool_workaround_message("bash", &available, &registry());
+        let msg = restricted_tool_workaround_message("bash", &available, registry());
         assert!(
             msg.contains("restricted") && (msg.contains("repeated") || msg.contains("plan-mode")),
             "must explain that the block is a session-level restriction, not a transient bug. Got: {msg}"
@@ -232,8 +230,8 @@ mod tests {
         // identical messages, which keeps journal diffs and
         // snapshot tests stable.
         let available = set(&["bash", "run_script", "read_file"]);
-        let msg1 = restricted_tool_workaround_message("write_file", &available, &registry());
-        let msg2 = restricted_tool_workaround_message("write_file", &available, &registry());
+        let msg1 = restricted_tool_workaround_message("write_file", &available, registry());
+        let msg2 = restricted_tool_workaround_message("write_file", &available, registry());
         assert_eq!(msg1, msg2);
     }
 }

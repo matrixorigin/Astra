@@ -24,7 +24,7 @@ fn backtab_keeps_approval_navigation_when_approval_is_pending() {
         None,
         "testing".into(),
         serde_json::Value::Null,
-            tx,
+        tx,
     );
 
     let action = pane.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));

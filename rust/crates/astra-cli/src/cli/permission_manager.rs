@@ -1173,8 +1173,10 @@ impl PermissionManager {
     /// Switch the permission mode at runtime (e.g., via `/allow` command).
     pub(super) fn set_mode(&mut self, mode: PermissionMode) {
         self.mode = mode;
-        self.mode_mirror
-            .store(encode_mode_for_mirror(mode), std::sync::atomic::Ordering::Release);
+        self.mode_mirror.store(
+            encode_mode_for_mirror(mode),
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     /// Hand out a cheap clone of the mode mirror so an external
@@ -1192,9 +1194,8 @@ impl PermissionManager {
     /// mirror without being able to borrow `&mut self`. Cheap; no-op
     /// when already in sync.
     pub(super) fn pull_mode_from_mirror(&mut self) {
-        let mirror = decode_mode_for_mirror(
-            self.mode_mirror.load(std::sync::atomic::Ordering::Acquire),
-        );
+        let mirror =
+            decode_mode_for_mirror(self.mode_mirror.load(std::sync::atomic::Ordering::Acquire));
         if self.mode != mirror {
             self.mode = mirror;
         }
@@ -1289,7 +1290,9 @@ impl PermissionManager {
         };
         Self {
             mode,
-            mode_mirror: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(encode_mode_for_mirror(mode))),
+            mode_mirror: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                encode_mode_for_mirror(mode),
+            )),
             session_overrides:
                 astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
             turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(
@@ -1421,7 +1424,9 @@ impl PermissionManager {
         let cached_user_deny = user_settings.parsed_deny_rules();
         Self {
             mode,
-            mode_mirror: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(encode_mode_for_mirror(mode))),
+            mode_mirror: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                encode_mode_for_mirror(mode),
+            )),
             session_overrides:
                 astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
             turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(
@@ -1514,7 +1519,9 @@ impl PermissionManager {
 
         Self {
             mode,
-            mode_mirror: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(encode_mode_for_mirror(mode))),
+            mode_mirror: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                encode_mode_for_mirror(mode),
+            )),
             session_overrides,
             turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(
             ),

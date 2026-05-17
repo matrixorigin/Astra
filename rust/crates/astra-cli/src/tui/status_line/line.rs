@@ -173,8 +173,7 @@ impl StatusLine {
         // modes (the previous global "⇧Tab mode" hint was deleted
         // for being repetitive and unanchored). Dim so it reads as
         // metadata of the chip, not an action of its own.
-        out.left
-            .push(Segment::styled("⇧Tab", dim));
+        out.left.push(Segment::styled("⇧Tab", dim));
 
         if ctx.pending_approvals > 0 {
             let text = if ctx.pending_approvals == 1 {

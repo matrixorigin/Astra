@@ -57,10 +57,22 @@ fn enqueue_pushes_view_and_renders_plan_body_plus_choices() {
         "rendered frame must show plan markdown body. Got:\n{frame}"
     );
     // All four choices present in the radio block.
-    assert!(frame.contains("Approve · auto"), "choice 1 missing:\n{frame}");
-    assert!(frame.contains("Approve · edit"), "choice 2 missing:\n{frame}");
-    assert!(frame.contains("Approve · default"), "choice 3 missing:\n{frame}");
-    assert!(frame.contains("Keep planning"), "choice 4 missing:\n{frame}");
+    assert!(
+        frame.contains("Approve · auto"),
+        "choice 1 missing:\n{frame}"
+    );
+    assert!(
+        frame.contains("Approve · edit"),
+        "choice 2 missing:\n{frame}"
+    );
+    assert!(
+        frame.contains("Approve · default"),
+        "choice 3 missing:\n{frame}"
+    );
+    assert!(
+        frame.contains("Keep planning"),
+        "choice 4 missing:\n{frame}"
+    );
     // Default selection marker on the first option.
     assert!(
         frame.contains("● Approve · auto"),
@@ -205,10 +217,7 @@ fn ctrl_c_cancels_overlay_without_escalating_to_quit() {
     let mut bp = BottomPane::new();
     let mut rx = enqueue(&mut bp, "1. Plan");
 
-    let action = bp.handle_key(KeyEvent::new(
-        KeyCode::Char('c'),
-        KeyModifiers::CONTROL,
-    ));
+    let action = bp.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
     // The overlay consumes Ctrl+C (CancellationEvent::Consumed) and the
     // BottomPane reports ViewCompleted, NOT Quit. This protects the

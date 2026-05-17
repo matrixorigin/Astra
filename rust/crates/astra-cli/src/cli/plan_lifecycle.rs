@@ -44,11 +44,24 @@ fn bind_state_to_session(state: &mut crate::SessionState, profile: Option<&str>,
     if state.session_id.as_deref() == Some(session_id) {
         return;
     }
-    let _ = crate::persist_profile_last_session(profile, session_id);
+    if let Err(error) = crate::persist_profile_last_session(profile, session_id) {
+        tracing::warn!(
+            session_id,
+            error = %error,
+            "plan mode: failed to persist profile last_session_id"
+        );
+    }
     state.task_manager.rebind(session_id);
     state.session_id = Some(session_id.to_string());
     if state.journal.is_none() {
-        state.journal = session_journal::JournalWriter::new(session_id).ok();
+        match session_journal::JournalWriter::new(session_id) {
+            Ok(writer) => state.journal = Some(writer),
+            Err(error) => tracing::warn!(
+                session_id,
+                error = %error,
+                "plan mode: failed to initialize session journal"
+            ),
+        }
     }
 }
 
@@ -281,7 +294,10 @@ mod tests {
         assert_eq!(plan_id, "plan-1");
         assert_eq!(state.session_id.as_deref(), Some("sess-1"));
         assert_eq!(
-            state.cloud_plan_mirror.as_ref().map(|plan| plan.goal.as_str()),
+            state
+                .cloud_plan_mirror
+                .as_ref()
+                .map(|plan| plan.goal.as_str()),
             Some("Ship auth")
         );
         assert_eq!(
@@ -407,7 +423,9 @@ mod tests {
             .await
             .unwrap();
 
-        let plan = state.cloud_plan_mirror.expect("planning plan should be mirrored");
+        let plan = state
+            .cloud_plan_mirror
+            .expect("planning plan should be mirrored");
         assert_eq!(plan.goal, "Ship auth");
         assert_eq!(plan.version, 7);
         assert_eq!(plan.plan.subtasks.len(), 2);
@@ -449,7 +467,10 @@ mod tests {
 
         assert!(error.contains("500"), "got: {error}");
         assert_eq!(
-            state.cloud_plan_mirror.as_ref().map(|plan| plan.goal.as_str()),
+            state
+                .cloud_plan_mirror
+                .as_ref()
+                .map(|plan| plan.goal.as_str()),
             Some("stale goal"),
             "failed sync must not overwrite the last known local mirror"
         );
@@ -542,7 +563,10 @@ mod tests {
 
         assert!(error.contains("500"), "got: {error}");
         assert_eq!(
-            state.cloud_plan_mirror.as_ref().map(|plan| plan.goal.as_str()),
+            state
+                .cloud_plan_mirror
+                .as_ref()
+                .map(|plan| plan.goal.as_str()),
             Some("Ship auth"),
             "failed unapproved exit sync must keep the last known mirror in place"
         );

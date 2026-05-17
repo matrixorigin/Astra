@@ -27,8 +27,6 @@ mod approval_integration_tests;
 #[cfg(test)]
 mod ask_user_integration_tests;
 #[cfg(test)]
-mod plan_review_integration_tests;
-#[cfg(test)]
 mod config_edit_tests;
 #[cfg(test)]
 mod hint_tests;
@@ -36,6 +34,8 @@ mod hint_tests;
 mod keyboard_tests;
 #[cfg(test)]
 mod mention_integration_tests;
+#[cfg(test)]
+mod plan_review_integration_tests;
 #[cfg(test)]
 mod slash_integration_tests;
 
@@ -375,6 +375,7 @@ impl BottomPane {
     /// Issue #326 P3: enqueue with the full metadata bundle. Used
     /// by the stream-render gate when it has source_agent / risk
     /// tags / Will-save preview / host context to attach.
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_approval_with_metadata(
         &mut self,
         tool: String,
