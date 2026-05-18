@@ -531,7 +531,7 @@ mod tests {
     #[async_trait::async_trait]
     impl SpawnAgentExecutor for CapturingModelExecutor {
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
-            *self.captured_model.lock().unwrap() = Some(config.model.clone());
+            *self.captured_model.lock().unwrap() = config.model.clone();
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,

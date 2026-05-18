@@ -195,9 +195,10 @@ pub use personal_skills::{
 };
 pub use prompt_delta::{
     PromptDeltaCounts, PromptRequestObservability, PromptRequestPersistInput,
-    PromptRequestPersistResult, PromptRequestPlan, count_prompt_requests_for_run,
-    count_prompt_requests_for_session, load_latest_prompt_observability_for_run,
-    load_latest_prompt_observability_for_session, persist_prompt_request, plan_prompt_request,
+    PromptRequestPersistResult, PromptRequestPlan, PromptRequestPlanInput,
+    count_prompt_requests_for_run, count_prompt_requests_for_session,
+    load_latest_prompt_observability_for_run, load_latest_prompt_observability_for_session,
+    persist_prompt_request, plan_prompt_request,
 };
 pub use reflect::{
     DatabaseReflectService, Diagnosis, ReflectReport, ReflectService, UnconfiguredReflectService,

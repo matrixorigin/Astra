@@ -103,17 +103,18 @@ fn record_full_llm_request_event(
         return;
     };
     let round = buf.current_round();
-    let prompt_request_plan = astra_services::plan_prompt_request(
-        session_id,
-        state.session_turn,
-        round,
-        attempt,
-        source,
-        messages,
-        tools,
-        max_output_tokens,
-    )
-    .ok();
+    let prompt_request_plan =
+        astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+            session_id,
+            turn: state.session_turn,
+            round,
+            attempt,
+            source,
+            messages,
+            tools,
+            max_output_tokens,
+        })
+        .ok();
     let trace = crate::turn::llm_exchange_capture::CaptureTrace {
         session_turn_source: Some("state"),
         turn_chain_id: None,
@@ -2479,17 +2480,18 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 .as_ref()
                 .map(|buffer| buffer.current_round())
                 .unwrap_or(state.llm_rounds_completed);
-            let prompt_request_plan = astra_services::plan_prompt_request(
-                &self.session_id,
-                state.session_turn,
-                prompt_round,
-                attempt_in_round,
-                "server_loop_host",
-                &llm_messages,
-                &final_tools,
-                Some(effective_max_output),
-            )
-            .ok();
+            let prompt_request_plan =
+                astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+                    session_id: &self.session_id,
+                    turn: state.session_turn,
+                    round: prompt_round,
+                    attempt: attempt_in_round,
+                    source: "server_loop_host",
+                    messages: &llm_messages,
+                    tools: &final_tools,
+                    max_output_tokens: Some(effective_max_output),
+                })
+                .ok();
             record_full_llm_request_event(
                 state,
                 self.full_llm_capture,

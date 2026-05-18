@@ -550,17 +550,15 @@ impl InMemoryRunStateStore {
                     .as_ref()
                     .and_then(|entry| entry.latest_event_type.clone())
             }),
-            latest_checkpoint
-                .map(|checkpoint| checkpoint_summary_tuple(checkpoint))
-                .or_else(|| {
-                    existing.as_ref().and_then(|entry| {
-                        Some((
-                            entry.latest_checkpoint_id.clone()?,
-                            entry.latest_checkpoint_kind.clone()?,
-                            entry.latest_checkpoint_version.clone()?,
-                        ))
-                    })
-                }),
+            latest_checkpoint.map(checkpoint_summary_tuple).or_else(|| {
+                existing.as_ref().and_then(|entry| {
+                    Some((
+                        entry.latest_checkpoint_id.clone()?,
+                        entry.latest_checkpoint_kind.clone()?,
+                        entry.latest_checkpoint_version.clone()?,
+                    ))
+                })
+            }),
         );
         projections.insert(run.run_id.clone(), projection);
     }

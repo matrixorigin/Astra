@@ -6164,7 +6164,7 @@ mod tests {
             agent_type: "test".to_string(),
             task: "do work".to_string(),
             system_prompt_addendum: String::new(),
-            model: "test-model".to_string(),
+            model: Some("test-model".to_string()),
             max_turns: 3,
             allowed_tools: allowed_tools.into_iter().map(String::from).collect(),
             read_only,

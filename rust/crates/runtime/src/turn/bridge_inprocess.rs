@@ -468,17 +468,18 @@ fn record_full_llm_request_event(
         return;
     };
     let round = buf.current_round();
-    let prompt_request_plan = astra_services::plan_prompt_request(
-        session_id,
-        turn,
-        round,
-        attempt,
-        source,
-        messages,
-        tools,
-        max_output_tokens,
-    )
-    .ok();
+    let prompt_request_plan =
+        astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+            session_id,
+            turn,
+            round,
+            attempt,
+            source,
+            messages,
+            tools,
+            max_output_tokens,
+        })
+        .ok();
     let mut evt = astra_services::session_journal::JournalEvent::llm_request_full(
         Some(session_id),
         turn,
@@ -2153,19 +2154,21 @@ impl InProcessChatTurnBridge {
                         &pruned_tools,
                     );
                     capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
-                    if let Ok(prompt_request_plan) = astra_services::plan_prompt_request(
-                        &session_id,
-                        trace_turn,
-                        turn_event_buffer
-                            .as_ref()
-                            .map(|buffer| buffer.current_round())
-                            .unwrap_or(round_index),
-                        attempt_in_round,
-                        "bridge_inprocess",
-                        &llm_messages,
-                        &pruned_tools,
-                        Some(max_output_tokens),
-                    ) {
+                    if let Ok(prompt_request_plan) =
+                        astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+                            session_id: &session_id,
+                            turn: trace_turn,
+                            round: turn_event_buffer
+                                .as_ref()
+                                .map(|buffer| buffer.current_round())
+                                .unwrap_or(round_index),
+                            attempt: attempt_in_round,
+                            source: "bridge_inprocess",
+                            messages: &llm_messages,
+                            tools: &pruned_tools,
+                            max_output_tokens: Some(max_output_tokens),
+                        })
+                    {
                         crate::turn::llm_exchange_capture::persist_prompt_request_plan_or_log(
                             "bridge_inprocess e2e capture",
                             shared_pool.as_ref(),
@@ -2233,19 +2236,21 @@ impl InProcessChatTurnBridge {
                     // long note ~60 lines up for why this is here and not
                     // before the mutations).
                     capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
-                    if let Ok(prompt_request_plan) = astra_services::plan_prompt_request(
-                        &session_id,
-                        trace_turn,
-                        turn_event_buffer
-                            .as_ref()
-                            .map(|buffer| buffer.current_round())
-                            .unwrap_or(round_index),
-                        attempt_in_round,
-                        "bridge_inprocess",
-                        &llm_messages,
-                        &pruned_tools,
-                        Some(max_output_tokens),
-                    ) {
+                    if let Ok(prompt_request_plan) =
+                        astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+                            session_id: &session_id,
+                            turn: trace_turn,
+                            round: turn_event_buffer
+                                .as_ref()
+                                .map(|buffer| buffer.current_round())
+                                .unwrap_or(round_index),
+                            attempt: attempt_in_round,
+                            source: "bridge_inprocess",
+                            messages: &llm_messages,
+                            tools: &pruned_tools,
+                            max_output_tokens: Some(max_output_tokens),
+                        })
+                    {
                         crate::turn::llm_exchange_capture::persist_prompt_request_plan_or_log(
                             "bridge_inprocess live capture",
                             shared_pool.as_ref(),
@@ -2527,19 +2532,21 @@ impl InProcessChatTurnBridge {
                                 &pruned_tools,
                                 Some(max_output_tokens / 2),
                             );
-                            if let Ok(prompt_request_plan) = astra_services::plan_prompt_request(
-                                &session_id,
-                                trace_turn,
-                                turn_event_buffer
-                                    .as_ref()
-                                    .map(|buffer| buffer.current_round())
-                                    .unwrap_or(round_index),
-                                attempt_in_round,
-                                "bridge_inprocess",
-                                &llm_messages,
-                                &pruned_tools,
-                                Some(max_output_tokens / 2),
-                            ) {
+                            if let Ok(prompt_request_plan) =
+                                astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+                                    session_id: &session_id,
+                                    turn: trace_turn,
+                                    round: turn_event_buffer
+                                        .as_ref()
+                                        .map(|buffer| buffer.current_round())
+                                        .unwrap_or(round_index),
+                                    attempt: attempt_in_round,
+                                    source: "bridge_inprocess",
+                                    messages: &llm_messages,
+                                    tools: &pruned_tools,
+                                    max_output_tokens: Some(max_output_tokens / 2),
+                                })
+                            {
                                 crate::turn::llm_exchange_capture::persist_prompt_request_plan_or_log(
                                     "bridge_inprocess retry capture",
                                     shared_pool.as_ref(),

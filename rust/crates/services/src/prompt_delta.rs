@@ -65,18 +65,20 @@ pub struct PromptRequestObservability {
     pub delta_counts: PromptDeltaCounts,
 }
 
-pub fn plan_prompt_request(
-    session_id: &str,
-    turn: u32,
-    round: u32,
-    attempt: u32,
-    source: &str,
-    messages: &[Value],
-    tools: &[Value],
-    max_output_tokens: Option<usize>,
-) -> Result<PromptRequestPlan, String> {
-    let mut chunks = Vec::with_capacity(messages.len() + tools.len());
-    for (index, message) in messages.iter().enumerate() {
+pub struct PromptRequestPlanInput<'a> {
+    pub session_id: &'a str,
+    pub turn: u32,
+    pub round: u32,
+    pub attempt: u32,
+    pub source: &'a str,
+    pub messages: &'a [Value],
+    pub tools: &'a [Value],
+    pub max_output_tokens: Option<usize>,
+}
+
+pub fn plan_prompt_request(input: PromptRequestPlanInput<'_>) -> Result<PromptRequestPlan, String> {
+    let mut chunks = Vec::with_capacity(input.messages.len() + input.tools.len());
+    for (index, message) in input.messages.iter().enumerate() {
         let logical_key = format!(
             "message:{index}:{}",
             message
@@ -92,7 +94,7 @@ pub fn plan_prompt_request(
         )?);
     }
     let message_count = chunks.len() as u32;
-    for (index, tool) in tools.iter().enumerate() {
+    for (index, tool) in input.tools.iter().enumerate() {
         let logical_key = format!("tool:{index}:{}", tool_identity(tool));
         chunks.push(build_chunk_plan(
             &logical_key,
@@ -101,22 +103,30 @@ pub fn plan_prompt_request(
             tool,
         )?);
     }
-    let tool_count = tools.len() as u32;
-    let max_output_tokens_u32 = max_output_tokens.map(|value| value.min(u32::MAX as usize) as u32);
+    let tool_count = input.tools.len() as u32;
+    let max_output_tokens_u32 = input
+        .max_output_tokens
+        .map(|value| value.min(u32::MAX as usize) as u32);
     let summary_json = json!({
-        "message_roles": messages.iter().map(message_role_summary).collect::<Vec<_>>(),
-        "tool_names": tools.iter().map(tool_identity).collect::<Vec<_>>(),
+        "message_roles": input.messages.iter().map(message_role_summary).collect::<Vec<_>>(),
+        "tool_names": input.tools.iter().map(tool_identity).collect::<Vec<_>>(),
         "max_output_tokens": max_output_tokens_u32,
         "message_count": message_count,
         "tool_count": tool_count,
     });
     let request_hash = hash_json_value(&json!({
-        "messages": messages,
-        "tools": tools,
+        "messages": input.messages,
+        "tools": input.tools,
         "max_output_tokens": max_output_tokens_u32,
     }))?;
     Ok(PromptRequestPlan {
-        request_id: prompt_request_id(session_id, turn, round, attempt, source),
+        request_id: prompt_request_id(
+            input.session_id,
+            input.turn,
+            input.round,
+            input.attempt,
+            input.source,
+        ),
         request_hash,
         message_count,
         tool_count,
@@ -198,15 +208,17 @@ pub async fn persist_prompt_request(
         };
         insert_prompt_delta(
             &mut tx,
-            &plan.request_id,
-            delta_seq,
-            &chunk.logical_key,
-            &chunk.chunk_kind,
-            chunk.position,
-            op,
-            Some(&chunk.chunk_id),
-            Some(&chunk.chunk_hash),
-            previous_hash.as_deref(),
+            PromptDeltaInsert {
+                request_id: &plan.request_id,
+                delta_seq,
+                logical_key: &chunk.logical_key,
+                chunk_kind: &chunk.chunk_kind,
+                position: chunk.position,
+                op,
+                chunk_id: Some(&chunk.chunk_id),
+                chunk_hash: Some(&chunk.chunk_hash),
+                previous_chunk_hash: previous_hash.as_deref(),
+            },
         )
         .await?;
         delta_seq = delta_seq.saturating_add(1);
@@ -215,15 +227,17 @@ pub async fn persist_prompt_request(
         delta_counts.drop = delta_counts.drop.saturating_add(1);
         insert_prompt_delta(
             &mut tx,
-            &plan.request_id,
-            delta_seq,
-            &logical_key,
-            "drop",
-            delta_seq,
-            "drop",
-            None,
-            None,
-            Some(previous_hash.as_str()),
+            PromptDeltaInsert {
+                request_id: &plan.request_id,
+                delta_seq,
+                logical_key: &logical_key,
+                chunk_kind: "drop",
+                position: delta_seq,
+                op: "drop",
+                chunk_id: None,
+                chunk_hash: None,
+                previous_chunk_hash: Some(previous_hash.as_str()),
+            },
         )
         .await?;
         delta_seq = delta_seq.saturating_add(1);
@@ -389,8 +403,7 @@ async fn load_existing_request(
     .map_err(|error| error.to_string())?;
     row.map(|row| {
         let summary_json = row.try_get::<String, _>("summary_json").unwrap_or_default();
-        let summary_value: Value =
-            serde_json::from_str(&summary_json).unwrap_or_else(|_| Value::Null);
+        let summary_value: Value = serde_json::from_str(&summary_json).unwrap_or(Value::Null);
         let delta_counts = summary_value
             .get("delta_counts")
             .cloned()
@@ -441,17 +454,21 @@ async fn load_request_chunks(
         .collect())
 }
 
+struct PromptDeltaInsert<'a> {
+    request_id: &'a str,
+    delta_seq: i32,
+    logical_key: &'a str,
+    chunk_kind: &'a str,
+    position: i32,
+    op: &'a str,
+    chunk_id: Option<&'a str>,
+    chunk_hash: Option<&'a str>,
+    previous_chunk_hash: Option<&'a str>,
+}
+
 async fn insert_prompt_delta(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    request_id: &str,
-    delta_seq: i32,
-    logical_key: &str,
-    chunk_kind: &str,
-    position: i32,
-    op: &str,
-    chunk_id: Option<&str>,
-    chunk_hash: Option<&str>,
-    previous_chunk_hash: Option<&str>,
+    delta: PromptDeltaInsert<'_>,
 ) -> Result<(), String> {
     sqlx::query(
         "INSERT INTO prompt_deltas
@@ -460,15 +477,15 @@ async fn insert_prompt_delta(
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
     )
     .bind(uuid::Uuid::now_v7().to_string())
-    .bind(request_id)
-    .bind(delta_seq)
-    .bind(logical_key)
-    .bind(chunk_kind)
-    .bind(position)
-    .bind(op)
-    .bind(chunk_id)
-    .bind(chunk_hash)
-    .bind(previous_chunk_hash)
+    .bind(delta.request_id)
+    .bind(delta.delta_seq)
+    .bind(delta.logical_key)
+    .bind(delta.chunk_kind)
+    .bind(delta.position)
+    .bind(delta.op)
+    .bind(delta.chunk_id)
+    .bind(delta.chunk_hash)
+    .bind(delta.previous_chunk_hash)
     .execute(&mut **tx)
     .await
     .map_err(|error| error.to_string())?;
@@ -582,27 +599,29 @@ mod tests {
 
     #[test]
     fn plan_prompt_request_hash_is_order_stable_for_object_keys() {
-        let plan_a = plan_prompt_request(
-            "session-1",
-            1,
-            0,
-            0,
-            "server_loop_host",
-            &[json!({"role": "system", "content": {"b": 2, "a": 1}})],
-            &[],
-            Some(1024),
-        )
+        let messages_a = [json!({"role": "system", "content": {"b": 2, "a": 1}})];
+        let plan_a = plan_prompt_request(PromptRequestPlanInput {
+            session_id: "session-1",
+            turn: 1,
+            round: 0,
+            attempt: 0,
+            source: "server_loop_host",
+            messages: &messages_a,
+            tools: &[],
+            max_output_tokens: Some(1024),
+        })
         .expect("plan");
-        let plan_b = plan_prompt_request(
-            "session-1",
-            1,
-            0,
-            0,
-            "server_loop_host",
-            &[json!({"content": {"a": 1, "b": 2}, "role": "system"})],
-            &[],
-            Some(1024),
-        )
+        let messages_b = [json!({"content": {"a": 1, "b": 2}, "role": "system"})];
+        let plan_b = plan_prompt_request(PromptRequestPlanInput {
+            session_id: "session-1",
+            turn: 1,
+            round: 0,
+            attempt: 0,
+            source: "server_loop_host",
+            messages: &messages_b,
+            tools: &[],
+            max_output_tokens: Some(1024),
+        })
         .expect("plan");
         assert_eq!(plan_a.request_hash, plan_b.request_hash);
         assert_eq!(plan_a.chunks[0].chunk_hash, plan_b.chunks[0].chunk_hash);
@@ -610,19 +629,21 @@ mod tests {
 
     #[test]
     fn plan_prompt_request_summarizes_roles_and_tools() {
-        let plan = plan_prompt_request(
-            "session-1",
-            2,
-            1,
-            0,
-            "bridge_inprocess",
-            &[
-                json!({"role": "system", "content": "sys"}),
-                json!({"role": "user", "content": [{"type": "text", "text": "hi"}]}),
-            ],
-            &[json!({"function": {"name": "bash"}})],
-            Some(512),
-        )
+        let messages = [
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": [{"type": "text", "text": "hi"}]}),
+        ];
+        let tools = [json!({"function": {"name": "bash"}})];
+        let plan = plan_prompt_request(PromptRequestPlanInput {
+            session_id: "session-1",
+            turn: 2,
+            round: 1,
+            attempt: 0,
+            source: "bridge_inprocess",
+            messages: &messages,
+            tools: &tools,
+            max_output_tokens: Some(512),
+        })
         .expect("plan");
         assert_eq!(plan.message_count, 2);
         assert_eq!(plan.tool_count, 1);
