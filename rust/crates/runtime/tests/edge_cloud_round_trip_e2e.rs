@@ -9,6 +9,8 @@
 //! cargo test -p astra-runtime --test edge_cloud_round_trip_e2e --features bridge-e2e-hooks
 //! ```
 
+mod test_support;
+
 use std::sync::{Arc, OnceLock};
 
 use astra_runtime::{
@@ -26,6 +28,7 @@ use axum::{
     http::{HeaderMap, Request, StatusCode},
 };
 use serde_json::{Value, json};
+use test_support::{parse_sse_events, tool_call};
 use tokio::sync::Mutex;
 use tower::util::ServiceExt;
 
@@ -195,10 +198,6 @@ fn tool_schema(name: &str) -> Value {
     json!({ "type": "function", "function": { "name": name, "description": name, "parameters": { "type": "object", "properties": { "path": { "type": "string" }, "command": { "type": "string" }, "content": { "type": "string" }, "old_str": { "type": "string" }, "new_str": { "type": "string" } } } } })
 }
 
-fn tool_call(id: &str, name: &str, args: Value) -> Value {
-    json!({ "id": id, "type": "function", "function": { "name": name, "arguments": serde_json::to_string(&args).unwrap() } })
-}
-
 fn build_app_with_capture(capture: Capture) -> Router {
     let enc = Arc::new(FernetTokenEncryptor::new("rt-e2e-fernet-key-32chars!!").expect("fernet"));
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
@@ -237,13 +236,6 @@ async fn chat_turn(app: &Router, payload: Value) -> (StatusCode, Vec<u8>) {
         .await
         .unwrap();
     (st, bytes.to_vec())
-}
-
-fn parse_sse_events(raw: &str) -> Vec<Value> {
-    raw.lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter_map(|data| serde_json::from_str(data).ok())
-        .collect()
 }
 
 fn events_of_type<'a>(events: &'a [Value], ty: &str) -> Vec<&'a Value> {

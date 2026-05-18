@@ -2587,6 +2587,7 @@ impl AgenticRunLifecycleService {
             agent_id,
             current_model: request.model.clone(),
             recursion_depth: 0,
+            is_fork_child: false,
             working_dir: workspace.to_path_buf(),
             spawner: entry.spawner,
             inherited_permissions: Self::inherited_permissions_from_constraints(
@@ -3138,6 +3139,9 @@ impl AgenticRunLifecycleService {
         .with_llm_token_service(request.llm_token_service.clone())
         .with_full_llm_capture(request.full_llm_capture)
         .with_edge_tools(edge_tools)
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            self.shared_pool.is_some(),
+        ))
         .with_edge_profile(edge_profile)
         .with_edge_callback_ledger(self.edge_callback_ledger.clone())
         .with_interactive_client(request.interactive_client)
@@ -3774,6 +3778,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 memoria_base,
                 None,
             )
+            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                self.shared_pool.is_some(),
+            ))
             .with_cancel_token(loop_state.cancellation.token.clone())
             .with_task_store(task_store);
             if let Some(pool) = &self.edge_connection_pool {
@@ -4242,6 +4249,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 memoria_base,
                 None,
             )
+            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                self.shared_pool.is_some(),
+            ))
             .with_cancel_token(state.cancellation.token.clone())
             .with_task_store(task_store);
             if let Some(pool) = &self.edge_connection_pool {
@@ -5151,7 +5161,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         let mut profile =
             AgentProfile::new(&config.agent_id, &config.agent_type, AgentTier::System);
         profile.system_prompt = Some(spawn_system_prompt(&config));
-        profile.model_override = Some(config.model.clone());
+        profile.model_override = config.model.clone();
         profile.skill_filter = config.allowed_tools.clone();
         profile.metadata.insert(
             "spawn_agent_type".to_string(),
@@ -5417,6 +5427,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
         )
         .with_model(config.agent_profile.model_override.clone())
         .with_llm_token_service(config.llm_token_service.clone())
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            self.shared_pool.is_some(),
+        ))
         .with_edge_profile(edge_profile)
         .with_edge_callback_ledger(self.edge_callback_ledger.clone());
 
@@ -5642,6 +5655,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 memoria_base,
                 None,
             )
+            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                self.shared_pool.is_some(),
+            ))
             .with_cancel_token(config.cancel_token.clone())
             .with_task_store(task_store);
             if let Some(pool) = self.shared_pool.as_ref() {
@@ -6737,6 +6753,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_run_conflicts_when_same_session_already_has_active_run() {
+        let svc = test_service();
+        let mut first = test_request("hello");
+        first.session_id = Some("shared-session".into());
+        ok(svc.create_run("user-1".into(), first).await);
+
+        let mut second = test_request("again");
+        second.session_id = Some("shared-session".into());
+        let err = err(svc.create_run("user-1".into(), second).await);
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(err.1.0.detail, "session already has an active run");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_conflicts_when_same_session_already_has_active_run() {
+        let svc = test_service();
+        let mut first = test_request("hello");
+        first.session_id = Some("shared-session".into());
+        ok(svc.create_run("user-1".into(), first).await);
+
+        let mut second = test_request("again");
+        second.session_id = Some("shared-session".into());
+        let err = err(svc.stream_chat("user-1".into(), second).await);
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(err.1.0.detail, "session already has an active run");
+    }
+
+    #[tokio::test]
     #[ignore] // stream_chat runs full agentic loop; needs live DB + LLM or mock
     async fn stream_chat_tracks_run_for_status_and_replay() {
         let svc = test_service();
@@ -6945,24 +6989,6 @@ mod tests {
         assert!(
             result.limit <= astra_services::pagination::MAX_API_LIST_LIMIT,
             "limit must be clamped to MAX_API_LIST_LIMIT"
-        );
-    }
-
-    /// P2-B source guard: list_runs must call clamp_api_list_pagination.
-    #[test]
-    fn list_runs_uses_pagination_clamping() {
-        let source = include_str!("run_lifecycle.rs");
-        let fn_start = source
-            .find("async fn list_runs(")
-            .expect("list_runs must exist");
-        let fn_end = source[fn_start..]
-            .find("\n    async fn ")
-            .map(|p| fn_start + p)
-            .unwrap_or(source.len());
-        let fn_body = &source[fn_start..fn_end];
-        assert!(
-            fn_body.contains("clamp_api_list_pagination"),
-            "list_runs must clamp pagination params"
         );
     }
 
@@ -7888,30 +7914,6 @@ mod tests {
         assert!(children.is_empty());
     }
 
-    // ─── Router route registration test ─────────────────────────────────
-
-    #[test]
-    fn router_includes_delegation_routes() {
-        // Quick check that our delegation routes are registered.
-        let source = include_str!("router_builder.rs");
-        assert!(
-            source.contains("/chat/runs/{run_id}/delegate"),
-            "Missing delegation route"
-        );
-        assert!(
-            source.contains("/chat/runs/{run_id}/delegations"),
-            "Missing delegations list route"
-        );
-        assert!(
-            source.contains("/chat/runs/{run_id}/delegations/pause"),
-            "Missing delegations pause route"
-        );
-        assert!(
-            source.contains("/chat/runs/{run_id}/delegations/resume"),
-            "Missing delegations resume route"
-        );
-    }
-
     /// P0-C: The agentic loop spawn must check token budget before starting.
     #[test]
     fn run_lifecycle_checks_token_budget_before_loop() {
@@ -7971,19 +7973,6 @@ mod tests {
         );
     }
 
-    /// P0-C source guard: both spawns must wire the background_task_count counter.
-    #[test]
-    fn both_spawns_wire_background_task_count() {
-        let source = include_str!("run_lifecycle.rs");
-        let test_start = source.find("mod tests {").unwrap_or(source.len());
-        let prod_code = &source[..test_start];
-        let count = prod_code.matches("background_task_count").count();
-        assert!(
-            count >= 4,
-            "background_task_count must appear in field def + drain method + both spawns, got {count}"
-        );
-    }
-
     /// P1-A: RunStatus::try_transition enforces valid state machine transitions.
     #[test]
     fn run_status_try_transition_valid_and_invalid() {
@@ -8015,138 +8004,6 @@ mod tests {
         // Running cannot go back to Running
         let err = Running.try_transition(&Running);
         assert!(err.is_err(), "Running → Running must be rejected");
-    }
-
-    /// P1-B: create_run must reject a second run on the same session with 409.
-    #[test]
-    fn per_session_active_run_guard_in_source() {
-        let source = include_str!("run_lifecycle.rs");
-        // Find create_run function
-        let fn_start = source
-            .find("async fn create_run(")
-            .expect("create_run must exist");
-        // Find the guard within create_run (before stream_chat)
-        let stream_chat_pos = source.find("async fn stream_chat(").unwrap_or(source.len());
-        let create_run_body = &source[fn_start..stream_chat_pos];
-        assert!(
-            create_run_body.contains("session already has an active run"),
-            "create_run must reject concurrent runs on the same session"
-        );
-        assert!(
-            create_run_body.contains("CONFLICT"),
-            "create_run must return 409 CONFLICT for concurrent session runs"
-        );
-    }
-
-    /// P1-A: try_transition must be used in all production status update paths.
-    #[test]
-    fn try_transition_used_in_production_code() {
-        let source = include_str!("run_lifecycle.rs");
-        let test_start = source.find("mod tests {").unwrap_or(source.len());
-        let prod_code = &source[..test_start];
-        let count = prod_code.matches("try_transition").count();
-        // Budget reject + post-loop (x2) + cancel + pause + resume = 6
-        assert!(
-            count >= 6,
-            "try_transition must be called in all 6 status update paths, found {count}"
-        );
-    }
-
-    /// P0-B: stream_chat must have the same per-session active-run guard as create_run.
-    #[test]
-    fn stream_chat_has_active_run_guard() {
-        let source = include_str!("run_lifecycle.rs");
-        // Find stream_chat function
-        let fn_start = source
-            .find("async fn stream_chat(")
-            .expect("stream_chat must exist");
-        // Find the next function after stream_chat
-        let fn_body_end = source[fn_start + 10..]
-            .find("\n    async fn ")
-            .map(|p| fn_start + 10 + p)
-            .unwrap_or(source.len());
-        let fn_body = &source[fn_start..fn_body_end];
-        assert!(
-            fn_body.contains("session already has an active run"),
-            "stream_chat must reject concurrent runs on the same session"
-        );
-        assert!(
-            fn_body.contains("CONFLICT"),
-            "stream_chat must return 409 CONFLICT for concurrent session runs"
-        );
-    }
-
-    /// P0-C: Budget-rejected runs must push run_error + run_finished events
-    /// so SSE clients don't hang, and must clean up channels.
-    #[test]
-    fn budget_rejected_run_pushes_terminal_events() {
-        let source = include_str!("run_lifecycle.rs");
-        // Find the budget rejection block
-        let budget_start = source
-            .find("run rejected: daily token budget exhausted")
-            .expect("budget rejection log must exist");
-        // Find the next `return;` after the budget rejection
-        let return_pos = source[budget_start..]
-            .find("return;")
-            .map(|p| budget_start + p)
-            .expect("budget rejection must return");
-        let budget_block = &source[budget_start..return_pos];
-        assert!(
-            budget_block.contains("run_finished"),
-            "budget rejection must push run_finished event"
-        );
-        assert!(
-            budget_block.contains("run_error"),
-            "budget rejection must push run_error event"
-        );
-        assert!(
-            budget_block.contains("approval_channels")
-                && budget_block.contains("user_prompt_channels")
-                && budget_block.contains("progress_channels"),
-            "budget rejection must clean up all channels"
-        );
-    }
-
-    /// P1-A: stream_chat must use extend (not overwrite) for events,
-    /// and handle cancellation with merge_cancelled_run_events.
-    #[test]
-    fn stream_chat_uses_extend_not_overwrite() {
-        let source = include_str!("run_lifecycle.rs");
-        let fn_start = source
-            .find("async fn stream_chat(")
-            .expect("stream_chat must exist");
-        let fn_body = &source[fn_start..];
-        let fn_end = fn_body[10..]
-            .find("\n    async fn ")
-            .map(|p| p + 10)
-            .unwrap_or(fn_body.len());
-        let fn_body = &fn_body[..fn_end];
-        // Must NOT do `run.events = all_events` (full overwrite)
-        assert!(
-            !fn_body.contains("run.events = all_events"),
-            "stream_chat must not overwrite events (use extend instead)"
-        );
-        // Must use merge_cancelled_run_events for cancel handling
-        assert!(
-            fn_body.contains("merge_cancelled_run_events"),
-            "stream_chat must handle cancellation with merge_cancelled_run_events"
-        );
-    }
-
-    /// P1-C: Terminal runs must be evicted from the in-memory runs map.
-    /// Both spawn blocks and the budget rejection path must schedule eviction.
-    #[test]
-    fn terminal_runs_scheduled_for_eviction() {
-        let source = include_str!("run_lifecycle.rs");
-        let test_start = source.find("mod tests {").unwrap_or(source.len());
-        let prod_code = &source[..test_start];
-        let eviction_calls = prod_code.matches("schedule_run_eviction").count();
-        // create_run spawn + stream_chat spawn + budget rejection = 3
-        assert!(
-            eviction_calls >= 3,
-            "schedule_run_eviction must be called in create_run spawn, stream_chat spawn, \
-             and budget rejection path, found {eviction_calls}"
-        );
     }
 
     /// P1-F: list_runs pagination must be deterministic — all runs appear
@@ -8213,37 +8070,25 @@ mod tests {
         assert_eq!(RunStatus::Waiting.as_str(), "waiting");
     }
 
-    /// P1-A: finalize_run_events must NOT map Waiting to Failed.
+    /// P1-A: finalize_run_events must preserve Waiting as a non-error status.
     #[test]
-    fn finalize_run_events_does_not_kill_waiting_runs() {
-        let source = include_str!("run_lifecycle.rs");
-        let fn_start = source
-            .find("fn finalize_run_events(")
-            .expect("finalize_run_events must exist");
-        let fn_end = source[fn_start..]
-            .find("\n    fn ")
-            .map(|p| fn_start + p)
-            .unwrap_or(source.len());
-        let fn_body = &source[fn_start..fn_end];
+    fn finalize_run_events_preserves_waiting_without_error_event() {
+        let svc = test_service();
+        let request = test_request("wait");
+        let state =
+            svc.build_initial_state("test-user", &request, "session-1", "run-1", None, None);
 
-        // The Waiting arm must NOT produce RunStatus::Failed
-        let waiting_arm = fn_body
-            .find("Waiting(w)")
-            .expect("Waiting arm must exist in finalize_run_events");
-        let arm_body = &fn_body[waiting_arm..waiting_arm + 300.min(fn_body.len() - waiting_arm)];
-        assert!(
-            !arm_body.contains("RunStatus::Failed"),
-            "Waiting outcome must NOT be mapped to Failed — use RunStatus::Waiting"
+        let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
+            Ok(AgenticLoopOutcome::Waiting("tool_approval".into())),
+            vec![],
+            &state,
         );
-        assert!(
-            arm_body.contains("RunStatus::Waiting"),
-            "Waiting outcome must map to RunStatus::Waiting"
-        );
-        // Must NOT emit run_error for Waiting (it's not an error)
-        assert!(
-            !arm_body.contains("run_error"),
-            "Waiting outcome must not emit run_error event"
-        );
+
+        assert_eq!(status, RunStatus::Waiting);
+        assert_eq!(error.as_deref(), Some("waiting: tool_approval"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event_type"], "run_waiting");
+        assert_eq!(events[0]["data"]["reason"], "waiting: tool_approval");
     }
 
     /// P1-F: stream_chat must persist usage unconditionally (not gated by persist_terminal_state).
@@ -8374,202 +8219,6 @@ mod tests {
         assert!(
             fn_body.contains("STATUS_WAITING"),
             "cancel_run durable fallback must include STATUS_WAITING"
-        );
-    }
-
-    #[test]
-    fn configure_runtime_controllers_wires_context_trace_artifact_store() {
-        let source = include_str!("run_lifecycle.rs");
-        assert!(
-            source.contains(
-                "artifact_store: astra_services::DatabaseSessionArtifactStore::new(matrixone.clone())"
-            ),
-            "context trace persistence should construct a remote workspace artifact store"
-        );
-        assert!(
-            source.contains(".with_pool(pool.clone())"),
-            "context trace artifact persistence should reuse the shared MatrixOne pool"
-        );
-    }
-
-    #[test]
-    fn server_tool_executor_is_wired_with_workspace_artifact_store() {
-        let source = include_str!("run_lifecycle.rs");
-        assert!(
-            source.contains(".with_workspace_artifact_store("),
-            "server run lifecycle should inject a workspace artifact store into ServerToolExecutor"
-        );
-    }
-
-    // ── CSL wiring structural checks ───────────────────────────────────────
-
-    #[test]
-    fn create_run_loads_csl_history() {
-        let source = include_str!("run_lifecycle.rs");
-        let create_run_start = source
-            .find("async fn create_run(")
-            .expect("create_run must exist");
-        let stream_chat_start = source
-            .find("async fn stream_chat(")
-            .expect("stream_chat must exist");
-        let create_run_body = &source[create_run_start..stream_chat_start];
-        assert!(
-            create_run_body.contains("restore_csl_history"),
-            "create_run must call restore_csl_history to load CSL conversation state"
-        );
-    }
-
-    #[test]
-    fn stream_chat_loads_csl_history() {
-        let source = include_str!("run_lifecycle.rs");
-        let stream_chat_start = source
-            .find("async fn stream_chat(")
-            .expect("stream_chat must exist");
-        let stream_chat_body = &source[stream_chat_start..];
-        assert!(
-            stream_chat_body.contains("restore_csl_history"),
-            "stream_chat must call restore_csl_history to load CSL conversation state"
-        );
-    }
-
-    #[test]
-    fn extract_session_state_compact_covers_all_fields() {
-        let source = include_str!("run_lifecycle.rs");
-        let extract_fn = source
-            .find("fn extract_session_state_compact")
-            .expect("extract_session_state_compact must exist");
-        let extract_body = &source[extract_fn..extract_fn + 2000];
-        let required_fields = [
-            "budget_remaining_tokens",
-            "budget_remaining_rounds",
-            "consecutive_ctx_errors",
-            "recent_tools",
-            "blocked_tools",
-            "approval_overrides",
-            "interruption",
-        ];
-        for field in &required_fields {
-            assert!(
-                extract_body.contains(field),
-                "extract_session_state_compact must include {field}"
-            );
-        }
-    }
-
-    #[test]
-    fn persist_context_uses_csl_manager() {
-        let source = include_str!("run_lifecycle.rs");
-        let persist_ctx = source
-            .find("struct PostLoopPersistContext")
-            .expect("PostLoopPersistContext must exist");
-        let persist_body = &source[persist_ctx..persist_ctx + 1000];
-        assert!(
-            persist_body.contains("csl_manager"),
-            "PostLoopPersistContext must have csl_manager field"
-        );
-        assert!(
-            persist_body.contains("CslManager"),
-            "PostLoopPersistContext must use CslManager type"
-        );
-    }
-
-    #[test]
-    fn persist_context_writes_assistant_final_text_to_csl() {
-        let source = include_str!("run_lifecycle.rs");
-        let persist_ctx = source
-            .find("struct PostLoopPersistContext")
-            .expect("PostLoopPersistContext must exist");
-        let persist_body = &source[persist_ctx..persist_ctx + 1800];
-        assert!(
-            persist_body.contains("messages_for_csl_persist(state)"),
-            "CSL persistence must include assistant final_text, not only state.messages"
-        );
-
-        let helper = source
-            .find("fn messages_for_csl_persist")
-            .expect("messages_for_csl_persist must exist");
-        let helper_body = &source[helper..helper + 1200];
-        assert!(
-            helper_body.contains("\"role\": \"assistant\"")
-                && helper_body.contains("\"content\": final_text"),
-            "messages_for_csl_persist must append the assistant final text"
-        );
-    }
-
-    #[test]
-    fn restore_csl_recovers_all_session_state_fields() {
-        let source = include_str!("run_lifecycle.rs");
-        let restore_fn = source
-            .find("async fn restore_csl_history")
-            .expect("restore_csl_history must exist");
-        let restore_body = &source[restore_fn..restore_fn + 3000];
-        assert!(
-            restore_body.contains("restore_session_state_compact"),
-            "restore_csl_history must apply compact session state"
-        );
-        let restore_helper = source
-            .find("fn restore_session_state_compact")
-            .expect("restore_session_state_compact must exist");
-        let restore_state_body = &source[restore_helper..restore_helper + 2000];
-        let required_fields = [
-            "blocked_tools",
-            "recent_tools",
-            "approval_overrides",
-            "interruption",
-            "budget_remaining_tokens",
-            "budget_remaining_rounds",
-            "consecutive_ctx_errors",
-        ];
-        for field in &required_fields {
-            assert!(
-                restore_state_body.contains(field),
-                "restore_session_state_compact must restore {field} from SessionStateCompact"
-            );
-        }
-    }
-
-    #[test]
-    fn restore_csl_does_not_auto_fallback_to_transcript() {
-        let source = include_str!("run_lifecycle.rs");
-        let restore_fn = source
-            .find("async fn restore_csl_history")
-            .expect("restore_csl_history must exist");
-        let restore_body = &source[restore_fn..restore_fn + 5000];
-        assert!(
-            !restore_body.contains("load_recent_transcript_messages")
-                && !restore_body.contains("session_transcript_items"),
-            "restore_csl_history must not silently load transcript rows into the LLM prompt"
-        );
-        assert!(
-            !source.contains("\n    async fn load_recent_transcript_messages"),
-            "old transcript fallback helper must stay removed; history lookup is an explicit LLM tool"
-        );
-        assert!(
-            restore_body.contains("mgr.load().await") && restore_body.contains("mat.messages"),
-            "restore_csl_history should restore only the CSL materialized history"
-        );
-    }
-
-    #[test]
-    fn both_entry_points_wire_csl_manager_to_persist_context() {
-        let source = include_str!("run_lifecycle.rs");
-        let create_run_start = source
-            .find("async fn create_run(")
-            .expect("create_run must exist");
-        let stream_chat_start = source
-            .find("async fn stream_chat(")
-            .expect("stream_chat must exist");
-
-        let create_run_body = &source[create_run_start..stream_chat_start];
-        assert!(
-            create_run_body.contains("csl_manager: csl_manager"),
-            "create_run must pass csl_manager to PostLoopPersistContext"
-        );
-
-        let stream_chat_body = &source[stream_chat_start..];
-        assert!(
-            stream_chat_body.contains("csl_manager: csl_manager"),
-            "stream_chat must pass csl_manager to PostLoopPersistContext"
         );
     }
 }

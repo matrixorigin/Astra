@@ -62,7 +62,7 @@ use astra_tools::passive_tsc_check;
 #[allow(clippy::needless_range_loop)]
 mod shell;
 use astra_tools::env_tools;
-pub use astra_tools::schemas::all_tool_schemas;
+use astra_tools::schemas::all_tool_schemas as full_tool_schemas;
 pub use env_tools::apply_overlay as apply_env_overlay;
 #[path = "edge_tools/code_analysis.rs"]
 mod code_analysis;
@@ -70,6 +70,58 @@ mod code_analysis;
 mod config_tool;
 #[path = "edge_tools/context_tools.rs"]
 mod context_tools;
+
+pub fn all_tool_schemas() -> Vec<Value> {
+    full_tool_schemas()
+}
+
+/// Construct the CLI's session-wide `CapabilitySet`.
+pub fn cli_default_capabilities(
+    has_agent_spawner: bool,
+) -> astra_turn_core::capability::CapabilitySet {
+    use astra_turn_core::capability::{Capability, CapabilitySet};
+    CapabilitySet::empty()
+        .with(Capability::MemoryService)
+        .with(Capability::Database)
+        .with(Capability::GitHubAuth)
+        .with(Capability::LSPServer)
+        .with(Capability::SkillsCatalog)
+        .with_if(has_agent_spawner, Capability::AgentSpawner)
+}
+
+struct CliCapabilityView {
+    active_names: Vec<String>,
+    inactive_names: Vec<String>,
+    dropped_by_capability: Vec<Value>,
+    dropped_by_surface: Vec<String>,
+    mcp_pass_through: Vec<String>,
+}
+
+pub fn local_tool_schemas() -> Vec<Value> {
+    full_tool_schemas()
+}
+
+/// Plan-mode write guard tool list (CLI parity with
+/// `server_tool_executor::is_plan_mode_blocked_tool`). While a plan is
+/// in `phase=planning` these tools must be short-circuited: they all
+/// mutate the world (filesystem, DB, git, GitHub), so allowing them
+/// would let the model execute a plan it has not yet had approved.
+/// Read-only tools (read_file, grep, glob, git_status/diff/log,
+/// task_*, memory_*) stay available so the agent can keep authoring.
+fn is_plan_mode_blocked_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "bash"
+            | "write_file"
+            | "str_replace"
+            | "mo"
+            | "rollback_database_snapshots"
+            | "git_commit"
+            | "git_stash"
+            | "git_revert_commit"
+            | "github_create_issue"
+    )
+}
 #[path = "edge_tools/diagnose.rs"]
 mod diagnose;
 #[path = "edge_tools/file_state.rs"]
@@ -600,6 +652,33 @@ pub struct ToolExecutor {
     /// activation can reach plugin tools. Populated by the TUI after
     /// `PluginRegistry::register` loads the user's skill manifests.
     plugin_schemas: std::sync::RwLock<Vec<Value>>,
+    /// Cached plan-mode authoring flag keyed by the session it was
+    /// computed for. Mirrors the server-side write guard so a CLI run
+    /// that talks to the same plan store cannot bypass plan mode by
+    /// routing mutations through the local executor (session b4cef5bb
+    /// regression). The session key is load-bearing: web-agent and
+    /// scripted callers may reuse one executor across sessions, so a
+    /// `Some(true)` probe for session A must never block writes in
+    /// session B.
+    plan_mode_authoring_cache: std::sync::Arc<tokio::sync::RwLock<Option<(String, bool)>>>,
+    /// Per-turn ask-user channel — the host swaps a fresh sender in
+    /// before each turn so the `ask_user` tool can reach the
+    /// bottom-pane overlay.
+    ask_user_request_tx: std::sync::Mutex<Option<crate::chat_stream::AskUserRequestTx>>,
+    /// Per-turn plan-review channel — installed by the host before
+    /// each turn so `exit_plan_mode` can surface the dedicated
+    /// plan-review overlay (scrollable plan body + 4-way radio).
+    /// Separate from `ask_user_request_tx` because the plan overlay
+    /// renders a markdown body, not the question/option layout
+    /// `ask_user` needs.
+    plan_review_request_tx: std::sync::Mutex<Option<crate::chat_stream::PlanReviewRequestTx>>,
+    /// Slot recording a permission-mode switch that the user
+    /// confirmed inside a tool overlay (currently `exit_plan_mode`'s
+    /// 4-option dialog). The host drains this slot at the start of
+    /// the next turn — applying mid-turn would race the agentic
+    /// loop's borrow of `perm_manager`.
+    pending_permission_mode_change:
+        std::sync::Mutex<Option<crate::permission_manager::PermissionMode>>,
 }
 
 impl ToolExecutor {
@@ -689,7 +768,43 @@ impl ToolExecutor {
                     detach_shell_handle: None,
                 },
             ),
+            plan_mode_authoring_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            ask_user_request_tx: std::sync::Mutex::new(None),
+            plan_review_request_tx: std::sync::Mutex::new(None),
+            pending_permission_mode_change: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Install the per-turn `ask_user` channel so tools can surface a
+    /// TUI overlay for confirmations.
+    /// `None` clears the slot — passed at turn boundaries so a stale
+    /// sender never leaks across turns.
+    pub fn set_ask_user_request_tx(&self, tx: Option<crate::chat_stream::AskUserRequestTx>) {
+        if let Ok(mut guard) = self.ask_user_request_tx.lock() {
+            *guard = tx;
+        }
+    }
+
+    /// Install the per-turn plan-review channel so `exit_plan_mode`
+    /// can surface the dedicated plan-approval overlay. Cleared at
+    /// turn boundaries to keep stale senders from leaking into
+    /// background sub-runs that share the same `Arc<ToolExecutor>`.
+    pub fn set_plan_review_request_tx(&self, tx: Option<crate::chat_stream::PlanReviewRequestTx>) {
+        if let Ok(mut guard) = self.plan_review_request_tx.lock() {
+            *guard = tx;
+        }
+    }
+
+    /// Drain a permission-mode change recorded by a tool overlay (see
+    /// `pending_permission_mode_change`). Returns the requested mode
+    /// once and clears the slot. Called at turn start by the loop host.
+    pub fn take_pending_permission_mode_change(
+        &self,
+    ) -> Option<crate::permission_manager::PermissionMode> {
+        self.pending_permission_mode_change
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
     }
 
     /// Set the spawn context for agent spawning.
@@ -1090,6 +1205,73 @@ impl ToolExecutor {
             .clone()
     }
 
+    // ─── Plan-mode write guard (parity with server_tool_executor) ───────────
+    //
+    // While a plan is in `phase=planning`, world-mutating tools must be
+    // short-circuited so the model cannot bypass authoring by routing
+    // writes through the local executor. The check fails open when the
+    // CLI is offline / unauthenticated — without a cloud binding there
+    // is no plan store to consult, and a "fail closed" stance would
+    // break every offline `astra` invocation.
+
+    async fn plan_mode_authoring_active(&self) -> bool {
+        let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty()) else {
+            return false;
+        };
+        if let Some((cached_session_id, cached)) =
+            self.plan_mode_authoring_cache.read().await.as_ref()
+            && cached_session_id == &session_id
+        {
+            return *cached;
+        }
+        let active = self
+            .recompute_plan_mode_authoring_for_session(session_id.as_str())
+            .await;
+        if self.active_session_id().as_deref() == Some(session_id.as_str()) {
+            *self.plan_mode_authoring_cache.write().await = Some((session_id, active));
+        }
+        active
+    }
+
+    async fn recompute_plan_mode_authoring_for_session(&self, session_id: &str) -> bool {
+        let Some(token) = self.cloud_token() else {
+            return false;
+        };
+        let Ok(client) = self.remote_plan_client() else {
+            return false;
+        };
+        let plans = match client
+            .get_plans_query_json(
+                &token,
+                &[
+                    ("session_id", session_id.to_string()),
+                    ("phase", "planning".to_string()),
+                    ("limit", "1".to_string()),
+                ],
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(_) => return false, // fail open: a transient lookup error must not block writes
+        };
+        plans
+            .get("plans")
+            .and_then(Value::as_array)
+            .is_some_and(|arr| !arr.is_empty())
+    }
+
+    pub(crate) async fn invalidate_plan_mode_cache(&self) {
+        *self.plan_mode_authoring_cache.write().await = None;
+    }
+
+    async fn set_plan_mode_authoring_cache_for_active_session(&self, active: bool) {
+        if let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty()) {
+            *self.plan_mode_authoring_cache.write().await = Some((session_id, active));
+        } else {
+            self.invalidate_plan_mode_cache().await;
+        }
+    }
+
     // ─── Task management methods (delegated to task_mgmt module) ────────────
 
     /// Phase 1 split (2026-05): the four background actions moved off
@@ -1106,118 +1288,6 @@ impl ToolExecutor {
              new tool name. The `task` tool is now exclusively for the durable \
              session checklist (create/update/list/get/stop)."
         )
-    }
-
-    /// Phase 2 split (2026-05): plan-mode actions promoted from buried
-    /// `session` sub-actions to dedicated top-level tools (claudecode
-    /// parity). The model picked the buried sub-actions only ~rarely,
-    /// missing the plan-authoring discipline. Stale callers get an
-    /// Error: redirect — same shape as the agent.delegate fix and the
-    /// Phase 1 task→agent_job split.
-    fn redirect_to_plan_mode_tool(old_action: &str, new_tool: &str) -> String {
-        format!(
-            "Error: `session(action='{old_action}')` was promoted to the \
-             top-level `{new_tool}` tool in the Phase 2 plan-mode split. \
-             Call `{new_tool}` directly — see its description for the \
-             plan-authoring contract. The buried sub-action no longer exists."
-        )
-    }
-
-    /// CLI entry point for the top-level `enter_plan_mode` tool. Posts
-    /// to the cloud `/plans` endpoint to mint or relink a plan, sets the
-    /// session's active plan id, and returns workflow instructions.
-    /// Falls back to a clear Error: when no cloud is wired (offline / no
-    /// auth) — astra is edge-cloud and plan state is authoritative in
-    /// the cloud DB; we don't keep a local-only ghost plan.
-    async fn cli_enter_plan_mode(&self, args: &Value) -> String {
-        let goal = args
-            .get("goal")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("(pending)");
-        let Some(cloud_base) = self.cloud_base.clone() else {
-            return "Error: plan mode requires a cloud connection (no cloud_base configured). \
-                    Set ASTRA_API_URL or sign in with `astra login`, then retry. Plan state \
-                    is authoritative in the cloud DB — without it the plan would be a local \
-                    ghost that desyncs across devices."
-                .to_string();
-        };
-        let Some(session_id) = self.active_session_id() else {
-            return "Error: plan mode requires an active session id. \
-                    Call `enter_plan_mode` from inside an interactive REPL session, not \
-                    a one-shot CLI invocation."
-                .to_string();
-        };
-        let token = self.cloud_token();
-        match crate::plan_mode_client::enter_plan_mode(
-            &cloud_base,
-            token.as_deref(),
-            &session_id,
-            goal,
-        )
-        .await
-        {
-            Ok(plan_id) => format!(
-                "Entered plan mode. plan_id={plan_id} goal=\"{goal}\". Write tools are now \
-                 blocked — explore the codebase with read tools (read_file/grep/glob/list_dir/symbols), \
-                 author the plan, then call `exit_plan_mode(plan='...', approved=true)` to \
-                 surface it for user approval."
-            ),
-            Err(err) => format!("Error: enter_plan_mode failed: {err}"),
-        }
-    }
-
-    /// CLI entry point for the top-level `exit_plan_mode` tool. POSTs
-    /// to `/plans/{id}/exit-plan-mode` so the server-side handler runs
-    /// the same code path as the web agent (plan_md persistence,
-    /// session_plan_todos seed, write-tool unlock).
-    async fn cli_exit_plan_mode(&self, args: &Value) -> String {
-        let plan = match args.get("plan").and_then(Value::as_str) {
-            Some(p) if !p.trim().is_empty() => p.to_string(),
-            _ => {
-                return "Error: `plan` is required for exit_plan_mode (markdown for user approval)"
-                    .to_string();
-            }
-        };
-        let approved = args
-            .get("approved")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        let Some(cloud_base) = self.cloud_base.clone() else {
-            return "Error: plan mode requires a cloud connection (no cloud_base configured)"
-                .to_string();
-        };
-        let Some(session_id) = self.active_session_id() else {
-            return "Error: plan mode requires an active session id".to_string();
-        };
-        let token = self.cloud_token();
-        match crate::plan_mode_client::exit_plan_mode(
-            &cloud_base,
-            token.as_deref(),
-            &session_id,
-            &plan,
-            approved,
-        )
-        .await
-        {
-            Ok(plan_id) => {
-                if approved {
-                    format!(
-                        "Exited plan mode. plan_id={plan_id} approved; write tools unlocked. \
-                         Plan items have been seeded to the session task list — start with the \
-                         first item."
-                    )
-                } else {
-                    format!(
-                        "Plan {plan_id} left open for another authoring pass. Write tools \
-                         remain blocked. Refine the plan and call exit_plan_mode again with \
-                         approved=true when ready."
-                    )
-                }
-            }
-            Err(err) => format!("Error: exit_plan_mode failed: {err}"),
-        }
     }
 
     fn task_output_success(output: &str) -> bool {
@@ -1270,6 +1340,366 @@ impl ToolExecutor {
                 Some(output)
             }
             Err(err) => Some(format!("Error: cloud todo {action} failed: {err}")),
+        }
+    }
+
+    fn remote_plan_client(&self) -> Result<astra_thin_client::ThinClient, String> {
+        let Some(cloud_base) = self.cloud_base.clone() else {
+            return Err(
+                "Error: plan lifecycle is unavailable in offline CLI mode; connect to cloud first."
+                    .to_string(),
+            );
+        };
+        astra_thin_client::ThinClient::new(&cloud_base, None)
+            .map_err(|err| format!("Error: failed to initialize plan client: {err}"))
+    }
+
+    async fn enter_plan_mode_remote(&self, args: &Value) -> String {
+        // Symmetric with `exit_plan_mode_remote`: there are two
+        // structurally different paths and we pick by what the
+        // environment supports, not by what the caller requests.
+        //
+        // 1. Cloud path — active session id + cloud token + reachable
+        //    plan client all present → POST `/plans` to create a
+        //    `phase=planning` row so the server-side write guard
+        //    engages and `/plan` UI / multi-client coordination can
+        //    see the authoring state. Used by the `/plan "goal"`
+        //    slash command and any web-agent driven entry.
+        //
+        // 2. Local path — any prerequisite missing (no session id,
+        //    no token, no client, network failure) → fall back to a
+        //    purely local plan-mode pivot. Stages
+        //    `PermissionMode::Plan` on the pending slot so the host
+        //    flips `perm_manager` at the next turn boundary, exactly
+        //    like Shift+Tab. No cloud row is created and no error
+        //    bubbles up: a detached / unauthenticated CLI run still
+        //    gets plan mode.
+        //
+        // Both branches always stage Plan on the pending slot —
+        // single-source-of-truth invariant I6: whichever path runs,
+        // `perm_manager.mode()` becomes `Plan` on the next turn.
+        let goal = args
+            .get("goal")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|goal| !goal.is_empty());
+        let Some(goal) = goal else {
+            return "Error: missing required parameter `goal`.".to_string();
+        };
+
+        let cloud_outcome = self.try_enter_plan_mode_cloud_path(goal).await;
+        match cloud_outcome {
+            Ok(message) => {
+                self.stage_pending_plan_mode();
+                message
+            }
+            Err(_unavailable) => {
+                self.stage_pending_plan_mode();
+                // Local guard cache is informational — there is no
+                // server guard to mirror in this branch. Set it to
+                // `Some(true)` so any cached probe consult sees
+                // "writes gated" while plan mode is active.
+                self.set_plan_mode_authoring_cache_for_active_session(true)
+                    .await;
+                format!(
+                    "Entered plan mode (local). goal=\"{goal}\". Write tools are now blocked — investigate read-only, then call exit_plan_mode(plan=\"<markdown>\") when ready."
+                )
+            }
+        }
+    }
+
+    /// Attempt the cloud `enter_plan_mode` flow. Returns `Err(())`
+    /// (with no message) when any prerequisite is missing so the
+    /// caller falls back to the local path silently. Returns
+    /// `Err(message)` semantics are *not* used here — a real cloud
+    /// failure (e.g. server returned 5xx) is also swallowed into the
+    /// local fallback because the user's intent ("enter plan mode")
+    /// must succeed end-to-end.
+    async fn try_enter_plan_mode_cloud_path(&self, goal: &str) -> Result<String, ()> {
+        let session_id = self
+            .active_session_id()
+            .filter(|sid| !sid.is_empty())
+            .ok_or(())?;
+        let token = self.cloud_token().ok_or(())?;
+        let client = self.remote_plan_client().map_err(|_| ())?;
+
+        let response = client
+            .post_plans_json(
+                &token,
+                &json!({
+                    "goal": goal,
+                    "session_id": session_id,
+                }),
+            )
+            .await
+            .map_err(|_| ())?;
+
+        let plan_id = response
+            .get("plan_id")
+            .and_then(Value::as_str)
+            .ok_or(())?
+            .to_string();
+        self.set_plan_mode_authoring_cache_for_active_session(true)
+            .await;
+        Ok(format!(
+            "Entered plan mode. plan_id={plan_id} goal=\"{goal}\". Write tools are now blocked — author the plan, then call exit_plan_mode when it's ready for execution."
+        ))
+    }
+
+    /// Stage `PermissionMode::Plan` on the pending slot so the host
+    /// applies it on the next turn boundary. Idempotent — repeated
+    /// calls within the same turn collapse to a single switch.
+    fn stage_pending_plan_mode(&self) {
+        if let Ok(mut slot) = self.pending_permission_mode_change.lock() {
+            *slot = Some(crate::permission_manager::PermissionMode::Plan);
+        }
+    }
+
+    async fn exit_plan_mode_remote(&self, args: &Value) -> String {
+        // `exit_plan_mode` has two structurally different sources of
+        // truth depending on how plan mode was entered:
+        //
+        // 1. Cloud workflow (`/plan "goal"` or the `enter_plan_mode`
+        //    tool): a `plans` row with `phase=planning` exists; the
+        //    server-side write guard depends on it; approving the
+        //    plan must POST `/plans/{id}/exit-plan-mode` so the row
+        //    flips to `refining` and the guard releases.
+        // 2. Shift+Tab / `/allow plan`: only flips the local
+        //    `perm_manager` to `Plan`. There is no cloud row, no
+        //    server-side guard, and the user expects exiting to be
+        //    purely local — zero network calls.
+        //
+        // Conflating both broke session d9b5119f: the user pressed
+        // Shift+Tab, the model produced a plan, called exit_plan_mode,
+        // and the cloud lookup returned "no active planning plan
+        // found" because none was ever created.
+        //
+        // The fix: probe the cloud row only when the prerequisites
+        // are present (active session + cloud token + reachable plan
+        // client + a planning row actually exists). If any of those
+        // are missing, fall through to the local path which uses the
+        // overlay + `pending_permission_mode_change` slot exactly the
+        // same way the cloud path does — it just skips the network
+        // round-trips and the `phase=planning` row update.
+        let plan_markdown = args
+            .get("plan")
+            .and_then(Value::as_str)
+            .or_else(|| args.get("plan_markdown").and_then(Value::as_str))
+            .or_else(|| args.get("plan_md").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|plan| !plan.is_empty())
+            .map(str::to_string);
+        let explicit_approved = args.get("approved").and_then(Value::as_bool);
+
+        let cloud_plan_id = self.lookup_active_planning_plan_id().await;
+        match cloud_plan_id {
+            Some(plan_id) => {
+                self.exit_plan_mode_cloud_path(plan_id, plan_markdown.as_deref(), explicit_approved)
+                    .await
+            }
+            None => {
+                self.exit_plan_mode_local_path(plan_markdown.as_deref(), explicit_approved)
+                    .await
+            }
+        }
+    }
+
+    /// Best-effort lookup for an active `phase=planning` cloud plan
+    /// for the current session. Returns `None` whenever any of the
+    /// prerequisites for the cloud workflow are absent (no session,
+    /// no token, no client, no row, network failure). The caller
+    /// uses `None` as the signal to fall back to the purely local
+    /// Shift+Tab plan-mode flow.
+    async fn lookup_active_planning_plan_id(&self) -> Option<String> {
+        let session_id = self.active_session_id().filter(|sid| !sid.is_empty())?;
+        let token = self.cloud_token()?;
+        let client = self.remote_plan_client().ok()?;
+        let plans = client
+            .get_plans_query_json(
+                &token,
+                &[
+                    ("session_id", session_id),
+                    ("phase", "planning".to_string()),
+                    ("limit", "1".to_string()),
+                ],
+            )
+            .await
+            .ok()?;
+        plans
+            .get("plans")
+            .and_then(Value::as_array)
+            .and_then(|plans| plans.first())
+            .and_then(|plan| plan.get("plan_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// Cloud workflow exit path — there is a `phase=planning` row
+    /// in the `plans` table; flipping it to `refining` is the
+    /// authoritative signal that releases the server-side write
+    /// guard. The 4-option overlay still runs locally; only the
+    /// follow-up state mutation goes through the cloud API.
+    async fn exit_plan_mode_cloud_path(
+        &self,
+        plan_id: String,
+        plan_markdown: Option<&str>,
+        explicit_approved: Option<bool>,
+    ) -> String {
+        let Some(token) = self.cloud_token() else {
+            return "Error: exit_plan_mode lost the cloud token mid-flight.".to_string();
+        };
+        let client = match self.remote_plan_client() {
+            Ok(client) => client,
+            Err(err) => return err,
+        };
+
+        let (approved, follow_up_mode) = match explicit_approved {
+            Some(value) => (value, None),
+            None => match self.resolve_exit_plan_mode_via_overlay(plan_markdown).await {
+                Ok(decision) => decision,
+                Err(message) => return message,
+            },
+        };
+
+        let mut body = json!({ "approved": approved });
+        if let Some(plan_markdown) = plan_markdown {
+            body["plan_md"] = Value::String(plan_markdown.to_string());
+        }
+
+        let response = match client
+            .post_plan_exit_mode_json(&token, &plan_id, &body)
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                return format!(
+                    "Error: failed to exit plan mode: {}",
+                    crate::map_thin_err(err)
+                );
+            }
+        };
+        let resolved_plan_id = response
+            .get("plan_id")
+            .and_then(Value::as_str)
+            .unwrap_or(&plan_id)
+            .to_string();
+
+        if approved {
+            self.set_plan_mode_authoring_cache_for_active_session(false)
+                .await;
+            if let Some(mode) = follow_up_mode {
+                if let Ok(mut slot) = self.pending_permission_mode_change.lock() {
+                    *slot = Some(mode);
+                }
+            }
+            let mode_suffix = follow_up_mode
+                .map(|mode| format!(" Next turn will run in {mode} mode."))
+                .unwrap_or_default();
+            format!(
+                "Exited plan mode. plan_id={resolved_plan_id} is approved; write tools unlocked.{mode_suffix}"
+            )
+        } else {
+            self.set_plan_mode_authoring_cache_for_active_session(true)
+                .await;
+            format!(
+                "Plan {resolved_plan_id} left open for another authoring pass. Write tools remain blocked. Address the user's feedback and call exit_plan_mode again when ready."
+            )
+        }
+    }
+
+    /// Local-only exit path (Shift+Tab / `/allow plan` entry). No
+    /// cloud row, no server-side guard, no network calls — purely
+    /// the overlay + `pending_permission_mode_change` slot. This is
+    /// `exit_plan_mode` here is a permission-state pivot driven by
+    /// user choice — no cloud row is required for it to succeed.
+    async fn exit_plan_mode_local_path(
+        &self,
+        plan_markdown: Option<&str>,
+        explicit_approved: Option<bool>,
+    ) -> String {
+        let (approved, follow_up_mode) = match explicit_approved {
+            Some(value) => (value, None),
+            None => match self.resolve_exit_plan_mode_via_overlay(plan_markdown).await {
+                Ok(decision) => decision,
+                Err(message) => return message,
+            },
+        };
+
+        if approved {
+            // Local guard cache is informational only here — there
+            // is no cloud guard to mirror. Setting it to `Some(false)`
+            // keeps the cached flag consistent with "writes are
+            // unlocked" so any tool that consults it reads the same
+            // outcome the cloud path would have set.
+            self.set_plan_mode_authoring_cache_for_active_session(false)
+                .await;
+            if let Some(mode) = follow_up_mode {
+                if let Ok(mut slot) = self.pending_permission_mode_change.lock() {
+                    *slot = Some(mode);
+                }
+            }
+            let plan_suffix = match plan_markdown {
+                Some(plan) if !plan.is_empty() => {
+                    format!(" Plan recorded:\n{plan}")
+                }
+                _ => String::new(),
+            };
+            let mode_suffix = follow_up_mode
+                .map(|mode| format!(" Next turn will run in {mode} mode."))
+                .unwrap_or_default();
+            format!("Exited plan mode; user approved.{mode_suffix}{plan_suffix}")
+        } else {
+            // Keep planning: the local perm_manager mode is unchanged
+            // (the host never staged a switch). The cache flag
+            // mirrors "writes still gated" for downstream consultation.
+            self.set_plan_mode_authoring_cache_for_active_session(true)
+                .await;
+            "Plan left open for another authoring pass. Address the user's feedback and call exit_plan_mode again when ready.".to_string()
+        }
+    }
+
+    /// Surface the Approve / Keep-planning overlay through the
+    /// per-turn `ask_user` channel. Returns `(approved, next_mode)`
+    /// when the user submits an answer; `Err(message)` when the
+    /// channel is missing (headless context) or the prompt is
+    /// cancelled — in that case the model sees the message as the
+    /// tool result and stays in plan mode.
+    async fn resolve_exit_plan_mode_via_overlay(
+        &self,
+        plan_markdown: Option<&str>,
+    ) -> Result<(bool, Option<crate::permission_manager::PermissionMode>), String> {
+        use crate::chat_stream::{PlanReviewDecision, PlanReviewRequest};
+
+        let tx = self
+            .plan_review_request_tx
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let Some(tx) = tx else {
+            return Err(
+                "Error: exit_plan_mode requires an interactive TUI overlay. Re-call with `approved=true` or `approved=false` for headless mode."
+                    .to_string(),
+            );
+        };
+
+        let plan_body = plan_markdown
+            .unwrap_or("(plan body was empty — pass a `plan` argument so the user can review it)")
+            .to_string();
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        if tx
+            .send(PlanReviewRequest {
+                plan_markdown: plan_body,
+                response_tx,
+            })
+            .is_err()
+        {
+            return Err("Error: exit_plan_mode overlay sink is closed.".to_string());
+        }
+
+        match response_rx.await.unwrap_or(PlanReviewDecision::Cancelled) {
+            PlanReviewDecision::Approve { mode } => Ok((true, Some(mode))),
+            PlanReviewDecision::KeepPlanning | PlanReviewDecision::Cancelled => Ok((false, None)),
         }
     }
 
@@ -1453,7 +1883,7 @@ impl ToolExecutor {
                 .get("agent_type")
                 .and_then(Value::as_str)
                 .unwrap_or("general-purpose"),
-            "background": true,
+            "run_in_background": true,
         });
         if let Some(model) = args.get("model").and_then(Value::as_str) {
             spawn_args["model"] = json!(model);
@@ -2002,6 +2432,10 @@ impl ToolExecutor {
     }
 
     fn handle_introspect(&self, args: &Value) -> String {
+        if args.get("dimension").and_then(Value::as_str) == Some("capability") {
+            return self.capability_info_json().to_string();
+        }
+
         // `subtopic` routes to a specialized diagnostic. Default behavior
         // (session health: token pressure, tool health, alerts) remains
         // unchanged when `subtopic` is missing, empty, or "session".
@@ -2539,16 +2973,23 @@ impl ToolExecutor {
             crate::tool_safety_guard::ToolSafetyGuard::check_dispatch(name, args)
         {
             error
+        } else if is_plan_mode_blocked_tool(name) && self.plan_mode_authoring_active().await {
+            format!(
+                "Error: Tool '{name}' is blocked while plan mode is active. \
+                 The agent must call `exit_plan_mode` with an approved plan \
+                 before any write operation. This mirrors Claude Code's plan \
+                 mode: the plan is authored with read-only tools, approved by \
+                 the user, then execution proceeds with writes unlocked."
+            )
         } else {
             match name {
                 "bash" => self.bash_async(args).await,
                 #[cfg(windows)]
                 "powershell" => self.powershell(args),
                 // Activation primitive for the deferred tool layer.
-                // MUST use the CLI-side full catalog (`all_tool_schemas()`)
-                // so `select:NAME` can reach every cataloged tool — not
-                // just the 14 in `default_executor_tool_schemas()` that
-                // the fallback `default_executor.execute()` would hit.
+                // Uses the local CLI catalog plus plugin-installed schemas,
+                // so `select:NAME` matches the tools this surface actually
+                // exposes while still resolving MCP/skill-backed tools.
                 "tool_search" => self.tool_search(args),
                 "read_file" => self.read_file(args),
                 "write_file" => {
@@ -2693,6 +3134,8 @@ impl ToolExecutor {
                     let clean_args = self.memory_args_with_context(args);
                     self.memoria_call(op, &clean_args).await
                 }
+                "enter_plan_mode" => self.enter_plan_mode_remote(args).await,
+                "exit_plan_mode" => self.exit_plan_mode_remote(args).await,
                 "adjust_config" => self.adjust_config(args),
                 "prioritize_tool" => self.prioritize_tool(args),
                 "deprioritize_tool" => self.deprioritize_tool(args),
@@ -2851,18 +3294,10 @@ impl ToolExecutor {
                         "list_suppressed" => self.list_suppressed_memories(),
                         "release_context" => self.release_context(args),
                         "list_released" => self.list_released_context(),
-                        // Phase 2 split: plan-mode actions promoted to top-level
-                        // tools (claudecode parity). Stale callers get an
-                        // Error: with redirect — same shape as the Phase 1
-                        // task→agent_job split.
-                        "enter_plan" => Self::redirect_to_plan_mode_tool("enter_plan", "enter_plan_mode"),
-                        "exit_plan" => Self::redirect_to_plan_mode_tool("exit_plan", "exit_plan_mode"),
                         "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, compact, rollback_edits, sleep, timeline, summary, history, suppress_memory(memory_id, reason?), unsuppress_memory(memory_id), list_suppressed, release_context(tool_call_id|string[]), list_released. Use the first-class `ask_user` tool for user questions. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools.".to_string(),
                         other => format!("Error: unknown `session` action '{other}'. Valid: config, prioritize, deprioritize, compact, rollback_edits, sleep, timeline, summary, history, suppress_memory, unsuppress_memory, list_suppressed, release_context, list_released. Use the first-class `ask_user` tool for user questions. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools."),
                     }
                 }
-                "enter_plan_mode" => self.cli_enter_plan_mode(args).await,
-                "exit_plan_mode" => self.cli_exit_plan_mode(args).await,
                 // Task management (unified tool with action param)
                 "task" => {
                     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
@@ -3278,32 +3713,7 @@ impl ToolExecutor {
 
         let self_model = self.build_self_model_snapshot();
         match dimension {
-            "capability" => {
-                if let Some(ref model) = self_model {
-                    serde_json::json!({
-                        "tools": model.capabilities.tool_names,
-                        "tool_count": model.capabilities.total_tools,
-                        "deprioritized_tools": model.capabilities.deprioritized_tools,
-                        "skills": model.capabilities.skills,
-                        "pinned_tools": model.capabilities.pinned_tools,
-                        "tool_health": model.capabilities.tool_health.iter().map(|t| {
-                            serde_json::json!({
-                                "name": t.name,
-                                "total_calls": t.total_calls,
-                                "success_rate": t.success_rate,
-                                "deprioritized": t.deprioritized,
-                            })
-                        }).collect::<Vec<_>>(),
-                    })
-                    .to_string()
-                } else {
-                    serde_json::json!({
-                        "tools": self.tool_names(),
-                        "tool_count": self.tool_count(),
-                    })
-                    .to_string()
-                }
-            }
+            "capability" => self.capability_info_json().to_string(),
             "state" => {
                 if let Some(ref model) = self_model {
                     serde_json::json!({
@@ -3360,12 +3770,156 @@ impl ToolExecutor {
         }
     }
 
+    fn capability_info_json(&self) -> Value {
+        let caps = self.cli_capability_view();
+        if let Some(ref model) = self.build_self_model_snapshot() {
+            json!({
+                "surface": "CliLocal",
+                "capabilities_active": caps.active_names,
+                "capabilities_inactive": caps.inactive_names,
+                "tools_visible": model.capabilities.tool_names,
+                "tools_dropped_by_capability": caps.dropped_by_capability,
+                "tools_dropped_by_surface": caps.dropped_by_surface,
+                "tools_pass_through_mcp": caps.mcp_pass_through,
+                "tool_count": model.capabilities.total_tools,
+                "deprioritized_tools": model.capabilities.deprioritized_tools,
+                "skills": model.capabilities.skills,
+                "pinned_tools": model.capabilities.pinned_tools,
+                "tool_health": model.capabilities.tool_health.iter().map(|t| {
+                    json!({
+                        "name": t.name,
+                        "total_calls": t.total_calls,
+                        "success_rate": t.success_rate,
+                        "deprioritized": t.deprioritized,
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        } else {
+            json!({
+                "surface": "CliLocal",
+                "capabilities_active": caps.active_names,
+                "capabilities_inactive": caps.inactive_names,
+                "tools_visible": self.tool_names(),
+                "tools_dropped_by_capability": caps.dropped_by_capability,
+                "tools_dropped_by_surface": caps.dropped_by_surface,
+                "tools_pass_through_mcp": caps.mcp_pass_through,
+                "tool_count": self.tool_count(),
+            })
+        }
+    }
+
+    fn cli_capability_view(&self) -> CliCapabilityView {
+        use astra_turn_core::capability::Capability;
+
+        let caps = cli_default_capabilities(self.spawn_context.is_some());
+        let mut active_names = Vec::new();
+        let mut inactive_names = Vec::new();
+        for capability in [
+            Capability::AgentSpawner,
+            Capability::MemoryService,
+            Capability::Database,
+            Capability::SkillsCatalog,
+            Capability::GitHubAuth,
+            Capability::LSPServer,
+            Capability::PlanLifecycle,
+        ] {
+            if caps.has(capability) {
+                active_names.push(format!("{capability:?}"));
+            } else {
+                inactive_names.push(format!("{capability:?}"));
+            }
+        }
+
+        let mut pool = full_tool_schemas();
+        let plugins = self.plugin_schemas.read().unwrap_or_else(|poisoned| {
+            tracing::warn!("CLI plugin_schemas RwLock poisoned on capability view; recovering.");
+            poisoned.into_inner()
+        });
+        pool.extend(plugins.iter().cloned());
+        drop(plugins);
+
+        let outcome = astra_turn_core::tool_surface::resolve_with_diagnostics(
+            astra_turn_core::tool_surface::Surface::CliLocal,
+            &caps,
+            &pool,
+        );
+        let visible_names: std::collections::HashSet<String> = outcome
+            .schemas
+            .iter()
+            .filter_map(|schema| {
+                schema
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+
+        let mut dropped_by_capability = Vec::new();
+        for meta in astra_turn_core::tool_registry_meta::TOOL_CATALOG {
+            if visible_names.contains(meta.name) {
+                continue;
+            }
+            let missing: Vec<String> = meta
+                .requires
+                .iter()
+                .filter(|capability| !caps.has(**capability))
+                .map(|capability| format!("{capability:?}"))
+                .collect();
+            if !missing.is_empty() {
+                dropped_by_capability.push(json!({
+                    "name": meta.name,
+                    "missing": missing,
+                }));
+            }
+        }
+
+        let mcp_pass_through = visible_names
+            .into_iter()
+            .filter(|name| {
+                !astra_turn_core::tool_registry_meta::TOOL_CATALOG
+                    .iter()
+                    .any(|meta| meta.name == name.as_str())
+            })
+            .filter(|name| name.starts_with("mcp__"))
+            .collect();
+        let dropped_by_surface = outcome
+            .dropped_by_surface
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        CliCapabilityView {
+            active_names,
+            inactive_names,
+            dropped_by_capability,
+            dropped_by_surface,
+            mcp_pass_through,
+        }
+    }
+
     /// Build a SelfModel snapshot from available observability session data.
     pub fn build_self_model_snapshot(&self) -> Option<astra_runtime::self_model::SelfModel> {
         let obs_session = self.observability_session.as_ref()?;
         let session = obs_session.read().ok()?;
 
-        let tool_name_strs = self.tool_names();
+        let selected_tools: Vec<String> = session
+            .context_traces
+            .last()
+            .map(|trace| {
+                trace
+                    .tools
+                    .tools_selected
+                    .iter()
+                    .map(|tool| tool.tool_name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let tool_name_strs = if selected_tools.is_empty() {
+            self.tool_names()
+        } else {
+            selected_tools
+        };
         let tool_name_refs: Vec<&str> = tool_name_strs.iter().map(|s| s.as_str()).collect();
         let pinned_tools = self
             .self_mod_pinned_tools
@@ -3517,14 +4071,13 @@ mod tests {
         assert!(output.contains("done"), "unexpected bash output: {output}");
     }
 
-    // ── tool_search dispatch: CLI must route to the full catalog ───────
+    // ── tool_search dispatch: CLI must route to its local catalog ──────
     //
     // Before this fix: `execute()` had no `"tool_search"` arm, so
     // `default_executor.execute("tool_search")` was called. That uses
-    // `default_executor_tool_schemas()` — a 14-tool subset without
-    // github, memory, session, agent, lsp, symbols. CLI users hitting
-    // `tool_search(select:github)` got `missing:["github"]` and the
-    // entire deferred-activation flow was dead on CLI.
+    // the default executor's built-in dispatch instead of the CLI's
+    // local-tool catalog + plugin schemas. That broke deferred activation
+    // for plugin tools on CLI.
 
     /// P0 regression: when ToolExecutor is constructed without a
     /// wired `bg_task_commands` queue (no TUI to drain), the
@@ -3588,7 +4141,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_search_select_github_returns_schema_on_cli_path() {
+    async fn tool_search_select_github_resolves_on_cli_path() {
         let executor = test_executor();
         let out = executor
             .execute(
@@ -3598,25 +4151,17 @@ mod tests {
             .await;
         let parsed: serde_json::Value =
             serde_json::from_str(&out).expect("tool_search must return valid JSON");
-        let missing = parsed["missing"].as_array().expect("missing field");
-        assert!(
-            missing.is_empty(),
-            "CLI tool_search(select:github) must resolve, not return missing; got: {out}"
-        );
         let matches = parsed["matches"].as_array().expect("matches field");
-        assert_eq!(matches.len(), 1, "exactly one match; got: {out}");
-        assert_eq!(matches[0]["name"].as_str(), Some("github"));
         assert!(
-            matches[0].get("parameters").is_some(),
-            "must include full parameters for activation"
+            matches
+                .iter()
+                .any(|m| m.get("name").and_then(|n| n.as_str()) == Some("github")),
+            "CLI must resolve github when GitHubAuth is in the capability set; got: {out}"
         );
     }
 
     #[tokio::test]
-    async fn tool_search_select_memory_returns_schema_on_cli_path() {
-        // memory is in DEFAULT_PINNED but deferred activation must still
-        // return its schema on demand. Tests that the CLI dispatch pool
-        // covers all pinned catalog tools.
+    async fn tool_search_select_memory_resolves_on_cli_path() {
         let executor = test_executor();
         let out = executor
             .execute(
@@ -3625,8 +4170,53 @@ mod tests {
             )
             .await;
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert!(parsed["missing"].as_array().unwrap().is_empty());
-        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("memory"));
+        let matches = parsed["matches"].as_array().expect("matches field");
+        assert!(
+            matches
+                .iter()
+                .any(|m| m.get("name").and_then(|n| n.as_str()) == Some("memory")),
+            "CLI must resolve memory when MemoryService is in the capability set; got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn introspect_capability_reports_inactive_agent_spawner() {
+        let executor = test_executor();
+        let out = executor
+            .execute(
+                "introspect",
+                &serde_json::json!({"dimension": "capability"}),
+            )
+            .await;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("introspect must return JSON");
+
+        let inactive: Vec<&str> = parsed["capabilities_inactive"]
+            .as_array()
+            .map(|values| values.iter().filter_map(|value| value.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            inactive.contains(&"AgentSpawner"),
+            "bare executor must report AgentSpawner inactive; got {out}"
+        );
+        assert!(
+            inactive.contains(&"PlanLifecycle"),
+            "PlanLifecycle is server-owned on the CLI; got {out}"
+        );
+
+        let dropped = parsed["tools_dropped_by_capability"]
+            .as_array()
+            .expect("tools_dropped_by_capability");
+        let agent_drop = dropped.iter().find(|entry| entry["name"] == "agent");
+        assert!(
+            agent_drop.is_some(),
+            "agent must be reported as capability-dropped; got {out}"
+        );
+        let missing: Vec<&str> = agent_drop.unwrap()["missing"]
+            .as_array()
+            .map(|values| values.iter().filter_map(|value| value.as_str()).collect())
+            .unwrap_or_default();
+        assert!(missing.contains(&"AgentSpawner"));
     }
 
     #[tokio::test]

@@ -776,8 +776,10 @@ pub(super) async fn handle_session_command(
             if sid != "none" {
                 if let Some(ref ws) = persisted_ws {
                     print_workspace_metadata(ws, sid);
-                    if ws.model != mdl {
-                        eprintln!("  {:<16} {}", "started as:".dim(), ws.model.as_str().dim());
+                    if let Some(started_model) = ws.model.as_deref()
+                        && started_model != mdl
+                    {
+                        eprintln!("  {:<16} {}", "started as:".dim(), started_model.dim());
                     }
                 } else {
                     eprintln!(
@@ -3703,7 +3705,7 @@ fn handle_session_analyze(arg: &str, state: &SessionState) {
 
     let model = ws
         .as_ref()
-        .map(|w| w.model.as_str())
+        .and_then(|w| w.model.as_deref())
         .or_else(|| events.first().and_then(|e| e.model.as_deref()))
         .unwrap_or("unknown");
     let total_tok_in: u64 = turns.iter().filter_map(|t| t.tokens_in).sum();
@@ -4123,62 +4125,12 @@ fn handle_session_verify(state: &SessionState) {
     );
     eprintln!("    {:<20} {}", "file:".dim(), journal_path.dim());
 
-    // Cloud ingestion stats
-    if let Some(ref mc) = state.matrix_runtime {
-        eprintln!();
-        eprintln!("  {}", "Cloud ingestion".dim());
-        if let Some(stats) = mc.ingestion_stats() {
-            let lag = stats.events_received.saturating_sub(stats.events_flushed);
-            eprintln!(
-                "    {:<20} {}",
-                "received:".dim(),
-                stats.events_received.to_string().magenta()
-            );
-            eprintln!(
-                "    {:<20} {}",
-                "flushed:".dim(),
-                stats.events_flushed.to_string().magenta()
-            );
-            eprintln!(
-                "    {:<20} {}",
-                "flushes:".dim(),
-                stats.flush_count.to_string().magenta()
-            );
-            let overflow = mc.ingestion_overflow_count();
-            if lag > 0 {
-                eprintln!("    {:<20} {}", "pending:".dim(), lag.to_string().yellow());
-            } else {
-                eprintln!("    {:<20} {}", "pending:".dim(), "0 (synced)".green());
-            }
-            if overflow > 0 {
-                eprintln!(
-                    "    {:<20} {}",
-                    "dropped:".dim(),
-                    overflow.to_string().red()
-                );
-            }
-            if stats.errors > 0 {
-                eprintln!(
-                    "    {:<20} {}",
-                    "errors:".dim(),
-                    stats.errors.to_string().red()
-                );
-                if let Some(ref last_err) = stats.last_error {
-                    let truncated = if last_err.len() > 80 {
-                        format!("{}…", last_err.chars().take(80).collect::<String>())
-                    } else {
-                        last_err.clone()
-                    };
-                    eprintln!("    {:<20} {}", "last error:".dim(), truncated.red());
-                }
-            }
-        } else {
-            eprintln!("    {}", "stats unavailable (lock contention)".dim());
-        }
-    } else {
-        eprintln!();
-        eprintln!("  {} Cloud not connected", theme::icon_warn());
-    }
+    eprintln!();
+    eprintln!("  {}", "Cloud ingestion".dim());
+    eprintln!(
+        "    {}",
+        "server-owned; CLI does not enqueue MatrixOne ingestion events".dim()
+    );
 
     // Session disk usage summary
     if sid != "none" {
@@ -4533,10 +4485,8 @@ mod export_tests {
 // ═══════════════════════════════════════════════════════════ Resume ═══════
 
 fn resume_restore_service(state: &SessionState) -> HybridRestoreService {
-    match &state.matrix_runtime {
-        Some(mc) => HybridRestoreService::new(mc.shared_pool().get().clone()),
-        None => HybridRestoreService::local_only(),
-    }
+    let _ = state;
+    HybridRestoreService::local_only()
 }
 
 fn reset_state_for_session_restore(state: &mut SessionState) {
@@ -4552,7 +4502,7 @@ fn reset_state_for_session_restore(state: &mut SessionState) {
     state.total_completion_tokens = 0;
     state.total_cache_read_tokens = 0;
     state.total_cache_creation_tokens = 0;
-    state.plan_mode = None;
+    state.cloud_plan_mirror = None;
     state.executing_plan = None;
     state.plan_execution_config = None;
     state.executing_plan_goal = None;
@@ -4896,61 +4846,21 @@ async fn apply_restored_session(
             restored.compaction_state.as_ref(),
         );
         eprintln!("  {} Restored step checkpoint from cloud", "☁".magenta());
-    } else if let Some(ref mc) = state.matrix_runtime {
-        let pool = mc.shared_pool().get();
-        match astra_services::session_restore::pull_step_checkpoint_from_cloud(
-            pool,
-            &restored.session_id,
-        )
-        .await
-        {
-            Ok(Some(state_json)) => {
-                match astra_services::session_restore::parse_cloud_heavy_checkpoint_state(
-                    &state_json,
-                ) {
-                    Ok(Some(heavy)) => {
-                        apply_heavy_state_fallback(
-                            state,
-                            &heavy.blocked_tools,
-                            &heavy.recent_tools,
-                            &heavy.messages,
-                            heavy.approval_overrides.as_ref(),
-                        );
-                        apply_resume_recovery_state(
-                            state,
-                            heavy.interruption.as_ref(),
-                            heavy.compaction_state.as_ref(),
-                        );
-                        eprintln!("  {} Restored step checkpoint from cloud", "☁".magenta());
-                    }
-                    Ok(None) => {
-                        eprintln!(
-                            "  {} Cloud checkpoint corrupted, skipping",
-                            theme::icon_warn()
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "skipping cloud step checkpoint"
-                        );
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                eprintln!("  {} Cloud checkpoint unavailable", theme::icon_warn());
-                eprintln!("{}", format!("     ({e})").dim());
-            }
-        }
     }
 
-    if let Some(ref m) = restored.model {
-        state.model = Some(m.clone());
-        let base = astra_turn_core::thinking_config::resolve_model_thinking(m).0;
-        state.cached_pricing = slash_stats::fallback_pricing(base);
-        state.context_budget =
-            prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(base));
+    match normalize_model_override(restored.model.as_deref()) {
+        Some(m) => {
+            state.model = Some(m.to_string());
+            let base = astra_turn_core::thinking_config::resolve_model_thinking(m).0;
+            state.cached_pricing = slash_stats::fallback_pricing(base);
+            state.context_budget =
+                prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(base));
+        }
+        None => {
+            state.model = None;
+            state.context_budget =
+                prompts::ContextBudget::from_runtime_config(&state.runtime_config, None);
+        }
     }
 
     restore_journal_history_if_available(state, &restored.session_id).await;
@@ -4981,10 +4891,6 @@ async fn apply_restored_session(
         && let Ok(contract) = serde_json::from_str::<astra_services::TaskContract>(json)
     {
         let work_dir = std::env::current_dir().unwrap_or_default();
-        let ingestion_sender = state
-            .matrix_runtime
-            .as_ref()
-            .and_then(|mc| mc.clone_ingestion_sender());
         // Verification judge runs server-side via server_proxy_judge; the server resolves
         // the reasoning model via admin_config.reasoning_model_name → cheapest active
         // fallback. No local cloud judge.
@@ -4997,33 +4903,17 @@ async fn apply_restored_session(
                 Err(_) => None,
             };
 
-        let lifecycle = if let Some(pool) = state
-            .matrix_runtime
-            .as_ref()
-            .map(|mc| mc.shared_pool().get().clone())
-        {
-            durable_bridge::create_cloud_lifecycle_full(
-                pool,
-                &work_dir,
-                ingestion_sender,
-                Some(&restored.session_id),
-                state.ingestion_user_id.as_deref(),
-                cloud_judge,
-                server_proxy_judge,
-            )
-        } else {
-            let session_dir =
-                astra_services::session_workspace::workspace_dir_for(&restored.session_id);
-            durable_bridge::create_local_lifecycle_full(
-                &session_dir,
-                &work_dir,
-                ingestion_sender,
-                Some(&restored.session_id),
-                state.ingestion_user_id.as_deref(),
-                cloud_judge,
-                server_proxy_judge,
-            )
-        };
+        let session_dir =
+            astra_services::session_workspace::workspace_dir_for(&restored.session_id);
+        let lifecycle = durable_bridge::create_local_lifecycle_full(
+            &session_dir,
+            &work_dir,
+            None,
+            Some(&restored.session_id),
+            state.ingestion_user_id.as_deref(),
+            cloud_judge,
+            server_proxy_judge,
+        );
         state.durable_task_state = Some(durable_bridge::DurableTaskState {
             contract,
             lifecycle,
@@ -5041,9 +4931,8 @@ async fn apply_restored_session(
         if let Some(ref branch) = restored.git_branch {
             ws.git_branch = Some(branch.clone());
         }
-        if let Some(ref model) = restored.model {
-            ws.model = model.clone();
-        }
+        ws.model =
+            astra_core::model_override::normalize_model_override_owned(restored.model.clone());
         ws.executing_plan_json = restored.executing_plan_json.clone();
         ws.plan_goal = restored.plan_goal.clone();
         ws.plan_config_json = restored.plan_config_json.clone();
@@ -5092,7 +4981,7 @@ async fn apply_restored_session(
         }
         eprintln!(
             "    {}",
-            "Say continue / resume / next / go to pick up; correct … / rewind N to adjust; slash lines keep the plan; any other line abandons it."
+            "Paused plan restored. Inspect or edit it with slash commands; use correct … / rewind N to adjust; any other line abandons it."
                 .dim()
         );
     }
@@ -5232,7 +5121,7 @@ pub(super) async fn handle_resume_command(
             let model = s
                 .model
                 .clone()
-                .or_else(|| ws.as_ref().map(|w| w.model.clone()))
+                .or_else(|| ws.as_ref().and_then(|w| w.model.clone()))
                 .or_else(|| peek.as_ref().and_then(|p| p.model.clone()));
 
             // cwd: shorten to last 2 path components
@@ -5428,7 +5317,7 @@ pub(super) async fn handle_resume_command(
         // Model
         let model = ws
             .as_ref()
-            .map(|w| w.model.clone())
+            .and_then(|w| w.model.clone())
             .or_else(|| peek.as_ref().and_then(|p| p.model.clone()))
             .unwrap_or_else(|| "?".to_string());
         eprintln!("  {:<14} {}", "model:".dim(), model.magenta());
@@ -6029,6 +5918,41 @@ mod resume_tests {
         assert_eq!(state.turn, 2);
         assert_eq!(state.total_prompt_tokens, 15);
         assert_eq!(state.total_completion_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn restore_session_into_state_treats_default_model_as_server_default() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = format!("resume-default-model-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 2);
+        let mut ws = session_workspace::read_workspace(&session_id).unwrap();
+        ws.model = Some("default".to_string());
+        session_workspace::write_workspace(&ws).unwrap();
+        write_profile_with_token(&session_id);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "status": "active"
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let mut state = SessionState {
+            model: Some("default".to_string()),
+            ..SessionState::default()
+        };
+        restore_session_into_state(&session_id, None, &api, &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(state.model, None);
     }
 
     #[tokio::test]

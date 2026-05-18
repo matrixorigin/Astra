@@ -55,6 +55,11 @@ impl ListSelectionView {
         self
     }
 
+    pub fn with_footer_hint(mut self, hint: impl Into<String>) -> Self {
+        self.footer_hint = Some(hint.into());
+        self
+    }
+
     pub fn accepted_name(&self) -> Option<&str> {
         self.accepted_name.as_deref()
     }

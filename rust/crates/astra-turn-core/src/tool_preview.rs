@@ -38,13 +38,9 @@ use serde_json::Value;
 
 use astra_text_utils::str_preview::{github_repo_display, shorten_path, truncate_line};
 
-/// Controls how verbose the preview is. `Concise` (default) matches
-/// the old `format_tool_description` output; `Verbose` is for a future
-/// `--verbose` flag that mirrors claudecode's verbose mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreviewStyle {
     Concise,
-    #[allow(dead_code)]
     Verbose,
 }
 

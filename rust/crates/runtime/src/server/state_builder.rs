@@ -1,5 +1,18 @@
 use super::*;
 
+mod bridge;
+mod core;
+mod runtime;
+
+struct RuntimeWiring {
+    matrix_rt: Arc<crate::matrix_cloud_runtime::MatrixCloudRuntime>,
+    run_lifecycle: super::run_lifecycle::AgenticRunLifecycleService,
+    profile_registry: Arc<astra_services::AgentProfileRegistry>,
+    delegation_engine: Arc<crate::server::delegation_engine::DelegationEngine>,
+    team_store: Arc<dyn astra_services::team_persistence::TeamPersistenceService>,
+    resource_governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>,
+}
+
 /// Build the same [`AppState`] as production `astra-server` (MatrixOne, auth, in-process bridge, runs).
 ///
 /// Intended for **ignored** integration tests (`ASTRA_TEST_DB_IT=1`) that hit real HTTP
@@ -10,420 +23,95 @@ pub async fn build_server_state(
     ensure_core_schema(&settings.matrixone, &settings.database_bootstrap_catalog).await?;
     let shared_pool = SharedPool::new(&settings.matrixone).await?;
     let lease_hold_cache = Arc::new(TaskLeaseHoldCache::default());
-    // Build a single encryptor from settings (falls back to env var when not explicitly set).
     let shared_encryptor = Arc::new(
         FernetTokenEncryptor::from_key(settings.token_encryption_key.as_deref())
             .map_err(Box::<dyn std::error::Error>::from)?,
     );
-    let skillify_matrixone = settings.matrixone.clone();
-    let auth_mode = std::env::var("ASTRA_AUTH_MODE")
-        .unwrap_or_else(|_| "local_jwt".to_string())
-        .trim()
-        .to_ascii_lowercase();
-    let auth_service: Arc<dyn AuthService> = match auth_mode.as_str() {
-        "" | "local_jwt" | "local" | "database" => Arc::new(
-            DatabaseAuthService::new(settings.matrixone.clone(), settings.jwt.clone())
-                .with_pool(shared_pool.clone()),
-        ),
-        "trusted_moi" => Arc::new(
-            astra_services::auth::TrustedMoiAuthService::from_env()
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
-        ),
-        other => {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("unsupported ASTRA_AUTH_MODE={other}; expected local_jwt or trusted_moi"),
-            )));
-        }
-    };
+    let auth_service = core::build_auth_service(&settings, &shared_pool)?;
 
-    let state = AppState::new(
-        ServiceInfo::default(),
-        Arc::new(
-            MatrixOneHealthChecker::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-        ),
-    )
-    .with_cors_origins(settings.api.cors_origins.clone())
-    .with_shared_pool(shared_pool.clone())
-    .with_plan_repository(Arc::new(astra_plan::CloudPlanRepository::new(
-        shared_pool.get().clone(),
-    )))
-    .with_auth_service(auth_service)
-    .with_session_service(Arc::new(
-        DatabaseSessionService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_agent_service(Arc::new(
-        DatabaseAgentService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_event_service(Arc::new(
-        DatabaseEventService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_context_service(Arc::new(
-        DatabaseContextService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_decision_service(Arc::new(
-        DatabaseDecisionService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_model_service({
-        Arc::new(
-            DatabaseModelService::new(settings.matrixone.clone(), Arc::clone(&shared_encryptor))
-                .with_pool(shared_pool.clone()),
-        )
-    })
-    .with_job_service(Arc::new(InMemoryJobService::new()))
-    .with_trigger_service(Arc::new(
-        DatabaseTriggerService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_workflow_service(Arc::new(
-        DatabaseWorkflowService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_harness_service(Arc::new(DatabaseHarnessService::new(shared_pool.clone())))
-    .with_sandbox_service(Arc::new(
-        DatabaseSandboxService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_branch_service(Arc::new(
-        DatabaseBranchService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_data_versioning_service(Arc::new(
-        DatabaseDataVersioningService::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone()),
-    ))
-    .with_marketplace_service(Arc::new(
-        DatabaseMarketplaceService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_marketplace_stats_service(Arc::new(
-        DatabaseMarketplaceStatsService::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone()),
-    ))
-    .with_replay_service(Arc::new(
-        DatabaseReplayService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_session_audit_service(Arc::new(
-        DatabaseSessionAuditService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_skill_service(Arc::new(
-        DatabaseSkillService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_skill_config_service(Arc::new(
-        DatabaseSkillConfigService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_llm_trusted_domain_service(Arc::new(
-        astra_services::DatabaseLlmTrustedDomainService::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone()),
-    ))
-    .with_fernet_encryptor((*shared_encryptor).clone())
-    .with_evaluation_service(Arc::new(
-        DatabaseEvaluationService::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone())
-            .with_memoria_config(
-                settings.memoria.base_url.clone(),
-                settings.memoria.master_key.clone(),
-            ),
-    ))
-    .with_introspection_service(Arc::new(
-        DatabaseIntrospectionService::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone()),
-    ))
-    .with_reflect_service(Arc::new(
-        DatabaseReflectService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_learning_feedback_service(Arc::new(
-        DatabaseLearningFeedbackService::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone()),
-    ))
-    .with_turn_core_event_writer(Arc::new(
-        DatabaseTurnCoreEventWriter::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_turn_tool_event_writer(Arc::new(
-        DatabaseTurnToolEventWriter::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_turn_hook_db_writer(Arc::new(
-        DatabaseTurnHookDbWriter::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_turn_reflection_lesson_writer(Arc::new(DatabaseTurnReflectionLessonWriter::new(
-        settings.memoria.base_url.clone(),
-        settings.memoria.master_key.clone(),
-    )))
-    .with_turn_observer_worker(Arc::new(DatabaseTurnObserverWorker::new(
-        settings.memoria.base_url.clone(),
-        settings.memoria.master_key.clone(),
-    )))
-    .with_turn_auxiliary_event_writer(Arc::new(
-        DatabaseTurnAuxiliaryEventWriter::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone()),
-    ))
-    .with_turn_session_activity_writer(Arc::new(
-        DatabaseTurnSessionActivityWriter::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone()),
-    ))
-    .with_admin_authorizer(Arc::new(
-        DatabaseAdminAuthorizer::new(settings.matrixone.clone(), settings.jwt)
-            .with_pool(shared_pool.clone()),
-    ))
-    .with_admin_initializer(Arc::new(
-        DatabaseAdminInitializer::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_admin_token_writer(Arc::new(
-        DatabaseAdminTokenWriter::from_env(settings.matrixone.clone())
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?
-            .with_pool(shared_pool.clone()),
-    ))
-    .with_admin_token_reader(Arc::new(
-        DatabaseAdminTokenReader::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_admin_audit_reader(Arc::new(
-        DatabaseAdminAuditReader::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_admin_feedback_stats_reader(Arc::new(
-        DatabaseAdminFeedbackStatsReader::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone()),
-    ))
-    .with_admin_user_role_manager(Arc::new(
-        DatabaseAdminUserRoleManager::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone()),
-    ))
-    .with_admin_config_service(Arc::new(
-        astra_services::DatabaseAdminConfigService::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone()),
-    ))
-    .with_task_service(Arc::new(MatrixOneTaskService::from_shared(&shared_pool)))
-    .with_edge_registry_service(Arc::new(DatabaseEdgeRegistryService::from_shared(
+    let state = core::build_core_state(&settings, &shared_pool, &shared_encryptor, auth_service);
+    let state = core::install_turn_persistence_services(state, &settings, &shared_pool);
+    let state = core::install_admin_services(state, &settings, &shared_pool)?;
+    let state = core::install_execution_services(state, &shared_pool, &lease_hold_cache)
+        .with_memoria_config(
+            settings.memoria.base_url.clone(),
+            settings.memoria.master_key.clone(),
+        );
+    let state = install_skillify_harness_service(state, &settings, &shared_pool, &shared_encryptor);
+
+    let wiring = runtime::build_runtime_wiring(
+        &settings,
         &shared_pool,
-    )))
-    .with_task_lease_service(Arc::new(DatabaseTaskLeaseService::from_shared(
-        &shared_pool,
-        Arc::clone(&lease_hold_cache),
-    )));
-
-    // Wire in-process chat turn bridge.
-    // Note: persist_tracker is wired after matrix_rt is created below.
-    let bridge_encryptor = Arc::clone(&shared_encryptor);
-    let bridge_edge_ledger = state.edge_callback_ledger.clone();
-    let bridge_matrixone = settings.matrixone.clone();
-    let bridge_pool = shared_pool.clone();
-    let bridge_chat_turn_bridge_secret = settings.bridge_secret;
-    let state = state.with_memoria_config(settings.memoria.base_url, settings.memoria.master_key);
-
-    // Wire run lifecycle service: uses ServerAgenticLoopHost for agentic loops.
-    // Attach RunEngine for durable persistence of run state.
-    let run_encryptor = Arc::clone(&shared_encryptor);
-    let run_store = Arc::new(astra_services::runs::DatabaseRunStateStore::new(
-        shared_pool.clone(),
-    ));
-    let state_projection_store = Arc::new(astra_services::DatabaseStateProjectionStore::new(
-        shared_pool.clone(),
-    ));
-    let run_engine = crate::server::run_engine::RunEngine::new(run_store)
-        .with_projection_store(Arc::clone(&state_projection_store));
-    match run_engine.recover_active_runs().await {
-        Ok(recovered_runs) => {
-            if !recovered_runs.is_empty() {
-                let waiting = recovered_runs
-                    .iter()
-                    .filter(|run| run.status == astra_core::STATUS_WAITING)
-                    .count();
-                let failed = recovered_runs
-                    .iter()
-                    .filter(|run| run.status == astra_core::STATUS_FAILED)
-                    .count();
-                tracing::warn!(
-                    target: "astra_runtime::state_builder",
-                    recovered_total = recovered_runs.len(),
-                    recovered_waiting = waiting,
-                    recovered_failed = failed,
-                    "recovered durable active runs during startup"
-                );
-            }
-        }
-        Err(error) => {
-            tracing::error!(
-                target: "astra_runtime::state_builder",
-                error = %error,
-                "failed to recover durable active runs during startup"
-            );
-        }
-    }
-
-    // Wire multi-agent coordination: profile registry + delegation engine.
-    let mut profile_registry = astra_services::AgentProfileRegistry::new();
-    // Register default agent profiles so delegation validation works.
-    {
-        use astra_services::coordination::{AgentProfile, AgentTier};
-        let mut orch = AgentProfile::new("orchestrator", "Orchestrator", AgentTier::Orchestrator);
-        orch.system_prompt = Some(
-            "You are the orchestrator agent. Coordinate sub-agents to complete complex tasks."
-                .to_string(),
-        );
-        let _ = profile_registry.register(orch);
-
-        let mut coder = AgentProfile::new("coder", "Coder", AgentTier::System);
-        coder.system_prompt = Some(
-            "You are a coding agent. Write, edit, and debug code to complete tasks.".to_string(),
-        );
-        coder.skill_filter = vec![
-            "bash".into(),
-            "read_file".into(),
-            "write_file".into(),
-            "str_replace".into(),
-            "git_commit".into(),
-        ];
-        let _ = profile_registry.register(coder);
-
-        let mut reviewer = AgentProfile::new("reviewer", "Reviewer", AgentTier::System);
-        reviewer.system_prompt = Some(
-            "You are a code review agent. Review code for bugs, security, and best practices."
-                .to_string(),
-        );
-        reviewer.skill_filter = vec!["read_file".into(), "bash".into()];
-        let _ = profile_registry.register(reviewer);
-
-        let mut writer = AgentProfile::new("writer", "Writer", AgentTier::User);
-        writer.system_prompt =
-            Some("You are a documentation writer. Create clear, concise docs.".to_string());
-        let _ = profile_registry.register(writer);
-    }
-    let profile_registry = Arc::new(profile_registry);
-    let progress_broadcaster = Arc::new(crate::orchestration::ProgressBroadcaster::default());
-    let delegation_tracker = Arc::new(
-        crate::server::delegation_engine::DelegationTracker::new()
-            .with_progress_broadcaster(Arc::clone(&progress_broadcaster)),
-    );
-
-    let user_id = astra_core::cli_user_id();
-
-    // Build MatrixCloudRuntime early so its memory-extraction service
-    // (which needs both ingestion and encryptor) can be shared with the
-    // lifecycle service + delegation sub-run executor, and later
-    // reused as the bridge persist tracker.
-    let matrix_rt = Arc::new(
-        crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(
-            shared_pool.clone(),
-            "default",
-            &user_id,
-            Arc::clone(&lease_hold_cache),
-        )
-        .with_encryptor(run_encryptor.clone()),
-    );
-    let memory_extraction_service = matrix_rt.clone_memory_extraction_service();
-
-    // Wire a real sub-run executor backed by ServerAgenticLoopHost.
-    let sub_run_executor: Arc<dyn crate::server::delegation_engine::SubRunExecutor> = {
-        let mut exec = super::run_lifecycle::ServerSubRunExecutor::new(
-            settings.matrixone.clone(),
-            run_encryptor.clone(),
-            state.edge_callback_ledger.clone(),
-        )
-        .with_pool(shared_pool.clone())
-        .with_edge_connection_pool(state.edge_connection_pool.clone())
-        .with_skill_service(state.skill_service.clone());
-        if let Some(svc) = memory_extraction_service.as_ref() {
-            exec = exec.with_memory_extraction_service(Arc::clone(svc));
-        }
-        Arc::new(exec)
-    };
-    let delegation_engine = Arc::new(
-        crate::server::delegation_engine::DelegationEngine::with_executor(
-            Arc::new(tokio::sync::RwLock::new((*profile_registry).clone())),
-            Arc::new(run_engine.clone()),
-            delegation_tracker,
-            sub_run_executor,
-        )
-        .with_projection_store(Arc::clone(&state_projection_store)),
-    );
-
-    // ── Resource governor (Phase 5) ───────────────────────────────────
-    let resource_governor =
-        astra_services::resource_governor::DatabaseResourceGovernor::new(shared_pool.clone());
-    if let Err(e) = resource_governor.ensure_tables().await {
-        tracing::warn!(
-            target: "astra_runtime::state_builder",
-            error = %e,
-            "resource_governor table init failed"
-        );
-    }
-    let resource_governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor> =
-        std::sync::Arc::new(resource_governor);
-
-    // Create lifecycle service with delegation engine wired in.
-    let mut run_lifecycle = super::run_lifecycle::AgenticRunLifecycleService::new(
-        settings.matrixone.clone(),
-        run_encryptor.clone(),
-        state.edge_callback_ledger.clone(),
+        &lease_hold_cache,
+        &shared_encryptor,
+        &state,
     )
-    .with_pool(shared_pool.clone())
-    .with_run_engine(run_engine)
-    .with_delegation_engine(Arc::clone(&delegation_engine))
-    .with_edge_connection_pool(state.edge_connection_pool.clone())
-    .with_resource_governor(resource_governor.clone())
-    .with_skill_service(state.skill_service.clone())
-    .with_hook_db_writer(state.turn_hook_db_writer.clone())
-    .with_observer_worker(state.turn_observer_worker.clone())
-    .with_tool_event_writer(state.turn_tool_event_writer.clone())
-    .with_auxiliary_event_writer(state.turn_auxiliary_event_writer.clone());
-    if let Some(svc) = memory_extraction_service.as_ref() {
-        run_lifecycle = run_lifecycle.with_memory_extraction_service(Arc::clone(svc));
-    }
+    .await?;
+    let matrix_rt = Arc::clone(&wiring.matrix_rt);
 
-    #[cfg(feature = "harness")]
-    let run_lifecycle = run_lifecycle.with_harness_registry(state.harness_registry.clone());
-
-    // Wire team persistence store backed by MatrixOne.
-    let team_store =
-        astra_services::team_persistence::MatrixOneTeamStore::new(shared_pool.get().clone());
-    if let Err(e) = team_store.ensure_builtins(&user_id).await {
-        tracing::warn!(
-            target: "astra_runtime::state_builder",
-            error = %e,
-            user_id = %user_id,
-            "team builtins seed failed"
-        );
-    }
-    let team_store: Arc<dyn astra_services::team_persistence::TeamPersistenceService> =
-        Arc::new(team_store);
     let state = state
-        .with_run_lifecycle_service(Arc::new(run_lifecycle))
-        .with_agent_profile_registry(profile_registry)
-        .with_delegation_engine(delegation_engine)
-        .with_team_store(team_store)
-        .with_resource_governor(resource_governor.clone());
+        .with_run_lifecycle_service(Arc::new(wiring.run_lifecycle))
+        .with_agent_profile_registry(Arc::clone(&wiring.profile_registry))
+        .with_delegation_engine(Arc::clone(&wiring.delegation_engine))
+        .with_team_store(Arc::clone(&wiring.team_store))
+        .with_resource_governor(Arc::clone(&wiring.resource_governor));
+    let state = bridge::attach_chat_turn_bridge(
+        state,
+        &settings,
+        &shared_pool,
+        &shared_encryptor,
+        &matrix_rt,
+    );
 
+    bridge::spawn_runtime_sweepers(shared_pool.clone());
+    Ok(state.with_matrix_cloud_runtime(Some(matrix_rt)))
+}
+
+fn install_skillify_harness_service(
+    state: AppState,
+    settings: &AppSettings,
+    shared_pool: &SharedPool,
+    shared_encryptor: &Arc<FernetTokenEncryptor>,
+) -> AppState {
     let skillify_agent_executor = Arc::new(
         super::skillify_agent_executor::RuntimeSkillifyAgentExecutor::new(
-            skillify_matrixone,
-            Arc::clone(&shared_encryptor),
-            state.admin_config_service.clone(),
+            settings.matrixone.clone(),
+            Arc::clone(shared_encryptor),
+            state.admin.config_service.clone(),
             shared_pool.clone(),
         ),
     );
-    let state = state.with_harness_service(Arc::new(
+    state.with_harness_service(Arc::new(
         DatabaseHarnessService::new(shared_pool.clone())
             .with_skillify_agent_executor(skillify_agent_executor),
-    ));
+    ))
+}
 
-    // Wire in-process chat turn bridge with matrix_rt as the persist tracker.
-    // HIGH #4: attach matrix_rt as BridgePersistTracker so SSE persist tasks drain on shutdown.
-    let state = state
-        .with_chat_turn_bridge(Arc::new(
-            turn::bridge_inprocess::InProcessChatTurnBridge::new(
-                bridge_matrixone,
-                bridge_encryptor,
-            )
-            .with_pool(bridge_pool)
-            .with_edge_callback_ledger(bridge_edge_ledger)
-            .with_persist_tracker(Arc::clone(&matrix_rt)
-                as Arc<dyn crate::matrix_cloud_runtime::BridgePersistTracker>),
-        ))
-        .with_chat_turn_bridge_secret(bridge_chat_turn_bridge_secret);
+#[cfg(test)]
+mod tests {
+    use super::runtime::default_agent_profile_registry;
+    use astra_services::coordination::AgentTier;
 
-    super::device_lease_sweeper::spawn_device_lease_expiry_sweeper(shared_pool.clone());
-    super::artifact_retention_sweeper::spawn_artifact_retention_sweeper(shared_pool.clone());
-    // U-16/U-17: lifecycle sweepers for `session_todos`.
-    // Stale `in_progress` rows auto-paused after 24h; `archived`
-    // rows GC'd after 90 days. Both are idle when the table has
-    // no qualifying rows, so cost stays near-zero.
-    super::session_todo_sweeper::spawn_session_todo_stale_sweeper(shared_pool.clone());
-    super::session_todo_sweeper::spawn_session_todo_archive_gc(shared_pool.clone());
+    #[test]
+    fn default_agent_profile_registry_registers_core_profiles() {
+        let registry = default_agent_profile_registry();
 
-    let state = state.with_matrix_cloud_runtime(Some(matrix_rt));
-    Ok(state)
+        assert_eq!(registry.list().len(), 4);
+
+        let orchestrator = registry.get("orchestrator").expect("orchestrator profile");
+        assert_eq!(orchestrator.name, "Orchestrator");
+        assert_eq!(orchestrator.tier, AgentTier::Orchestrator);
+        assert!(orchestrator.can_delegate);
+
+        let coder = registry.get("coder").expect("coder profile");
+        assert_eq!(coder.tier, AgentTier::System);
+        assert!(coder.skill_filter.iter().any(|tool| tool == "write_file"));
+
+        let reviewer = registry.get("reviewer").expect("reviewer profile");
+        assert_eq!(reviewer.skill_filter, vec!["read_file", "bash"]);
+
+        let writer = registry.get("writer").expect("writer profile");
+        assert_eq!(writer.tier, AgentTier::User);
+        assert!(!writer.can_delegate);
+    }
 }

@@ -372,15 +372,6 @@ pub(crate) async fn handle_slash_command(
             slash_profile::handle_profile_command(arg, &ctx);
         }
 
-        "/tuning" => {
-            let ctx = slash_tuning::TuningCommandContext {
-                engine: &state.auto_tuning_engine,
-                runtime_config: &mut state.runtime_config,
-                writer: &mut std::io::stderr(),
-            };
-            let _ = slash_tuning::handle_tuning_command(arg, ctx);
-        }
-
         "/register" | "/login" | "/logout" | "/memory-setup" => {
             handle_account_command(cmd, arg, api, profile, state).await?;
         }
@@ -556,8 +547,12 @@ pub(crate) async fn handle_slash_command(
             .await?;
         }
 
-        "/memory" | "/plan" => {
+        "/memory" => {
             handle_memory_domain_command(cmd, arg, api, state, token).await?;
+        }
+
+        "/plan" => {
+            crate::slash_plan::handle_plan_command(arg, api, profile, state, token).await?;
         }
 
         "/task" => {

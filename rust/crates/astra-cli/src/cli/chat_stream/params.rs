@@ -203,6 +203,14 @@ pub struct ApprovalRequest {
     pub header: String,
     pub detail: Option<String>,
     pub reason: String,
+    /// Original tool-call arguments. Carried alongside the request
+    /// so the approval queue can re-run `permission_engine::evaluate`
+    /// when the user pivots permission modes (e.g. Edit → Auto)
+    /// while the request is still pending. Without this we would
+    /// have no way to ask "would this same call still need approval
+    /// now?" without round-tripping through the model. `Value::Null`
+    /// when the caller has no structured args (rare).
+    pub args: serde_json::Value,
     pub response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
     /// Optional enriched metadata. Stored as `Option<Box<…>>` so
     /// the empty case stays cheap on the message channel.
@@ -216,6 +224,7 @@ impl ApprovalRequest {
         header: String,
         detail: Option<String>,
         reason: String,
+        args: serde_json::Value,
         response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
     ) -> Self {
         Self {
@@ -223,6 +232,7 @@ impl ApprovalRequest {
             header,
             detail,
             reason,
+            args,
             response_tx,
             metadata: None,
         }
@@ -251,6 +261,32 @@ pub struct AskUserRequest {
 }
 
 pub type AskUserRequestTx = mpsc::UnboundedSender<AskUserRequest>;
+
+/// Outcome of the plan-review overlay surfaced when the model calls
+/// `exit_plan_mode` without an explicit `approved` field.
+///
+/// The CLI side maps the user's choice into a permission mode (or
+/// keeps plan mode active) before the next turn boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanReviewDecision {
+    /// User approved and chose an execution mode.
+    Approve {
+        mode: crate::permission_manager::PermissionMode,
+    },
+    /// User wants to keep planning — provide feedback on next turn.
+    KeepPlanning,
+    /// Overlay was dismissed (Esc / channel closed).
+    Cancelled,
+}
+
+pub struct PlanReviewRequest {
+    /// Markdown body of the proposed plan, surfaced as scrollable
+    /// read-only content in the overlay.
+    pub plan_markdown: String,
+    pub response_tx: tokio::sync::oneshot::Sender<PlanReviewDecision>,
+}
+
+pub type PlanReviewRequestTx = mpsc::UnboundedSender<PlanReviewRequest>;
 
 /// Parameters for a single agentic chat turn — groups the many arguments
 /// to `stream_chat_sse` into a named struct to reduce cognitive load.
@@ -292,8 +328,6 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Unified skill registry (single source of truth for all skill resolution).
     pub(crate) unified_skill_registry:
         &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
-    /// When true, omit edge tools and inject plan-only system instructions (CLI `/plan on`).
-    pub(crate) plan_only_chat: bool,
     /// When true, this turn is executing a plan subtask — `when: task_completed` stop hooks apply.
     pub(crate) is_plan_subtask: bool,
     /// Sent on `/chat/turn` JSON so cloud can classify the turn like local `is_plan_subtask`.
@@ -321,6 +355,11 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) approval_request_tx: Option<ApprovalRequestTx>,
     /// Optional channel for native TUI ask_user prompts.
     pub(crate) ask_user_request_tx: Option<AskUserRequestTx>,
+    /// Optional channel for the dedicated `exit_plan_mode` overlay
+    /// (scrollable plan body + 4-way radio). Separate from
+    /// `ask_user_request_tx` so plan markdown does not have to be
+    /// shoehorned into the question/option layout.
+    pub(crate) plan_review_request_tx: Option<PlanReviewRequestTx>,
     /// MCP client manager for external tool servers.
     pub(crate) mcp_manager:
         Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
@@ -494,7 +533,6 @@ impl<'a> ChatTurnParams<'a> {
             latest_skill_diagnosis: None,
             latest_turn_quality_feedback: None,
             unified_skill_registry: ctx.unified_skill_registry,
-            plan_only_chat: false,
             is_plan_subtask: false,
             plan_subtask_id: None,
             delegation_engine: None,
@@ -504,6 +542,7 @@ impl<'a> ChatTurnParams<'a> {
             agent_live_event_sink: None,
             approval_request_tx: None,
             ask_user_request_tx: None,
+            plan_review_request_tx: None,
             mcp_manager: None,
             skill_search: ctx.skill_search,
             skill_quality_tracker,

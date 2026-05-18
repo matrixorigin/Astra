@@ -16,23 +16,19 @@ fn eprint_plan_execution_paused_hints() {
     eprintln!("{}", "  What you can do:".dim());
     eprintln!(
         "    {}",
-        "continue · resume · next · go · 继续 — resume execution from this point".dim()
+        "Slash lines keep the paused plan in memory so you can inspect or edit it.".dim()
     );
     eprintln!(
         "    {}",
-        "Lines starting with / — run a slash command; the paused plan stays in memory".dim()
+        "After edits, start execution again from the current plan state.".dim()
     );
     eprintln!(
         "    {}",
-        "Any other message — abandons the plan and sends it as a normal chat turn".dim()
+        "Any other message — abandons the paused run and sends a normal chat turn".dim()
     );
     eprintln!(
         "    {}",
-        "Step-by-step mode: at \"Execute this subtask?\", use skip to defer one subtask".dim()
-    );
-    eprintln!(
-        "    {}",
-        "correct … / note … / adjust … — stack guidance for upcoming subtasks (correct clear to drop)"
+        "correct … / note … / adjust … — stack guidance for the next run (correct clear to drop)"
             .dim()
     );
     eprintln!(
@@ -133,7 +129,7 @@ fn emit_plan_lifecycle_event(
 enum PlanMonitorOutcome {
     /// Normal drain — more updates may follow.
     Continue,
-    /// `PlanPaused` received — executor is waiting for Resume/Cancel.
+    /// `PlanPaused` received — return control to the caller with the current plan intact.
     Paused,
     /// `PlanCompleted` or `PlanError` received — executor has exited.
     Finished,
@@ -301,7 +297,7 @@ fn display_plan_updates_live(
                         st.status = status;
                     }
                 }
-                if let Some(ref mut ps) = state.plan_mode {
+                if let Some(ref mut ps) = state.cloud_plan_mirror {
                     if let Some(st) = ps.plan.subtasks.iter_mut().find(|s| s.id == id) {
                         st.status = status;
                     }
@@ -372,7 +368,7 @@ fn display_plan_updates_live(
                     eprintln!();
                     durable_bridge::display_delivery_report(report);
                 }
-                if state.plan_mode.is_some() {
+                if state.plan_mode_active() {
                     eprintln!();
                     eprintln!(
                         "{}",
@@ -416,15 +412,18 @@ fn display_plan_updates_live(
                     &mut state.plan_thinking_pane,
                     msg,
                 );
-                if state.plan_mode.is_some() {
+                if state.plan_mode_active() {
                     eprintln!();
                     eprintln!("{}  {}", "📋".magenta(), "Recovery options:".bold());
-                    eprintln!("{}", "    resume      — retry from where it stopped".dim());
+                    eprintln!("{}", "    go          — run the current plan again".dim());
                     eprintln!(
                         "{}",
                         "    rewind N    — reset subtask N and try again".dim()
                     );
-                    eprintln!("{}", "    correct ... — add guidance before resuming".dim());
+                    eprintln!(
+                        "{}",
+                        "    correct ... — add guidance before the next run".dim()
+                    );
                     eprintln!("{}", "    show        — display current plan state".dim());
                     eprintln!("{}", "    exit        — leave plan mode".dim());
                 }
@@ -870,7 +869,7 @@ pub(crate) fn flush_plan_updates_between_prompts(state: &mut SessionState) -> bo
     outcome == PlanMonitorOutcome::Finished
 }
 
-/// Clear REPL state when the plan update channel closed without `PlanCompleted` / `PlanError`.
+/// Clear plan-monitor state when the update channel closed without `PlanCompleted` / `PlanError`.
 /// Emits structured journal events so the failure is observable in telemetry.
 fn cleanup_orphan_plan_executor(state: &mut SessionState, plan_spinner: &mut Option<PlanSpinner>) {
     if let Some(s) = plan_spinner.take() {
@@ -935,7 +934,7 @@ fn cleanup_orphan_plan_executor(state: &mut SessionState, plan_spinner: &mut Opt
     );
 }
 
-/// Block the REPL until the plan executor finishes, pauses, or errors.
+/// Block the CLI until the plan executor finishes, pauses, or errors.
 ///
 /// Replaces the old "fire and forget" background model: the user cannot type
 /// at the prompt while a plan is running. First Ctrl+C sends Pause; a second
@@ -958,6 +957,11 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut SessionState) {
                 break;
             }
             PlanMonitorOutcome::Paused => {
+                if state.plan_handle.as_ref().is_some_and(|h| h.is_finished())
+                    && let Some(mut h) = state.plan_handle.take()
+                {
+                    while h.try_recv().is_some() {}
+                }
                 break;
             }
             PlanMonitorOutcome::Continue => {}
@@ -977,7 +981,7 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut SessionState) {
         }
 
         if state.pending_approval.is_some() {
-            // Issue #326 P0 (tui-only) / #331: with the REPL gone,
+            // Issue #326 P0 (tui-only) / #331: with the old REPL path gone,
             // plan_monitor no longer prompts on stdin. The approval
             // is owned by the TUI's bottom_pane queue (which receives
             // it via the same response_tx channel pending_approval
@@ -1044,7 +1048,7 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut SessionState) {
         pane.clear();
     }
 
-    if state.plan_handle.is_some() {
+    if state.executing_plan.is_some() {
         eprint_plan_execution_paused_hints();
     }
 }
@@ -1107,7 +1111,7 @@ fn sync_subtask_status(
             st.status = status;
         }
     }
-    if let Some(ref mut ps) = state.plan_mode {
+    if let Some(ref mut ps) = state.cloud_plan_mirror {
         if let Some(st) = ps.plan.subtasks.iter_mut().find(|s| s.id == subtask_id) {
             st.status = status;
         }
@@ -1167,7 +1171,7 @@ async fn sync_task_board_from_executing_plan(state: &SessionState) {
     };
     if let Some(goal) = state.executing_plan_goal.as_deref()
         && let Err(error) =
-            crate::plan_interaction::mirror_plan_to_task_board(state, goal, plan).await
+            crate::plan_task_board::mirror_plan_to_task_board(state, goal, plan).await
     {
         tracing::warn!(
             goal = %goal,
@@ -1175,7 +1179,7 @@ async fn sync_task_board_from_executing_plan(state: &SessionState) {
             "failed to ensure executing plan is mirrored into task board"
         );
     }
-    let plan_fingerprint = crate::plan_interaction::plan_task_board_fingerprint(plan);
+    let plan_fingerprint = crate::plan_task_board::plan_task_board_fingerprint(plan);
     for subtask in &plan.subtasks {
         if let Err(error) =
             sync_task_board_subtask_status(state, &plan_fingerprint, &subtask.id, subtask.status)
@@ -1247,7 +1251,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let plan_fingerprint = crate::plan_interaction::plan_task_board_fingerprint(&plan);
+        let plan_fingerprint = crate::plan_task_board::plan_task_board_fingerprint(&plan);
         let create = state
             .task_manager
             .create(&serde_json::json!({
@@ -1296,7 +1300,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        crate::plan_interaction::mirror_plan_to_task_board(&state, "same goal", &stale)
+        crate::plan_task_board::mirror_plan_to_task_board(&state, "same goal", &stale)
             .await
             .unwrap();
 
@@ -1309,7 +1313,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        crate::plan_interaction::mirror_plan_to_task_board(&state, "same goal", &current)
+        crate::plan_task_board::mirror_plan_to_task_board(&state, "same goal", &current)
             .await
             .unwrap();
         state.executing_plan = Some(current);

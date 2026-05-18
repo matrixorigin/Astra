@@ -269,7 +269,9 @@ impl PermissionRule {
 
     /// Check if this rule matches a fully-described tool call.
     pub fn matches_with_context(&self, tool_name: &str, ctx: &RuleMatchContext) -> bool {
-        if self.tool != tool_name.to_lowercase() {
+        if self.tool != tool_name.to_lowercase()
+            && !file_write_family_matches(&self.tool, tool_name, ctx)
+        {
             return false;
         }
         if let Some(expected) = &self.op
@@ -377,6 +379,20 @@ impl PermissionRule {
             (Some(_), None) => false, // Pattern rule but no command to match
         }
     }
+}
+
+fn file_write_family_matches(rule_tool: &str, tool_name: &str, ctx: &RuleMatchContext) -> bool {
+    rule_tool == "edit"
+        && matches!(
+            crate::cloud_approval_policy::cloud_gated_tool_kind(tool_name),
+            Some(crate::cloud_approval_policy::CloudGatedToolKind::Write)
+        )
+        && ctx
+            .op
+            .as_deref()
+            .is_some_and(|op| op.eq_ignore_ascii_case("write"))
+        && ctx.path.is_some()
+        && crate::tool_categories::registry().is_file_op(tool_name)
 }
 
 /// Context for v2 permission-rule matching.
@@ -1304,7 +1320,12 @@ mod tests {
         };
 
         assert!(rule.matches_with_context("edit", &write_ctx));
+        assert!(rule.matches_with_context("write_file", &write_ctx));
+        assert!(rule.matches_with_context("str_replace", &write_ctx));
         assert!(!rule.matches_with_context("edit", &read_ctx));
+        assert!(!rule.matches_with_context("read_file", &read_ctx));
+        assert!(!rule.matches_with_context("read_file", &write_ctx));
+        assert!(!rule.matches_with_context("github", &write_ctx));
     }
 
     #[test]

@@ -143,8 +143,7 @@ pub trait ToolHook: Send + Sync {
 
     /// Return `false` to skip this hook for the current tool call. Default
     /// applies to every tool.
-    #[allow(unused_variables)]
-    fn applies_to(&self, tool_name: &str) -> bool {
+    fn applies_to(&self, _tool_name: &str) -> bool {
         true
     }
 

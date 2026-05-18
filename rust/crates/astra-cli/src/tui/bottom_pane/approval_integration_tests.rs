@@ -28,6 +28,7 @@ fn enqueue(bp: &mut BottomPane, tool: &str) -> oneshot::Receiver<ApprovalRespons
         format!("{tool} needs approval"),
         None,
         "unknown".into(),
+        serde_json::Value::Null,
         tx,
     );
     rx
@@ -54,6 +55,7 @@ fn enqueue_grouped(
         format!("{tool} needs approval"),
         None,
         "unknown".into(),
+        serde_json::Value::Null,
         tx,
         ApprovalMetadata::default().with_batch_group_key(group),
     );

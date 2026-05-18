@@ -2,17 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::cache_diagnostics::CacheBreakReason;
 use crate::token_accounting::TokenAccounting;
-
-/// Reason a cache break was detected.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CacheBreakReason {
-    SystemPromptChanged,
-    ToolSchemaChanged,
-    LatchFlip { header_name: String },
-    ModelChanged,
-    UnknownColdStart,
-}
 
 /// Feedback from a single API response. Produced by Execute, consumed by
 /// PipelineStats::record().
@@ -115,10 +106,18 @@ mod tests {
     fn attribute_replaces_unknown() {
         let mut f = ContextFeedback::from_usage(0, 0, 5000, 100, false);
         f.detect_cache_break(2, 1000);
-        f.attribute_cache_break(CacheBreakReason::ToolSchemaChanged);
+        f.attribute_cache_break(CacheBreakReason::ToolSchemasChanged {
+            added: vec!["bash".to_string()],
+            removed: Vec::new(),
+            changed: Vec::new(),
+        });
         assert_eq!(
             f.cache_break_detected,
-            Some(CacheBreakReason::ToolSchemaChanged)
+            Some(CacheBreakReason::ToolSchemasChanged {
+                added: vec!["bash".to_string()],
+                removed: Vec::new(),
+                changed: Vec::new(),
+            })
         );
     }
 }

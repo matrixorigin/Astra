@@ -72,6 +72,18 @@ const RUN_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Safety valve for retryable lifecycle poll failures to avoid indefinite hung streams.
 const MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS: u32 = 300;
 
+fn ws_connection_limit_reached_with(current: usize) -> bool {
+    current >= MAX_WS_CONNECTIONS
+}
+
+fn ws_connection_limit_reached() -> bool {
+    ws_connection_limit_reached_with(WS_CONNECTION_COUNT.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn should_echo_close_frame(message: Option<&Result<Message, axum::Error>>) -> bool {
+    matches!(message, Some(Ok(Message::Close(_))) | None)
+}
+
 // ─── Client Message Types ────────────────────────────────────────────────────
 
 /// Messages sent from browser client to server.
@@ -299,8 +311,7 @@ pub(super) async fn ws_chat_handler(
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     // Reject if at connection limit
-    let current = WS_CONNECTION_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-    if current >= MAX_WS_CONNECTIONS {
+    if ws_connection_limit_reached() {
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "too many WebSocket connections",
@@ -605,10 +616,11 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                     Some(Ok(Message::Ping(data))) => {
                         let _ = socket.send(Message::Pong(data)).await;
                     }
-                    Some(Ok(Message::Close(_))) | None => {
+                    msg @ (Some(Ok(Message::Close(_))) | None) => {
                         // audit-#9: echo a Close frame so the peer knows we
                         // observed the closure and isn't left waiting on a
                         // reciprocal frame before tearing down the TCP socket.
+                        debug_assert!(should_echo_close_frame(msg.as_ref()));
                         let _ = socket.send(Message::Close(None)).await;
                         break;
                     }
@@ -705,6 +717,7 @@ async fn handle_chat_message(
 
     // Try RunLifecycleService first (server-side agentic loop)
     match state
+        .execution
         .run_lifecycle_service
         .create_run(conn.user.user_id.clone(), request)
         .await
@@ -747,6 +760,7 @@ async fn handle_cancel_run(
     run_id: &str,
 ) {
     match state
+        .execution
         .run_lifecycle_service
         .cancel_run(run_id.to_string(), conn.user.user_id.clone())
         .await
@@ -768,6 +782,7 @@ async fn handle_pause_run(
     emit_ack: bool,
 ) {
     match state
+        .execution
         .run_lifecycle_service
         .pause_run(run_id.to_string(), conn.user.user_id.clone())
         .await
@@ -797,6 +812,7 @@ async fn handle_resume_run(
     emit_ack: bool,
 ) {
     match state
+        .execution
         .run_lifecycle_service
         .resume_run(run_id.to_string(), conn.user.user_id.clone())
         .await
@@ -1180,6 +1196,7 @@ fn lifecycle_events_to_ws_payloads(
 
 async fn best_effort_cancel_run(state: &AppState, conn: &WsConnection, run_id: &str) {
     let _ = state
+        .execution
         .run_lifecycle_service
         .cancel_run(run_id.to_string(), conn.user.user_id.clone())
         .await;
@@ -1332,6 +1349,7 @@ async fn stream_run_over_websocket(
             _ = poll.tick() => {
                 // ── Phase E: Forward pending approval requests to client ──
                 for req in state
+                    .execution
                     .run_lifecycle_service
                     .drain_approval_requests(run_id)
                     .await
@@ -1354,6 +1372,7 @@ async fn stream_run_over_websocket(
                 }
 
                 for req in state
+                    .execution
                     .run_lifecycle_service
                     .drain_user_prompt_requests(run_id)
                     .await
@@ -1384,6 +1403,7 @@ async fn stream_run_over_websocket(
 
                 // ── Phase F.3: Forward pending progress events to client ──
                 for evt in state
+                    .execution
                     .run_lifecycle_service
                     .drain_progress_events(run_id)
                     .await
@@ -1469,6 +1489,7 @@ async fn stream_run_over_websocket(
                 }
 
                 let events = match state
+                    .execution
                     .run_lifecycle_service
                     .stream_run(run_id.to_string(), conn.user.user_id.clone(), last_index)
                     .await
@@ -1577,6 +1598,7 @@ async fn stream_run_over_websocket(
                 }
 
                 let status = match state
+                    .execution
                     .run_lifecycle_service
                     .get_run_status(run_id.to_string(), conn.user.user_id.clone())
                     .await
@@ -4297,34 +4319,20 @@ mod tests {
         );
     }
 
-    /// audit-#9: the message loop must echo a Close frame back to the peer
-    /// before tearing the socket down so the WebSocket close handshake completes.
     #[test]
-    fn message_loop_echoes_close_frame() {
-        let source = include_str!("ws_handler.rs");
-        let needle = "Some(Ok(Message::Close(_))) | None =>";
-        let idx = source.find(needle).expect("close arm present");
-        let arm = &source[idx..idx + 400];
-        assert!(
-            arm.contains("socket.send(Message::Close(None))"),
-            "WS message_loop must echo a Close frame before breaking"
-        );
+    fn should_echo_close_frame_for_close_or_eof() {
+        let close = Ok(Message::Close(None));
+        let ping = Ok(Message::Ping(Vec::new().into()));
+
+        assert!(should_echo_close_frame(Some(&close)));
+        assert!(should_echo_close_frame(None));
+        assert!(!should_echo_close_frame(Some(&ping)));
     }
 
-    /// U4: ws_chat_handler must enforce a connection limit to prevent
-    /// fd/memory exhaustion from connection floods.
     #[test]
-    fn ws_handler_has_connection_limit() {
-        let source = include_str!("ws_handler.rs");
-        let test_start = source.find("mod tests {").unwrap_or(source.len());
-        let prod_code = &source[..test_start];
-        assert!(
-            prod_code.contains("MAX_WS_CONNECTIONS"),
-            "ws_chat_handler must check a connection limit"
-        );
-        assert!(
-            prod_code.contains("WS_CONNECTION_COUNT"),
-            "ws_connection_loop must track active connections"
-        );
+    fn ws_connection_limit_reached_at_threshold() {
+        assert!(!ws_connection_limit_reached_with(MAX_WS_CONNECTIONS - 1));
+        assert!(ws_connection_limit_reached_with(MAX_WS_CONNECTIONS));
+        assert!(ws_connection_limit_reached_with(MAX_WS_CONNECTIONS + 1));
     }
 }

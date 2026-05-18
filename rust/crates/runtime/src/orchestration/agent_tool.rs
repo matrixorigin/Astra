@@ -27,6 +27,8 @@ pub struct AgentToolContext {
     pub current_model: Option<String>,
     /// Current nested agent/sub-run depth of the agent.
     pub recursion_depth: u8,
+    /// Whether this agent already inherited a fork prefix.
+    pub is_fork_child: bool,
     /// Working directory inherited by the child unless isolation changes it.
     pub working_dir: PathBuf,
     /// Shared lifecycle owner for dynamic child agents.
@@ -105,11 +107,12 @@ pub async fn handle_agent_spawn_tool(args: &Value, ctx: Option<&AgentToolContext
     }
 
     let mut inherited_permissions = ctx.inherited_permissions.clone();
-    inherited_permissions.is_background = input.background;
+    inherited_permissions.is_background = input.run_in_background;
     let spawn_ctx = SpawnContext {
         parent_run_id: ctx.run_id.clone(),
         parent_agent_id: ctx.agent_id.clone(),
         recursion_depth: ctx.recursion_depth,
+        parent_is_fork_child: ctx.is_fork_child,
         working_dir: ctx.working_dir.clone(),
         inherited_permissions: Some(inherited_permissions),
         inherited_skills: ctx.active_skills.clone(),
@@ -495,7 +498,7 @@ mod tests {
         }))
         .unwrap();
         let input: SpawnAgentInput = serde_json::from_value(normalized).unwrap();
-        assert!(input.background);
+        assert!(input.run_in_background);
     }
 
     #[tokio::test]
@@ -563,6 +566,7 @@ mod tests {
             agent_id: "root-agent".into(),
             current_model: current_model.map(str::to_string),
             recursion_depth: 0,
+            is_fork_child: false,
             working_dir: PathBuf::from("."),
             spawner,
             inherited_permissions: InheritedPermissions::auto_approve(),

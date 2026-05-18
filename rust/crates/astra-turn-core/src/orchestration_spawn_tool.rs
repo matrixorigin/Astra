@@ -46,6 +46,7 @@ pub struct SpawnAgentInput {
 
     /// Agent type: "explore", "code-review", "task", "general-purpose".
     #[serde(default = "default_agent_type")]
+    #[serde(alias = "type")]
     pub agent_type: String,
 
     /// Optional model override.
@@ -54,20 +55,14 @@ pub struct SpawnAgentInput {
     /// Run in background (async). Default false — synchronous mode
     /// ensures the parent receives the child's result in the tool-call
     /// response before its turn budget is consumed.
-    ///
-    /// Accepts both `background` (legacy) and `run_in_background`
-    /// (claude-code-style) as wire keys.
-    #[serde(
-        default,
-        alias = "run_in_background",
-        deserialize_with = "deserialize_bool_lenient"
-    )]
-    pub background: bool,
+    #[serde(default, deserialize_with = "deserialize_bool_lenient")]
+    pub run_in_background: bool,
 
     /// Name for agent-to-agent messaging.
     pub name: Option<String>,
 
     /// Max turns before auto-stopping.
+    #[serde(default, deserialize_with = "deserialize_option_u32_lenient")]
     pub max_turns: Option<u32>,
 
     /// Max output tokens for the child's first API call. When a
@@ -76,6 +71,7 @@ pub struct SpawnAgentInput {
     /// clamp the effective thinking budget below the captured
     /// parent value (cache key drift).
     #[serde(default)]
+    #[serde(deserialize_with = "deserialize_option_u32_lenient")]
     pub max_output_tokens: Option<u32>,
 
     /// Create isolated git worktree for this agent.
@@ -96,7 +92,11 @@ pub struct SpawnAgentInput {
     /// spec instead of the whole tool call failing with a schema
     /// validation error. Proper JSON objects continue to parse as
     /// before.
-    #[serde(default, deserialize_with = "deserialize_inherit_prefix_lenient")]
+    #[serde(
+        default,
+        alias = "inherit_context",
+        deserialize_with = "deserialize_inherit_prefix_lenient"
+    )]
     pub inherit_prefix: Option<InheritPrefixSpec>,
 
     /// Optional task-complexity hint used to scale the default
@@ -120,7 +120,7 @@ pub struct SpawnAgentInput {
 /// Lenient bool deserializer: accepts `true`, `false`, `"true"`,
 /// `"false"`, `"1"`, `"0"`, `1`, `0`, or null/absent (→ false).
 /// LLMs frequently serialize booleans as strings (session 7e3fecb5:
-/// `"background": "true"` caused 3 consecutive InvalidInput errors
+/// `"run_in_background": "true"` caused 3 consecutive InvalidInput errors
 /// that triggered ToolHealthTracker restriction).
 fn deserialize_bool_lenient<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
@@ -175,6 +175,55 @@ where
         }
     }
     deserializer.deserialize_any(BoolVisitor)
+}
+
+/// Lenient optional-u32 deserializer: accepts bare integers, quoted
+/// decimal strings like `"10"`, null, or absence.
+///
+/// Models sometimes stringify numeric inputs (`"max_turns":"10"`)
+/// which default serde rejects with `invalid type: string "10",
+/// expected u32`, failing the whole spawn call before the child can
+/// launch. Accept only canonical non-negative integer strings; reject
+/// floats, negatives, empty strings, and non-scalar types.
+fn deserialize_option_u32_lenient<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(number) => {
+            let raw = number
+                .as_u64()
+                .ok_or_else(|| Error::custom("expected a non-negative integer"))?;
+            let parsed = u32::try_from(raw)
+                .map_err(|_| Error::custom(format!("integer out of range for u32: {raw}")))?;
+            Ok(Some(parsed))
+        }
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Err(Error::custom(
+                    "unrecognized integer string: \"\" (expected decimal digits)",
+                ));
+            }
+            let raw = trimmed.parse::<u64>().map_err(|_| {
+                Error::custom(format!(
+                    "unrecognized integer string: \"{trimmed}\" (expected decimal digits)"
+                ))
+            })?;
+            let parsed = u32::try_from(raw)
+                .map_err(|_| Error::custom(format!("integer out of range for u32: {raw}")))?;
+            Ok(Some(parsed))
+        }
+        serde_json::Value::Bool(_) => Err(Error::custom("expected integer; got bool")),
+        serde_json::Value::Array(_) => Err(Error::custom("expected integer; got array")),
+        serde_json::Value::Object(_) => Err(Error::custom("expected integer; got object")),
+    }
 }
 
 /// Lenient deserializer for `inherit_prefix`: accepts a JSON object
@@ -248,7 +297,7 @@ impl Default for SpawnAgentInput {
             prompt: String::new(),
             agent_type: default_agent_type(),
             model: None,
-            background: false,
+            run_in_background: false,
             name: None,
             max_turns: None,
             max_output_tokens: None,
@@ -438,7 +487,7 @@ pub fn spawn_agent_schema() -> serde_json::Value {
                         "type": "string",
                         "description": "Optional model override."
                     },
-                    "background": {
+                    "run_in_background": {
                         "type": "boolean",
                         "description": "If true, return immediately with agent_id and you MUST call get_agent_result(agent_id) to collect the output. Default false waits for the result synchronously.",
                         "default": false
@@ -482,6 +531,21 @@ pub fn spawn_agent_schema() -> serde_json::Value {
                                 "default": false
                             }
                         }
+                    },
+                    "inherit_context": {
+                        "type": "object",
+                        "description": "Alias for inherit_prefix. Prefer inherit_prefix in generated calls; accepted for product-facing P0 wording.",
+                        "properties": {
+                            "from_run_id": {
+                                "type": "string",
+                                "description": "Parent run id. Omit to use the caller's run."
+                            },
+                            "required": {
+                                "type": "boolean",
+                                "description": "If true, fail when the prefix is missing or incompatible. Default false.",
+                                "default": false
+                            }
+                        }
                     }
                 },
                 "required": ["description", "prompt"]
@@ -508,9 +572,9 @@ mod tests {
         let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
         assert_eq!(input.description, "Test");
         assert_eq!(input.agent_type, "general-purpose");
-        // Default is synchronous (background=false) so the parent
+        // Default is synchronous (run_in_background=false) so the parent
         // receives the child's result in the tool-call response.
-        assert!(!input.background);
+        assert!(!input.run_in_background);
         // Inheritance defaults to None — existing clients get no
         // behavior change when they don't set inherit_prefix.
         assert!(input.inherit_prefix.is_none());
@@ -518,39 +582,40 @@ mod tests {
     }
 
     #[test]
-    fn background_default_is_false() {
+    fn agent_type_accepts_legacy_type_alias() {
+        let json = r#"{"description":"Test","prompt":"Do the thing","type":"task"}"#;
+        let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.agent_type, "task");
+    }
+
+    #[test]
+    fn run_in_background_default_is_false() {
         let input = SpawnAgentInput::default();
         assert!(
-            !input.background,
-            "background must default to false — synchronous spawn \
+            !input.run_in_background,
+            "run_in_background must default to false — synchronous spawn \
              ensures the parent receives the child's result before \
              its turn budget is consumed"
         );
     }
 
     #[test]
-    fn background_true_requires_explicit_opt_in() {
-        let json = r#"{"description": "D", "prompt": "P", "background": true}"#;
+    fn run_in_background_true_requires_explicit_opt_in() {
+        let json = r#"{"description": "D", "prompt": "P", "run_in_background": true}"#;
         let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
         assert!(
-            input.background,
-            "explicit background: true must be honored"
+            input.run_in_background,
+            "explicit run_in_background: true must be honored"
         );
     }
 
     #[test]
-    fn run_in_background_alias_maps_to_background_field() {
-        // The tool schema advertises `run_in_background` (claude-code
-        // style). Some models primed on that name will emit that key
-        // instead of the legacy `background`. Both must route to the
-        // same boolean — otherwise the sync-default promise breaks
-        // silently for any caller that uses the schema-documented
-        // name.
+    fn run_in_background_populates_canonical_field() {
         let json = r#"{"description": "D", "prompt": "P", "run_in_background": true}"#;
         let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
         assert!(
-            input.background,
-            "run_in_background alias must populate the background field"
+            input.run_in_background,
+            "run_in_background must populate the canonical field"
         );
     }
 
@@ -559,7 +624,7 @@ mod tests {
         let json = r#"{"description": "D", "prompt": "P", "run_in_background": false}"#;
         let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
         assert!(
-            !input.background,
+            !input.run_in_background,
             "run_in_background: false must produce the sync-default spawn"
         );
     }
@@ -608,7 +673,66 @@ mod tests {
         let schema = spawn_agent_schema();
         let props = &schema["function"]["parameters"]["properties"];
         assert!(props["inherit_prefix"].is_object());
+        assert!(
+            props["inherit_context"].is_object(),
+            "schema must expose the product-facing inherit_context alias"
+        );
         assert!(props["max_output_tokens"].is_object());
+    }
+
+    #[test]
+    fn inherit_context_alias_populates_inherit_prefix() {
+        let json = r#"{
+            "description": "D",
+            "prompt": "P",
+            "inherit_context": {"required": true}
+        }"#;
+        let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
+        let spec = input
+            .inherit_prefix
+            .expect("inherit_context must opt into prefix inheritance");
+        assert!(spec.required);
+        assert_eq!(spec.from_run_id, None);
+    }
+
+    #[test]
+    fn inherit_context_conflicts_with_inherit_prefix() {
+        let err = serde_json::from_str::<SpawnAgentInput>(
+            r#"{
+                "description": "D",
+                "prompt": "P",
+                "inherit_prefix": {"required": false},
+                "inherit_context": {"required": true}
+            }"#,
+        )
+        .expect_err("ambiguous dual inheritance fields must fail");
+        assert!(
+            err.to_string().contains("duplicate field"),
+            "error should reject conflicting inheritance aliases as duplicate fields, got: {err}"
+        );
+    }
+
+    #[test]
+    fn inherit_context_alias_accepts_empty_object_string() {
+        let input: SpawnAgentInput =
+            serde_json::from_str(r#"{"description":"d","prompt":"p","inherit_context":"{}"}"#)
+                .unwrap();
+        let spec = input
+            .inherit_prefix
+            .expect("inherit_context alias should use the same lenient parser");
+        assert_eq!(spec.from_run_id, None);
+        assert!(!spec.required);
+    }
+
+    #[test]
+    fn inherit_context_alias_accepts_null() {
+        let input: SpawnAgentInput =
+            serde_json::from_str(r#"{"description":"d","prompt":"p","inherit_context":null}"#)
+                .unwrap();
+        assert!(
+            input.inherit_prefix.is_none(),
+            "null alias should behave like null inherit_prefix"
+        );
     }
 
     #[test]
@@ -754,29 +878,30 @@ mod bool_lenient_tests {
     use super::SpawnAgentInput;
 
     #[test]
-    fn background_accepts_string_true() {
+    fn run_in_background_accepts_string_true() {
         // Regression (session 7e3fecb5): LLM passed "true" (string)
         // instead of true (bool) → serde rejected → 3 failures →
         // tool restricted. Lenient deserializer fixes this.
-        let input: SpawnAgentInput =
-            serde_json::from_str(r#"{"description":"test","prompt":"p","background":"true"}"#)
-                .expect("string 'true' must deserialize");
-        assert!(input.background);
+        let input: SpawnAgentInput = serde_json::from_str(
+            r#"{"description":"test","prompt":"p","run_in_background":"true"}"#,
+        )
+        .expect("string 'true' must deserialize");
+        assert!(input.run_in_background);
     }
 
     #[test]
-    fn background_accepts_bool_true() {
+    fn run_in_background_accepts_bool_true() {
         let input: SpawnAgentInput =
-            serde_json::from_str(r#"{"description":"test","prompt":"p","background":true}"#)
+            serde_json::from_str(r#"{"description":"test","prompt":"p","run_in_background":true}"#)
                 .expect("bool true must deserialize");
-        assert!(input.background);
+        assert!(input.run_in_background);
     }
 
     #[test]
-    fn background_defaults_false_on_absence() {
+    fn run_in_background_defaults_false_on_absence() {
         let input: SpawnAgentInput = serde_json::from_str(r#"{"description":"test","prompt":"p"}"#)
-            .expect("absent background must default to false");
-        assert!(!input.background);
+            .expect("absent run_in_background must default to false");
+        assert!(!input.run_in_background);
     }
 
     #[test]
@@ -788,12 +913,12 @@ mod bool_lenient_tests {
     }
 
     #[test]
-    fn background_rejects_unknown_string() {
+    fn run_in_background_rejects_unknown_string() {
         // Contract: only {true,false,1,0,yes,no} are accepted. Anything
         // else must error instead of silently defaulting to false — so
         // genuine LLM bugs surface rather than masquerading as success.
         let err = serde_json::from_str::<SpawnAgentInput>(
-            r#"{"description":"test","prompt":"p","background":"maybe"}"#,
+            r#"{"description":"test","prompt":"p","run_in_background":"maybe"}"#,
         )
         .expect_err("unknown string must be rejected");
         assert!(
@@ -803,22 +928,22 @@ mod bool_lenient_tests {
     }
 
     #[test]
-    fn background_rejects_empty_string() {
+    fn run_in_background_rejects_empty_string() {
         // Regression guard: empty string used to coerce to `false`,
-        // hiding malformed `"background": ""` input. Now must error.
+        // hiding malformed `"run_in_background": ""` input. Now must error.
         let err = serde_json::from_str::<SpawnAgentInput>(
-            r#"{"description":"test","prompt":"p","background":""}"#,
+            r#"{"description":"test","prompt":"p","run_in_background":""}"#,
         )
         .expect_err("empty string must be rejected");
         assert!(err.to_string().contains("unrecognized boolean string"));
     }
 
     #[test]
-    fn background_rejects_arbitrary_integer() {
+    fn run_in_background_rejects_arbitrary_integer() {
         // Contract: only 0/1 are accepted. `42` used to silently
         // coerce to `true`; now must error.
         let err = serde_json::from_str::<SpawnAgentInput>(
-            r#"{"description":"test","prompt":"p","background":42}"#,
+            r#"{"description":"test","prompt":"p","run_in_background":42}"#,
         )
         .expect_err("arbitrary integer must be rejected");
         assert!(
@@ -828,10 +953,50 @@ mod bool_lenient_tests {
     }
 
     #[test]
-    fn background_accepts_integer_one() {
+    fn run_in_background_accepts_integer_one() {
         let input: SpawnAgentInput =
-            serde_json::from_str(r#"{"description":"test","prompt":"p","background":1}"#)
+            serde_json::from_str(r#"{"description":"test","prompt":"p","run_in_background":1}"#)
                 .expect("integer 1 must deserialize to true");
-        assert!(input.background);
+        assert!(input.run_in_background);
+    }
+}
+
+#[cfg(test)]
+mod u32_lenient_tests {
+    use super::SpawnAgentInput;
+
+    #[test]
+    fn max_turns_accepts_string_integer() {
+        let input: SpawnAgentInput =
+            serde_json::from_str(r#"{"description":"test","prompt":"p","max_turns":"10"}"#)
+                .expect("string '10' must deserialize");
+        assert_eq!(input.max_turns, Some(10));
+    }
+
+    #[test]
+    fn max_output_tokens_accepts_string_integer() {
+        let input: SpawnAgentInput = serde_json::from_str(
+            r#"{"description":"test","prompt":"p","max_output_tokens":"8000"}"#,
+        )
+        .expect("string max_output_tokens must deserialize");
+        assert_eq!(input.max_output_tokens, Some(8000));
+    }
+
+    #[test]
+    fn max_turns_rejects_empty_string() {
+        let err = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"test","prompt":"p","max_turns":""}"#,
+        )
+        .expect_err("empty string must not silently coerce");
+        assert!(err.to_string().contains("unrecognized integer string"));
+    }
+
+    #[test]
+    fn max_turns_rejects_float_string() {
+        let err = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"test","prompt":"p","max_turns":"10.5"}"#,
+        )
+        .expect_err("float string must not deserialize as u32");
+        assert!(err.to_string().contains("unrecognized integer string"));
     }
 }

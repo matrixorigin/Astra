@@ -139,9 +139,8 @@ mod tests {
         summary.tool_failures.insert("grep".into(), 5);
         summary.stall_events = 3;
         summary.user_corrections = vec!["fix a".into(), "fix b".into()];
-        summary.unmet_postconditions = 4;
 
         cp.maybe_checkpoint(&summary, 10, "u1", "generic", None);
-        assert_eq!(cp.recorded_count(), 4); // tool + stall + corrections + postconditions
+        assert_eq!(cp.recorded_count(), 3); // tool + stall + corrections
     }
 }

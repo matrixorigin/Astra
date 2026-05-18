@@ -799,14 +799,20 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             if state.telemetry.initial_skill_selector_shortlist.is_none() {
                 state.telemetry.initial_skill_selector_shortlist = Some(());
             }
-            crate::prompts::build_skill_listing_section_for_model(&full, model_hint.as_deref()).map(
-                |section| {
-                    serde_json::json!({
-                        "role": "system",
-                        "content": section.text,
-                    })
-                },
+            let agent_spawn_available = host
+                .capabilities()
+                .has(astra_turn_core::capability::Capability::AgentSpawner);
+            crate::prompts::build_skill_listing_section_with_caps(
+                &full,
+                model_hint.as_deref(),
+                agent_spawn_available,
             )
+            .map(|section| {
+                serde_json::json!({
+                    "role": "system",
+                    "content": section.text,
+                })
+            })
         };
     }
 

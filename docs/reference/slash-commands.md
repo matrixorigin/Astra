@@ -143,27 +143,21 @@ Session management.
 /session export                  # Export to Markdown
 ```
 
-### `/plan [subcommand]`
+### `/plan [description]`
 Structured planning mode for complex tasks.
 
-| Subcommand | Description |
-|------------|-------------|
-| (none) | Enter plan mode with a goal |
-| `go` | Execute plan automatically |
-| `step` | Execute one step at a time |
-| `status` | Show plan progress |
-| `show` | Display current plan |
-| `pause` | Pause execution |
-| `resume` | Resume execution |
-| `exit` | Exit plan mode |
-| `help` | Show plan commands |
+| Form | Description |
+|------|-------------|
+| `/plan` | Enter plan mode, or leave it if already in `plan>` |
+| `/plan <description>` | Enter plan mode and immediately start planning that goal |
 
 ```
 /plan Build a REST API           # Start planning
-/plan go                         # Auto-execute
-/plan step                       # Step-by-step
-/plan exit                       # Leave plan mode
+/plan                            # Enter or leave plan mode
 ```
+
+Inside `plan>` mode, use plain commands like `execute`, `step`, `status`, `show`,
+`pause`, `resume`, `cancel`, and `help`.
 
 ### `/report [save]`
 Show the last delivery report from plan execution.
@@ -276,14 +270,14 @@ Auto-tuning status and history.
 | `reset` | Reset tuning state |
 
 ### `/sync [subcommand]`
-Cloud sync status and operations.
+Cloud sync status hint. Sync orchestration is server-owned; the CLI no longer opens MatrixOne connections or forces sync domains directly.
 
 | Subcommand | Description |
 |------------|-------------|
-| (none) | Show sync status |
-| `log` | Recent sync events |
-| `push` | Force push to cloud |
-| `pull` | Pull from cloud |
+| (none) | Explain server-owned sync status |
+| `log` | Point to server/API diagnostics |
+| `push` | Deprecated; no direct CLI DB operation |
+| `pull` | Deprecated; no direct CLI DB operation |
 
 ### `/context`
 Show context window and token budget summary.

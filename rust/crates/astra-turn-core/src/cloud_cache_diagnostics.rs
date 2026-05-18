@@ -3,43 +3,18 @@
 //! Tracks what causes prompt cache invalidation (system prompt changes,
 //! tool schema changes, model switches) and logs actionable diagnostics.
 
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use fnv::FnvHasher;
+
+pub use crate::cache_diagnostics::CacheBreakReason as CacheBreakCause;
 
 /// Minimum cache read tokens to consider "cache hitting".
 const MIN_CACHE_HIT_TOKENS: u64 = 1_000;
 
 /// Cache TTL threshold for expiration detection (5 minutes).
 const CACHE_TTL_5MIN_SECS: u64 = 5 * 60;
-
-/// Cause of a prompt cache break.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CacheBreakCause {
-    SystemPromptChanged,
-    ToolSchemasChanged,
-    ModelChanged,
-    ProviderChanged,
-    /// Cache TTL expired (inferred from time gap + fingerprint unchanged).
-    TtlExpired {
-        gap_seconds: u64,
-    },
-}
-
-impl std::fmt::Display for CacheBreakCause {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::SystemPromptChanged => write!(f, "SystemPromptChanged"),
-            Self::ToolSchemasChanged => write!(f, "ToolSchemasChanged"),
-            Self::ModelChanged => write!(f, "ModelChanged"),
-            Self::ProviderChanged => write!(f, "ProviderChanged"),
-            Self::TtlExpired { gap_seconds } => {
-                let mins = gap_seconds / 60;
-                write!(f, "TtlExpired({mins}m)")
-            }
-        }
-    }
-}
 
 /// Fingerprint of the cache-eligible prompt prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +37,7 @@ impl CacheFingerprint {
 }
 
 fn hash_str(s: &str) -> u64 {
-    let mut h = DefaultHasher::new();
+    let mut h = FnvHasher::default();
     s.hash(&mut h);
     h.finish()
 }
@@ -80,13 +55,23 @@ pub fn diff_fingerprints(old: &CacheFingerprint, new: &CacheFingerprint) -> Vec<
         causes.push(CacheBreakCause::SystemPromptChanged);
     }
     if old.tool_schemas_hash != new.tool_schemas_hash {
-        causes.push(CacheBreakCause::ToolSchemasChanged);
+        causes.push(CacheBreakCause::ToolSchemasChanged {
+            added: Vec::new(),
+            removed: Vec::new(),
+            changed: Vec::new(),
+        });
     }
     if old.model != new.model {
-        causes.push(CacheBreakCause::ModelChanged);
+        causes.push(CacheBreakCause::ModelChanged {
+            from: old.model.clone(),
+            to: new.model.clone(),
+        });
     }
     if old.provider != new.provider {
-        causes.push(CacheBreakCause::ProviderChanged);
+        causes.push(CacheBreakCause::ProviderChanged {
+            from: old.provider.clone(),
+            to: new.provider.clone(),
+        });
     }
     causes
 }

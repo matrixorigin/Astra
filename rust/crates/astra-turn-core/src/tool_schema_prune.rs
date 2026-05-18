@@ -62,6 +62,38 @@ pub fn prune_tool_schemas(tools: &[Value], tier: CompactionTier) -> Vec<Value> {
     }
 }
 
+/// Tool names that always remain available in plan mode regardless of category —
+/// `enter_plan_mode` keeps the model from getting stuck if it tries to re-enter,
+/// and `exit_plan_mode` is the model's only way to surface the authored plan
+/// for user approval.
+pub const PLAN_MODE_REQUIRED_TOOLS: &[&str] = &["enter_plan_mode", "exit_plan_mode"];
+
+/// Collect schema names from `schemas` that are mutating, so the caller can
+/// merge them into its `restricted_tools` set when entering plan mode.
+///
+/// Read-only schemas and the [`PLAN_MODE_REQUIRED_TOOLS`] are always kept.
+/// Tools whose category cannot be classified are treated as mutating (fail-safe).
+pub fn plan_mode_restrictions<F>(schemas: &[Value], is_read_only: F) -> HashSet<String>
+where
+    F: Fn(&str) -> bool,
+{
+    schemas
+        .iter()
+        .filter_map(schema_function_name)
+        .filter(|name| {
+            !PLAN_MODE_REQUIRED_TOOLS.contains(&name.as_str()) && !is_read_only(name.as_str())
+        })
+        .collect()
+}
+
+fn schema_function_name(schema: &Value) -> Option<String> {
+    schema
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(|n| n.as_str())
+        .map(str::to_string)
+}
+
 /// Drop OpenAI-style tool definitions whose `function.name` is in `excluded` (e.g. stall-restricted tools).
 pub fn filter_tool_schemas_by_excluded_names(
     schemas: Vec<Value>,
@@ -265,6 +297,40 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn name_only_schema(name: &str) -> Value {
+        json!({"function": {"name": name}})
+    }
+
+    #[test]
+    fn plan_mode_keeps_read_only_and_required_tools() {
+        let schemas = vec![
+            name_only_schema("read_file"),
+            name_only_schema("grep"),
+            name_only_schema("write_file"),
+            name_only_schema("str_replace"),
+            name_only_schema("bash"),
+            name_only_schema("exit_plan_mode"),
+            name_only_schema("enter_plan_mode"),
+        ];
+        let read_only = |n: &str| matches!(n, "read_file" | "grep");
+        let restricted = plan_mode_restrictions(&schemas, read_only);
+
+        assert!(restricted.contains("write_file"));
+        assert!(restricted.contains("str_replace"));
+        assert!(restricted.contains("bash"));
+        assert!(!restricted.contains("read_file"));
+        assert!(!restricted.contains("grep"));
+        assert!(!restricted.contains("exit_plan_mode"));
+        assert!(!restricted.contains("enter_plan_mode"));
+    }
+
+    #[test]
+    fn plan_mode_unknown_tool_is_treated_as_mutating() {
+        let schemas = vec![name_only_schema("custom_tool")];
+        let restricted = plan_mode_restrictions(&schemas, |_| false);
+        assert!(restricted.contains("custom_tool"));
+    }
+
     fn make_tool_schema(name: &str, desc: &str, optional_param: bool) -> Value {
         let mut props = serde_json::Map::new();
         props.insert("command".to_string(), json!({"type": "string"}));
@@ -391,7 +457,7 @@ mod tests {
                         "description": {"type": "string"},
                         "prompt": {"type": "string"},
                         "task": {"type": "string"},
-                        "background": {"type": "boolean"}
+                        "run_in_background": {"type": "boolean"}
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {
@@ -420,7 +486,7 @@ mod tests {
         );
         // Pure optional stays stripped.
         assert!(
-            props.get("background").is_none(),
+            props.get("run_in_background").is_none(),
             "purely-optional props still get pruned"
         );
     }

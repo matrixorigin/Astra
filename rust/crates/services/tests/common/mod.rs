@@ -14,10 +14,13 @@
 //! becomes the dominant source of per-test wall-time and the reason
 //! unrelated tests tip past the strict-online 2s budget.
 //!
-//! Solution: memoize the `ensure_core_schema` + `SharedPool::new` result
-//! per-binary via `tokio::sync::OnceCell`. Tests are already
-//! session/user/plan scoped by UUID, so a shared pool is isolation-safe;
-//! we only pay the schema bootstrap once per nextest binary process.
+//! Solution: memoize only the `ensure_core_schema` bootstrap per-binary via
+//! `tokio::sync::OnceCell`, but build a fresh `SharedPool` per test call.
+//! Sharing one SQLx pool across `#[tokio::test]` runtimes is not actually
+//! isolation-safe: once the runtime that created the pool shuts down, sibling
+//! tests can trip `A Tokio 1.x context was found, but it is being shutdown.`
+//! We still avoid repeated schema DDL, while each test keeps runtime-local pool
+//! state.
 
 #![allow(dead_code)]
 
@@ -34,13 +37,13 @@ pub fn require_db_it_env() -> MatrixOneSettings {
     MatrixOneSettings::from_env()
 }
 
-/// Shared per-binary bootstrap. Runs `ensure_core_schema` + `SharedPool::new`
-/// exactly once per test binary process — even if 50 concurrent tests call
-/// `setup_pool()` simultaneously. See module-level docs for why.
-static SHARED_BOOTSTRAP: tokio::sync::OnceCell<(SharedPool, MatrixOneSettings)> =
+/// Shared per-binary bootstrap. Runs `ensure_core_schema` exactly once per test
+/// binary process — even if 50 concurrent tests call `setup_pool()`
+/// simultaneously. Each caller still creates its own runtime-local pool.
+static SHARED_BOOTSTRAP: tokio::sync::OnceCell<MatrixOneSettings> =
     tokio::sync::OnceCell::const_new();
 
-async fn bootstrap_shared() -> &'static (SharedPool, MatrixOneSettings) {
+async fn bootstrap_shared() -> &'static MatrixOneSettings {
     SHARED_BOOTSTRAP
         .get_or_init(|| async {
             let settings = require_db_it_env();
@@ -49,19 +52,20 @@ async fn bootstrap_shared() -> &'static (SharedPool, MatrixOneSettings) {
             ensure_core_schema(&settings, &catalog)
                 .await
                 .expect("ensure_core_schema; is MatrixOne up?");
-            let pool = SharedPool::new(&settings).await.expect("SharedPool::new");
-            (pool, settings)
+            settings
         })
         .await
 }
 
-/// Sets up a connection pool with schema bootstrapped (cached per-binary).
+/// Sets up a fresh connection pool after schema bootstrap (cached per-binary).
 pub async fn setup_pool() -> SharedPool {
-    bootstrap_shared().await.0.clone()
+    let settings = bootstrap_shared().await;
+    SharedPool::new(settings).await.expect("SharedPool::new")
 }
 
-/// Sets up pool and returns both pool and settings (cached per-binary).
+/// Sets up a fresh pool and returns it with the cached settings snapshot.
 pub async fn setup_pool_and_settings() -> (SharedPool, MatrixOneSettings) {
-    let (pool, settings) = bootstrap_shared().await;
-    (pool.clone(), settings.clone())
+    let settings = bootstrap_shared().await.clone();
+    let pool = SharedPool::new(&settings).await.expect("SharedPool::new");
+    (pool, settings)
 }

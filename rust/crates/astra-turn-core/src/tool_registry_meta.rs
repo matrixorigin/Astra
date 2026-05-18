@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::capability::Capability;
+
 /// Intent type for tag-based pre-filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +66,8 @@ pub struct ToolMeta {
     pub intents: &'static [IntentType],
     /// Data source scope
     pub scope: Scope,
+    /// Runtime capabilities required before this tool can be advertised.
+    pub requires: &'static [Capability],
     /// Estimated token cost of the full JSON schema (~JSON bytes / 4)
     pub schema_tokens: u32,
 }
@@ -88,6 +92,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::CodeEdit, IntentType::CodeRead, IntentType::Git],
         scope: Scope::Local,
+        requires: &[],
         schema_tokens: 35,
     },
     ToolMeta {
@@ -116,6 +121,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
+        requires: &[],
         schema_tokens: 35,
     },
     ToolMeta {
@@ -147,6 +153,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
+        requires: &[],
         schema_tokens: 25,
     },
     ToolMeta {
@@ -177,6 +184,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
+        requires: &[],
         schema_tokens: 40,
     },
     ToolMeta {
@@ -207,6 +215,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
+        requires: &[],
         schema_tokens: 25,
     },
     ToolMeta {
@@ -227,6 +236,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
+        requires: &[],
         schema_tokens: 40,
     },
     ToolMeta {
@@ -256,6 +266,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
+        requires: &[],
         schema_tokens: 25,
     },
     ToolMeta {
@@ -275,6 +286,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
+        requires: &[],
         schema_tokens: 20,
     },
     ToolMeta {
@@ -294,6 +306,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
+        requires: &[],
         schema_tokens: 25,
     },
     // ── Dynamic tools (selected per-request) ────────────────────────
@@ -347,6 +360,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::CodeRead, IntentType::CodeEdit],
         scope: Scope::Local,
+        requires: &[Capability::LSPServer],
         schema_tokens: 90,
     },
     ToolMeta {
@@ -374,6 +388,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::Git],
         scope: Scope::LocalGit,
+        requires: &[],
         schema_tokens: 50,
     },
     ToolMeta {
@@ -392,6 +407,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::GitHub],
         scope: Scope::External,
+        requires: &[Capability::GitHubAuth],
         schema_tokens: 50,
     },
     ToolMeta {
@@ -422,6 +438,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::External,
+        requires: &[],
         schema_tokens: 25,
     },
     // memory_store is pinned — intrinsic memory capability. The model must
@@ -438,6 +455,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::Memory],
         scope: Scope::CrossSession,
+        requires: &[Capability::MemoryService],
         schema_tokens: 40,
     },
     ToolMeta {
@@ -466,6 +484,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::Introspect],
         scope: Scope::Local,
+        requires: &[],
         schema_tokens: 60,
     },
     ToolMeta {
@@ -484,6 +503,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
+        requires: &[Capability::Database],
         schema_tokens: 40,
     },
     ToolMeta {
@@ -493,6 +513,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
+        requires: &[Capability::AgentSpawner],
         schema_tokens: 40,
     },
     ToolMeta {
@@ -511,6 +532,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
+        requires: &[],
         schema_tokens: 25,
     },
     ToolMeta {
@@ -520,6 +542,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::CodeEdit, IntentType::CodeRead],
         scope: Scope::Local,
+        requires: &[],
         schema_tokens: 15,
     },
     ToolMeta {
@@ -529,7 +552,38 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
+        requires: &[],
         schema_tokens: 40,
+    },
+    ToolMeta {
+        name: "skill",
+        description: "Execute a discovered skill by name. Skills wrap reusable workflows.",
+        triggers: &["skill", "workflow", "技能"],
+        pinned: true,
+        intents: &[IntentType::CodeRead],
+        scope: Scope::Local,
+        requires: &[Capability::SkillsCatalog],
+        schema_tokens: 30,
+    },
+    ToolMeta {
+        name: "enter_plan_mode",
+        description: "Switch the runtime into plan-authoring mode. Server-owned state machine.",
+        triggers: &["plan", "enter plan mode"],
+        pinned: false,
+        intents: &[IntentType::CodeEdit],
+        scope: Scope::External,
+        requires: &[Capability::PlanLifecycle],
+        schema_tokens: 15,
+    },
+    ToolMeta {
+        name: "exit_plan_mode",
+        description: "Submit the authored plan for user review and exit plan-authoring mode.",
+        triggers: &["exit plan", "submit plan"],
+        pinned: false,
+        intents: &[IntentType::CodeEdit],
+        scope: Scope::External,
+        requires: &[Capability::PlanLifecycle],
+        schema_tokens: 20,
     },
 ];
 
@@ -710,6 +764,31 @@ mod tests {
             tool.pinned,
             "memory must be pinned — intrinsic store/retrieve capability"
         );
+    }
+
+    #[test]
+    fn capability_gated_tools_declare_requires() {
+        let cases = [
+            ("agent", Capability::AgentSpawner),
+            ("memory", Capability::MemoryService),
+            ("mo", Capability::Database),
+            ("github", Capability::GitHubAuth),
+            ("lsp", Capability::LSPServer),
+            ("skill", Capability::SkillsCatalog),
+            ("enter_plan_mode", Capability::PlanLifecycle),
+            ("exit_plan_mode", Capability::PlanLifecycle),
+        ];
+        for (name, expected) in cases {
+            let tool = TOOL_CATALOG
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} must exist in catalog"));
+            assert!(
+                tool.requires.contains(&expected),
+                "{name} must require {expected:?}, got {:?}",
+                tool.requires
+            );
+        }
     }
 
     #[test]

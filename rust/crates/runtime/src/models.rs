@@ -1,7 +1,8 @@
 use astra_services::models::*;
+use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use astra_core::ErrorResponse;
+use astra_core::{ErrorResponse, error_response};
 use axum::{
     Json,
     extract::{Path, State},
@@ -13,7 +14,7 @@ pub async fn create_model_handler(
     headers: HeaderMap,
     Json(request): Json<ModelCreateRequest>,
 ) -> Result<(StatusCode, Json<ModelResponse>), (StatusCode, Json<ErrorResponse>)> {
-    let admin = state.admin_authorizer.require_admin(&headers).await?;
+    let admin = state.admin.authorizer.require_admin(&headers).await?;
 
     let model = state
         .model_service
@@ -45,7 +46,7 @@ pub async fn list_models_handler(
     headers: HeaderMap,
 ) -> Result<Json<Vec<ModelListItemResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let is_admin = state.admin_authorizer.require_admin(&headers).await.is_ok();
+    let is_admin = state.admin.authorizer.require_admin(&headers).await.is_ok();
     let models = state
         .model_service
         .list_models(user.user_id, is_admin)
@@ -68,13 +69,43 @@ pub async fn get_model_handler(
     Ok(Json(ModelResponse::from(model)))
 }
 
+pub async fn get_memory_model_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<MemoryModelResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let _user = state.auth_service.current_user(&headers).await?;
+    let matrixone = crate::matrix_cloud_runtime::matrix_settings_from_env().map_err(|e| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("MatrixOne configuration unavailable: {e}"),
+        )
+    })?;
+    let pool_ref = state.shared_pool.as_ref().map(|sp| sp.get());
+    let resolved = resolve_memory_model(&matrixone, &state.fernet_encryptor, pool_ref)
+        .await
+        .map_err(|e| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Memory model resolution failed: {e}"),
+            )
+        })?;
+    Ok(Json(MemoryModelResponse {
+        model_name: resolved.model_name,
+    }))
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryModelResponse {
+    pub model_name: String,
+}
+
 pub async fn update_model_handler(
     State(state): State<AppState>,
     Path(model_name): Path<String>,
     headers: HeaderMap,
     Json(request): Json<ModelUpdateRequest>,
 ) -> Result<Json<ModelResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _admin = state.admin_authorizer.require_admin(&headers).await?;
+    let _admin = state.admin.authorizer.require_admin(&headers).await?;
     let model = state
         .model_service
         .update_model(
@@ -105,7 +136,7 @@ pub async fn delete_model_handler(
     Path(model_name): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    let _admin = state.admin_authorizer.require_admin(&headers).await?;
+    let _admin = state.admin.authorizer.require_admin(&headers).await?;
     state.model_service.delete_model(model_name).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -115,7 +146,7 @@ pub async fn check_model_handler(
     Path(model_name): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<ModelResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _admin = state.admin_authorizer.require_admin(&headers).await?;
+    let _admin = state.admin.authorizer.require_admin(&headers).await?;
     let model = state.model_service.check_model(model_name).await?;
     Ok(Json(ModelResponse::from(model)))
 }

@@ -16,7 +16,7 @@
 //! The draw pipeline lives in `super::draw`; priority is
 //! `Active > TaskBoard > Status > NextHint > Empty`.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
@@ -74,35 +74,29 @@ fn flush_chat_widget(
     if new_cells.is_empty() {
         return;
     }
-    // Batch layout: each cell renders its lines then gets a trailing
-    // blank for visual separation. Response cells (`⎿ Set model to …`)
-    // want to hug the `› /cmd` line above —
-    // both when paired in the same batch (no blank between them)
-    // and when the UserCell flushed in an earlier event (the
-    // picker-return path). For the former we detect the pair here
-    // and skip its separator; for the latter we also skip the
-    // response's OWN leading and trailing blanks so the reply
-    // stacks tight onto the previous flush's `› /cmd`.
-    let mut batch: Vec<ratatui::text::Line<'static>> = Vec::new();
-    for (i, cell) in new_cells.iter().enumerate() {
-        batch.extend(cell.display_lines(width));
-        let is_last = i + 1 == new_cells.len();
-        let next_is_response = !is_last && is_response_cell(new_cells[i + 1].as_ref());
-        let this_is_slash_user = is_slash_user_cell(cell.as_ref());
-        let this_is_response = is_response_cell(cell.as_ref());
+    let batch = render_history_batch_lines(&new_cells, width);
+    guard.queue_history_lines(batch);
+}
 
-        // Skip the trailing blank in two cases:
-        //   1. This cell is a slash UserCell and the next is a
-        //      response — they're a visual pair.
-        //   2. This cell is a response — its reply should stack
-        //      tight onto whatever came next, and nothing in the
-        //      current batch should push air below it.
-        let suppress_blank = (this_is_slash_user && next_is_response) || this_is_response;
+fn render_history_batch_lines(
+    cells: &[Arc<dyn history_cell::HistoryCell>],
+    width: u16,
+) -> Vec<ratatui::text::Line<'static>> {
+    // Batch layout: each cell renders its lines then usually gets a trailing
+    // blank for visual separation. Slash user cells must stay tight to the
+    // slash outcome even when a deferred picker/view causes the paired
+    // response to flush in a later batch, so `/cmd` suppresses its own
+    // trailing blank unconditionally. Response cells (`⎿ Set model to …`)
+    // also suppress their trailing blank so the pair stays compact.
+    let mut batch: Vec<ratatui::text::Line<'static>> = Vec::new();
+    for cell in cells {
+        batch.extend(cell.display_lines(width));
+        let suppress_blank = is_slash_user_cell(cell.as_ref()) || is_response_cell(cell.as_ref());
         if !suppress_blank {
             batch.push(ratatui::text::Line::default());
         }
     }
-    guard.queue_history_lines(batch);
+    batch
 }
 
 fn surface_status_line_system_cell(event: &TuiAppEvent, chat_widget: &mut chat_widget::ChatWidget) {
@@ -262,6 +256,142 @@ fn should_flush_ambient_commits(pending_deferred_slash_flush: bool) -> bool {
     !pending_deferred_slash_flush
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PlanModeUiSnapshot {
+    active: bool,
+    goal: String,
+    executing: bool,
+}
+
+fn capture_plan_mode_ui_snapshot(state: &crate::session_state::SessionState) -> PlanModeUiSnapshot {
+    PlanModeUiSnapshot {
+        active: state.plan_mode_active(),
+        goal: state
+            .cloud_plan_mirror
+            .as_ref()
+            .map(|ps| ps.goal.trim().to_string())
+            .unwrap_or_default(),
+        executing: state.executing_plan.is_some() || state.plan_handle.is_some(),
+    }
+}
+
+fn summarize_plan_goal(goal: &str) -> String {
+    let summary: String = goal.chars().take(80).collect();
+    if goal.chars().count() > 80 {
+        format!("{summary}...")
+    } else {
+        summary
+    }
+}
+
+fn plan_transition_notice(
+    before: &PlanModeUiSnapshot,
+    after: &PlanModeUiSnapshot,
+    triggered_by_plan_request: bool,
+) -> Option<String> {
+    match (before.active, after.active) {
+        (false, true) => {
+            if after.goal.is_empty() {
+                Some(
+                    "Plan mode active - describe your goal. Use `go` to run once a plan is ready, or `/plan` to exit.".into(),
+                )
+            } else {
+                Some(format!(
+                    "Plan mode active - goal: {}. Send edits, `show` to inspect, `go` to run, `/plan` to exit.",
+                    summarize_plan_goal(&after.goal)
+                ))
+            }
+        }
+        (true, true) if before.goal != after.goal && !after.goal.is_empty() => Some(format!(
+            "Plan goal set - {}. Send edits, `show` to inspect, `go` to run, `/plan` to exit.",
+            summarize_plan_goal(&after.goal)
+        )),
+        (true, false) if after.executing => {
+            Some("Plan mode closed - execution is running in the background.".into())
+        }
+        (true, false) => Some("Plan mode closed - back to normal chat.".into()),
+        (false, false) if triggered_by_plan_request => {
+            Some("Planning response delivered - continuing in normal chat.".into())
+        }
+        _ => None,
+    }
+}
+
+fn commit_plan_transition_notice(
+    chat_widget: &mut chat_widget::ChatWidget,
+    before: &PlanModeUiSnapshot,
+    state: &crate::session_state::SessionState,
+    triggered_by_plan_request: bool,
+) {
+    let after = capture_plan_mode_ui_snapshot(state);
+    if let Some(msg) = plan_transition_notice(before, &after, triggered_by_plan_request) {
+        chat_widget.commit_system(history_cell::system::SystemCell::response(msg));
+    }
+}
+
+fn looks_like_implicit_plan_request(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.starts_with('/') {
+        return false;
+    }
+
+    let lowered = trimmed.to_lowercase();
+    let meta_queries = [
+        "what is /plan",
+        "how does /plan",
+        "what does /plan",
+        "plan mode",
+        "plan模式",
+        "现在plan是怎么",
+        "什么是/plan",
+        "/plan是什么意思",
+        "怎么进入plan",
+    ];
+    if meta_queries.iter().any(|needle| lowered.contains(needle)) {
+        return false;
+    }
+
+    let planning_requests = [
+        "help me plan",
+        "please plan",
+        "plan how to",
+        "make a plan",
+        "draft a plan",
+        "come up with a plan",
+        "plan out",
+        "帮我计划",
+        "帮我规划",
+        "给我一个计划",
+        "给我个计划",
+        "做个计划",
+        "规划一下",
+        "计划一下",
+        "制定计划",
+        "先计划",
+    ];
+    planning_requests
+        .iter()
+        .any(|needle| lowered.contains(needle))
+}
+
+fn slash_plan_goal(text: &str) -> Option<&str> {
+    let rest = text.trim().strip_prefix("/plan")?;
+    let goal = rest.trim();
+    (!goal.is_empty()).then_some(goal)
+}
+
+fn refresh_footer_from_state(
+    bottom_pane: &mut BottomPane,
+    state: &crate::session_state::SessionState,
+) {
+    bottom_pane.footer.model = state.model.clone();
+    bottom_pane.footer.session_id = state
+        .session_id
+        .as_ref()
+        .map(|sid| sid[..8.min(sid.len())].to_string());
+    bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
+}
+
 /// Replay a session's JSONL transcript into a fresh `ChatWidget`,
 /// paint the restored cells into the terminal scrollback, and
 /// advance the widget's watermark so future ticks don't reflush
@@ -380,6 +510,9 @@ pub(crate) async fn run_tui_repl(
     let (ask_user_tx, mut ask_user_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::AskUserRequest>();
     state.tui_ask_user_request_tx = Some(ask_user_tx);
+    let (plan_review_tx, mut plan_review_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::PlanReviewRequest>();
+    state.tui_plan_review_request_tx = Some(plan_review_tx);
 
     // ── Enter TUI ───────────────────────────────────────────────────────
     let mut guard = TerminalGuard::init().map_err(|e| format!("TUI init failed: {e}"))?;
@@ -395,6 +528,12 @@ pub(crate) async fn run_tui_repl(
         bottom_pane.footer.session_id = Some(sid[..8.min(sid.len())].to_string());
     }
     bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
+    // Lock-free observer of `perm_manager.mode()` so the inner-tick
+    // path can refresh the status-line chip while the agentic loop
+    // holds `&mut state`. Without this, mid-turn pivots
+    // (`exit_plan_mode` flipping Plan → Auto on the next-turn
+    // boundary) only land on screen when the outer select wakes up.
+    let perm_mode_mirror = state.perm_manager.mode_mirror_handle();
 
     // Load skill items for $ mention popup
     {
@@ -709,6 +848,40 @@ pub(crate) async fn run_tui_repl(
                             continue;
                         }
                         match bottom_pane.handle_key(key) {
+                            BottomPaneAction::CyclePermissionMode => {
+                                let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                let next_mode = slash_dispatch::next_permission_mode_for_cycle(
+                                    state.perm_manager.mode(),
+                                );
+                                state.perm_manager.set_mode(next_mode);
+                                chat_widget.commit_system(
+                                    crate::tui::history_cell::system::SystemCell::response(
+                                        slash_dispatch::permission_mode_feedback(next_mode),
+                                    ),
+                                );
+                                // Re-evaluate the pending approval queue
+                                // so the chip and pending count agree.
+                                // Without this, an approval generated
+                                // under the previous (more restrictive)
+                                // mode lingers in the queue while the
+                                // chip says e.g. `auto` — see session
+                                // 6953d1da regression note on
+                                // `BottomPane::reevaluate_approvals_for_mode`.
+                                let released = bottom_pane
+                                    .reevaluate_approvals_for_mode(next_mode);
+                                if released > 0 {
+                                    chat_widget.commit_system(
+                                        crate::tui::history_cell::system::SystemCell::response(
+                                            format!(
+                                                "  ✓ {released} pending approval(s) auto-resolved by the new mode",
+                                            ),
+                                        ),
+                                    );
+                                }
+                                refresh_footer_from_state(&mut bottom_pane, &state);
+                                flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                frame_requester.schedule_frame();
+                            }
                             BottomPaneAction::SubmitInput(text) => {
                                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                 let flush_user_immediately =
@@ -741,11 +914,69 @@ pub(crate) async fn run_tui_repl(
                                     }
                                 }
 
-                                if text.starts_with('/') {
+                                let mut inline_chat_submit = None;
+                                if let Some(plan_goal) = slash_plan_goal(&text) {
+                                    let before = capture_plan_mode_ui_snapshot(&state);
+                                    let Some(token) =
+                                        crate::plan_lifecycle::fresh_token_for_plan(api, profile).await
+                                    else {
+                                        chat_widget.commit_system(
+                                            history_cell::system::SystemCell::error(
+                                                "Not logged in. Use /login.",
+                                            ),
+                                        );
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    };
+                                    match crate::plan_lifecycle::enter_remote_plan_mode(
+                                        api,
+                                        profile,
+                                        &token,
+                                        &mut state,
+                                        plan_goal,
+                                    )
+                                    .await
+                                    {
+                                        Ok(_) => {
+                                            inline_chat_submit = Some(plan_goal.to_string());
+                                            commit_plan_transition_notice(
+                                                &mut chat_widget,
+                                                &before,
+                                                &state,
+                                                true,
+                                            );
+                                            if let Some(ref sid) = state.session_id
+                                                && chat_widget.session_id() != sid
+                                            {
+                                                chat_widget.set_session_id(sid.clone());
+                                                task_board.rebind_session(sid.clone());
+                                                board_user_pin = None;
+                                            }
+                                            refresh_footer_from_state(&mut bottom_pane, &state);
+                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        }
+                                        Err(error) => {
+                                            chat_widget.commit_system(
+                                                history_cell::system::SystemCell::error(error),
+                                            );
+                                            refresh_footer_from_state(&mut bottom_pane, &state);
+                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                            frame_requester.schedule_frame();
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                if text.starts_with('/') && inline_chat_submit.is_none() {
                                     // Snapshot session id before dispatch so we
                                     // can detect when a `/resume <id>` fallback
                                     // rebinds it and trigger the replay.
                                     let pre_sid = state.session_id.clone();
+                                    let pre_plan_snapshot = text
+                                        .trim_start()
+                                        .starts_with("/plan")
+                                        .then(|| capture_plan_mode_ui_snapshot(&state));
                                     let mut dctx = slash_dispatch::DispatchContext {
                                         api, profile, state: &mut state,
                                         guard: &mut guard, bottom_pane: &mut bottom_pane,
@@ -803,10 +1034,334 @@ pub(crate) async fn run_tui_repl(
                                         // re-enters auto-rules.
                                         board_user_pin = None;
                                     }
-                                    if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.clone()); }
-                                    if let Some(ref s) = state.session_id { bottom_pane.footer.session_id = Some(s[..8.min(s.len())].to_string()); }
-                                    bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
+                                    refresh_footer_from_state(&mut bottom_pane, &state);
+                                    if let Some(before) = pre_plan_snapshot.as_ref() {
+                                        commit_plan_transition_notice(
+                                            &mut chat_widget,
+                                            before,
+                                            &state,
+                                            true,
+                                        );
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                    }
                                 } else {
+                                    let submit_was_inline_plan_goal = inline_chat_submit.is_some();
+                                    let submit_text = inline_chat_submit.unwrap_or(text);
+                                    if crate::plan_lifecycle::looks_like_pending_local_plan_entry(
+                                        &state,
+                                    ) {
+                                        let Some(token) =
+                                            crate::plan_lifecycle::fresh_token_for_plan(api, profile)
+                                                .await
+                                        else {
+                                            chat_widget.commit_system(
+                                                history_cell::system::SystemCell::error(
+                                                    "Not logged in. Use /login.",
+                                                ),
+                                            );
+                                            refresh_footer_from_state(&mut bottom_pane, &state);
+                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                            frame_requester.schedule_frame();
+                                            continue;
+                                        };
+                                        match crate::plan_lifecycle::enter_remote_plan_mode(
+                                            api,
+                                            profile,
+                                            &token,
+                                            &mut state,
+                                            &submit_text,
+                                        )
+                                        .await
+                                        {
+                                            Ok(_) => {
+                                                // After bare `/plan`, the first plain message is
+                                                // the user's real planning goal. Don't insert a
+                                                // synthetic `Plan goal set ...` system line above
+                                                // the actual planning/model output.
+                                                if let Some(ref sid) = state.session_id
+                                                    && chat_widget.session_id() != sid
+                                                {
+                                                    chat_widget.set_session_id(sid.clone());
+                                                    task_board.rebind_session(sid.clone());
+                                                    board_user_pin = None;
+                                                }
+                                                refresh_footer_from_state(&mut bottom_pane, &state);
+                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                            }
+                                            Err(error) => {
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::error(error),
+                                                );
+                                                refresh_footer_from_state(&mut bottom_pane, &state);
+                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                frame_requester.schedule_frame();
+                                                continue;
+                                            }
+                                        }
+                                    } else {
+                                        if !submit_was_inline_plan_goal {
+                                            if let Some(plan_command) =
+                                                crate::plan_commands::parse_plan_command(&submit_text)
+                                                    .filter(|command| {
+                                                        crate::plan_commands::is_plan_command_available(
+                                                            &state, command,
+                                                        )
+                                                    })
+                                            {
+                                                match plan_command {
+                                                    crate::plan_commands::ParsedPlanCommand::Go => {
+                                                        let go_result = guard
+                                                            .with_restored(|| async {
+                                                                let Some(token) =
+                                                                    crate::plan_lifecycle::fresh_token_for_plan(
+                                                                        api, profile,
+                                                                    )
+                                                                    .await
+                                                                else {
+                                                                    return Err(
+                                                                        "Not logged in. Use /login."
+                                                                            .to_string(),
+                                                                    );
+                                                                };
+                                                                crate::plan_commands::prepare_plan_execution(
+                                                                    &mut state, api, &token,
+                                                                )
+                                                                .await?;
+                                                                crate::plan_runtime::start_and_monitor_plan(
+                                                                    &mut state,
+                                                                    Some(&token),
+                                                                    api,
+                                                                    profile,
+                                                                )
+                                                                .await
+                                                            })
+                                                            .await;
+                                                        match go_result {
+                                                            Ok(Ok(())) => {
+                                                                let message = if state
+                                                                    .executing_plan
+                                                                    .is_some()
+                                                                {
+                                                                    "Plan run paused. Use `show`, `rewind …`, `correct …`, or `go` to continue.".to_string()
+                                                                } else if state
+                                                                    .plan_run_task_last_error
+                                                                    .is_some()
+                                                                {
+                                                                    "Plan run ended with an error. Rewind or adjust it before trying `go` again.".to_string()
+                                                                } else {
+                                                                    "Plan run finished. Back in normal chat.".to_string()
+                                                                };
+                                                                chat_widget.commit_system(
+                                                                    history_cell::system::SystemCell::response(
+                                                                        message,
+                                                                    ),
+                                                                );
+                                                            }
+                                                            Ok(Err(error)) => {
+                                                                chat_widget.commit_system(
+                                                                    history_cell::system::SystemCell::error(
+                                                                        error,
+                                                                    ),
+                                                                );
+                                                            }
+                                                            Err(error) => {
+                                                                chat_widget.commit_system(
+                                                                    history_cell::system::SystemCell::error(
+                                                                        format!(
+                                                                            "Terminal restore failed: {error}"
+                                                                        ),
+                                                                    ),
+                                                                );
+                                                            }
+                                                        }
+                                                        refresh_footer_from_state(
+                                                            &mut bottom_pane,
+                                                            &state,
+                                                        );
+                                                        flush_chat_widget(
+                                                            &mut guard,
+                                                            &mut chat_widget,
+                                                            w,
+                                                        );
+                                                        frame_requester.schedule_frame();
+                                                        continue;
+                                                    }
+                                                    crate::plan_commands::ParsedPlanCommand::Show => {
+                                                        match crate::plan_commands::render_plan_snapshot(
+                                                            &state,
+                                                        ) {
+                                                            Ok(message) => chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::response(
+                                                                    message,
+                                                                ),
+                                                            ),
+                                                            Err(error) => chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::error(
+                                                                    error,
+                                                                ),
+                                                            ),
+                                                        }
+                                                        refresh_footer_from_state(
+                                                            &mut bottom_pane,
+                                                            &state,
+                                                        );
+                                                        flush_chat_widget(
+                                                            &mut guard,
+                                                            &mut chat_widget,
+                                                            w,
+                                                        );
+                                                        frame_requester.schedule_frame();
+                                                        continue;
+                                                    }
+                                                    crate::plan_commands::ParsedPlanCommand::Rewind {
+                                                        anchor,
+                                                    } => {
+                                                        let token =
+                                                            crate::plan_lifecycle::fresh_token_for_plan(
+                                                                api, profile,
+                                                            )
+                                                            .await;
+                                                        match crate::plan_commands::rewind_plan(
+                                                            &mut state,
+                                                            api,
+                                                            token.as_deref(),
+                                                            &anchor,
+                                                        )
+                                                        .await
+                                                        {
+                                                            Ok(message) => chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::response(
+                                                                    message,
+                                                                ),
+                                                            ),
+                                                            Err(error) => chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::error(
+                                                                    error,
+                                                                ),
+                                                            ),
+                                                        }
+                                                        refresh_footer_from_state(
+                                                            &mut bottom_pane,
+                                                            &state,
+                                                        );
+                                                        flush_chat_widget(
+                                                            &mut guard,
+                                                            &mut chat_widget,
+                                                            w,
+                                                        );
+                                                        frame_requester.schedule_frame();
+                                                        continue;
+                                                    }
+                                                    crate::plan_commands::ParsedPlanCommand::AddCorrection { .. }
+                                                    | crate::plan_commands::ParsedPlanCommand::ClearCorrections => {
+                                                        match crate::plan_commands::apply_plan_correction(
+                                                            &mut state,
+                                                            &plan_command,
+                                                        ) {
+                                                            Ok(message) => chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::response(
+                                                                    message,
+                                                                ),
+                                                            ),
+                                                            Err(error) => chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::error(
+                                                                    error,
+                                                                ),
+                                                            ),
+                                                        }
+                                                        refresh_footer_from_state(
+                                                            &mut bottom_pane,
+                                                            &state,
+                                                        );
+                                                        flush_chat_widget(
+                                                            &mut guard,
+                                                            &mut chat_widget,
+                                                            w,
+                                                        );
+                                                        frame_requester.schedule_frame();
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                            if state.executing_plan.is_some()
+                                                && !state.plan_mode_active()
+                                                && crate::plan_commands::abandon_plan_execution(
+                                                    &mut state,
+                                                )
+                                            {
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::info(
+                                                        "Paused plan abandoned — continuing with normal chat.".to_string(),
+                                                    ),
+                                                );
+                                                refresh_footer_from_state(
+                                                    &mut bottom_pane,
+                                                    &state,
+                                                );
+                                                flush_chat_widget(
+                                                    &mut guard,
+                                                    &mut chat_widget,
+                                                    w,
+                                                );
+                                            }
+                                        }
+                                        if looks_like_implicit_plan_request(&submit_text) {
+                                        let before = capture_plan_mode_ui_snapshot(&state);
+                                        let Some(token) =
+                                            crate::plan_lifecycle::fresh_token_for_plan(api, profile)
+                                                .await
+                                        else {
+                                            chat_widget.commit_system(
+                                                history_cell::system::SystemCell::error(
+                                                    "Not logged in. Use /login.",
+                                                ),
+                                            );
+                                            refresh_footer_from_state(&mut bottom_pane, &state);
+                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                            frame_requester.schedule_frame();
+                                            continue;
+                                        };
+                                        match crate::plan_lifecycle::enter_remote_plan_mode(
+                                            api,
+                                            profile,
+                                            &token,
+                                            &mut state,
+                                            &submit_text,
+                                        )
+                                        .await
+                                        {
+                                            Ok(_) => {
+                                                commit_plan_transition_notice(
+                                                    &mut chat_widget,
+                                                    &before,
+                                                    &state,
+                                                    true,
+                                                );
+                                                if let Some(ref sid) = state.session_id
+                                                    && chat_widget.session_id() != sid
+                                                {
+                                                    chat_widget.set_session_id(sid.clone());
+                                                    task_board.rebind_session(sid.clone());
+                                                    board_user_pin = None;
+                                                }
+                                                refresh_footer_from_state(&mut bottom_pane, &state);
+                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                frame_requester.schedule_frame();
+                                                continue;
+                                            }
+                                            Err(e) => {
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::error(e),
+                                                );
+                                                refresh_footer_from_state(&mut bottom_pane, &state);
+                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                frame_requester.schedule_frame();
+                                                continue;
+                                            }
+                                        }
+                                        }
+                                    }
+
                                     bottom_pane.set_task_status(TaskStatus::WaitingModel);
                                     let turn_start = std::time::Instant::now();
                                     let pre_prompt_tokens = state.total_prompt_tokens;
@@ -848,7 +1403,7 @@ pub(crate) async fn run_tui_repl(
                                         let ctx = crate::chat_turn::TurnContext { api, profile };
                                         let token = crate::session_runtime::fresh_access_token(api, profile).await;
                                         let mut tui_ui = ui_adapter::TuiUiAdapter::new(tui_tx.clone());
-                                        let fut = crate::chat_turn::handle_chat_input_with_ui(text, token.as_deref(), &mut state, ctx, &mut tui_ui);
+                                        let fut = crate::chat_turn::handle_chat_input_with_ui(submit_text, token.as_deref(), &mut state, ctx, &mut tui_ui);
                                         tokio::pin!(fut);
 
                                         let r: Result<(), String> = loop {
@@ -864,6 +1419,49 @@ pub(crate) async fn run_tui_repl(
                                                 Some(tev) = event_stream.next() => {
                                                     match tev {
                                                         TuiEvent::Key(k) => {
+                                                            // Shift+Tab cycles permission mode mid-turn.
+                                                            // The current turn keeps running with the
+                                                            // schema it was assembled with (Invariant
+                                                            // I8); only the next turn picks up the new
+                                                            // mode. We refresh the chip via the lock-free
+                                                            // mirror so the user sees the pivot land
+                                                            // immediately.
+                                                            if k.code == crossterm::event::KeyCode::BackTab {
+                                                                let next_mode = slash_dispatch::next_permission_mode_for_cycle(
+                                                                    perm_mode_mirror.current(),
+                                                                );
+                                                                // Mid-turn: agentic loop holds &mut state, so we
+                                                                // cannot borrow perm_manager. Stage on the
+                                                                // mirror; the host calls pull_mode_from_mirror
+                                                                // at the next turn boundary so `self.mode`
+                                                                // catches up.
+                                                                perm_mode_mirror.stage(next_mode);
+                                                                bottom_pane.footer.permission_mode =
+                                                                    Some(format!("{}", next_mode));
+                                                                // Reflect the staged mode in the approval queue
+                                                                // immediately so the chip and pending count
+                                                                // agree. perm_manager.mode() will catch up at
+                                                                // the next turn boundary, but the queue's
+                                                                // visible state shouldn't lag.
+                                                                let released = bottom_pane
+                                                                    .reevaluate_approvals_for_mode(next_mode);
+                                                                if released > 0 {
+                                                                    chat_widget.commit_system(
+                                                                        history_cell::system::SystemCell::response(
+                                                                            format!(
+                                                                                "  ✓ {released} pending approval(s) auto-resolved by the new mode",
+                                                                            ),
+                                                                        ),
+                                                                    );
+                                                                }
+                                                                chat_widget.commit_system(
+                                                                    history_cell::system::SystemCell::response(
+                                                                        slash_dispatch::permission_mode_feedback(next_mode),
+                                                                    ),
+                                                                );
+                                                                frame_requester.schedule_frame();
+                                                                continue;
+                                                            }
                                                             // Ctrl+B: foreground bash → background promotion.
                                                             // If a bash invocation is currently in flight and
                                                             // listening on the detach signal, fire it: the
@@ -1235,6 +1833,7 @@ pub(crate) async fn run_tui_repl(
                                                             req.header,
                                                             req.detail,
                                                             req.reason,
+                                                            req.args,
                                                             req.response_tx,
                                                             *metadata,
                                                         )
@@ -1244,6 +1843,7 @@ pub(crate) async fn run_tui_repl(
                                                             req.header,
                                                             req.detail,
                                                             req.reason,
+                                                            req.args,
                                                             req.response_tx,
                                                         )
                                                     };
@@ -1281,7 +1881,35 @@ pub(crate) async fn run_tui_repl(
                                     let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                 }
                                                 }
+                                                Some(req) = plan_review_rx.recv() => {
+                                                    bottom_pane.enqueue_plan_review(req.plan_markdown, req.response_tx);
+                                                    frame_requester.schedule_frame();
+                                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                                    let frame = active_viewport(
+                                                        &chat_widget,
+                                                        &status_indicator,
+                                                        Some(&*task_board),
+                                                        board_expanded,
+                                                        board_user_pin,
+                                                        w,
+                                                        guard.terminal.size().map(|s| s.height).unwrap_or(24),
+                                                    );
+                                                    board_expanded = frame.resolved_board_expanded;
+                                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                                }
                                                 _ = &mut itick => {
+                                                    // Refresh the permission-mode chip via the
+                                                    // lock-free mirror — the agentic loop holds
+                                                    // `&mut state` so reading `state.perm_manager`
+                                                    // here would clash. Catches turn-boundary
+                                                    // pivots (e.g. exit_plan_mode → Auto) within
+                                                    // one inner tick.
+                                                    let live_mode = format!("{}", perm_mode_mirror.current());
+                                                    if bottom_pane.footer.permission_mode.as_deref()
+                                                        != Some(live_mode.as_str())
+                                                    {
+                                                        bottom_pane.footer.permission_mode = Some(live_mode);
+                                                    }
                                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                                     let frame = active_viewport(
                                         &chat_widget,
@@ -1613,20 +2241,6 @@ pub(crate) async fn run_tui_repl(
                                                     }
                                                     state.config_version_id =
                                                         Some(save.new_version_id.clone());
-                                                    if let Some(ref mc) = state.matrix_runtime {
-                                                        let user_id = state
-                                                            .ingestion_user_id
-                                                            .clone()
-                                                            .unwrap_or_else(|| "anonymous".to_string());
-                                                        let row = astra_services::config_version_cloud::ConfigVersionRow {
-                                                            version_id: save.new_version_id.clone(),
-                                                            user_id,
-                                                            toml_body: save.toml_body.clone(),
-                                                            created_at_ms: chrono::Utc::now().timestamp_millis(),
-                                                            first_seen_session: state.session_id.clone(),
-                                                        };
-                                                        mc.enqueue_config_version_push(&row);
-                                                    }
                                                 }
                                                 history_cell::system::SystemCell::response(outcome.message)
                                             }
@@ -1963,6 +2577,36 @@ pub(crate) async fn run_tui_repl(
                 }
             }
             _ = &mut tick => {
+                // Re-derive permission-mode chip from live state so
+                // mode pivots driven by the agentic loop (e.g. the
+                // `exit_plan_mode` overlay handing the next turn back
+                // to Auto) reach the status line within one tick
+                // instead of waiting for the next turn boundary that
+                // happens to call `refresh_footer_from_state`. Cheap:
+                // a string format and an Option<u64> compare per 50ms.
+                let live_mode_enum = state.perm_manager.mode();
+                let live_mode = format!("{live_mode_enum}");
+                if bottom_pane.footer.permission_mode.as_deref() != Some(live_mode.as_str()) {
+                    bottom_pane.footer.permission_mode = Some(live_mode);
+                    // Mode just shifted (driven by host-side
+                    // pull_mode_from_mirror after exit_plan_mode
+                    // overlay or mid-turn Shift+Tab). Re-evaluate
+                    // the approval queue against the new mode so
+                    // any pending entries the new mode would
+                    // auto-approve are released — same machinery
+                    // the keystroke paths use.
+                    let released = bottom_pane.reevaluate_approvals_for_mode(live_mode_enum);
+                    if released > 0 {
+                        chat_widget.commit_system(
+                            crate::tui::history_cell::system::SystemCell::response(
+                                format!(
+                                    "  ✓ {released} pending approval(s) auto-resolved by the new mode",
+                                ),
+                            ),
+                        );
+                    }
+                    frame_requester.schedule_frame();
+                }
                 // Pulse the chat-widget scrollback so if any async
                 // event was handled since the last draw the new
                 // cells land promptly instead of waiting for the
@@ -2242,6 +2886,128 @@ mod tests {
         assert_eq!(ReopenTarget::parse("Agents"), None, "case-sensitive");
     }
 
+    #[test]
+    fn implicit_plan_request_detector_accepts_actionable_prompts() {
+        assert!(looks_like_implicit_plan_request(
+            "帮我计划在/tmp下生成一个报销系统"
+        ));
+        assert!(looks_like_implicit_plan_request(
+            "help me plan how to refactor the auth middleware"
+        ));
+        assert!(looks_like_implicit_plan_request(
+            "please plan how to migrate this service to Axum"
+        ));
+    }
+
+    #[test]
+    fn implicit_plan_request_detector_rejects_meta_plan_questions() {
+        assert!(!looks_like_implicit_plan_request("现在plan是怎么工作的?"));
+        assert!(!looks_like_implicit_plan_request("what is /plan mode?"));
+        assert!(!looks_like_implicit_plan_request("/plan"));
+    }
+
+    #[test]
+    fn plan_transition_notice_covers_enter_goal_and_exit() {
+        let inactive = PlanModeUiSnapshot::default();
+        let entered_empty = PlanModeUiSnapshot {
+            active: true,
+            goal: String::new(),
+            executing: false,
+        };
+        let entered_goal = PlanModeUiSnapshot {
+            active: true,
+            goal: "Implement auth middleware".into(),
+            executing: false,
+        };
+        let exited_running = PlanModeUiSnapshot {
+            active: false,
+            goal: String::new(),
+            executing: true,
+        };
+
+        let enter_msg = plan_transition_notice(&inactive, &entered_empty, false)
+            .expect("entering plan mode should announce itself");
+        assert!(enter_msg.contains("Plan mode active"));
+        assert!(enter_msg.contains("describe your goal"));
+
+        let goal_msg = plan_transition_notice(&entered_empty, &entered_goal, false)
+            .expect("setting the first goal should be surfaced");
+        assert!(goal_msg.contains("Plan goal set"));
+        assert!(goal_msg.contains("Implement auth middleware"));
+
+        let exit_msg = plan_transition_notice(&entered_goal, &exited_running, false)
+            .expect("background execution exit should be surfaced");
+        assert!(exit_msg.contains("running in the background"));
+    }
+
+    #[test]
+    fn submit_input_routes_plan_mode_and_implicit_plan_requests_before_chat_turn() {
+        let source = include_str!("event_loop.rs");
+        let arm_start = source
+            .find("BottomPaneAction::SubmitInput(text) => {")
+            .expect("SubmitInput arm must exist");
+        let arm_end = source[arm_start..]
+            .find("BottomPaneAction::ViewCompleted { result, reopen } => {")
+            .expect("SubmitInput arm must end before ViewCompleted");
+        let arm = &source[arm_start..arm_start + arm_end];
+
+        assert!(
+            arm.contains("slash_plan_goal(&text)")
+                && arm.contains("crate::plan_lifecycle::enter_remote_plan_mode("),
+            "/plan <goal> should pre-enter remote plan mode before the chat turn"
+        );
+        assert!(
+            arm.contains("looks_like_implicit_plan_request(&submit_text)")
+                && arm.contains("crate::plan_lifecycle::enter_remote_plan_mode("),
+            "plain planning requests should enter remote /plan semantics before normal chat turns"
+        );
+        assert!(
+            arm.contains("crate::plan_lifecycle::looks_like_pending_local_plan_entry(")
+                && arm.contains("crate::plan_lifecycle::enter_remote_plan_mode("),
+            "the first plain message after bare /plan should bind remote plan mode and continue as chat"
+        );
+    }
+
+    #[test]
+    fn pending_local_plan_goal_binding_does_not_emit_synthetic_notice() {
+        let source = include_str!("event_loop.rs");
+        let branch_start = source
+            .find("if crate::plan_lifecycle::looks_like_pending_local_plan_entry(")
+            .expect("pending local plan entry branch must exist");
+        let branch_end = source[branch_start..]
+            .find("} else {")
+            .map(|offset| branch_start + offset)
+            .expect("pending local plan entry branch must end before the generic else");
+        let branch = &source[branch_start..branch_end];
+
+        assert!(
+            !branch.contains("commit_plan_transition_notice("),
+            "the first real goal after bare /plan should flow directly to model output"
+        );
+    }
+
+    #[test]
+    fn submit_input_handles_plan_text_commands_before_normal_chat() {
+        let source = include_str!("event_loop.rs");
+        let arm_start = source
+            .find("BottomPaneAction::SubmitInput(text) => {")
+            .expect("SubmitInput arm must exist");
+        let arm_end = source[arm_start..]
+            .find("BottomPaneAction::ViewCompleted { result, reopen } => {")
+            .expect("SubmitInput arm must end before ViewCompleted");
+        let arm = &source[arm_start..arm_start + arm_end];
+
+        assert!(
+            arm.contains("crate::plan_commands::parse_plan_command(&submit_text)")
+                && arm.contains("crate::plan_runtime::start_and_monitor_plan("),
+            "plain TUI submits should intercept go/show/rewind/correct plan commands and wire `go` into the real plan runtime"
+        );
+        assert!(
+            arm.contains("crate::plan_commands::abandon_plan_execution("),
+            "ordinary prose after a paused plan should abandon the paused execution instead of keeping stale state around"
+        );
+    }
+
     /// REGRESSION (review M1): the `else if pending_deferred_slash_flush`
     /// branch must call `flush_chat_widget` before clearing the flag,
     /// otherwise any system cells committed during the deferred window
@@ -2515,5 +3281,54 @@ mod tests {
         assert!(next_pending_deferred_slash_flush(
             &slash_dispatch::SlashResult::Deferred
         ));
+    }
+
+    #[test]
+    fn render_history_batch_lines_keeps_prose_gap() {
+        let cells: Vec<Arc<dyn history_cell::HistoryCell>> =
+            vec![Arc::new(history_cell::user::UserCell::new("hi"))];
+        let lines = render_history_batch_lines(&cells, 80);
+
+        assert_eq!(lines.len(), 2, "prose cells should keep one separator row");
+        assert!(lines[1].spans.is_empty(), "separator should be blank");
+    }
+
+    #[test]
+    fn render_history_batch_lines_omits_slash_user_gap() {
+        let cells: Vec<Arc<dyn history_cell::HistoryCell>> =
+            vec![Arc::new(history_cell::user::UserCell::new("/allow"))];
+        let lines = render_history_batch_lines(&cells, 80);
+
+        assert_eq!(
+            lines.len(),
+            1,
+            "slash command should not emit a trailing blank row"
+        );
+    }
+
+    #[test]
+    fn render_history_batch_lines_keeps_slash_pair_tight() {
+        let cells: Vec<Arc<dyn history_cell::HistoryCell>> = vec![
+            Arc::new(history_cell::user::UserCell::new("/allow")),
+            Arc::new(history_cell::system::SystemCell::response("Mode → auto")),
+        ];
+        let lines = render_history_batch_lines(&cells, 80);
+
+        assert_eq!(
+            lines.len(),
+            2,
+            "slash command and response should hug with no blank row"
+        );
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert!(rendered[0].contains("/allow"));
+        assert!(rendered[1].contains("Mode → auto"));
     }
 }

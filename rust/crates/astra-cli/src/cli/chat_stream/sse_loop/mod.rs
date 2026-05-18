@@ -19,7 +19,6 @@ use astra_core::RuntimeLimits;
 use astra_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
-    plan_decompose::CHAT_PLAN_ONLY_SYSTEM,
     semantic_dedup::SemanticDedup,
     tool_registry::ToolRegistry,
     turn::agentic_loop_finalization::run_agentic_loop_with_host,
@@ -145,6 +144,7 @@ pub(crate) async fn stream_chat_sse(
     mut p: ChatTurnParams<'_>,
 ) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
+    p.model = normalize_turn_model(p.model);
     let root_agent_id = p.root_agent_id.unwrap_or("main");
     p.perm_manager.clear_turn_overrides();
 
@@ -276,6 +276,7 @@ pub(crate) async fn stream_chat_sse(
                 agent_id: root_agent_id.to_string(),
                 current_model: p.model.map(str::to_string),
                 recursion_depth: 0,
+                is_fork_child: false,
                 working_dir: project_root.clone(),
                 spawner: spawner.clone(),
                 inherited_permissions: p.perm_manager.inherited_permissions_for_child(false),
@@ -323,45 +324,38 @@ pub(crate) async fn stream_chat_sse(
             executor.expand_sandbox_path(PathBuf::from(dir));
         }
     }
-    let mut messages = load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message);
+    let messages = load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message);
 
     // ─── Context pre-fetch (disabled) ─────────────────────────────────────
     // Returns (all_schemas, mcp_plugin_schemas) so the edge executor can
     // install MCP tools for `tool_search(select:)` resolution while the
     // registry gets the capability-filtered list.
-    let all_schemas: (Vec<Value>, Vec<Value>) = if p.plan_only_chat {
-        messages.insert(
-            0,
-            json!({
-                "role": "system",
-                "content": CHAT_PLAN_ONLY_SYSTEM,
-            }),
-        );
-        (Vec::new(), Vec::new())
+    // Refresh any MCP servers that received tool-list-changed notifications
+    if let Some(ref mgr) = p.mcp_manager {
+        let mut m = mgr.write().await;
+        m.refresh_changed_tools().await;
+        m.consume_prompt_changes();
+        m.consume_resource_changes();
+    }
+    // Inject MCP tool schemas from connected servers.
+    // Tracked separately from the static catalog so the edge
+    // `ToolExecutor` can install them via `set_plugin_schemas` for
+    // `tool_search(select:mcp__X)` resolution.
+    let mcp_schemas = if let Some(ref mgr) = p.mcp_manager {
+        let m = mgr.read().await;
+        m.all_tool_schemas()
     } else {
-        // Refresh any MCP servers that received tool-list-changed notifications
-        if let Some(ref mgr) = p.mcp_manager {
-            let mut m = mgr.write().await;
-            m.refresh_changed_tools().await;
-            m.consume_prompt_changes();
-            m.consume_resource_changes();
-        }
-        // Inject MCP tool schemas from connected servers.
-        // Tracked separately from the static catalog so the edge
-        // `ToolExecutor` can install them via `set_plugin_schemas` for
-        // `tool_search(select:mcp__X)` resolution.
-        let mcp_schemas = if let Some(ref mgr) = p.mcp_manager {
-            let m = mgr.read().await;
-            m.all_tool_schemas()
-        } else {
-            Vec::new()
-        };
-        let schemas = astra_runtime::capabilities::cli_local_tool_schemas(
-            edge_tools::all_tool_schemas(),
-            mcp_schemas.clone(),
-        );
-        (schemas, mcp_schemas)
+        Vec::new()
     };
+    let cli_capabilities = edge_tools::cli_default_capabilities(p.agent_spawner.is_some());
+    let all_schemas: (Vec<Value>, Vec<Value>) = (
+        astra_runtime::capabilities::cli_local_tool_schemas(
+            edge_tools::local_tool_schemas(),
+            mcp_schemas.clone(),
+            &cli_capabilities,
+        ),
+        mcp_schemas,
+    );
     let mcp_plugin_schemas = all_schemas.1.clone();
     let all_schemas = all_schemas.0;
     // Install MCP schemas on the edge executor so `tool_search(select:NAME)`
@@ -441,12 +435,7 @@ pub(crate) async fn stream_chat_sse(
     } else {
         None
     };
-    let mut task_profile = infer_task_execution_profile(p.message);
-    // Plan-only turns have no tools; factual retry would inject a useless "call tools" nudge and
-    // spurious "↻ … corrective retry" when the decomposition prompt mentions repo/context words.
-    if p.plan_only_chat {
-        task_profile.allow_factual_retry = false;
-    }
+    let task_profile = infer_task_execution_profile(p.message);
 
     let turn_guard = if p.tool_health_entries.is_empty() {
         TurnGuard::with_profile(task_profile)
@@ -515,6 +504,7 @@ pub(crate) async fn stream_chat_sse(
         file_context,
         perm_manager: p.perm_manager,
         valid_tool_names,
+        capabilities: cli_capabilities,
         pending_clear_lines: 0,
         is_plan_subtask: p.is_plan_subtask,
         plan_subtask_id: p.plan_subtask_id,
@@ -522,6 +512,7 @@ pub(crate) async fn stream_chat_sse(
         stream_event_tx: p.stream_event_tx,
         approval_request_tx: p.approval_request_tx,
         ask_user_request_tx: p.ask_user_request_tx,
+        plan_review_request_tx: p.plan_review_request_tx,
         root_send_message_context,
         chat_turn_index: p.turn_index,
         tool_cache: crate::stream_render::EdgeToolCache::new(
@@ -939,6 +930,10 @@ pub(crate) async fn stream_chat_sse(
     Ok(result)
 }
 
+fn normalize_turn_model(model: Option<&str>) -> Option<&str> {
+    astra_core::model_override::normalize_model_override(model)
+}
+
 fn load_turn_messages(
     pre_loaded_messages: Option<Vec<serde_json::Value>>,
     history: &[(String, String)],
@@ -973,6 +968,7 @@ mod tests {
     use super::circuit_breaker_config_from_tool_selection;
     use super::detect_turn_hook_sets;
     use super::extend_restricted_with_blocked_tools;
+    use super::normalize_turn_model;
     use astra_runtime::observability_integration::ObservabilityHub;
     use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
     use std::collections::HashSet;
@@ -993,6 +989,16 @@ mod tests {
         assert_eq!(cfg.max_introspect_emissions, 3);
         assert_eq!(cfg.half_open_patience, 2);
         assert_eq!(cfg.absolute_max_rounds, 200);
+    }
+
+    #[test]
+    fn turn_model_normalization_drops_symbolic_default_override() {
+        assert_eq!(normalize_turn_model(None), None);
+        assert_eq!(normalize_turn_model(Some(" default ")), None);
+        assert_eq!(
+            normalize_turn_model(Some("MiniMax-M2.7")),
+            Some("MiniMax-M2.7")
+        );
     }
 
     #[test]

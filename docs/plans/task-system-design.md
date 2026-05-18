@@ -76,7 +76,7 @@ All references file:line, verified.
 
 ### 1.1 Tool registry and dispatch
 - Schemas centrally defined in `rust/crates/astra-tools/src/schemas.rs::all_tool_schemas_core`.
-- Allowlists `DEFAULT_EXECUTOR_TOOL_NAMES` (edge), `SERVER_EXECUTOR_TOOL_NAMES` (cloud).
+- Tool visibility is capability-driven via `astra-turn-core::tool_surface`; legacy edge/cloud tool-name allowlists have been removed.
 - Server dispatch: `runtime/src/server/server_tool_executor.rs::execute_local_with_metadata`, match arm on tool name.
 - Edge dispatch: `astra-tools/src/executor.rs::DefaultToolExecutor::dispatch`.
 - Unified `task` tool already registered with `action: create|update|list|get|stop`.

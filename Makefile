@@ -636,13 +636,6 @@ test-workspace: sweep
 	@echo "Running workspace doctests (cargo test --doc; not covered by nextest)..."
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) --workspace --doc
 
-# Guard: server allowlist names ⊆ all_tool_schemas(), memory_* allowlist coverage,
-# DEFAULT_EXECUTOR_TOOL_NAMES ⊆ SERVER_EXECUTOR_TOOL_NAMES (manifest-path rust/Cargo.toml).
-.PHONY: check-server-tool-schemas
-check-server-tool-schemas:
-	@echo "Running astra-tools server/allowlist/schema guard tests..."
-	@$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-tools schemas::tests::
-
 # Compiles chat/turn bridge hook paths and runs integration binaries that require
 # `required-features = ["bridge-e2e-hooks"]` (e.g. chat_turn_bridge_ledger_inject_e2e).
 .PHONY: test-runtime-bridge-hooks

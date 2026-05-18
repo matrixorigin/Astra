@@ -12,7 +12,7 @@ pub(crate) fn suggest_followup(
     if trimmed.is_empty()
         || trimmed.starts_with('/')
         || super::chat_turn::is_short_continuation_prompt(trimmed)
-        || state.plan_mode.is_some()
+        || state.plan_mode_active()
         || state.executing_plan.is_some()
         || state.plan_handle.is_some()
         || state.pending_approval.is_some()

@@ -39,6 +39,8 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+use crate::canonical_json;
+
 /// Strict request identity used for approval-queue dedup and
 /// pre-execution stale revalidation.
 ///
@@ -152,47 +154,7 @@ pub fn hash_canonical_json(value: &serde_json::Value) -> [u8; 32] {
 /// Serialize `value` to JSON with object keys sorted recursively.
 #[must_use]
 pub fn canonical_args_json(value: &serde_json::Value) -> String {
-    let mut out = String::new();
-    write_canonical(&mut out, value);
-    out
-}
-
-fn write_canonical(out: &mut String, value: &serde_json::Value) {
-    use serde_json::Value;
-    match value {
-        Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Number(n) => out.push_str(&n.to_string()),
-        Value::String(s) => {
-            // Reuse serde_json's escaping for strings.
-            out.push_str(&serde_json::to_string(s).unwrap_or_else(|_| String::from("\"\"")));
-        }
-        Value::Array(items) => {
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_canonical(out, item);
-            }
-            out.push(']');
-        }
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            out.push('{');
-            for (i, key) in keys.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                let key_json = serde_json::to_string(*key).unwrap_or_else(|_| String::from("\"\""));
-                out.push_str(&key_json);
-                out.push(':');
-                write_canonical(out, &map[*key]);
-            }
-            out.push('}');
-        }
-    }
+    canonical_json::to_string(value)
 }
 
 #[cfg(test)]

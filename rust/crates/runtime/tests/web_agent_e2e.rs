@@ -8,17 +8,19 @@
 //! cargo test -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks
 //! ```
 
+mod test_support;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
 use astra_runtime::{
-    AgenticRunLifecycleService, AppState, AuthLoginRequestData, AuthRefreshRequestData,
-    AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord, ErrorResponse,
-    FernetTokenEncryptor, HealthChecker, MatrixOneSettings, ServiceInfo, SessionActivityRecord,
-    SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
-    SessionUpdateRequestData, TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest,
-    TurnObserverWorker, TurnToolEventPersistPlan, TurnToolEventWriter, build_app,
+    AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
+    AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo,
+    SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
+    SessionRecord, SessionService, SessionUpdateRequestData, TurnHookDbPersistPlan,
+    TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker, TurnToolEventPersistPlan,
+    TurnToolEventWriter, build_app,
 };
 use astra_services::skills::{
     SkillInfoRecord, SkillListItem, SkillListRecord, SkillPublishRequestData, SkillRecord,
@@ -33,6 +35,10 @@ use axum::{
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tower::util::ServiceExt;
+
+use crate::test_support::{
+    parse_sse_events, test_fernet_encryptor, test_run_lifecycle, tool_call, tool_schema,
+};
 
 // ── Env setup ────────────────────────────────────────────────────────────────
 
@@ -351,23 +357,14 @@ impl SkillService for TestSkillService {
 // ── App builder ──────────────────────────────────────────────────────────────
 
 fn build_test_app() -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>) {
-    let enc =
-        Arc::new(FernetTokenEncryptor::new("web-e2e-fernet-key-32-chars!!!").expect("fernet key"));
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
         .with_session_service(Arc::new(StubSession));
 
     let ledger = base.edge_callback_ledger();
 
-    let lifecycle = AgenticRunLifecycleService::new(
-        MatrixOneSettings {
-            host: "127.0.0.1".into(),
-            port: 0,
-            user: "x".into(),
-            password: "x".into(),
-            database: "x".into(),
-        },
-        enc,
+    let lifecycle = test_run_lifecycle(
+        test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
         ledger.clone(),
     );
 
@@ -383,8 +380,6 @@ fn build_test_app_with_hooks() -> (
     Arc<RecordingToolEventWriter>,
 ) {
     init_env();
-    let enc =
-        Arc::new(FernetTokenEncryptor::new("web-e2e-fernet-key-32-chars!!!").expect("fernet key"));
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
         .with_session_service(Arc::new(StubSession));
@@ -394,15 +389,8 @@ fn build_test_app_with_hooks() -> (
     let observer_worker = Arc::new(RecordingObserverWorker::default());
     let tool_event_writer = Arc::new(RecordingToolEventWriter::default());
 
-    let lifecycle = AgenticRunLifecycleService::new(
-        MatrixOneSettings {
-            host: "127.0.0.1".into(),
-            port: 0,
-            user: "x".into(),
-            password: "x".into(),
-            database: "x".into(),
-        },
-        enc,
+    let lifecycle = test_run_lifecycle(
+        test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
         ledger,
     )
     .with_hook_db_writer(hook_writer.clone())
@@ -425,8 +413,6 @@ fn build_test_app_with_hooks_and_skills() -> (
     Arc<RecordingToolEventWriter>,
 ) {
     init_env();
-    let enc =
-        Arc::new(FernetTokenEncryptor::new("web-e2e-fernet-key-32-chars!!!").expect("fernet key"));
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
         .with_session_service(Arc::new(StubSession));
@@ -436,15 +422,8 @@ fn build_test_app_with_hooks_and_skills() -> (
     let observer_worker = Arc::new(RecordingObserverWorker::default());
     let tool_event_writer = Arc::new(RecordingToolEventWriter::default());
 
-    let lifecycle = AgenticRunLifecycleService::new(
-        MatrixOneSettings {
-            host: "127.0.0.1".into(),
-            port: 0,
-            user: "x".into(),
-            password: "x".into(),
-            database: "x".into(),
-        },
-        enc,
+    let lifecycle = test_run_lifecycle(
+        test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
         ledger,
     )
     .with_skill_service(Arc::new(TestSkillService))
@@ -462,33 +441,6 @@ fn build_test_app_with_hooks_and_skills() -> (
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-#[allow(dead_code)]
-fn tool_call(id: &str, name: &str, args: Value) -> Value {
-    json!({
-        "id": id,
-        "type": "function",
-        "function": {
-            "name": name,
-            "arguments": serde_json::to_string(&args).unwrap()
-        }
-    })
-}
-
-#[allow(dead_code)]
-fn tool_schema(name: &str) -> Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": format!("{name} tool"),
-            "parameters": {
-                "type": "object",
-                "properties": { "path": { "type": "string" } }
-            }
-        }
-    })
-}
 
 /// Send a POST /chat/stream request and collect all SSE events from the stream.
 async fn chat_stream_collect(app: &Router, payload: Value) -> Vec<Value> {
@@ -524,14 +476,6 @@ async fn chat_stream_start(app: &Router, payload: Value) -> axum::response::Resp
         .body(Body::from(payload.to_string()))
         .unwrap();
     app.clone().oneshot(req).await.unwrap()
-}
-
-/// Parse SSE events from a body string.
-fn parse_sse_events(body: &str) -> Vec<Value> {
-    body.lines()
-        .filter(|line| line.starts_with("data: "))
-        .filter_map(|line| serde_json::from_str(line.strip_prefix("data: ").unwrap()).ok())
-        .collect()
 }
 
 /// POST /tools/result

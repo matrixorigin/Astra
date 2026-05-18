@@ -148,7 +148,7 @@ impl AgentRegistry {
                 } else {
                     format!("{}\n{}", base.system_prompt_addendum, config.system_prompt)
                 },
-                default_model: config.model.unwrap_or_else(|| base.default_model.clone()),
+                default_model: config.model.or_else(|| base.default_model.clone()),
                 max_turns: config.max_turns.unwrap_or(base.max_turns),
                 allowed_tools: config
                     .allowed_tools
@@ -161,7 +161,7 @@ impl AgentRegistry {
                 agent_type: config.name,
                 description: config.description,
                 system_prompt_addendum: config.system_prompt,
-                default_model: config.model.unwrap_or_else(|| "claude-sonnet".to_string()),
+                default_model: config.model,
                 max_turns: config.max_turns.unwrap_or(30),
                 allowed_tools: config
                     .allowed_tools
@@ -253,7 +253,7 @@ mod tests {
         assert_eq!(def.agent_type, "deep-explore");
         assert_eq!(def.max_turns, 40);
         assert!(def.read_only); // inherited from explore
-        assert_eq!(def.default_model, "claude-haiku"); // inherited
+        assert_eq!(def.default_model, None); // inherited server default
         assert!(def.system_prompt_addendum.contains("architecture"));
     }
 
@@ -266,7 +266,7 @@ mod tests {
             agent_type: "explore".to_string(),
             description: "Custom explore".to_string(),
             system_prompt_addendum: String::new(),
-            default_model: "claude-opus".to_string(),
+            default_model: Some("claude-opus".to_string()),
             max_turns: 100,
             allowed_tools: ["*"].into_iter().map(String::from).collect(),
             read_only: false,

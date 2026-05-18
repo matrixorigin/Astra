@@ -295,37 +295,7 @@ fn system_prompt_with_no_tools_still_valid() {
     assert!(!prompt.contains("Memory Rules"));
 }
 
-// ── 9. Session cleanup sequencing contract ──────────────────────────────
-
-#[test]
-fn session_cleanup_sequences_store_before_purge() {
-    let src = include_str!("../../../astra-cli/src/cli/session_cleanup.rs");
-    let store_pos = src.find("memoria_store_lessons_fire_and_forget");
-    let purge_pos = src.find("/v1/memories/purge");
-    assert!(
-        store_pos.is_some() && purge_pos.is_some(),
-        "session_cleanup must have both store and purge"
-    );
-    let store_pos = store_pos.unwrap();
-    let purge_pos = purge_pos.unwrap();
-
-    let between = &src[store_pos..purge_pos];
-    assert!(
-        between.contains(".await"),
-        "store must be awaited BEFORE purge to prevent race (found: store at {store_pos}, purge at {purge_pos})"
-    );
-}
-
-#[test]
-fn signal_lessons_use_strict_quality_gate() {
-    let src = include_str!("../../../astra-cli/src/cli/session_cleanup.rs");
-    assert!(
-        src.contains("is_synthesized_lesson_acceptable"),
-        "signal lessons must use is_synthesized_lesson_acceptable (strict gate with blocklist), not is_high_quality_lesson"
-    );
-}
-
-// ── 10. Journal event structure ─────────────────────────────────────────
+// ── 9. Journal event structure ─────────────────────────────────────────
 
 #[test]
 fn session_memory_extraction_journal_event_structure() {

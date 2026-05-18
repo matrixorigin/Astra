@@ -29,11 +29,14 @@
 //! The cache is neither thread-safe nor shared across processes — wrap in
 //! a `Mutex` / `RwLock` at the integration site.
 
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
+use fnv::FnvHasher;
 use serde_json::Value;
+
+use crate::canonical_json;
+use crate::lru_map::LruMap;
 
 /// Signature identifying a tool call for dedup purposes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -49,8 +52,8 @@ impl CallSignature {
     /// `ctx_hash` defaults to `0`; pass [`Self::with_ctx_hash`] after
     /// constructing if a caller-supplied context hash applies.
     pub fn from_args(tool_name: &str, args: &Value) -> Self {
-        let canon = canonicalize(args);
-        let mut h = DefaultHasher::new();
+        let canon = canonical_json::to_string(args);
+        let mut h = FnvHasher::default();
         canon.hash(&mut h);
         Self {
             tool_name: tool_name.to_string(),
@@ -75,8 +78,7 @@ struct CachedEntry {
 /// Simple LRU + TTL result cache.
 #[derive(Debug)]
 pub struct ResultCache {
-    entries: Vec<(CallSignature, CachedEntry)>,
-    max_entries: usize,
+    entries: LruMap<CallSignature, CachedEntry>,
     ttl: Option<Duration>,
 }
 
@@ -86,8 +88,7 @@ impl ResultCache {
     pub fn new(max_entries: usize, ttl: Option<Duration>) -> Self {
         assert!(max_entries > 0, "max_entries must be >= 1");
         Self {
-            entries: Vec::with_capacity(max_entries),
-            max_entries,
+            entries: LruMap::new(max_entries),
             ttl,
         }
     }
@@ -106,38 +107,32 @@ impl ResultCache {
     /// stored result is replaced and moved to the MRU slot. If capacity
     /// would be exceeded, the LRU (front) entry is evicted first.
     pub fn record(&mut self, sig: CallSignature, result: String) {
-        if let Some(pos) = self.entries.iter().position(|(k, _)| k == &sig) {
-            self.entries.remove(pos);
-        } else if self.entries.len() >= self.max_entries {
-            self.entries.remove(0);
-        }
-        self.entries.push((
+        self.entries.insert(
             sig,
             CachedEntry {
                 result,
                 inserted: Instant::now(),
             },
-        ));
+        );
     }
 
     /// Fetch a cached result. A TTL miss evicts the stale entry and
     /// returns `None`. A hit moves the entry to the MRU slot.
     pub fn lookup(&mut self, sig: &CallSignature) -> Option<String> {
-        let pos = self.entries.iter().position(|(k, _)| k == sig)?;
-        let (key, entry) = self.entries.remove(pos);
+        let entry = self.entries.remove(sig)?;
         if let Some(ttl) = self.ttl {
             if entry.inserted.elapsed() > ttl {
                 return None;
             }
         }
         let result = entry.result.clone();
-        self.entries.push((
-            key,
+        self.entries.insert(
+            sig.clone(),
             CachedEntry {
                 result: result.clone(),
                 inserted: entry.inserted,
             },
-        ));
+        );
         Some(result)
     }
 
@@ -146,7 +141,8 @@ impl ResultCache {
         let Some(ttl) = self.ttl else {
             return;
         };
-        self.entries.retain(|(_, e)| e.inserted.elapsed() <= ttl);
+        self.entries
+            .retain(|_, entry| entry.inserted.elapsed() <= ttl);
     }
 
     /// Remove every entry whose tool name matches `tool_name`. Callers
@@ -154,7 +150,7 @@ impl ResultCache {
     /// read results (e.g. a `write_file` invalidates any prior
     /// `read_file` results — the caller-side policy decides the mapping).
     pub fn invalidate_tool(&mut self, tool_name: &str) {
-        self.entries.retain(|(k, _)| k.tool_name != tool_name);
+        self.entries.retain(|sig, _| sig.tool_name != tool_name);
     }
 
     /// Clear the cache.
@@ -234,29 +230,6 @@ where
         guard.record(sig.clone(), fresh.clone());
     }
     (fresh, false)
-}
-
-/// Canonicalize a JSON value by sorting object keys recursively.
-///
-/// Returns a `String` (not a `Value`) because the caller only needs a
-/// stable hashable representation.
-fn canonicalize(v: &Value) -> String {
-    match v {
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            let parts: Vec<String> = keys
-                .into_iter()
-                .map(|k| format!("{}:{}", k, canonicalize(&map[k])))
-                .collect();
-            format!("{{{}}}", parts.join(","))
-        }
-        Value::Array(arr) => {
-            let parts: Vec<String> = arr.iter().map(canonicalize).collect();
-            format!("[{}]", parts.join(","))
-        }
-        other => other.to_string(),
-    }
 }
 
 #[cfg(test)]
@@ -395,15 +368,15 @@ mod tests {
 
     #[test]
     fn canonicalize_handles_nested_structures() {
-        let a = canonicalize(&json!({"outer":{"b":2,"a":1}}));
-        let b = canonicalize(&json!({"outer":{"a":1,"b":2}}));
+        let a = canonical_json::to_string(&json!({"outer":{"b":2,"a":1}}));
+        let b = canonical_json::to_string(&json!({"outer":{"a":1,"b":2}}));
         assert_eq!(a, b);
     }
 
     #[test]
     fn canonicalize_preserves_array_order() {
-        let a = canonicalize(&json!([1, 2, 3]));
-        let b = canonicalize(&json!([3, 2, 1]));
+        let a = canonical_json::to_string(&json!([1, 2, 3]));
+        let b = canonical_json::to_string(&json!([3, 2, 1]));
         assert_ne!(a, b);
     }
 

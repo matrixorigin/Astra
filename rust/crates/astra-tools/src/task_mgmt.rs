@@ -888,7 +888,20 @@ impl TaskManager {
                             return Err(format!("task '{}' not found", task_id));
                         };
                         let Some(subtask) = task.subtasks.iter_mut().find(|st| st.id == st_id) else {
-                            return Err(format!("subtask '{}' not found in task '{}'", st_id, task_id));
+                            let available = task
+                                .subtasks
+                                .iter()
+                                .map(|st| st.id.as_str())
+                                .collect::<Vec<_>>();
+                            let hint = if available.is_empty() {
+                                "task has no subtasks".to_string()
+                            } else {
+                                format!("available subtask ids: {}", available.join(", "))
+                            };
+                            return Err(format!(
+                                "subtask '{}' not found in task '{}' ({hint})",
+                                st_id, task_id
+                            ));
                         };
                         let previous_status = subtask.status.clone();
                         if let Some(status) = new_status.as_deref() {
@@ -1328,6 +1341,33 @@ mod tests {
         assert!(
             list.contains("\"count\":1"),
             "duplicate must not be persisted; got {list}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_missing_subtask_reports_available_ids() {
+        let m = mgr();
+        m.create(&json!({
+            "title": "Build game",
+            "subtasks": [
+                {"id": "setup", "title": "Create files"},
+                {"id": "render", "title": "Render scene"}
+            ]
+        }))
+        .await;
+
+        let out = m
+            .update(&json!({
+                "task_id": "task-1",
+                "subtask_id": "dirs",
+                "status": "completed"
+            }))
+            .await;
+
+        assert!(out.contains("subtask 'dirs' not found"), "got {out}");
+        assert!(
+            out.contains("available subtask ids: setup, render"),
+            "error must help the model recover with valid ids: {out}"
         );
     }
 

@@ -614,7 +614,7 @@ fn build_environment_surface(
                 .and_then(|restored| restored.git_branch.clone())
         }),
         git_head: workspace.and_then(|ws| ws.git_head.clone()),
-        model: workspace.map(|ws| ws.model.clone()).or_else(|| {
+        model: workspace.and_then(|ws| ws.model.clone()).or_else(|| {
             artifacts
                 .restored
                 .as_ref()

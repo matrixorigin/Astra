@@ -365,6 +365,34 @@ pub struct DecisionEnvelope {
     pub risk_tags: Vec<RiskTag>,
 }
 
+fn legacy_plan_mode_tool_alias(tool_name: &str, args: &Value) -> Option<&'static str> {
+    let action = args.get("action").and_then(Value::as_str).map(str::trim);
+    match tool_name {
+        "session" => match action {
+            Some("enter_plan_mode") => Some("enter_plan_mode"),
+            Some("exit_plan_mode") => Some("exit_plan_mode"),
+            _ => None,
+        },
+        "agent" if action == Some("run_chain") => match args.get("chain").and_then(Value::as_str) {
+            Some("enter_plan_mode") => Some("enter_plan_mode"),
+            Some("exit_plan_mode") => Some("exit_plan_mode"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+pub(crate) fn plan_mode_denial_reason(tool_name: &str, args: &Value) -> String {
+    if let Some(canonical_tool) = legacy_plan_mode_tool_alias(tool_name, args) {
+        return format!(
+            "Tool '{tool_name}' denied by permission mode. Use `{canonical_tool}` directly — plan mode no longer routes through `{tool_name}`."
+        );
+    }
+    format!(
+        "Tool '{tool_name}' denied by permission mode. Plan mode allows read-only tools plus `enter_plan_mode` / `exit_plan_mode`; author the plan, then call `exit_plan_mode(plan=...)`."
+    )
+}
+
 /// Evaluate a tool call against the synchronized parent/child permission
 /// context.
 ///
@@ -720,8 +748,33 @@ pub fn evaluate_permission(
             "plan mode ignores mutating allow rules",
         );
         let mode_label = ctx.mode().to_string();
+        // Plan-control tools (`enter_plan_mode` / `exit_plan_mode`)
+        // must remain callable in plan mode — they are the model's
+        // only escape hatch (the `tool_schema_prune` module
+        // deliberately keeps them in the visible schema for the same
+        // reason). Without this exemption schema and runtime
+        // disagree: the model sees `exit_plan_mode`, calls it to
+        // surface its plan, runtime denies it as "denied by permission
+        // mode", and the agent is stuck in plan mode forever.
+        // Regression: session 4cb6b459.
+        if crate::tool_schema_prune::PLAN_MODE_REQUIRED_TOOLS.contains(&tool_name) {
+            let decision = HardDecision::Allow;
+            push_matched(
+                &mut trace,
+                EvaluationStep::Mode,
+                &decision,
+                "plan-control tool — exempt from plan-mode deny",
+            );
+            return envelope(
+                decision,
+                DecisionSource::Mode { mode: mode_label },
+                trace,
+                will_save,
+                risk_tags,
+            );
+        }
         let decision = HardDecision::Deny {
-            reason: format!("Tool '{tool_name}' denied by permission mode"),
+            reason: plan_mode_denial_reason(tool_name, args),
         };
         push_matched(&mut trace, EvaluationStep::Mode, &decision, &mode_label);
         return envelope(
@@ -1217,14 +1270,36 @@ fn content_aware_fingerprint_candidates(tool_name: &str, args: &Value) -> Vec<Ap
         cloud_gated_tool_kind(tool_name),
         Some(CloudGatedToolKind::Write)
     ) && let Some(path) = path_hint_from_args(args)
-        && let Some(resolved) = resolved_write_path(&path)
     {
-        let resolved_fp = ApprovalFingerprint::file_op_exact(tool_name, Some(&resolved));
-        if resolved_fp != primary {
-            candidates.push(resolved_fp);
+        if crate::tool_categories::registry().is_file_op(tool_name) {
+            push_unique_fingerprint(
+                &mut candidates,
+                ApprovalFingerprint::file_op_exact("edit", Some(&path)),
+            );
+        }
+        if let Some(resolved) = resolved_write_path(&path) {
+            push_unique_fingerprint(
+                &mut candidates,
+                ApprovalFingerprint::file_op_exact(tool_name, Some(&resolved)),
+            );
+            if crate::tool_categories::registry().is_file_op(tool_name) {
+                push_unique_fingerprint(
+                    &mut candidates,
+                    ApprovalFingerprint::file_op_exact("edit", Some(&resolved)),
+                );
+            }
         }
     }
     candidates
+}
+
+fn push_unique_fingerprint(
+    candidates: &mut Vec<ApprovalFingerprint>,
+    candidate: ApprovalFingerprint,
+) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
 }
 
 fn risk_tags_for_request(tool_name: &str, args: &Value) -> Vec<RiskTag> {
@@ -1386,7 +1461,7 @@ mod tests {
             .into_owned();
         assert_eq!(
             rule,
-            format!(r#"write_file(path_prefix="{cwd}", op="write", cwd_root="{cwd}")"#)
+            format!(r#"Edit(path_prefix="{cwd}", op="write", cwd_root="{cwd}")"#)
         );
     }
 
@@ -1397,7 +1472,7 @@ mod tests {
             &serde_json::json!({"path": "/tmp/zzzz3.md", "content": "# zzzz3"}),
         );
 
-        assert_eq!(rule, r#"write_file(path_glob="/tmp/zzzz3.md", op="write")"#);
+        assert_eq!(rule, r#"Edit(path_glob="/tmp/zzzz3.md", op="write")"#);
     }
 
     #[test]
@@ -1494,6 +1569,55 @@ mod tests {
             &ctx,
         );
         assert!(matches!(mutating_bash.decision, HardDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn plan_mode_allows_plan_control_tools_so_model_can_exit() {
+        // Regression for session 4cb6b459: in plan mode the model
+        // saw `exit_plan_mode` in its schema (kept by
+        // `tool_schema_prune::PLAN_MODE_REQUIRED_TOOLS`), called it
+        // to surface the authored plan, but the permission engine's
+        // fallback denied it as "denied by permission mode" — leaving
+        // the agent stuck in plan mode forever. The two layers must
+        // agree: anything kept in the plan-mode schema must also pass
+        // the runtime gate.
+        let ctx = crate::permission_types::PermissionSyncContext::new(
+            crate::permission_types::InheritedPermissions {
+                mode: crate::permission_types::PermissionMode::Plan,
+                ..Default::default()
+            },
+        );
+        for tool in crate::tool_schema_prune::PLAN_MODE_REQUIRED_TOOLS {
+            let envelope = evaluate_permission(tool, &serde_json::json!({}), &ctx);
+            assert!(
+                matches!(envelope.decision, HardDecision::Allow),
+                "plan mode must allow `{tool}` so the agent can leave plan mode; got {:?}",
+                envelope.decision
+            );
+        }
+    }
+
+    #[test]
+    fn plan_mode_denial_reason_guides_legacy_plan_tool_aliases() {
+        let session_reason =
+            plan_mode_denial_reason("session", &serde_json::json!({"action": "exit_plan_mode"}));
+        assert!(session_reason.contains("Use `exit_plan_mode` directly"));
+        assert!(session_reason.contains("no longer routes through `session`"));
+
+        let agent_reason = plan_mode_denial_reason(
+            "agent",
+            &serde_json::json!({"action": "run_chain", "chain": "exit_plan_mode"}),
+        );
+        assert!(agent_reason.contains("Use `exit_plan_mode` directly"));
+        assert!(agent_reason.contains("no longer routes through `agent`"));
+    }
+
+    #[test]
+    fn generic_plan_mode_denial_reason_points_to_exit_tool() {
+        let reason =
+            plan_mode_denial_reason("bash", &serde_json::json!({"command": "touch plan.txt"}));
+        assert!(reason.contains("Plan mode allows read-only tools"));
+        assert!(reason.contains("exit_plan_mode(plan=...)"));
     }
 
     #[test]

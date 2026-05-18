@@ -2151,6 +2151,13 @@ impl CliSseStreamHost<'_> {
                 header,
                 display_label.or(detail).map(ToString::to_string),
                 reason,
+                // Cloud approvals are launched without structured
+                // args in scope (the cloud server already validated
+                // the call). Re-evaluation after a mode pivot will
+                // see Value::Null and fall through unchanged, which
+                // is correct: cloud approvals are bound to the
+                // cloud's own gate, not the local mode.
+                serde_json::Value::Null,
                 resp_tx,
             ))
             .is_err()
@@ -2752,6 +2759,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         header,
                         detail,
                         reason,
+                        args: args.clone(),
                         response_tx: resp_tx,
                         metadata: Some(Box::new(metadata)),
                     });
@@ -2999,6 +3007,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         format!("🔒 {header}"),
                                         detail,
                                         reason,
+                                        args.clone(),
                                         resp_tx,
                                     ));
                                     let response = if let Some(token) = self.cancel_token {
@@ -3828,6 +3837,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             header,
                             detail,
                             reason,
+                            args.clone(),
                             resp_tx,
                         ));
                         let response = if let Some(token) = self.cancel_token {
@@ -7227,22 +7237,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn edge_tool_result_401_refreshes_and_retries_without_terminal_auth_failure() {
-        static CREDENTIALS_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-            std::sync::OnceLock::new();
-        let _guard = CREDENTIALS_ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("credentials env lock");
-
-        let credentials_dir = tempdir().expect("credentials dir");
-        unsafe { std::env::set_var("ASTRA_CREDENTIALS_DIR", credentials_dir.path()) };
-        struct CredentialsEnvGuard;
-        impl Drop for CredentialsEnvGuard {
-            fn drop(&mut self) {
-                unsafe { std::env::remove_var("ASTRA_CREDENTIALS_DIR") };
-            }
-        }
-        let _env_guard = CredentialsEnvGuard;
+        let _creds_guard = crate::tests::isolate_credentials();
 
         let mut creds = CredentialsFile {
             current_profile: Some("test".to_string()),

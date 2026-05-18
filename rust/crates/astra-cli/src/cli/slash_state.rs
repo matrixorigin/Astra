@@ -339,7 +339,6 @@ pub(super) async fn handle_state_command(
                     latest_skill_diagnosis: None,
                     latest_turn_quality_feedback: None,
                     unified_skill_registry: astra_runtime::skills::default_unified_registry(),
-                    plan_only_chat: false,
                     is_plan_subtask: false,
                     plan_subtask_id: None,
                     delegation_engine: None,
@@ -353,6 +352,7 @@ pub(super) async fn handle_state_command(
                     agent_live_event_sink: None,
                     approval_request_tx: None,
                     ask_user_request_tx: None,
+            plan_review_request_tx: None,
                     mcp_manager: Some(state.mcp_manager.clone()),
                     skill_search: &state.skill_search,
                     skill_quality_tracker: &mut state.skill_quality_tracker,
@@ -467,7 +467,6 @@ pub(super) async fn handle_state_command(
                             latest_turn_quality_feedback: None,
                             unified_skill_registry: astra_runtime::skills::default_unified_registry(
                             ),
-                            plan_only_chat: false,
                             is_plan_subtask: false,
                             plan_subtask_id: None,
                             delegation_engine: None,
@@ -477,6 +476,7 @@ pub(super) async fn handle_state_command(
                             agent_live_event_sink: None,
                             approval_request_tx: None,
                             ask_user_request_tx: None,
+                            plan_review_request_tx: None,
                             mcp_manager: Some(state.mcp_manager.clone()),
                             skill_search: &state.skill_search,
                             skill_quality_tracker: &mut state.skill_quality_tracker,
@@ -572,7 +572,6 @@ pub(super) async fn handle_state_command(
                                     latest_turn_quality_feedback: None,
                                     unified_skill_registry:
                                         astra_runtime::skills::default_unified_registry(),
-                                    plan_only_chat: false,
                                     is_plan_subtask: false,
                                     plan_subtask_id: None,
                                     delegation_engine: None,
@@ -582,6 +581,7 @@ pub(super) async fn handle_state_command(
                                     agent_live_event_sink: None,
                                     approval_request_tx: None,
                                     ask_user_request_tx: None,
+                                    plan_review_request_tx: None,
                                     mcp_manager: Some(state.mcp_manager.clone()),
                                     skill_search: &state.skill_search,
                                     skill_quality_tracker: &mut state.skill_quality_tracker,
@@ -756,7 +756,7 @@ pub(super) async fn handle_state_command(
                 state.history.len(),
                 mem_note,
             );
-            if state.plan_mode.is_some() || state.executing_plan.is_some() {
+            if state.plan_mode_active() || state.executing_plan.is_some() {
                 eprintln!(
                     "{}",
                     "  Tip: Plan context was shortened — if steps feel stale, refresh `/plan` or your plan view."

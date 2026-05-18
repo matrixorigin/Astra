@@ -8,9 +8,9 @@
 //!
 //! * [`CloudPlanRepository`] — SQLx backed by the `plans` + `plan_step_runs`
 //!   MatrixOne tables created in `astra-services::storage`. Source of truth.
-//! * [`LocalCachePlanRepository`] — thin wrapper over the legacy on-disk
-//!   `~/.astra/plans/{plan_id}.json` helpers on [`PlanModeState`]. Used in
-//!   tests and as an offline fallback; it does not know about `plan_step_runs`.
+//! * [`InMemoryPlanRepository`] — process-local fallback for tests and
+//!   unconfigured runtime wiring. Mirrors the trait contract without reviving
+//!   legacy filesystem persistence.
 //!
 //! # Invariants enforced here
 //!
@@ -23,13 +23,46 @@
 //! * `plan_step_runs` is append-only. Every subtask attempt creates a new row
 //!   — never UPDATE, never DELETE.
 
-use crate::decompose::{PlanLoadError, PlanModeState, SavedPlanInfo};
+use crate::state::PlanModeState;
 use astra_services::task_orchestrator::TaskStatus;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{MySql, Pool, Row};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 use uuid::Uuid;
+
+/// Typed errors for plan persistence operations.
+#[derive(Debug, Clone)]
+pub enum PlanLoadError {
+    /// Plan ID contains illegal characters (path traversal, etc.)
+    InvalidId(String),
+    /// Plan does not exist in storage.
+    NotFound(String),
+    /// Stored plan payload is corrupted or unreadable.
+    Corrupt(String),
+    /// Optimistic-concurrency conflict.
+    Conflict { expected: u64, actual: u64 },
+    /// I/O or other unexpected error.
+    Internal(String),
+}
+
+impl std::fmt::Display for PlanLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidId(msg) => write!(f, "invalid plan ID: {msg}"),
+            Self::NotFound(msg) => write!(f, "plan not found: {msg}"),
+            Self::Corrupt(msg) => write!(f, "plan corrupted: {msg}"),
+            Self::Conflict { expected, actual } => {
+                write!(f, "version conflict: expected {expected}, stored {actual}")
+            }
+            Self::Internal(msg) => write!(f, "plan error: {msg}"),
+        }
+    }
+}
 
 // ─── Step-run record ─────────────────────────────────────────────────────────
 
@@ -58,6 +91,16 @@ pub struct NewStepRun<'a> {
     pub status: TaskStatus,
     pub session_id: &'a str,
     pub request_id: &'a str,
+}
+
+/// Summary info for a saved plan.
+#[derive(Debug, Clone)]
+pub struct SavedPlanInfo {
+    pub name: String,
+    pub goal: String,
+    pub progress_pct: u32,
+    pub subtask_count: usize,
+    pub status: String,
 }
 
 // ─── Trait ───────────────────────────────────────────────────────────────────
@@ -141,8 +184,6 @@ pub trait PlanRepository: Send + Sync {
         artifact_ref: Option<&str>,
     ) -> Result<String, PlanLoadError>;
 
-    /// Finalize an existing step-run with its outcome. Status/finished_at/error
-    /// are the mutable fields; everything else is immutable.
     /// Finalize an existing step-run with its outcome. Status/finished_at/error
     /// are the mutable fields; everything else is immutable.
     ///
@@ -237,6 +278,21 @@ fn map_sqlx(err: sqlx::Error) -> PlanLoadError {
     PlanLoadError::Internal(format!("sql error: {err}"))
 }
 
+fn validate_plan_id(plan_id: &str) -> Result<(), PlanLoadError> {
+    if plan_id.is_empty() {
+        return Err(PlanLoadError::InvalidId("plan ID must not be empty".into()));
+    }
+    if !plan_id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(PlanLoadError::InvalidId(format!(
+            "'{plan_id}': only alphanumeric, dash, and underscore allowed"
+        )));
+    }
+    Ok(())
+}
+
 /// Translate the MySQL duplicate-key error (1062) raised by the unique
 /// `(plan_id, subtask_id, attempt)` index on `plan_step_runs` into
 /// [`PlanLoadError::Conflict`]. This happens when two concurrent redos
@@ -267,7 +323,7 @@ impl PlanRepository for CloudPlanRepository {
         state: &mut PlanModeState,
         expected_version: Option<u64>,
     ) -> Result<(), PlanLoadError> {
-        PlanModeState::validate_plan_id(plan_id)?;
+        validate_plan_id(plan_id)?;
         let phase = infer_phase_for_persist(state);
         let progress = state.plan.progress_pct() as i32;
         let goal = state.goal.clone();
@@ -325,7 +381,7 @@ impl PlanRepository for CloudPlanRepository {
                     "INSERT INTO plans \
                          (plan_id, user_id, session_id, goal, phase, version, plan_json, plan_md, \
                           progress_pct, subtask_count, created_by, created_at, updated_at) \
-                     VALUES (?, ?, ?, ?, ?, 1, ?, NULL, ?, ?, ?, NOW(6), NOW(6))",
+                     VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
                 )
                 .bind(plan_id)
                 .bind(&user_id)
@@ -333,6 +389,7 @@ impl PlanRepository for CloudPlanRepository {
                 .bind(&goal)
                 .bind(phase)
                 .bind(&plan_json)
+                .bind(state.plan_md.as_deref())
                 .bind(progress)
                 .bind(subtask_count)
                 .bind(&user_id)
@@ -371,12 +428,12 @@ impl PlanRepository for CloudPlanRepository {
                 // Conditional UPDATE: only succeeds when the stored version
                 // is still `stored`. Concurrent writer that already bumped
                 // the row to `stored + 1` causes our WHERE to miss, and
-                // `rows_affected() == 0` → conflict. Session_id / plan_md /
-                // user_id are intentionally NOT in SET so routine saves
-                // don't clobber hints set via set_active_plan.
+                // `rows_affected() == 0` → conflict. Session_id / user_id are
+                // intentionally NOT in SET so routine saves don't clobber
+                // hints set via set_active_plan.
                 let res = sqlx::query(
                     "UPDATE plans \
-                     SET goal = ?, phase = ?, version = ?, plan_json = ?, \
+                     SET goal = ?, phase = ?, version = ?, plan_json = ?, plan_md = ?, \
                          progress_pct = ?, subtask_count = ?, updated_at = NOW(6) \
                      WHERE plan_id = ? AND version = ?",
                 )
@@ -384,6 +441,7 @@ impl PlanRepository for CloudPlanRepository {
                 .bind(phase)
                 .bind(next_version as i64)
                 .bind(&plan_json)
+                .bind(state.plan_md.as_deref())
                 .bind(progress)
                 .bind(subtask_count)
                 .bind(plan_id)
@@ -414,12 +472,14 @@ impl PlanRepository for CloudPlanRepository {
     }
 
     async fn load(&self, plan_id: &str) -> Result<PlanModeState, PlanLoadError> {
-        PlanModeState::validate_plan_id(plan_id)?;
-        let row = sqlx::query("SELECT plan_json, session_id, version FROM plans WHERE plan_id = ?")
-            .bind(plan_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
+        validate_plan_id(plan_id)?;
+        let row = sqlx::query(
+            "SELECT plan_json, plan_md, session_id, version FROM plans WHERE plan_id = ?",
+        )
+        .bind(plan_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         let Some(row) = row else {
             return Err(PlanLoadError::NotFound(plan_id.to_string()));
         };
@@ -429,12 +489,16 @@ impl PlanRepository for CloudPlanRepository {
         let session_hint: Option<String> = row
             .try_get("session_id")
             .map_err(|e| PlanLoadError::Corrupt(format!("read session_id: {e}")))?;
+        let plan_md: Option<String> = row
+            .try_get("plan_md")
+            .map_err(|e| PlanLoadError::Corrupt(format!("read plan_md: {e}")))?;
         let version_col: i64 = row
             .try_get("version")
             .map_err(|e| PlanLoadError::Corrupt(format!("read version: {e}")))?;
         let mut state = serde_json::from_str::<PlanModeState>(&plan_json)
             .map_err(|e| PlanLoadError::Corrupt(format!("parse plan state: {e}")))?;
         state.session_hint = session_hint;
+        state.plan_md = plan_md.or(state.plan_md);
         // `plans.version` is the authoritative optimistic-concurrency value.
         // Old rows written before the save() ordering fix may have a stale
         // version inside plan_json; trust the column.
@@ -506,7 +570,7 @@ impl PlanRepository for CloudPlanRepository {
     }
 
     async fn delete(&self, plan_id: &str) -> Result<(), PlanLoadError> {
-        PlanModeState::validate_plan_id(plan_id)?;
+        validate_plan_id(plan_id)?;
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
 
         let result = sqlx::query("DELETE FROM plans WHERE plan_id = ?")
@@ -729,7 +793,7 @@ impl PlanRepository for CloudPlanRepository {
         subtask_id: Option<&str>,
         limit: i32,
     ) -> Result<Vec<PlanStepRun>, PlanLoadError> {
-        PlanModeState::validate_plan_id(plan_id)?;
+        validate_plan_id(plan_id)?;
         let limit = limit.clamp(1, 1000);
 
         // Stable order: newest started_at first, `run_id` ASC as the
@@ -790,7 +854,7 @@ impl PlanRepository for CloudPlanRepository {
         plan_id: &str,
         subtask_ids: &[String],
     ) -> Result<u64, PlanLoadError> {
-        PlanModeState::validate_plan_id(plan_id)?;
+        validate_plan_id(plan_id)?;
         if subtask_ids.is_empty() {
             return Ok(0);
         }
@@ -818,44 +882,90 @@ impl PlanRepository for CloudPlanRepository {
     }
 }
 
-// ─── Local-cache (filesystem) implementation ─────────────────────────────────
+// ─── In-memory implementation ────────────────────────────────────────────────
 
-/// Filesystem-backed repository — wraps the legacy `~/.astra/plans/*.json`
-/// helpers on [`PlanModeState`]. Used as an offline fallback, in tests, and
-/// as the in-process cache behind [`CloudPlanRepository`].
+#[derive(Debug, Default)]
+struct InMemoryPlanRepositoryState {
+    plans: HashMap<String, PlanModeState>,
+    active_plans: HashMap<String, String>,
+    step_runs: HashMap<String, PlanStepRun>,
+}
+
+/// Process-local repository for tests and unconfigured runtime defaults.
 ///
-/// Does **not** persist `plan_step_runs` or `active_plan_id` — those are
-/// cloud-only concepts. The corresponding trait methods are Ok no-ops so a
-/// CLI running offline can still exercise the same codepaths.
+/// Unlike the removed filesystem cache, this fallback keeps all plan state in
+/// memory, so it cannot leak stale plan files across runs or workspaces.
 #[derive(Debug, Clone, Default)]
-pub struct LocalCachePlanRepository;
+pub struct InMemoryPlanRepository {
+    inner: Arc<RwLock<InMemoryPlanRepositoryState>>,
+}
 
-impl LocalCachePlanRepository {
+impl InMemoryPlanRepository {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+}
+
+fn saved_plan_info(plan_id: &str, state: &PlanModeState) -> SavedPlanInfo {
+    let status = if state.plan.progress_pct() == 100 {
+        "completed"
+    } else if state.plan.items_done() > 0 {
+        "in_progress"
+    } else {
+        "pending"
+    };
+    SavedPlanInfo {
+        name: plan_id.to_string(),
+        goal: state.goal.clone(),
+        progress_pct: state.plan.progress_pct(),
+        subtask_count: state.plan.subtasks.len(),
+        status: status.to_string(),
     }
 }
 
 #[async_trait]
-impl PlanRepository for LocalCachePlanRepository {
+impl PlanRepository for InMemoryPlanRepository {
     async fn save(
         &self,
         plan_id: &str,
         state: &mut PlanModeState,
         expected_version: Option<u64>,
     ) -> Result<(), PlanLoadError> {
-        if let Some(expected) = expected_version
-            && state.version != expected
-        {
-            return Err(PlanLoadError::conflict(expected, state.version));
+        validate_plan_id(plan_id)?;
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        match (
+            guard.plans.get(plan_id).map(|s| s.version),
+            expected_version,
+        ) {
+            (None, Some(expected)) if expected != 0 => {
+                return Err(PlanLoadError::conflict(expected, 0));
+            }
+            (Some(actual), None) => {
+                return Err(PlanLoadError::conflict(0, actual));
+            }
+            (Some(actual), Some(expected)) if expected != actual => {
+                return Err(PlanLoadError::conflict(expected, actual));
+            }
+            (Some(actual), _) => {
+                state.version = actual + 1;
+            }
+            (None, _) => {
+                state.version = 1;
+            }
         }
-        state
-            .save_to_plans_dir_with_id(plan_id)
-            .map_err(PlanLoadError::Internal)
+        guard.plans.insert(plan_id.to_string(), state.clone());
+        Ok(())
     }
 
     async fn load(&self, plan_id: &str) -> Result<PlanModeState, PlanLoadError> {
-        PlanModeState::load_from_plans_dir(plan_id)
+        validate_plan_id(plan_id)?;
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .plans
+            .get(plan_id)
+            .cloned()
+            .ok_or_else(|| PlanLoadError::NotFound(plan_id.to_string()))
     }
 
     async fn load_owned(
@@ -873,173 +983,215 @@ impl PlanRepository for LocalCachePlanRepository {
     async fn list_for_user(
         &self,
         user_id: &str,
-        _filter: PlanListFilter<'_>,
+        filter: PlanListFilter<'_>,
     ) -> Result<Vec<SavedPlanInfo>, PlanLoadError> {
-        Ok(PlanModeState::list_saved_plans_for_user(user_id))
+        let guard = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let mut plans = guard
+            .plans
+            .iter()
+            .filter_map(|(plan_id, state)| {
+                let owner = state.created_by.as_deref().unwrap_or(user_id);
+                if owner != user_id {
+                    return None;
+                }
+                if let Some(session_id) = filter.session_id
+                    && state.session_hint.as_deref() != Some(session_id)
+                {
+                    return None;
+                }
+                if let Some(phase) = filter.phase
+                    && infer_phase_for_persist(state) != phase
+                {
+                    return None;
+                }
+                Some(saved_plan_info(plan_id, state))
+            })
+            .collect::<Vec<_>>();
+        plans.sort_by(|a, b| a.name.cmp(&b.name));
+        if let Some(limit) = filter.limit {
+            plans.truncate(limit.max(0) as usize);
+        }
+        Ok(plans)
     }
 
     async fn delete(&self, plan_id: &str) -> Result<(), PlanLoadError> {
-        PlanModeState::delete_saved_plan(plan_id)
+        validate_plan_id(plan_id)?;
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        guard.plans.remove(plan_id);
+        guard.active_plans.retain(|_, active| active != plan_id);
+        guard.step_runs.retain(|_, run| run.plan_id != plan_id);
+        Ok(())
     }
 
     async fn set_active_plan(
         &self,
-        _session_id: &str,
-        _plan_id: Option<&str>,
+        session_id: &str,
+        plan_id: Option<&str>,
     ) -> Result<(), PlanLoadError> {
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        guard.active_plans.remove(session_id);
+        if let Some(plan_id) = plan_id {
+            validate_plan_id(plan_id)?;
+            guard.active_plans.retain(|_, active| active != plan_id);
+            guard
+                .active_plans
+                .insert(session_id.to_string(), plan_id.to_string());
+        }
         Ok(())
     }
 
     async fn active_plan_for_session(
         &self,
-        _session_id: &str,
+        session_id: &str,
     ) -> Result<Option<String>, PlanLoadError> {
-        Ok(None)
+        Ok(self
+            .inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .active_plans
+            .get(session_id)
+            .cloned())
     }
 
-    async fn record_step_run(&self, _input: NewStepRun<'_>) -> Result<String, PlanLoadError> {
-        Ok(Uuid::new_v4().to_string())
+    async fn record_step_run(&self, input: NewStepRun<'_>) -> Result<String, PlanLoadError> {
+        let run_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .step_runs
+            .insert(
+                run_id.clone(),
+                PlanStepRun {
+                    run_id: run_id.clone(),
+                    plan_id: input.plan_id.to_string(),
+                    subtask_id: input.subtask_id.to_string(),
+                    attempt: input.attempt,
+                    status: input.status,
+                    session_id: input.session_id.to_string(),
+                    started_at: now,
+                    finished_at: None,
+                    request_id: input.request_id.to_string(),
+                    error: None,
+                    artifact_ref: None,
+                },
+            );
+        Ok(run_id)
     }
 
     async fn record_completed_step_run(
         &self,
-        _input: NewStepRun<'_>,
-        _error: Option<&str>,
-        _artifact_ref: Option<&str>,
+        input: NewStepRun<'_>,
+        error: Option<&str>,
+        artifact_ref: Option<&str>,
     ) -> Result<String, PlanLoadError> {
-        Ok(Uuid::new_v4().to_string())
+        let run_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .step_runs
+            .insert(
+                run_id.clone(),
+                PlanStepRun {
+                    run_id: run_id.clone(),
+                    plan_id: input.plan_id.to_string(),
+                    subtask_id: input.subtask_id.to_string(),
+                    attempt: input.attempt,
+                    status: input.status,
+                    session_id: input.session_id.to_string(),
+                    started_at: now,
+                    finished_at: Some(now),
+                    request_id: input.request_id.to_string(),
+                    error: error.map(str::to_string),
+                    artifact_ref: artifact_ref.map(str::to_string),
+                },
+            );
+        Ok(run_id)
     }
 
     async fn finalize_step_run(
         &self,
-        _plan_id: &str,
-        _run_id: &str,
-        _status: TaskStatus,
-        _error: Option<&str>,
-        _artifact_ref: Option<&str>,
+        plan_id: &str,
+        run_id: &str,
+        status: TaskStatus,
+        error: Option<&str>,
+        artifact_ref: Option<&str>,
     ) -> Result<(), PlanLoadError> {
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let Some(run) = guard.step_runs.get_mut(run_id) else {
+            return Err(PlanLoadError::NotFound(run_id.to_string()));
+        };
+        if run.plan_id != plan_id {
+            return Err(PlanLoadError::NotFound(run_id.to_string()));
+        }
+        run.status = status;
+        run.finished_at = Some(Utc::now());
+        run.error = error.map(str::to_string);
+        run.artifact_ref = artifact_ref.map(str::to_string);
         Ok(())
     }
 
     async fn get_step_run(
         &self,
-        _plan_id: &str,
+        plan_id: &str,
         run_id: &str,
     ) -> Result<PlanStepRun, PlanLoadError> {
-        Err(PlanLoadError::NotFound(format!(
-            "step_run {run_id} (local cache has no step_runs)"
-        )))
+        let guard = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let Some(run) = guard.step_runs.get(run_id) else {
+            return Err(PlanLoadError::NotFound(run_id.to_string()));
+        };
+        if run.plan_id != plan_id {
+            return Err(PlanLoadError::NotFound(run_id.to_string()));
+        }
+        Ok(run.clone())
     }
 
     async fn list_step_runs(
         &self,
-        _plan_id: &str,
-        _subtask_id: Option<&str>,
-        _limit: i32,
+        plan_id: &str,
+        subtask_id: Option<&str>,
+        limit: i32,
     ) -> Result<Vec<PlanStepRun>, PlanLoadError> {
-        Ok(Vec::new())
+        let guard = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let mut runs = guard
+            .step_runs
+            .values()
+            .filter(|run| run.plan_id == plan_id)
+            .filter(|run| subtask_id.is_none_or(|subtask_id| run.subtask_id == subtask_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        runs.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then_with(|| b.run_id.cmp(&a.run_id))
+        });
+        runs.truncate(limit.max(0) as usize);
+        Ok(runs)
     }
 
     async fn abort_open_step_runs(
         &self,
-        _plan_id: &str,
-        _subtask_ids: &[String],
+        plan_id: &str,
+        subtask_ids: &[String],
     ) -> Result<u64, PlanLoadError> {
-        // Local cache doesn't track step_runs, so nothing to abort.
-        Ok(0)
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let now = Utc::now();
+        let mut aborted = 0;
+        for run in guard.step_runs.values_mut() {
+            if run.plan_id == plan_id
+                && run.finished_at.is_none()
+                && subtask_ids
+                    .iter()
+                    .any(|subtask_id| subtask_id == &run.subtask_id)
+            {
+                run.status = TaskStatus::Cancelled;
+                run.finished_at = Some(now);
+                aborted += 1;
+            }
+        }
+        Ok(aborted)
     }
-}
-
-/// Fetch the rendered system-prompt section for the session's active plan, if
-/// one exists. Returns `None` when the session has no active plan. Swallows
-/// any repo errors to `None` so that a transient DB hiccup does not block chat
-/// turns — the worst-case failure mode is a missing hint on one turn.
-pub async fn plan_resume_hint_for_session(
-    repo: &dyn PlanRepository,
-    session_id: &str,
-) -> Option<String> {
-    let plan_id = repo
-        .active_plan_for_session(session_id)
-        .await
-        .ok()
-        .flatten()?;
-    let state = repo.load(&plan_id).await.ok()?;
-    crate::plan_resume::plan_resume_system_prompt_section(&state)
-}
-
-// ─── Fork helper ─────────────────────────────────────────────────────────────
-
-/// Duplicate a plan onto a new session.
-///
-/// Takes the parent plan's state, mints a new `plan_id` (derived from the
-/// parent's goal so both are searchable), copies every subtask including
-/// their completion status, pins the child session_hint, and atomically
-/// points `agent_sessions.active_plan_id` at the fork for the child session.
-///
-/// The parent plan and its linkage are untouched — fork is non-destructive,
-/// so the parent session can continue executing on its own copy.
-///
-/// `forked_at_subtask` is embedded in the new plan's timeline event so audit
-/// tools can tell where the fork split, but is not used to prune subtasks;
-/// callers that want to "restart from subtask X" should follow the fork with
-/// a `rewind` call on the child.
-///
-/// Returns `Some(new_plan_id)` on success, `PlanLoadError::NotFound` if the
-/// parent plan doesn't exist.
-pub async fn fork_plan_for_session(
-    repo: &dyn PlanRepository,
-    parent_plan_id: &str,
-    child_session_id: &str,
-    forked_at_subtask: Option<&str>,
-) -> Result<Option<String>, PlanLoadError> {
-    let parent = repo.load(parent_plan_id).await?;
-
-    // Mint a new plan_id that's distinct from the parent but still linkable.
-    // Uses the parent's goal so `generate_plan_id` produces a human-readable
-    // slug like `ship-feature-abcd` → `ship-feature-ef12`.
-    let mut child = parent.clone();
-    // Always append a short UUID suffix so successive forks from the same
-    // parent never collide (with each other or with any unrelated plan that
-    // happened to hash the same way via generate_plan_id). Keep the
-    // goal-derived prefix so forked ids remain human-readable.
-    let new_id = {
-        let base = PlanModeState::generate_plan_id(&parent.goal);
-        let suffix: String = Uuid::new_v4()
-            .simple()
-            .to_string()
-            .chars()
-            .take(8)
-            .collect();
-        // Cap total length so MatrixOne's VARCHAR(64) can always hold it.
-        let prefix_len = base.len().min(55);
-        format!("{}-{}", &base[..prefix_len], suffix)
-    };
-    child.version = 0; // fresh row → save will bump to 1
-    child.session_hint = Some(child_session_id.to_string());
-    child
-        .timeline
-        .record(crate::decompose::TimelineEventKind::PlanCreated {
-            subtask_count: child.plan.subtasks.len(),
-        });
-    // Record the fork point so audit trails can follow the lineage. Uses the
-    // existing Replan event kind with a descriptive reason — keeps the schema
-    // changes small and slots into existing UI rendering.
-    child
-        .timeline
-        .record(crate::decompose::TimelineEventKind::Replan {
-            reason: format!(
-                "forked from plan {parent_plan_id}{}",
-                forked_at_subtask
-                    .map(|st| format!(" at subtask {st}"))
-                    .unwrap_or_default()
-            ),
-            changes: "fork".to_string(),
-        });
-
-    repo.save(&new_id, &mut child, None).await?;
-    repo.set_active_plan(child_session_id, Some(&new_id))
-        .await?;
-    Ok(Some(new_id))
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -1047,55 +1199,52 @@ pub async fn fork_plan_for_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decompose::ProjectContext;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    /// Global lock for tests that mutate `HOME`. `cargo test` runs these in
-    /// parallel by default, so without serialization two tests can stamp on
-    /// each other's plan directory and observe stale rows from a sibling.
-    fn home_guard() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+    #[test]
+    fn validate_plan_id_rejects_unsafe_ids() {
+        for id in [
+            "",
+            "../etc/passwd",
+            "foo/../bar",
+            "foo/bar",
+            "foo\\bar",
+            "plan.json",
+            "id with space",
+            "a;b",
+            "a&b",
+        ] {
+            let err = validate_plan_id(id).unwrap_err();
+            assert!(
+                matches!(err, PlanLoadError::InvalidId(_)),
+                "should reject {id}: {err}"
+            );
+        }
     }
 
-    fn temp_plans_dir() -> (tempfile::TempDir, MutexGuard<'static, ()>) {
-        let guard = home_guard();
-        let dir = tempfile::TempDir::new().unwrap();
-        // SAFETY: home_guard() serializes access across tests so only one
-        // holder at a time is writing HOME. Matches the pattern used by
-        // existing filesystem tests in decompose.rs.
-        unsafe {
-            std::env::set_var("HOME", dir.path());
+    #[test]
+    fn validate_plan_id_accepts_safe_ids() {
+        for id in ["abc", "plan-123", "my_plan_v2", "ABC-xyz_01"] {
+            assert!(validate_plan_id(id).is_ok(), "should accept {id}");
         }
-        (dir, guard)
     }
 
     #[tokio::test]
-    async fn local_cache_save_and_load_roundtrip() {
-        let _guard = temp_plans_dir();
-        // _guard holds both TempDir + MutexGuard for the duration of this test.
-        let repo = LocalCachePlanRepository::new();
-        let mut state = PlanModeState::new_with_owner(
-            "test goal".into(),
-            ProjectContext::default(),
-            "u-1".into(),
-        );
+    async fn in_memory_save_and_load_roundtrip() {
+        let repo = InMemoryPlanRepository::new();
+        let mut state = PlanModeState::new_with_owner("test goal".into(), "u-1".into());
+        state.plan_md = Some("# test plan".into());
         repo.save("plan-1", &mut state, None).await.unwrap();
 
         let loaded = repo.load("plan-1").await.unwrap();
         assert_eq!(loaded.goal, "test goal");
         assert_eq!(loaded.created_by.as_deref(), Some("u-1"));
+        assert_eq!(loaded.plan_md.as_deref(), Some("# test plan"));
     }
 
     #[tokio::test]
-    async fn local_cache_load_owned_returns_not_found_for_wrong_user() {
-        let _guard = temp_plans_dir();
-        // _guard holds both TempDir + MutexGuard for the duration of this test.
-        let repo = LocalCachePlanRepository::new();
-        let mut state =
-            PlanModeState::new_with_owner("goal".into(), ProjectContext::default(), "u-1".into());
+    async fn in_memory_load_owned_returns_not_found_for_wrong_user() {
+        let repo = InMemoryPlanRepository::new();
+        let mut state = PlanModeState::new_with_owner("goal".into(), "u-1".into());
         repo.save("plan-2", &mut state, None).await.unwrap();
 
         let err = repo.load_owned("plan-2", "u-other").await.unwrap_err();
@@ -1103,8 +1252,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_cache_step_run_methods_are_noops() {
-        let repo = LocalCachePlanRepository::new();
+    async fn in_memory_step_run_roundtrip_and_abort() {
+        let repo = InMemoryPlanRepository::new();
         let run_id = repo
             .record_step_run(NewStepRun {
                 plan_id: "p",
@@ -1116,14 +1265,18 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(!run_id.is_empty());
+        let open = repo.get_step_run("p", &run_id).await.unwrap();
+        assert_eq!(open.status, TaskStatus::InProgress);
+        assert!(open.finished_at.is_none());
 
-        // finalize on a noop run just returns Ok.
-        repo.finalize_step_run("p", &run_id, TaskStatus::Completed, None, None)
+        let aborted = repo
+            .abort_open_step_runs("p", &[String::from("s")])
             .await
             .unwrap();
+        assert_eq!(aborted, 1);
 
-        let runs = repo.list_step_runs("p", None, 10).await.unwrap();
-        assert!(runs.is_empty());
+        let closed = repo.get_step_run("p", &run_id).await.unwrap();
+        assert_eq!(closed.status, TaskStatus::Cancelled);
+        assert!(closed.finished_at.is_some());
     }
 }

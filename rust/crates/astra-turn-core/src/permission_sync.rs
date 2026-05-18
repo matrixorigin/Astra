@@ -336,7 +336,18 @@ impl PermissionRequestHandler {
                 // Deny mode: reject without escalation
                 PermissionResponse::deny("permission mode is deny")
             }
-            PermissionMode::Plan => PermissionResponse::deny("permission mode is plan"),
+            PermissionMode::Plan => {
+                if crate::tool_schema_prune::PLAN_MODE_REQUIRED_TOOLS
+                    .contains(&request.tool_name.as_str())
+                {
+                    PermissionResponse::approve()
+                } else {
+                    PermissionResponse::deny(crate::permission_engine::plan_mode_denial_reason(
+                        &request.tool_name,
+                        &request.args,
+                    ))
+                }
+            }
             PermissionMode::AcceptEdits | PermissionMode::Prompt => {
                 // Prompt mode: use callback or default logic
                 drop(ctx);
@@ -458,6 +469,36 @@ mod handler_tests {
 
         assert!(!response.approved);
         assert!(response.reason.as_ref().unwrap().contains("plan"));
+    }
+
+    #[tokio::test]
+    async fn handler_plan_mode_allows_plan_control_tools() {
+        let ctx = PermissionSyncContext::root(PermissionMode::Plan);
+        let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
+
+        let request =
+            PermissionRequest::new("exit_plan_mode", serde_json::json!({"plan": "# plan"}));
+        let response = handler.handle_request(&request).await;
+
+        assert!(response.approved);
+    }
+
+    #[tokio::test]
+    async fn handler_plan_mode_guides_legacy_aliases_to_exit_plan_mode() {
+        let ctx = PermissionSyncContext::root(PermissionMode::Plan);
+        let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
+
+        let request =
+            PermissionRequest::new("session", serde_json::json!({"action": "exit_plan_mode"}));
+        let response = handler.handle_request(&request).await;
+
+        assert!(!response.approved);
+        assert!(
+            response
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Use `exit_plan_mode` directly"))
+        );
     }
 
     #[tokio::test]

@@ -23,9 +23,6 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use astra_core::SharedPool;
-#[cfg(test)]
-use astra_runtime::plan_decompose;
 use astra_runtime::{prompts, tool_registry};
 use astra_services::session_journal;
 use clap::Parser;
@@ -95,6 +92,8 @@ mod file_history;
 mod followup_suggestion;
 #[path = "cli/http_task_service.rs"]
 mod http_task_service;
+#[path = "cli/http_team_store.rs"]
+mod http_team_store;
 #[path = "cli/idle_agent_messages.rs"]
 mod idle_agent_messages;
 #[path = "cli/journal_diff.rs"]
@@ -111,16 +110,18 @@ mod mock_llm;
 mod notifications;
 #[path = "cli/permission_manager.rs"]
 mod permission_manager;
+#[path = "cli/plan_commands.rs"]
+mod plan_commands;
 #[path = "cli/plan_executor.rs"]
 mod plan_executor;
-#[path = "cli/plan_interaction.rs"]
-mod plan_interaction;
-#[path = "cli/plan_mode_client.rs"]
-mod plan_mode_client;
+#[path = "cli/plan_lifecycle.rs"]
+mod plan_lifecycle;
 #[path = "cli/plan_monitor.rs"]
 mod plan_monitor;
 #[path = "cli/plan_runtime.rs"]
 mod plan_runtime;
+#[path = "cli/plan_task_board.rs"]
+mod plan_task_board;
 #[path = "cli/preferences_client.rs"]
 mod preferences_client;
 #[path = "cli/project_instructions.rs"]
@@ -164,6 +165,8 @@ mod slash_mcp;
 mod slash_memory;
 #[path = "cli/slash_messaging.rs"]
 mod slash_messaging;
+#[path = "cli/slash_plan.rs"]
+mod slash_plan;
 #[path = "cli/slash_profile.rs"]
 mod slash_profile;
 #[path = "cli/slash_router.rs"]
@@ -186,8 +189,6 @@ mod slash_team;
 mod slash_telemetry;
 #[path = "cli/slash_tools.rs"]
 mod slash_tools;
-#[path = "cli/slash_tuning.rs"]
-mod slash_tuning;
 #[path = "cli/spawn_subrun.rs"]
 mod spawn_subrun;
 #[path = "cli/sse_utils.rs"]
@@ -228,8 +229,9 @@ use cli_utils::save_credentials;
 use cli_utils::{
     SessionResumePreflight, clear_profile_last_session_if_matches, compact_or_raw,
     credential_store, get_profile_and_token, interactive_select, load_credentials, map_thin_err,
-    mutate_credentials, persist_profile_last_session, persist_profile_memoria_api_key,
-    prefix_chars, preflight_remote_resume_session, print_json_or_raw, profile_name, prompt_or,
+    mutate_credentials, normalize_model_override, normalize_model_override_owned,
+    persist_profile_last_session, persist_profile_memoria_api_key, prefix_chars,
+    preflight_remote_resume_session, print_json_or_raw, profile_name, prompt_or,
     prompt_password_masked, resumable_last_session_id, truncate_str, urlencoding,
     validated_resumable_last_session_id,
 };
@@ -566,8 +568,9 @@ async fn main() {
     }
 
     // Resolve model: --model flag > config default_model > None
-    let resolved_model =
-        cli_model.or_else(|| command_router::read_config_default_model().ok().flatten());
+    let resolved_model = normalize_model_override_owned(
+        cli_model.or_else(|| command_router::read_config_default_model().ok().flatten()),
+    );
 
     // Make the resolved model available to slash commands that print
     // model-aware diagnostics without mutating the process environment.
@@ -1692,8 +1695,6 @@ total_tokens_out: 500
     async fn slash_health_offline_shows_cloud_section() {
         let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
         let mut state = SessionState::default();
-        // No matrix runtime — should show "Offline" in cloud section
-        assert!(state.matrix_runtime.is_none());
         let exit = handle_slash_command("/health", &api, None, &mut state, None)
             .await
             .unwrap();
@@ -2498,32 +2499,6 @@ total_tokens_out: 500
                 assert_eq!(words, &["what", "is", "rust"]);
             }
             _ => panic!("expected Message command"),
-        }
-    }
-
-    #[test]
-    fn cli_plan_decompose_parses() {
-        let cli = Cli::try_parse_from([
-            "astra",
-            "plan",
-            "decompose",
-            "-g",
-            "smoke goal",
-            "--json",
-            "-q",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Command::Plan(PlanCmd::Decompose {
-                ref goal,
-                json,
-                quiet,
-            })) => {
-                assert_eq!(goal, "smoke goal");
-                assert!(json);
-                assert!(quiet);
-            }
-            _ => panic!("expected Plan::Decompose command"),
         }
     }
 

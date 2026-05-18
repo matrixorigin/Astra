@@ -57,6 +57,7 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub file_context: Vec<String>,
     pub perm_manager: &'a mut PermissionManager,
     pub valid_tool_names: HashSet<String>,
+    pub capabilities: astra_turn_core::capability::CapabilitySet,
     /// Lines written to stderr between SSE turns (headless tool output, etc.)
     /// that the next `consume_turn_sse` must clear before streaming.
     pub pending_clear_lines: usize,
@@ -69,6 +70,11 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub approval_request_tx: Option<super::super::ApprovalRequestTx>,
     /// Optional channel for native TUI ask_user prompts.
     pub ask_user_request_tx: Option<super::super::AskUserRequestTx>,
+    /// Per-turn channel into the dedicated plan-review overlay used
+    /// by `exit_plan_mode`. Lives next to `ask_user_request_tx` but
+    /// stays separate so plan markdown does not have to be smuggled
+    /// through the question/option layout `ask_user` expects.
+    pub plan_review_request_tx: Option<super::super::PlanReviewRequestTx>,
     /// Root-level messaging context used when the current turn has no mailbox.
     pub root_send_message_context:
         Option<crate::edge_tools::agent_messaging::SendMessageRuntimeContext>,
@@ -185,6 +191,59 @@ impl CliAgenticLoopHost<'_> {
     }
 }
 
+fn permission_mode_change_audit_event(
+    session_id: Option<&str>,
+    turn: u32,
+    from_mode: PermissionMode,
+    to_mode: PermissionMode,
+    source: &str,
+) -> astra_services::session_journal::JournalEvent {
+    astra_services::session_journal::JournalEvent::permission_audit(
+        session_id,
+        Some(turn),
+        serde_json::json!({
+            "kind": "permission_mode_changed",
+            "from_mode": from_mode.to_string(),
+            "to_mode": to_mode.to_string(),
+            "source": source,
+            "changed": from_mode != to_mode,
+        }),
+    )
+}
+
+fn append_permission_mode_change_audit(
+    session_id: Option<&str>,
+    turn: u32,
+    from_mode: PermissionMode,
+    to_mode: PermissionMode,
+    source: &str,
+) {
+    let Some(session_id) = session_id.filter(|sid| !sid.trim().is_empty()) else {
+        tracing::warn!(
+            source,
+            from_mode = %from_mode,
+            to_mode = %to_mode,
+            "permission mode changed without session_id; journal event skipped"
+        );
+        return;
+    };
+    let event =
+        permission_mode_change_audit_event(Some(session_id), turn, from_mode, to_mode, source);
+    match astra_services::session_journal::JournalWriter::new(session_id)
+        .and_then(|writer| writer.append(&event))
+    {
+        Ok(()) => {}
+        Err(error) => tracing::warn!(
+            session_id,
+            source,
+            from_mode = %from_mode,
+            to_mode = %to_mode,
+            error = %error,
+            "failed to journal permission mode change"
+        ),
+    }
+}
+
 #[async_trait]
 impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     async fn execute_turn(
@@ -208,6 +267,93 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             );
         }
         let pre_clear = std::mem::take(&mut self.pending_clear_lines);
+
+        // Apply any pending permission-mode change recorded by a tool
+        // overlay during the previous turn (currently
+        // `exit_plan_mode`'s 4-option dialog). Done at turn start
+        // because mid-turn `set_mode` would race the agentic loop's
+        // borrow of `perm_manager`. When a switch did happen we also
+        // tell the model it now runs in the new mode so the next
+        // round's reasoning is grounded in the new permission set.
+        if let Some(new_mode) = self.executor.take_pending_permission_mode_change() {
+            let old_mode = self.perm_manager.mode();
+            self.perm_manager.set_mode(new_mode);
+            append_permission_mode_change_audit(
+                state.current_session_id.as_deref(),
+                self.chat_turn_index,
+                old_mode,
+                new_mode,
+                "plan_approval_overlay",
+            );
+            state.push_volatile(
+                astra_runtime::turn::agentic_loop_host::VolatileKind::PlanModeMarker,
+                format!(
+                    "[mode={new_mode}] User approved the plan; you are now executing in `{new_mode}` permission mode. Mutating tools are available — proceed to implement the plan."
+                ),
+            );
+        }
+
+        // Pull mid-turn UI-staged mode pivots into `self.mode`. The
+        // user can press Shift+Tab while a turn is running; the TUI
+        // cannot borrow `perm_manager` then, so it writes the new
+        // mode through the lock-free mirror. Reading it here makes
+        // the new mode authoritative for this turn's schema and
+        // gating decisions. No-op when nothing was staged.
+        let mode_before = self.perm_manager.mode();
+        self.perm_manager.pull_mode_from_mirror();
+        let mode_after = self.perm_manager.mode();
+        if mode_before != mode_after {
+            append_permission_mode_change_audit(
+                state.current_session_id.as_deref(),
+                self.chat_turn_index,
+                mode_before,
+                mode_after,
+                "mid_turn_ui",
+            );
+            state.push_volatile(
+                astra_runtime::turn::agentic_loop_host::VolatileKind::PlanModeMarker,
+                format!(
+                    "[mode={mode_after}] User pressed Shift+Tab; permission mode is now `{mode_after}`. Adjust your tool selection accordingly."
+                ),
+            );
+        }
+
+        // Install the per-turn ask_user channel on the shared
+        // ToolExecutor so tools that need a TUI overlay
+        // (currently `exit_plan_mode` for the Approve / Keep
+        // planning dialog) can reach the bottom-pane handler. The
+        // slot is cleared after the turn completes via the
+        // `on_turn_completed` hook so a stale sender never leaks
+        // into background sub-runs.
+        self.executor
+            .set_ask_user_request_tx(self.ask_user_request_tx.clone());
+        self.executor
+            .set_plan_review_request_tx(self.plan_review_request_tx.clone());
+
+        // Plan mode: surface a one-line mode marker so the model knows
+        // why mutating tools are missing from the schema. Singleton
+        // (`is_singleton` on the kind), so re-pushing every turn keeps
+        // exactly one entry on the lane. Drained alongside other
+        // runtime nudges by the call below.
+        if self.perm_manager.mode() == crate::permission_manager::PermissionMode::Plan {
+            state.push_volatile(
+                astra_runtime::turn::agentic_loop_host::VolatileKind::PlanModeMarker,
+                "[mode=plan] You are in read-only plan mode. Investigate with read-only tools (read_file, grep, glob, web_fetch, …); mutating tools are intentionally absent from the schema. When the plan is ready call `exit_plan_mode(plan=\"<markdown>\")` so the user can approve and choose an execution mode. Do not attempt edits or shell mutations in this mode.",
+            );
+
+            // Plan-mode nudge: if the previous turn produced a
+            // plan-shaped response but the model did not actually
+            // call `exit_plan_mode`, the user never sees an approval
+            // overlay and the agent silently stalls. Inject a
+            // corrective so the next round either tightens the plan
+            // and submits via the tool, or asks the user a question.
+            if let Some(reminder) = plan_mode_missed_exit_reminder(&state.messages) {
+                state.push_volatile(
+                    astra_runtime::turn::agentic_loop_host::VolatileKind::Corrective,
+                    reminder,
+                );
+            }
+        }
 
         // Session c47c2dca regression fix: drain the structured volatile
         // lane BEFORE subsequent immutable state borrows — the lane
@@ -233,6 +379,23 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         state
             .restricted_tools
             .extend(interaction_scoped_restrictions.iter().cloned());
+
+        // Plan-mode restrictions follow the same turn-scoped pattern:
+        // computed at the start of the turn from the current
+        // perm_manager state, removed unconditionally at the end.
+        // Owning the lifecycle here (instead of inside
+        // `prepare_chat_turn_payload`) is what keeps the
+        // restrictions from leaking into later turns — regression
+        // for session 19298aea, where `extend` without a matching
+        // `remove` left `write_file` / `bash` permanently
+        // restricted after the model called `exit_plan_mode`.
+        let plan_scoped_restrictions = plan_mode_restriction_names(
+            self.perm_manager.mode() == crate::permission_manager::PermissionMode::Plan,
+            &self.all_schemas,
+        );
+        state
+            .restricted_tools
+            .extend(plan_scoped_restrictions.iter().cloned());
 
         // Propagate skill sandbox policy to the tool executor for this turn.
         // Saved/restored so it doesn't persist after the skill deactivates.
@@ -355,6 +518,9 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         .await;
 
         for name in &interaction_scoped_restrictions {
+            state.restricted_tools.remove(name);
+        }
+        for name in &plan_scoped_restrictions {
             state.restricted_tools.remove(name);
         }
 
@@ -598,6 +764,10 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         &self.valid_tool_names
     }
 
+    fn capabilities(&self) -> astra_turn_core::capability::CapabilitySet {
+        self.capabilities.clone()
+    }
+
     fn inject_tool_schema(&mut self, schema: Value) {
         if let Some(name) = schema
             .get("function")
@@ -645,6 +815,13 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         &mut self,
         state: &astra_runtime::turn::agentic_loop_host::AgenticLoopState,
     ) {
+        // Drop the per-turn ask_user channel so a stale sender from
+        // this turn doesn't leak into background sub-runs that share
+        // the same `Arc<ToolExecutor>` (the channel is reinstalled at
+        // the start of every turn).
+        self.executor.set_ask_user_request_tx(None);
+        self.executor.set_plan_review_request_tx(None);
+
         // Bug B step 3: capture the parent turn's cacheable prefix
         // so subsequent spawn_agent / delegate calls can inherit it
         // for prompt-cache reuse. No-op unless:
@@ -700,9 +877,155 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     }
 }
 
+/// Detect the "model wrote a plan but forgot to call `exit_plan_mode`"
+/// failure mode. Returns the reminder text to push as a Corrective
+/// volatile, or `None` when the previous turn either did not look
+/// plan-shaped or already exited the plan via the tool.
+///
+/// Heuristic — intentionally conservative:
+///   * Look at the most recent assistant message in `messages`.
+///   * It must contain an explicit `## Plan` / `### Steps` markdown
+///     header, OR a plan marker plus at least three numbered steps.
+///   * The same assistant message must NOT carry a `tool_calls`
+///     entry whose name is `exit_plan_mode` (already-exited turns
+///     don't need the nudge).
+///
+/// Rationale: if the heuristic is too eager it spams the model on
+/// every analytical answer; if it's too cautious it leaves the user
+/// stuck. We err toward "don't nudge" — the cost of a missed nudge
+/// is one stale turn; the cost of a false nudge is repeated
+/// scolding the model takes literally.
+fn plan_mode_missed_exit_reminder(messages: &[serde_json::Value]) -> Option<String> {
+    let last_assistant = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))?;
+
+    if assistant_called_exit_plan_mode(last_assistant) {
+        return None;
+    }
+
+    let content = assistant_text(last_assistant)?;
+    if !looks_plan_shaped(&content) {
+        return None;
+    }
+
+    Some(
+        "[plan-nudge] Your last response looked like a plan but you did not call `exit_plan_mode`. Surface the plan for user approval by calling `exit_plan_mode(plan=\"<markdown>\")`. Without that call the user has no way to approve and unlock execution.".to_string()
+    )
+}
+
+fn assistant_called_exit_plan_mode(message: &serde_json::Value) -> bool {
+    let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    tool_calls.iter().any(|call| {
+        call.get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            == Some("exit_plan_mode")
+    })
+}
+
+fn assistant_text(message: &serde_json::Value) -> Option<String> {
+    if let Some(text) = message.get("content").and_then(|v| v.as_str()) {
+        return Some(text.to_string());
+    }
+    // OpenAI-style content arrays: [{type: "text", text: "…"}, …]
+    if let Some(parts) = message.get("content").and_then(|v| v.as_array()) {
+        let collected: String = parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !collected.is_empty() {
+            return Some(collected);
+        }
+    }
+    None
+}
+
+/// Compute the set of tool names that plan mode wants hidden, based
+/// on the current turn's schema view. Pure: hand it the schemas the
+/// turn would have shown and the plan-active flag, get back the
+/// names to add to `restricted_tools` (empty when plan mode is off).
+///
+/// Centralised here so the `add at turn start, remove at turn end`
+/// flow is symmetric — see `apply_plan_mode_restrictions` /
+/// `clear_plan_mode_restrictions`. Mirrors the existing
+/// `interaction_scoped_tool_restrictions` lifecycle.
+fn plan_mode_restriction_names(
+    plan_active: bool,
+    schemas: &[serde_json::Value],
+) -> HashSet<String> {
+    if !plan_active {
+        return HashSet::new();
+    }
+    let registry = astra_turn_core::tool_categories::registry();
+    astra_turn_core::tool_schema_prune::plan_mode_restrictions(schemas, |name| {
+        registry.is_read_only(name)
+    })
+}
+
+fn looks_plan_shaped(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    // Markdown plan headers — strongest signal.
+    let has_markdown_plan_header = lower.contains("## plan")
+        || lower.contains("### plan")
+        || lower.contains("## steps")
+        || lower.contains("### steps");
+    if has_markdown_plan_header {
+        return true;
+    }
+    let has_plan_marker = lower.contains("plan:")
+        || lower.contains("here's the plan")
+        || lower.contains("here is the plan")
+        || lower.contains("proposed plan")
+        || lower.contains("implementation plan");
+    if !has_plan_marker {
+        return false;
+    }
+    // Numbered list with at least three items: 1. … 2. … 3. …
+    let mut numbered_hits = 0;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix(|c: char| c.is_ascii_digit()) {
+            if rest.starts_with('.') || rest.starts_with(')') {
+                numbered_hits += 1;
+                if numbered_hits >= 3 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_services::session_journal::JournalEventType;
+
+    #[test]
+    fn permission_mode_change_audit_event_carries_source_and_modes() {
+        let event = permission_mode_change_audit_event(
+            Some("sess-audit"),
+            7,
+            PermissionMode::Plan,
+            PermissionMode::Auto,
+            "plan_approval_overlay",
+        );
+
+        assert_eq!(event.event_type, JournalEventType::PermissionAudit);
+        assert_eq!(event.session_id.as_deref(), Some("sess-audit"));
+        assert_eq!(event.turn, Some(7));
+        let metadata = event.metadata.expect("permission audit metadata");
+        assert_eq!(metadata["kind"], "permission_mode_changed");
+        assert_eq!(metadata["from_mode"], "plan");
+        assert_eq!(metadata["to_mode"], "auto");
+        assert_eq!(metadata["source"], "plan_approval_overlay");
+        assert_eq!(metadata["changed"], true);
+    }
 
     #[test]
     fn derive_turn_interaction_mode_maps_permission_mode_with_native_prompt_sink() {
@@ -916,5 +1239,209 @@ mod tests {
             "execute_turn must pass an augmented messages_slice to \
              fetch_chat_turn_sse, not raw state.messages (session c47c2dca)"
         );
+    }
+
+    #[test]
+    fn plan_nudge_fires_on_numbered_plan_without_exit_call() {
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "Sure. Plan:\n1. Read auth.rs\n2. Add tests\n3. Submit PR",
+        })];
+        let nudge = plan_mode_missed_exit_reminder(&messages)
+            .expect("numbered plan without exit_plan_mode call must trigger nudge");
+        assert!(
+            nudge.contains("exit_plan_mode"),
+            "nudge must point the model at exit_plan_mode. Got: {nudge}"
+        );
+    }
+
+    #[test]
+    fn plan_nudge_fires_on_markdown_plan_header() {
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "## Plan\n\nWe will read the file then add tests.",
+        })];
+        assert!(plan_mode_missed_exit_reminder(&messages).is_some());
+    }
+
+    #[test]
+    fn plan_nudge_skipped_when_assistant_called_exit_plan_mode() {
+        // The model already submitted the plan via the tool — no
+        // need to nag.
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "Submitting the plan for approval.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "exit_plan_mode",
+                        "arguments": "{\"plan\":\"1. step\"}"
+                    }
+                }
+            ]
+        })];
+        assert!(plan_mode_missed_exit_reminder(&messages).is_none());
+    }
+
+    #[test]
+    fn plan_nudge_skipped_for_short_analytical_answer() {
+        // A one-paragraph answer is not plan-shaped and must not
+        // trigger the nudge — false positives spam the model.
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "The auth module lives in `src/auth.rs`; it uses bcrypt.",
+        })];
+        assert!(plan_mode_missed_exit_reminder(&messages).is_none());
+    }
+
+    #[test]
+    fn plan_nudge_skipped_for_analytical_numbered_list_without_plan_marker() {
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "I'll analyze this in three stages:\n1. Read the module\n2. Trace the call graph\n3. Summarize the risk",
+        })];
+        assert!(
+            plan_mode_missed_exit_reminder(&messages).is_none(),
+            "ordinary analytical numbered lists should not force a plan approval nudge"
+        );
+    }
+
+    #[test]
+    fn plan_nudge_handles_openai_content_array_shape() {
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Plan:"},
+                {"type": "text", "text": "1. read\n2. test\n3. ship"},
+            ]
+        })];
+        assert!(plan_mode_missed_exit_reminder(&messages).is_some());
+    }
+
+    #[test]
+    fn plan_nudge_skipped_when_no_assistant_message_yet() {
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "Investigate the auth module"
+        })];
+        assert!(plan_mode_missed_exit_reminder(&messages).is_none());
+    }
+
+    // ── Plan-mode restriction lifecycle ─────────────────────────
+    //
+    // Regression for session 19298aea-06de-49bf-a1b5-2873c7e87b9e:
+    // the model entered plan mode, called `exit_plan_mode`, the
+    // overlay flipped perm_manager to Auto on the next turn — but
+    // `restricted_tools` had been `extend()`-ed with the plan-mode
+    // mutating tools and never cleared. The whole rest of the
+    // session, write_file / bash / str_replace stayed restricted,
+    // and the model was reduced to telling the user "please run
+    // these commands yourself".
+    //
+    // The contract the lifecycle helpers below pin: plan-mode
+    // restrictions are *turn-scoped* — added when the turn opens
+    // with plan-mode active, removed unconditionally when the turn
+    // ends. Same shape as `interaction_scoped_tool_restrictions`.
+
+    fn schema(name: &str) -> serde_json::Value {
+        serde_json::json!({"function": {"name": name}})
+    }
+
+    #[test]
+    fn plan_mode_restriction_names_lists_mutating_only_in_plan_mode() {
+        let schemas = vec![
+            schema("read_file"),
+            schema("grep"),
+            schema("write_file"),
+            schema("str_replace"),
+            schema("bash"),
+            schema("exit_plan_mode"),
+            schema("enter_plan_mode"),
+        ];
+        let plan_off = plan_mode_restriction_names(false, &schemas);
+        assert!(
+            plan_off.is_empty(),
+            "plan-mode restrictions must be empty when plan mode is off"
+        );
+
+        let plan_on = plan_mode_restriction_names(true, &schemas);
+        // Mutating tools restricted.
+        assert!(plan_on.contains("write_file"));
+        assert!(plan_on.contains("str_replace"));
+        assert!(plan_on.contains("bash"));
+        // Read-only and plan-control tools survive.
+        assert!(!plan_on.contains("read_file"));
+        assert!(!plan_on.contains("grep"));
+        assert!(!plan_on.contains("exit_plan_mode"));
+        assert!(!plan_on.contains("enter_plan_mode"));
+    }
+
+    #[test]
+    fn plan_mode_restrictions_are_cleared_after_turn_ends() {
+        // Simulates the per-turn lifecycle the host runs:
+        //   turn N: plan_active=true, add restrictions
+        //   turn N ends, restrictions removed
+        //   turn N+1: plan_active=false (user/agent exited plan
+        //             mode), restrictions empty so write_file flows
+        //             through normally.
+        let schemas = vec![
+            schema("read_file"),
+            schema("write_file"),
+            schema("bash"),
+            schema("exit_plan_mode"),
+        ];
+        let mut restricted: HashSet<String> = HashSet::new();
+
+        // Turn N: enter plan mode.
+        let plan_set = plan_mode_restriction_names(true, &schemas);
+        restricted.extend(plan_set.iter().cloned());
+        assert!(restricted.contains("write_file"));
+        assert!(restricted.contains("bash"));
+
+        // Turn N ends — host removes the names it added.
+        for name in &plan_set {
+            restricted.remove(name);
+        }
+        assert!(
+            restricted.is_empty(),
+            "after turn ends, plan-mode restrictions must be gone — they are turn-scoped, not session-scoped (regression: session 19298aea)"
+        );
+
+        // Turn N+1: plan mode off after exit_plan_mode → no restrictions.
+        let plan_off = plan_mode_restriction_names(false, &schemas);
+        restricted.extend(plan_off.iter().cloned());
+        assert!(
+            !restricted.contains("write_file"),
+            "next turn after exit_plan_mode must let write_file through"
+        );
+        assert!(
+            !restricted.contains("bash"),
+            "next turn after exit_plan_mode must let bash through"
+        );
+    }
+
+    #[test]
+    fn plan_mode_restrictions_do_not_clobber_caller_existing_entries() {
+        // The host shares `restricted_tools` between several lifecycle
+        // owners (interaction-scoped, plan-scoped, stall-scoped, etc.).
+        // Removing plan-scoped names must leave entries that other
+        // owners added in place.
+        let schemas = vec![schema("write_file"), schema("bash"), schema("read_file")];
+        let mut restricted: HashSet<String> = HashSet::new();
+        // Pretend an unrelated subsystem already restricted `ask_user`.
+        restricted.insert("ask_user".to_string());
+
+        let plan_set = plan_mode_restriction_names(true, &schemas);
+        restricted.extend(plan_set.iter().cloned());
+        for name in &plan_set {
+            restricted.remove(name);
+        }
+
+        assert!(
+            restricted.contains("ask_user"),
+            "plan-mode cleanup must not delete entries it never owned"
+        );
+        assert_eq!(restricted.len(), 1);
     }
 }

@@ -2535,17 +2535,12 @@ mod tests {
             std::fs::write(skill_dir.join("SKILL.md"), "---\nname: removable\n---").unwrap();
             assert!(skill_dir.exists());
 
-            let prev_dir = std::env::current_dir().unwrap();
-            std::env::set_current_dir(tmp.path()).unwrap();
-
             // uninstall_skill_from_marketplace needs SessionState; test the core logic directly
-            let target = std::env::current_dir()
-                .unwrap()
-                .join(".astra/skills/removable-skill");
+            // without mutating process-global cwd, which would race with other unit tests.
+            let target = tmp.path().join(".astra/skills/removable-skill");
             assert!(target.exists());
             std::fs::remove_dir_all(&target).unwrap();
 
-            std::env::set_current_dir(&prev_dir).unwrap();
             assert!(!skill_dir.exists(), "skill dir should be removed");
         }
 

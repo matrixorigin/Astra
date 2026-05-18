@@ -537,7 +537,7 @@ fn sha256(bytes: &[u8]) -> ContentHash {
 /// here because the hash scheme is part of cache identity: the capture
 /// side and any future re-capture must agree bit-for-bit.
 pub fn hash_tool_schema(value: &serde_json::Value) -> (Vec<u8>, ContentHash) {
-    let canonical = canonical_json_bytes(value);
+    let canonical = crate::canonical_json::to_vec(value);
     let hash = sha256(&canonical);
     (canonical, hash)
 }
@@ -570,59 +570,6 @@ pub fn build_tool_schema_entries(schemas: &[serde_json::Value]) -> Vec<ToolSchem
             })
         })
         .collect()
-}
-
-/// Serialize a JSON value with keys sorted at every object level. The
-/// built-in `serde_json::to_vec` preserves insertion order, which is
-/// fine for most IO but not for content-hashing — a downstream caller
-/// that reconstructs the same semantic schema in a different order
-/// must produce the same bytes here.
-fn canonical_json_bytes(value: &serde_json::Value) -> Vec<u8> {
-    let mut out = Vec::new();
-    write_canonical(value, &mut out);
-    out
-}
-
-fn write_canonical(value: &serde_json::Value, out: &mut Vec<u8>) {
-    use serde_json::Value;
-    match value {
-        Value::Null => out.extend_from_slice(b"null"),
-        Value::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
-        Value::Number(n) => out.extend_from_slice(n.to_string().as_bytes()),
-        Value::String(s) => {
-            // Reuse serde_json's string escaping via the `to_string`
-            // path on a fresh `Value::String` to guarantee identical
-            // quoting rules as any SDK that serializes strings with
-            // serde_json.
-            let quoted = serde_json::to_string(s).expect("string always serializable");
-            out.extend_from_slice(quoted.as_bytes());
-        }
-        Value::Array(arr) => {
-            out.push(b'[');
-            for (i, v) in arr.iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                write_canonical(v, out);
-            }
-            out.push(b']');
-        }
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            out.push(b'{');
-            for (i, k) in keys.iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                let quoted_key = serde_json::to_string(k).expect("string always serializable");
-                out.extend_from_slice(quoted_key.as_bytes());
-                out.push(b':');
-                write_canonical(&map[*k], out);
-            }
-            out.push(b'}');
-        }
-    }
 }
 
 // ---------------------------------------------------------------------

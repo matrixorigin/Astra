@@ -64,6 +64,14 @@ pub(super) fn profile_name(cli_profile: Option<&str>, data: &CredentialsFile) ->
     CredentialStore::resolve_profile_name(cli_profile, data.current_profile.as_deref())
 }
 
+pub(super) fn normalize_model_override(model: Option<&str>) -> Option<&str> {
+    astra_core::model_override::normalize_model_override(model)
+}
+
+pub(super) fn normalize_model_override_owned(model: Option<String>) -> Option<String> {
+    astra_core::model_override::normalize_model_override_owned(model)
+}
+
 pub(super) fn get_profile_and_token(
     cli_profile: Option<&str>,
 ) -> Result<(CredentialsFile, String, Profile, String), String> {
@@ -943,6 +951,18 @@ mod tests {
     fn profile_name_falls_back_to_default() {
         let creds = CredentialsFile::default();
         assert_eq!(profile_name(None, &creds), "default");
+    }
+
+    #[test]
+    fn normalize_model_override_treats_default_as_api_default() {
+        assert_eq!(normalize_model_override(None), None);
+        assert_eq!(normalize_model_override(Some("")), None);
+        assert_eq!(normalize_model_override(Some(" default ")), None);
+        assert_eq!(normalize_model_override(Some("DEFAULT")), None);
+        assert_eq!(
+            normalize_model_override(Some("MiniMax-M2.7")),
+            Some("MiniMax-M2.7")
+        );
     }
 
     #[test]

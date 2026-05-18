@@ -630,6 +630,7 @@ pub struct ServerAgenticLoopHost {
 
     // ── Context ──
     edge_tools: Vec<Value>,
+    capabilities: astra_turn_core::capability::CapabilitySet,
     edge_profile: Map<String, Value>,
     valid_tools: HashSet<String>,
     /// Names the validator should admit beyond the static catalog.
@@ -747,6 +748,7 @@ pub struct ServerAgenticLoopHostBuilder {
     mock_provider: Option<(String, String)>,
     #[cfg(feature = "bridge-e2e-hooks")]
     llm_request_capture: Option<Arc<std::sync::Mutex<Vec<CapturedLlmRequest>>>>,
+    capabilities: astra_turn_core::capability::CapabilitySet,
     /// Shared tool_call dedup state. When set (via `with_dedup_state`), the
     /// built host shares the same `emitted_tool_call_ids` Arc as the parent
     /// host, preventing duplicate `tool_call` events across host instances
@@ -789,6 +791,7 @@ impl ServerAgenticLoopHostBuilder {
             mock_provider: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             llm_request_capture: None,
+            capabilities: crate::capabilities::full_server_capabilities_for_tests(),
             #[cfg(feature = "bridge-e2e-hooks")]
             shared_dedup_state: None,
             prefix_store: None,
@@ -928,7 +931,7 @@ impl ServerAgenticLoopHostBuilder {
         // server-side tool schemas from astra-tools so the LLM knows what's available.
         let server_side_tools = self.edge_tools.is_empty();
         let edge_tools = if server_side_tools {
-            crate::capabilities::server_runtime_tool_schemas()
+            crate::capabilities::server_runtime_tool_schemas(&self.capabilities)
         } else {
             self.edge_tools
         };
@@ -954,6 +957,7 @@ impl ServerAgenticLoopHostBuilder {
             resolved_model_name: None,
             resolved_llm_params: None,
             edge_tools,
+            capabilities: self.capabilities,
             edge_profile: self.edge_profile,
             valid_tools,
             admissible_extras: Vec::new(),
@@ -990,6 +994,14 @@ impl ServerAgenticLoopHostBuilder {
             prefix_store: self.prefix_store,
             last_turn_tool_schemas: Vec::new(),
         }
+    }
+
+    pub fn with_capabilities(
+        mut self,
+        capabilities: astra_turn_core::capability::CapabilitySet,
+    ) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 }
 
@@ -2996,6 +3008,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
     fn valid_tool_names(&self) -> &HashSet<String> {
         &self.valid_tools
+    }
+
+    fn capabilities(&self) -> astra_turn_core::capability::CapabilitySet {
+        self.capabilities.clone()
     }
 
     fn on_turn_completed(&mut self, state: &crate::turn::agentic_loop_host::AgenticLoopState) {

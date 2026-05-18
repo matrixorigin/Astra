@@ -242,11 +242,24 @@ fn approval_lookup_fingerprint_candidates(
         cloud_gated_tool_kind_with_args(name, Some(args)),
         Some(CloudGatedToolKind::Write)
     ) && let Some(path) = path_hint_from_args(args)
-        && let Some(resolved) = resolved_write_path(&path)
     {
-        let resolved_fp = ApprovalFingerprint::file_op_exact(name, Some(&resolved));
-        if resolved_fp != primary {
-            candidates.push(resolved_fp);
+        if astra_turn_core::tool_categories::registry().is_file_op(name) {
+            push_unique_fingerprint(
+                &mut candidates,
+                ApprovalFingerprint::file_op_exact("edit", Some(&path)),
+            );
+        }
+        if let Some(resolved) = resolved_write_path(&path) {
+            push_unique_fingerprint(
+                &mut candidates,
+                ApprovalFingerprint::file_op_exact(name, Some(&resolved)),
+            );
+            if astra_turn_core::tool_categories::registry().is_file_op(name) {
+                push_unique_fingerprint(
+                    &mut candidates,
+                    ApprovalFingerprint::file_op_exact("edit", Some(&resolved)),
+                );
+            }
         }
     }
     candidates
@@ -262,14 +275,36 @@ fn cloud_detail_lookup_fingerprint_candidates(
     let mut candidates = vec![primary.clone()];
     if matches!(cloud_gated_tool_kind(tool), Some(CloudGatedToolKind::Write))
         && let Some(path) = detail
-        && let Some(resolved) = resolved_write_path(path)
     {
-        let resolved_fp = ApprovalFingerprint::file_op_exact(tool, Some(&resolved));
-        if resolved_fp != primary {
-            candidates.push(resolved_fp);
+        if astra_turn_core::tool_categories::registry().is_file_op(tool) {
+            push_unique_fingerprint(
+                &mut candidates,
+                ApprovalFingerprint::file_op_exact("edit", Some(path)),
+            );
+        }
+        if let Some(resolved) = resolved_write_path(path) {
+            push_unique_fingerprint(
+                &mut candidates,
+                ApprovalFingerprint::file_op_exact(tool, Some(&resolved)),
+            );
+            if astra_turn_core::tool_categories::registry().is_file_op(tool) {
+                push_unique_fingerprint(
+                    &mut candidates,
+                    ApprovalFingerprint::file_op_exact("edit", Some(&resolved)),
+                );
+            }
         }
     }
     candidates
+}
+
+fn push_unique_fingerprint(
+    candidates: &mut Vec<astra_turn_core::approval_fingerprint::ApprovalFingerprint>,
+    candidate: astra_turn_core::approval_fingerprint::ApprovalFingerprint,
+) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
 }
 
 fn cloud_detail_is_sensitive(tool: &str, detail: Option<&str>) -> bool {
@@ -360,6 +395,56 @@ fn sensitive_path_match(args: &serde_json::Value) -> Option<String> {
 // turn-core's `PermissionDecision` (Approve / Deny / Escalate).
 pub(super) use astra_turn_core::permission_types::PermissionMode;
 pub(super) use astra_turn_core::permission_types::PermissionRule;
+
+/// Atomic encoding of [`PermissionMode`] for the lock-free mirror
+/// the TUI inner-tick path consumes. Keeps the mapping local and
+/// stable; widening the enum requires updating both directions.
+fn encode_mode_for_mirror(mode: PermissionMode) -> u8 {
+    match mode {
+        PermissionMode::Prompt => 0,
+        PermissionMode::Auto => 1,
+        PermissionMode::Plan => 2,
+        PermissionMode::AcceptEdits => 3,
+        PermissionMode::Deny => 4,
+    }
+}
+
+fn decode_mode_for_mirror(value: u8) -> PermissionMode {
+    match value {
+        1 => PermissionMode::Auto,
+        2 => PermissionMode::Plan,
+        3 => PermissionMode::AcceptEdits,
+        4 => PermissionMode::Deny,
+        _ => PermissionMode::Prompt,
+    }
+}
+
+/// Read-only handle to the live permission mode held by a
+/// [`PermissionManager`]. Cheap to clone; cheap to read. Used by
+/// the status-line refresh path where the TUI can't borrow the
+/// manager while the agentic loop holds `&mut state`.
+#[derive(Clone, Debug)]
+pub(crate) struct PermissionModeMirror {
+    inner: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl PermissionModeMirror {
+    pub(crate) fn current(&self) -> PermissionMode {
+        decode_mode_for_mirror(self.inner.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Stage a new mode without borrowing the `PermissionManager`.
+    /// The owning manager picks this up on its next turn boundary
+    /// via [`PermissionManager::pull_mode_from_mirror`]. Used by
+    /// mid-turn Shift+Tab where the agentic loop holds `&mut state`
+    /// and the UI cannot reach the manager directly.
+    pub(crate) fn stage(&self, mode: PermissionMode) {
+        self.inner.store(
+            encode_mode_for_mirror(mode),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SideEffect {
@@ -921,6 +1006,14 @@ fn parse_rule_with_grammar_v2(s: &str) -> PermissionRule {
 
 pub(super) struct PermissionManager {
     mode: PermissionMode,
+    /// Atomic mirror of `mode` for read-only consumers that hold no
+    /// borrow of the `PermissionManager`. The TUI's inner-tick path
+    /// uses this to refresh the status-line chip while the agentic
+    /// loop holds `&mut state` — without this mirror, mid-turn
+    /// pivots (e.g. `exit_plan_mode` flipping Plan → Auto on the
+    /// next-turn boundary) would not reach the chip until the
+    /// outer select woke up. Updated atomically inside `set_mode`.
+    mode_mirror: std::sync::Arc<std::sync::atomic::AtomicU8>,
     session_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides,
     turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides,
     denial_tracker: astra_turn_core::approval_fingerprint::DenialTracker,
@@ -1115,6 +1208,32 @@ impl PermissionManager {
     /// Switch the permission mode at runtime (e.g., via `/allow` command).
     pub(super) fn set_mode(&mut self, mode: PermissionMode) {
         self.mode = mode;
+        self.mode_mirror.store(
+            encode_mode_for_mirror(mode),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// Hand out a cheap clone of the mode mirror so an external
+    /// observer (the TUI status line) can read the current mode
+    /// without holding any borrow of the `PermissionManager`.
+    /// The handle stays valid for the lifetime of the manager.
+    pub(super) fn mode_mirror_handle(&self) -> PermissionModeMirror {
+        PermissionModeMirror {
+            inner: std::sync::Arc::clone(&self.mode_mirror),
+        }
+    }
+
+    /// Re-sync `self.mode` from the atomic mirror. Used at turn
+    /// boundaries when a UI event (mid-turn Shift+Tab) wrote to the
+    /// mirror without being able to borrow `&mut self`. Cheap; no-op
+    /// when already in sync.
+    pub(super) fn pull_mode_from_mirror(&mut self) {
+        let mirror =
+            decode_mode_for_mirror(self.mode_mirror.load(std::sync::atomic::Ordering::Acquire));
+        if self.mode != mirror {
+            self.mode = mirror;
+        }
     }
 
     pub(super) fn set_active_session_id(&mut self, session_id: &str) {
@@ -1206,6 +1325,9 @@ impl PermissionManager {
         };
         Self {
             mode,
+            mode_mirror: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                encode_mode_for_mirror(mode),
+            )),
             session_overrides:
                 astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
             turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(
@@ -1337,6 +1459,9 @@ impl PermissionManager {
         let cached_user_deny = user_settings.parsed_deny_rules();
         Self {
             mode,
+            mode_mirror: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                encode_mode_for_mirror(mode),
+            )),
             session_overrides:
                 astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
             turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(
@@ -1429,6 +1554,9 @@ impl PermissionManager {
 
         Self {
             mode,
+            mode_mirror: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                encode_mode_for_mirror(mode),
+            )),
             session_overrides,
             turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(
             ),
@@ -5360,13 +5488,20 @@ mod tests {
     fn make_allow_rule_file_write_uses_path_rule() {
         let args = serde_json::json!({"path": "/tmp/foo"});
         let rule = PermissionManager::make_allow_rule("write_file", &args);
-        assert_eq!(rule, r#"write_file(path_glob="/tmp/foo", op="write")"#);
+        assert_eq!(rule, r#"Edit(path_glob="/tmp/foo", op="write")"#);
 
         let parsed = PermissionRule::parse(&rule);
         assert!(parsed.matches_with_context(
             "write_file",
             &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
                 "write_file",
+                &args
+            )
+        ));
+        assert!(parsed.matches_with_context(
+            "str_replace",
+            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                "str_replace",
                 &args
             )
         ));
@@ -5380,7 +5515,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_write_file_rule_does_not_widen_beyond_fingerprint() {
+    fn persisted_write_file_rule_covers_file_edit_family_inside_workspace() {
         let mut pm = PermissionManager::new(false);
         let approved_args = serde_json::json!({"path": "zzzz3.md", "content": "# zzzz3"});
         let rule = PermissionManager::make_allow_rule("write_file", &approved_args);
@@ -5388,6 +5523,10 @@ mod tests {
         pm.cached_allow = pm.settings.parsed_allow_rules();
 
         assert!(pm.check_allow_rules("write_file", &approved_args));
+        assert!(pm.check_allow_rules(
+            "str_replace",
+            &serde_json::json!({"path": "zzzz4.md", "old_str": "a", "new_str": "b"})
+        ));
         assert!(!pm.check_allow_rules(
             "write_file",
             &serde_json::json!({"path": "/tmp/zzzz4.md", "content": "# zzzz4"})
@@ -5407,7 +5546,7 @@ mod tests {
         assert_eq!(
             rule,
             format!(
-                r#"write_file(path_prefix="{workspace_root}", op="write", cwd_root="{workspace_root}")"#
+                r#"Edit(path_prefix="{workspace_root}", op="write", cwd_root="{workspace_root}")"#
             )
         );
     }
@@ -6221,6 +6360,11 @@ mod tests {
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         let args_a = serde_json::json!({"path": "src/foo.rs", "content": "a"});
         let args_b = serde_json::json!({"path": "tests/bar.rs", "content": "b"});
+        let replace_args = serde_json::json!({
+            "path": "tests/bar.rs",
+            "old_str": "b",
+            "new_str": "c"
+        });
         let workspace_root = std::env::current_dir()
             .unwrap()
             .canonicalize()
@@ -6242,6 +6386,12 @@ mod tests {
         assert!(
             matches!(decision, PermissionDecision::Allow),
             "workspace write trust should cover later safe file edits anywhere in the workspace"
+        );
+
+        let decision = pm.check_nonblocking("str_replace", &replace_args);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "workspace write trust should cover sibling file-edit tools, got {decision:?}"
         );
     }
 
@@ -7298,5 +7448,99 @@ mod tests {
             Some(astra_thin_client::ApprovalDecision::Allow),
             "quiet + session override must Allow; got {decision:?}"
         );
+    }
+
+    // ── Mode mirror lifecycle ──────────────────────────────────
+    //
+    // The mirror lets the TUI inner-tick path read the live mode
+    // and lets mid-turn Shift+Tab stage a new mode while the
+    // agentic loop holds `&mut state`. These tests pin both
+    // directions of the contract.
+
+    #[test]
+    fn mode_mirror_encode_decode_covers_all_modes_without_collisions() {
+        let all_modes = [
+            PermissionMode::Prompt,
+            PermissionMode::Auto,
+            PermissionMode::Plan,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Deny,
+        ];
+        let mut seen = std::collections::HashSet::new();
+
+        for mode in all_modes {
+            let encoded = encode_mode_for_mirror(mode);
+            assert!(
+                seen.insert(encoded),
+                "mode {mode:?} collides with another mirror encoding"
+            );
+            assert_eq!(
+                decode_mode_for_mirror(encoded),
+                mode,
+                "mode mirror encoding must round-trip for {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mode_mirror_reflects_set_mode() {
+        let mut pm = PermissionManager::new(false);
+        let mirror = pm.mode_mirror_handle();
+        assert_eq!(mirror.current(), PermissionMode::Prompt);
+
+        pm.set_mode(PermissionMode::Plan);
+        assert_eq!(
+            mirror.current(),
+            PermissionMode::Plan,
+            "set_mode must publish to the mirror so chip readers see it instantly"
+        );
+
+        pm.set_mode(PermissionMode::Auto);
+        assert_eq!(mirror.current(), PermissionMode::Auto);
+    }
+
+    #[test]
+    fn mode_mirror_stage_then_pull_round_trips() {
+        // Mid-turn Shift+Tab path: TUI calls stage() while the
+        // agentic loop holds &mut state. The host calls
+        // pull_mode_from_mirror() at the next turn boundary, and
+        // self.mode catches up.
+        let mut pm = PermissionManager::new(false);
+        let mirror = pm.mode_mirror_handle();
+        assert_eq!(pm.mode(), PermissionMode::Prompt);
+
+        mirror.stage(PermissionMode::Plan);
+        // pm.mode() hasn't been pulled yet — the field still holds Prompt.
+        assert_eq!(
+            pm.mode(),
+            PermissionMode::Prompt,
+            "stage alone must not mutate self.mode; the host must pull explicitly"
+        );
+
+        pm.pull_mode_from_mirror();
+        assert_eq!(
+            pm.mode(),
+            PermissionMode::Plan,
+            "pull_mode_from_mirror must adopt the staged mode"
+        );
+    }
+
+    #[test]
+    fn mode_mirror_pull_is_noop_when_already_in_sync() {
+        let mut pm = PermissionManager::new(false);
+        // Without any stage(), pull is a no-op and leaves state
+        // untouched. Idempotent.
+        pm.pull_mode_from_mirror();
+        assert_eq!(pm.mode(), PermissionMode::Prompt);
+    }
+
+    #[test]
+    fn mode_mirror_handle_is_clonable_and_independent() {
+        let pm = PermissionManager::new(false);
+        let h1 = pm.mode_mirror_handle();
+        let h2 = pm.mode_mirror_handle();
+        // Both handles see the same mirror.
+        h1.stage(PermissionMode::Auto);
+        assert_eq!(h2.current(), PermissionMode::Auto);
     }
 }

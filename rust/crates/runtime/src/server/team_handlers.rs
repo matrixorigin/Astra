@@ -47,6 +47,24 @@ fn require_delegation_engine(
     })
 }
 
+async fn load_team_by_name_or_id(
+    store: &Arc<dyn TeamPersistenceService>,
+    user_id: &str,
+    name_or_id: &str,
+) -> Result<Option<TeamDefinition>, (StatusCode, Json<ErrorResponse>)> {
+    let by_name = store
+        .load_team(user_id, name_or_id)
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if by_name.is_some() {
+        return Ok(by_name);
+    }
+    store
+        .load_team_by_id(user_id, name_or_id)
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
 // ─── List Teams ─────────────────────────────────────────────────────────────
 
 /// GET /teams
@@ -62,9 +80,7 @@ pub(super) async fn list_teams_handler(
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    Ok(Json(TeamListResponse {
-        teams: teams.into_iter().map(TeamSummary::from).collect(),
-    }))
+    Ok(Json(TeamListResponse { teams }))
 }
 
 // ─── Get Team ───────────────────────────────────────────────────────────────
@@ -74,17 +90,15 @@ pub(super) async fn get_team_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<TeamDetailResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<TeamDefinition>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let store = require_team_store(&state)?;
 
-    let team = store
-        .load_team(&user.user_id, &name)
-        .await
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    let team = load_team_by_name_or_id(store, &user.user_id, &name)
+        .await?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, format!("team '{name}' not found")))?;
 
-    Ok(Json(TeamDetailResponse::from(team)))
+    Ok(Json(team))
 }
 
 // ─── Create / Update Team ───────────────────────────────────────────────────
@@ -94,7 +108,7 @@ pub(super) async fn upsert_team_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CreateTeamRequest>,
-) -> Result<Json<TeamDetailResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<TeamDefinition>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let store = require_team_store(&state)?;
 
@@ -144,7 +158,7 @@ pub(super) async fn upsert_team_handler(
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    Ok(Json(TeamDetailResponse::from(def)))
+    Ok(Json(def))
 }
 
 // ─── Delete Team ────────────────────────────────────────────────────────────
@@ -194,11 +208,8 @@ pub(super) async fn list_executions_handler(
     let user = state.auth_service.current_user(&headers).await?;
     let store = require_team_store(&state)?;
 
-    // Resolve name → team_id
-    let team = store
-        .load_team(&user.user_id, &name)
-        .await
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    let team = load_team_by_name_or_id(store, &user.user_id, &name)
+        .await?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, format!("team '{name}' not found")))?;
 
     let limit = if query.limit == 0 {
@@ -214,7 +225,7 @@ pub(super) async fn list_executions_handler(
 
     Ok(Json(ExecutionListResponse {
         team_id: team.team_id,
-        team_name: name,
+        team_name: team.name,
         executions: executions.into_iter().map(ExecutionEntry::from).collect(),
     }))
 }
@@ -356,71 +367,7 @@ pub(super) struct CreateTeamRequest {
 
 #[derive(Debug, Serialize)]
 pub(super) struct TeamListResponse {
-    pub teams: Vec<TeamSummary>,
-}
-
-#[derive(Debug, Serialize)]
-pub(super) struct TeamSummary {
-    pub team_id: String,
-    pub name: String,
-    pub description: String,
-    pub member_count: usize,
-    pub coordination: astra_services::team_persistence::TeamCoordination,
-    pub worktree_mode: astra_services::team_persistence::WorktreeMode,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub budget: Option<astra_services::team_persistence::TeamBudget>,
-    pub max_parallel: u32,
-}
-
-impl From<TeamDefinition> for TeamSummary {
-    fn from(t: TeamDefinition) -> Self {
-        Self {
-            team_id: t.team_id,
-            name: t.name,
-            description: t.description,
-            member_count: t.members.len(),
-            coordination: t.coordination,
-            worktree_mode: t.worktree_mode,
-            budget: t.budget,
-            max_parallel: t.max_parallel,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-pub(super) struct TeamDetailResponse {
-    pub team_id: String,
-    pub user_id: String,
-    pub name: String,
-    pub description: String,
-    pub coordination: astra_services::team_persistence::TeamCoordination,
-    pub members: Vec<astra_services::team_persistence::TeamMemberDef>,
-    pub context: std::collections::HashMap<String, String>,
-    pub worktree_mode: astra_services::team_persistence::WorktreeMode,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub budget: Option<astra_services::team_persistence::TeamBudget>,
-    pub max_parallel: u32,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-impl From<TeamDefinition> for TeamDetailResponse {
-    fn from(t: TeamDefinition) -> Self {
-        Self {
-            team_id: t.team_id,
-            user_id: t.user_id,
-            name: t.name,
-            description: t.description,
-            coordination: t.coordination,
-            members: t.members,
-            context: t.context,
-            worktree_mode: t.worktree_mode,
-            budget: t.budget,
-            max_parallel: t.max_parallel,
-            created_at: t.created_at,
-            updated_at: t.updated_at,
-        }
-    }
+    pub teams: Vec<TeamDefinition>,
 }
 
 #[derive(Debug, Serialize)]

@@ -515,13 +515,22 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             idem_key,
         } = validated;
         if self.ctx.restricted_tools.contains(&execution.name) {
-            let err_msg = format!(
-                "Tool '{}' is currently restricted due to repeated failures in \
-                 this session. The tool itself is not broken — it was blocked \
-                 because previous calls failed (possibly due to argument errors).\n\n\
-                 Workaround: use `bash` to accomplish the same task directly, \
-                 or describe what you need and ask the user to run the command.",
-                execution.name
+            // The fallback recommendation has to know which tools
+            // the model could actually call this turn — without
+            // that filter the message used to suggest `bash` even
+            // when bash itself was the tool being denied (session
+            // 19298aea regression). Available = visible − restricted.
+            let available_tools: std::collections::HashSet<String> = self
+                .ctx
+                .valid_tool_names
+                .iter()
+                .filter(|name| !self.ctx.restricted_tools.contains(*name))
+                .cloned()
+                .collect();
+            let err_msg = astra_turn_core::tool_workaround::restricted_tool_workaround_message(
+                &execution.name,
+                &available_tools,
+                astra_turn_core::tool_categories::registry(),
             );
             emit_blocked_tool_result(
                 HeadlessBlockedTool {

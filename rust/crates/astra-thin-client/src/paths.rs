@@ -166,6 +166,11 @@ pub fn model(name: &str) -> String {
 }
 
 #[inline]
+pub fn model_memory() -> &'static str {
+    "/models/memory"
+}
+
+#[inline]
 pub fn model_check(model_name: &str) -> String {
     format!("/models/{model_name}/check")
 }
@@ -316,6 +321,12 @@ pub fn plan(id: &str) -> String {
 pub fn plan_status(id: &str) -> String {
     format!("/plans/{id}/status")
 }
+
+#[inline]
+pub fn plan_exit_mode(id: &str) -> String {
+    format!("/plans/{id}/exit-plan-mode")
+}
+
 #[inline]
 pub fn plan_rewind(id: &str) -> String {
     format!("/plans/{id}/rewind")

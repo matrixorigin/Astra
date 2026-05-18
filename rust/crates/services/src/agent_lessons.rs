@@ -21,8 +21,6 @@ pub enum LessonKind {
     ToolBoost,
     /// The system prompt / context shape that led to success.
     PromptShape,
-    /// A postcondition pattern that kept failing — restructure the plan.
-    PostconditionPattern,
     /// A recovery recipe for a specific error signature.
     ErrorRecovery,
     /// A positive pattern learned from successful outcomes — the agent
@@ -43,7 +41,6 @@ impl LessonKind {
             Self::ToolDeprioritize => "tool_deprioritize",
             Self::ToolBoost => "tool_boost",
             Self::PromptShape => "prompt_shape",
-            Self::PostconditionPattern => "postcondition_pattern",
             Self::ErrorRecovery => "error_recovery",
             Self::SkillAcquired => "skill_acquired",
         }
@@ -54,7 +51,6 @@ impl LessonKind {
             "tool_deprioritize" => Some(Self::ToolDeprioritize),
             "tool_boost" => Some(Self::ToolBoost),
             "prompt_shape" => Some(Self::PromptShape),
-            "postcondition_pattern" => Some(Self::PostconditionPattern),
             "error_recovery" => Some(Self::ErrorRecovery),
             "skill_acquired" => Some(Self::SkillAcquired),
             _ => None,

@@ -13,6 +13,7 @@
 //! `server_tool_executor` field. When present, the headless round
 //! calls it directly instead of waiting for edge POST callbacks.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -563,8 +564,19 @@ fn persist_manual_compression(
     writer.append(&event).map_err(|e| e.to_string())
 }
 
-fn supports_server_tool_name(tool: &str) -> bool {
-    astra_tools::schemas::SERVER_EXECUTOR_TOOL_NAMES.contains(&tool)
+fn resolved_server_tool_names(
+    capabilities: &astra_turn_core::capability::CapabilitySet,
+) -> HashSet<String> {
+    crate::capabilities::server_runtime_tool_schemas(capabilities)
+        .iter()
+        .filter_map(|schema| {
+            schema
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 fn json_str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -690,7 +702,7 @@ fn render_session_history_rows(
 }
 
 /// Tools that mutate the world outside the session. Blocked while plan mode
-/// is active (`PlanPhase` = PlanOnlyChat|Planning|Refining) to mirror Claude
+/// is active (`PlanPhase` = Planning|Refining) to mirror Claude
 /// Code's `prepareContextForPlanMode` behaviour: the model must call
 /// ExitPlanMode before writing anything.
 ///
@@ -921,6 +933,8 @@ pub struct ServerToolExecutor {
     plugin_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
     /// Shared dynamic-agent tool context for `agent.spawn/get_result`.
     agent_tool_context: Option<AgentToolContext>,
+    capabilities: astra_turn_core::capability::CapabilitySet,
+    server_tool_names: HashSet<String>,
 }
 
 /// Snapshot used by the plan-mode write guard and the system-prompt
@@ -972,6 +986,9 @@ impl ServerToolExecutor {
         let task_store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
         let task_manager = Arc::new(TaskManager::new(session_id.clone(), task_store));
 
+        let capabilities = crate::capabilities::full_server_capabilities_for_tests();
+        let server_tool_names = resolved_server_tool_names(&capabilities);
+
         Self {
             workspace_root,
             user_id,
@@ -1006,7 +1023,18 @@ impl ServerToolExecutor {
             plan_resume_hint_handle: None,
             plugin_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
             agent_tool_context: None,
+            capabilities,
+            server_tool_names,
         }
+    }
+
+    pub fn with_capabilities(
+        mut self,
+        capabilities: astra_turn_core::capability::CapabilitySet,
+    ) -> Self {
+        self.server_tool_names = resolved_server_tool_names(&capabilities);
+        self.capabilities = capabilities;
+        self
     }
 
     /// Install plugin-registered schemas (MCP, etc.) so
@@ -1025,6 +1053,10 @@ impl ServerToolExecutor {
             poisoned.into_inner()
         });
         *guard = schemas;
+    }
+
+    fn supports_server_tool_name(&self, tool: &str) -> bool {
+        self.server_tool_names.contains(tool)
     }
 
     /// Inject the plan repository so plan-mode tools and the write-tool guard
@@ -1777,11 +1809,11 @@ impl ServerToolExecutor {
             //
             // Lets the LLM look up schemas by name via
             // `tool_search(query="select:NAME")`.
-            // Schema pool = static server allowlist + plugin schemas
+            // Schema pool = capability-resolved server tools + plugin schemas
             // installed via `set_plugin_schemas`. Without the union,
             // MCP/skill-backed tools would never resolve.
             "tool_search" => {
-                let mut pool = astra_tools::schemas::server_executor_tool_schemas();
+                let mut pool = crate::capabilities::server_runtime_tool_schemas(&self.capabilities);
                 // Poison recovery: recover inner so deferred activation
                 // survives a prior panic. See set_plugin_schemas doc.
                 let guard = self.plugin_schemas.read().unwrap_or_else(|poisoned| {
@@ -1829,13 +1861,7 @@ impl ServerToolExecutor {
                 }
             }
             "list_dir" => self.default_executor.execute("list_dir", args).await,
-            // ── Top-level plan-mode tools (Phase 2) ────────────────────
-            // Promoted from `session.enter_plan` / `session.exit_plan` to
-            // dedicated tools matching claudecode's `EnterPlanMode` /
-            // `ExitPlanMode`. The buried sub-actions never got picked,
-            // wasting the plan-authoring discipline. The schema-side
-            // entries are gone (see schemas.rs); the dispatch here also
-            // redirects stale calls so the model self-corrects.
+            // ── Top-level plan-mode tools ───────────────────────────────
             "enter_plan_mode" => {
                 astra_tools::ToolResult::text(self.tool_enter_plan_mode(args).await)
             }
@@ -1848,19 +1874,6 @@ impl ServerToolExecutor {
                     "prioritize" => tool_result_from_output(self.prioritize_tool(args)),
                     "deprioritize" => tool_result_from_output(self.deprioritize_tool(args)),
                     "compact" => tool_result_from_output(self.compress_context(args)),
-                    // Phase 2 split: plan-mode actions promoted to top-level
-                    // tools. Stale callers get a redirect Error so the model
-                    // self-corrects instead of silently no-op'ing.
-                    "enter_plan" => astra_tools::ToolResult::text(format!(
-                        "Error: `session(action='enter_plan')` was promoted to the \
-                         top-level `enter_plan_mode` tool in the Phase 2 plan-mode split. \
-                         Call `enter_plan_mode` directly. The buried sub-action no longer exists."
-                    )),
-                    "exit_plan" => astra_tools::ToolResult::text(format!(
-                        "Error: `session(action='exit_plan')` was promoted to the \
-                         top-level `exit_plan_mode` tool in the Phase 2 plan-mode split. \
-                         Call `exit_plan_mode` directly with the plan markdown."
-                    )),
                     "rollback_edits" => tool_result_from_output(self.rollback_file_edits(args)),
                     "ask_user" => self.server_ask_user(args).await,
                     "sleep" => self.default_executor.execute("sleep", args).await,
@@ -3175,7 +3188,7 @@ impl ServerToolExecutor {
             })
         };
         let capability = || {
-            let schemas = crate::capabilities::server_runtime_tool_schemas();
+            let schemas = crate::capabilities::server_runtime_tool_schemas(&self.capabilities);
             let tool_names: Vec<&str> = schemas
                 .iter()
                 .filter_map(|t| {
@@ -3503,7 +3516,7 @@ impl ServerToolExecutor {
         let Some(tool) = extract_tool_name(args) else {
             return json!({"error": "Missing required parameter: tool"}).to_string();
         };
-        if !supports_server_tool_name(&tool) {
+        if !self.supports_server_tool_name(&tool) {
             return json!({"error": format!("Unknown tool: {tool}")}).to_string();
         }
 
@@ -3573,7 +3586,7 @@ impl ServerToolExecutor {
         let Some(tool) = extract_tool_name(args) else {
             return json!({"error": "Missing required parameter: tool"}).to_string();
         };
-        if !supports_server_tool_name(&tool) {
+        if !self.supports_server_tool_name(&tool) {
             return json!({"error": format!("Unknown tool: {tool}")}).to_string();
         }
 
@@ -3904,7 +3917,7 @@ impl ServerToolExecutor {
                 // counts as authoring.
                 let authoring =
                     !has_subtasks || (!any_in_progress && !items_done && !progress_complete);
-                let hint = astra_plan::plan_resume_system_prompt_section(&state);
+                let hint = astra_plan::plan_resume_prompt_hint(&state);
                 (authoring, hint)
             }
             Err(_) => (false, None),
@@ -3971,11 +3984,8 @@ impl ServerToolExecutor {
                 (s, Some(v))
             }
             Err(astra_plan::PlanLoadError::NotFound(_)) => {
-                let mut s = astra_plan::PlanModeState::new_with_owner(
-                    goal.clone(),
-                    astra_plan::ProjectContext::default(),
-                    self.user_id.clone(),
-                );
+                let mut s =
+                    astra_plan::PlanModeState::new_with_owner(goal.clone(), self.user_id.clone());
                 s.session_hint = Some(self.session_id.clone());
                 (s, None)
             }
@@ -4741,7 +4751,7 @@ impl ToolExecutor for ServerToolExecutor {
     }
 
     fn tool_schemas(&self) -> Vec<Value> {
-        crate::capabilities::server_runtime_tool_schemas()
+        crate::capabilities::server_runtime_tool_schemas(&self.capabilities)
     }
 
     fn project_root(&self) -> &Path {
@@ -4803,31 +4813,34 @@ mod tests {
     #[test]
     fn session_history_actions_are_advertised_on_session_tool() {
         let names: std::collections::HashSet<String> =
-            crate::capabilities::server_runtime_tool_schemas()
-                .into_iter()
-                .filter_map(|schema| {
-                    schema
-                        .pointer("/function/name")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .collect();
+            crate::capabilities::server_runtime_tool_schemas(
+                &crate::capabilities::full_server_capabilities_for_tests(),
+            )
+            .into_iter()
+            .filter_map(|schema| {
+                schema
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
 
         assert!(
             names.contains("session"),
             "session must be advertised to the web-agent LLM"
         );
         assert!(
-            supports_server_tool_name("session"),
+            resolved_server_tool_names(&crate::capabilities::full_server_capabilities_for_tests())
+                .contains("session"),
             "session must be accepted by ServerToolExecutor"
         );
 
-        let session_schema = crate::capabilities::server_runtime_tool_schemas()
-            .into_iter()
-            .find(|schema| {
-                schema.pointer("/function/name").and_then(Value::as_str) == Some("session")
-            })
-            .expect("session schema should exist");
+        let session_schema = crate::capabilities::server_runtime_tool_schemas(
+            &crate::capabilities::full_server_capabilities_for_tests(),
+        )
+        .into_iter()
+        .find(|schema| schema.pointer("/function/name").and_then(Value::as_str) == Some("session"))
+        .expect("session schema should exist");
         let actions = session_schema
             .pointer("/function/parameters/properties/action/enum")
             .and_then(Value::as_array)
@@ -6002,6 +6015,18 @@ esac
     }
 
     #[tokio::test]
+    async fn session_enter_plan_legacy_action_is_unknown() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute("session", &json!({"action": "enter_plan"}))
+            .await;
+        assert!(
+            result.contains("Unknown session action: 'enter_plan'"),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
     async fn symbols_extracts_rust_symbols() {
         let (exec, dir) = test_executor();
         std::fs::write(
@@ -6387,7 +6412,7 @@ esac
         let active = Arc::new(AtomicU32::new(0));
         let load = Arc::new(AtomicU32::new(0));
         let inner: Arc<dyn astra_plan::PlanRepository> =
-            Arc::new(astra_plan::LocalCachePlanRepository::new());
+            Arc::new(astra_plan::InMemoryPlanRepository::new());
         let wrapper = Arc::new(QueryCountingPlanRepo {
             inner,
             active_calls: active.clone(),
@@ -6429,7 +6454,7 @@ esac
         // in the system prompt for the rest of the run. The executor now
         // shares the slot and pushes updates through on enter/exit.
         let inner: Arc<dyn astra_plan::PlanRepository> =
-            Arc::new(astra_plan::LocalCachePlanRepository::new());
+            Arc::new(astra_plan::InMemoryPlanRepository::new());
         let (mut exec, _dir) = test_executor();
         exec.set_plan_repository(inner);
 
@@ -6464,7 +6489,7 @@ esac
         let active = Arc::new(AtomicU32::new(0));
         let load = Arc::new(AtomicU32::new(0));
         let inner: Arc<dyn astra_plan::PlanRepository> =
-            Arc::new(astra_plan::LocalCachePlanRepository::new());
+            Arc::new(astra_plan::InMemoryPlanRepository::new());
         let wrapper = Arc::new(QueryCountingPlanRepo {
             inner,
             active_calls: active.clone(),
@@ -6621,11 +6646,8 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
 
         // Seed a plan in authoring state (has subtasks, all pending, none done).
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "test plan".into(),
-            astra_plan::ProjectContext::default(),
-            "test-user".into(),
-        );
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("test plan".into(), "test-user".into());
         state
             .plan
             .subtasks
@@ -6701,11 +6723,8 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
 
         // Plan with 3 subtasks — typical "split into steps" output.
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "ship feature X".into(),
-            astra_plan::ProjectContext::default(),
-            "alice".into(),
-        );
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("ship feature X".into(), "alice".into());
         for (i, title) in ["wire schema", "implement handler", "write tests"]
             .iter()
             .enumerate()
@@ -6781,7 +6800,6 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
-            astra_plan::ProjectContext::default(),
             "alice".into(),
         );
         for (i, title) in [
@@ -6860,7 +6878,6 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
-            astra_plan::ProjectContext::default(),
             "alice".into(),
         );
         state
@@ -6939,7 +6956,6 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
-            astra_plan::ProjectContext::default(),
             "alice".into(),
         );
         state
@@ -7020,7 +7036,6 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
-            astra_plan::ProjectContext::default(),
             "alice".into(),
         );
         state
@@ -7135,11 +7150,8 @@ esac
     #[tokio::test]
     async fn exit_plan_mode_rejected_does_not_seed_todos() {
         let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "still drafting".into(),
-            astra_plan::ProjectContext::default(),
-            "alice".into(),
-        );
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("still drafting".into(), "alice".into());
         state
             .plan
             .subtasks
@@ -7182,11 +7194,8 @@ esac
     #[tokio::test]
     async fn exit_plan_mode_with_empty_plan_seeds_nothing() {
         let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "empty plan".into(),
-            astra_plan::ProjectContext::default(),
-            "alice".into(),
-        );
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("empty plan".into(), "alice".into());
         repo.save("plan-empty-test", &mut state, None)
             .await
             .unwrap();
@@ -7378,11 +7387,8 @@ esac
     #[tokio::test]
     async fn exit_plan_mode_rejected_keeps_write_guard_blocking() {
         let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "draft plan".into(),
-            astra_plan::ProjectContext::default(),
-            "alice".into(),
-        );
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("draft plan".into(), "alice".into());
         state
             .plan
             .subtasks
@@ -7424,11 +7430,8 @@ esac
     #[tokio::test]
     async fn exit_plan_mode_seed_failure_is_non_fatal_and_unlocks_writes() {
         let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "seed failure plan".into(),
-            astra_plan::ProjectContext::default(),
-            "alice".into(),
-        );
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("seed failure plan".into(), "alice".into());
         state
             .plan
             .subtasks

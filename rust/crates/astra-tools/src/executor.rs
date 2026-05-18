@@ -347,7 +347,7 @@ impl ToolExecutor for DefaultToolExecutor {
     }
 
     fn tool_schemas(&self) -> Vec<Value> {
-        crate::schemas::default_executor_tool_schemas()
+        crate::schemas::all_tool_schemas()
     }
 
     fn project_root(&self) -> &Path {

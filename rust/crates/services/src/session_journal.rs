@@ -3086,7 +3086,7 @@ impl JournalEvent {
         parent_run_id: &str,
         agent_type: &str,
         description: &str,
-        model: &str,
+        model: Option<&str>,
         inherit_prefix: bool,
     ) -> Self {
         let mut evt = Self::base(JournalEventType::AgentSpawned, session_id);

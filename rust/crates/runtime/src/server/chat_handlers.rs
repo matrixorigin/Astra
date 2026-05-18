@@ -185,6 +185,7 @@ pub(super) async fn chat_handler(
     chat_data.session_id = resolved.session_id;
     chat_data.full_llm_capture = resolved.full_llm_capture;
     let run = state
+        .execution
         .run_lifecycle_service
         .create_run(user.user_id, chat_data)
         .await?;
@@ -240,6 +241,7 @@ pub(super) async fn chat_stream_handler(
     }
 
     match state
+        .execution
         .run_lifecycle_service
         .stream_chat(user.user_id.clone(), chat_data.clone())
         .await
@@ -435,14 +437,14 @@ pub(super) async fn dispatch_chat_turn_bridge(
         .forward(
             &bridge_headers,
             prepared.body,
-            state.turn_core_event_writer.clone(),
-            state.turn_tool_event_writer.clone(),
-            state.turn_hook_db_writer.clone(),
-            state.turn_reflection_state_store.clone(),
-            state.turn_reflection_lesson_writer.clone(),
-            state.turn_observer_worker.clone(),
-            state.turn_auxiliary_event_writer.clone(),
-            state.turn_session_activity_writer.clone(),
+            state.turn_persistence.core_event_writer.clone(),
+            state.turn_persistence.tool_event_writer.clone(),
+            state.turn_persistence.hook_db_writer.clone(),
+            state.turn_persistence.reflection_state_store.clone(),
+            state.turn_persistence.reflection_lesson_writer.clone(),
+            state.turn_persistence.observer_worker.clone(),
+            state.turn_persistence.auxiliary_event_writer.clone(),
+            state.turn_persistence.session_activity_writer.clone(),
             Some(client_disconnect),
         )
         .await

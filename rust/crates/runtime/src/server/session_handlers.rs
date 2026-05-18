@@ -1475,35 +1475,236 @@ async fn load_device_lease_event_payloads(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use std::sync::Arc;
 
-    #[test]
-    fn session_artifact_handlers_enforce_session_scope_and_store_api() {
-        let source = include_str!("session_handlers.rs");
-        let production_source = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("session_handlers.rs should contain production code before tests");
-        assert!(
-            production_source.contains("get_session(session_id.clone(), user.user_id)"),
-            "artifact handlers should verify session ownership before reading artifacts"
+    use astra_core::{ErrorResponse, error_response};
+    use astra_services::auth::SessionActivityRecord;
+    use astra_services::{
+        AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
+        AuthTokenRecord, AuthUserRecord, SessionCreateRequestData, SessionListFilter,
+        SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
+    };
+    use async_trait::async_trait;
+    use axum::{
+        Json,
+        extract::{Path, Query, State},
+        http::{HeaderMap, HeaderValue, StatusCode},
+    };
+    use serde_json::json;
+    use tokio::sync::Mutex;
+
+    use crate::{AppState, HealthChecker, ServiceInfo};
+
+    #[derive(Clone)]
+    struct AlwaysHealthy;
+
+    #[async_trait]
+    impl HealthChecker for AlwaysHealthy {
+        async fn database_healthy(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingAuthService;
+
+    #[async_trait]
+    impl AuthService for RecordingAuthService {
+        async fn register(
+            &self,
+            _request: AuthRegisterRequestData,
+        ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("register is not used in session handler tests")
+        }
+
+        async fn login(
+            &self,
+            _request: AuthLoginRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("login is not used in session handler tests")
+        }
+
+        async fn refresh(
+            &self,
+            _request: AuthRefreshRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("refresh is not used in session handler tests")
+        }
+
+        async fn logout(
+            &self,
+            _request: AuthRefreshRequestData,
+        ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("logout is not used in session handler tests")
+        }
+
+        async fn current_user(
+            &self,
+            headers: &HeaderMap,
+        ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+            if headers.get("authorization").is_none() {
+                return Err(error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "missing authorization",
+                ));
+            }
+            Ok(AuthUserRecord {
+                user_id: "artifact-owner".into(),
+                username: "artifact-owner".into(),
+                email: "artifact@example.com".into(),
+                display_name: None,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingSessionService {
+        get_session_calls: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl SessionService for RecordingSessionService {
+        async fn create_session(
+            &self,
+            _user_id: String,
+            _request: SessionCreateRequestData,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("create_session is not used in session artifact tests")
+        }
+
+        async fn list_sessions(
+            &self,
+            _filter: SessionListFilter,
+        ) -> Result<SessionListRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("list_sessions is not used in session artifact tests")
+        }
+
+        async fn get_session(
+            &self,
+            session_id: String,
+            user_id: String,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.get_session_calls
+                .lock()
+                .await
+                .push((session_id, user_id));
+            Err(error_response(
+                StatusCode::FORBIDDEN,
+                "session access denied",
+            ))
+        }
+
+        async fn update_session(
+            &self,
+            _session_id: String,
+            _user_id: String,
+            _request: SessionUpdateRequestData,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("update_session is not used in session artifact tests")
+        }
+
+        async fn delete_session(
+            &self,
+            _session_id: String,
+            _user_id: String,
+        ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("delete_session is not used in session artifact tests")
+        }
+
+        async fn get_session_activity(
+            &self,
+            _session_id: String,
+            _user_id: String,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("get_session_activity is not used in session artifact tests")
+        }
+    }
+
+    fn build_state(
+        auth_service: Arc<dyn AuthService>,
+        session_service: Arc<dyn SessionService>,
+    ) -> AppState {
+        AppState::new(ServiceInfo::default(), Arc::new(AlwaysHealthy))
+            .with_auth_service(auth_service)
+            .with_session_service(session_service)
+    }
+
+    fn auth_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer session-test-token"),
         );
-        assert!(
-            production_source.contains(".list_json_artifacts("),
-            "artifact list handler should use the session artifact store list API"
-        );
-        assert!(
-            production_source.contains(".load_json_artifact(&artifact_id)"),
-            "artifact get handler should use the session artifact store get API"
-        );
-        assert!(
-            production_source.contains(".load_latest_json_artifact(&session_id, &artifact_kind)"),
-            "artifact latest handler should use the session artifact store latest API"
-        );
-        assert!(
-            production_source.contains("build_presigned_artifact_download")
-                && !production_source.contains("serde_json::to_vec_pretty(&response)"),
-            "artifact download handler should return a presigned URL without loading payload into API memory"
+        headers
+    }
+
+    #[tokio::test]
+    async fn session_artifact_handlers_verify_session_ownership_before_store_access() {
+        let session_service = Arc::new(RecordingSessionService::default());
+        let state = build_state(Arc::new(RecordingAuthService), session_service.clone());
+        let session_id = "session-123".to_string();
+
+        let list_err = match list_session_artifacts_handler(
+            State(state.clone()),
+            Path(session_id.clone()),
+            auth_headers(),
+            Query(SessionArtifactListQuery::default()),
+        )
+        .await
+        {
+            Ok(_) => panic!("list should stop at session ownership check"),
+            Err(err) => err,
+        };
+        assert_eq!(list_err.0, StatusCode::FORBIDDEN);
+
+        let latest_err = match get_latest_session_artifact_handler(
+            State(state.clone()),
+            Path((session_id.clone(), "trace".to_string())),
+            auth_headers(),
+        )
+        .await
+        {
+            Ok(_) => panic!("latest should stop at session ownership check"),
+            Err(err) => err,
+        };
+        assert_eq!(latest_err.0, StatusCode::FORBIDDEN);
+
+        let get_err = match get_session_artifact_handler(
+            State(state.clone()),
+            Path((session_id.clone(), "artifact-1".to_string())),
+            auth_headers(),
+        )
+        .await
+        {
+            Ok(_) => panic!("get should stop at session ownership check"),
+            Err(err) => err,
+        };
+        assert_eq!(get_err.0, StatusCode::FORBIDDEN);
+
+        let download_err = match download_session_artifact_handler(
+            State(state),
+            Path((session_id.clone(), "artifact-1".to_string())),
+            auth_headers(),
+        )
+        .await
+        {
+            Ok(_) => panic!("download should stop at session ownership check"),
+            Err(err) => err,
+        };
+        assert_eq!(download_err.0, StatusCode::FORBIDDEN);
+
+        let calls = session_service.get_session_calls.lock().await.clone();
+        assert_eq!(
+            calls,
+            vec![
+                (session_id.clone(), "artifact-owner".to_string()),
+                (session_id.clone(), "artifact-owner".to_string()),
+                (session_id.clone(), "artifact-owner".to_string()),
+                (session_id, "artifact-owner".to_string()),
+            ],
+            "artifact handlers should verify session ownership before touching artifact storage"
         );
     }
 

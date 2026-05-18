@@ -1,12 +1,11 @@
 //! Plan execution wiring: spawns a background executor task, then runs the
 //! in-process plan monitor in the current task until the run pauses, completes, or
-//! the user cancels. Progress is shown live; between-monitor idle time (if the REPL
-//! is reached again) may still use [`crate::plan_monitor::flush_plan_updates_between_prompts`]
+//! the user cancels. Progress is shown live; between-monitor idle time (if the CLI
+//! prompt is reached again) may still use [`crate::plan_monitor::flush_plan_updates_between_prompts`]
 //! when applicable.
 
 use crate::durable_bridge;
 use crate::plan_executor;
-use crate::plan_interaction;
 
 use crate::session_state::SessionState;
 use crate::theme;
@@ -27,11 +26,11 @@ fn build_fallback_delegation_engine()
     std::sync::Arc::new(engine)
 }
 
-/// Extract a [`BackgroundPlanContext`] from the current REPL state.
+/// Extract a [`BackgroundPlanContext`] from the current CLI session state.
 ///
 /// Clones the active plan for the background executor, moves durable task state
 /// and corrections out of `state`, and leaves an in-memory copy behind so
-/// `/plan status` can keep reporting progress after plan mode exits.
+/// execution state can still be surfaced after plan mode exits.
 fn take_plan_context(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
@@ -81,9 +80,6 @@ fn take_plan_context(
         harness_sink: Some(state.harness_sink.clone()),
         #[cfg(feature = "harness")]
         harness_trace: Some(state.harness_trace.clone()),
-        ingestion_user_id: state.ingestion_user_id.clone(),
-        matrix_runtime: state.matrix_runtime.clone(),
-        plan_execution_config: state.plan_execution_config.clone(),
         turn: state.turn,
         turn_retry_counts: std::collections::HashMap::new(),
         current_subtask_strategy_hint: None,
@@ -95,17 +91,17 @@ fn take_plan_context(
 /// or the user hits Ctrl+C (per monitor behavior).
 ///
 /// The heavy work still runs in the executor’s `tokio` task. This function only
-/// returns after the blocking monitor loop exits, so the normal REPL prompt is not
+/// returns after the blocking monitor loop exits, so the normal CLI prompt is not
 /// interleaved with that plan run. The in-memory `executing_plan` copy and
 /// `plan_handle` keep [`crate::plan_monitor::flush_plan_updates_between_prompts`] and
-/// `/plan status` useful when the user is at the prompt again.
+/// related execution state available when the user is at the prompt again.
 pub(crate) async fn start_and_monitor_plan(
     state: &mut SessionState,
     current_token: Option<&str>,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> Result<(), String> {
-    if plan_interaction::shutdown_plan_executor(state) {
+    if shutdown_plan_executor(state) {
         eprintln!(
             "  {}  Previous plan executor cancelled before starting new run.",
             theme::icon_warn()
@@ -129,6 +125,21 @@ pub(crate) async fn start_and_monitor_plan(
     super::plan_monitor::run_blocking_plan_monitor(state).await;
 
     Ok(())
+}
+
+/// Cleanly shut down a running plan executor handle.
+///
+/// Sends `Cancel`, drains remaining updates, and returns `true` if a handle was
+/// actually present (i.e. an executor was running). Call this before spawning a
+/// new executor or when abandoning an in-flight run.
+pub(crate) fn shutdown_plan_executor(state: &mut SessionState) -> bool {
+    if let Some(mut h) = state.plan_handle.take() {
+        let _ = h.send_command(crate::plan_executor::PlanCommand::Cancel);
+        while h.try_recv().is_some() {}
+        true
+    } else {
+        false
+    }
 }
 
 /// Initialize `durable_task_state` on `SessionState` if it's `None` and a plan
@@ -185,44 +196,24 @@ async fn ensure_durable_task_state(
             None
         };
 
-    let ingestion_sender = state
-        .matrix_runtime
-        .as_ref()
-        .and_then(|mc| mc.clone_ingestion_sender());
     // Judge runs server-side via server_proxy_judge (the server resolves the reasoning model
     // from admin_config + infra_llm_models). No local cloud judge.
     let cloud_judge: Option<std::sync::Arc<dyn astra_services::LlmJudge>> = None;
 
-    let lifecycle = if let Some(pool) = state
-        .matrix_runtime
+    let session_dir = state
+        .session_id
         .as_ref()
-        .map(|mc| mc.shared_pool().get().clone())
-    {
-        durable_bridge::create_cloud_lifecycle_full(
-            pool,
-            &work_dir,
-            ingestion_sender,
-            Some(session_id),
-            Some(user_id),
-            cloud_judge,
-            server_proxy_judge,
-        )
-    } else {
-        let session_dir = state
-            .session_id
-            .as_ref()
-            .map(|sid| astra_services::session_workspace::workspace_dir_for(sid))
-            .unwrap_or_else(|| work_dir.join(".mo-session"));
-        durable_bridge::create_local_lifecycle_full(
-            &session_dir,
-            &work_dir,
-            ingestion_sender,
-            Some(session_id),
-            Some(user_id),
-            cloud_judge,
-            server_proxy_judge,
-        )
-    };
+        .map(|sid| astra_services::session_workspace::workspace_dir_for(sid))
+        .unwrap_or_else(|| work_dir.join(".mo-session"));
+    let lifecycle = durable_bridge::create_local_lifecycle_full(
+        &session_dir,
+        &work_dir,
+        None,
+        Some(session_id),
+        Some(user_id),
+        cloud_judge,
+        server_proxy_judge,
+    );
 
     if let Some(contract) =
         durable_bridge::generate_contract(&lifecycle, plan, goal, user_id, session_id, &work_dir)
@@ -323,5 +314,23 @@ mod tests {
         };
 
         assert!(engine.validate(&request, "main").await.is_ok());
+    }
+
+    #[test]
+    fn shutdown_plan_executor_returns_false_without_handle() {
+        let mut state = SessionState::default();
+        assert!(!shutdown_plan_executor(&mut state));
+    }
+
+    #[test]
+    fn shutdown_plan_executor_cancels_and_clears_handle() {
+        let mut state = SessionState::default();
+        let (handle, _update_tx, _cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+
+        let had_handle = shutdown_plan_executor(&mut state);
+
+        assert!(had_handle);
+        assert!(state.plan_handle.is_none());
     }
 }

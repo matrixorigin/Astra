@@ -9,22 +9,18 @@
 //! - `GET /plans/{plan_id}/status` — get plan status + metrics
 //! - `POST /plans/{plan_id}/exit-plan-mode` — web-agent equivalent of the
 //!   ExitPlanMode tool; flips the phase to `refining`/`planning` based on
-//!   approval and optionally writes `plan_md` alongside the state.
+//!   approval and optionally persists `plan_md` alongside the state.
 //! - `POST /plans/{plan_id}/rewind` — reset one anchor + everything after
 //!   (mirrors the CLI `rewind N` path); distinct from redo-step.
 //! - `POST /plans/{plan_id}/redo-step` — reset one subtask for re-execution.
 //! - `GET /plans/{plan_id}/step-runs` — list `plan_step_runs` rows (paginated).
 //! - `DELETE /plans/{plan_id}` — delete a plan.
 //!
-//! All handlers go through [`AppState::plan_repo`] — the filesystem-backed
-//! helpers on `PlanModeState` are the offline fallback, not the source of
-//! truth.
+//! All handlers go through [`AppState::plan_repo`] — the repository is the
+//! source of truth for plan lifecycle state.
 
 use super::*;
-use crate::plan::{
-    ApprovalPolicy, PlanCapabilities, PlanLoadError, PlanModeState, PlanPhase, ProjectContext,
-    metrics::PlanMetrics,
-};
+use crate::plan::{PlanLoadError, PlanModeState};
 use astra_plan::{PlanListFilter, PlanStepRun};
 use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
 
@@ -42,6 +38,66 @@ const MAX_ATTEMPT: i32 = 1_000_000;
 /// Cap on free-form client text stored in journal/state so a hostile caller
 /// can't bloat `plan_json` or the journal with multi-MB payloads.
 const MAX_REASON_LENGTH: usize = 5_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct PlanCapabilities {
+    pub can_read_files: bool,
+    pub can_execute_tools: bool,
+    pub can_modify_files: bool,
+    pub can_access_network: bool,
+    pub max_subtasks: usize,
+    pub max_execution_rounds: usize,
+    pub requires_approval: ApprovalPolicy,
+}
+
+impl Default for PlanCapabilities {
+    fn default() -> Self {
+        Self {
+            can_read_files: true,
+            can_execute_tools: true,
+            can_modify_files: true,
+            can_access_network: true,
+            max_subtasks: 20,
+            max_execution_rounds: 50,
+            requires_approval: ApprovalPolicy::Destructive,
+        }
+    }
+}
+
+impl PlanCapabilities {
+    fn planning() -> Self {
+        Self {
+            can_read_files: true,
+            can_execute_tools: false,
+            can_modify_files: false,
+            can_access_network: false,
+            max_subtasks: 20,
+            max_execution_rounds: 0,
+            requires_approval: ApprovalPolicy::All,
+        }
+    }
+
+    fn auto_execute() -> Self {
+        Self::default()
+    }
+
+    fn step_by_step() -> Self {
+        Self {
+            requires_approval: ApprovalPolicy::PerSubtask,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ApprovalPolicy {
+    None,
+    PerSubtask,
+    #[default]
+    Destructive,
+    All,
+}
 const MAX_ERROR_LENGTH: usize = 10_000;
 const MAX_ARTIFACT_REF_LENGTH: usize = 1_000;
 
@@ -76,8 +132,6 @@ fn validate_optional_len(
 #[derive(Deserialize)]
 pub(super) struct CreatePlanRequest {
     pub goal: String,
-    #[serde(default)]
-    pub context: Option<ProjectContext>,
     /// Optional session this plan is being authored in. When present the plan
     /// becomes the session's active plan.
     #[serde(default)]
@@ -211,7 +265,6 @@ pub(super) struct PlanResponse {
     pub version: u64,
     pub plan: Option<TaskPlan>,
     pub capabilities: PlanCapabilities,
-    pub metrics: PlanMetrics,
 }
 
 #[derive(Serialize)]
@@ -224,7 +277,6 @@ pub(super) struct PlanStatusResponse {
     pub subtask_count: usize,
     pub completed_count: usize,
     pub failed_count: usize,
-    pub metrics: PlanMetrics,
     pub capabilities: PlanCapabilities,
 }
 
@@ -303,6 +355,62 @@ fn check_version(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlanRewindAnchor {
+    OneBased(usize),
+    IdPrefix(String),
+}
+
+fn resolve_rewind_start_index(plan: &TaskPlan, anchor: &PlanRewindAnchor) -> Result<usize, String> {
+    match anchor {
+        PlanRewindAnchor::OneBased(n) => {
+            if *n == 0 || *n > plan.subtasks.len() {
+                return Err(format!("subtask index must be 1..={}", plan.subtasks.len()));
+            }
+            Ok(*n - 1)
+        }
+        PlanRewindAnchor::IdPrefix(s) => {
+            let q = s.trim();
+            if q.is_empty() {
+                return Err("empty subtask id".into());
+            }
+            let matches: Vec<usize> = plan
+                .subtasks
+                .iter()
+                .enumerate()
+                .filter(|(_, st)| st.id == q || st.id.starts_with(q))
+                .map(|(i, _)| i)
+                .collect();
+            match matches.len() {
+                0 => Err(format!("no subtask id matches {q:?}")),
+                1 => Ok(matches[0]),
+                _ => Err(format!(
+                    "ambiguous id {:?} ({} matches); use a longer prefix or `rewind N` (1-based)",
+                    q,
+                    matches.len()
+                )),
+            }
+        }
+    }
+}
+
+fn rewind_plan_from_subtask(plan: &mut TaskPlan, start_idx: usize) -> usize {
+    let mut reset_count = 0usize;
+    for subtask in plan.subtasks.iter_mut().skip(start_idx) {
+        if matches!(
+            subtask.status,
+            TaskStatus::Completed
+                | TaskStatus::InProgress
+                | TaskStatus::Paused
+                | TaskStatus::Failed
+        ) {
+            subtask.status = TaskStatus::Pending;
+            reset_count += 1;
+        }
+    }
+    reset_count
 }
 
 /// Infer the phase name from a persisted `PlanModeState`.
@@ -395,9 +503,7 @@ pub(super) async fn create_plan_handler(
         ));
     }
 
-    let context = req.context.unwrap_or_default();
-    let mut plan_state =
-        PlanModeState::new_with_owner(goal.clone(), context.clone(), user.user_id.clone());
+    let mut plan_state = PlanModeState::new_with_owner(goal.clone(), user.user_id.clone());
     // session_hint seeds `plans.session_id` on first insert so the UPSERT below
     // doesn't need a second statement to record the routing link.
     plan_state.session_hint = req.session_id.clone();
@@ -432,22 +538,17 @@ pub(super) async fn create_plan_handler(
         ),
     );
 
-    let phase = PlanPhase::Planning {
-        goal: goal.clone(),
-        context,
-    };
-    let capabilities = PlanCapabilities::for_phase(&phase);
+    let capabilities = PlanCapabilities::planning();
 
     Ok((
         StatusCode::CREATED,
         Json(PlanResponse {
             plan_id,
-            phase: phase.phase_name().to_string(),
+            phase: "planning".to_string(),
             goal,
             version: plan_state.version,
             plan: None,
             capabilities,
-            metrics: PlanMetrics::default(),
         }),
     ))
 }
@@ -508,7 +609,6 @@ pub(super) async fn get_plan_handler(
         version: plan_state.version,
         plan: Some(plan_state.plan),
         capabilities,
-        metrics: PlanMetrics::default(),
     }))
 }
 
@@ -544,8 +644,6 @@ pub(super) async fn update_plan_handler(
         ));
     }
 
-    plan_state.add_turn(&instruction, "(pending LLM response)");
-
     let session_hint = plan_state.session_hint.clone();
     let expected = resolve_expected_version(&plan_state, req.expected_version);
     state
@@ -574,7 +672,6 @@ pub(super) async fn update_plan_handler(
         version: plan_state.version,
         plan: Some(plan_state.plan),
         capabilities: PlanCapabilities::planning(),
-        metrics: PlanMetrics::default(),
     }))
 }
 
@@ -681,7 +778,6 @@ pub(super) async fn execute_plan_handler(
         subtask_count: plan_state.plan.subtasks.len(),
         completed_count: completed,
         failed_count: failed,
-        metrics: PlanMetrics::default(),
         capabilities,
     }))
 }
@@ -714,11 +810,11 @@ pub(super) async fn exit_plan_mode_handler(
 
     check_version(&plan_state, req.expected_version)?;
 
-    // Stash the rendered markdown inside the state blob so web and CLI see
-    // the same artifact. Stored under a well-known history key so it round-
-    // trips through the existing (user, assistant) log — no schema change.
+    // Persist the rendered markdown alongside plan_json so web, sync, and CLI
+    // consumers can read the same artifact without reviving the removed
+    // turn-history compatibility layer.
     if let Some(md) = req.plan_md {
-        plan_state.add_turn("__plan_md__", &md);
+        plan_state.plan_md = Some(md);
     }
 
     let session_hint = plan_state.session_hint.clone();
@@ -772,7 +868,6 @@ pub(super) async fn exit_plan_mode_handler(
         version: plan_state.version,
         plan: Some(plan_state.plan),
         capabilities,
-        metrics: PlanMetrics::default(),
     }))
 }
 
@@ -783,8 +878,6 @@ pub(super) async fn rewind_plan_handler(
     Path(plan_id): Path<String>,
     Json(req): Json<RewindRequest>,
 ) -> Result<Json<RewindResponse>, (StatusCode, Json<ErrorResponse>)> {
-    use astra_plan::{PlanRewindAnchor, resolve_rewind_start_index, rewind_plan_from_subtask};
-
     let user = state.auth_service.current_user(&headers).await?;
 
     let anchor = req.anchor.trim();
@@ -881,8 +974,6 @@ pub(super) async fn redo_step_handler(
     Path(plan_id): Path<String>,
     Json(req): Json<RedoStepRequest>,
 ) -> Result<Json<RedoStepResponse>, (StatusCode, Json<ErrorResponse>)> {
-    use astra_plan::{PlanRewindAnchor, resolve_rewind_start_index};
-
     let user = state.auth_service.current_user(&headers).await?;
 
     let sid = req.subtask_id.trim();
@@ -922,8 +1013,7 @@ pub(super) async fn redo_step_handler(
         .map_err(map_plan_load_err)?;
 
     // Compute the next attempt number by counting prior runs for this subtask.
-    // The LocalCachePlanRepository returns an empty vec so attempt starts at 1
-    // there — that's fine for offline/test paths.
+    // In-memory/test repos start empty too, so the first attempt is 1 there.
     let prior_runs = state
         .plan_repo
         .list_step_runs(&plan_id, Some(&resolved_subtask_id), DEFAULT_RUNS_LIMIT)
@@ -1287,7 +1377,6 @@ pub(super) async fn plan_status_handler(
         subtask_count: plan_state.plan.subtasks.len(),
         completed_count: completed,
         failed_count: failed,
-        metrics: PlanMetrics::default(),
         capabilities,
     }))
 }
@@ -1330,17 +1419,37 @@ pub(super) async fn delete_plan_handler(
 mod tests {
     use super::*;
 
+    fn task_plan(subtasks: Vec<astra_services::task_orchestrator::SubtaskPlan>) -> TaskPlan {
+        TaskPlan {
+            subtasks,
+            notes: None,
+        }
+    }
+
+    fn subtask(
+        id: &str,
+        title: &str,
+        status: astra_services::task_orchestrator::TaskStatus,
+    ) -> astra_services::task_orchestrator::SubtaskPlan {
+        astra_services::task_orchestrator::SubtaskPlan {
+            id: id.into(),
+            title: title.into(),
+            status,
+            ..Default::default()
+        }
+    }
+
     // ── infer_phase_name tests ─────────────────────────────────────────────
 
     #[test]
     fn infer_phase_name_empty_plan_is_planning() {
-        let state = PlanModeState::new("build auth".into(), ProjectContext::default());
+        let state = PlanModeState::new("build auth".into());
         assert_eq!(infer_phase_name(&state), "planning");
     }
 
     #[test]
     fn infer_phase_name_with_pending_subtasks_is_refining() {
-        let mut state = PlanModeState::new("add tests".into(), ProjectContext::default());
+        let mut state = PlanModeState::new("add tests".into());
         state
             .plan
             .subtasks
@@ -1355,7 +1464,7 @@ mod tests {
 
     #[test]
     fn infer_phase_name_with_in_progress_subtasks_is_executing() {
-        let mut state = PlanModeState::new("add tests".into(), ProjectContext::default());
+        let mut state = PlanModeState::new("add tests".into());
         state
             .plan
             .subtasks
@@ -1379,7 +1488,7 @@ mod tests {
 
     #[test]
     fn infer_phase_name_all_completed() {
-        let mut state = PlanModeState::new("deploy service".into(), ProjectContext::default());
+        let mut state = PlanModeState::new("deploy service".into());
         state
             .plan
             .subtasks
@@ -1437,19 +1546,19 @@ mod tests {
 
     #[test]
     fn check_version_passes_when_none() {
-        let state = PlanModeState::new("x".into(), ProjectContext::default());
+        let state = PlanModeState::new("x".into());
         assert!(check_version(&state, None).is_ok());
     }
 
     #[test]
     fn check_version_passes_when_matching() {
-        let state = PlanModeState::new("x".into(), ProjectContext::default());
+        let state = PlanModeState::new("x".into());
         assert!(check_version(&state, Some(state.version)).is_ok());
     }
 
     #[test]
     fn check_version_fails_when_mismatched() {
-        let state = PlanModeState::new("x".into(), ProjectContext::default());
+        let state = PlanModeState::new("x".into());
         let (status, _) = check_version(&state, Some(state.version + 99)).unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
     }
@@ -1467,11 +1576,64 @@ mod tests {
 
     #[test]
     fn new_with_owner_sets_created_by() {
-        let state = PlanModeState::new_with_owner(
-            "goal".into(),
-            ProjectContext::default(),
-            "user-123".into(),
-        );
+        let state = PlanModeState::new_with_owner("goal".into(), "user-123".into());
         assert_eq!(state.created_by.as_deref(), Some("user-123"));
+    }
+
+    #[test]
+    fn rewind_index_resolves_one_based_anchor() {
+        let plan = task_plan(vec![
+            subtask("a", "A", TaskStatus::Pending),
+            subtask("b", "B", TaskStatus::Pending),
+        ]);
+        assert_eq!(
+            resolve_rewind_start_index(&plan, &PlanRewindAnchor::OneBased(2)),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn rewind_index_rejects_ambiguous_prefix() {
+        let plan = task_plan(vec![
+            subtask("test-unit", "Unit", TaskStatus::Pending),
+            subtask("test-integration", "Integration", TaskStatus::Pending),
+        ]);
+        let err = resolve_rewind_start_index(&plan, &PlanRewindAnchor::IdPrefix("test".into()))
+            .expect_err("prefix should be ambiguous");
+        assert!(err.contains("ambiguous"));
+    }
+
+    #[test]
+    fn rewind_index_rejects_empty_prefix() {
+        let plan = task_plan(vec![subtask("a", "A", TaskStatus::Pending)]);
+        assert!(resolve_rewind_start_index(&plan, &PlanRewindAnchor::IdPrefix("".into())).is_err());
+    }
+
+    #[test]
+    fn rewind_resets_terminal_and_in_progress_subtasks() {
+        let mut plan = task_plan(vec![
+            subtask("a", "A", TaskStatus::Completed),
+            subtask("b", "B", TaskStatus::InProgress),
+            subtask("c", "C", TaskStatus::Pending),
+        ]);
+        let reset_count = rewind_plan_from_subtask(&mut plan, 1);
+        assert_eq!(reset_count, 1);
+        assert_eq!(plan.subtasks[0].status, TaskStatus::Completed);
+        assert_eq!(plan.subtasks[1].status, TaskStatus::Pending);
+        assert_eq!(plan.subtasks[2].status, TaskStatus::Pending);
+    }
+
+    #[test]
+    fn rewind_from_middle_resolves_and_resets_following_subtasks() {
+        let mut plan = task_plan(vec![
+            subtask("a", "A", TaskStatus::Completed),
+            subtask("b", "B", TaskStatus::Failed),
+            subtask("c", "C", TaskStatus::InProgress),
+        ]);
+        let idx = resolve_rewind_start_index(&plan, &PlanRewindAnchor::OneBased(2)).unwrap();
+        assert_eq!(rewind_plan_from_subtask(&mut plan, idx), 2);
+        assert_eq!(plan.subtasks[0].status, TaskStatus::Completed);
+        assert_eq!(plan.subtasks[1].status, TaskStatus::Pending);
+        assert_eq!(plan.subtasks[2].status, TaskStatus::Pending);
     }
 }

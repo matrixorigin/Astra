@@ -23,12 +23,16 @@ pub(crate) enum PermissionMode {
 
 impl PermissionMode {
     pub fn chip_text(self) -> &'static str {
+        // Plain words — emojis varied wildly across themes and got
+        // flagged as visually noisy ("🔍" and "✎" never landed). The
+        // chip's colour already carries the urgency signal: blue for
+        // plan, cyan for edit, yellow for auto, red for deny.
         match self {
-            Self::Ask => "",
-            Self::Auto => "⚡auto",
+            Self::Ask => "default",
+            Self::Auto => "auto",
             Self::Plan => "plan",
-            Self::AcceptEdits => "✎edits",
-            Self::Deny => "⚡deny",
+            Self::AcceptEdits => "edit",
+            Self::Deny => "deny",
         }
     }
 }
@@ -95,9 +99,18 @@ pub(crate) struct StatusLine {
     pub right: Vec<Segment>,
 }
 
-/// Full idle hint. Shown when the terminal is wide enough.
-pub(crate) const IDLE_HINT_FULL: &str = "/ @ $ · Ctrl+O transcript";
-/// Tiny idle hint for very narrow terminals.
+/// Idle hint: input-prefix legend only. The `⇧Tab mode` /
+/// `Ctrl+O transcript` cheatsheet that used to live here was
+/// duplicating signal already conveyed by the permission-mode chip
+/// to the right (default / auto / edit / plan); once a user knows
+/// the shortcut the hint is permanent noise. The remaining `/ @ $`
+/// triplet stays because those characters change the *meaning* of
+/// the next keystroke (slash command / mention / shell), which is
+/// not visible from any other chip.
+pub(crate) const IDLE_HINT_FULL: &str = "/ @ $";
+/// Same hint at narrow widths — `IDLE_HINT_FULL` already fits in
+/// most terminals; keep an alias so existing layout code that
+/// distinguishes the two has a tiny form to fall back to.
 pub(crate) const IDLE_HINT_TINY: &str = "/ @ $";
 
 /// Threshold below which the budget chip is dim, above which it warns.
@@ -125,7 +138,10 @@ impl StatusLine {
         out.left.push(Segment::styled(hint_text, dim));
 
         match ctx.permission_mode {
-            PermissionMode::Ask => {}
+            PermissionMode::Ask => {
+                out.left
+                    .push(Segment::styled(PermissionMode::Ask.chip_text(), dim));
+            }
             PermissionMode::Auto => {
                 out.left.push(Segment::styled(
                     PermissionMode::Auto.chip_text(),
@@ -151,6 +167,13 @@ impl StatusLine {
                 ));
             }
         }
+
+        // Hint that the chip itself is the cycle anchor — without
+        // this the user has no surface clue that ⇧Tab moves between
+        // modes (the previous global "⇧Tab mode" hint was deleted
+        // for being repetitive and unanchored). Dim so it reads as
+        // metadata of the chip, not an action of its own.
+        out.left.push(Segment::styled("⇧Tab", dim));
 
         if ctx.pending_approvals > 0 {
             let text = if ctx.pending_approvals == 1 {

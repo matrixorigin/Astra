@@ -15,6 +15,7 @@ pub(super) async fn delegate_run_handler(
     let user = state.auth_service.current_user(&headers).await?;
     // Verify the authenticated user owns this run (IDOR prevention).
     state
+        .execution
         .run_lifecycle_service
         .get_run_status(run_id.clone(), user.user_id)
         .await?;
@@ -64,6 +65,7 @@ pub(super) async fn list_delegations_handler(
 ) -> Result<Json<DelegationListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     state
+        .execution
         .run_lifecycle_service
         .get_run_status(run_id.clone(), user.user_id)
         .await?;
@@ -150,6 +152,7 @@ pub(super) async fn pause_delegations_handler(
 ) -> Result<Json<DelegationMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     state
+        .execution
         .run_lifecycle_service
         .get_run_status(run_id.clone(), user.user_id)
         .await?;
@@ -178,6 +181,7 @@ pub(super) async fn resume_delegations_handler(
 ) -> Result<Json<DelegationMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     state
+        .execution
         .run_lifecycle_service
         .get_run_status(run_id.clone(), user.user_id)
         .await?;
@@ -198,25 +202,245 @@ pub(super) async fn resume_delegations_handler(
 
 #[cfg(test)]
 mod tests {
-    /// P0-A: All delegation handlers must verify run ownership via
-    /// get_run_status (not just authenticate). No `let _user =` patterns.
-    #[test]
-    fn delegation_handlers_verify_run_ownership() {
-        let source = include_str!("delegation_handlers.rs");
-        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
-        let prod_code = &source[..test_start];
+    use super::*;
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
-        // Must NOT have discarded user identity
-        assert!(
-            !prod_code.contains("let _user"),
-            "delegation handlers must use user identity, not discard it"
+    use astra_core::{ErrorResponse, error_response};
+    use astra_services::{
+        AggregationStrategy, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData,
+        AuthService, AuthTokenRecord, AuthUserRecord, CancelRunRecord, ChatRequestData,
+        ChatRunRecord, ChatStreamRecord, CoordinationPattern, RunLifecycleService, RunListRecord,
+        RunStatusRecord,
+    };
+    use async_trait::async_trait;
+    use axum::{
+        Json,
+        extract::{Path, State},
+        http::{HeaderMap, HeaderValue, StatusCode},
+    };
+    use tokio::sync::Mutex;
+
+    use crate::{AppState, HealthChecker, ServiceInfo};
+
+    #[derive(Clone)]
+    struct AlwaysHealthy;
+
+    #[async_trait]
+    impl HealthChecker for AlwaysHealthy {
+        async fn database_healthy(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingAuthService {
+        current_user_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AuthService for RecordingAuthService {
+        async fn register(
+            &self,
+            _request: AuthRegisterRequestData,
+        ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("register is not used in delegation handler tests")
+        }
+
+        async fn login(
+            &self,
+            _request: AuthLoginRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("login is not used in delegation handler tests")
+        }
+
+        async fn refresh(
+            &self,
+            _request: AuthRefreshRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("refresh is not used in delegation handler tests")
+        }
+
+        async fn logout(
+            &self,
+            _request: AuthRefreshRequestData,
+        ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("logout is not used in delegation handler tests")
+        }
+
+        async fn current_user(
+            &self,
+            headers: &HeaderMap,
+        ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.current_user_calls.fetch_add(1, Ordering::SeqCst);
+            if headers.get("authorization").is_none() {
+                return Err(error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "missing authorization",
+                ));
+            }
+            Ok(AuthUserRecord {
+                user_id: "delegation-owner".into(),
+                username: "delegation-owner".into(),
+                email: "delegation@example.com".into(),
+                display_name: None,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingRunLifecycleService {
+        run_status_requests: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl RunLifecycleService for RecordingRunLifecycleService {
+        async fn create_run(
+            &self,
+            _user_id: String,
+            _request: ChatRequestData,
+        ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("create_run is not used in delegation handler tests")
+        }
+
+        async fn stream_chat(
+            &self,
+            _user_id: String,
+            _request: ChatRequestData,
+        ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("stream_chat is not used in delegation handler tests")
+        }
+
+        async fn get_run_status(
+            &self,
+            run_id: String,
+            user_id: String,
+        ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.run_status_requests
+                .lock()
+                .await
+                .push((run_id, user_id));
+            Err(error_response(StatusCode::FORBIDDEN, "run access denied"))
+        }
+
+        async fn stream_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+            _last_index: u32,
+        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("stream_run is not used in delegation handler tests")
+        }
+
+        async fn cancel_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+        ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("cancel_run is not used in delegation handler tests")
+        }
+
+        async fn list_runs(
+            &self,
+            _user_id: String,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!("list_runs is not used in delegation handler tests")
+        }
+    }
+
+    fn build_state(
+        auth_service: Arc<dyn AuthService>,
+        run_lifecycle_service: Arc<dyn RunLifecycleService>,
+    ) -> AppState {
+        AppState::new(ServiceInfo::default(), Arc::new(AlwaysHealthy))
+            .with_auth_service(auth_service)
+            .with_run_lifecycle_service(run_lifecycle_service)
+    }
+
+    fn auth_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer delegation-test-token"),
         );
+        headers
+    }
 
-        // All 4 handlers must call get_run_status for ownership verification
-        let ownership_checks = prod_code.matches("get_run_status").count();
+    fn fan_out_request(run_id: &str) -> DelegationRequest {
+        DelegationRequest {
+            delegation_id: "delegation-1".into(),
+            parent_run_id: run_id.into(),
+            task: "delegate this run".into(),
+            pattern: CoordinationPattern::FanOut {
+                agent_ids: vec!["agent-a".into()],
+                aggregation: AggregationStrategy::AllResults,
+                timeout_sec: 30,
+            },
+            user_id: "delegation-owner".into(),
+            depth: 0,
+            context: HashMap::new(),
+        }
+    }
+
+    /// P0-A: All delegation handlers must verify run ownership via get_run_status
+    /// before touching the delegation engine.
+    #[tokio::test]
+    async fn delegation_handlers_verify_run_ownership() {
+        let auth = Arc::new(RecordingAuthService::default());
+        let lifecycle = Arc::new(RecordingRunLifecycleService::default());
+        let state = build_state(auth.clone(), lifecycle.clone());
+        let run_id = "run-123".to_string();
+
+        let delegate_err = delegate_run_handler(
+            State(state.clone()),
+            Path(run_id.clone()),
+            auth_headers(),
+            Json(fan_out_request(&run_id)),
+        )
+        .await
+        .expect_err("delegate should stop at ownership check");
+        assert_eq!(delegate_err.0, StatusCode::FORBIDDEN);
+
+        let list_err =
+            list_delegations_handler(State(state.clone()), Path(run_id.clone()), auth_headers())
+                .await
+                .expect_err("list should stop at ownership check");
+        assert_eq!(list_err.0, StatusCode::FORBIDDEN);
+
+        let pause_err =
+            pause_delegations_handler(State(state.clone()), Path(run_id.clone()), auth_headers())
+                .await
+                .expect_err("pause should stop at ownership check");
+        assert_eq!(pause_err.0, StatusCode::FORBIDDEN);
+
+        let resume_err =
+            resume_delegations_handler(State(state), Path(run_id.clone()), auth_headers())
+                .await
+                .expect_err("resume should stop at ownership check");
+        assert_eq!(resume_err.0, StatusCode::FORBIDDEN);
+
+        let calls = lifecycle.run_status_requests.lock().await.clone();
         assert!(
-            ownership_checks >= 4,
-            "all 4 delegation handlers must verify run ownership via get_run_status, found {ownership_checks}"
+            calls
+                == vec![
+                    (run_id.clone(), "delegation-owner".to_string()),
+                    (run_id.clone(), "delegation-owner".to_string()),
+                    (run_id.clone(), "delegation-owner".to_string()),
+                    (run_id, "delegation-owner".to_string()),
+                ],
+            "all delegation handlers should verify run ownership before proceeding: {calls:?}"
+        );
+        assert_eq!(
+            auth.current_user_calls.load(Ordering::SeqCst),
+            4,
+            "all delegation handlers should authenticate before checking ownership"
         );
     }
 }

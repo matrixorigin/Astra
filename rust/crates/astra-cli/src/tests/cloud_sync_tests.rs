@@ -91,8 +91,6 @@ fn display_sync_status_no_crash_full_data() {
 async fn slash_health_offline_shows_cloud_section() {
     let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
     let mut state = SessionState::default();
-    // No matrix runtime — should show "Offline" in cloud section
-    assert!(state.matrix_runtime.is_none());
     let exit = handle_slash_command("/health", &api, None, &mut state, None)
         .await
         .unwrap();

@@ -87,9 +87,10 @@ pub fn fingerprint_for_match_target(
                     )
                 })
                 .unwrap_or_else(|| ApprovalFingerprint::bare(tool_name)),
-            Some(CloudGatedToolKind::Write) => {
-                ApprovalFingerprint::file_op_exact(tool_name, path_hint_from_args(args).as_deref())
-            }
+            Some(CloudGatedToolKind::Write) => ApprovalFingerprint::file_op_exact(
+                file_write_fingerprint_tool(tool_name),
+                path_hint_from_args(args).as_deref(),
+            ),
             None => ApprovalFingerprint::bare(tool_name),
         },
         AllowMatchTarget::Prefix(prefix) => match cloud_gated_tool_kind(tool_name) {
@@ -101,7 +102,7 @@ pub fn fingerprint_for_match_target(
                 )
             }
             Some(CloudGatedToolKind::Write) if !prefix.is_empty() => {
-                ApprovalFingerprint::file_op_prefix(tool_name, prefix)
+                ApprovalFingerprint::file_op_prefix(file_write_fingerprint_tool(tool_name), prefix)
             }
             _ => ApprovalFingerprint::bare(tool_name),
         },
@@ -211,8 +212,9 @@ fn exact_rule(tool_name: &str, args: &Value) -> Option<String> {
         }
         CloudGatedToolKind::Write => {
             let path = path_hint_from_args(args)?;
+            let rule_tool = file_write_rule_tool(tool_name);
             Some(serialize_rule_v2(&PermissionRuleV2 {
-                tool: tool_name.to_string(),
+                tool: rule_tool,
                 argv_exact: None,
                 argv_prefix: None,
                 path_glob: Some(path),
@@ -250,8 +252,9 @@ fn prefix_rule(tool_name: &str, _args: &Value, prefix: &str) -> Option<String> {
             let cwd_root = path_hint_from_args(_args)
                 .and_then(|path| workspace_write_prefix(&path))
                 .filter(|root| root == prefix);
+            let rule_tool = file_write_rule_tool(tool_name);
             Some(serialize_rule_v2(&PermissionRuleV2 {
-                tool: tool_name.to_string(),
+                tool: rule_tool,
                 argv_exact: None,
                 argv_prefix: None,
                 path_glob: None,
@@ -264,6 +267,22 @@ fn prefix_rule(tool_name: &str, _args: &Value, prefix: &str) -> Option<String> {
                 extra: Default::default(),
             }))
         }
+    }
+}
+
+fn file_write_rule_tool(tool_name: &str) -> String {
+    if crate::tool_categories::registry().is_file_op(tool_name) {
+        "Edit".to_string()
+    } else {
+        tool_name.to_string()
+    }
+}
+
+fn file_write_fingerprint_tool(tool_name: &str) -> &str {
+    if crate::tool_categories::registry().is_file_op(tool_name) {
+        "edit"
+    } else {
+        tool_name
     }
 }
 
@@ -352,13 +371,20 @@ mod tests {
             &args,
             &AllowMatchTarget::Prefix("zzz".to_string()),
         );
-        assert_eq!(rule, r#"write_file(path_prefix="zzz", op="write")"#);
+        assert_eq!(rule, r#"Edit(path_prefix="zzz", op="write")"#);
 
         let parsed = PermissionRule::parse(&rule);
         assert!(parsed.matches_with_context(
             "write_file",
             &RuleMatchContext::from_tool_args(
                 "write_file",
+                &serde_json::json!({"path": "zzz2.md"})
+            )
+        ));
+        assert!(parsed.matches_with_context(
+            "str_replace",
+            &RuleMatchContext::from_tool_args(
+                "str_replace",
                 &serde_json::json!({"path": "zzz2.md"})
             )
         ));
@@ -376,12 +402,10 @@ mod tests {
             &args,
             &AllowMatchTarget::Prefix("zzz".into()),
         );
-        let later = crate::approval_fingerprint::ApprovalFingerprint::file_op(
-            "write_file",
-            Some("zzz2.md"),
-        );
+        let later =
+            crate::approval_fingerprint::ApprovalFingerprint::file_op("edit", Some("zzz2.md"));
         let other =
-            crate::approval_fingerprint::ApprovalFingerprint::file_op("write_file", Some("abc.md"));
+            crate::approval_fingerprint::ApprovalFingerprint::file_op("edit", Some("abc.md"));
         let mut overrides = crate::approval_fingerprint::FingerprintedOverrides::default();
         overrides.insert(approved, true);
 
@@ -403,6 +427,12 @@ mod tests {
         assert_eq!(target, AllowMatchTarget::Prefix(workspace_root.clone()));
 
         let rule = allow_rule_for_match_target("write_file", &args, &target);
+        assert_eq!(
+            rule,
+            format!(
+                r#"Edit(path_prefix="{workspace_root}", op="write", cwd_root="{workspace_root}")"#
+            )
+        );
         let parsed = PermissionRule::parse(&rule);
         assert!(parsed.matches_with_context(
             "write_file",
@@ -416,6 +446,13 @@ mod tests {
             &RuleMatchContext::from_tool_args(
                 "write_file",
                 &serde_json::json!({"path": "/tmp/outside.txt"})
+            )
+        ));
+        assert!(parsed.matches_with_context(
+            "str_replace",
+            &RuleMatchContext::from_tool_args(
+                "str_replace",
+                &serde_json::json!({"path": "web/src/app/page.tsx"})
             )
         ));
     }
@@ -492,7 +529,7 @@ mod tests {
         assert_eq!(
             allow_rule_for_match_target("write_file", &args, &target),
             format!(
-                r#"write_file(path_prefix="{workspace_root}", op="write", cwd_root="{workspace_root}")"#
+                r#"Edit(path_prefix="{workspace_root}", op="write", cwd_root="{workspace_root}")"#
             )
         );
     }

@@ -50,10 +50,55 @@ pub enum CacheBreakReason {
     },
     /// Model changed between turns.
     ModelChanged { from: String, to: String },
+    /// Provider changed between turns.
+    ProviderChanged { from: String, to: String },
     /// Cache TTL expired (inferred from time gap + cache miss).
     TtlExpired { gap_seconds: u64 },
+    /// Cache turned cold but no stable attribution is available.
+    UnknownColdStart,
     /// Multiple causes at once.
     Multiple(Vec<CacheBreakReason>),
+}
+
+impl std::fmt::Display for CacheBreakReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SystemPromptChanged => write!(f, "SystemPromptChanged"),
+            Self::ToolSchemasChanged {
+                added,
+                removed,
+                changed,
+            } => {
+                let mut parts = Vec::new();
+                if !added.is_empty() {
+                    parts.push(format!("added={}", added.join(",")));
+                }
+                if !removed.is_empty() {
+                    parts.push(format!("removed={}", removed.join(",")));
+                }
+                if !changed.is_empty() {
+                    parts.push(format!("changed={}", changed.join(",")));
+                }
+                if parts.is_empty() {
+                    write!(f, "ToolSchemasChanged")
+                } else {
+                    write!(f, "ToolSchemasChanged({})", parts.join(";"))
+                }
+            }
+            Self::ModelChanged { from, to } => write!(f, "ModelChanged({from}->{to})"),
+            Self::ProviderChanged { from, to } => write!(f, "ProviderChanged({from}->{to})"),
+            Self::TtlExpired { gap_seconds } => write!(f, "TtlExpired({}m)", gap_seconds / 60),
+            Self::UnknownColdStart => write!(f, "UnknownColdStart"),
+            Self::Multiple(reasons) => {
+                let joined = reasons
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "Multiple({joined})")
+            }
+        }
+    }
 }
 
 /// A detected cache break event with diagnostics.
@@ -447,6 +492,12 @@ impl CacheBreakDetector {
                 CacheBreakReason::ModelChanged { from, to } => {
                     return Some(format!(
                         "Model changed from {from} to {to}. Model switches always \
+                          invalidate the KV cache."
+                    ));
+                }
+                CacheBreakReason::ProviderChanged { from, to } => {
+                    return Some(format!(
+                        "Provider changed from {from} to {to}. Provider switches always \
                          invalidate the KV cache."
                     ));
                 }
@@ -456,6 +507,13 @@ impl CacheBreakDetector {
                         "Cache TTL likely expired ({minutes}min gap between turns). \
                          For long pauses, this is expected."
                     ));
+                }
+                CacheBreakReason::UnknownColdStart => {
+                    return Some(
+                        "Cache turned cold without a stable fingerprint cause; inspect provider \
+                         cache eligibility and first-turn warm-up behavior."
+                            .into(),
+                    );
                 }
                 CacheBreakReason::Multiple(_) => {}
             }

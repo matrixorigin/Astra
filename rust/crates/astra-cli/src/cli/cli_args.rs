@@ -179,9 +179,6 @@ pub(crate) enum Command {
     Completion(CompletionArgs),
     /// Diagnose installation, config, and connectivity
     Doctor,
-    /// Structured plan in non-interactive mode (scripting / CI)
-    #[command(subcommand)]
-    Plan(PlanCmd),
     /// Team orchestration and shared context management
     #[command(alias = "teams")]
     Team(TeamArgs),
@@ -249,23 +246,6 @@ pub(crate) struct ContextDumpArgs {
     /// a JSON file.  Useful for `| grep`, CI logs, bug reports.
     #[arg(long)]
     pub summary: bool,
-}
-
-/// Headless plan commands (no interactive `plan>` prompt).
-#[derive(Subcommand, Debug)]
-pub(crate) enum PlanCmd {
-    /// Decompose a goal into a structured plan (same backend as `/plan enter`).
-    Decompose {
-        /// Goal text for decomposition
-        #[arg(short = 'g', long)]
-        goal: String,
-        /// Print parsed plan as JSON on stdout
-        #[arg(long, default_value_t = false)]
-        json: bool,
-        /// Suppress progress messages on stderr
-        #[arg(short, long, default_value_t = false)]
-        quiet: bool,
-    },
 }
 
 #[derive(Args, Debug)]
@@ -349,17 +329,6 @@ pub(crate) struct ChatArgs {
     /// tool_started, tool_completed, status).
     #[arg(long = "stream-events", hide = true, default_value_t = false)]
     pub stream_events: bool,
-}
-
-#[derive(Args, Debug, Clone)]
-pub(crate) struct ForwardArgs {
-    /// Remaining arguments forwarded to the underlying command handler
-    #[arg(
-        value_name = "ARGS",
-        trailing_var_arg = true,
-        allow_hyphen_values = true
-    )]
-    pub args: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -480,10 +449,10 @@ pub(crate) enum TaskSubcommand {
     Status(TaskQueryArgs),
     /// Run a headless task with the agent
     Run(TaskRunArgs),
-    /// Queue a MatrixOne-backed cloud task without executing it locally (cloud-agent ops)
+    /// Queue an API-backed cloud task without executing it locally (cloud-agent ops)
     #[command(hide = true)]
     Queue(TaskQueueArgs),
-    /// Claim and execute queued MatrixOne-backed cloud tasks (cloud-agent ops)
+    /// Claim and execute queued API-backed cloud tasks (cloud-agent ops)
     #[command(hide = true)]
     Worker(TaskWorkerArgs),
     /// Show the result of a task run
@@ -1299,7 +1268,7 @@ pub(crate) enum ConfigVersionCmd {
     Diff(ConfigVersionDiffArgs),
     /// Print the id of the config the current process would run under.
     Current,
-    /// Pull cloud-mirrored versions into the local store.
+    /// Deprecated: config version pull is server-owned.
     Pull(ConfigVersionPullArgs),
 }
 

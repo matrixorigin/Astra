@@ -795,7 +795,7 @@ async fn execute_task_queue(args: TaskQueueArgs) -> Result<ExitCode, String> {
     // scope — token comes from env via current_access_token(None).
     // Per-user CLI sessions use `astra task worker` which threads
     // profile through.
-    let (svc, _) = session_runtime::resolve_matrixone_task_runtime(None).await?;
+    let (svc, _) = session_runtime::resolve_cloud_task_runtime(None).await?;
     let session_id = std::env::var("ASTRA_CLI_SESSION_ID").unwrap_or_else(|_| "cloud-queue".into());
     let task_id = svc
         .create_task(
@@ -818,7 +818,7 @@ async fn execute_task_queue(args: TaskQueueArgs) -> Result<ExitCode, String> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "task_id": task_id,
                 "status": "pending",
-                "backend": "matrixone",
+                "backend": "cloud-api",
             }))
             .unwrap_or_default()
         );
@@ -860,7 +860,7 @@ async fn execute_task_worker_once(
 ) -> Result<WorkerOutcome, String> {
     use astra_services::{LeaseClaimResult, TaskStatus};
 
-    let (svc, lease_svc) = session_runtime::resolve_matrixone_task_runtime(profile).await?;
+    let (svc, lease_svc) = session_runtime::resolve_cloud_task_runtime(profile).await?;
     let user_id = "local";
     let agent_id = args.agent_id.clone().unwrap_or_else(default_task_agent_id);
     let edge_id = std::env::var("ASTRA_EDGE_ID").unwrap_or_else(|_| agent_id.clone());
@@ -1650,6 +1650,10 @@ async fn execute_repl_bridge_command(
         "/memory" => {
             handle_memory_domain_command("/memory", arg, api, &mut state, token.as_deref()).await?
         }
+        "/plan" => {
+            crate::slash_plan::handle_plan_command(arg, api, profile, &mut state, token.as_deref())
+                .await?
+        }
         "/review" | "/grep" => {
             handle_info_command(slash_cmd, arg, api, &mut state, profile, token.as_deref()).await?
         }
@@ -2040,32 +2044,6 @@ pub(super) async fn execute_cli_command(
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }
-
-        Some(Command::Plan(plan_cmd)) => match plan_cmd {
-            PlanCmd::Decompose { goal, json, quiet } => {
-                let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-                let session_id = validated_resumable_last_session_id(api, profile.as_deref()).await;
-                let plan = crate::slash_memory::headless_plan_decompose(
-                    api,
-                    &token,
-                    &goal,
-                    session_id.as_deref(),
-                    global_model.as_deref(),
-                    quiet,
-                )
-                .await?;
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&plan)
-                            .map_err(|e| format!("serialize plan: {e}"))?
-                    );
-                } else {
-                    println!("{}", astra_runtime::plan_decompose::format_plan(&plan));
-                }
-                Ok(ExitCode::Success)
-            }
-        },
 
         Some(Command::Team(args)) => {
             execute_repl_bridge_command(
@@ -4014,46 +3992,11 @@ async fn config_version_dispatch(sub: ConfigVersionCmd) -> Result<(), String> {
             println!("{id}");
             Ok(())
         }
-        ConfigVersionCmd::Pull(args) => config_version_pull(args.limit, &store).await,
+        ConfigVersionCmd::Pull(_) => Err(
+            "config version pull is server-owned; CLI no longer connects to MatrixOne directly"
+                .to_string(),
+        ),
     }
-}
-
-/// Fetch every cloud-mirrored config version for the current user
-/// and write blobs into the local version store. No-op when the
-/// cloud isn't configured (MATRIXONE_* unset / unreachable) —
-/// returns a clear error instead of hanging on a dead connection.
-async fn config_version_pull(
-    limit: i64,
-    local: &astra_config::config_versions::LocalFileStore,
-) -> Result<(), String> {
-    let settings = astra_runtime::matrix_settings_from_env()
-        .map_err(|e| format!("cloud not configured: {e} (set MATRIXONE_PASSWORD)"))?;
-    // Make sure the table exists — CLI clients against a fresh DB
-    // might arrive before the server's ensure_core_schema has ever
-    // run. ensure_core_schema connects once to bootstrap + applies
-    // the DDL; idempotent on re-runs.
-    astra_services::storage::ensure_core_schema(&settings, "mo_catalog")
-        .await
-        .map_err(|e| format!("schema sync failed: {e}"))?;
-    let pool = astra_core::SharedPool::new(&settings)
-        .await
-        .map_err(|e| format!("cloud connect failed: {e}"))?;
-    let user_id = astra_core::cli_user_id();
-    let outcome = astra_services::config_version_cloud::pull_all_into_local_store(
-        pool.get(),
-        &user_id,
-        local,
-        limit,
-    )
-    .await
-    .map_err(|e| format!("pull failed: {e}"))?;
-    println!(
-        "Pulled {fetched} versions from cloud ({written} new, {skipped} skipped).",
-        fetched = outcome.fetched,
-        written = outcome.written,
-        skipped = outcome.skipped_hash_mismatch
-    );
-    Ok(())
 }
 
 fn config_show_policy(model: Option<&str>, json: bool) -> Result<(), String> {

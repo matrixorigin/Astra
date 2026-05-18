@@ -297,6 +297,10 @@ struct PrepareChatTurnRequest<'a> {
     /// so the per-turn SelfModel ingest can read `hub.tuning().recent_signals()`.
     observability_hub: Option<&'a Arc<astra_runtime::observability_integration::ObservabilityHub>>,
     append_system_prompt: Option<&'a str>,
+    /// Whether the current permission mode is `Plan`. When true the schema-
+    /// preparation step adds every mutating tool to `restricted_tools` so the
+    /// model only sees read-only + plan-control tools (`exit_plan_mode` etc.).
+    plan_mode_active: bool,
 }
 
 pub(crate) fn turn_policy_from_payload_edge_tools(
@@ -526,6 +530,14 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             ctx.all_schemas,
         );
     }
+
+    // Plan-mode tool restrictions are owned by the host
+    // (`CliAgenticLoopHost::execute_turn`) using the same
+    // turn-scoped add-then-remove pattern as
+    // `interaction_scoped_tool_restrictions`. Doing it here as a
+    // raw `extend` on the shared `state.restricted_tools` set
+    // leaked names into later turns — see the regression note on
+    // session 19298aea in `cli_loop_host::plan_mode_restriction_names`.
 
     let selected_tool_costs: Vec<(String, u32)> = selection_report
         .tools_selected
@@ -1135,6 +1147,8 @@ pub(crate) async fn fetch_chat_turn_sse(
             recent_rejections: perm_manager.recent_rejections(),
             observability_hub,
             append_system_prompt,
+            plan_mode_active: perm_manager.mode()
+                == crate::permission_manager::PermissionMode::Plan,
         },
     )
     .await?;

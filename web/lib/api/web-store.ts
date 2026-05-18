@@ -1042,11 +1042,6 @@ function normalizeCanonicalChatIds(store: Store) {
   const seen = new Set<string>();
   const normalized: ChatRecord[] = [];
   for (const chat of store.chats) {
-    const legacyBackendSessionId = (chat as ChatRecord & { backendSessionId?: unknown }).backendSessionId;
-    if (typeof legacyBackendSessionId === 'string' && legacyBackendSessionId.trim()) {
-      chat.id = legacyBackendSessionId;
-    }
-    delete (chat as ChatRecord & { backendSessionId?: unknown }).backendSessionId;
     if (LEGACY_LOCAL_CHAT_IDS.has(chat.id)) {
       continue;
     }

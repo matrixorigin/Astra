@@ -230,6 +230,18 @@ pub(crate) fn classify_llm_error(msg: &str) -> astra_core::ErrorKind {
         || lower.contains("http 401")
         || lower.contains("unauthorized")
         || lower.contains("api key")
+        // astra-server JWT middleware shape (regression: session b4cef5bb).
+        || lower.contains("could not validate credentials")
+        // Generic credential / token shapes that don't carry a 401 anchor —
+        // mirror `astra_core::classify_tool_output`'s Auth branch so the
+        // bridge classifier does not silently downgrade these to Unknown.
+        || lower.contains("invalid credentials")
+        || lower.contains("bad credentials")
+        || lower.contains("authentication failed")
+        || lower.contains("token expired")
+        || lower.contains("invalid token")
+        // AWS STS shape — surfaces when Bedrock session tokens roll mid-run.
+        || lower.contains("security token included in the request is expired")
     {
         astra_core::ErrorKind::Auth
     } else if lower.contains("cancelled") || lower.contains("canceled") {
@@ -4114,6 +4126,44 @@ mod tests {
         assert_eq!(
             classify_llm_error("LLM call cancelled"),
             ErrorKind::Cancelled
+        );
+    }
+
+    /// Regression: session b4cef5bb-9549-... (2026-05-16, Haiku 4.5).
+    /// astra-server's JWT middleware emitted "Error: Could not validate
+    /// credentials" mid-stream during a token-refresh race. The bridge's
+    /// `classify_llm_error` did not match any branch and fell through
+    /// to `Unknown`, producing a journal entry with
+    /// `error_kind=unknown, retryable=false, guidance=An unexpected
+    /// error occurred`. The user had to re-issue the turn manually
+    /// (it would have succeeded on the very next attempt). Pinned
+    /// patterns must classify these as `Auth` so retry policy and
+    /// telemetry both reflect what actually happened.
+    #[test]
+    fn classify_llm_error_recognizes_credential_validation_failures() {
+        use astra_core::ErrorKind;
+        // Exact wire shape from the regression session.
+        assert_eq!(
+            classify_llm_error("Error: Could not validate credentials"),
+            ErrorKind::Auth,
+            "astra-server JWT middleware shape must classify as Auth"
+        );
+        // Lower-case variant — matchers must be case-insensitive.
+        assert_eq!(
+            classify_llm_error("could not validate credentials for user xyz"),
+            ErrorKind::Auth
+        );
+        // Generic credential-shaped failures the existing matcher missed
+        // (no "401" or "api key" anchor).
+        assert_eq!(classify_llm_error("invalid credentials"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("bad credentials"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("token expired"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("invalid token"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("authentication failed"), ErrorKind::Auth);
+        // AWS/Bedrock STS shape that surfaces during session expiry.
+        assert_eq!(
+            classify_llm_error("The security token included in the request is expired"),
+            ErrorKind::Auth
         );
     }
 
@@ -8724,7 +8774,7 @@ mod tests {
                             "maximum": 100,
                             "default": 10
                         },
-                        "background": {
+                        "run_in_background": {
                             "type": "boolean",
                             "description": "Run in background",
                             "default": true

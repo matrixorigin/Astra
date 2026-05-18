@@ -141,22 +141,11 @@ pub(super) async fn handle_health_command(arg: &str, state: &SessionState) {
         "\n{}",
         "─── Cloud Sync ─────────────────────────────────".bold()
     );
-    match &state.matrix_runtime {
-        None => {
-            eprintln!(
-                "  {} {}",
-                "○".dim(),
-                "Offline — no MatrixOne connection".dim()
-            );
-            eprintln!("  {}", "Set MATRIXONE_HOST to enable cloud sync.".dim());
-        }
-        Some(mc) => {
-            let sync_status =
-                astra_services::state_sync::StateSyncService::status(mc.sync_service().as_ref())
-                    .await;
-            display_sync_status(&sync_status);
-        }
-    }
+    eprintln!(
+        "  {} {}",
+        "●".green(),
+        "Server-owned — CLI does not connect to MatrixOne directly".dim()
+    );
 
     eprintln!(
         "{}",

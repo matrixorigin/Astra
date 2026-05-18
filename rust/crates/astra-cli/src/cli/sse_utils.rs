@@ -1,7 +1,7 @@
 //! Shared SSE parsing for CLI code paths that consume `text_delta` streams.
 //!
 //! **Single source of truth:** `collect_sse_text` and `stream_sse_markdown` live only here.
-//! `plan_interaction` and `slash_memory` import them — do not duplicate the
+//! Plan-oriented CLI flows and `slash_memory` import them — do not duplicate the
 //! `data:` / `text_delta` loop elsewhere.
 
 use crate::theme;
