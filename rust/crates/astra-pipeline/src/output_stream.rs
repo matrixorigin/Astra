@@ -82,7 +82,10 @@ impl OutputStream {
     }
 
     pub fn append(&self, bytes: &[u8]) -> Result<OutputAppend, OutputStreamError> {
-        let _guard = self.append_lock.lock().unwrap();
+        let _guard = self
+            .append_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -106,7 +109,8 @@ impl OutputStream {
                 path: self.path.clone(),
                 source,
             })?;
-        let bytes_written = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let bytes_written =
+            u64::try_from(bytes.len()).expect("usize byte length must fit into u64");
         Ok(OutputAppend {
             path: self.path.clone(),
             start_offset,

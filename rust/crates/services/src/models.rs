@@ -358,6 +358,32 @@ pub fn resolve_model_alias<'a>(
     }
 }
 
+fn normalize_model_selector_for_resolution(requested: &str) -> &str {
+    let trimmed = requested.trim();
+    if !trimmed.ends_with(')') {
+        return trimmed;
+    }
+    let Some(open) = trimmed.rfind('(') else {
+        return trimmed;
+    };
+    let inner = &trimmed[open + 1..trimmed.len() - 1];
+    let base = trimmed[..open].trim_end();
+    if inner == "thinking" {
+        return base;
+    }
+    if let Some(effort) = inner.strip_prefix("thinking:") {
+        if matches!(effort, "low" | "medium" | "high" | "max") {
+            return base;
+        }
+        if let Some(budget) = effort.strip_prefix("budget:") {
+            if budget.parse::<u32>().is_ok() {
+                return base;
+            }
+        }
+    }
+    trimmed
+}
+
 /// Error surface for [`resolve_model_alias`]. Preserved so the
 /// DB-layer caller can distinguish "no such model" from "ambiguous"
 /// and render a helpful message to the LLM / user.
@@ -510,7 +536,9 @@ pub async fn resolve_active_llm_model(
 ) -> Result<ResolvedActiveLlmModel, String> {
     let pool = acquire_pool(pool, matrixone).await?;
 
-    let pref = preferred.map(str::trim).filter(|s| !s.is_empty());
+    let pref = preferred
+        .map(normalize_model_selector_for_resolution)
+        .filter(|s| !s.is_empty());
 
     if let Some(name) = pref {
         // Try exact match first — the fast path. If the LLM supplied
@@ -2363,6 +2391,34 @@ mod tests {
                 "under-cap list must include {n}: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn normalize_model_selector_for_resolution_strips_supported_thinking_suffixes() {
+        assert_eq!(
+            normalize_model_selector_for_resolution("deepseek-v4-pro(thinking:high)"),
+            "deepseek-v4-pro"
+        );
+        assert_eq!(
+            normalize_model_selector_for_resolution("qwen-plus(thinking:budget:8000)"),
+            "qwen-plus"
+        );
+        assert_eq!(
+            normalize_model_selector_for_resolution("claude-opus(thinking)"),
+            "claude-opus"
+        );
+    }
+
+    #[test]
+    fn normalize_model_selector_for_resolution_keeps_non_thinking_suffixes_verbatim() {
+        assert_eq!(
+            normalize_model_selector_for_resolution("deepseek-v4-pro(custom:foo)"),
+            "deepseek-v4-pro(custom:foo)"
+        );
+        assert_eq!(
+            normalize_model_selector_for_resolution("deepseek-v4-pro(thinking:budget)"),
+            "deepseek-v4-pro(thinking:budget)"
+        );
     }
 
     // -- rank_cheapest_index --

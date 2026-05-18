@@ -114,7 +114,11 @@ pub fn parse_ask_user_prompt(args: &Value) -> Result<AskUserPrompt, String> {
     } else if let Some(nested) = nested_questionnaire.as_ref() {
         nested
             .get("questions")
-            .expect("nested questionnaire must contain questions")
+            .ok_or_else(|| {
+                ask_user_contract_error(
+                    "embedded questionnaire is missing a top-level 'questions' array",
+                )
+            })?
     } else {
         return Err(ask_user_contract_error(
             "ask_user requires top-level 'questions': [...]. Do not send top-level 'question' or 'choices'.",
