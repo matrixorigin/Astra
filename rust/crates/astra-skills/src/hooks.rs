@@ -9,6 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 
+const TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT: u32 = 3;
+
 // ── Skill lifecycle hooks (existing) ─────────────────────────────────────
 
 /// An action to execute as part of a hook.
@@ -76,6 +78,12 @@ pub enum PreToolDecision {
     AllowWithContext(String),
     /// Block the tool call with a reason.
     Block(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PreToolHookOutcome {
+    Decision(PreToolDecision),
+    OperationalFailure(String),
 }
 
 impl PreToolDecision {
@@ -211,6 +219,8 @@ pub struct ToolEventHookRegistry {
     hooks: Vec<ToolEventHook>,
     /// Track which `once` hooks have already fired (by index in `hooks`).
     fired_once: std::sync::Mutex<std::collections::HashSet<usize>>,
+    tripped_circuits: std::sync::Mutex<std::collections::HashSet<usize>>,
+    consecutive_failures: std::sync::Mutex<std::collections::HashMap<usize, u32>>,
 }
 
 impl ToolEventHookRegistry {
@@ -218,23 +228,39 @@ impl ToolEventHookRegistry {
         Self {
             hooks,
             fired_once: std::sync::Mutex::new(std::collections::HashSet::new()),
+            tripped_circuits: std::sync::Mutex::new(std::collections::HashSet::new()),
+            consecutive_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     /// Return all hooks that match the given event kind and tool name,
     /// sorted by priority (ascending) and filtered by `once` status.
     pub fn matching(&self, event: ToolEventKind, tool_name: &str) -> Vec<&ToolEventHook> {
+        self.matching_indexed(event, tool_name)
+            .into_iter()
+            .map(|(_, hook)| hook)
+            .collect()
+    }
+
+    fn matching_indexed(&self, event: ToolEventKind, tool_name: &str) -> Vec<(usize, &ToolEventHook)> {
         let fired = self.fired_once.lock().unwrap_or_else(|e| e.into_inner());
+        let tripped = self
+            .tripped_circuits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut result: Vec<(usize, &ToolEventHook)> = self
             .hooks
             .iter()
             .enumerate()
             .filter(|(i, h)| {
-                h.event == event && h.matches_tool(tool_name) && !(h.once && fired.contains(i))
+                h.event == event
+                    && h.matches_tool(tool_name)
+                    && !(h.once && fired.contains(i))
+                    && !tripped.contains(i)
             })
             .collect();
         result.sort_by_key(|(_, h)| h.priority);
-        result.into_iter().map(|(_, h)| h).collect()
+        result
     }
 
     /// Mark a `once` hook as fired (by matching identity).
@@ -257,6 +283,32 @@ impl ToolEventHookRegistry {
 
     pub fn len(&self) -> usize {
         self.hooks.len()
+    }
+
+    fn note_hook_success(&self, index: usize) {
+        let mut failures = self
+            .consecutive_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        failures.remove(&index);
+    }
+
+    fn note_hook_failure(&self, index: usize) -> bool {
+        let mut failures = self
+            .consecutive_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let failure_count = failures.entry(index).or_insert(0);
+        *failure_count = failure_count.saturating_add(1);
+        if *failure_count < TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT {
+            return false;
+        }
+        drop(failures);
+        let mut tripped = self
+            .tripped_circuits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        tripped.insert(index)
     }
 }
 
@@ -469,14 +521,14 @@ pub async fn evaluate_pre_tool_hooks(
     tool_name: &str,
     tool_args: &serde_json::Value,
 ) -> PreToolDecision {
-    let hooks = registry.matching(ToolEventKind::PreToolUse, tool_name);
+    let hooks = registry.matching_indexed(ToolEventKind::PreToolUse, tool_name);
     if hooks.is_empty() {
         return PreToolDecision::Allow;
     }
 
     let mut accumulated_context: Vec<String> = Vec::new();
 
-    for hook in hooks {
+    for (hook_index, hook) in hooks {
         // Async hooks: fire-and-forget in background
         if hook.is_async {
             let action = hook.action.clone();
@@ -490,12 +542,35 @@ pub async fn evaluate_pre_tool_hooks(
 
         match &hook.action {
             HookAction::Shell { command } => {
-                let decision =
+                let outcome =
                     run_shell_pre_hook(command, tool_name, tool_args, hook.timeout_secs).await;
-                match decision {
-                    PreToolDecision::Block(reason) => return PreToolDecision::Block(reason),
-                    PreToolDecision::AllowWithContext(ctx) => accumulated_context.push(ctx),
-                    PreToolDecision::Allow => {}
+                match outcome {
+                    PreToolHookOutcome::Decision(PreToolDecision::Block(reason)) => {
+                        registry.note_hook_success(hook_index);
+                        return PreToolDecision::Block(reason);
+                    }
+                    PreToolHookOutcome::Decision(PreToolDecision::AllowWithContext(ctx)) => {
+                        registry.note_hook_success(hook_index);
+                        accumulated_context.push(ctx);
+                    }
+                    PreToolHookOutcome::Decision(PreToolDecision::Allow) => {
+                        registry.note_hook_success(hook_index);
+                    }
+                    PreToolHookOutcome::OperationalFailure(reason) => {
+                        let tripped = registry.note_hook_failure(hook_index);
+                        if tripped {
+                            tracing::error!(
+                                target: "hook",
+                                "PreToolUse hook {} for '{}' tripped its circuit breaker after {} consecutive failures: {}",
+                                hook_index,
+                                tool_name,
+                                TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT,
+                                reason
+                            );
+                            continue;
+                        }
+                        return PreToolDecision::Block(reason);
+                    }
                 }
             }
             HookAction::Http {
@@ -503,18 +578,43 @@ pub async fn evaluate_pre_tool_hooks(
                 headers,
                 timeout_secs,
             } => {
-                let decision =
+                let outcome =
                     run_http_pre_hook(url, headers, tool_name, tool_args, *timeout_secs).await;
-                match decision {
-                    PreToolDecision::Block(reason) => return PreToolDecision::Block(reason),
-                    PreToolDecision::AllowWithContext(ctx) => accumulated_context.push(ctx),
-                    PreToolDecision::Allow => {}
+                match outcome {
+                    PreToolHookOutcome::Decision(PreToolDecision::Block(reason)) => {
+                        registry.note_hook_success(hook_index);
+                        return PreToolDecision::Block(reason);
+                    }
+                    PreToolHookOutcome::Decision(PreToolDecision::AllowWithContext(ctx)) => {
+                        registry.note_hook_success(hook_index);
+                        accumulated_context.push(ctx);
+                    }
+                    PreToolHookOutcome::Decision(PreToolDecision::Allow) => {
+                        registry.note_hook_success(hook_index);
+                    }
+                    PreToolHookOutcome::OperationalFailure(reason) => {
+                        let tripped = registry.note_hook_failure(hook_index);
+                        if tripped {
+                            tracing::error!(
+                                target: "hook",
+                                "PreToolUse HTTP hook {} for '{}' tripped its circuit breaker after {} consecutive failures: {}",
+                                hook_index,
+                                tool_name,
+                                TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT,
+                                reason
+                            );
+                            continue;
+                        }
+                        return PreToolDecision::Block(reason);
+                    }
                 }
             }
             HookAction::SetEnv { key, value } => {
+                registry.note_hook_success(hook_index);
                 astra_core::session_env_overlay::set(key, value);
             }
             HookAction::Custom { id, .. } => {
+                registry.note_hook_success(hook_index);
                 tracing::warn!(
                     target: "hook",
                     "Custom hook '{}' matched tool '{}' — not yet implemented",
@@ -619,7 +719,7 @@ async fn run_shell_pre_hook(
     tool_name: &str,
     tool_args: &serde_json::Value,
     timeout_secs: u32,
-) -> PreToolDecision {
+) -> PreToolHookOutcome {
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
@@ -639,7 +739,9 @@ async fn run_shell_pre_hook(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(target: "hook", "Failed to spawn hook '{}': {}", command, e);
-            return PreToolDecision::Block(format!("Hook '{command}' failed to spawn: {e}"));
+            return PreToolHookOutcome::OperationalFailure(format!(
+                "Hook '{command}' failed to spawn: {e}"
+            ));
         }
     };
 
@@ -663,19 +765,19 @@ async fn run_shell_pre_hook(
 
     let wait_result = tokio::time::timeout(timeout, read_fut).await;
     match wait_result {
-        Ok((_, Ok(status))) if !status.success() => PreToolDecision::Block(format!(
-            "Hook '{}' exited with status {}",
-            command,
-            status.code().unwrap_or(-1)
-        )),
+        Ok((_, Ok(status))) if !status.success() => PreToolHookOutcome::OperationalFailure(
+            format!("Hook '{}' exited with status {}", command, status.code().unwrap_or(-1)),
+        ),
         Ok((buf, Ok(_))) => parse_pre_hook_output(&buf),
         Ok((_, Err(e))) => {
             tracing::warn!(target: "hook", "Hook I/O error for '{}': {}", command, e);
-            PreToolDecision::Block(format!("Hook '{command}' failed during I/O: {e}"))
+            PreToolHookOutcome::OperationalFailure(format!(
+                "Hook '{command}' failed during I/O: {e}"
+            ))
         }
         Err(_) => {
             let _ = child.kill().await;
-            PreToolDecision::Block(format!(
+            PreToolHookOutcome::OperationalFailure(format!(
                 "Hook '{}' timed out after {}s",
                 command, timeout_secs
             ))
@@ -743,20 +845,24 @@ async fn run_shell_post_hook(
 }
 
 /// Parse stdout from a PreToolUse shell hook into a decision.
-fn parse_pre_hook_output(stdout: &[u8]) -> PreToolDecision {
+fn parse_pre_hook_output(stdout: &[u8]) -> PreToolHookOutcome {
     let text = String::from_utf8_lossy(stdout);
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return PreToolDecision::Allow;
+        return PreToolHookOutcome::Decision(PreToolDecision::Allow);
     }
 
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
         match PreToolDecision::from_json_contract(&v) {
-            Ok(decision) => decision,
-            Err(err) => PreToolDecision::Block(format!("invalid hook decision contract: {err}")),
+            Ok(decision) => PreToolHookOutcome::Decision(decision),
+            Err(err) => PreToolHookOutcome::OperationalFailure(format!(
+                "invalid hook decision contract: {err}"
+            )),
         }
     } else {
-        PreToolDecision::Block("invalid hook decision contract: stdout was not JSON".into())
+        PreToolHookOutcome::OperationalFailure(
+            "invalid hook decision contract: stdout was not JSON".into(),
+        )
     }
 }
 
@@ -784,7 +890,7 @@ async fn run_http_pre_hook(
     tool_name: &str,
     tool_args: &serde_json::Value,
     timeout_secs: u32,
-) -> PreToolDecision {
+) -> PreToolHookOutcome {
     let payload = serde_json::json!({
         "hook_event": "pre_tool_use",
         "tool_name": tool_name,
@@ -793,7 +899,7 @@ async fn run_http_pre_hook(
 
     match http_post_json(url, headers, &payload, timeout_secs).await {
         Some(body) => parse_pre_hook_output(body.as_bytes()),
-        None => PreToolDecision::Block(format!("HTTP hook '{url}' failed")),
+        None => PreToolHookOutcome::OperationalFailure(format!("HTTP hook '{url}' failed")),
     }
 }
 
@@ -1915,6 +2021,63 @@ mod tests {
         match decision {
             PreToolDecision::Block(reason) => assert!(reason.contains("not JSON")),
             _ => panic!("expected Block, got {:?}", decision),
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_pre_hook_operational_failures_trip_circuit_breaker() {
+        let registry = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PreToolUse,
+            matcher: "bash".into(),
+            action: HookAction::Shell {
+                command: "echo definitely-not-json".into(),
+            },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+
+        for _ in 0..(TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT - 1) {
+            let decision =
+                evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+            match decision {
+                PreToolDecision::Block(reason) => assert!(reason.contains("not JSON")),
+                _ => panic!("expected Block before circuit opens, got {:?}", decision),
+            }
+        }
+
+        let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+        assert_eq!(
+            decision,
+            PreToolDecision::Allow,
+            "failing hooks should fail open after the circuit breaker trips"
+        );
+
+        let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+        assert_eq!(decision, PreToolDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn e2e_pre_hook_policy_blocks_do_not_trip_circuit_breaker() {
+        let registry = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PreToolUse,
+            matcher: "bash".into(),
+            action: HookAction::Shell {
+                command: r#"echo '{"decision": "block", "reason": "still blocked"}'"#.into(),
+            },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+
+        for _ in 0..(TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT + 1) {
+            let decision =
+                evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+            assert_eq!(decision, PreToolDecision::Block("still blocked".into()));
         }
     }
 

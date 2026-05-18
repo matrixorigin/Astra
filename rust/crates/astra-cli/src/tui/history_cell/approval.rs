@@ -7,7 +7,7 @@
 //!   rm -rf /tmp/scratch
 //!   destructive path outside cwd
 //!
-//! ▸ Allow once    Always allow similar in workspace    Reject
+//! ▸ Allow once    Always allow this command pattern in workspace    Reject
 //!   ← → navigate · Enter confirm · Esc reject
 //! ```
 //!
@@ -492,7 +492,10 @@ impl HistoryCell for ApprovalCell {
         if let Some(preview) = &self.remember_preview {
             lines.push(Line::from(vec![
                 bar.clone(),
-                Span::styled("Always allow similar in workspace: ".to_string(), muted),
+                Span::styled(
+                    "Always allow this command pattern in workspace: ".to_string(),
+                    muted,
+                ),
                 Span::styled(preview.clone(), body_style.add_modifier(Modifier::BOLD)),
             ]));
         }
@@ -695,7 +698,7 @@ mod tests {
         let rendered = render(&cell);
         assert!(
             rendered.contains(
-                "Always allow similar in workspace: similar `npm test` commands in this workspace"
+                "Always allow this command pattern in workspace: similar `npm test` commands in this workspace"
             ),
             "expected remember preview line, got:\n{rendered}"
         );
@@ -778,7 +781,7 @@ mod tests {
         let rendered = render(&cell);
         assert!(!rendered.contains("⚑ "), "no risk badge expected");
         assert!(
-            !rendered.contains("Always allow similar in workspace:"),
+            !rendered.contains("Always allow this command pattern in workspace:"),
             "no remember-preview row expected"
         );
         assert!(!rendered.contains("[agent:"), "no agent chip expected");

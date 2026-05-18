@@ -188,13 +188,8 @@ pub fn analyze_command_risks(command: &str) -> Vec<CommandRisk> {
         }
     }
 
-    for path in CREDENTIAL_PATHS {
-        if lower.contains(path) {
-            push_unique(
-                &mut risks,
-                CommandRisk::CredentialAccess((*path).to_string()),
-            );
-        }
+    if let Some(path) = credential_access_target(&lower) {
+        push_unique(&mut risks, CommandRisk::CredentialAccess(path));
     }
 
     if let Some(cmd) = destructive_command(&lower) {
@@ -267,22 +262,49 @@ const DESTRUCTIVE_COMMANDS: &[&str] = &[
     "mkfs",
     "mkfs.ext4",
     "mkfs.xfs",
+    "truncate",
     "shred",
     "wipefs",
     "blkdiscard",
     "fdisk",
     "sfdisk",
     "parted",
+    "cryptsetup",
+    "pvremove",
+    "vgremove",
+    "lvremove",
+    "zpool",
+    "zfs",
 ];
 
-const CREDENTIAL_PATHS: &[&str] = &[
+const CREDENTIAL_PATH_PREFIXES: &[&str] = &[
     "/.ssh/",
+    "~/.ssh/",
     "/.aws/",
+    "~/.aws/",
     "/.kube/",
+    "~/.kube/",
     "/.docker/config.json",
-    ".env",
+    "~/.docker/config.json",
+    "/.gnupg/",
+    "~/.gnupg/",
+    "/.config/gh/",
+    "~/.config/gh/",
+    "/.config/gcloud/",
+    "~/.config/gcloud/",
+    "/.azure/",
+    "~/.azure/",
+    "/.git-credentials",
+    "~/.git-credentials",
+    "/.netrc",
+    "~/.netrc",
+];
+
+const CREDENTIAL_FILE_NAMES: &[&str] = &[
     "id_rsa",
     "id_ed25519",
+    "id_ecdsa",
+    "id_ed25519_sk",
 ];
 
 fn destructive_command(lower: &str) -> Option<&'static str> {
@@ -297,13 +319,75 @@ fn destructive_command(lower: &str) -> Option<&'static str> {
     None
 }
 
+fn credential_access_target(lower: &str) -> Option<String> {
+    for fragment in lower.split(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '|' | '&')) {
+        let token = normalize_shell_token(fragment);
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(path) = credential_path_match(token) {
+            return Some(path.to_string());
+        }
+        if let Some((_, value)) = token.rsplit_once('=') {
+            if let Some(path) = credential_path_match(normalize_shell_token(value)) {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn credential_path_match(token: &str) -> Option<&str> {
+    if token.is_empty() {
+        return None;
+    }
+
+    for prefix in CREDENTIAL_PATH_PREFIXES {
+        if token.contains(prefix) {
+            return Some(token);
+        }
+    }
+
+    let filename = token
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(token)
+        .trim_matches(['"', '\'']);
+    if CREDENTIAL_FILE_NAMES.contains(&filename) || is_sensitive_dotenv_name(filename) {
+        return Some(token);
+    }
+
+    None
+}
+
+fn is_sensitive_dotenv_name(name: &str) -> bool {
+    if name == ".env" {
+        return true;
+    }
+    let Some(suffix) = name.strip_prefix(".env.") else {
+        return false;
+    };
+    !matches!(
+        suffix,
+        "example" | "sample" | "template" | "dist" | "defaults" | "local.example"
+    )
+}
+
+fn normalize_shell_token(token: &str) -> &str {
+    token.trim_matches(|ch: char| matches!(ch, '"' | '\'' | '(' | ')' | ',' | ';'))
+}
+
 fn workspace_out_write_target(lower: &str) -> Option<String> {
     if let Some(target) = redirected_write_target(lower) {
         return Some(target);
     }
 
+    if let Some(target) = download_output_target(lower) {
+        return Some(target);
+    }
+
     let tokens: Vec<&str> = lower.split_whitespace().collect();
-    let write_commands = ["cp", "mv", "touch", "mkdir", "install", "tee"];
+    let write_commands = ["cp", "mv", "touch", "mkdir", "install", "tee", "rsync"];
     let mut iter = tokens.iter();
     while let Some(token) = iter.next() {
         let command = token.trim_matches([';', '|', '&']);
@@ -317,6 +401,32 @@ fn workspace_out_write_target(lower: &str) -> Option<String> {
             }
             if is_workspace_out_path(target) {
                 return Some(target.to_string());
+            }
+        }
+        break;
+    }
+    None
+}
+
+fn download_output_target(command: &str) -> Option<String> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut iter = tokens.iter();
+    while let Some(token) = iter.next() {
+        let command = token.trim_matches([';', '|', '&']);
+        if !matches!(command, "curl" | "wget") {
+            continue;
+        }
+        while let Some(arg) = iter.next() {
+            let arg = normalize_shell_token(arg);
+            let target = match arg {
+                "-o" | "-O" | "--output" => iter.next().copied(),
+                _ => None,
+            };
+            if let Some(target) = target {
+                let target = normalize_shell_token(target);
+                if is_workspace_out_path(target) {
+                    return Some(target.to_string());
+                }
             }
         }
         break;
@@ -553,6 +663,8 @@ mod tests {
             "mkfs.ext4 /dev/sda1",
             "shred -u secrets.txt",
             "wipefs -a /dev/sdb",
+            "cryptsetup luksformat /dev/sdc",
+            "truncate -s 0 ~/.ssh/known_hosts",
         ] {
             let risks = analyze_command_risks(command);
             assert!(
@@ -568,12 +680,38 @@ mod tests {
     fn detects_credential_path_access() {
         for command in [
             "cat ~/.ssh/id_rsa",
+            "cat ~/.ssh/id_ecdsa",
+            "cat ~/.ssh/id_ed25519_sk",
             "cat ~/.aws/credentials",
             "cat ~/.kube/config",
+            "cat ~/.config/gh/hosts.yml",
+            "cat ~/.config/gcloud/application_default_credentials.json",
+            "cat ~/.netrc",
+            "cat ~/.git-credentials",
+            "gpg --import ~/.gnupg/private.key",
+            "cat .env.production",
         ] {
             let risks = analyze_command_risks(command);
             assert!(
                 risks
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::CredentialAccess(_))),
+                "{command}: {risks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dotenv_examples_do_not_trigger_credential_risk() {
+        for command in [
+            "cat .env.example",
+            "cat config/.env.sample",
+            "cat deployment/.env.template",
+            "cat .environment",
+        ] {
+            let risks = analyze_command_risks(command);
+            assert!(
+                !risks
                     .iter()
                     .any(|risk| matches!(risk, CommandRisk::CredentialAccess(_))),
                 "{command}: {risks:?}"
@@ -588,6 +726,9 @@ mod tests {
             "echo secret>../outside-no-space.txt",
             "touch /tmp/outside-workspace",
             "mv report.txt ../../report.txt",
+            "curl -o ../payload.tgz https://example.com/payload.tgz",
+            "wget -O /tmp/payload.tgz https://example.com/payload.tgz",
+            "rsync build/out.txt ../out.txt",
         ] {
             let risks = analyze_command_risks(command);
             assert!(
@@ -601,7 +742,12 @@ mod tests {
 
     #[test]
     fn safe_workspace_local_write_has_no_workspace_out_risk() {
-        for command in ["echo ok > reports/out.txt", "cp -p report.txt reports/out.txt"] {
+        for command in [
+            "echo ok > reports/out.txt",
+            "cp -p report.txt reports/out.txt",
+            "curl -o reports/payload.tgz https://example.com/payload.tgz",
+            "rsync build/out.txt reports/out.txt",
+        ] {
             let risks = analyze_command_risks(command);
             assert!(
                 !risks

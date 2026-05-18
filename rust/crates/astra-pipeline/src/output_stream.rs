@@ -9,6 +9,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+const DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputAppend {
     pub path: PathBuf,
@@ -46,16 +48,30 @@ pub enum OutputStreamError {
         offset: u64,
         len: u64,
     },
+    #[error("append would grow output stream '{path}' beyond configured max {max_bytes} bytes (attempted {attempted_end})")]
+    MaxBytesExceeded {
+        path: PathBuf,
+        attempted_end: u64,
+        max_bytes: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub struct OutputStream {
     path: PathBuf,
+    max_bytes: u64,
     append_lock: Arc<Mutex<()>>,
 }
 
 impl OutputStream {
     pub fn create(path: impl Into<PathBuf>) -> Result<Self, OutputStreamError> {
+        Self::create_with_max_bytes(path, DEFAULT_MAX_BYTES)
+    }
+
+    pub fn create_with_max_bytes(
+        path: impl Into<PathBuf>,
+        max_bytes: u64,
+    ) -> Result<Self, OutputStreamError> {
         let path = path.into();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| OutputStreamError::CreateDir {
@@ -73,6 +89,7 @@ impl OutputStream {
             })?;
         Ok(Self {
             path,
+            max_bytes,
             append_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -102,6 +119,16 @@ impl OutputStream {
                 source,
             })?
             .len();
+        let bytes_written =
+            u64::try_from(bytes.len()).expect("usize byte length must fit into u64");
+        let attempted_end = start_offset.saturating_add(bytes_written);
+        if attempted_end > self.max_bytes {
+            return Err(OutputStreamError::MaxBytesExceeded {
+                path: self.path.clone(),
+                attempted_end,
+                max_bytes: self.max_bytes,
+            });
+        }
         file.write_all(bytes)
             .and_then(|_| file.flush())
             .and_then(|_| file.sync_data())
@@ -109,12 +136,10 @@ impl OutputStream {
                 path: self.path.clone(),
                 source,
             })?;
-        let bytes_written =
-            u64::try_from(bytes.len()).expect("usize byte length must fit into u64");
         Ok(OutputAppend {
             path: self.path.clone(),
             start_offset,
-            end_offset: start_offset.saturating_add(bytes_written),
+            end_offset: attempted_end,
             bytes_written,
         })
     }
@@ -232,5 +257,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn append_rejects_writes_that_exceed_max_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let stream = OutputStream::create_with_max_bytes(dir.path().join("bounded.out"), 8).unwrap();
+        let first = stream.append(b"1234").unwrap();
+        assert_eq!(first.end_offset, 4);
+
+        let err = stream.append(b"56789").unwrap_err();
+        assert!(matches!(
+            err,
+            OutputStreamError::MaxBytesExceeded {
+                attempted_end: 9,
+                max_bytes: 8,
+                ..
+            }
+        ));
+        assert_eq!(std::fs::read_to_string(stream.path()).unwrap(), "1234");
+    }
+
+    #[test]
+    fn append_allows_exact_max_bytes_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let stream = OutputStream::create_with_max_bytes(dir.path().join("exact.out"), 8).unwrap();
+        stream.append(b"1234").unwrap();
+        let second = stream.append(b"5678").unwrap();
+        assert_eq!(second.end_offset, 8);
+        assert_eq!(std::fs::read_to_string(stream.path()).unwrap(), "12345678");
     }
 }

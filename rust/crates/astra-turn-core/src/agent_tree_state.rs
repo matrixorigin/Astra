@@ -6,6 +6,8 @@ use std::time::{Duration, SystemTime};
 use crate::orchestration_progress::{AgentProgressEvent, ProgressEventType};
 use crate::orchestration_types::{AgentStatus, SpawnedAgentInfo, SpawnedAgentMetrics};
 
+const MAX_AGENT_RECORDS: usize = 256;
+
 #[derive(Debug, Clone)]
 pub struct AgentTreeSnapshot {
     pub roots: Vec<SpawnedAgentInfo>,
@@ -131,6 +133,7 @@ impl AgentTreeState {
                 }
             }
         }
+        self.prune_completed_leaf_agents();
     }
 
     #[must_use]
@@ -174,6 +177,43 @@ impl AgentTreeState {
             failed_agents,
         }
     }
+
+    fn prune_completed_leaf_agents(&mut self) {
+        while self.agents.len() > MAX_AGENT_RECORDS {
+            let child_parent_ids: HashSet<&str> = self
+                .agents
+                .values()
+                .map(|record| record.info.parent_run_id.as_str())
+                .collect();
+            let Some(run_id) = self
+                .agents
+                .iter()
+                .filter(|(run_id, record)| {
+                    is_terminal_status(&record.info.status)
+                        && !child_parent_ids.contains(run_id.as_str())
+                })
+                .min_by(|(left_run_id, left), (right_run_id, right)| {
+                    left.info
+                        .started_at
+                        .cmp(&right.info.started_at)
+                        .then_with(|| left_run_id.cmp(right_run_id))
+                })
+                .map(|(run_id, _)| run_id.clone())
+            else {
+                break;
+            };
+            if let Some(removed) = self.agents.remove(&run_id) {
+                self.run_id_by_agent_id.remove(removed.info.agent_id.as_str());
+            }
+        }
+    }
+}
+
+fn is_terminal_status(status: &AgentStatus) -> bool {
+    matches!(
+        status,
+        AgentStatus::Completed { .. } | AgentStatus::Failed { .. } | AgentStatus::Cancelled
+    )
 }
 
 fn aggregate_info(
@@ -343,5 +383,98 @@ mod tests {
         let snap = state.snapshot();
         assert_eq!(snap.roots.len(), 1);
         assert_eq!(snap.roots[0].run_id, "orphan-run");
+    }
+
+    #[test]
+    fn prunes_oldest_completed_leaf_agents_when_capacity_is_exceeded() {
+        let mut state = AgentTreeState::default();
+        for idx in 0..(MAX_AGENT_RECORDS as u64 + 8) {
+            let run_id = format!("run-{idx}");
+            state.apply(AgentProgressEvent {
+                agent_id: format!("agent-{idx}"),
+                event_type: ProgressEventType::AgentSpawned {
+                    run_id: run_id.clone(),
+                    parent_run_id: "root".into(),
+                    agent_type: "task".into(),
+                    description: format!("agent {idx}"),
+                },
+                timestamp_epoch_ms: idx,
+            });
+            state.apply(AgentProgressEvent {
+                agent_id: format!("agent-{idx}"),
+                event_type: ProgressEventType::Completed {
+                    result_summary: "done".into(),
+                    total_tool_calls: 1,
+                    total_tokens: (idx, 0),
+                    duration_ms: 1,
+                },
+                timestamp_epoch_ms: idx,
+            });
+        }
+
+        assert_eq!(state.agents.len(), MAX_AGENT_RECORDS);
+        let snap = state.snapshot();
+        assert_eq!(snap.roots.len(), MAX_AGENT_RECORDS);
+        assert!(!snap.roots.iter().any(|root| root.run_id == "run-0"));
+        assert!(!snap.roots.iter().any(|root| root.run_id == "run-7"));
+        assert!(snap.roots.iter().any(|root| root.run_id == "run-8"));
+        assert!(snap.roots.iter().any(|root| root.run_id == "run-263"));
+        assert_eq!(
+            snap.total_prompt_tokens,
+            (8..(MAX_AGENT_RECORDS as u64 + 8)).sum::<u64>()
+        );
+    }
+
+    #[test]
+    fn pruning_keeps_active_agents_even_when_capacity_is_exceeded() {
+        let mut state = AgentTreeState::default();
+        state.apply(AgentProgressEvent {
+            agent_id: "active-agent".into(),
+            event_type: ProgressEventType::AgentSpawned {
+                run_id: "active-run".into(),
+                parent_run_id: "root".into(),
+                agent_type: "task".into(),
+                description: "active".into(),
+            },
+            timestamp_epoch_ms: 1,
+        });
+        state.apply(AgentProgressEvent {
+            agent_id: "active-agent".into(),
+            event_type: ProgressEventType::Started {
+                description: "working".into(),
+            },
+            timestamp_epoch_ms: 2,
+        });
+
+        for idx in 0..MAX_AGENT_RECORDS {
+            let run_id = format!("done-run-{idx}");
+            let agent_id = format!("done-agent-{idx}");
+            let timestamp = (idx + 10) as u64;
+            state.apply(AgentProgressEvent {
+                agent_id: agent_id.clone(),
+                event_type: ProgressEventType::AgentSpawned {
+                    run_id: run_id.clone(),
+                    parent_run_id: "root".into(),
+                    agent_type: "task".into(),
+                    description: "done".into(),
+                },
+                timestamp_epoch_ms: timestamp,
+            });
+            state.apply(AgentProgressEvent {
+                agent_id,
+                event_type: ProgressEventType::Completed {
+                    result_summary: "done".into(),
+                    total_tool_calls: 1,
+                    total_tokens: (1, 0),
+                    duration_ms: 1,
+                },
+                timestamp_epoch_ms: timestamp,
+            });
+        }
+
+        assert_eq!(state.agents.len(), MAX_AGENT_RECORDS);
+        let snap = state.snapshot();
+        assert!(snap.roots.iter().any(|root| root.run_id == "active-run"));
+        assert!(!snap.roots.iter().any(|root| root.run_id == "done-run-0"));
     }
 }

@@ -13,7 +13,11 @@ fn primary_row_has_simple_ux_buttons_in_expected_order() {
     let labels: Vec<&str> = row.buttons().iter().map(|b| b.label).collect();
     assert_eq!(
         labels,
-        vec!["Allow once", "Always allow similar in workspace", "Reject"]
+        vec![
+            "Allow once",
+            "Always allow this command pattern in workspace",
+            "Reject"
+        ]
     );
 }
 
@@ -43,7 +47,7 @@ fn right_arrow_advances_focus() {
     assert_eq!(row.focus(), 1);
     assert_eq!(
         row.focused().unwrap().label,
-        "Always allow similar in workspace"
+        "Always allow this command pattern in workspace"
     );
 }
 

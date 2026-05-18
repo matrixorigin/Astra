@@ -90,7 +90,7 @@ pub struct CostLedgerSummary {
     pub total_cache_read_tokens: u64,
     pub total_cache_write_tokens: u64,
     pub per_model_cost_usd: BTreeMap<String, f64>,
-    pub per_agent_cost_usd: BTreeMap<String, f64>,
+    pub rolled_up_agent_cost_usd: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -142,7 +142,7 @@ impl CostLedger {
         let mut total_cache_read_tokens: u64 = 0;
         let mut total_cache_write_tokens: u64 = 0;
         let mut per_model_cost_usd = BTreeMap::new();
-        let mut per_agent_cost_usd = BTreeMap::new();
+        let mut rolled_up_agent_cost_usd = BTreeMap::new();
         for entry in &self.entries {
             total_cost_usd += entry.cost_usd;
             total_prompt_tokens = total_prompt_tokens.saturating_add(entry.prompt_tokens);
@@ -153,11 +153,11 @@ impl CostLedger {
             total_cache_write_tokens =
                 total_cache_write_tokens.saturating_add(entry.cache_write_tokens);
             *per_model_cost_usd.entry(entry.model.clone()).or_insert(0.0) += entry.cost_usd;
-            *per_agent_cost_usd
+            *rolled_up_agent_cost_usd
                 .entry(entry.agent_id.clone())
                 .or_insert(0.0) += entry.cost_usd;
             if let Some(parent) = &entry.parent_agent_id {
-                *per_agent_cost_usd.entry(parent.clone()).or_insert(0.0) += entry.cost_usd;
+                *rolled_up_agent_cost_usd.entry(parent.clone()).or_insert(0.0) += entry.cost_usd;
             }
         }
         CostLedgerSummary {
@@ -167,7 +167,7 @@ impl CostLedger {
             total_cache_read_tokens,
             total_cache_write_tokens,
             per_model_cost_usd,
-            per_agent_cost_usd,
+            rolled_up_agent_cost_usd,
         }
     }
 
@@ -403,8 +403,8 @@ mod tests {
         assert_eq!(summary.total_cache_write_tokens, 10);
         assert_eq!(summary.per_model_cost_usd["claude"], 0.10);
         assert_eq!(summary.per_model_cost_usd["gpt"], 0.25);
-        assert_eq!(summary.per_agent_cost_usd["child"], 0.25);
-        assert_eq!(summary.per_agent_cost_usd["root"], 0.35);
+        assert_eq!(summary.rolled_up_agent_cost_usd["child"], 0.25);
+        assert_eq!(summary.rolled_up_agent_cost_usd["root"], 0.35);
     }
 
     #[test]
