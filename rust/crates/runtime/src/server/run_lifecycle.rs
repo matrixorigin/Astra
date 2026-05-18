@@ -4,8 +4,8 @@
 //! that runs multi-turn agentic loops on the server via the shared
 //! [`run_agentic_loop_with_host`] cognitive pipeline.
 //!
-//! Run state is held in-memory (`DashMap`) for low-latency queries; events are
-//! buffered per-run so `stream_run()` can replay from any offset.
+//! Run status, listing, and replay are backed by durable run state. The
+//! process-local map only keeps live control handles for in-flight runs.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -1763,11 +1763,14 @@ fn terminal_events_for_persistence(events: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+fn live_delta_event_for_persistence(event: &Value) -> bool {
+    durable_event_type(event) == Some("text_delta")
+}
+
 /// Per-run state held in the lifecycle service.
 struct RunState {
     run_id: String,
     session_id: String,
-    user_id: String,
     status: RunStatus,
     events: Vec<Value>,
     cancel_flag: Arc<AtomicBool>,
@@ -1786,11 +1789,11 @@ struct RunState {
 /// Production [`RunLifecycleService`] that executes agentic loops via
 /// [`ServerAgenticLoopHost`].
 ///
-/// When a `RunEngine` is attached, all state changes are also persisted
-/// to the durable store for crash recovery.
+/// Durable run state is mandatory; process-local state is limited to live
+/// control handles that cannot survive a restart.
 pub struct AgenticRunLifecycleService {
-    /// In-memory run store (run_id → state). Hot cache for low-latency queries.
-    /// Arc-wrapped so background tasks spawned by `create_run` can update events.
+    /// Process-local run handles (run_id -> state) for live cancellation, pause,
+    /// and active SSE fanout. Durable state is the user-visible authority.
     runs: Arc<RwLock<HashMap<String, RunState>>>,
     /// LLM resolution dependencies.
     matrixone: MatrixOneSettings,
@@ -1798,8 +1801,8 @@ pub struct AgenticRunLifecycleService {
     shared_pool: Option<SharedPool>,
     /// Edge callback ledger shared with the API server.
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
-    /// Optional durable run engine for persistence.
-    run_engine: Option<RunEngine>,
+    /// Durable run engine for persistence, replay, status, and recovery.
+    run_engine: RunEngine,
     /// Optional delegation engine for multi-agent coordination.
     delegation_engine: Option<Arc<crate::server::delegation_engine::DelegationEngine>>,
     /// Per-user resource governor (Phase 5).
@@ -1846,6 +1849,7 @@ impl AgenticRunLifecycleService {
         matrixone: MatrixOneSettings,
         encryptor: Arc<FernetTokenEncryptor>,
         edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
+        run_engine: RunEngine,
     ) -> Self {
         Self {
             runs: Arc::new(RwLock::new(HashMap::new())),
@@ -1853,7 +1857,7 @@ impl AgenticRunLifecycleService {
             encryptor,
             shared_pool: None,
             edge_callback_ledger,
-            run_engine: None,
+            run_engine,
             delegation_engine: None,
             resource_governor: None,
             edge_connection_pool: None,
@@ -1891,11 +1895,6 @@ impl AgenticRunLifecycleService {
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.shared_pool = Some(pool);
-        self
-    }
-
-    pub fn with_run_engine(mut self, engine: RunEngine) -> Self {
-        self.run_engine = Some(engine);
         self
     }
 
@@ -2113,9 +2112,7 @@ impl AgenticRunLifecycleService {
     }
 
     async fn persist_graceful_shutdown_checkpoints(&self) {
-        let Some(engine) = &self.run_engine else {
-            return;
-        };
+        let engine = &self.run_engine;
         let run_ids = {
             let runs = self.runs.read().await;
             runs.values()
@@ -2181,7 +2178,7 @@ impl AgenticRunLifecycleService {
     fn build_tracked_run_state(
         run_id: String,
         session_id: String,
-        user_id: String,
+        _user_id: String,
     ) -> (
         RunState,
         Arc<AtomicBool>,
@@ -2194,7 +2191,6 @@ impl AgenticRunLifecycleService {
         let run_state = RunState {
             run_id,
             session_id,
-            user_id,
             status: RunStatus::Running,
             events: vec![json!({"event_type": "run_started", "data": {}})],
             cancel_flag: cancel_flag.clone(),
@@ -2243,15 +2239,28 @@ impl AgenticRunLifecycleService {
         loop_state.delegation_engine = self.delegation_engine.clone();
     }
 
-    async fn persist_run_start_if_configured(&self, run_id: &str, user_id: &str, session_id: &str) {
-        if let Some(engine) = &self.run_engine {
-            astra_core::log_persist!(
-                engine.start_run(run_id, user_id, session_id).await,
-                "run_lifecycle",
-                run_id,
-                "start_run"
-            );
-        }
+    async fn persist_run_start(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        self.run_engine
+            .start_run(run_id, user_id, session_id)
+            .await
+            .map_err(|error| {
+                let status = if error == "session already has an active run" {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                };
+                let detail = if status == StatusCode::CONFLICT {
+                    error
+                } else {
+                    format!("Failed to persist durable run start: {error}")
+                };
+                error_response(status, detail)
+            })
     }
 
     fn finalize_run_events(
@@ -2902,16 +2911,6 @@ impl AgenticRunLifecycleService {
             .collect()
     }
 
-    fn status_record(run: &RunState) -> RunStatusRecord {
-        RunStatusRecord {
-            run_id: run.run_id.clone(),
-            session_id: run.session_id.clone(),
-            status: run.status.as_str().to_string(),
-            waiting_for: run.waiting_for.clone(),
-            events_count: run.events.len() as i64,
-        }
-    }
-
     fn durable_status_record(run: &DurableRunRecord) -> RunStatusRecord {
         RunStatusRecord {
             run_id: run.run_id.clone(),
@@ -2936,11 +2935,7 @@ impl AgenticRunLifecycleService {
         run_id: &str,
         user_id: &str,
     ) -> Result<Option<DurableRunRecord>, (StatusCode, Json<ErrorResponse>)> {
-        let Some(engine) = &self.run_engine else {
-            return Ok(None);
-        };
-
-        let run = engine.load_run(run_id).await.map_err(|error| {
+        let run = self.run_engine.load_run(run_id).await.map_err(|error| {
             error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("Failed to load durable run state: {error}"),
@@ -2958,6 +2953,33 @@ impl AgenticRunLifecycleService {
         Ok(Some(run))
     }
 
+    async fn require_durable_run_for_user(
+        &self,
+        run_id: &str,
+        user_id: &str,
+    ) -> Result<DurableRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.load_durable_run_for_user(run_id, user_id)
+            .await?
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))
+    }
+
+    fn run_status_from_durable(
+        status: &str,
+    ) -> Result<RunStatus, (StatusCode, Json<ErrorResponse>)> {
+        match status {
+            STATUS_RUNNING => Ok(RunStatus::Running),
+            STATUS_PAUSED => Ok(RunStatus::Paused),
+            STATUS_WAITING => Ok(RunStatus::Waiting),
+            STATUS_COMPLETED => Ok(RunStatus::Completed),
+            STATUS_FAILED => Ok(RunStatus::Failed),
+            STATUS_CANCELLED => Ok(RunStatus::Cancelled),
+            other => Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid durable run status '{other}'"),
+            )),
+        }
+    }
+
     fn run_state_conflict(action: &str, status: &str) -> (StatusCode, Json<ErrorResponse>) {
         error_response(
             StatusCode::CONFLICT,
@@ -2969,6 +2991,13 @@ impl AgenticRunLifecycleService {
         error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             format!("Run control state unavailable for {action}"),
+        )
+    }
+
+    fn durable_persist_error(action: &str, error: String) -> (StatusCode, Json<ErrorResponse>) {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("Failed to persist durable run {action}: {error}"),
         )
     }
 
@@ -3031,9 +3060,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             runs.insert(run_id.clone(), run_state);
         }
 
-        // Persist to durable store if available
-        self.persist_run_start_if_configured(&run_id, &user_id, &session_id)
-            .await;
+        if let Err(error) = self.persist_run_start(&run_id, &user_id, &session_id).await {
+            self.runs.write().await.remove(&run_id);
+            return Err(error);
+        }
 
         // Spawn background agentic loop.
         let edge_tools = Self::extract_edge_tools(&request);
@@ -3283,21 +3313,19 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     bg_approval_channels.lock().await.remove(&bg_run_id);
                     bg_user_prompt_channels.lock().await.remove(&bg_run_id);
                     bg_progress_channels.lock().await.remove(&bg_run_id);
-                    if let Some(ref engine) = run_engine {
-                        astra_core::log_persist!(
-                            engine
-                                .persist_status(
-                                    &bg_run_id,
-                                    astra_core::STATUS_FAILED,
-                                    None,
-                                    Some(&reason),
-                                )
-                                .await,
-                            "run_lifecycle",
-                            &bg_run_id,
-                            "budget_reject"
-                        );
-                    }
+                    astra_core::log_persist!(
+                        run_engine
+                            .persist_status(
+                                &bg_run_id,
+                                astra_core::STATUS_FAILED,
+                                None,
+                                Some(&reason),
+                            )
+                            .await,
+                        "run_lifecycle",
+                        &bg_run_id,
+                        "budget_reject"
+                    );
                     Self::schedule_run_eviction(&runs, bg_run_id.clone());
                     return;
                 }
@@ -3337,7 +3365,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 } else {
                     run.events.extend(events);
                     if run.status.try_transition(&final_status).is_ok() {
-                        run.status = final_status;
+                        run.status = final_status.clone();
                     }
                     if run.status != RunStatus::Waiting {
                         run.live_tx = None;
@@ -3345,46 +3373,44 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
             }
 
-            if let Some(engine) = &run_engine {
-                if persist_terminal_state {
-                    astra_core::log_persist!(
-                        engine
-                            .persist_status(&bg_run_id, status_str, None, error_msg.as_deref())
-                            .await,
-                        "run_lifecycle",
-                        &bg_run_id,
-                        "status"
-                    );
-                }
+            if persist_terminal_state {
                 astra_core::log_persist!(
-                    engine
-                        .persist_usage(
-                            &bg_run_id,
-                            loop_state.total_prompt,
-                            loop_state.total_completion,
-                            loop_state.total_tool_calls,
-                        )
+                    run_engine
+                        .persist_status(&bg_run_id, status_str, None, error_msg.as_deref())
                         .await,
                     "run_lifecycle",
                     &bg_run_id,
-                    "usage"
+                    "status"
                 );
-                // Record tokens consumed so check_token_budget sees up-to-date usage.
-                if let Some(ref gov) = bg_resource_governor {
-                    let total = loop_state.total_prompt + loop_state.total_completion;
-                    if total > 0 {
-                        gov.record_tokens(&bg_user_id, total).await;
-                    }
+            }
+            astra_core::log_persist!(
+                run_engine
+                    .persist_usage(
+                        &bg_run_id,
+                        loop_state.total_prompt,
+                        loop_state.total_completion,
+                        loop_state.total_tool_calls,
+                    )
+                    .await,
+                "run_lifecycle",
+                &bg_run_id,
+                "usage"
+            );
+            // Record tokens consumed so check_token_budget sees up-to-date usage.
+            if let Some(ref gov) = bg_resource_governor {
+                let total = loop_state.total_prompt + loop_state.total_completion;
+                if total > 0 {
+                    gov.record_tokens(&bg_user_id, total).await;
                 }
-                if persist_terminal_state {
-                    for event in terminal_events {
-                        astra_core::log_persist!(
-                            engine.append_event(&bg_run_id, event).await,
-                            "run_lifecycle",
-                            &bg_run_id,
-                            "append_terminal_event"
-                        );
-                    }
+            }
+            if persist_terminal_state {
+                for event in terminal_events {
+                    astra_core::log_persist!(
+                        run_engine.append_event(&bg_run_id, event).await,
+                        "run_lifecycle",
+                        &bg_run_id,
+                        "append_terminal_event"
+                    );
                 }
             }
 
@@ -3469,8 +3495,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let (event_tx, mut fanout_rx) = mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
         let (live_tx, _) = broadcast::channel::<Value>(SSE_CHANNEL_CAPACITY);
         let live_tx_for_fanout = live_tx.clone();
+        let fanout_runs = self.runs_handle();
+        let fanout_run_id = run_id.clone();
+        let fanout_run_engine = self.run_engine.clone();
         tokio::spawn(async move {
             while let Some(event) = fanout_rx.recv().await {
+                if live_delta_event_for_persistence(&event) {
+                    if let Some(run) = fanout_runs.write().await.get_mut(&fanout_run_id) {
+                        run.events.push(event.clone());
+                    }
+                    astra_core::log_persist!(
+                        fanout_run_engine
+                            .append_event(&fanout_run_id, event.clone())
+                            .await,
+                        "run_lifecycle",
+                        &fanout_run_id,
+                        "append_live_delta_event"
+                    );
+                }
                 let _ = live_tx_for_fanout.send(event.clone());
                 let _ = client_event_tx.send(event).await;
             }
@@ -3546,8 +3588,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
             runs.insert(run_id.clone(), run_state);
         }
-        self.persist_run_start_if_configured(&run_id, &user_id, &session_id)
-            .await;
+        if let Err(error) = self.persist_run_start(&run_id, &user_id, &session_id).await {
+            self.runs.write().await.remove(&run_id);
+            return Err(error);
+        }
         if let Some(pool) = &self.shared_pool {
             let user_transcript = TranscriptPersistItem {
                 run_id: run_id.clone(),
@@ -3724,21 +3768,19 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
 
             if persist_terminal_state {
-                if let Some(engine) = &run_engine {
-                    astra_core::log_persist!(
-                        engine
-                            .persist_status(
-                                &bg_run_id,
-                                final_status.as_str(),
-                                None,
-                                error_msg.as_deref()
-                            )
-                            .await,
-                        "run_lifecycle",
-                        &bg_run_id,
-                        "status"
-                    );
-                }
+                astra_core::log_persist!(
+                    run_engine
+                        .persist_status(
+                            &bg_run_id,
+                            final_status.as_str(),
+                            None,
+                            error_msg.as_deref()
+                        )
+                        .await,
+                    "run_lifecycle",
+                    &bg_run_id,
+                    "status"
+                );
             }
 
             for event in streamed_final_events {
@@ -3749,32 +3791,28 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             // Persist usage unconditionally — cancelled runs still consumed tokens
             // and must have accurate usage in durable store for billing/audit.
-            if let Some(engine) = &run_engine {
-                astra_core::log_persist!(
-                    engine
-                        .persist_usage(
-                            &bg_run_id,
-                            state.total_prompt,
-                            state.total_completion,
-                            state.total_tool_calls,
-                        )
-                        .await,
-                    "run_lifecycle",
-                    &bg_run_id,
-                    "usage"
-                );
-            }
+            astra_core::log_persist!(
+                run_engine
+                    .persist_usage(
+                        &bg_run_id,
+                        state.total_prompt,
+                        state.total_completion,
+                        state.total_tool_calls,
+                    )
+                    .await,
+                "run_lifecycle",
+                &bg_run_id,
+                "usage"
+            );
 
             // Persist terminal events to durable store.
-            if let Some(engine) = &run_engine {
-                for event in terminal_events {
-                    astra_core::log_persist!(
-                        engine.append_event(&bg_run_id, event).await,
-                        "run_lifecycle",
-                        &bg_run_id,
-                        "append_terminal_event"
-                    );
-                }
+            for event in terminal_events {
+                astra_core::log_persist!(
+                    run_engine.append_event(&bg_run_id, event).await,
+                    "run_lifecycle",
+                    &bg_run_id,
+                    "append_terminal_event"
+                );
             }
 
             // Emit turn_complete event so clients (HTTP SSE, WebSocket) know the turn is done.
@@ -3813,21 +3851,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         run_id: String,
         user_id: String,
     ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
-        {
-            let runs = self.runs.read().await;
-            if let Some(run) = runs.get(&run_id) {
-                if run.user_id != user_id {
-                    return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
-                }
-                return Ok(Self::status_record(run));
-            }
-        }
-
-        if let Some(run) = self.load_durable_run_for_user(&run_id, &user_id).await? {
-            return Ok(Self::durable_status_record(&run));
-        }
-
-        Err(error_response(StatusCode::NOT_FOUND, "Run not found"))
+        let run = self.require_durable_run_for_user(&run_id, &user_id).await?;
+        Ok(Self::durable_status_record(&run))
     }
 
     async fn stream_run(
@@ -3836,27 +3861,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         last_index: u32,
     ) -> Result<Vec<Value>, (StatusCode, Json<ErrorResponse>)> {
-        {
-            let runs = self.runs.read().await;
-            if let Some(run) = runs.get(&run_id) {
-                if run.user_id != user_id {
-                    return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
-                }
-                let offset = last_index as usize;
-                let events = if offset < run.events.len() {
-                    Self::format_run_events(&run.events[offset..], offset)
-                } else {
-                    Vec::new()
-                };
-                return Ok(events);
-            }
-        }
-
-        if let Some(run) = self.load_durable_run_for_user(&run_id, &user_id).await? {
-            return Ok(Self::durable_stream_events(&run, last_index));
-        }
-
-        Err(error_response(StatusCode::NOT_FOUND, "Run not found"))
+        let run = self.require_durable_run_for_user(&run_id, &user_id).await?;
+        Ok(Self::durable_stream_events(&run, last_index))
     }
 
     async fn stream_run_live(
@@ -3865,52 +3871,44 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         last_index: u32,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
-        {
+        let durable = self.require_durable_run_for_user(&run_id, &user_id).await?;
+        let live_tx = {
             let runs = self.runs.read().await;
-            if let Some(run) = runs.get(&run_id) {
-                if run.user_id != user_id {
-                    return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
+            runs.get(&run_id).and_then(|run| run.live_tx.clone())
+        };
+        if let Some(live_tx) = live_tx {
+            let replay_events = Self::durable_stream_events(&durable, last_index);
+            let mut live_rx = live_tx.subscribe();
+            let (event_tx, event_rx) = mpsc::channel(512);
+            tokio::spawn(async move {
+                for event in replay_events {
+                    if event_tx.send(event).await.is_err() {
+                        return;
+                    }
                 }
-                if let Some(live_tx) = &run.live_tx {
-                    let offset = last_index as usize;
-                    let replay_events = if offset < run.events.len() {
-                        Self::format_run_events(&run.events[offset..], offset)
-                    } else {
-                        Vec::new()
-                    };
-                    let mut live_rx = live_tx.subscribe();
-                    let (event_tx, event_rx) = mpsc::channel(512);
-                    tokio::spawn(async move {
-                        for event in replay_events {
+                loop {
+                    match live_rx.recv().await {
+                        Ok(event) => {
                             if event_tx.send(event).await.is_err() {
                                 return;
                             }
                         }
-                        loop {
-                            match live_rx.recv().await {
-                                Ok(event) => {
-                                    if event_tx.send(event).await.is_err() {
-                                        return;
-                                    }
-                                }
-                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                Err(broadcast::error::RecvError::Closed) => return,
-                            }
-                        }
-                    });
-                    return Ok(ChatStreamRecord {
-                        session_id: run.session_id.clone(),
-                        run_id,
-                        events: Vec::new(),
-                        event_rx: Some(event_rx),
-                    });
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    }
                 }
-            }
+            });
+            return Ok(ChatStreamRecord {
+                session_id: durable.session_id,
+                run_id,
+                events: Vec::new(),
+                event_rx: Some(event_rx),
+            });
         }
 
-        let events = self.stream_run(run_id.clone(), user_id, last_index).await?;
+        let events = Self::durable_stream_events(&durable, last_index);
         Ok(ChatStreamRecord {
-            session_id: String::new(),
+            session_id: durable.session_id,
             run_id,
             events,
             event_rx: None,
@@ -3973,54 +3971,40 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             "data": {"input": input.input},
         });
 
-        {
-            let mut runs = self.runs.write().await;
-            if let Some(run) = runs.get_mut(&run_id) {
-                if run.user_id != user_id {
-                    return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
-                }
-                let duplicate = run.events.iter().any(|event| {
-                    event.get("idempotency_key").and_then(Value::as_str)
-                        == Some(idempotency_key.as_str())
-                });
-                if !duplicate {
-                    run.events.push(event.clone());
-                }
-                drop(runs);
-                if let Some(engine) = &self.run_engine {
-                    engine.append_event(&run_id, event).await.map_err(|error| {
-                        error_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            format!("Failed to persist run input: {error}"),
-                        )
-                    })?;
-                }
-                return Ok(RunInputRecord {
-                    run_id,
-                    accepted: true,
-                    duplicate,
-                });
-            }
+        let durable = self.require_durable_run_for_user(&run_id, &user_id).await?;
+        let durable_status = Self::run_status_from_durable(&durable.status)?;
+        if matches!(
+            durable_status,
+            RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+        ) {
+            return Err(Self::run_state_conflict("submit input to", &durable.status));
         }
 
-        if let Some(_run) = self.load_durable_run_for_user(&run_id, &user_id).await? {
-            let Some(engine) = &self.run_engine else {
-                return Err(Self::run_control_state_unavailable("input"));
-            };
-            engine.append_event(&run_id, event).await.map_err(|error| {
-                error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Failed to persist run input: {error}"),
-                )
-            })?;
+        let duplicate = durable.events.iter().any(|event| {
+            event.get("idempotency_key").and_then(Value::as_str) == Some(idempotency_key.as_str())
+        });
+        if duplicate {
             return Ok(RunInputRecord {
                 run_id,
                 accepted: true,
-                duplicate: false,
+                duplicate: true,
             });
         }
 
-        Err(error_response(StatusCode::NOT_FOUND, "Run not found"))
+        self.run_engine
+            .append_event(&run_id, event.clone())
+            .await
+            .map_err(|error| Self::durable_persist_error("input", error))?;
+
+        if let Some(run) = self.runs.write().await.get_mut(&run_id) {
+            run.events.push(event);
+        }
+
+        Ok(RunInputRecord {
+            run_id,
+            accepted: true,
+            duplicate: false,
+        })
     }
 
     async fn drain_background_tasks(&self, timeout: std::time::Duration) -> bool {
@@ -4032,80 +4016,49 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         run_id: String,
         user_id: String,
     ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        let durable = self.require_durable_run_for_user(&run_id, &user_id).await?;
+        let durable_status = Self::run_status_from_durable(&durable.status)?;
+        if matches!(
+            durable_status,
+            RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+        ) {
+            return Ok(CancelRunRecord {
+                run_id,
+                status: durable.status,
+            });
+        }
+
+        let cancel_event = json!({"event_type": "run_finished", "data": {"cancelled": true}});
+        self.run_engine
+            .persist_status(&run_id, STATUS_CANCELLED, None, None)
+            .await
+            .map_err(|error| Self::durable_persist_error("cancel status", error))?;
+        let append_result = self
+            .run_engine
+            .append_event(&run_id, cancel_event.clone())
+            .await;
+
         {
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(&run_id) {
-                if run.user_id != user_id {
-                    return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
-                }
-                let mutated = run.status.try_transition(&RunStatus::Cancelled).is_ok();
-                if mutated {
-                    run.cancel_flag.store(true, Ordering::SeqCst);
-                    run.pause_flag.store(false, Ordering::SeqCst);
-                    run.llm_cancel_token.cancel();
-                    run.status = RunStatus::Cancelled;
-                    run.waiting_for = None;
-                    run.events.push(json!({
-                        "event_type": "run_finished",
-                        "data": {"cancelled": true}
-                    }));
-                }
-                let final_status = run.status.as_str().to_string();
-                // Drop the write lock before async persist calls so concurrent
-                // readers/writers (and pause/resume) are not blocked across DB I/O.
-                drop(runs);
-
-                if mutated {
-                    if let Some(engine) = &self.run_engine {
-                        astra_core::log_persist!(
-                            engine
-                                .persist_status(&run_id, STATUS_CANCELLED, None, None)
-                                .await,
-                            "run_lifecycle",
-                            &run_id,
-                            "cancel_status"
-                        );
-                        astra_core::log_persist!(
-                            engine
-                                .append_event(
-                                    &run_id,
-                                    json!({"event_type": "run_finished", "data": {"cancelled": true}}),
-                                )
-                                .await,
-                            "run_lifecycle",
-                            &run_id,
-                            "cancel_event"
-                        );
-                    }
-                }
-                // Cascade cancellation to delegation sub-runs.
-                if mutated {
-                    if let Some(de) = &self.delegation_engine {
-                        de.cancel_children_of(&run_id).await;
-                    }
-                }
-                return Ok(CancelRunRecord {
-                    run_id,
-                    status: final_status,
-                });
+                run.cancel_flag.store(true, Ordering::SeqCst);
+                run.pause_flag.store(false, Ordering::SeqCst);
+                run.llm_cancel_token.cancel();
+                run.status = RunStatus::Cancelled;
+                run.waiting_for = None;
+                run.events.push(cancel_event);
             }
         }
 
-        if let Some(run) = self.load_durable_run_for_user(&run_id, &user_id).await? {
-            return if matches!(
-                run.status.as_str(),
-                STATUS_RUNNING | STATUS_PAUSED | STATUS_WAITING
-            ) {
-                Err(Self::run_control_state_unavailable("cancellation"))
-            } else {
-                Ok(CancelRunRecord {
-                    run_id,
-                    status: run.status,
-                })
-            };
+        if let Some(de) = &self.delegation_engine {
+            de.cancel_children_of(&run_id).await;
         }
+        append_result.map_err(|error| Self::durable_persist_error("cancel event", error))?;
 
-        Err(error_response(StatusCode::NOT_FOUND, "Run not found"))
+        Ok(CancelRunRecord {
+            run_id,
+            status: STATUS_CANCELLED.to_string(),
+        })
     }
 
     async fn list_runs(
@@ -4115,45 +4068,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         offset: u32,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
         let (limit, offset) = astra_services::pagination::clamp_api_list_pagination(limit, offset);
-        if let Some(engine) = &self.run_engine {
-            let (durable_runs, total) = engine
-                .list_user_runs(&user_id, limit, offset)
-                .await
-                .map_err(|error| {
-                    error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("Failed to list durable run state: {error}"),
-                    )
-                })?;
-            let runs = self.runs.read().await;
-            let page = durable_runs
-                .iter()
-                .map(|run| {
-                    runs.get(&run.run_id)
-                        .map(|live| Self::status_record(live))
-                        .unwrap_or_else(|| Self::durable_status_record(run))
-                })
-                .collect();
-            return Ok(RunListRecord {
-                runs: page,
-                total,
-                limit,
-                offset,
-            });
-        }
-
-        let runs = self.runs.read().await;
-        let mut all: Vec<RunStatusRecord> = runs
-            .values()
-            .filter(|run| run.user_id == user_id)
-            .map(Self::status_record)
+        let (durable_runs, total) = self
+            .run_engine
+            .list_user_runs(&user_id, limit, offset)
+            .await
+            .map_err(|error| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Failed to list durable run state: {error}"),
+                )
+            })?;
+        let page = durable_runs
+            .iter()
+            .map(Self::durable_status_record)
             .collect();
-        // Sort by run_id for deterministic pagination (HashMap iteration order is undefined).
-        all.sort_by(|a, b| a.run_id.cmp(&b.run_id));
-        let total = all.len() as i64;
-        let start = (offset as usize).min(all.len());
-        let end = (start + limit as usize).min(all.len());
-        let page = all[start..end].to_vec();
         Ok(RunListRecord {
             runs: page,
             total,
@@ -4167,66 +4095,69 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         run_id: String,
         user_id: String,
     ) -> Result<RunMutationRecord, (StatusCode, Json<ErrorResponse>)> {
+        let durable = self.require_durable_run_for_user(&run_id, &user_id).await?;
+        if durable.status != STATUS_RUNNING {
+            return Err(Self::run_state_conflict("pause", &durable.status));
+        }
+
+        let pause_event = json!({"event_type": "run_paused", "data": {}});
+        {
+            let mut runs = self.runs.write().await;
+            let Some(run) = runs.get_mut(&run_id) else {
+                return Err(Self::run_control_state_unavailable("pause"));
+            };
+            if run.status.try_transition(&RunStatus::Paused).is_err() {
+                return Err(Self::run_state_conflict("pause", run.status.as_str()));
+            }
+            run.pause_flag.store(true, Ordering::SeqCst);
+        }
+
+        if let Err(error) = self
+            .run_engine
+            .persist_status(&run_id, STATUS_PAUSED, Some("user_resume"), None)
+            .await
+        {
+            if let Some(run) = self.runs.write().await.get_mut(&run_id) {
+                run.pause_flag.store(false, Ordering::SeqCst);
+            }
+            return Err(Self::durable_persist_error("pause status", error));
+        }
+        let append_result = self
+            .run_engine
+            .append_event(&run_id, pause_event.clone())
+            .await;
+
         {
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(&run_id) {
-                if run.user_id != user_id {
-                    return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
-                }
-                if run.status.try_transition(&RunStatus::Paused).is_err() {
-                    return Err(Self::run_state_conflict("pause", run.status.as_str()));
-                }
-                let previous = run.status.as_str().to_string();
                 run.status = RunStatus::Paused;
                 run.pause_flag.store(true, Ordering::SeqCst);
                 run.waiting_for = Some("user_resume".to_string());
-                run.events.push(json!({
-                    "event_type": "run_paused",
-                    "data": {}
-                }));
-                // Drop the write lock before async delegation calls.
-                drop(runs);
-
-                // Persist pause
-                if let Some(engine) = &self.run_engine {
-                    astra_core::log_persist!(
-                        engine
-                            .persist_status(&run_id, STATUS_PAUSED, Some("user_resume"), None)
-                            .await,
-                        "run_lifecycle",
-                        &run_id,
-                        "pause_status"
-                    );
-                    astra_core::log_persist!(
-                        engine
-                            .append_event(&run_id, json!({"event_type": "run_paused", "data": {}}))
-                            .await,
-                        "run_lifecycle",
-                        &run_id,
-                        "pause_event"
-                    );
-                }
-                // Cascade: pause all delegated sub-runs of this parent.
-                if let Some(de) = &self.delegation_engine {
-                    de.pause_children_of(&run_id).await;
-                }
-                return Ok(RunMutationRecord {
-                    run_id,
-                    status: STATUS_PAUSED.to_string(),
-                    previous_status: previous,
-                });
+                run.events.push(pause_event);
             }
         }
 
-        if let Some(run) = self.load_durable_run_for_user(&run_id, &user_id).await? {
-            return if run.status == STATUS_RUNNING {
-                Err(Self::run_control_state_unavailable("pause"))
-            } else {
-                Err(Self::run_state_conflict("pause", &run.status))
-            };
+        if let Err(error) = append_result {
+            if let Some(run) = self.runs.write().await.get_mut(&run_id) {
+                run.status = RunStatus::Running;
+                run.pause_flag.store(false, Ordering::SeqCst);
+                run.waiting_for = None;
+                run.events.pop();
+            }
+            let _ = self
+                .run_engine
+                .persist_status(&run_id, STATUS_RUNNING, None, None)
+                .await;
+            return Err(Self::durable_persist_error("pause event", error));
         }
-
-        Err(error_response(StatusCode::NOT_FOUND, "Run not found"))
+        if let Some(de) = &self.delegation_engine {
+            de.pause_children_of(&run_id).await;
+        }
+        Ok(RunMutationRecord {
+            run_id,
+            status: STATUS_PAUSED.to_string(),
+            previous_status: durable.status,
+        })
     }
 
     async fn resume_run(
@@ -4234,66 +4165,62 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         run_id: String,
         user_id: String,
     ) -> Result<RunMutationRecord, (StatusCode, Json<ErrorResponse>)> {
+        let durable = self.require_durable_run_for_user(&run_id, &user_id).await?;
+        if durable.status != STATUS_PAUSED {
+            return Err(Self::run_state_conflict("resume", &durable.status));
+        }
+
+        let resume_event = json!({"event_type": "run_resumed", "data": {}});
         {
             let mut runs = self.runs.write().await;
-            if let Some(run) = runs.get_mut(&run_id) {
-                if run.user_id != user_id {
-                    return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
-                }
-                if run.status.try_transition(&RunStatus::Running).is_err() {
-                    return Err(Self::run_state_conflict("resume", run.status.as_str()));
-                }
-                let previous = run.status.as_str().to_string();
-                run.status = RunStatus::Running;
-                run.pause_flag.store(false, Ordering::SeqCst);
-                run.waiting_for = None;
-                run.events.push(json!({
-                    "event_type": "run_resumed",
-                    "data": {}
-                }));
-                // Drop the write lock before async delegation calls.
-                drop(runs);
-
-                // Persist resume
-                if let Some(engine) = &self.run_engine {
-                    astra_core::log_persist!(
-                        engine
-                            .persist_status(&run_id, STATUS_RUNNING, None, None)
-                            .await,
-                        "run_lifecycle",
-                        &run_id,
-                        "resume_status"
-                    );
-                    astra_core::log_persist!(
-                        engine
-                            .append_event(&run_id, json!({"event_type": "run_resumed", "data": {}}))
-                            .await,
-                        "run_lifecycle",
-                        &run_id,
-                        "resume_event"
-                    );
-                }
-                // Cascade: resume all delegated sub-runs of this parent.
-                if let Some(de) = &self.delegation_engine {
-                    de.resume_children_of(&run_id).await;
-                }
-                return Ok(RunMutationRecord {
-                    run_id,
-                    status: STATUS_RUNNING.to_string(),
-                    previous_status: previous,
-                });
+            let Some(run) = runs.get_mut(&run_id) else {
+                return Err(Self::run_control_state_unavailable("resume"));
+            };
+            if run.status.try_transition(&RunStatus::Running).is_err() {
+                return Err(Self::run_state_conflict("resume", run.status.as_str()));
             }
         }
 
-        if let Some(run) = self.load_durable_run_for_user(&run_id, &user_id).await? {
-            return if run.status == STATUS_PAUSED {
-                Err(Self::run_control_state_unavailable("resume"))
-            } else {
-                Err(Self::run_state_conflict("resume", &run.status))
-            };
+        self.run_engine
+            .persist_status(&run_id, STATUS_RUNNING, None, None)
+            .await
+            .map_err(|error| Self::durable_persist_error("resume status", error))?;
+        let append_result = self
+            .run_engine
+            .append_event(&run_id, resume_event.clone())
+            .await;
+
+        {
+            let mut runs = self.runs.write().await;
+            if let Some(run) = runs.get_mut(&run_id) {
+                run.status = RunStatus::Running;
+                run.pause_flag.store(false, Ordering::SeqCst);
+                run.waiting_for = None;
+                run.events.push(resume_event);
+            }
         }
 
-        Err(error_response(StatusCode::NOT_FOUND, "Run not found"))
+        if let Err(error) = append_result {
+            if let Some(run) = self.runs.write().await.get_mut(&run_id) {
+                run.status = RunStatus::Paused;
+                run.pause_flag.store(true, Ordering::SeqCst);
+                run.waiting_for = Some("user_resume".to_string());
+                run.events.pop();
+            }
+            let _ = self
+                .run_engine
+                .persist_status(&run_id, STATUS_PAUSED, Some("user_resume"), None)
+                .await;
+            return Err(Self::durable_persist_error("resume event", error));
+        }
+        if let Some(de) = &self.delegation_engine {
+            de.resume_children_of(&run_id).await;
+        }
+        Ok(RunMutationRecord {
+            run_id,
+            status: STATUS_RUNNING.to_string(),
+            previous_status: durable.status,
+        })
     }
 }
 
@@ -5008,10 +4935,14 @@ mod tests {
     }
 
     fn test_service() -> AgenticRunLifecycleService {
+        use astra_services::runs::InMemoryRunStateStore;
+
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
         AgenticRunLifecycleService::new(
             test_settings(),
             test_encryptor(),
             Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
         )
     }
 
@@ -5414,7 +5345,6 @@ mod tests {
         let mut run = RunState {
             run_id: "run-1".into(),
             session_id: "session-1".into(),
-            user_id: "user-1".into(),
             status: RunStatus::Cancelled,
             events: vec![
                 json!({"event_type": "run_started", "data": {}}),
@@ -6169,16 +6099,7 @@ mod tests {
     // ─── Durable persistence integration tests ─────────────────────────
 
     fn test_service_with_engine() -> AgenticRunLifecycleService {
-        use crate::server::run_engine::RunEngine;
-        use astra_services::runs::InMemoryRunStateStore;
-
-        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
-        AgenticRunLifecycleService::new(
-            test_settings(),
-            test_encryptor(),
-            Arc::new(TokioMutex::new(HashMap::new())),
-        )
-        .with_run_engine(engine)
+        test_service()
     }
 
     #[tokio::test]
@@ -6187,7 +6108,7 @@ mod tests {
         let svc = test_service_with_engine();
         let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
 
-        let engine = svc.run_engine.as_ref().unwrap();
+        let engine = &svc.run_engine;
         let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
         assert_eq!(durable.user_id, "user-1");
         assert_eq!(durable.status, "running");
@@ -6200,7 +6121,7 @@ mod tests {
         let svc = test_service_with_engine();
         let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
 
-        let engine = svc.run_engine.as_ref().unwrap();
+        let engine = &svc.run_engine;
         let durable = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
@@ -6231,7 +6152,7 @@ mod tests {
             .stream_chat("user-1".into(), test_request("hello"))
             .await);
 
-        let engine = svc.run_engine.as_ref().unwrap();
+        let engine = &svc.run_engine;
         let durable = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let durable = engine.load_run(&stream.run_id).await.unwrap().unwrap();
@@ -6264,7 +6185,7 @@ mod tests {
         let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
         ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
 
-        let engine = svc.run_engine.as_ref().unwrap();
+        let engine = &svc.run_engine;
         let durable = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
@@ -6293,7 +6214,7 @@ mod tests {
         let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
 
         ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
-        let engine = svc.run_engine.as_ref().unwrap();
+        let engine = &svc.run_engine;
         let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
         assert_eq!(durable.status, "paused");
         assert_eq!(durable.waiting_for.as_deref(), Some("user_resume"));
@@ -6307,7 +6228,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_run_returns_durable_terminal_status_on_cache_miss() {
         let svc = test_service_with_engine();
-        let engine = svc.run_engine.as_ref().unwrap();
+        let engine = &svc.run_engine;
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine
             .persist_status("run-1", STATUS_COMPLETED, None, None)
@@ -6320,23 +6241,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_run_running_cache_miss_returns_service_unavailable() {
+    async fn cancel_run_running_cache_miss_persists_cancelled() {
         let svc = test_service_with_engine();
-        let engine = svc.run_engine.as_ref().unwrap();
+        let engine = &svc.run_engine;
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
 
-        let e = err(svc.cancel_run("run-1".into(), "user-1".into()).await);
-        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            e.1.0.detail,
-            "Run control state unavailable for cancellation"
-        );
+        let result = ok(svc.cancel_run("run-1".into(), "user-1".into()).await);
+        assert_eq!(result.status, STATUS_CANCELLED);
+        let durable = engine.load_run("run-1").await.unwrap().unwrap();
+        assert_eq!(durable.status, STATUS_CANCELLED);
+        assert_eq!(durable.events.last().unwrap()["event_type"], "run_finished");
     }
 
     #[tokio::test]
     async fn pause_run_running_cache_miss_returns_service_unavailable() {
         let svc = test_service_with_engine();
-        let engine = svc.run_engine.as_ref().unwrap();
+        let engine = &svc.run_engine;
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
 
         let e = err(svc.pause_run("run-1".into(), "user-1".into()).await);
@@ -6347,7 +6267,7 @@ mod tests {
     #[tokio::test]
     async fn resume_run_paused_cache_miss_returns_service_unavailable() {
         let svc = test_service_with_engine();
-        let engine = svc.run_engine.as_ref().unwrap();
+        let engine = &svc.run_engine;
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine
             .persist_status("run-1", STATUS_PAUSED, Some("user_resume"), None)
@@ -6360,21 +6280,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_run_paused_cache_miss_returns_service_unavailable() {
+    async fn cancel_run_paused_cache_miss_persists_cancelled() {
         let svc = test_service_with_engine();
-        let engine = svc.run_engine.as_ref().unwrap();
+        let engine = &svc.run_engine;
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine
             .persist_status("run-1", STATUS_PAUSED, Some("user_resume"), None)
             .await
             .unwrap();
 
-        let e = err(svc.cancel_run("run-1".into(), "user-1".into()).await);
-        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            e.1.0.detail,
-            "Run control state unavailable for cancellation"
-        );
+        let result = ok(svc.cancel_run("run-1".into(), "user-1".into()).await);
+        assert_eq!(result.status, STATUS_CANCELLED);
+        let durable = engine.load_run("run-1").await.unwrap().unwrap();
+        assert_eq!(durable.status, STATUS_CANCELLED);
     }
 
     #[tokio::test]
@@ -6384,7 +6302,7 @@ mod tests {
         let stream = ok(svc
             .stream_chat("user-1".into(), test_request("hello"))
             .await);
-        let engine = svc.run_engine.as_ref().unwrap();
+        let engine = &svc.run_engine;
         let durable = engine.load_run(&stream.run_id).await.unwrap().unwrap();
 
         svc.runs.write().await.remove(&stream.run_id);
@@ -6402,7 +6320,7 @@ mod tests {
     #[tokio::test]
     async fn stream_run_cache_miss_replays_durable_text_done() {
         let svc = test_service_with_engine();
-        let engine = svc.run_engine.as_ref().unwrap();
+        let engine = &svc.run_engine;
         engine
             .start_run("run-durable-text", "user-1", "session-1")
             .await
@@ -6433,13 +6351,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_run_input_uses_durable_idempotency_on_cache_miss() {
+        let svc = test_service_with_engine();
+        let engine = &svc.run_engine;
+        engine
+            .start_run("run-input", "user-1", "session-1")
+            .await
+            .unwrap();
+
+        let first = ok(svc
+            .submit_run_input(
+                "run-input".into(),
+                "user-1".into(),
+                RunInputData {
+                    idempotency_key: "key-1".into(),
+                    input: json!({"answer": "yes"}),
+                },
+            )
+            .await);
+        let duplicate = ok(svc
+            .submit_run_input(
+                "run-input".into(),
+                "user-1".into(),
+                RunInputData {
+                    idempotency_key: "key-1".into(),
+                    input: json!({"answer": "yes"}),
+                },
+            )
+            .await);
+
+        let durable = engine.load_run("run-input").await.unwrap().unwrap();
+        let matching_inputs = durable
+            .events
+            .iter()
+            .filter(|event| event.get("idempotency_key").and_then(Value::as_str) == Some("key-1"))
+            .count();
+        assert!(!first.duplicate);
+        assert!(duplicate.duplicate);
+        assert_eq!(matching_inputs, 1);
+    }
+
+    #[tokio::test]
+    async fn submit_run_input_rejects_terminal_durable_run() {
+        let svc = test_service_with_engine();
+        let engine = &svc.run_engine;
+        engine
+            .start_run("run-terminal-input", "user-1", "session-1")
+            .await
+            .unwrap();
+        engine
+            .persist_status("run-terminal-input", STATUS_COMPLETED, None, None)
+            .await
+            .unwrap();
+
+        let e = err(svc
+            .submit_run_input(
+                "run-terminal-input".into(),
+                "user-1".into(),
+                RunInputData {
+                    idempotency_key: "key-1".into(),
+                    input: json!({"answer": "late"}),
+                },
+            )
+            .await);
+        assert_eq!(e.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn create_run_conflict_checks_durable_active_session() {
+        let svc = test_service_with_engine();
+        let engine = &svc.run_engine;
+        engine
+            .start_run("existing-run", "user-1", "shared-session")
+            .await
+            .unwrap();
+        let mut request = test_request("second");
+        request.session_id = Some("shared-session".into());
+
+        let e = err(svc.create_run("user-1".into(), request).await);
+        assert_eq!(e.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
     #[ignore] // stream_chat runs full agentic loop; needs live DB + LLM or mock
     async fn stream_run_falls_back_to_durable_store_on_cache_miss() {
         let svc = test_service_with_engine();
         let stream = ok(svc
             .stream_chat("user-1".into(), test_request("hello"))
             .await);
-        let engine = svc.run_engine.as_ref().unwrap();
+        let engine = &svc.run_engine;
         let durable = engine.load_run(&stream.run_id).await.unwrap().unwrap();
 
         svc.runs.write().await.remove(&stream.run_id);
@@ -6474,11 +6474,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_engine_works_without_persistence() {
-        // Service without engine should still work (backward compat)
+    async fn lifecycle_run_creation_is_durable_by_default() {
         let svc = test_service();
         let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-        ok(svc.cancel_run(run.run_id, "user-1".into()).await);
+        let durable = svc.run_engine.load_run(&run.run_id).await.unwrap().unwrap();
+        assert_eq!(durable.user_id, "user-1");
+        assert_eq!(durable.session_id, run.session_id);
+        assert_eq!(durable.status, STATUS_RUNNING);
     }
 
     // ─── EdgeContext integration tests ──────────────────────────────────
@@ -6586,7 +6588,7 @@ mod tests {
         let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
 
         // Deterministic wait: poll durable state until it leaves "running".
-        let engine = svc.run_engine.as_ref().unwrap();
+        let engine = &svc.run_engine;
         let durable = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
@@ -6941,23 +6943,24 @@ mod tests {
         );
     }
 
-    /// cancel_run durable fallback must include STATUS_WAITING in cancellable states.
-    /// A Waiting run persisted in durable store must be cancellable.
-    #[test]
-    fn cancel_run_durable_fallback_includes_waiting() {
-        let source = include_str!("run_lifecycle.rs");
-        let fn_start = source
-            .find("async fn cancel_run(")
-            .expect("cancel_run must exist");
-        let fn_end = source[fn_start..]
-            .find("\n    async fn ")
-            .map(|p| fn_start + p)
-            .unwrap_or(source.len());
-        let fn_body = &source[fn_start..fn_end];
-        // The durable fallback match must include STATUS_WAITING
-        assert!(
-            fn_body.contains("STATUS_WAITING"),
-            "cancel_run durable fallback must include STATUS_WAITING"
-        );
+    /// A Waiting run persisted in durable store must be cancellable even after
+    /// the process-local control handle is gone.
+    #[tokio::test]
+    async fn cancel_run_waiting_cache_miss_persists_cancelled() {
+        let svc = test_service_with_engine();
+        let engine = &svc.run_engine;
+        engine
+            .start_run("waiting-run", "user-1", "session-1")
+            .await
+            .unwrap();
+        engine
+            .persist_status("waiting-run", STATUS_WAITING, Some("tool_approval"), None)
+            .await
+            .unwrap();
+
+        let result = ok(svc.cancel_run("waiting-run".into(), "user-1".into()).await);
+        let durable = engine.load_run("waiting-run").await.unwrap().unwrap();
+        assert_eq!(result.status, STATUS_CANCELLED);
+        assert_eq!(durable.status, STATUS_CANCELLED);
     }
 }

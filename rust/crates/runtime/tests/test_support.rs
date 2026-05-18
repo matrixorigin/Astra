@@ -2,7 +2,10 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use astra_runtime::{AgenticRunLifecycleService, FernetTokenEncryptor, MatrixOneSettings};
+use astra_runtime::{
+    AgenticRunLifecycleService, FernetTokenEncryptor, MatrixOneSettings, RunEngine,
+};
+use astra_services::InMemoryRunStateStore;
 use serde_json::{Value, json};
 
 pub type EdgeCallbackLedger = Arc<tokio::sync::Mutex<HashMap<String, Value>>>;
@@ -25,7 +28,8 @@ pub fn test_run_lifecycle(
     encryptor: Arc<FernetTokenEncryptor>,
     ledger: EdgeCallbackLedger,
 ) -> AgenticRunLifecycleService {
-    AgenticRunLifecycleService::new(test_matrixone_settings(), encryptor, ledger)
+    let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    AgenticRunLifecycleService::new(test_matrixone_settings(), encryptor, ledger, run_engine)
 }
 
 pub fn tool_call(id: &str, name: &str, args: Value) -> Value {

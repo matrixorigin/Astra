@@ -535,8 +535,8 @@ mod tests {
                     .expect("test encryptor should initialize"),
             ),
             Arc::new(TokioMutex::new(HashMap::new())),
-        )
-        .with_run_engine(engine);
+            engine,
+        );
 
         let app = build_app(
             AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))

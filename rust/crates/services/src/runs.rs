@@ -364,7 +364,7 @@ pub struct DurableRunRecord {
 /// Abstraction for durable run persistence.
 ///
 /// Implementations:
-/// - `InMemoryRunStateStore` — for tests and single-process deployments
+/// - `InMemoryRunStateStore` — deterministic durable fake for tests
 /// - `DatabaseRunStateStore` — MatrixOne-backed persistence
 #[async_trait]
 pub trait RunStateStore: Send + Sync {
@@ -412,6 +412,13 @@ pub trait RunStateStore: Send + Sync {
     /// Find runs in RUNNING status (for crash recovery — mark them failed on restart).
     async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String>;
 
+    /// Find the newest run that blocks starting another run in the same session.
+    async fn find_blocking_session_run(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<DurableRunRecord>, String>;
+
     /// Find all sub-runs belonging to a delegation.
     async fn find_sub_runs(&self, delegation_id: &str) -> Result<Vec<DurableRunRecord>, String>;
 
@@ -442,10 +449,23 @@ impl Default for InMemoryRunStateStore {
     }
 }
 
+fn run_blocks_session(status: &str, waiting_for: Option<&str>) -> bool {
+    matches!(status, "running" | "waiting") || (status == "paused" && waiting_for.is_some())
+}
+
 #[async_trait]
 impl RunStateStore for InMemoryRunStateStore {
     async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
         let mut runs = self.runs.write().await;
+        if record.parent_run_id.is_none()
+            && runs.values().any(|run| {
+                run.user_id == record.user_id
+                    && run.session_id == record.session_id
+                    && run_blocks_session(&run.status, run.waiting_for.as_deref())
+            })
+        {
+            return Err("session already has an active run".to_string());
+        }
         runs.insert(record.run_id.clone(), record);
 
         // Evict oldest completed/failed runs when over capacity
@@ -568,6 +588,26 @@ impl RunStateStore for InMemoryRunStateStore {
             .filter(|r| r.status == "running")
             .cloned()
             .collect())
+    }
+
+    async fn find_blocking_session_run(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<DurableRunRecord>, String> {
+        let runs = self.runs.read().await;
+        let mut matches = runs
+            .values()
+            .filter(|run| {
+                run.user_id == user_id
+                    && run.session_id == session_id
+                    && (matches!(run.status.as_str(), "running" | "waiting")
+                        || (run.status == "paused" && run.waiting_for.is_some()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        matches.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(matches.into_iter().next())
     }
 
     async fn find_sub_runs(&self, delegation_id: &str) -> Result<Vec<DurableRunRecord>, String> {
@@ -1120,44 +1160,98 @@ impl RunStateStore for DatabaseRunStateStore {
                 .unwrap_or_else(|_| chrono::Duration::seconds(45));
         let events = std::mem::take(&mut record.events);
 
-        sqlx::query(
-            "INSERT INTO agent_runs
-             (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
-              delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
-              owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
-              checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
-              total_prompt_tokens, total_completion_tokens, total_tool_calls, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
-             ON DUPLICATE KEY UPDATE updated_at = NOW(6)",
-        )
-        .bind(&record.run_id)
-        .bind(&record.user_id)
-        .bind(&record.session_id)
-        .bind(&record.parent_run_id)
-        .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
-        .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
-        .bind(record.depth as i64)
-        .bind(&record.delegation_id)
-        .bind(&record.agent_id)
-        .bind(&record.retry_of)
-        .bind(retry_scope)
-        .bind(&record.status)
-        .bind(&record.waiting_for)
-        .bind(&self.owner_pod_id)
-        .bind(lease_expires_at.naive_utc())
-        .bind(record.run_generation as i64)
-        .bind(record.last_event_idx)
-        .bind(&record.checkpoint_version)
-        .bind(&record.checkpoint_json)
-        .bind(&record.error_code)
-        .bind(&record.error_message)
-        .bind(record.retry_count as i64)
-        .bind(record.total_prompt_tokens as i64)
-        .bind(record.total_completion_tokens as i64)
-        .bind(record.total_tool_calls as i64)
-        .execute(self.pool.get())
-        .await
-        .map_err(|source| db_error("insert_run", &record.run_id, source).to_string())?;
+        let insert_result = if record.parent_run_id.is_none() {
+            sqlx::query(
+                "INSERT INTO agent_runs
+                 (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
+                  delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
+                  owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
+                  checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
+                  total_prompt_tokens, total_completion_tokens, total_tool_calls, created_at, updated_at)
+                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6)
+                 FROM DUAL
+                 WHERE NOT EXISTS (
+                     SELECT 1
+                     FROM agent_runs
+                     WHERE user_id = ?
+                       AND session_id = ?
+                       AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL))
+                     LIMIT 1
+                 )",
+            )
+            .bind(&record.run_id)
+            .bind(&record.user_id)
+            .bind(&record.session_id)
+            .bind(&record.parent_run_id)
+            .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
+            .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
+            .bind(record.depth as i64)
+            .bind(&record.delegation_id)
+            .bind(&record.agent_id)
+            .bind(&record.retry_of)
+            .bind(&retry_scope)
+            .bind(&record.status)
+            .bind(&record.waiting_for)
+            .bind(&self.owner_pod_id)
+            .bind(lease_expires_at.naive_utc())
+            .bind(record.run_generation as i64)
+            .bind(record.last_event_idx)
+            .bind(&record.checkpoint_version)
+            .bind(&record.checkpoint_json)
+            .bind(&record.error_code)
+            .bind(&record.error_message)
+            .bind(record.retry_count as i64)
+            .bind(record.total_prompt_tokens as i64)
+            .bind(record.total_completion_tokens as i64)
+            .bind(record.total_tool_calls as i64)
+            .bind(&record.user_id)
+            .bind(&record.session_id)
+            .execute(self.pool.get())
+            .await
+            .map_err(|source| db_error("insert_run", &record.run_id, source).to_string())?
+        } else {
+            sqlx::query(
+                "INSERT INTO agent_runs
+                 (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
+                  delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
+                  owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
+                  checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
+                  total_prompt_tokens, total_completion_tokens, total_tool_calls, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
+                 ON DUPLICATE KEY UPDATE updated_at = NOW(6)",
+            )
+            .bind(&record.run_id)
+            .bind(&record.user_id)
+            .bind(&record.session_id)
+            .bind(&record.parent_run_id)
+            .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
+            .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
+            .bind(record.depth as i64)
+            .bind(&record.delegation_id)
+            .bind(&record.agent_id)
+            .bind(&record.retry_of)
+            .bind(&retry_scope)
+            .bind(&record.status)
+            .bind(&record.waiting_for)
+            .bind(&self.owner_pod_id)
+            .bind(lease_expires_at.naive_utc())
+            .bind(record.run_generation as i64)
+            .bind(record.last_event_idx)
+            .bind(&record.checkpoint_version)
+            .bind(&record.checkpoint_json)
+            .bind(&record.error_code)
+            .bind(&record.error_message)
+            .bind(record.retry_count as i64)
+            .bind(record.total_prompt_tokens as i64)
+            .bind(record.total_completion_tokens as i64)
+            .bind(record.total_tool_calls as i64)
+            .execute(self.pool.get())
+            .await
+            .map_err(|source| db_error("insert_run", &record.run_id, source).to_string())?
+        };
+        if insert_result.rows_affected() == 0 {
+            return Err("session already has an active run".to_string());
+        }
 
         sqlx::query(
             "INSERT INTO run_counters
@@ -1329,6 +1423,28 @@ impl RunStateStore for DatabaseRunStateStore {
 
     async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         self.find_runs_by_status("running").await
+    }
+
+    async fn find_blocking_session_run(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<DurableRunRecord>, String> {
+        let row = sqlx::query(
+            "SELECT * FROM agent_runs \
+             WHERE user_id = ? AND session_id = ? \
+               AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL)) \
+             ORDER BY updated_at DESC \
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| db_error("find_blocking_session_run", session_id, source).to_string())?;
+        row.map(run_record_from_row)
+            .transpose()
+            .map_err(|e| e.to_string())
     }
 
     async fn find_sub_runs(&self, delegation_id: &str) -> Result<Vec<DurableRunRecord>, String> {

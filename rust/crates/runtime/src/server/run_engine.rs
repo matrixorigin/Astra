@@ -1,8 +1,8 @@
 //! Durable run execution engine.
 //!
 //! `RunEngine` orchestrates agentic run execution with persistence backing via
-//! [`RunStateStore`]. It bridges the gap between volatile in-memory run state
-//! (used for low-latency queries) and durable storage (for crash recovery).
+//! [`RunStateStore`]. Durable storage is the authority for run status, replay,
+//! listing, and restart recovery; process-local state is only for live controls.
 //!
 //! # Architecture
 //!
@@ -44,10 +44,9 @@ use astra_core::{STATUS_RUNNING, STATUS_WAITING};
 ///
 /// Wraps a [`RunStateStore`] and provides high-level operations for
 /// durable run management. The engine is designed to be composed into
-/// `AgenticRunLifecycleService` alongside the volatile in-memory cache.
-/// Wraps a [`RunStateStore`] with higher-level operations for durable run
-/// management: create, status transitions, usage/checkpoint persistence,
-/// event logging, and recovery.
+/// `AgenticRunLifecycleService` alongside process-local live control handles:
+/// create, status transitions, usage/checkpoint persistence, event logging,
+/// session blocking queries, and recovery.
 #[derive(Clone)]
 pub struct RunEngine {
     store: Arc<dyn RunStateStore>,
@@ -241,6 +240,17 @@ impl RunEngine {
     /// Find all runs in WAITING status (for the resume engine to re-evaluate).
     pub async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         self.store.find_waiting_runs().await
+    }
+
+    /// Find the newest run that blocks another run in the same user/session.
+    pub async fn find_blocking_session_run(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<DurableRunRecord>, String> {
+        self.store
+            .find_blocking_session_run(user_id, session_id)
+            .await
     }
 
     /// Find all sub-runs belonging to a delegation.
@@ -553,6 +563,48 @@ mod tests {
         let waiting = engine.find_waiting_runs().await.unwrap();
         assert_eq!(waiting.len(), 1);
         assert_eq!(waiting[0].run_id, "run-2");
+    }
+
+    #[tokio::test]
+    async fn find_blocking_session_run_matches_only_blocking_states() {
+        let engine = test_engine();
+        engine
+            .start_run("running", "user-1", "sess-blocked")
+            .await
+            .unwrap();
+        engine
+            .start_run("paused-free", "user-1", "sess-free")
+            .await
+            .unwrap();
+        engine
+            .persist_status("paused-free", "paused", None, None)
+            .await
+            .unwrap();
+        engine
+            .start_run("completed", "user-1", "sess-done")
+            .await
+            .unwrap();
+        engine
+            .persist_status("completed", "completed", None, None)
+            .await
+            .unwrap();
+
+        let blocked = engine
+            .find_blocking_session_run("user-1", "sess-blocked")
+            .await
+            .unwrap();
+        let free = engine
+            .find_blocking_session_run("user-1", "sess-free")
+            .await
+            .unwrap();
+        let done = engine
+            .find_blocking_session_run("user-1", "sess-done")
+            .await
+            .unwrap();
+
+        assert_eq!(blocked.unwrap().run_id, "running");
+        assert!(free.is_none());
+        assert!(done.is_none());
     }
 
     #[tokio::test]

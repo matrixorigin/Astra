@@ -64,9 +64,9 @@ pub(super) async fn build_runtime_wiring(
         settings.matrixone.clone(),
         Arc::clone(run_encryptor),
         state.edge_callback_ledger.clone(),
+        run_engine,
     )
     .with_pool(shared_pool.clone())
-    .with_run_engine(run_engine)
     .with_delegation_engine(Arc::clone(&delegation_engine))
     .with_edge_connection_pool(state.edge_connection_pool.clone())
     .with_resource_governor(resource_governor.clone())
