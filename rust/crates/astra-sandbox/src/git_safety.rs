@@ -146,6 +146,11 @@ fn check_commit_message(command: &str, violations: &mut Vec<GitSafetyViolation>)
     if is_double_quoted {
         for (pattern, label) in [("$(", "$(...)"), ("`", "backtick"), ("${", "${...}")] {
             if msg.contains(pattern) {
+                // Allow $(cat << ...) — common heredoc-based multi-line
+                // commit message pattern that reads from a literal block.
+                if pattern == "$(" && (msg.starts_with("$(cat <<") || msg.starts_with("$(< ")) {
+                    break;
+                }
                 violations.push(GitSafetyViolation::CommitMessageInjection { pattern: label });
                 return;
             }

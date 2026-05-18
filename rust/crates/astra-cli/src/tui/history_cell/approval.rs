@@ -7,7 +7,7 @@
 //!   rm -rf /tmp/scratch
 //!   destructive path outside cwd
 //!
-//! ▸ Allow once    Always allow this command pattern in workspace    Reject
+//! ▸ Allow once    Always allow    Reject
 //!   ← → navigate · Enter confirm · Esc reject
 //! ```
 //!
@@ -383,9 +383,9 @@ impl ApprovalCell {
                 spans.push(Span::styled(text, sel_style));
             } else if disabled {
                 let text = if last {
-                    format!(" {}×", btn.label)
+                    format!(" {}", btn.label)
                 } else {
-                    format!(" {}× ", btn.label)
+                    format!(" {} ", btn.label)
                 };
                 spans.push(Span::styled(text, Style::default().fg(Color::DarkGray)));
             } else {
@@ -492,10 +492,7 @@ impl HistoryCell for ApprovalCell {
         if let Some(preview) = &self.remember_preview {
             lines.push(Line::from(vec![
                 bar.clone(),
-                Span::styled(
-                    "Always allow this command pattern in workspace: ".to_string(),
-                    muted,
-                ),
+                Span::styled("Remember: ".to_string(), muted),
                 Span::styled(preview.clone(), body_style.add_modifier(Modifier::BOLD)),
             ]));
         }
@@ -527,20 +524,14 @@ impl HistoryCell for ApprovalCell {
 
         // Keep high-risk persistence disabled in plain language; the
         // UI should not expose old scope internals.
-        if self.always_disabled_reason().is_some() {
-            let reason_text = self.always_disabled_reason().unwrap_or_default();
+        if let Some(reason_text) = self.always_disabled_reason() {
             lines.push(Line::from(vec![
                 bar.clone(),
                 Span::styled(
-                    "Always disabled".to_string(),
+                    format!("Can't save: {reason_text}"),
                     Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(": ".to_string(), Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    reason_text.to_string(),
-                    Style::default().fg(Color::DarkGray),
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
                 ),
             ]));
         }
@@ -558,7 +549,7 @@ impl HistoryCell for ApprovalCell {
         // style. Unfocused: plain border close — the user isn't
         // looking at this card for actions yet.
         let bottom = if self.focused {
-            let hint = "↑↓←→ select · Enter confirm · Esc reject · Ctrl+Enter quick accept";
+            let hint = "←→ select · Enter confirm · Esc reject";
             Line::from(vec![
                 Span::styled("╰─ ".to_string(), accent_style),
                 Span::styled(hint.to_string(), muted),
@@ -626,12 +617,12 @@ mod tests {
         // Hint is advertised on the bottom border for focused cells,
         // including every key binding the user can reach.
         assert!(
-            rendered.contains("↑↓←→ select"),
+            rendered.contains("←→ select"),
             "arrow-key hint missing on focused cell"
         );
         assert!(
-            rendered.contains("Ctrl+Enter"),
-            "Ctrl+Enter shortcut hint missing on focused cell"
+            rendered.contains("Esc reject"),
+            "Esc reject shortcut hint missing on focused cell"
         );
     }
 
@@ -652,7 +643,7 @@ mod tests {
         assert!(rendered.contains("╰─"));
         // But the action hint is reserved for the focused cell.
         assert!(
-            !rendered.contains("↑↓←→ select"),
+            !rendered.contains("←→ select"),
             "unfocused cell should not advertise actions"
         );
     }
@@ -697,9 +688,7 @@ mod tests {
         .with_remember_preview("similar `npm test` commands in this workspace");
         let rendered = render(&cell);
         assert!(
-            rendered.contains(
-                "Always allow this command pattern in workspace: similar `npm test` commands in this workspace"
-            ),
+            rendered.contains("Remember: similar `npm test` commands in this workspace"),
             "expected remember preview line, got:\n{rendered}"
         );
         assert!(
@@ -781,7 +770,7 @@ mod tests {
         let rendered = render(&cell);
         assert!(!rendered.contains("⚑ "), "no risk badge expected");
         assert!(
-            !rendered.contains("Always allow this command pattern in workspace:"),
+            !rendered.contains("Remember:"),
             "no remember-preview row expected"
         );
         assert!(!rendered.contains("[agent:"), "no agent chip expected");
@@ -948,7 +937,7 @@ mod tests {
         .with_risk_tag_labels(vec!["GitDestructive".into()]);
         let rendered = render(&cell);
         assert!(
-            rendered.contains("Always disabled: git destructive"),
+            rendered.contains("Can't save: git destructive"),
             "destructive cell must advertise the disabled-Always state, got:\n{rendered}"
         );
     }

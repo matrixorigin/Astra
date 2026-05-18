@@ -99,7 +99,7 @@ To auto-allow sensitive paths across sessions, set allow_sensitive_path_writes=t
     if !workspace_persistence_available {
         return format!("  ✓ {remember_preview}: allowed for this session");
     }
-    format!("  ✓ Always allow this command pattern in workspace: {remember_preview}")
+    format!("  ✓ Remember: {remember_preview}")
 }
 
 /// Canonicalize an existing path, or a missing path whose parent chain
@@ -3583,7 +3583,7 @@ mod tests {
         );
         assert_eq!(
             out,
-            "  ✓ Always allow this command pattern in workspace: the `cargo test` command family in this workspace"
+            "  ✓ Remember: the `cargo test` command family in this workspace"
         );
     }
 

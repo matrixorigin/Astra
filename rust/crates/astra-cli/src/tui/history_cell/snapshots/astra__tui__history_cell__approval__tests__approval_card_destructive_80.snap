@@ -6,7 +6,7 @@ expression: "render_at(&cell, 80)"
 │ ⚑ WritesOutsideWorkspace  ⚑ WritesSensitiveFile
 │ /etc/hosts
 │ ⚠ writes outside workspace
-│ Always disabled: outside workspace
+│ Can't save: outside workspace
 │
-│  Allow once   Always allow this command pattern in workspace×   Reject
-╰─ ↑↓←→ select · Enter confirm · Esc reject · Ctrl+Enter quick accept
+│  Allow once   Always allow   Reject
+╰─ ←→ select · Enter confirm · Esc reject
