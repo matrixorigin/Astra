@@ -138,6 +138,7 @@ pub fn lifecycle_server_capabilities(
 ) -> astra_turn_core::capability::CapabilitySet {
     use astra_turn_core::capability::{Capability, CapabilitySet};
     CapabilitySet::empty()
+        .with(Capability::AgentSpawner)
         .with(Capability::MemoryService)
         .with_if(database_pool_present, Capability::Database)
         .with(Capability::SkillsCatalog)
@@ -146,9 +147,6 @@ pub fn lifecycle_server_capabilities(
 }
 
 /// Production-truth server `CapabilitySet` derived from [`crate::app_state::AppState`].
-///
-/// `AgentSpawner` intentionally stays off until `ServerToolExecutor` has a
-/// wired dispatch path for `agent(action='spawn'|'get_result')`.
 pub fn server_capabilities_from(
     state: &crate::app_state::AppState,
 ) -> astra_turn_core::capability::CapabilitySet {
@@ -620,11 +618,11 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_capabilities_omit_agent_spawner_until_dispatch_exists() {
+    fn lifecycle_capabilities_include_agent_spawner() {
         let caps = lifecycle_server_capabilities(true);
         assert!(
-            !caps.has(astra_turn_core::capability::Capability::AgentSpawner),
-            "server lifecycle must not advertise AgentSpawner until server executor dispatches agent.spawn"
+            caps.has(astra_turn_core::capability::Capability::AgentSpawner),
+            "server lifecycle should advertise AgentSpawner because ServerToolExecutor dispatches agent.spawn"
         );
     }
 
@@ -637,12 +635,12 @@ mod tests {
     }
 
     #[test]
-    fn web_resolve_with_lifecycle_caps_does_not_advertise_agent() {
+    fn web_resolve_with_lifecycle_caps_advertises_agent() {
         let caps = lifecycle_server_capabilities(true);
         let names = names(server_runtime_tool_schemas(&caps));
         assert!(
-            !names.contains(&"agent".to_string()),
-            "production lifecycle must not advertise agent — got {names:?}"
+            names.contains(&"agent".to_string()),
+            "production lifecycle should advertise agent — got {names:?}"
         );
     }
 

@@ -223,6 +223,13 @@ pub async fn run_chat_run_pause_resume_http() {
             "message": "matrix e2e background run",
             "session_id": session_id,
             "model": mock_model,
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "full_text": "matrix e2e pause/resume completed"
+                    }
+                ]
+            },
             "execution_budget": {
                 "initial_turns": 1,
                 "hard_turn_limit": 1
