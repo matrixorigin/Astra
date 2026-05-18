@@ -38,8 +38,8 @@ fn turn_active_replaces_hints_with_interrupt_prompt() {
     };
     let plain = StatusLine::from_context(&c).plain();
     assert!(
-        plain.contains("interrupt"),
-        "active turn should mention Ctrl+C interrupt; got {plain:?}"
+        !plain.contains("Ctrl+C interrupt"),
+        "active turn should NOT show Ctrl+C interrupt; got {plain:?}"
     );
     assert!(
         !plain.contains("Ctrl+O transcript"),
@@ -48,7 +48,7 @@ fn turn_active_replaces_hints_with_interrupt_prompt() {
 }
 
 #[test]
-fn active_turn_without_objective_renders_interrupt_once() {
+fn active_turn_without_objective_renders_no_interrupt() {
     let c = StatusContext {
         turn_active: true,
         ..ctx()
@@ -56,8 +56,8 @@ fn active_turn_without_objective_renders_interrupt_once() {
     let plain = StatusLine::from_context(&c).plain();
     assert_eq!(
         plain.matches("Ctrl+C interrupt").count(),
-        1,
-        "fallback interrupt hint must not render twice; got {plain:?}"
+        0,
+        "interrupt hint must not render in status line; got {plain:?}"
     );
 }
 
@@ -79,8 +79,8 @@ fn active_turn_surfaces_objective_and_elapsed() {
         "elapsed time should render; got {plain:?}"
     );
     assert!(
-        plain.contains("Ctrl+C interrupt"),
-        "interrupt hint should remain visible; got {plain:?}"
+        !plain.contains("Ctrl+C interrupt"),
+        "interrupt hint should NOT appear in status line; got {plain:?}"
     );
 }
 
@@ -156,11 +156,10 @@ fn auto_mode_renders_yellow_chip() {
         .find(|seg| seg.text == "auto")
         .expect("auto chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Yellow));
-    assert!(
-        chip.style
-            .add_modifier
-            .contains(ratatui::style::Modifier::BOLD)
-    );
+    assert!(chip
+        .style
+        .add_modifier
+        .contains(ratatui::style::Modifier::BOLD));
 }
 
 #[test]
@@ -176,11 +175,10 @@ fn accept_edits_mode_renders_cyan_chip() {
         .find(|seg| seg.text == "edit")
         .expect("accept_edits chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Cyan));
-    assert!(
-        chip.style
-            .add_modifier
-            .contains(ratatui::style::Modifier::BOLD)
-    );
+    assert!(chip
+        .style
+        .add_modifier
+        .contains(ratatui::style::Modifier::BOLD));
 }
 
 #[test]
@@ -196,11 +194,10 @@ fn plan_mode_renders_blue_chip() {
         .find(|seg| seg.text == "plan")
         .expect("plan chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Blue));
-    assert!(
-        chip.style
-            .add_modifier
-            .contains(ratatui::style::Modifier::BOLD)
-    );
+    assert!(chip
+        .style
+        .add_modifier
+        .contains(ratatui::style::Modifier::BOLD));
 }
 
 #[test]
@@ -216,11 +213,10 @@ fn deny_mode_renders_red_chip() {
         .find(|seg| seg.text == "deny")
         .expect("deny chip");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Red));
-    assert!(
-        chip.style
-            .add_modifier
-            .contains(ratatui::style::Modifier::BOLD)
-    );
+    assert!(chip
+        .style
+        .add_modifier
+        .contains(ratatui::style::Modifier::BOLD));
 }
 
 // ─── Right-side segments: model · dir · tokens · cost · branch ────
@@ -421,12 +417,10 @@ fn pending_chip_is_yellow_without_extra_bold() {
         .find(|seg| seg.text.contains("pending"))
         .expect("pending chip");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Yellow));
-    assert!(
-        !chip
-            .style
-            .add_modifier
-            .contains(ratatui::style::Modifier::BOLD)
-    );
+    assert!(!chip
+        .style
+        .add_modifier
+        .contains(ratatui::style::Modifier::BOLD));
 }
 
 // ── Phase 3b.2: background task chip ────────────────────────────────

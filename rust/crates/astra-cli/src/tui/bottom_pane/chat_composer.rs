@@ -51,7 +51,7 @@ pub(crate) struct ChatComposer {
 /// expect URLs and one-liners to appear verbatim.
 const PASTE_INLINE_MAX_CHARS: usize = 800;
 const PASTE_INLINE_MAX_LINES: usize = 2;
-const COMPOSER_PLACEHOLDER: &str = "Ask astra to do anything  · Ctrl+E editor";
+const COMPOSER_PLACEHOLDER: &str = "Ask astra to do anything  · Ctrl+E editor  · Ctrl+C interrupt";
 
 impl ChatComposer {
     pub fn new() -> Self {

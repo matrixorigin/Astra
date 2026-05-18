@@ -139,31 +139,29 @@ impl StatusLine {
         let hint_text = if let Some(objective) = active_objective.clone() {
             objective
         } else if ctx.turn_active {
-            "Ctrl+C interrupt".to_string()
+            String::new()
         } else {
             IDLE_HINT_FULL.to_string()
         };
         let active_hint_style = Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD);
-        out.left.push(Segment::styled(
-            hint_text,
-            if ctx.turn_active {
-                active_hint_style
-            } else {
-                hint
-            },
-        ));
+        if !hint_text.is_empty() {
+            out.left.push(Segment::styled(
+                hint_text,
+                if ctx.turn_active {
+                    active_hint_style
+                } else {
+                    hint
+                },
+            ));
+        }
 
         if ctx.turn_active
             && let Some(elapsed) = ctx.turn_elapsed
         {
             out.left
                 .push(Segment::styled(format_duration_compact(elapsed), muted));
-        }
-
-        if active_objective.is_some() {
-            out.left.push(Segment::styled("Ctrl+C interrupt", muted));
         }
 
         match ctx.permission_mode {
@@ -392,8 +390,7 @@ impl StatusLine {
         let Some(first) = self.left.first() else {
             return self.left.clone();
         };
-        // Only degrade the known idle-hint strings. `Ctrl+C interrupt`
-        // during an active turn is already short; leave untouched.
+        // Only degrade the known idle-hint strings.
         if first.text != IDLE_HINT_FULL {
             return self.left.clone();
         }
