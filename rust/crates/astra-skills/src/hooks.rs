@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 const TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT: u32 = 3;
+const TOOL_HOOK_CIRCUIT_BREAKER_SKIP_MATCHES: u32 = 3;
 
 // ── Skill lifecycle hooks (existing) ─────────────────────────────────────
 
@@ -219,7 +220,7 @@ pub struct ToolEventHookRegistry {
     hooks: Vec<ToolEventHook>,
     /// Track which `once` hooks have already fired (by index in `hooks`).
     fired_once: std::sync::Mutex<std::collections::HashSet<usize>>,
-    tripped_circuits: std::sync::Mutex<std::collections::HashSet<usize>>,
+    tripped_circuits: std::sync::Mutex<std::collections::HashMap<usize, u32>>,
     consecutive_failures: std::sync::Mutex<std::collections::HashMap<usize, u32>>,
 }
 
@@ -228,7 +229,7 @@ impl ToolEventHookRegistry {
         Self {
             hooks,
             fired_once: std::sync::Mutex::new(std::collections::HashSet::new()),
-            tripped_circuits: std::sync::Mutex::new(std::collections::HashSet::new()),
+            tripped_circuits: std::sync::Mutex::new(std::collections::HashMap::new()),
             consecutive_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -244,7 +245,7 @@ impl ToolEventHookRegistry {
 
     fn matching_indexed(&self, event: ToolEventKind, tool_name: &str) -> Vec<(usize, &ToolEventHook)> {
         let fired = self.fired_once.lock().unwrap_or_else(|e| e.into_inner());
-        let tripped = self
+        let mut tripped = self
             .tripped_circuits
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -253,10 +254,21 @@ impl ToolEventHookRegistry {
             .iter()
             .enumerate()
             .filter(|(i, h)| {
+                let circuit_open = match tripped.get_mut(i) {
+                    Some(remaining) if *remaining > 0 => {
+                        *remaining -= 1;
+                        true
+                    }
+                    Some(_) => {
+                        tripped.remove(i);
+                        false
+                    }
+                    None => false,
+                };
                 h.event == event
                     && h.matches_tool(tool_name)
                     && !(h.once && fired.contains(i))
-                    && !tripped.contains(i)
+                    && !circuit_open
             })
             .collect();
         result.sort_by_key(|(_, h)| h.priority);
@@ -291,6 +303,12 @@ impl ToolEventHookRegistry {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         failures.remove(&index);
+        drop(failures);
+        let mut tripped = self
+            .tripped_circuits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        tripped.remove(&index);
     }
 
     fn note_hook_failure(&self, index: usize) -> bool {
@@ -303,12 +321,14 @@ impl ToolEventHookRegistry {
         if *failure_count < TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT {
             return false;
         }
+        failures.remove(&index);
         drop(failures);
         let mut tripped = self
             .tripped_circuits
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        tripped.insert(index)
+        tripped.insert(index, TOOL_HOOK_CIRCUIT_BREAKER_SKIP_MATCHES);
+        true
     }
 }
 
@@ -2055,8 +2075,17 @@ mod tests {
             "failing hooks should fail open after the circuit breaker trips"
         );
 
-        let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
-        assert_eq!(decision, PreToolDecision::Allow);
+        for _ in 0..TOOL_HOOK_CIRCUIT_BREAKER_SKIP_MATCHES {
+            let decision =
+                evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+            assert_eq!(decision, PreToolDecision::Allow);
+        }
+
+        let retried = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+        match retried {
+            PreToolDecision::Block(reason) => assert!(reason.contains("not JSON")),
+            _ => panic!("expected breaker to retry the hook after suppression window"),
+        }
     }
 
     #[tokio::test]

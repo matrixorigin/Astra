@@ -190,22 +190,38 @@ impl CostLedger {
         let content = self
             .to_json_lines()
             .map_err(CostLedgerStoreError::Serialize)?;
-        std::fs::write(path, content).map_err(|source| CostLedgerStoreError::Write {
-            path: path.to_path_buf(),
+        let tmp_path = temporary_ledger_path(path);
+        std::fs::write(&tmp_path, content).map_err(|source| CostLedgerStoreError::Write {
+            path: tmp_path.clone(),
             source,
         })?;
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .open(path)
+            .open(&tmp_path)
             .map_err(|source| CostLedgerStoreError::Open {
-                path: path.to_path_buf(),
+                path: tmp_path.clone(),
                 source,
             })?;
         file.sync_data()
             .map_err(|source| CostLedgerStoreError::Write {
-                path: path.to_path_buf(),
+                path: tmp_path.clone(),
                 source,
             })?;
+        std::fs::rename(&tmp_path, path).map_err(|source| CostLedgerStoreError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if let Some(parent) = path.parent() {
+            let dir = std::fs::File::open(parent).map_err(|source| CostLedgerStoreError::Open {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+            dir.sync_data()
+                .map_err(|source| CostLedgerStoreError::Write {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+        }
         Ok(())
     }
 
@@ -219,7 +235,7 @@ impl CostLedger {
                 path: path_buf,
                 source,
             })?;
-        Self::from_json_lines(session_id, &content)
+        Self::from_json_lines_recovering_tail(session_id, &content)
     }
 
     #[must_use]
@@ -237,17 +253,50 @@ impl CostLedger {
         session_id: impl Into<String>,
         lines: &str,
     ) -> Result<Self, CostLedgerLoadError> {
+        Self::parse_json_lines(session_id, lines, false)
+    }
+
+    fn from_json_lines_recovering_tail(
+        session_id: impl Into<String>,
+        lines: &str,
+    ) -> Result<Self, CostLedgerLoadError> {
+        Self::parse_json_lines(session_id, lines, true)
+    }
+
+    fn parse_json_lines(
+        session_id: impl Into<String>,
+        lines: &str,
+        allow_partial_final_line: bool,
+    ) -> Result<Self, CostLedgerLoadError> {
         let mut ledger = Self::new(session_id);
-        for (idx, line) in lines.lines().enumerate() {
+        let mut iter = lines.lines().enumerate().peekable();
+        while let Some((idx, line)) = iter.next() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
             let entry: CostLedgerEntry =
-                serde_json::from_str(trimmed).map_err(|source| CostLedgerLoadError::Parse {
-                    line: idx + 1,
-                    source,
-                })?;
+                match serde_json::from_str(trimmed) {
+                    Ok(entry) => entry,
+                    Err(_source)
+                        if allow_partial_final_line
+                            && iter.peek().is_none()
+                            && looks_like_partial_json_line(trimmed) =>
+                    {
+                        tracing::warn!(
+                            target: "cost_ledger",
+                            "Recovering cost ledger by ignoring truncated final line {}",
+                            idx + 1
+                        );
+                        break;
+                    }
+                    Err(source) => {
+                        return Err(CostLedgerLoadError::Parse {
+                            line: idx + 1,
+                            source,
+                        });
+                    }
+                };
             ledger
                 .append(entry)
                 .map_err(|source| CostLedgerLoadError::Ledger {
@@ -333,6 +382,24 @@ fn price_tokens(tokens: u64, rate_per_million: f64) -> f64 {
     (tokens as f64 / TOKENS_PER_MILLION) * rate_per_million
 }
 
+fn temporary_ledger_path(path: &Path) -> PathBuf {
+    let mut extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_string)
+        .unwrap_or_default();
+    if !extension.is_empty() {
+        extension.push('.');
+    }
+    extension.push_str("tmp");
+    path.with_extension(extension)
+}
+
+fn looks_like_partial_json_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('{') && !trimmed.ends_with('}')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +451,24 @@ mod tests {
         ledger.save_to_path(&path).unwrap();
         let restored = CostLedger::load_from_path("s1", &path).unwrap();
 
+        assert_eq!(restored.entries(), ledger.entries());
+        assert!(!temporary_ledger_path(&path).exists());
+    }
+
+    #[test]
+    fn load_from_path_recovers_truncated_final_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cost/ledger.jsonl");
+        let mut ledger = CostLedger::new("s1");
+        ledger
+            .append(entry("t1", "root", None, "claude", 0.10))
+            .unwrap();
+        let mut content = ledger.to_json_lines().unwrap();
+        content.push_str("{\"session_id\":\"s1\"");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+
+        let restored = CostLedger::load_from_path("s1", &path).unwrap();
         assert_eq!(restored.entries(), ledger.entries());
     }
 

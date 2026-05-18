@@ -59,9 +59,13 @@ fn command_family(command: &str) -> Option<String> {
             break;
         }
     }
-    tokens
+    let family = tokens
         .next()
-        .map(|s| s.trim_matches('"').to_ascii_lowercase())
+        .map(|s| s.trim_matches('"').to_ascii_lowercase())?;
+    if is_test_runner_family(&family) && command_contains_word(command, "test") {
+        return Some("test".to_string());
+    }
+    Some(family)
 }
 
 fn is_env_assignment(token: &str) -> bool {
@@ -79,6 +83,13 @@ fn command_contains_word(command: &str, needle: &str) -> bool {
     command
         .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_')
         .any(|word| word == needle)
+}
+
+fn is_test_runner_family(family: &str) -> bool {
+    matches!(
+        family,
+        "cargo" | "go" | "npm" | "pnpm" | "yarn" | "bun" | "pytest" | "uv" | "poetry"
+    )
 }
 
 #[cfg(test)]
@@ -99,6 +110,10 @@ mod tests {
             "git diff --quiet",
             "test -f missing",
             "[ -f missing ]",
+            "cargo test",
+            "go test ./...",
+            "npm test",
+            "pnpm test",
         ] {
             let semantics = classify_exit(command, 1);
             assert_eq!(semantics, ExitSemantics::DomainNegative, "{command}");

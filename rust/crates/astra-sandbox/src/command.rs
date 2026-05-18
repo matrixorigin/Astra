@@ -436,8 +436,7 @@ fn download_output_target(command: &str) -> Option<String> {
 
 fn redirected_write_target(command: &str) -> Option<String> {
     let mut scan_from = 0;
-    while let Some(found) = command[scan_from..].find('>') {
-        let op_index = scan_from + found;
+    while let Some(op_index) = next_redirect_operator(command, scan_from) {
         let bytes = command.as_bytes();
         let mut target_index = op_index + 1;
         if bytes.get(target_index) == Some(&b'>') {
@@ -458,6 +457,31 @@ fn redirected_write_target(command: &str) -> Option<String> {
             return Some(target.to_string());
         }
         scan_from = target_index;
+    }
+    None
+}
+
+fn next_redirect_operator(command: &str, scan_from: usize) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut idx = scan_from;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'>' if !in_single && !in_double => {
+                let previous = idx.checked_sub(1).and_then(|i| bytes.get(i)).copied();
+                let next = bytes.get(idx + 1).copied();
+                if matches!(previous, Some(b'=' | b'-')) || matches!(next, Some(b'=')) {
+                    idx += 1;
+                    continue;
+                }
+                return Some(idx);
+            }
+            _ => {}
+        }
+        idx += 1;
     }
     None
 }
@@ -747,6 +771,8 @@ mod tests {
             "cp -p report.txt reports/out.txt",
             "curl -o reports/payload.tgz https://example.com/payload.tgz",
             "rsync build/out.txt reports/out.txt",
+            "python -c \"print('> ../outside.txt')\"",
+            "test 5 >= 3",
         ] {
             let risks = analyze_command_risks(command);
             assert!(

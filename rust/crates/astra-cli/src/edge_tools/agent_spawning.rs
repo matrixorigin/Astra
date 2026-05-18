@@ -185,7 +185,10 @@ fn normalize_spawn_agent_args(args: &Value) -> Result<Value, String> {
     let description = non_empty_string(obj.get("description")).map(str::to_string);
     let prompt = non_empty_string(obj.get("prompt")).map(str::to_string);
     if description.is_none() && prompt.is_none() {
-        return Err("missing required field `prompt` or `description`".to_string());
+        return Err(
+            "agent.spawn requires a non-empty `description` or `prompt`; if one is omitted, it is derived from the other."
+                .to_string(),
+        );
     }
 
     if description.is_none() {
