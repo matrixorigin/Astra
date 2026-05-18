@@ -899,14 +899,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        // Checkpoint should be set after preparation phase
-        assert!(
-            run.checkpoint_json.is_some(),
-            "expected checkpoint to be persisted"
-        );
-        let cp: serde_json::Value =
-            serde_json::from_str(run.checkpoint_json.as_ref().unwrap()).unwrap();
+        // Typed checkpoint should be set after preparation phase
+        let checkpoint = run_engine
+            .load_latest_checkpoint(&report.parent_run_id, Some("phase"))
+            .await
+            .unwrap()
+            .expect("expected typed checkpoint to be persisted");
+        let cp: serde_json::Value = serde_json::from_str(&checkpoint.checkpoint_json).unwrap();
         assert_eq!(cp["phase"], "prepared");
+        assert_eq!(run.status, "completed");
     }
 
     #[tokio::test]

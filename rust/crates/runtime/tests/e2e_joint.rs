@@ -14,10 +14,12 @@ use astra_services::runs::{
     RunInputData, RunInputRecord, RunLifecycleService, RunListRecord, RunMutationRecord,
     RunStateStore, RunStatusRecord,
 };
+use astra_services::session_workspace::{WorkspaceMetadata, persist_remote_workspace};
 use astra_services::{
     BubbleUpTarget, COMPACTION_INVARIANT_SQL, ConfidenceAction, ContextManifestItemWrite,
     ContextManifestWrite, DatabaseContextManifestStore, DatabaseRunStateStore,
-    DatabaseStateProjectionStore, DelegationProjectionUpsert, next_action_confidence_action,
+    DatabaseSessionArtifactStore, DatabaseStateProjectionStore, DelegationProjectionUpsert,
+    SessionArtifactJsonRecord, SessionArtifactJsonStore, next_action_confidence_action,
 };
 use async_trait::async_trait;
 use axum::{Json, Router, http::HeaderMap, http::StatusCode};
@@ -1579,10 +1581,51 @@ async fn e2e_joint_4_s10_five_level_delegation_bubble_up_and_retry_node() {
 #[ignore = "e2e_joint"]
 async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
     let pool = setup_pool().await;
+    let matrixone = require_db_it_env();
     let user_id = id("user");
     let session_id = id("session");
     let run_id = id("run");
     insert_session(&pool, &user_id, &session_id).await;
+    let mut workspace = WorkspaceMetadata::with_context(
+        &session_id,
+        "gpt-5.4",
+        "/tmp/joint-workspace",
+        Some("main"),
+    );
+    workspace.git_root = Some("/tmp/joint-workspace".to_string());
+    workspace.git_head = Some("deadbeef".to_string());
+    persist_remote_workspace(
+        &workspace,
+        &user_id,
+        &DatabaseSessionArtifactStore::new(matrixone).with_pool(pool.clone()),
+    )
+    .await
+    .expect("S14 workspace metadata artifact insert must succeed");
+    insert_state_item(
+        &pool,
+        &user_id,
+        &session_id,
+        &run_id,
+        "todo_state",
+        "resume-ui",
+        1,
+    )
+    .await;
+    DatabaseSessionArtifactStore::new(require_db_it_env())
+        .with_pool(pool.clone())
+        .persist_json_artifact(SessionArtifactJsonRecord {
+            artifact_id: id("artifact"),
+            session_id: session_id.clone(),
+            user_id: user_id.clone(),
+            artifact_kind: "llm_capture".to_string(),
+            source: Some("e2e_joint".to_string()),
+            turn: Some(1),
+            round: None,
+            content: json!({"preview": "capture"}),
+            metadata: Some(json!({"kind": "preview"})),
+        })
+        .await
+        .expect("S14 artifact preview seed insert must succeed");
     let store = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("joint-device");
     store
         .insert_run(durable_record(&run_id, &session_id, &user_id))
@@ -1612,6 +1655,43 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
         .await
         .expect("S14 transcript seed insert must succeed");
     }
+    DatabaseContextManifestStore::new(pool.clone())
+        .save_manifest(
+            ContextManifestWrite {
+                manifest_id: id("manifest"),
+                user_id: user_id.clone(),
+                session_id: session_id.clone(),
+                run_id: Some(run_id.clone()),
+                turn_id: format!("{run_id}:turn-1"),
+                model_provider: "openai".to_string(),
+                model_name: "gpt-5.4".to_string(),
+                context_window_tokens: 8000,
+                max_output_tokens: 512,
+                total_estimated_tokens: 321,
+                policy_version: "context_manifest_v1".to_string(),
+                tokenizer_id: Some("estimated_v1".to_string()),
+                budget_template_id: Some("budget_v1_8k".to_string()),
+                turn_intent: Some("resume".to_string()),
+                reason: "initial_turn".to_string(),
+                manifest_json: json!({"source": "e2e_joint_s14"}),
+            },
+            vec![ContextManifestItemWrite {
+                session_id: session_id.clone(),
+                item_order: 0,
+                zone: "session_anchor".to_string(),
+                source_table: "session_state_items".to_string(),
+                source_id: "anchor-1".to_string(),
+                source_hash: None,
+                included: true,
+                token_estimate: 321,
+                budget_tokens: 400,
+                reason: "initial_turn".to_string(),
+                render_mode: "summary".to_string(),
+                raw_ref: None,
+            }],
+        )
+        .await
+        .expect("S14 context manifest insert must succeed");
 
     let shared_store = Arc::new(RwLock::new(store));
     let app = build_joint_app(pool.clone(), user_id.clone(), shared_store);
@@ -1637,6 +1717,55 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
         assert!(
             state.pointer("/active_run/run_id").and_then(Value::as_str) == Some(run_id.as_str()),
             "S14 cold-start must return active_run for device {device_idx}; state={state}"
+        );
+        assert_eq!(
+            state
+                .pointer("/workspace_authority/cwd")
+                .and_then(Value::as_str),
+            Some("/tmp/joint-workspace"),
+            "S14 bounded session state must include durable workspace authority; state={state}"
+        );
+        assert_eq!(
+            state
+                .pointer("/workspace_authority/git_head")
+                .and_then(Value::as_str),
+            Some("deadbeef"),
+            "S14 bounded session state must expose workspace git head for resume/debug; state={state}"
+        );
+        assert_eq!(
+            state
+                .pointer("/latest_context_manifest/reason")
+                .and_then(Value::as_str),
+            Some("initial_turn"),
+            "S14 bounded session state must include latest context manifest summary; state={state}"
+        );
+        assert_eq!(
+            state
+                .pointer("/latest_context_manifest/total_estimated_tokens")
+                .and_then(Value::as_u64),
+            Some(321),
+            "S14 bounded session state must surface manifest token estimate; state={state}"
+        );
+        assert_eq!(
+            state
+                .pointer("/state_summary/0/category")
+                .and_then(Value::as_str),
+            Some("todo_state"),
+            "S14 bounded session state must summarize active session state categories; state={state}"
+        );
+        assert_eq!(
+            state
+                .pointer("/state_summary/0/count")
+                .and_then(Value::as_u64),
+            Some(1),
+            "S14 bounded session state must count active/backlog state items; state={state}"
+        );
+        assert_eq!(
+            state
+                .pointer("/artifact_previews/0/artifact_kind")
+                .and_then(Value::as_str),
+            Some("llm_capture"),
+            "S14 bounded session state must include recent non-workspace artifact previews; state={state}"
         );
         let transcript: Value = client
             .get(format!(

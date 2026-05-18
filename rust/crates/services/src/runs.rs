@@ -361,6 +361,20 @@ pub struct DurableRunRecord {
     pub updated_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableRunCheckpointRecord {
+    pub checkpoint_id: String,
+    pub run_id: String,
+    pub user_id: String,
+    pub session_id: String,
+    pub node_seq: i64,
+    pub checkpoint_kind: String,
+    pub checkpoint_version: String,
+    pub idempotency_key: String,
+    pub checkpoint_json: String,
+    pub created_at: String,
+}
+
 /// Abstraction for durable run persistence.
 ///
 /// Implementations:
@@ -394,6 +408,13 @@ pub trait RunStateStore: Send + Sync {
 
     /// Save checkpoint JSON for crash recovery.
     async fn save_checkpoint(&self, run_id: &str, checkpoint_json: &str) -> Result<bool, String>;
+
+    /// Load the newest checkpoint for a run, optionally filtered by kind.
+    async fn load_latest_checkpoint(
+        &self,
+        run_id: &str,
+        checkpoint_kind: Option<&str>,
+    ) -> Result<Option<DurableRunCheckpointRecord>, String>;
 
     /// Append an event to the run's event log.
     async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String>;
@@ -429,6 +450,8 @@ pub trait RunStateStore: Send + Sync {
 /// In-memory run state store for tests and single-process deployments.
 pub struct InMemoryRunStateStore {
     runs: tokio::sync::RwLock<std::collections::HashMap<String, DurableRunRecord>>,
+    checkpoints:
+        tokio::sync::RwLock<std::collections::HashMap<String, Vec<DurableRunCheckpointRecord>>>,
 }
 
 impl InMemoryRunStateStore {
@@ -439,6 +462,7 @@ impl InMemoryRunStateStore {
     pub fn new() -> Self {
         Self {
             runs: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            checkpoints: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -451,6 +475,43 @@ impl Default for InMemoryRunStateStore {
 
 fn run_blocks_session(status: &str, waiting_for: Option<&str>) -> bool {
     matches!(status, "running" | "waiting") || (status == "paused" && waiting_for.is_some())
+}
+
+fn checkpoint_metadata(
+    run_id: &str,
+    checkpoint_json: &str,
+) -> Result<(String, String, String), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(checkpoint_json).map_err(|error| error.to_string())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "checkpoint payload must be a JSON object".to_string())?;
+    let checkpoint_version = object
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("checkpoint_unversioned_v1")
+        .to_string();
+    let checkpoint_kind = if object
+        .get("graceful")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        "resume"
+    } else if object.contains_key("phase") {
+        "phase"
+    } else {
+        "generic"
+    }
+    .to_string();
+    let idempotency_key = object
+        .get("last_batch_id")
+        .and_then(serde_json::Value::as_str)
+        .map(|batch_id| format!("checkpoint:{run_id}:{checkpoint_kind}:{batch_id}"))
+        .unwrap_or_else(|| {
+            let hash = sha256_hex(checkpoint_json.as_bytes());
+            format!("checkpoint:{run_id}:{checkpoint_kind}:{hash}")
+        });
+    Ok((checkpoint_kind, checkpoint_version, idempotency_key))
 }
 
 #[async_trait]
@@ -533,12 +594,60 @@ impl RunStateStore for InMemoryRunStateStore {
     async fn save_checkpoint(&self, run_id: &str, checkpoint_json: &str) -> Result<bool, String> {
         let mut runs = self.runs.write().await;
         if let Some(run) = runs.get_mut(run_id) {
+            let (checkpoint_kind, checkpoint_version, idempotency_key) =
+                checkpoint_metadata(run_id, checkpoint_json)?;
             run.checkpoint_json = Some(checkpoint_json.to_string());
+            run.checkpoint_version = Some(checkpoint_version.clone());
             run.updated_at = chrono::Utc::now().to_rfc3339();
+            let checkpoint = DurableRunCheckpointRecord {
+                checkpoint_id: uuid::Uuid::now_v7().to_string(),
+                run_id: run.run_id.clone(),
+                user_id: run.user_id.clone(),
+                session_id: run.session_id.clone(),
+                node_seq: run.last_event_idx.max(0),
+                checkpoint_kind,
+                checkpoint_version,
+                idempotency_key,
+                checkpoint_json: checkpoint_json.to_string(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            let mut checkpoints = self.checkpoints.write().await;
+            let entries = checkpoints.entry(run_id.to_string()).or_default();
+            if let Some(existing) = entries
+                .iter_mut()
+                .find(|entry| entry.idempotency_key == checkpoint.idempotency_key)
+            {
+                *existing = checkpoint;
+            } else {
+                entries.push(checkpoint);
+            }
             Ok(true)
         } else {
             Ok(false)
         }
+    }
+
+    async fn load_latest_checkpoint(
+        &self,
+        run_id: &str,
+        checkpoint_kind: Option<&str>,
+    ) -> Result<Option<DurableRunCheckpointRecord>, String> {
+        let checkpoints = self.checkpoints.read().await;
+        let mut matches = checkpoints
+            .get(run_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|checkpoint| {
+                checkpoint_kind.is_none_or(|kind| checkpoint.checkpoint_kind == kind)
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.checkpoint_id.cmp(&a.checkpoint_id))
+        });
+        Ok(matches.into_iter().next())
     }
 
     async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String> {
@@ -667,8 +776,6 @@ pub enum DatabaseRunStateStoreError {
     },
     #[error("invalid retry_scope for run {run_id}: {retry_scope}")]
     InvalidRetryScope { run_id: String, retry_scope: String },
-    #[error("invalid checkpoint_v1 for run {run_id}: {reason}")]
-    InvalidCheckpoint { run_id: String, reason: String },
     #[error("tool output batch too large: run_id={run_id}, rows={rows}, bytes={bytes}")]
     ToolOutputBatchTooLarge {
         run_id: String,
@@ -1368,18 +1475,113 @@ impl RunStateStore for DatabaseRunStateStore {
     }
 
     async fn save_checkpoint(&self, run_id: &str, checkpoint_json: &str) -> Result<bool, String> {
-        validate_checkpoint_v1(run_id, checkpoint_json).map_err(|e| e.to_string())?;
+        let Some(run) = self
+            .load_run_metadata(run_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
+        let (checkpoint_kind, checkpoint_version, idempotency_key) =
+            checkpoint_metadata(run_id, checkpoint_json)?;
+        let checkpoint_id = format!("ckpt-{}", uuid::Uuid::now_v7());
+        let created_at = chrono::Utc::now().naive_utc();
+        let mut tx = self
+            .pool
+            .get()
+            .begin()
+            .await
+            .map_err(|source| db_error("begin_save_checkpoint", run_id, source).to_string())?;
+        sqlx::query(
+            "INSERT INTO run_checkpoints
+             (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
+              checkpoint_version, idempotency_key, checkpoint_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+              checkpoint_json = VALUES(checkpoint_json),
+              checkpoint_version = VALUES(checkpoint_version),
+              node_seq = VALUES(node_seq)",
+        )
+        .bind(&checkpoint_id)
+        .bind(run_id)
+        .bind(&run.user_id)
+        .bind(&run.session_id)
+        .bind(run.last_event_idx.max(0))
+        .bind(&checkpoint_kind)
+        .bind(&checkpoint_version)
+        .bind(&idempotency_key)
+        .bind(checkpoint_json)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|source| db_error("insert_run_checkpoint", run_id, source).to_string())?;
         let result = sqlx::query(
             "UPDATE agent_runs
-             SET checkpoint_version = 'checkpoint_v1', checkpoint_json = ?, updated_at = NOW(6)
+             SET checkpoint_version = ?, checkpoint_json = ?, updated_at = NOW(6)
              WHERE run_id = ?",
         )
+        .bind(&checkpoint_version)
         .bind(checkpoint_json)
         .bind(run_id)
-        .execute(self.pool.get())
+        .execute(&mut *tx)
         .await
         .map_err(|source| db_error("save_checkpoint", run_id, source).to_string())?;
-        Ok(result.rows_affected() > 0)
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+        tx.commit()
+            .await
+            .map_err(|source| db_error("commit_save_checkpoint", run_id, source).to_string())?;
+        Ok(true)
+    }
+
+    async fn load_latest_checkpoint(
+        &self,
+        run_id: &str,
+        checkpoint_kind: Option<&str>,
+    ) -> Result<Option<DurableRunCheckpointRecord>, String> {
+        let row = if let Some(checkpoint_kind) = checkpoint_kind {
+            sqlx::query(
+                "SELECT checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
+                        checkpoint_version, idempotency_key, checkpoint_json,
+                        DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+                 FROM run_checkpoints
+                 WHERE run_id = ? AND checkpoint_kind = ?
+                 ORDER BY created_at DESC, checkpoint_id DESC
+                 LIMIT 1",
+            )
+            .bind(run_id)
+            .bind(checkpoint_kind)
+            .fetch_optional(self.pool.get())
+            .await
+            .map_err(|source| db_error("load_latest_checkpoint", run_id, source).to_string())?
+        } else {
+            sqlx::query(
+                "SELECT checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
+                        checkpoint_version, idempotency_key, checkpoint_json,
+                        DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+                 FROM run_checkpoints
+                 WHERE run_id = ?
+                 ORDER BY created_at DESC, checkpoint_id DESC
+                 LIMIT 1",
+            )
+            .bind(run_id)
+            .fetch_optional(self.pool.get())
+            .await
+            .map_err(|source| db_error("load_latest_checkpoint", run_id, source).to_string())?
+        };
+        Ok(row.map(|row| DurableRunCheckpointRecord {
+            checkpoint_id: row.try_get("checkpoint_id").unwrap_or_default(),
+            run_id: row.try_get("run_id").unwrap_or_default(),
+            user_id: row.try_get("user_id").unwrap_or_default(),
+            session_id: row.try_get("session_id").unwrap_or_default(),
+            node_seq: row.try_get("node_seq").unwrap_or(0),
+            checkpoint_kind: row.try_get("checkpoint_kind").unwrap_or_default(),
+            checkpoint_version: row.try_get("checkpoint_version").unwrap_or_default(),
+            idempotency_key: row.try_get("idempotency_key").unwrap_or_default(),
+            checkpoint_json: row.try_get("checkpoint_json").unwrap_or_default(),
+            created_at: row.try_get("created_at").unwrap_or_default(),
+        }))
     }
 
     async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String> {
@@ -1515,66 +1717,6 @@ fn validate_retry_scope(run_id: &str, retry_scope: &str) -> DbStoreResult<()> {
             retry_scope: other.to_string(),
         }),
     }
-}
-
-fn validate_checkpoint_v1(run_id: &str, checkpoint_json: &str) -> DbStoreResult<()> {
-    let value: serde_json::Value = serde_json::from_str(checkpoint_json).map_err(|source| {
-        DatabaseRunStateStoreError::Json {
-            operation: "parse_checkpoint",
-            entity: run_id.to_string(),
-            source,
-        }
-    })?;
-    let object =
-        value
-            .as_object()
-            .ok_or_else(|| DatabaseRunStateStoreError::InvalidCheckpoint {
-                run_id: run_id.to_string(),
-                reason: "checkpoint root must be an object".to_string(),
-            })?;
-    if object.get("version").and_then(serde_json::Value::as_str) != Some("checkpoint_v1") {
-        return Err(DatabaseRunStateStoreError::InvalidCheckpoint {
-            run_id: run_id.to_string(),
-            reason: "version must be checkpoint_v1".to_string(),
-        });
-    }
-    if !matches!(object.get("graceful"), Some(serde_json::Value::Bool(_))) {
-        return Err(DatabaseRunStateStoreError::InvalidCheckpoint {
-            run_id: run_id.to_string(),
-            reason: "graceful must be boolean".to_string(),
-        });
-    }
-    if object
-        .get("last_batch_id")
-        .and_then(serde_json::Value::as_str)
-        .is_none()
-    {
-        return Err(DatabaseRunStateStoreError::InvalidCheckpoint {
-            run_id: run_id.to_string(),
-            reason: "last_batch_id must be string".to_string(),
-        });
-    }
-    let extra = object.get("extra").and_then(serde_json::Value::as_object);
-    if extra.is_none() {
-        return Err(DatabaseRunStateStoreError::InvalidCheckpoint {
-            run_id: run_id.to_string(),
-            reason: "extra must be object".to_string(),
-        });
-    }
-    if let Some(partial) = extra
-        .and_then(|m| m.get("partial_progress"))
-        .and_then(serde_json::Value::as_object)
-    {
-        for key in ["step_index", "total_steps", "resumable_marker"] {
-            if !partial.contains_key(key) {
-                return Err(DatabaseRunStateStoreError::InvalidCheckpoint {
-                    run_id: run_id.to_string(),
-                    reason: format!("extra.partial_progress.{key} is required"),
-                });
-            }
-        }
-    }
-    Ok(())
 }
 
 fn build_tool_output_preview_row(

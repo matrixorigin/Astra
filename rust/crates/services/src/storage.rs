@@ -660,6 +660,26 @@ pub async fn ensure_core_schema(
     .await?;
 
     query(
+        "CREATE TABLE IF NOT EXISTS run_checkpoints (
+            checkpoint_id VARCHAR(64) PRIMARY KEY,
+            run_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            node_seq BIGINT NOT NULL DEFAULT 0,
+            checkpoint_kind VARCHAR(32) NOT NULL,
+            checkpoint_version VARCHAR(32) NOT NULL,
+            idempotency_key VARCHAR(191) NOT NULL,
+            checkpoint_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uniq_run_checkpoint_idem (run_id, checkpoint_kind, idempotency_key),
+            INDEX idx_run_checkpoints_run_created (run_id, created_at),
+            INDEX idx_run_checkpoints_session_kind_created (session_id, checkpoint_kind, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
         "CREATE TABLE IF NOT EXISTS session_tool_output_batches (
             batch_id VARCHAR(64) PRIMARY KEY,
             session_id VARCHAR(64) NOT NULL,

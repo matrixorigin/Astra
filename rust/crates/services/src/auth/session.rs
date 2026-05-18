@@ -674,6 +674,10 @@ async fn hard_delete_session_rows(
             "agent_run_events",
             "DELETE FROM agent_run_events WHERE session_id = ?",
         ),
+        (
+            "run_checkpoints",
+            "DELETE FROM run_checkpoints WHERE session_id = ?",
+        ),
         ("agent_runs", "DELETE FROM agent_runs WHERE session_id = ?"),
         (
             "agent_events",

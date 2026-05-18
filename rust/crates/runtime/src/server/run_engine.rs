@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use astra_services::{
     DatabaseStateProjectionStore,
-    runs::{DurableRunRecord, RunStateStore},
+    runs::{DurableRunCheckpointRecord, DurableRunRecord, RunStateStore},
 };
 
 use astra_core::{STATUS_RUNNING, STATUS_WAITING};
@@ -227,6 +227,17 @@ impl RunEngine {
         self.store.save_checkpoint(run_id, checkpoint_json).await
     }
 
+    /// Load the newest typed checkpoint for a run.
+    pub async fn load_latest_checkpoint(
+        &self,
+        run_id: &str,
+        checkpoint_kind: Option<&str>,
+    ) -> Result<Option<DurableRunCheckpointRecord>, String> {
+        self.store
+            .load_latest_checkpoint(run_id, checkpoint_kind)
+            .await
+    }
+
     /// Append an event to the durable event log.
     pub async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String> {
         self.store.append_event(run_id, event).await
@@ -283,7 +294,7 @@ impl RunEngine {
 
         let mut recovered_running = Vec::with_capacity(running.len());
         for mut run in running {
-            if has_graceful_checkpoint_v1(&run) {
+            if has_graceful_resume_checkpoint(self, &run).await {
                 if let Err(e) = self
                     .store
                     .update_run_status(&run.run_id, STATUS_WAITING, Some("restart_resume"), None)
@@ -362,13 +373,26 @@ impl RunEngine {
     }
 }
 
-fn has_graceful_checkpoint_v1(run: &DurableRunRecord) -> bool {
-    if run.checkpoint_version.as_deref() != Some("checkpoint_v1") {
+async fn has_graceful_resume_checkpoint(engine: &RunEngine, run: &DurableRunRecord) -> bool {
+    if let Ok(Some(checkpoint)) = engine
+        .load_latest_checkpoint(&run.run_id, Some("resume"))
+        .await
+    {
+        return checkpoint_is_graceful_resume(
+            &checkpoint.checkpoint_version,
+            &checkpoint.checkpoint_json,
+        );
+    }
+    checkpoint_is_graceful_resume(
+        run.checkpoint_version.as_deref().unwrap_or_default(),
+        run.checkpoint_json.as_deref().unwrap_or_default(),
+    )
+}
+
+fn checkpoint_is_graceful_resume(checkpoint_version: &str, checkpoint_json: &str) -> bool {
+    if checkpoint_version != "checkpoint_v1" || checkpoint_json.is_empty() {
         return false;
     }
-    let Some(checkpoint_json) = run.checkpoint_json.as_deref() else {
-        return false;
-    };
     serde_json::from_str::<serde_json::Value>(checkpoint_json)
         .ok()
         .and_then(|value| value.get("graceful").and_then(serde_json::Value::as_bool))
@@ -440,7 +464,7 @@ impl astra_server_types::team_orchestrator_traits::RunPersistence for RunEngine 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_services::runs::InMemoryRunStateStore;
+    use astra_services::runs::{DurableRunRecord, InMemoryRunStateStore, RunStateStore};
 
     fn test_engine() -> RunEngine {
         RunEngine::new(Arc::new(InMemoryRunStateStore::new()))
@@ -526,10 +550,15 @@ mod tests {
     async fn persist_checkpoint_saves() {
         let engine = test_engine();
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
-        let ck = r#"{"messages":[],"turn":3}"#;
+        let ck = r#"{"version":"checkpoint_v1","graceful":true,"messages":[],"turn":3}"#;
         engine.persist_checkpoint("run-1", ck).await.unwrap();
-        let run = engine.load_run("run-1").await.unwrap().unwrap();
-        assert_eq!(run.checkpoint_json.as_deref(), Some(ck));
+        let checkpoint = engine
+            .load_latest_checkpoint("run-1", Some("resume"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.checkpoint_kind, "resume");
+        assert_eq!(checkpoint.checkpoint_json, ck);
     }
 
     #[tokio::test]
@@ -646,6 +675,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_active_runs_promotes_graceful_resume_checkpoint_to_waiting() {
+        let engine = test_engine();
+        engine
+            .start_run("run-resume", "user-1", "sess-resume")
+            .await
+            .unwrap();
+        engine
+            .persist_checkpoint(
+                "run-resume",
+                r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"shutdown-run-resume"}"#,
+            )
+            .await
+            .unwrap();
+
+        let recovered = engine.recover_active_runs().await.unwrap();
+        let resumed = recovered
+            .into_iter()
+            .find(|run| run.run_id == "run-resume")
+            .expect("graceful checkpointed run should be recoverable");
+        assert_eq!(resumed.status, "waiting");
+        assert_eq!(resumed.waiting_for.as_deref(), Some("restart_resume"));
+        let durable = engine.load_run("run-resume").await.unwrap().unwrap();
+        assert_eq!(durable.status, "waiting");
+        assert_eq!(durable.waiting_for.as_deref(), Some("restart_resume"));
+        assert_eq!(
+            durable.events.last().unwrap()["event_type"],
+            "run_resumed_after_restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_active_runs_falls_back_to_embedded_legacy_checkpoint() {
+        let store = Arc::new(InMemoryRunStateStore::new());
+        let engine = RunEngine::new(store.clone());
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .insert_run(DurableRunRecord {
+                run_id: "run-legacy".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-legacy".to_string(),
+                parent_run_id: None,
+                root_run_id: Some("run-legacy".to_string()),
+                ancestor_path: Some("run-legacy".to_string()),
+                depth: 0,
+                delegation_id: None,
+                agent_id: None,
+                retry_of: None,
+                retry_scope: Some("node".to_string()),
+                status: STATUS_RUNNING.to_string(),
+                waiting_for: None,
+                owner_pod_id: None,
+                owner_lease_expires_at: None,
+                run_generation: 0,
+                last_event_idx: 0,
+                checkpoint_version: Some("checkpoint_v1".to_string()),
+                checkpoint_json: Some(
+                    r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"legacy-batch"}"#
+                        .to_string(),
+                ),
+                error_code: None,
+                error_message: None,
+                retry_count: 0,
+                total_prompt_tokens: 0,
+                total_completion_tokens: 0,
+                total_tool_calls: 0,
+                events: vec![serde_json::json!({"event_type":"run_started","data":{}})],
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+
+        let recovered = engine.recover_active_runs().await.unwrap();
+        let resumed = recovered
+            .into_iter()
+            .find(|run| run.run_id == "run-legacy")
+            .expect("legacy checkpointed run should still resume");
+        assert_eq!(resumed.status, "waiting");
+        assert_eq!(resumed.waiting_for.as_deref(), Some("restart_resume"));
+    }
+
+    #[tokio::test]
     async fn full_lifecycle_start_pause_resume_complete() {
         let engine = test_engine();
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
@@ -673,7 +784,7 @@ mod tests {
         // Simulate completion
         engine.persist_usage("run-1", 2000, 800, 12).await.unwrap();
         engine
-            .persist_checkpoint("run-1", r#"{"final": true}"#)
+            .persist_checkpoint("run-1", r#"{"phase":"final","final":true}"#)
             .await
             .unwrap();
         engine
@@ -693,7 +804,16 @@ mod tests {
         assert_eq!(run.total_prompt_tokens, 2000);
         assert_eq!(run.total_completion_tokens, 800);
         assert_eq!(run.total_tool_calls, 12);
-        assert_eq!(run.checkpoint_json.as_deref(), Some(r#"{"final": true}"#));
+        let checkpoint = engine
+            .load_latest_checkpoint("run-1", Some("phase"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.checkpoint_kind, "phase");
+        assert_eq!(
+            checkpoint.checkpoint_json,
+            r#"{"phase":"final","final":true}"#
+        );
         // run_started + run_paused + run_resumed + run_finished = 4
         assert_eq!(run.events.len(), 4);
         assert!(run.waiting_for.is_none());

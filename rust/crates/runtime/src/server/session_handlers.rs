@@ -1,8 +1,10 @@
 use super::*;
 use astra_core::{STATUS_CANCELLED, is_duplicate_key_error};
+use astra_services::session_workspace::{WORKSPACE_METADATA_ARTIFACT_KIND, WorkspaceMetadata};
 use astra_services::{
     DatabaseSessionArtifactStore, DatabaseStateProjectionStore, PresignedArtifactDownload,
-    SessionArtifactJsonStore, UserAnchorMemoryItem, build_presigned_artifact_download,
+    SessionArtifactJsonStore, StoredSessionArtifact, UserAnchorMemoryItem,
+    build_presigned_artifact_download,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,6 +37,10 @@ pub(super) struct SessionStateResponse {
     pub state_revision: StateRevisionResponse,
     pub transcript_high_watermark: i64,
     pub active_run: Option<ActiveRunProjection>,
+    pub workspace_authority: Option<WorkspaceAuthorityResponse>,
+    pub latest_context_manifest: Option<ContextManifestSummaryResponse>,
+    pub state_summary: Vec<StateCategorySummaryResponse>,
+    pub artifact_previews: Vec<ArtifactPreviewResponse>,
     pub anchor_memory: Vec<UserAnchorMemoryResponse>,
     pub replay_required: bool,
     pub transcript_replay_required: bool,
@@ -62,6 +68,54 @@ pub(super) struct UserAnchorMemoryResponse {
     pub item_key: String,
     pub summary_text: Option<String>,
     pub token_estimate: u32,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub(super) struct WorkspaceAuthorityResponse {
+    pub cwd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub(super) struct ContextManifestSummaryResponse {
+    pub manifest_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub turn_id: String,
+    pub reason: String,
+    pub total_estimated_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_template_id: Option<String>,
+    pub policy_version: String,
+    pub created_at: String,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub(super) struct StateCategorySummaryResponse {
+    pub category: String,
+    pub count: u32,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub(super) struct ArtifactPreviewResponse {
+    pub artifact_id: String,
+    pub artifact_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 fn user_anchor_memory_response(item: UserAnchorMemoryItem) -> UserAnchorMemoryResponse {
@@ -343,6 +397,15 @@ pub(super) async fn get_session_state_handler(
     let transcript_replay_required = cold_start && transcript_high_watermark > 0;
     let run_event_replay_required = cold_start && run_event_high_watermark > 0;
     let replay_required = transcript_replay_required || run_event_replay_required;
+    let workspace_authority = load_workspace_authority(&state, &session.session_id).await?;
+    let latest_context_manifest = load_latest_context_manifest(
+        pool,
+        &session.session_id,
+        active_run.as_ref().map(|run| run.run_id.as_str()),
+    )
+    .await?;
+    let state_summary = load_state_summary(pool, &session.session_id).await?;
+    let artifact_previews = load_artifact_previews(&state, &session.session_id).await?;
     let active_run = active_run.map(|mut run| {
         run.replay_required = run_event_replay_required;
         run.replay_start_event_idx = if run_event_replay_required {
@@ -373,6 +436,10 @@ pub(super) async fn get_session_state_handler(
         },
         transcript_high_watermark,
         active_run,
+        workspace_authority,
+        latest_context_manifest,
+        state_summary,
+        artifact_previews,
         anchor_memory,
         replay_required,
         transcript_replay_required,
@@ -481,6 +548,150 @@ fn transcript_assistant_run_ids(rows: &[sqlx::mysql::MySqlRow]) -> Vec<String> {
         }
     }
     run_ids
+}
+
+fn workspace_authority_from_artifact(
+    artifact: &StoredSessionArtifact,
+) -> Result<WorkspaceAuthorityResponse, String> {
+    let metadata = serde_json::from_value::<WorkspaceMetadata>(artifact.content.clone())
+        .map_err(|error| format!("workspace authority artifact decode failed: {error}"))?;
+    Ok(WorkspaceAuthorityResponse {
+        cwd: metadata.cwd,
+        git_root: metadata.git_root,
+        git_branch: metadata.git_branch,
+        git_head: metadata.git_head,
+        model: metadata.model,
+        updated_at: metadata.updated_at,
+    })
+}
+
+async fn load_workspace_authority(
+    state: &AppState,
+    session_id: &str,
+) -> Result<Option<WorkspaceAuthorityResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let artifact = session_artifact_store(state)?
+        .load_latest_json_artifact(session_id, WORKSPACE_METADATA_ARTIFACT_KIND)
+        .await
+        .map_err(internal_error)?;
+    artifact
+        .as_ref()
+        .map(workspace_authority_from_artifact)
+        .transpose()
+        .map_err(internal_error)
+}
+
+async fn load_state_summary(
+    pool: &SharedPool,
+    session_id: &str,
+) -> Result<Vec<StateCategorySummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let rows = sqlx::query(
+        "SELECT category, COUNT(*) AS total
+         FROM session_state_items
+         WHERE session_id = ? AND status IN ('active', 'backlog')
+         GROUP BY category
+         ORDER BY total DESC, category ASC
+         LIMIT 16",
+    )
+    .bind(session_id)
+    .fetch_all(pool.get())
+    .await
+    .map_err(internal_error)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| StateCategorySummaryResponse {
+            category: row.try_get("category").unwrap_or_default(),
+            count: row.try_get::<i64, _>("total").unwrap_or(0).max(0) as u32,
+        })
+        .collect())
+}
+
+async fn load_artifact_previews(
+    state: &AppState,
+    session_id: &str,
+) -> Result<Vec<ArtifactPreviewResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let artifacts = session_artifact_store(state)?
+        .list_json_artifacts(session_id, None, 8)
+        .await
+        .map_err(internal_error)?;
+    Ok(artifacts
+        .into_iter()
+        .filter(|artifact| artifact.artifact_kind != WORKSPACE_METADATA_ARTIFACT_KIND)
+        .take(5)
+        .map(|artifact| ArtifactPreviewResponse {
+            artifact_id: artifact.artifact_id,
+            artifact_kind: artifact.artifact_kind,
+            source: artifact.source,
+            turn: artifact.turn,
+            round: artifact.round,
+            created_at: artifact.created_at,
+        })
+        .collect())
+}
+
+async fn load_latest_context_manifest(
+    pool: &SharedPool,
+    session_id: &str,
+    preferred_run_id: Option<&str>,
+) -> Result<Option<ContextManifestSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if let Some(run_id) = preferred_run_id
+        && let Some(summary) = fetch_latest_context_manifest(pool, session_id, Some(run_id)).await?
+    {
+        return Ok(Some(summary));
+    }
+    fetch_latest_context_manifest(pool, session_id, None).await
+}
+
+async fn fetch_latest_context_manifest(
+    pool: &SharedPool,
+    session_id: &str,
+    run_id: Option<&str>,
+) -> Result<Option<ContextManifestSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let row = if let Some(run_id) = run_id {
+        sqlx::query(
+            "SELECT manifest_id, run_id, turn_id, reason, total_estimated_tokens,
+                    budget_template_id, policy_version,
+                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+             FROM context_manifests
+             WHERE session_id = ? AND run_id = ?
+             ORDER BY created_at DESC, manifest_id DESC
+             LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(run_id)
+        .fetch_optional(pool.get())
+        .await
+        .map_err(internal_error)?
+    } else {
+        sqlx::query(
+            "SELECT manifest_id, run_id, turn_id, reason, total_estimated_tokens,
+                    budget_template_id, policy_version,
+                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+             FROM context_manifests
+             WHERE session_id = ?
+             ORDER BY created_at DESC, manifest_id DESC
+             LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(pool.get())
+        .await
+        .map_err(internal_error)?
+    };
+    Ok(row.map(|row| ContextManifestSummaryResponse {
+        manifest_id: row.try_get("manifest_id").unwrap_or_default(),
+        run_id: row.try_get::<Option<String>, _>("run_id").ok().flatten(),
+        turn_id: row.try_get("turn_id").unwrap_or_default(),
+        reason: row.try_get("reason").unwrap_or_default(),
+        total_estimated_tokens: row
+            .try_get::<i64, _>("total_estimated_tokens")
+            .unwrap_or(0)
+            .max(0) as u32,
+        budget_template_id: row
+            .try_get::<Option<String>, _>("budget_template_id")
+            .ok()
+            .flatten(),
+        policy_version: row.try_get("policy_version").unwrap_or_default(),
+        created_at: row.try_get("created_at").unwrap_or_default(),
+    }))
 }
 
 async fn load_transcript_reasoning_by_run(
@@ -1483,6 +1694,7 @@ mod tests {
         AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
         AuthTokenRecord, AuthUserRecord, SessionCreateRequestData, SessionListFilter,
         SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
+        StoredSessionArtifact,
     };
     use async_trait::async_trait;
     use axum::{
@@ -1754,5 +1966,50 @@ mod tests {
             projection.done,
             "thinking_done should mark the block complete"
         );
+    }
+
+    #[test]
+    fn workspace_authority_reads_workspace_metadata_artifact() {
+        let artifact = StoredSessionArtifact {
+            artifact_id: "artifact-1".to_string(),
+            session_id: "session-1".to_string(),
+            user_id: "user-1".to_string(),
+            artifact_kind: WORKSPACE_METADATA_ARTIFACT_KIND.to_string(),
+            source: Some("workspace_metadata".to_string()),
+            turn: Some(3),
+            round: None,
+            content: json!({
+                "session_id": "session-1",
+                "cwd": "/tmp/project",
+                "git_root": "/tmp/project",
+                "git_branch": "main",
+                "git_head": "abc123",
+                "model": "gpt-5.4",
+                "created_at": "2026-05-18T00:00:00Z",
+                "updated_at": "2026-05-18T00:01:00Z",
+                "turn_count": 3,
+                "total_tokens_in": 10,
+                "total_tokens_out": 20,
+                "status": "active",
+                "checkpoints": []
+            }),
+            metadata: None,
+            retention_policy: None,
+            retention_until: None,
+            status: Some("active".to_string()),
+            referenced_by_manifest_count: 0,
+            referenced_by_state_items_count: 0,
+            referenced_by_citation_count: 0,
+            created_at: Some("2026-05-18T00:01:00Z".to_string()),
+        };
+
+        let authority =
+            workspace_authority_from_artifact(&artifact).expect("workspace metadata should decode");
+
+        assert_eq!(authority.cwd, "/tmp/project");
+        assert_eq!(authority.git_branch.as_deref(), Some("main"));
+        assert_eq!(authority.git_head.as_deref(), Some("abc123"));
+        assert_eq!(authority.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(authority.updated_at, "2026-05-18T00:01:00Z");
     }
 }
