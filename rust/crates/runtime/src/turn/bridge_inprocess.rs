@@ -468,6 +468,17 @@ fn record_full_llm_request_event(
         return;
     };
     let round = buf.current_round();
+    let prompt_request_plan = astra_services::plan_prompt_request(
+        session_id,
+        turn,
+        round,
+        attempt,
+        source,
+        messages,
+        tools,
+        max_output_tokens,
+    )
+    .ok();
     let mut evt = astra_services::session_journal::JournalEvent::llm_request_full(
         Some(session_id),
         turn,
@@ -484,11 +495,16 @@ fn record_full_llm_request_event(
                 "turn_chain_id": trace.turn_chain_id,
                 "user_query_event_id": trace.user_query_event_id,
             },
-            "request": crate::turn::llm_exchange_capture::build_capture_request_json(
-                messages,
-                tools,
-                max_output_tokens,
-            ),
+            "prompt_request_id": prompt_request_plan.as_ref().map(|plan| plan.request_id.as_str()),
+            "request_hash": prompt_request_plan.as_ref().map(|plan| plan.request_hash.as_str()),
+            "request_summary": prompt_request_plan
+                .as_ref()
+                .map(|plan| plan.summary_json.clone())
+                .unwrap_or_else(|| crate::turn::llm_exchange_capture::build_capture_request_summary_json(
+                    messages,
+                    tools,
+                    max_output_tokens,
+                )),
         }),
     );
     evt.offset_ms = Some(buf.offset_ms());
@@ -2137,6 +2153,40 @@ impl InProcessChatTurnBridge {
                         &pruned_tools,
                     );
                     capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
+                    if let Ok(prompt_request_plan) = astra_services::plan_prompt_request(
+                        &session_id,
+                        trace_turn,
+                        turn_event_buffer
+                            .as_ref()
+                            .map(|buffer| buffer.current_round())
+                            .unwrap_or(round_index),
+                        attempt_in_round,
+                        "bridge_inprocess",
+                        &llm_messages,
+                        &pruned_tools,
+                        Some(max_output_tokens),
+                    ) {
+                        crate::turn::llm_exchange_capture::persist_prompt_request_plan_or_log(
+                            "bridge_inprocess e2e capture",
+                            shared_pool.as_ref(),
+                            astra_services::PromptRequestPersistInput {
+                                session_id: session_id.clone(),
+                                user_id: user_id.clone(),
+                                run_id: Some(run_id.clone()),
+                                turn: trace_turn,
+                                round: turn_event_buffer
+                                    .as_ref()
+                                    .map(|buffer| buffer.current_round())
+                                    .unwrap_or(round_index),
+                                attempt: attempt_in_round,
+                                source: "bridge_inprocess".to_string(),
+                                model: request_capture_model.clone(),
+                                provider: provider.clone(),
+                            },
+                            &prompt_request_plan,
+                        )
+                        .await;
+                    }
                     yield render_sse(&crate::turn::llm_context::context_meta_event(
                         &breakdown,
                         Some(&bridge_manifest_trace_json),
@@ -2183,6 +2233,40 @@ impl InProcessChatTurnBridge {
                     // long note ~60 lines up for why this is here and not
                     // before the mutations).
                     capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
+                    if let Ok(prompt_request_plan) = astra_services::plan_prompt_request(
+                        &session_id,
+                        trace_turn,
+                        turn_event_buffer
+                            .as_ref()
+                            .map(|buffer| buffer.current_round())
+                            .unwrap_or(round_index),
+                        attempt_in_round,
+                        "bridge_inprocess",
+                        &llm_messages,
+                        &pruned_tools,
+                        Some(max_output_tokens),
+                    ) {
+                        crate::turn::llm_exchange_capture::persist_prompt_request_plan_or_log(
+                            "bridge_inprocess live capture",
+                            shared_pool.as_ref(),
+                            astra_services::PromptRequestPersistInput {
+                                session_id: session_id.clone(),
+                                user_id: user_id.clone(),
+                                run_id: Some(run_id.clone()),
+                                turn: trace_turn,
+                                round: turn_event_buffer
+                                    .as_ref()
+                                    .map(|buffer| buffer.current_round())
+                                    .unwrap_or(round_index),
+                                attempt: attempt_in_round,
+                                source: "bridge_inprocess".to_string(),
+                                model: request_capture_model.clone(),
+                                provider: provider.clone(),
+                            },
+                            &prompt_request_plan,
+                        )
+                        .await;
+                    }
 
                     // wip-7: emit per-channel fingerprints ONLY — no raw
                     // text crosses the HTTP boundary. Raw channel content
@@ -2443,6 +2527,40 @@ impl InProcessChatTurnBridge {
                                 &pruned_tools,
                                 Some(max_output_tokens / 2),
                             );
+                            if let Ok(prompt_request_plan) = astra_services::plan_prompt_request(
+                                &session_id,
+                                trace_turn,
+                                turn_event_buffer
+                                    .as_ref()
+                                    .map(|buffer| buffer.current_round())
+                                    .unwrap_or(round_index),
+                                attempt_in_round,
+                                "bridge_inprocess",
+                                &llm_messages,
+                                &pruned_tools,
+                                Some(max_output_tokens / 2),
+                            ) {
+                                crate::turn::llm_exchange_capture::persist_prompt_request_plan_or_log(
+                                    "bridge_inprocess retry capture",
+                                    shared_pool.as_ref(),
+                                    astra_services::PromptRequestPersistInput {
+                                        session_id: session_id.clone(),
+                                        user_id: user_id.clone(),
+                                        run_id: Some(run_id.clone()),
+                                        turn: trace_turn,
+                                        round: turn_event_buffer
+                                            .as_ref()
+                                            .map(|buffer| buffer.current_round())
+                                            .unwrap_or(round_index),
+                                        attempt: attempt_in_round,
+                                        source: "bridge_inprocess".to_string(),
+                                        model: request_capture_model.clone(),
+                                        provider: provider.clone(),
+                                    },
+                                    &prompt_request_plan,
+                                )
+                                .await;
+                            }
 
                             // Retry LLM call
                             match call_llm_stream(
@@ -5777,6 +5895,15 @@ mod tests {
         assert_eq!(
             llm_events[0]["metadata"]["trace"]["session_turn_source"].as_str(),
             Some("header")
+        );
+        assert!(
+            llm_events[0]["metadata"]["prompt_request_id"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_eq!(
+            llm_events[0]["metadata"]["request_summary"]["message_count"].as_u64(),
+            Some(1)
         );
         assert!(
             llm_events[0]["metadata"]["trace"]["turn_chain_id"]

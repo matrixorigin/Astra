@@ -27,6 +27,7 @@ pub mod models;
 pub mod multi_agent;
 pub mod pagination;
 pub mod personal_skills;
+pub mod prompt_delta;
 pub mod reflect;
 pub mod replay;
 pub mod resource_governor;
@@ -182,6 +183,12 @@ pub use personal_skills::{
     UserSkillSourceRecord, UserSkillVersionRecord, normalize_skill_md, normalize_version_or_legacy,
     skill_md_content_hash,
 };
+pub use prompt_delta::{
+    PromptDeltaCounts, PromptRequestObservability, PromptRequestPersistInput,
+    PromptRequestPersistResult, PromptRequestPlan, count_prompt_requests_for_run,
+    count_prompt_requests_for_session, load_latest_prompt_observability_for_run,
+    load_latest_prompt_observability_for_session, persist_prompt_request, plan_prompt_request,
+};
 pub use reflect::{
     DatabaseReflectService, Diagnosis, ReflectReport, ReflectService, UnconfiguredReflectService,
 };
@@ -190,7 +197,7 @@ pub use runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DatabaseRunStateStore,
     DurableRunRecord, InMemoryRunStateStore, LlmTokenServiceConfig, LlmTokenServiceRequest,
     RunLifecycleService, RunListRecord, RunMutationRecord, RunStateStore, RunStatusRecord,
-    UnconfiguredRunLifecycleService, transform_run_event_for_client,
+    UnconfiguredRunLifecycleService, extract_event_type, transform_run_event_for_client,
 };
 pub use sandbox::{
     DatabaseSandboxService, SandboxRecord, SandboxService, UnconfiguredSandboxService,

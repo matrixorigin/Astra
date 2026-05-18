@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use astra_core::SharedPool;
 use astra_services::{SessionArtifactJsonRecord, SessionArtifactJsonStore, SessionArtifactStore};
 use serde_json::{Value, json};
 
@@ -62,6 +63,19 @@ pub(crate) fn build_capture_request_json(
         "max_output_tokens": max_output_tokens,
         "messages": messages,
         "tools": tools,
+    })
+}
+
+pub(crate) fn build_capture_request_summary_json(
+    messages: &[Value],
+    tools: &[Value],
+    max_output_tokens: Option<usize>,
+) -> Value {
+    json!({
+        "message_count": messages.len(),
+        "tool_count": tools.len(),
+        "max_output_tokens": max_output_tokens,
+        "degraded_summary": true,
     })
 }
 
@@ -296,6 +310,26 @@ pub(crate) async fn persist_configured_capture_or_log(
     .await
     {
         astra_core::agent_error!("llm-capture", "{context}: {error}");
+    }
+}
+
+pub(crate) async fn persist_prompt_request_plan_or_log(
+    context: &str,
+    shared_pool: Option<&SharedPool>,
+    input: astra_services::PromptRequestPersistInput,
+    plan: &astra_services::PromptRequestPlan,
+) {
+    let Some(shared_pool) = shared_pool else {
+        return;
+    };
+    if let Err(error) = astra_services::persist_prompt_request(shared_pool, &input, plan).await {
+        tracing::error!(
+            target: "astra_runtime::prompt_delta",
+            %context,
+            request_id = %plan.request_id,
+            error = %error,
+            "failed to persist prompt request delta"
+        );
     }
 }
 

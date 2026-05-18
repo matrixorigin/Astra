@@ -42,6 +42,7 @@ pub(super) struct SessionStateResponse {
     pub state_summary: Vec<StateCategorySummaryResponse>,
     pub artifact_previews: Vec<ArtifactPreviewResponse>,
     pub anchor_memory: Vec<UserAnchorMemoryResponse>,
+    pub projection_observability: SessionProjectionObservabilityResponse,
     pub replay_required: bool,
     pub transcript_replay_required: bool,
     pub run_event_replay_required: bool,
@@ -118,6 +119,27 @@ pub(super) struct ArtifactPreviewResponse {
     pub created_at: Option<String>,
 }
 
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub(super) struct PromptRequestObservabilityResponse {
+    pub request_id: String,
+    pub request_hash: String,
+    pub message_count: u32,
+    pub tool_count: u32,
+    pub delta_counts: astra_services::PromptDeltaCounts,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub(super) struct SessionProjectionObservabilityResponse {
+    pub observability_available: bool,
+    pub transcript_page_count: u32,
+    pub transcript_page_high_watermark: i64,
+    pub transcript_page_lag_items: i64,
+    pub active_run_projection_lag_events: i64,
+    pub prompt_request_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_prompt_request: Option<PromptRequestObservabilityResponse>,
+}
+
 fn user_anchor_memory_response(item: UserAnchorMemoryItem) -> UserAnchorMemoryResponse {
     UserAnchorMemoryResponse {
         item_id: item.item_id,
@@ -139,8 +161,18 @@ pub(super) struct TranscriptQuery {
 pub(super) struct TranscriptResponse {
     pub session_id: String,
     pub items: Vec<TranscriptItemResponse>,
+    pub page_refs: Vec<TranscriptPageRefResponse>,
     pub next_before_seq: Option<i64>,
     pub has_more: bool,
+}
+
+#[derive(Serialize)]
+pub(super) struct TranscriptPageRefResponse {
+    pub page_seq: i64,
+    pub start_item_seq: i64,
+    pub end_item_seq: i64,
+    pub item_count: i64,
+    pub page_hash: String,
 }
 
 #[derive(Serialize)]
@@ -406,6 +438,13 @@ pub(super) async fn get_session_state_handler(
     .await?;
     let state_summary = load_state_summary(pool, &session.session_id).await?;
     let artifact_previews = load_artifact_previews(&state, &session.session_id).await?;
+    let projection_observability = load_session_projection_observability(
+        pool,
+        &session.session_id,
+        transcript_high_watermark,
+        active_run.as_ref(),
+    )
+    .await?;
     let active_run = active_run.map(|mut run| {
         run.replay_required = run_event_replay_required;
         run.replay_start_event_idx = if run_event_replay_required {
@@ -441,6 +480,7 @@ pub(super) async fn get_session_state_handler(
         state_summary,
         artifact_previews,
         anchor_memory,
+        projection_observability,
         replay_required,
         transcript_replay_required,
         run_event_replay_required,
@@ -522,11 +562,24 @@ pub(super) async fn get_session_transcript_handler(
         })
         .collect::<Vec<_>>();
     items.reverse();
+    let page_refs = load_transcript_page_refs(
+        pool,
+        &session_id,
+        items.first().map(|item| item.item_seq),
+        items.last().map(|item| item.item_seq),
+    )
+    .await
+    .map_err(|error| {
+        internal_error(format!(
+            "load transcript page refs failed for session {session_id}: {error}"
+        ))
+    })?;
     let next_before_seq = items.first().map(|item| item.item_seq);
     let has_more = items.len() == limit as usize && next_before_seq.unwrap_or(0) > 1;
     Ok(Json(TranscriptResponse {
         session_id,
         items,
+        page_refs,
         next_before_seq,
         has_more,
     }))
@@ -548,6 +601,104 @@ fn transcript_assistant_run_ids(rows: &[sqlx::mysql::MySqlRow]) -> Vec<String> {
         }
     }
     run_ids
+}
+
+async fn load_transcript_page_refs(
+    pool: &SharedPool,
+    session_id: &str,
+    start_item_seq: Option<i64>,
+    end_item_seq: Option<i64>,
+) -> Result<Vec<TranscriptPageRefResponse>, sqlx::Error> {
+    let (Some(start_item_seq), Some(end_item_seq)) = (start_item_seq, end_item_seq) else {
+        return Ok(Vec::new());
+    };
+    let rows = sqlx::query(
+        "SELECT page_seq, start_item_seq, end_item_seq, item_count, page_hash
+         FROM transcript_pages
+         WHERE session_id = ? AND end_item_seq >= ? AND start_item_seq <= ?
+         ORDER BY page_seq ASC",
+    )
+    .bind(session_id)
+    .bind(start_item_seq)
+    .bind(end_item_seq)
+    .fetch_all(pool.get())
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| TranscriptPageRefResponse {
+            page_seq: row.try_get("page_seq").unwrap_or_default(),
+            start_item_seq: row.try_get("start_item_seq").unwrap_or_default(),
+            end_item_seq: row.try_get("end_item_seq").unwrap_or_default(),
+            item_count: row.try_get::<i64, _>("item_count").unwrap_or_default(),
+            page_hash: row.try_get("page_hash").unwrap_or_default(),
+        })
+        .collect())
+}
+
+async fn load_session_projection_observability(
+    pool: &SharedPool,
+    session_id: &str,
+    transcript_high_watermark: i64,
+    active_run: Option<&ActiveRunProjection>,
+) -> Result<SessionProjectionObservabilityResponse, (StatusCode, Json<ErrorResponse>)> {
+    let transcript_page_row = sqlx::query(
+        "SELECT COUNT(*) AS page_count, COALESCE(MAX(end_item_seq), 0) AS page_high_watermark
+         FROM transcript_pages
+         WHERE session_id = ?",
+    )
+    .bind(session_id)
+    .fetch_one(pool.get())
+    .await
+    .map_err(internal_error)?;
+    let transcript_page_count = transcript_page_row
+        .try_get::<i64, _>("page_count")
+        .unwrap_or(0)
+        .max(0) as u32;
+    let transcript_page_high_watermark = transcript_page_row
+        .try_get::<i64, _>("page_high_watermark")
+        .unwrap_or(0)
+        .max(0);
+    let active_run_projection_lag_events = if let Some(active_run) = active_run {
+        let row = sqlx::query(
+            "SELECT projection_event_idx
+             FROM run_display_projections
+             WHERE run_id = ?",
+        )
+        .bind(&active_run.run_id)
+        .fetch_optional(pool.get())
+        .await
+        .map_err(internal_error)?;
+        let projection_event_idx = row
+            .and_then(|row| row.try_get::<i64, _>("projection_event_idx").ok())
+            .unwrap_or(-1);
+        (active_run.run_event_high_watermark - projection_event_idx).max(0)
+    } else {
+        0
+    };
+    let prompt_request_count = astra_services::count_prompt_requests_for_session(pool, session_id)
+        .await
+        .map_err(internal_error)?;
+    let latest_prompt_request =
+        astra_services::load_latest_prompt_observability_for_session(pool, session_id)
+            .await
+            .map_err(internal_error)?
+            .map(|request| PromptRequestObservabilityResponse {
+                request_id: request.request_id,
+                request_hash: request.request_hash,
+                message_count: request.message_count,
+                tool_count: request.tool_count,
+                delta_counts: request.delta_counts,
+            });
+    Ok(SessionProjectionObservabilityResponse {
+        observability_available: true,
+        transcript_page_count,
+        transcript_page_high_watermark,
+        transcript_page_lag_items: (transcript_high_watermark - transcript_page_high_watermark)
+            .max(0),
+        active_run_projection_lag_events,
+        prompt_request_count,
+        latest_prompt_request,
+    })
 }
 
 fn workspace_authority_from_artifact(

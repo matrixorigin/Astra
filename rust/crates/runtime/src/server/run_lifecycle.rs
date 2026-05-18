@@ -8,7 +8,7 @@
 //! process-local map only keeps live control handles for in-flight runs.
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -31,7 +31,7 @@ use astra_services::EdgeContext;
 use astra_services::runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunRecord,
     RunInputData, RunInputRecord, RunLifecycleService, RunListRecord, RunMutationRecord,
-    RunStatusRecord,
+    RunProjectionCheckpointRecord, RunProjectionRecord, RunStatusRecord,
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::skills::SkillService;
@@ -1329,6 +1329,7 @@ async fn persist_session_transcript_items_inner(
     .fetch_one(&mut *tx)
     .await?;
     let mut next_seq = row.try_get::<i64, _>("next_seq")?;
+    let mut dirty_pages = BTreeSet::new();
 
     for item in items {
         let existing = sqlx::query(
@@ -1363,10 +1364,94 @@ async fn persist_session_transcript_items_inner(
         .bind(transcript_content_hash(item.role, &item.content))
         .execute(&mut *tx)
         .await?;
+        dirty_pages.insert(transcript_page_seq(item_seq));
         next_seq += 1;
     }
 
+    for page_seq in dirty_pages {
+        sync_transcript_page_inner(&mut tx, session_id, page_seq).await?;
+    }
+
     tx.commit().await
+}
+
+const TRANSCRIPT_PAGE_SIZE: i64 = 50;
+
+fn transcript_page_seq(item_seq: i64) -> i64 {
+    ((item_seq.max(1) - 1) / TRANSCRIPT_PAGE_SIZE) + 1
+}
+
+fn transcript_page_bounds(page_seq: i64) -> (i64, i64) {
+    let page_seq = page_seq.max(1);
+    let start = ((page_seq - 1) * TRANSCRIPT_PAGE_SIZE) + 1;
+    let end = start + TRANSCRIPT_PAGE_SIZE - 1;
+    (start, end)
+}
+
+async fn sync_transcript_page_inner(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    session_id: &str,
+    page_seq: i64,
+) -> Result<(), sqlx::Error> {
+    let (start_item_seq, end_item_seq) = transcript_page_bounds(page_seq);
+    let rows = sqlx::query(
+        "SELECT item_seq, role, content_hash
+         FROM session_transcript_items
+         WHERE session_id = ? AND item_seq BETWEEN ? AND ?
+         ORDER BY item_seq ASC",
+    )
+    .bind(session_id)
+    .bind(start_item_seq)
+    .bind(end_item_seq)
+    .fetch_all(&mut **tx)
+    .await?;
+    if rows.is_empty() {
+        sqlx::query("DELETE FROM transcript_pages WHERE session_id = ? AND page_seq = ?")
+            .bind(session_id)
+            .bind(page_seq)
+            .execute(&mut **tx)
+            .await?;
+        return Ok(());
+    }
+
+    let first_item_seq = rows
+        .first()
+        .and_then(|row| row.try_get::<i64, _>("item_seq").ok())
+        .unwrap_or(start_item_seq);
+    let last_item_seq = rows
+        .last()
+        .and_then(|row| row.try_get::<i64, _>("item_seq").ok())
+        .unwrap_or(end_item_seq);
+    let mut hasher = Sha256::new();
+    for row in &rows {
+        hasher.update(row.try_get::<i64, _>("item_seq")?.to_string().as_bytes());
+        hasher.update([0]);
+        hasher.update(row.try_get::<String, _>("role")?.as_bytes());
+        hasher.update([0]);
+        hasher.update(row.try_get::<String, _>("content_hash")?.as_bytes());
+        hasher.update([0xff]);
+    }
+    let page_hash = format!("{:x}", hasher.finalize());
+    sqlx::query(
+        "INSERT INTO transcript_pages
+         (session_id, page_seq, start_item_seq, end_item_seq, item_count, page_hash, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
+         ON DUPLICATE KEY UPDATE
+           start_item_seq = VALUES(start_item_seq),
+           end_item_seq = VALUES(end_item_seq),
+           item_count = VALUES(item_count),
+           page_hash = VALUES(page_hash),
+           updated_at = NOW(6)",
+    )
+    .bind(session_id)
+    .bind(page_seq)
+    .bind(first_item_seq)
+    .bind(last_item_seq)
+    .bind(rows.len() as i64)
+    .bind(page_hash)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 fn transcript_content_hash(role: &str, content: &str) -> String {
@@ -2930,6 +3015,12 @@ impl AgenticRunLifecycleService {
         }
     }
 
+    fn durable_recent_events(run: &DurableRunRecord, limit: u32) -> Vec<Value> {
+        let capped = limit.clamp(1, 100) as usize;
+        let offset = run.events.len().saturating_sub(capped);
+        Self::format_run_events(&run.events[offset..], offset)
+    }
+
     async fn load_durable_run_for_user(
         &self,
         run_id: &str,
@@ -3853,6 +3944,107 @@ impl RunLifecycleService for AgenticRunLifecycleService {
     ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
         let run = self.require_durable_run_for_user(&run_id, &user_id).await?;
         Ok(Self::durable_status_record(&run))
+    }
+
+    async fn get_run_projection(
+        &self,
+        run_id: String,
+        user_id: String,
+        recent_limit: u32,
+    ) -> Result<RunProjectionRecord, (StatusCode, Json<ErrorResponse>)> {
+        let run = self.require_durable_run_for_user(&run_id, &user_id).await?;
+        let projection = self
+            .run_engine
+            .load_run_projection(&run_id)
+            .await
+            .map_err(|error| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Failed to load run projection: {error}"),
+                )
+            })?;
+        let latest_checkpoint = self
+            .run_engine
+            .load_latest_checkpoint(&run_id, None)
+            .await
+            .map_err(|error| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Failed to load run checkpoint: {error}"),
+                )
+            })?;
+        let recent_events = Self::durable_recent_events(&run, recent_limit);
+
+        if let Some(projection) = projection {
+            Ok(RunProjectionRecord {
+                run_id: projection.run_id,
+                session_id: projection.session_id,
+                status: projection.status,
+                waiting_for: projection.waiting_for,
+                error_message: projection.error_message,
+                run_event_high_watermark: run.last_event_idx,
+                projection_event_idx: projection.projection_event_idx,
+                projection_updated_at: projection.updated_at,
+                projection_hash: projection.projection_hash,
+                latest_event_type: projection.latest_event_type,
+                total_prompt_tokens: projection.total_prompt_tokens,
+                total_completion_tokens: projection.total_completion_tokens,
+                total_tool_calls: projection.total_tool_calls,
+                latest_checkpoint: latest_checkpoint.map(|checkpoint| {
+                    RunProjectionCheckpointRecord {
+                        checkpoint_id: checkpoint.checkpoint_id,
+                        checkpoint_kind: checkpoint.checkpoint_kind,
+                        checkpoint_version: checkpoint.checkpoint_version,
+                        node_seq: checkpoint.node_seq,
+                        created_at: checkpoint.created_at,
+                    }
+                }),
+                recent_events,
+            })
+        } else {
+            let latest_event_type = run.events.last().map(astra_services::extract_event_type);
+            Ok(RunProjectionRecord {
+                run_id: run.run_id.clone(),
+                session_id: run.session_id.clone(),
+                status: run.status.clone(),
+                waiting_for: run.waiting_for.clone(),
+                error_message: run.error_message.clone(),
+                run_event_high_watermark: run.last_event_idx,
+                projection_event_idx: run.last_event_idx,
+                projection_updated_at: run.updated_at.clone(),
+                projection_hash: format!(
+                    "{:x}",
+                    Sha256::digest(
+                        serde_json::json!({
+                            "run_id": run.run_id,
+                            "status": run.status,
+                            "waiting_for": run.waiting_for,
+                            "last_event_idx": run.last_event_idx,
+                            "total_prompt_tokens": run.total_prompt_tokens,
+                            "total_completion_tokens": run.total_completion_tokens,
+                            "total_tool_calls": run.total_tool_calls,
+                            "latest_event_type": latest_event_type.clone(),
+                        })
+                        .to_string()
+                        .as_bytes()
+                    )
+                ),
+                latest_event_type,
+                total_prompt_tokens: run.total_prompt_tokens,
+                total_completion_tokens: run.total_completion_tokens,
+                total_tool_calls: run.total_tool_calls,
+                latest_checkpoint: latest_checkpoint.map(|checkpoint| {
+                    RunProjectionCheckpointRecord {
+                        checkpoint_id: checkpoint.checkpoint_id,
+                        checkpoint_kind: checkpoint.checkpoint_kind,
+                        checkpoint_version: checkpoint.checkpoint_version,
+                        node_seq: checkpoint.node_seq,
+                        created_at: checkpoint.created_at,
+                    }
+                }),
+                recent_events,
+            })
+        }
     }
 
     async fn stream_run(
@@ -4808,6 +5000,21 @@ mod tests {
         assert_eq!(event["type"], "turn_complete");
         assert_eq!(event["has_tool_calls"], true);
         assert!(event.get("assistant_text").is_none());
+    }
+
+    #[test]
+    fn transcript_page_seq_rolls_over_every_fifty_items() {
+        assert_eq!(transcript_page_seq(1), 1);
+        assert_eq!(transcript_page_seq(50), 1);
+        assert_eq!(transcript_page_seq(51), 2);
+        assert_eq!(transcript_page_seq(101), 3);
+    }
+
+    #[test]
+    fn transcript_page_bounds_cover_exact_page_window() {
+        assert_eq!(transcript_page_bounds(1), (1, 50));
+        assert_eq!(transcript_page_bounds(2), (51, 100));
+        assert_eq!(transcript_page_bounds(3), (101, 150));
     }
 
     #[test]

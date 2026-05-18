@@ -144,6 +144,176 @@ pub(super) async fn get_run_status_handler(
     Ok(Json(RunStatusResponse::from(run)))
 }
 
+#[derive(serde::Deserialize)]
+pub(super) struct RunProjectionQuery {
+    #[serde(default = "default_projection_recent_limit")]
+    pub recent_limit: u32,
+}
+
+fn default_projection_recent_limit() -> u32 {
+    20
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct RunProjectionCheckpointResponse {
+    pub checkpoint_id: String,
+    pub checkpoint_kind: String,
+    pub checkpoint_version: String,
+    pub node_seq: i64,
+    pub created_at: String,
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct RunProjectionResponse {
+    pub run_id: String,
+    pub session_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    pub run_event_high_watermark: i64,
+    pub projection_event_idx: i64,
+    pub projection_updated_at: String,
+    pub projection_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_event_type: Option<String>,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub total_tool_calls: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_checkpoint: Option<RunProjectionCheckpointResponse>,
+    pub observability: RunProjectionObservabilityResponse,
+    pub recent_events: Vec<serde_json::Value>,
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct PromptRequestObservabilityResponse {
+    pub request_id: String,
+    pub request_hash: String,
+    pub message_count: u32,
+    pub tool_count: u32,
+    pub delta_counts: astra_services::PromptDeltaCounts,
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct RunProjectionObservabilityResponse {
+    pub has_durable_projection: bool,
+    pub observability_available: bool,
+    pub projection_lag_events: i64,
+    pub prompt_request_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_prompt_request: Option<PromptRequestObservabilityResponse>,
+}
+
+impl RunProjectionResponse {
+    fn new(
+        value: astra_services::runs::RunProjectionRecord,
+        observability: RunProjectionObservabilityResponse,
+    ) -> Self {
+        Self {
+            run_id: value.run_id,
+            session_id: value.session_id,
+            status: value.status,
+            waiting_for: value.waiting_for,
+            error_message: value.error_message,
+            run_event_high_watermark: value.run_event_high_watermark,
+            projection_event_idx: value.projection_event_idx,
+            projection_updated_at: value.projection_updated_at,
+            projection_hash: value.projection_hash,
+            latest_event_type: value.latest_event_type,
+            total_prompt_tokens: value.total_prompt_tokens,
+            total_completion_tokens: value.total_completion_tokens,
+            total_tool_calls: value.total_tool_calls,
+            latest_checkpoint: value.latest_checkpoint.map(|checkpoint| {
+                RunProjectionCheckpointResponse {
+                    checkpoint_id: checkpoint.checkpoint_id,
+                    checkpoint_kind: checkpoint.checkpoint_kind,
+                    checkpoint_version: checkpoint.checkpoint_version,
+                    node_seq: checkpoint.node_seq,
+                    created_at: checkpoint.created_at,
+                }
+            }),
+            observability,
+            recent_events: value.recent_events,
+        }
+    }
+}
+
+pub(super) async fn get_run_projection_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<RunProjectionQuery>,
+) -> Result<Json<RunProjectionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let mut projection = state
+        .execution
+        .run_lifecycle_service
+        .get_run_projection(run_id.clone(), user.user_id, query.recent_limit)
+        .await?;
+    projection.recent_events =
+        transform_stream_run_events_for_client(&run_id, projection.recent_events);
+    let projection_lag_events =
+        (projection.run_event_high_watermark - projection.projection_event_idx).max(0);
+    let (observability_available, prompt_request_count, latest_prompt_request) =
+        load_run_prompt_observability(&state, &run_id).await?;
+    let has_durable_projection = projection.run_event_high_watermark
+        == projection.projection_event_idx
+        || projection.projection_event_idx >= 0;
+    Ok(Json(RunProjectionResponse::new(
+        projection,
+        RunProjectionObservabilityResponse {
+            has_durable_projection,
+            observability_available,
+            projection_lag_events,
+            prompt_request_count,
+            latest_prompt_request,
+        },
+    )))
+}
+
+async fn load_run_prompt_observability(
+    state: &AppState,
+    run_id: &str,
+) -> Result<
+    (bool, u32, Option<PromptRequestObservabilityResponse>),
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let Some(shared_pool) = state.shared_pool.as_ref() else {
+        return Ok((false, 0, None));
+    };
+    let prompt_request_count = astra_services::count_prompt_requests_for_run(shared_pool, run_id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse::new(format!(
+                    "Failed to load run prompt request observability: {error}"
+                ))),
+            )
+        })?;
+    let latest_prompt_request =
+        astra_services::load_latest_prompt_observability_for_run(shared_pool, run_id)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse::new(format!(
+                        "Failed to load latest run prompt request: {error}"
+                    ))),
+                )
+            })?
+            .map(|request| PromptRequestObservabilityResponse {
+                request_id: request.request_id,
+                request_hash: request.request_hash,
+                message_count: request.message_count,
+                tool_count: request.tool_count,
+                delta_counts: request.delta_counts,
+            });
+    Ok((true, prompt_request_count, latest_prompt_request))
+}
+
 pub(super) async fn stream_run_handler(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
@@ -583,5 +753,185 @@ mod tests {
             text.contains("\"type\":\"run_finished\""),
             "terminal lifecycle event should still reach the client: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn get_run_projection_http_returns_bounded_projection_and_filters_internal_events() {
+        use crate::server::run_engine::RunEngine;
+        use crate::server::run_lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::InMemoryRunStateStore;
+
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        engine
+            .start_run("run-projection-http", "u1", "session-projection")
+            .await
+            .expect("start durable run");
+        engine
+            .append_event(
+                "run-projection-http",
+                json!({"event_type": "injection_freshness", "data": {"fingerprint": "secret"}}),
+            )
+            .await
+            .expect("persist internal event");
+        engine
+            .append_event(
+                "run-projection-http",
+                json!({"event_type": "text_done", "data": {"full_text": "durable answer"}}),
+            )
+            .await
+            .expect("persist final answer");
+        engine
+            .append_event(
+                "run-projection-http",
+                json!({"event_type": "run_error", "data": {"error": "boom"}}),
+            )
+            .await
+            .expect("persist error");
+        engine
+            .append_event(
+                "run-projection-http",
+                json!({"event_type": "run_finished", "data": {"prompt_tokens": 5, "completion_tokens": 2}}),
+            )
+            .await
+            .expect("persist run finished");
+        engine
+            .persist_usage("run-projection-http", 5, 2, 0)
+            .await
+            .expect("persist usage");
+        engine
+            .persist_checkpoint(
+                "run-projection-http",
+                r#"{"version":"checkpoint_v3","graceful":true,"last_batch_id":"batch-run-projection"}"#,
+            )
+            .await
+            .expect("persist checkpoint");
+        engine
+            .persist_status(
+                "run-projection-http",
+                astra_core::STATUS_FAILED,
+                None,
+                Some("boom"),
+            )
+            .await
+            .expect("mark failed");
+
+        let lifecycle = AgenticRunLifecycleService::new(
+            test_matrixone(),
+            Arc::new(
+                crate::FernetTokenEncryptor::new("0123456789abcdef")
+                    .expect("test encryptor should initialize"),
+            ),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
+        );
+
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_run_lifecycle_service(Arc::new(lifecycle)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/chat/runs/run-projection-http/projection?recent_limit=4")
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body should be readable");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("projection response should be valid json");
+        assert_eq!(json.get("status"), Some(&json!("failed")));
+        assert_eq!(json.get("latest_event_type"), Some(&json!("run_finished")));
+        assert_eq!(json.get("run_event_high_watermark"), Some(&json!(4)));
+        assert_eq!(
+            json.pointer("/latest_checkpoint/checkpoint_version"),
+            Some(&json!("checkpoint_v3"))
+        );
+        assert_eq!(
+            json.pointer("/observability/projection_lag_events"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            json.pointer("/observability/observability_available"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            json.pointer("/observability/prompt_request_count"),
+            Some(&json!(0))
+        );
+        let recent_events = json
+            .get("recent_events")
+            .and_then(serde_json::Value::as_array)
+            .expect("recent_events should be an array");
+        assert_eq!(recent_events.len(), 4);
+        assert!(
+            recent_events.iter().all(|event| {
+                event.get("type").and_then(serde_json::Value::as_str) != Some("injection_freshness")
+            }),
+            "internal events must stay out of the public projection payload"
+        );
+        assert!(
+            recent_events
+                .iter()
+                .any(|event| event.get("type") == Some(&json!("usage"))),
+            "run projection should expose transformed usage data"
+        );
+        assert!(
+            recent_events
+                .iter()
+                .any(|event| event.get("full_text") == Some(&json!("durable answer"))),
+            "run projection should keep bounded durable transcript data"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_run_projection_http_rejects_foreign_run() {
+        use crate::server::run_engine::RunEngine;
+        use crate::server::run_lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::InMemoryRunStateStore;
+
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        engine
+            .start_run("run-foreign", "u2", "session-foreign")
+            .await
+            .expect("start durable run");
+        let lifecycle = AgenticRunLifecycleService::new(
+            test_matrixone(),
+            Arc::new(
+                crate::FernetTokenEncryptor::new("0123456789abcdef")
+                    .expect("test encryptor should initialize"),
+            ),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
+        );
+
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_run_lifecycle_service(Arc::new(lifecycle)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/chat/runs/run-foreign/projection")
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }

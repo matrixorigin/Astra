@@ -35,7 +35,10 @@ use std::sync::Arc;
 
 use astra_services::{
     DatabaseStateProjectionStore,
-    runs::{DurableRunCheckpointRecord, DurableRunRecord, RunStateStore},
+    runs::{
+        DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord, DurableRunRecord,
+        RunStateStore,
+    },
 };
 
 use astra_core::{STATUS_RUNNING, STATUS_WAITING};
@@ -236,6 +239,14 @@ impl RunEngine {
         self.store
             .load_latest_checkpoint(run_id, checkpoint_kind)
             .await
+    }
+
+    /// Load the current durable display projection for a run.
+    pub async fn load_run_projection(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
+        self.store.load_run_projection(run_id).await
     }
 
     /// Append an event to the durable event log.
@@ -559,6 +570,63 @@ mod tests {
             .unwrap();
         assert_eq!(checkpoint.checkpoint_kind, "resume");
         assert_eq!(checkpoint.checkpoint_json, ck);
+    }
+
+    #[tokio::test]
+    async fn run_projection_tracks_latest_event_usage_and_checkpoint() {
+        let engine = test_engine();
+        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
+        engine
+            .append_event(
+                "run-1",
+                serde_json::json!({"event_type": "tool_call_start", "data": {"tool": "bash"}}),
+            )
+            .await
+            .unwrap();
+        engine.persist_usage("run-1", 11, 7, 3).await.unwrap();
+        engine
+            .persist_checkpoint(
+                "run-1",
+                r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"batch-1"}"#,
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_status("run-1", "waiting", Some("user_input"), None)
+            .await
+            .unwrap();
+
+        let projection = engine
+            .load_run_projection("run-1")
+            .await
+            .unwrap()
+            .expect("projection should exist");
+        assert_eq!(projection.status, "waiting");
+        assert_eq!(projection.waiting_for.as_deref(), Some("user_input"));
+        assert_eq!(projection.projection_event_idx, 1);
+        assert_eq!(
+            projection.latest_event_type.as_deref(),
+            Some("tool_call_start")
+        );
+        assert_eq!(projection.latest_checkpoint_kind.as_deref(), Some("resume"));
+        assert_eq!(
+            projection.latest_checkpoint_version.as_deref(),
+            Some("checkpoint_v2")
+        );
+        assert_eq!(projection.total_prompt_tokens, 11);
+        assert_eq!(projection.total_completion_tokens, 7);
+        assert_eq!(projection.total_tool_calls, 3);
+        assert!(
+            !projection.projection_hash.is_empty(),
+            "projection hash should be stable and non-empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_run_projection_missing_run_returns_none() {
+        let engine = test_engine();
+        let projection = engine.load_run_projection("nope").await.unwrap();
+        assert!(projection.is_none());
     }
 
     #[tokio::test]
