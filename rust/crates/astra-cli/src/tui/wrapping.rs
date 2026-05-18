@@ -1,4 +1,4 @@
-//! Word-wrapping with URL-aware heuristics.
+//! Word-wrapping with URL/path-aware heuristics.
 //!
 //! The TUI renders text that frequently contains URLs — command output,
 //! markdown, agent messages, tool-call results. Standard `textwrap`
@@ -21,10 +21,9 @@
 //! functions. Callers that definitely will not (code blocks, pure
 //! numeric output) can use the standard path for speed.
 //!
-//! URL detection is heuristic — see [`text_contains_url_like`] for the
-//! rules. False positives suppress hyphenation for that line; false
-//! negatives let a URL get split. The heuristic is intentionally
-//! conservative: file paths like `src/main.rs` are not matched.
+//! Link detection is heuristic — see [`text_contains_wrapping_protected_token`]
+//! for the rules. False positives suppress hyphenation for that line; false
+//! negatives let a clickable token get split.
 
 use ratatui::text::Line;
 use ratatui::text::Span;
@@ -185,6 +184,15 @@ pub(crate) fn line_contains_url_like(line: &Line<'_>) -> bool {
     text_contains_url_like(&text)
 }
 
+pub(crate) fn line_contains_wrapping_protected_token(line: &Line<'_>) -> bool {
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    text_contains_wrapping_protected_token(&text)
+}
+
 /// Returns `true` if `line` contains both a URL-like token and at least one
 /// substantive non-URL token.
 ///
@@ -242,6 +250,69 @@ fn text_has_mixed_url_and_non_url_tokens(text: &str) -> bool {
 fn is_url_like_token(raw_token: &str) -> bool {
     let token = trim_url_token(raw_token);
     !token.is_empty() && (is_absolute_url_like(token) || is_bare_url_like(token))
+}
+
+fn text_contains_wrapping_protected_token(text: &str) -> bool {
+    text.split_ascii_whitespace()
+        .any(is_wrapping_protected_token)
+}
+
+fn is_wrapping_protected_token(raw_token: &str) -> bool {
+    is_osc8_token(raw_token) || is_url_like_token(raw_token) || is_file_path_like_token(raw_token)
+}
+
+fn is_osc8_token(raw_token: &str) -> bool {
+    raw_token.contains("\x1b]8;;") && raw_token.contains("\x1b]8;;\x1b")
+}
+
+fn is_file_path_like_token(raw_token: &str) -> bool {
+    let token = trim_url_token(raw_token);
+    if token.is_empty() || is_url_like_token(token) {
+        return false;
+    }
+    let (path, line_part) = split_optional_line_suffix(token);
+    if let Some(line) = line_part
+        && (line.is_empty() || !line.chars().all(|c| c.is_ascii_digit()))
+    {
+        return false;
+    }
+    is_absolute_path_like(path) || is_relative_path_like(path)
+}
+
+fn split_optional_line_suffix(token: &str) -> (&str, Option<&str>) {
+    let Some((path, suffix)) = token.rsplit_once(':') else {
+        return (token, None);
+    };
+    if suffix.chars().all(|c| c.is_ascii_digit()) && path.contains('/') {
+        (path, Some(suffix))
+    } else {
+        (token, None)
+    }
+}
+
+fn is_absolute_path_like(path: &str) -> bool {
+    path.starts_with('/')
+        && path.len() > 1
+        && path
+            .chars()
+            .all(|c| !c.is_control() && !matches!(c, '\x1b' | '\x07'))
+}
+
+fn is_relative_path_like(path: &str) -> bool {
+    if !(path.starts_with("./") || path.starts_with("../") || path.contains('/')) {
+        return false;
+    }
+    if path.ends_with('/') || path.contains("://") {
+        return false;
+    }
+    let Some(last) = path.rsplit('/').next() else {
+        return false;
+    };
+    last.contains('.')
+        && !last.starts_with('.')
+        && path
+            .chars()
+            .all(|c| !c.is_control() && !matches!(c, '\x1b' | '\x07' | '*' | '?'))
 }
 
 fn is_substantive_non_url_token(raw_token: &str) -> bool {
@@ -463,7 +534,7 @@ fn is_domain_label(label: &str) -> bool {
 /// while still allowing character-level splitting for non-URL words.
 pub(crate) fn url_preserving_wrap_options<'a>(opts: RtOptions<'a>) -> RtOptions<'a> {
     opts.word_separator(textwrap::WordSeparator::AsciiSpace)
-        .word_splitter(textwrap::WordSplitter::Custom(split_non_url_word))
+        .word_splitter(textwrap::WordSplitter::Custom(split_unprotected_word))
         .break_words(/*break_words*/ false)
 }
 
@@ -471,8 +542,8 @@ pub(crate) fn url_preserving_wrap_options<'a>(opts: RtOptions<'a>) -> RtOptions<
 /// points) for URL-like tokens so they are kept intact; returns every
 /// char-boundary index for everything else so non-URL words can still
 /// break at any position.
-fn split_non_url_word(word: &str) -> Vec<usize> {
-    if is_url_like_token(word) {
+fn split_unprotected_word(word: &str) -> Vec<usize> {
+    if is_wrapping_protected_token(word) {
         return Vec::new();
     }
 
@@ -488,7 +559,7 @@ fn split_non_url_word(word: &str) -> Vec<usize> {
 /// words on the same line still break normally.
 #[must_use]
 pub(crate) fn adaptive_wrap_line<'a>(line: &'a Line<'a>, base: RtOptions<'a>) -> Vec<Line<'a>> {
-    let selected = if line_contains_url_like(line) {
+    let selected = if line_contains_wrapping_protected_token(line) {
         url_preserving_wrap_options(base)
     } else {
         base
@@ -1187,6 +1258,45 @@ them."#
     }
 
     #[test]
+    fn text_contains_wrapping_protected_token_accepts_file_paths() {
+        let positives = [
+            "src/tui/wrapping.rs",
+            "./rust/crates/astra-cli/src/main.rs:42",
+            "../docs/reference/config.md",
+            "/home/xupeng/astra/rust/Cargo.toml:12",
+        ];
+        for text in positives {
+            assert!(
+                text_contains_wrapping_protected_token(text),
+                "expected path-like protected token for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_contains_wrapping_protected_token_rejects_globs_and_plain_words() {
+        let negatives = [
+            "src/**/*.rs",
+            "hello.world",
+            "foo/bar/baz",
+            "key:value",
+            "just-some-text-with-dashes",
+        ];
+        for text in negatives {
+            assert!(
+                !text_contains_wrapping_protected_token(text),
+                "did not expect protected token for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_contains_wrapping_protected_token_accepts_osc8_links() {
+        let link = "\x1b]8;;file:///tmp/example.rs:9\x1b\\/tmp/example.rs:9\x1b]8;;\x1b\\";
+        assert!(text_contains_wrapping_protected_token(link));
+    }
+
+    #[test]
     fn line_contains_url_like_checks_across_spans() {
         let line = Line::from(vec![
             "see ".into(),
@@ -1235,6 +1345,16 @@ them."#
             concat_line(&out[0]),
             "example.test/a-very-long-path-with-many-segments-and-query?x=1&y=2"
         );
+    }
+
+    #[test]
+    fn adaptive_wrap_line_keeps_long_file_path_token_intact() {
+        let path =
+            "rust/crates/astra-cli/src/tui/very-long-component-name/wrapping_regression_case.rs:99";
+        let line = Line::from(path);
+        let out = adaptive_wrap_line(&line, RtOptions::new(/*width*/ 20));
+        assert_eq!(out.len(), 1);
+        assert_eq!(concat_line(&out[0]), path);
     }
 
     #[test]

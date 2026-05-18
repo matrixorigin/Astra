@@ -4,8 +4,10 @@
 //! focused, sends an OS-level notification to alert them. Supports macOS
 //! (`osascript`), Linux (`notify-send`), and a terminal bell fallback.
 
+use std::io::IsTerminal as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{fmt, str::FromStr};
 
 /// Minimum interval between notifications to prevent toast spam.
 const NOTIFICATION_COOLDOWN_SECS: u64 = 30;
@@ -23,6 +25,8 @@ static LAST_NOTIFICATION_AT: AtomicU64 = AtomicU64::new(0);
 pub struct NotificationConfig {
     /// Whether notifications are enabled.
     pub enabled: bool,
+    /// User-selected delivery method.
+    pub method: NotificationMethod,
     /// Minimum task duration (in seconds) before a notification is sent.
     pub min_duration_secs: u64,
 }
@@ -31,6 +35,7 @@ impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            method: NotificationMethod::Auto,
             min_duration_secs: 10,
         }
     }
@@ -43,6 +48,39 @@ impl NotificationConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationMethod {
+    Auto,
+    Osc9,
+    Bell,
+    Off,
+}
+
+impl fmt::Display for NotificationMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Osc9 => f.write_str("osc9"),
+            Self::Bell => f.write_str("bell"),
+            Self::Off => f.write_str("off"),
+        }
+    }
+}
+
+impl FromStr for NotificationMethod {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Ok(Self::Auto),
+            "osc9" | "osc-9" | "terminal" => Ok(Self::Osc9),
+            "bell" | "bel" => Ok(Self::Bell),
+            "off" | "none" | "disabled" | "false" => Ok(Self::Off),
+            other => Err(format!("unknown notification method: {other}")),
+        }
+    }
+}
+
 /// The notification backend to use, determined by the current platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationBackend {
@@ -52,27 +90,64 @@ pub enum NotificationBackend {
     Linux,
     /// Fallback: emit the terminal bell character (`\x07`).
     TerminalBell,
+    /// Terminal notification via OSC 9 on stderr.
+    Osc9,
     /// Notifications are disabled by configuration.
     Disabled,
 }
 
 /// Detect the appropriate notification backend for the current platform.
 pub fn detect_backend(config: &NotificationConfig) -> NotificationBackend {
-    if !config.enabled {
+    detect_backend_with(
+        config,
+        current_platform(),
+        which_exists("notify-send"),
+        std::io::stderr().is_terminal(),
+    )
+}
+
+fn current_platform() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "other"
+    }
+}
+
+fn detect_backend_with(
+    config: &NotificationConfig,
+    platform: &str,
+    has_notify_send: bool,
+    stderr_is_terminal: bool,
+) -> NotificationBackend {
+    if !config.enabled || config.method == NotificationMethod::Off {
         return NotificationBackend::Disabled;
     }
 
-    if cfg!(target_os = "macos") {
-        NotificationBackend::MacOs
-    } else if cfg!(target_os = "linux") {
-        // Check if notify-send is available
-        if which_exists("notify-send") {
-            NotificationBackend::Linux
-        } else {
-            NotificationBackend::TerminalBell
+    match config.method {
+        NotificationMethod::Osc9 => {
+            if stderr_is_terminal {
+                NotificationBackend::Osc9
+            } else {
+                NotificationBackend::Disabled
+            }
         }
-    } else {
-        NotificationBackend::TerminalBell
+        NotificationMethod::Bell => {
+            if stderr_is_terminal {
+                NotificationBackend::TerminalBell
+            } else {
+                NotificationBackend::Disabled
+            }
+        }
+        NotificationMethod::Off => NotificationBackend::Disabled,
+        NotificationMethod::Auto => match platform {
+            "macos" => NotificationBackend::MacOs,
+            "linux" if has_notify_send => NotificationBackend::Linux,
+            _ if stderr_is_terminal => NotificationBackend::Osc9,
+            _ => NotificationBackend::Disabled,
+        },
     }
 }
 
@@ -193,6 +268,9 @@ async fn send_notification(backend: NotificationBackend, title: &str, body: &str
         NotificationBackend::TerminalBell => {
             send_terminal_bell();
         }
+        NotificationBackend::Osc9 => {
+            send_osc9_notification(title, body);
+        }
         NotificationBackend::Disabled => {}
     }
 }
@@ -227,6 +305,18 @@ fn send_terminal_bell() {
     eprint!("\x07");
 }
 
+fn send_osc9_notification(title: &str, body: &str) {
+    let title = sanitize_terminal_notification(title);
+    let body = sanitize_terminal_notification(body);
+    eprint!("\x1b]9;{title}: {body}\x07");
+}
+
+fn sanitize_terminal_notification(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(*c, '\x1b' | '\x07') && !c.is_control())
+        .collect()
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -239,7 +329,23 @@ mod tests {
     fn test_config_default() {
         let config = NotificationConfig::default();
         assert!(config.enabled);
+        assert_eq!(config.method, NotificationMethod::Auto);
         assert_eq!(config.min_duration_secs, 10);
+    }
+
+    #[test]
+    fn notification_method_roundtrips_and_rejects_unknown() {
+        for (raw, expected) in [
+            ("auto", NotificationMethod::Auto),
+            ("OSC9", NotificationMethod::Osc9),
+            ("bel", NotificationMethod::Bell),
+            ("off", NotificationMethod::Off),
+        ] {
+            let parsed: NotificationMethod = raw.parse().unwrap();
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.to_string(), expected.to_string());
+        }
+        assert!("native".parse::<NotificationMethod>().is_err());
     }
 
     // ── Duration threshold ──────────────────────────────────────────────
@@ -248,6 +354,7 @@ mod tests {
     fn test_exceeds_threshold_below() {
         let config = NotificationConfig {
             enabled: true,
+            method: NotificationMethod::Auto,
             min_duration_secs: 10,
         };
         assert!(!config.exceeds_threshold(Duration::from_secs(5)));
@@ -257,6 +364,7 @@ mod tests {
     fn test_exceeds_threshold_exact() {
         let config = NotificationConfig {
             enabled: true,
+            method: NotificationMethod::Auto,
             min_duration_secs: 10,
         };
         assert!(config.exceeds_threshold(Duration::from_secs(10)));
@@ -266,6 +374,7 @@ mod tests {
     fn test_exceeds_threshold_above() {
         let config = NotificationConfig {
             enabled: true,
+            method: NotificationMethod::Auto,
             min_duration_secs: 10,
         };
         assert!(config.exceeds_threshold(Duration::from_secs(42)));
@@ -277,20 +386,53 @@ mod tests {
     fn test_detect_backend_disabled() {
         let config = NotificationConfig {
             enabled: false,
+            method: NotificationMethod::Auto,
             min_duration_secs: 10,
         };
         assert_eq!(detect_backend(&config), NotificationBackend::Disabled);
     }
 
     #[test]
-    fn test_detect_backend_enabled_returns_valid_variant() {
+    fn auto_detect_prefers_notify_send_on_linux_and_disables_non_tty_fallback() {
         let config = NotificationConfig {
             enabled: true,
+            method: NotificationMethod::Auto,
             min_duration_secs: 10,
         };
-        let backend = detect_backend(&config);
-        // On any platform, we should get a non-Disabled variant when enabled.
-        assert_ne!(backend, NotificationBackend::Disabled);
+        assert_eq!(
+            detect_backend_with(&config, "linux", true, true),
+            NotificationBackend::Linux
+        );
+        assert_eq!(
+            detect_backend_with(&config, "linux", false, true),
+            NotificationBackend::Osc9
+        );
+        assert_eq!(
+            detect_backend_with(&config, "linux", false, false),
+            NotificationBackend::Disabled
+        );
+    }
+
+    #[test]
+    fn explicit_terminal_methods_require_tty() {
+        let mut config = NotificationConfig {
+            enabled: true,
+            method: NotificationMethod::Osc9,
+            min_duration_secs: 10,
+        };
+        assert_eq!(
+            detect_backend_with(&config, "linux", true, true),
+            NotificationBackend::Osc9
+        );
+        assert_eq!(
+            detect_backend_with(&config, "linux", true, false),
+            NotificationBackend::Disabled
+        );
+        config.method = NotificationMethod::Bell;
+        assert_eq!(
+            detect_backend_with(&config, "linux", true, true),
+            NotificationBackend::TerminalBell
+        );
     }
 
     // ── Message formatting ──────────────────────────────────────────────
@@ -330,6 +472,7 @@ mod tests {
     async fn test_notify_completion_disabled_config_is_noop() {
         let config = NotificationConfig {
             enabled: false,
+            method: NotificationMethod::Auto,
             min_duration_secs: 1,
         };
         // Should return immediately without side effects.
@@ -340,6 +483,7 @@ mod tests {
     async fn test_notify_completion_below_threshold_is_noop() {
         let config = NotificationConfig {
             enabled: true,
+            method: NotificationMethod::Auto,
             min_duration_secs: 60,
         };
         // 5 seconds < 60 threshold — should be a no-op.
@@ -369,6 +513,11 @@ mod tests {
     async fn send_notification_terminal_bell_does_not_panic() {
         // eprint! the bell — no subprocess, no await, just stderr write.
         send_notification(NotificationBackend::TerminalBell, "t", "b").await;
+    }
+
+    #[tokio::test]
+    async fn send_notification_osc9_does_not_panic() {
+        send_notification(NotificationBackend::Osc9, "t\x1b", "b\x07").await;
     }
 
     #[tokio::test]

@@ -10,6 +10,8 @@ use std::process::Command;
 
 use crossterm::style::Stylize;
 
+use crate::terminal_hyperlinks::{osc8_link, sanitize_osc8_component, terminal_hyperlinks_enabled};
+
 /// Max bytes read from `git diff` / `git show` (avoid OOM on huge trees).
 const MAX_DIFF_BYTES: usize = 2_000_000;
 /// Stop rendering after this many lines (tail message points to narrowed `/diff -- <path>`).
@@ -95,6 +97,37 @@ impl TerminalDiffSink {
     }
 }
 
+fn strip_diff_path_prefix(path: &str) -> &str {
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
+}
+
+fn file_uri_for_diff_path(path: &str) -> String {
+    let clean = sanitize_osc8_component(strip_diff_path_prefix(path));
+    if clean.starts_with('/') {
+        format!("file://{clean}")
+    } else {
+        format!("file://./{clean}")
+    }
+}
+
+fn hyperlink_diff_path_meta(line: &str) -> String {
+    if !terminal_hyperlinks_enabled() {
+        return line.to_string();
+    }
+    for prefix in ["--- ", "+++ "] {
+        if let Some(path) = line.strip_prefix(prefix) {
+            if path == "/dev/null" {
+                return line.to_string();
+            }
+            let link = osc8_link(&file_uri_for_diff_path(path), path);
+            return format!("{prefix}{link}");
+        }
+    }
+    line.to_string()
+}
+
 impl DiffSink for TerminalDiffSink {
     fn header(&mut self, line: &str) {
         if !self.bump() {
@@ -118,7 +151,8 @@ impl DiffSink for TerminalDiffSink {
         if !self.bump() {
             return;
         }
-        let _ = writeln!(io::stdout(), "{}", self.clip(line).dim());
+        let line = hyperlink_diff_path_meta(line);
+        let _ = writeln!(io::stdout(), "{}", self.clip(&line).dim());
     }
 
     fn hunk_header(&mut self, line: &str) {
@@ -581,5 +615,21 @@ diff --git a/y b/y
         assert!(c.0.iter().any(|l| l.starts_with("H:")));
         assert!(c.0.iter().any(|l| l.starts_with("A:+y")));
         assert!(c.0.iter().any(|l| l.starts_with("D:-x")));
+    }
+
+    #[test]
+    fn diff_path_meta_formats_osc8_file_links() {
+        let rendered = hyperlink_diff_path_meta("+++ b/rust/crates/astra-cli/src/main.rs");
+        assert!(rendered.contains("\x1b]8;;file://./rust/crates/astra-cli/src/main.rs\x1b\\"));
+        assert!(rendered.contains("b/rust/crates/astra-cli/src/main.rs"));
+        assert!(rendered.ends_with("\x1b]8;;\x1b\\"));
+    }
+
+    #[test]
+    fn diff_path_meta_sanitizes_controls_and_skips_dev_null() {
+        assert_eq!(hyperlink_diff_path_meta("--- /dev/null"), "--- /dev/null");
+        let rendered = hyperlink_diff_path_meta("+++ b/src/\x1bmain.rs");
+        assert!(!rendered.contains("src/\x1bmain.rs"));
+        assert!(rendered.contains("src/main.rs"));
     }
 }

@@ -119,6 +119,9 @@ pub(crate) struct SessionState {
     /// User preference: send desktop notifications when turns complete.
     /// Synced via `pref_keys::NOTIFICATIONS_ENABLED`.
     pub notifications_enabled: bool,
+    /// User preference: notification delivery method.
+    /// Synced via `pref_keys::NOTIFICATION_METHOD`.
+    pub notification_method: crate::notifications::NotificationMethod,
     /// User preference: minimum elapsed seconds before a notification fires.
     /// Synced via `pref_keys::NOTIFICATION_THRESHOLD_SECS`.
     pub notification_threshold_secs: u64,
@@ -457,6 +460,7 @@ impl Default for SessionState {
             verbose_mode: true,
             auto_memory_enabled: true,
             notifications_enabled: true,
+            notification_method: crate::notifications::NotificationMethod::Auto,
             notification_threshold_secs: 10,
             history: Vec::new(),
             total_prompt_tokens: 0,

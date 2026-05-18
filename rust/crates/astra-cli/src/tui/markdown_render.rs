@@ -3,7 +3,7 @@ use super::render::line_utils::line_to_static;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use unicode_width::UnicodeWidthStr;
 
 struct MarkdownStyles {
@@ -49,13 +49,13 @@ pub(crate) fn render_markdown_text_with_width(input: &str, width: Option<usize>)
 pub(crate) fn render_markdown_text_with_width_and_cwd(
     input: &str,
     width: Option<usize>,
-    _cwd: Option<&Path>,
+    cwd: Option<&Path>,
 ) -> Text<'static> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
     let parser = Parser::new_ext(input, options);
-    let mut writer = Writer::new(width);
+    let mut writer = Writer::new(width, cwd.map(Path::to_path_buf));
     writer.run(parser);
     writer.into_text()
 }
@@ -74,6 +74,7 @@ struct Writer {
     /// Total render width, used for horizontal rules and wrap-aware
     /// tables. `None` means "no hint — fall back to a reasonable default".
     width: Option<usize>,
+    cwd: Option<PathBuf>,
     /// Active table state. `None` outside of `Tag::Table`.
     table: Option<TableBuilder>,
 }
@@ -108,7 +109,7 @@ impl TableBuilder {
 }
 
 impl Writer {
-    fn new(width: Option<usize>) -> Self {
+    fn new(width: Option<usize>, cwd: Option<PathBuf>) -> Self {
         Self {
             styles: MarkdownStyles::default(),
             lines: Vec::new(),
@@ -121,6 +122,7 @@ impl Writer {
             in_blockquote: false,
             link_url: None,
             width,
+            cwd,
             table: None,
         }
     }
@@ -569,6 +571,14 @@ impl Writer {
         while self.lines.last().is_some_and(|l| l.spans.is_empty()) {
             self.lines.pop();
         }
+        if !self.lines.is_empty() {
+            let cwd = self.cwd.as_deref();
+            self.lines = self
+                .lines
+                .into_iter()
+                .map(|line| crate::terminal_hyperlinks::hyperlink_line_file_paths(&line, cwd))
+                .collect();
+        }
         Text::from(self.lines)
     }
 }
@@ -691,7 +701,7 @@ fn list_item_hang_wrap(spans: &[Span<'static>], width: usize) -> Option<Vec<Line
         )))
         .subsequent_indent(Line::from(Span::raw(hang)));
 
-    let wrapped = super::wrapping::word_wrap_line(&body_line, opts);
+    let wrapped = super::wrapping::adaptive_wrap_line(&body_line, opts);
     if wrapped.is_empty() {
         return None;
     }
@@ -729,7 +739,7 @@ fn blockquote_wrap(
         .initial_indent(bar())
         .subsequent_indent(bar());
     let body_line = Line::from(spans.to_vec());
-    let wrapped = super::wrapping::word_wrap_line(&body_line, opts);
+    let wrapped = super::wrapping::adaptive_wrap_line(&body_line, opts);
     if wrapped.is_empty() {
         return None;
     }
@@ -754,7 +764,7 @@ fn paragraph_wrap(spans: &[Span<'static>], width: usize) -> Option<Vec<Line<'sta
     }
     let body_line = Line::from(spans.to_vec());
     let opts = super::wrapping::RtOptions::new(width);
-    let wrapped = super::wrapping::word_wrap_line(&body_line, opts);
+    let wrapped = super::wrapping::adaptive_wrap_line(&body_line, opts);
     if wrapped.is_empty() {
         return None;
     }
@@ -837,6 +847,7 @@ fn pad_cell(text: &str, width: usize, align: Alignment) -> String {
 #[cfg(test)]
 mod polish_tests {
     use super::*;
+    use std::path::Path;
 
     fn lines(md: &str) -> Vec<String> {
         render_markdown_text(md)
@@ -853,6 +864,19 @@ mod polish_tests {
 
     fn lines_at(md: &str, width: usize) -> Vec<String> {
         render_markdown_text_with_width(md, Some(width))
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn lines_at_cwd(md: &str, width: usize, cwd: &Path) -> Vec<String> {
+        render_markdown_text_with_width_and_cwd(md, Some(width), Some(cwd))
             .lines
             .iter()
             .map(|l| {
@@ -1076,5 +1100,33 @@ mod polish_tests {
             .expect("rule line");
         // Previous implementation was hardcoded to 40 — now it's 60.
         assert_eq!(rule_line.chars().count(), 60);
+    }
+
+    #[test]
+    fn renders_relative_file_paths_as_osc8_links() {
+        let out = lines_at_cwd(
+            "See src/tui/wrapping.rs:42 for details.",
+            80,
+            Path::new("/home/xupeng/astra/rust/crates/astra-cli"),
+        );
+        let joined = out.join("\n");
+        assert!(joined.contains(
+            "\x1b]8;;file:///home/xupeng/astra/rust/crates/astra-cli/src/tui/wrapping.rs\x1b\\src/tui/wrapping.rs:42\x1b]8;;\x1b\\"
+        ));
+    }
+
+    #[test]
+    fn long_file_paths_wrap_without_splitting_the_token() {
+        let out = lines_at_cwd(
+            "inspect ./rust/crates/astra-cli/src/tui/markdown_render.rs:757 before changing anything",
+            34,
+            Path::new("/home/xupeng/astra"),
+        );
+        assert!(out.len() >= 2, "expected wrapped output; got {out:?}");
+        assert!(
+            out.iter()
+                .any(|line| line.contains("./rust/crates/astra-cli/src/tui/markdown_render.rs:757")),
+            "expected intact path token in wrapped output; got {out:?}"
+        );
     }
 }

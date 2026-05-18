@@ -59,15 +59,19 @@ fn display_width(s: &str) -> usize {
         return s.width();
     }
 
-    // Strip OSC sequences: ESC ] ... BEL
+    // Strip OSC sequences: ESC ] ... BEL or ESC ] ... ST
     let mut visible = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(ch) = chars.next() {
         if ch == '\x1B' && chars.clone().next() == Some(']') {
-            // Consume the ']' and everything up to and including BEL.
+            // Consume the ']' and everything up to and including BEL or ST.
             chars.next(); // skip ']'
-            for c in chars.by_ref() {
+            while let Some(c) = chars.next() {
                 if c == '\x07' {
+                    break;
+                }
+                if c == '\x1B' && chars.clone().next() == Some('\\') {
+                    chars.next();
                     break;
                 }
             }
@@ -759,5 +763,11 @@ mod tests {
                 .any(|command| matches!(command, DrawCommand::ClearToEnd { x: 2, y: 0, .. })),
             "expected clear-to-end to start after the remaining wide char; commands: {commands:?}"
         );
+    }
+
+    #[test]
+    fn display_width_ignores_osc8_payload_terminated_by_st() {
+        let linked = "\x1b]8;;file:///tmp/example.rs\x1b\\example.rs\x1b]8;;\x1b\\";
+        assert_eq!(display_width(linked), "example.rs".width());
     }
 }

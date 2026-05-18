@@ -92,6 +92,8 @@ pub(crate) struct StatusIndicator {
 /// reassure the user during Bedrock extended-thinking pauses,
 /// long enough to avoid flickering in/out for a normal prompt.
 const SILENT_WINDOW_BEFORE_THOUGHT_CHIP: Duration = Duration::from_secs(5);
+const STALL_WARN_AFTER: Duration = Duration::from_secs(5);
+const STALL_ERROR_AFTER: Duration = Duration::from_secs(10);
 const DEFAULT_TURN_LABEL: &str = "Thinking";
 
 impl StatusIndicator {
@@ -184,11 +186,12 @@ fn render_for(
     let elapsed = elapsed_origin.and_then(|t| now.checked_duration_since(t));
 
     let theme = crate::tui::theme::current();
+    let intensity_color = stall_intensity_color(elapsed, theme);
     let star_style = Style::default()
-        .fg(theme.accent)
+        .fg(intensity_color)
         .add_modifier(Modifier::BOLD);
     let label_style = Style::default()
-        .fg(theme.accent)
+        .fg(intensity_color)
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Color::DarkGray);
 
@@ -268,6 +271,14 @@ fn thought_for_duration(
     }
 }
 
+fn stall_intensity_color(elapsed: Option<Duration>, theme: &crate::tui::theme::Theme) -> Color {
+    match elapsed {
+        Some(d) if d >= STALL_ERROR_AFTER => theme.error,
+        Some(d) if d >= STALL_WARN_AFTER => theme.warn,
+        _ => theme.accent,
+    }
+}
+
 /// Parenthesised suffix: `(elapsed · thought for Ns · ↓ N tokens · esc to interrupt)`.
 /// Sections elide when they'd be meaningless (token counter
 /// before first delta, no-yet elapsed at state flip, thought-for
@@ -343,10 +354,10 @@ fn label_spans_for_mode(
         return Vec::new();
     }
 
-    let base = match style.fg {
-        Some(Color::Rgb(r, g, b)) => (r, g, b),
-        _ => (150, 120, 255),
-    };
+    let base = style
+        .fg
+        .and_then(color_to_rgb_approx)
+        .unwrap_or((150, 120, 255));
     let highlight = crate::tui::terminal_palette::default_fg().unwrap_or((255, 255, 255));
     let padding = 2usize;
     let period = chars.len() + padding * 2;
@@ -372,6 +383,29 @@ fn label_spans_for_mode(
             )
         })
         .collect()
+}
+
+fn color_to_rgb_approx(color: Color) -> Option<(u8, u8, u8)> {
+    match color {
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        Color::Black => Some((0, 0, 0)),
+        Color::Red => Some((205, 49, 49)),
+        Color::Green => Some((13, 188, 121)),
+        Color::Yellow => Some((229, 229, 16)),
+        Color::Blue => Some((36, 114, 200)),
+        Color::Magenta => Some((188, 63, 188)),
+        Color::Cyan => Some((17, 168, 205)),
+        Color::Gray => Some((204, 204, 204)),
+        Color::DarkGray => Some((118, 118, 118)),
+        Color::LightRed => Some((241, 76, 76)),
+        Color::LightGreen => Some((35, 209, 139)),
+        Color::LightYellow => Some((245, 245, 67)),
+        Color::LightBlue => Some((59, 142, 234)),
+        Color::LightMagenta => Some((214, 112, 214)),
+        Color::LightCyan => Some((41, 184, 219)),
+        Color::White => Some((255, 255, 255)),
+        Color::Indexed(_) | Color::Reset => None,
+    }
 }
 
 /// Rotating star glyph. Time-keyed to a 500 ms window — slow
@@ -471,6 +505,35 @@ mod tests {
         assert!(text.contains("Thinking"));
         assert!(text.contains("3s"));
         assert!(text.contains("esc to interrupt"));
+    }
+
+    #[test]
+    fn thinking_stall_intensity_warns_at_5s_and_errors_at_10s() {
+        let theme = crate::tui::theme::Theme::dark();
+        assert_eq!(
+            stall_intensity_color(Some(Duration::from_secs(4)), &theme),
+            theme.accent
+        );
+        assert_eq!(
+            stall_intensity_color(Some(Duration::from_secs(5)), &theme),
+            theme.warn
+        );
+        assert_eq!(
+            stall_intensity_color(Some(Duration::from_secs(10)), &theme),
+            theme.error
+        );
+    }
+
+    #[test]
+    fn rendered_spinner_uses_stall_color_on_first_span() {
+        let mut s = StatusIndicator::new();
+        let t0 = Instant::now();
+        s.set_state(IndicatorState::Thinking { started_at: t0 });
+        let line = s.render_at(t0 + Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            line.spans[0].style.fg,
+            Some(crate::tui::theme::current().error)
+        );
     }
 
     #[test]
