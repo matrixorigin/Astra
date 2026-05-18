@@ -530,6 +530,14 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             ctx.all_schemas,
         );
     }
+    if ctx.plan_mode_active {
+        astra_turn_core::tool_schema_prune::inject_required_tool_names(
+            &mut turn_schemas,
+            &mut selection_report,
+            astra_turn_core::tool_schema_prune::PLAN_MODE_REQUIRED_TOOLS,
+            ctx.all_schemas,
+        );
+    }
 
     // Plan-mode tool restrictions are owned by the host
     // (`CliAgenticLoopHost::execute_turn`) using the same
@@ -1507,6 +1515,41 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
         assert_eq!(report.selected_count, 4);
         assert!(report.tools_selected.contains(&"grep".into()));
         assert!(report.tools_selected.contains(&"glob".into()));
+        assert_eq!(turn_schemas.len(), 4);
+    }
+
+    #[test]
+    fn plan_mode_required_tools_injected_into_selection() {
+        use astra_runtime::tool_registry::SelectionReport;
+        use astra_turn_core::tool_schema_prune::{
+            PLAN_MODE_REQUIRED_TOOLS, inject_required_tool_names,
+        };
+
+        let all_schemas = [
+            schema("read_file"),
+            schema("write_file"),
+            schema("enter_plan_mode"),
+            schema("exit_plan_mode"),
+        ];
+
+        let mut turn_schemas = vec![schema("read_file"), schema("write_file")];
+        let mut report = SelectionReport {
+            tools_selected: vec!["read_file".into(), "write_file".into()],
+            selected_count: 2,
+            budget_used: 0,
+            budget_total: 0,
+        };
+
+        let injected = inject_required_tool_names(
+            &mut turn_schemas,
+            &mut report,
+            PLAN_MODE_REQUIRED_TOOLS,
+            &all_schemas,
+        );
+
+        assert_eq!(injected, 2);
+        assert!(report.tools_selected.contains(&"enter_plan_mode".into()));
+        assert!(report.tools_selected.contains(&"exit_plan_mode".into()));
         assert_eq!(turn_schemas.len(), 4);
     }
 }

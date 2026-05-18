@@ -266,7 +266,8 @@ fn build_skill_listing_section_with_budget_and_caps(
              agents\", \"parallel review\", \"different angles in parallel\"), \
              route through `agent(action='spawn', ...)` instead — emit N \
              separate `agent` calls in a single assistant message, each with \
-             `action='spawn'` and `run_in_background: true`, then collect with \
+             `action='spawn'`, top-level `prompt` for the full child brief \
+             (never top-level `task`), and `run_in_background: true`, then collect with \
              `agent(action='get_result', agent_id=...)`. Skills usually run \
              sequentially inside the parent turn, which contradicts the \
              user's explicit fan-out intent.",
@@ -3416,6 +3417,11 @@ mod tests {
                     .text
                     .contains("agent(action='get_result', agent_id=...)"),
             "skill listing must teach consolidated agent(action=...) syntax: {}",
+            section.text
+        );
+        assert!(
+            section.text.contains("never top-level `task`"),
+            "skill listing must explicitly forbid the deprecated task field: {}",
             section.text
         );
         assert!(

@@ -292,6 +292,31 @@ pub fn inject_skill_allowed_tools(
     injected
 }
 
+/// Force-inject required tool names that must always be callable when a
+/// surrounding workflow depends on them (for example: plan-mode escape hatches).
+pub fn inject_required_tool_names(
+    selected: &mut Vec<Value>,
+    report: &mut SelectionReport,
+    required_tools: &[&str],
+    all_schemas: &[Value],
+) -> u32 {
+    let selected_names: HashSet<String> = report.tools_selected.iter().cloned().collect();
+    let mut injected = 0u32;
+    for name in required_tools {
+        if !selected_names.contains(*name)
+            && let Some(schema) = all_schemas
+                .iter()
+                .find(|s| schema_tool_name(s) == Some(*name))
+        {
+            selected.push(schema.clone());
+            report.tools_selected.push((*name).to_string());
+            report.selected_count += 1;
+            injected += 1;
+        }
+    }
+    injected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,5 +718,67 @@ mod tests {
 
         assert_eq!(injected, 0);
         assert_eq!(selected.len(), 1);
+    }
+
+    #[test]
+    fn inject_required_tool_names_adds_missing_plan_escape_hatches() {
+        let all = vec![
+            make_tool_schema("read_file", "read", false),
+            make_tool_schema("enter_plan_mode", "enter", false),
+            make_tool_schema("exit_plan_mode", "exit", false),
+        ];
+        let mut selected = vec![make_tool_schema("read_file", "read", false)];
+        let mut report = SelectionReport {
+            tools_selected: vec!["read_file".into()],
+            selected_count: 1,
+            budget_used: 0,
+            budget_total: 100,
+        };
+
+        let injected =
+            inject_required_tool_names(&mut selected, &mut report, PLAN_MODE_REQUIRED_TOOLS, &all);
+
+        assert_eq!(injected, 2);
+        assert_eq!(selected.len(), 3);
+        assert!(
+            report
+                .tools_selected
+                .contains(&"enter_plan_mode".to_string())
+        );
+        assert!(
+            report
+                .tools_selected
+                .contains(&"exit_plan_mode".to_string())
+        );
+    }
+
+    #[test]
+    fn inject_required_tool_names_skips_already_selected_or_unknown() {
+        let all = vec![make_tool_schema("exit_plan_mode", "exit", false)];
+        let mut selected = vec![make_tool_schema("exit_plan_mode", "exit", false)];
+        let mut report = SelectionReport {
+            tools_selected: vec!["exit_plan_mode".into()],
+            selected_count: 1,
+            budget_used: 0,
+            budget_total: 100,
+        };
+
+        let injected = inject_required_tool_names(
+            &mut selected,
+            &mut report,
+            &["exit_plan_mode", "enter_plan_mode"],
+            &all,
+        );
+
+        assert_eq!(injected, 0);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            report
+                .tools_selected
+                .iter()
+                .filter(|name| name.as_str() == "exit_plan_mode")
+                .count(),
+            1
+        );
     }
 }
