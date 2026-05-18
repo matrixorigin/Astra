@@ -880,6 +880,26 @@ impl BottomPane {
                 }
                 Some(BottomPaneAction::Consumed)
             }
+            KeyCode::Char(digit)
+                if key.modifiers.is_empty()
+                    && let Some(index) = digit.to_digit(10)
+                    && index > 0 =>
+            {
+                if self
+                    .slash_menu
+                    .as_mut()
+                    .is_some_and(|menu| menu.select(index as usize - 1))
+                    && let Some(picked) = self
+                        .slash_menu
+                        .as_ref()
+                        .and_then(|m| m.selected_item())
+                        .map(|i| i.name.to_string())
+                {
+                    self.composer.set_text(&format!("{picked} "));
+                    self.slash_menu = None;
+                }
+                Some(BottomPaneAction::Consumed)
+            }
             KeyCode::Enter => {
                 if let Some(picked) = self
                     .slash_menu
@@ -968,6 +988,8 @@ impl BottomPane {
         if let Some(view) = self.active_view_mut() {
             view.pre_draw_tick(now);
         }
+        self.footer.current_objective = self.task_status.objective_label();
+        self.footer.turn_elapsed = self.task_status.elapsed();
         // Flush paste burst buffer when idle timeout expires.
         if self.composer.flush_paste_burst() {
             self.sync_popups();

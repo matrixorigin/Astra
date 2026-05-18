@@ -88,7 +88,7 @@ async fn agent_action_delegate_is_rejected_with_redirect_to_spawn() {
     );
     assert!(
         result.contains("spawn"),
-        "agent.delegate's error must name `agent.spawn` as the \
+        "agent.delegate's error must name the `agent` spawn action as the \
          alternative — without that, the model has no path to recovery. \
          Got: {result}"
     );

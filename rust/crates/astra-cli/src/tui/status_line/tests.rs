@@ -2,6 +2,8 @@
 
 #![cfg(test)]
 
+use std::time::Duration;
+
 use super::{PermissionMode, StatusContext, StatusLine};
 
 fn ctx() -> StatusContext {
@@ -42,6 +44,56 @@ fn turn_active_replaces_hints_with_interrupt_prompt() {
     assert!(
         !plain.contains("Ctrl+O transcript"),
         "idle transcript hint should be suppressed when active; got {plain:?}"
+    );
+}
+
+#[test]
+fn active_turn_without_objective_renders_interrupt_once() {
+    let c = StatusContext {
+        turn_active: true,
+        ..ctx()
+    };
+    let plain = StatusLine::from_context(&c).plain();
+    assert_eq!(
+        plain.matches("Ctrl+C interrupt").count(),
+        1,
+        "fallback interrupt hint must not render twice; got {plain:?}"
+    );
+}
+
+#[test]
+fn active_turn_surfaces_objective_and_elapsed() {
+    let c = StatusContext {
+        turn_active: true,
+        current_objective: Some("Running bash".into()),
+        turn_elapsed: Some(Duration::from_secs(16)),
+        ..ctx()
+    };
+    let plain = StatusLine::from_context(&c).plain();
+    assert!(
+        plain.contains("Running bash"),
+        "active objective should render; got {plain:?}"
+    );
+    assert!(
+        plain.contains("16s"),
+        "elapsed time should render; got {plain:?}"
+    );
+    assert!(
+        plain.contains("Ctrl+C interrupt"),
+        "interrupt hint should remain visible; got {plain:?}"
+    );
+}
+
+#[test]
+fn idle_turn_does_not_render_elapsed_chip() {
+    let c = StatusContext {
+        turn_elapsed: Some(Duration::from_secs(16)),
+        ..ctx()
+    };
+    let plain = StatusLine::from_context(&c).plain();
+    assert!(
+        !plain.contains("16s"),
+        "elapsed chip must stay hidden when turn is idle; got {plain:?}"
     );
 }
 
@@ -210,6 +262,7 @@ fn long_cwd_truncates_with_leading_ellipsis() {
 #[test]
 fn token_budget_renders_as_percent_and_absolute() {
     let c = StatusContext {
+        turn_active: true,
         token_budget: Some((25_000, 100_000)),
         ..ctx()
     };
@@ -219,6 +272,27 @@ fn token_budget_renders_as_percent_and_absolute() {
     assert!(
         plain.contains("25k") || plain.contains("25000") || plain.contains("25,000"),
         "absolute used count expected; got {plain:?}"
+    );
+    assert!(
+        plain.contains("75k left") || plain.contains("75000 left"),
+        "remaining budget expected; got {plain:?}"
+    );
+}
+
+#[test]
+fn idle_turn_hides_remaining_budget_suffix() {
+    let c = StatusContext {
+        token_budget: Some((25_000, 100_000)),
+        ..ctx()
+    };
+    let plain = StatusLine::from_context(&c).plain();
+    assert!(
+        plain.contains("25%"),
+        "usage summary should remain visible; got {plain:?}"
+    );
+    assert!(
+        !plain.contains("left"),
+        "remaining budget suffix should be active-turn only; got {plain:?}"
     );
 }
 

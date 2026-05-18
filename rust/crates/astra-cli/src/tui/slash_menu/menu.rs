@@ -429,6 +429,15 @@ impl SlashMenu {
         }
     }
 
+    pub fn select(&mut self, index: usize) -> bool {
+        if index < self.match_count() {
+            self.selected = index;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn selected_item(&self) -> Option<&SlashItem> {
         match &self.mode {
             Mode::Command { .. } => self.filtered.get(self.selected).map(|&i| &self.items[i]),

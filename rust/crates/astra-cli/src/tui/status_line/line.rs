@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+use std::time::Duration;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -45,6 +47,8 @@ pub(crate) struct StatusContext {
     pub cwd: Option<String>,
     /// Tuple `(used, limit)` in tokens.
     pub token_budget: Option<(u64, u64)>,
+    pub current_objective: Option<String>,
+    pub turn_elapsed: Option<Duration>,
     pub permission_mode: PermissionMode,
     pub turn_active: bool,
     pub session_id: Option<String>,
@@ -128,12 +132,39 @@ impl StatusLine {
         // Idle hint is built in two forms so the renderer can swap to the
         // short form when the terminal is too narrow for the full one.
         // `render()` picks between them based on remaining width.
-        let hint_text = if ctx.turn_active {
+        let active_objective = ctx
+            .turn_active
+            .then(|| ctx.current_objective.clone())
+            .flatten();
+        let hint_text = if let Some(objective) = active_objective.clone() {
+            objective
+        } else if ctx.turn_active {
             "Ctrl+C interrupt".to_string()
         } else {
             IDLE_HINT_FULL.to_string()
         };
-        out.left.push(Segment::styled(hint_text, hint));
+        let active_hint_style = Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD);
+        out.left.push(Segment::styled(
+            hint_text,
+            if ctx.turn_active {
+                active_hint_style
+            } else {
+                hint
+            },
+        ));
+
+        if ctx.turn_active
+            && let Some(elapsed) = ctx.turn_elapsed
+        {
+            out.left
+                .push(Segment::styled(format_duration_compact(elapsed), muted));
+        }
+
+        if active_objective.is_some() {
+            out.left.push(Segment::styled("Ctrl+C interrupt", muted));
+        }
 
         match ctx.permission_mode {
             PermissionMode::Ask => {
@@ -256,9 +287,11 @@ impl StatusLine {
                 .push(Segment::styled(truncate_cwd(cwd, CWD_MAX_WIDTH), muted));
         }
 
+        let mut remaining_budget_segment = None;
         if let Some((used, limit)) = ctx.token_budget {
             if limit > 0 {
                 let pct = (used as f32 / limit as f32) * 100.0;
+                let remaining = limit.saturating_sub(used);
                 let style = if pct >= BUDGET_ERROR_PERCENT {
                     Style::default().fg(Color::Red)
                 } else if pct >= BUDGET_WARN_PERCENT {
@@ -270,12 +303,22 @@ impl StatusLine {
                     format!("{pct:.0}% ({})", format_tokens_compact(used)),
                     style,
                 ));
+                if ctx.turn_active {
+                    remaining_budget_segment = Some(Segment::styled(
+                        format!("{} left", format_tokens_compact(remaining)),
+                        style,
+                    ));
+                }
             }
         }
 
         if let Some(cost) = ctx.cost_usd {
             out.right
                 .push(Segment::styled(format!("${cost:.2}"), muted));
+        }
+
+        if let Some(segment) = remaining_budget_segment {
+            out.right.push(segment);
         }
 
         out
@@ -431,5 +474,14 @@ fn format_tokens_compact(n: u64) -> String {
         format!("{}k", n / 1_000)
     } else {
         format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
+}
+
+fn format_duration_compact(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 60 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
     }
 }

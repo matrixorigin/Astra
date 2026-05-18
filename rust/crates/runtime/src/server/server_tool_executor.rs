@@ -2006,7 +2006,7 @@ impl ServerToolExecutor {
                 // never intercepted by `agentic_delegate_interception` (which
                 // matches on tool NAME == "delegate", not action="delegate").
                 // It silently returned a fake-success acknowledgement.
-                // Removed in favor of `agent.spawn`. The standalone `delegate`
+                // Removed in favor of the consolidated agent spawn action. The standalone `delegate`
                 // tool name (below) still works — it IS intercepted upstream
                 // and routed through the real DelegationEngine.
                 let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");

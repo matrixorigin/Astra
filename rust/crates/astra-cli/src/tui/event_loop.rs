@@ -837,7 +837,7 @@ pub(crate) async fn run_tui_repl(
                                 chat_widget.commit_system(
                                     history_cell::system::SystemCell::info(
                                         "No parallel agents to drill into yet. \
-                                         Spawn some with `agent.spawn` first."
+                                         Spawn some with `agent(action='spawn', ...)` first."
                                             .to_string(),
                                     ),
                                 );
@@ -1559,7 +1559,7 @@ pub(crate) async fn run_tui_repl(
                                                                     chat_widget.commit_system(
                                                                         history_cell::system::SystemCell::info(
                                                                             "No parallel agents to drill into yet. \
-                                                                             Spawn some with `agent.spawn` first."
+                                                                             Spawn some with `agent(action='spawn', ...)` first."
                                                                                 .to_string(),
                                                                         ),
                                                                     );
@@ -2003,7 +2003,6 @@ pub(crate) async fn run_tui_repl(
                                     if let Some(ref s) = state.session_id { bottom_pane.footer.session_id = Some(s[..8.min(s.len())].to_string()); }
                                     bottom_pane.footer.token_usage = Some(format!("{}↑ {}↓", state.total_prompt_tokens, state.total_completion_tokens));
                                     bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
-                                    bottom_pane.footer.cost_usd = Some(state.total_session_cost);
                                     // Footer "N% (Mk)" chip shows the CONTEXT WINDOW for
                                     // the most recent turn — i.e. how many input tokens
                                     // the model saw this turn, not cumulative session

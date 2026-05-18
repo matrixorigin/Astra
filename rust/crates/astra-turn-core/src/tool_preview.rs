@@ -1014,7 +1014,7 @@ mod tests {
         );
     }
 
-    /// REGRESSION: agent.spawn preview should prefer the short `name`
+    /// REGRESSION: agent spawn preview should prefer the short `name`
     /// field over the long `description` field. The TUI's multi_agent
     /// strip and InFlightAgentsView render this preview as the per-
     /// agent display label; with description-only rendering, parallel

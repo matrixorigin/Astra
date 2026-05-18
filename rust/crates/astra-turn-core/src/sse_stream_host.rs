@@ -381,7 +381,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
 
         // Parallel tool calls often arrive as several adjacent SSE
         // `tool_request` frames. If we flush immediately after the first
-        // frame, the first long-running `agent.spawn` blocks the socket reader
+        // frame, the first long-running agent spawn action blocks the socket reader
         // and the later spawn frames cannot join the same batch. Coalesce only
         // requests that are already classified as concurrency-safe, and only
         // for a tiny window; side-effectful tools still execute inline to avoid
@@ -1409,13 +1409,13 @@ mod tests {
     }
 
     /// REGRESSION (session 8ca96f0f): when the model emits N
-    /// `agent.spawn` calls in one round, all N must run in parallel.
+    /// agent spawn actions in one round, all N must run in parallel.
     /// Pre-fix the classifier omitted `agent`, so the dispatcher
     /// took the sequential path and processed them one by one — the
     /// strip showed "1 parallel agents" because only one ToolStarted
     /// reached the chat_widget at a time.
     ///
-    /// agent.spawn IS safe to parallelize: each spawn creates an
+    /// The agent spawn action is safe to parallelize: each spawn creates an
     /// isolated sub-process with its own working dir / mailbox /
     /// permission ctx. The only "side effect" is mailbox registration
     /// keyed by unique run_id — no shared mutable state between
@@ -1436,7 +1436,7 @@ mod tests {
         });
         assert!(
             super::is_tool_concurrency_safe("agent", Some(&args)),
-            "agent.spawn must be concurrency-safe so N parallel spawns \
+            "agent spawn actions must be concurrency-safe so N parallel spawns \
              actually run in parallel — pre-fix sequential dispatch \
              was the smoking gun in session 8ca96f0f"
         );
@@ -1597,7 +1597,7 @@ mod tests {
 
     /// Adjacent concurrency-safe tool requests may arrive as separate SSE
     /// chunks. They must still execute as one batch; otherwise the first
-    /// long-running `agent.spawn` blocks the socket reader and the UI only
+    /// long-running agent spawn action blocks the socket reader and the UI only
     /// ever sees "1 parallel agent".
     #[tokio::test]
     async fn concurrent_agent_spawn_requests_coalesce_across_adjacent_chunks() {
@@ -1695,7 +1695,7 @@ mod tests {
         assert_eq!(
             *batch_sizes.lock().unwrap(),
             vec![3],
-            "agent.spawn requests should execute as one parallel batch"
+            "agent spawn requests should execute as one parallel batch"
         );
         bridge.await.unwrap();
     }

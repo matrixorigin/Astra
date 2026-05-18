@@ -343,7 +343,7 @@ enum AgentLiveMirror {
 }
 
 /// `live_tasks` is the multi-slot register for **parallel TaskCells**
-/// (sub-agents spawned via `agent.spawn` in a single turn). Each
+/// (sub-agents spawned via the agent spawn action in a single turn). Each
 /// keyed by its `tool_use_id`. Children events route by
 /// `parent_tool_use_id` and mutate the matching live cell directly,
 /// so spawning agent B no longer commits agent A to scrollback —
@@ -367,7 +367,7 @@ pub(crate) struct ChatWidget {
     live_task_order: Vec<String>,
     /// Logical background agents keyed by their returned `agent_id`.
     ///
-    /// `agent.spawn` and `agent.get_result` are control-plane tool calls. They
+    /// the agent spawn/get_result actions are control-plane tool calls. They
     /// should not be the thing Ctrl+G drills into; users expect the actual
     /// child agent. This registry is populated from those tool outputs and is
     /// the canonical source for the multi-agent strip/drilldown.
@@ -438,7 +438,7 @@ impl ChatWidget {
     }
 
     /// Logical agent rows currently known to the session. Unlike
-    /// `live_task_ids`, these are child agent IDs returned by `agent.spawn`,
+    /// `live_task_ids`, these are child agent IDs returned by the spawn action,
     /// not transient control-plane tool call IDs such as `get_result`.
     pub fn agent_run_ids(&self) -> Vec<String> {
         self.agent_runs.ids()
@@ -2786,7 +2786,7 @@ mod tests {
     // recently-started one. These tests pin the desired post-rework
     // contract.
 
-    /// Two parallel `agent.spawn` calls (claudecode pattern: single
+    /// Two parallel agent spawn calls (claudecode pattern: single
     /// assistant turn, multiple Agent tool uses) must produce TWO
     /// live TaskCells, not one + one-committed-to-scrollback.
     #[test]

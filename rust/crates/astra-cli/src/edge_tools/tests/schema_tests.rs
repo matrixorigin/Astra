@@ -249,11 +249,11 @@ fn agent_spawn_schema_requires_description_and_prompt() {
     let req = conditional_required_for(tool_schema(&schemas, "agent"), "spawn");
     assert!(
         req.contains(&"description".to_string()),
-        "agent.spawn must require `description`: {req:?}"
+        "agent spawn action must require `description`: {req:?}"
     );
     assert!(
         req.contains(&"prompt".to_string()),
-        "agent.spawn must require `prompt`: {req:?}"
+        "agent spawn action must require `prompt`: {req:?}"
     );
 }
 

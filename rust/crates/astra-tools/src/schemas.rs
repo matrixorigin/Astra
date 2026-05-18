@@ -878,7 +878,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
         \n\
         ## When NOT to Use This Tool\n\
         - Quick commands (< 5s): use `bash` directly — the round-trip overhead isn't worth it.\n\
-        - Synchronous sub-agent that you need the answer from before continuing: use `agent.spawn` + `agent.get_result` — that path is integrated with the parallel-spawn coalescing window.\n\
+        - Synchronous sub-agent that you need the answer from before continuing: use `agent(action='spawn', ...)` + `agent(action='get_result', agent_id=...)` — that path is integrated with the parallel-spawn coalescing window.\n\
         - In-session todos/checklist tracking: use `task` (create/update/list/get/stop). `agent_job` is for processes, not progress markers.\n\
         \n\
         ## Notifications\n\
@@ -1145,6 +1145,26 @@ mod tests {
         assert!(
             desc.contains("exit_plan_mode") && desc.contains("run_chain"),
             "agent description should steer plan lifecycle away from run_chain"
+        );
+    }
+
+    #[test]
+    fn agent_job_schema_uses_consolidated_agent_actions() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let agent_job = find_schema(&schemas, "agent_job").expect("agent_job schema must exist");
+        let desc = agent_job
+            .get("function")
+            .and_then(|f| f.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            desc.contains("agent(action='spawn', ...)")
+                && desc.contains("agent(action='get_result', agent_id=...)"),
+            "agent_job description must teach the consolidated agent(action=...) syntax"
+        );
+        assert!(
+            !desc.contains("agent.spawn") && !desc.contains("agent.get_result"),
+            "agent_job description must not mention the legacy dotted agent syntax"
         );
     }
 

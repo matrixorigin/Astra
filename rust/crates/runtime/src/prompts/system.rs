@@ -264,9 +264,10 @@ fn build_skill_listing_section_with_budget_and_caps(
             "EXCEPTION: when the user explicitly asks for parallel / \
              multi-agent / multiple-agent fan-out (e.g. \"多agents\", \"N \
              agents\", \"parallel review\", \"different angles in parallel\"), \
-             route through `agent.spawn` instead — emit N spawn calls in a \
-             single assistant message, each with `run_in_background: true`, \
-             then collect with `agent.get_result`. Skills usually run \
+             route through `agent(action='spawn', ...)` instead — emit N \
+             separate `agent` calls in a single assistant message, each with \
+             `action='spawn'` and `run_in_background: true`, then collect with \
+             `agent(action='get_result', agent_id=...)`. Skills usually run \
              sequentially inside the parent turn, which contradicts the \
              user's explicit fan-out intent.",
         );
@@ -274,7 +275,8 @@ fn build_skill_listing_section_with_budget_and_caps(
         body.push_str(
             "This session does not provide sub-agent fan-out. When the user \
              asks for parallel or multi-agent work, execute the relevant skills \
-             sequentially in this parent turn instead of calling `agent.spawn`.",
+             sequentially in this parent turn instead of requesting sub-agent \
+             fan-out.",
         );
     }
 
@@ -3396,6 +3398,31 @@ mod tests {
         assert!(!section.text.contains("route through `agent.spawn` instead"));
         assert!(section.text.contains("does not provide sub-agent fan-out"));
         assert!(section.text.contains("sequentially"));
+    }
+
+    #[test]
+    fn skill_listing_uses_consolidated_agent_action_syntax_when_available() {
+        let skills = vec![astra_skills::traits::SkillToolInfo {
+            name: "review_code".to_string(),
+            description: "Review code".to_string(),
+            ..Default::default()
+        }];
+        let section = build_skill_listing_section_with_caps(&skills, None, true)
+            .expect("non-empty skill catalog");
+
+        assert!(
+            section.text.contains("agent(action='spawn', ...)")
+                && section
+                    .text
+                    .contains("agent(action='get_result', agent_id=...)"),
+            "skill listing must teach consolidated agent(action=...) syntax: {}",
+            section.text
+        );
+        assert!(
+            !section.text.contains("agent.spawn") && !section.text.contains("agent.get_result"),
+            "skill listing must not mention the legacy dotted agent syntax: {}",
+            section.text
+        );
     }
 
     #[test]

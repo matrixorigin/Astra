@@ -8,7 +8,7 @@
 /// frames.
 ///
 /// Providers often stream parallel tool calls as separate frames. Waiting this
-/// long lets sibling calls (notably `agent.spawn`) join one batch before the
+/// long lets sibling calls (notably the agent spawn action) join one batch before the
 /// first tool starts blocking the socket reader. The window is deliberately
 /// tiny and only applies after all pending requests are already classified as
 /// concurrency-safe; side-effectful tools still execute immediately.

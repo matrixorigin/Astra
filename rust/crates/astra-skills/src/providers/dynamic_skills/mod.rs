@@ -18,7 +18,7 @@ mod verify;
 /// `batch` was deleted: its instructions told the model to call the
 /// removed `delegate` action, and its triggers (`parallel`, `bulk`,
 /// `for each`) auto-fired on read-only review requests. With
-/// `agent.spawn` + `run_in_background: true` documented in the tool
+/// `agent(action='spawn', ...)` + `run_in_background: true` documented in the tool
 /// description, the model already knows how to fan out parallel work.
 pub fn all_dynamic_skills() -> Vec<String> {
     vec![

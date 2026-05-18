@@ -693,7 +693,7 @@ mod tests {
         assert_eq!(tool_results.len(), 1);
         assert_eq!(tool_call_records.len(), 1);
         // The agent_type's `allowed_tools` is now treated as the
-        // sub-agent's authorised surface — the parent's `agent.spawn`
+        // sub-agent's authorised surface — the parent's spawn action
         // declared what tools the child gets, so the gate denies
         // bash up-front with "not in allowlist" instead of trying to
         // ask a parent that was never registered (the pre-fix path,

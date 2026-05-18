@@ -1,7 +1,7 @@
 //! In-flight agents drill-in list.
 //!
 //! When multiple sub-agents are running in parallel (the model spawned
-//! N `agent.spawn` tools in one turn), the user presses `Ctrl+G` to
+//! N agent spawn actions in one turn), the user presses `Ctrl+G` to
 //! open this view: a vertical list of every live TaskCell with its
 //! description, child count, and elapsed time. ↑↓ navigates, Enter
 //! drills into a `TaskDetailView` for the selected agent, Esc/← closes.

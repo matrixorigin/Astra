@@ -31,10 +31,42 @@ impl TaskStatus {
             TaskStatus::WaitingModel => "Waiting for model",
         }
     }
+
+    pub fn objective_label(&self) -> Option<String> {
+        match self {
+            TaskStatus::Idle => None,
+            TaskStatus::TurnRunning { .. } => Some("Thinking".to_string()),
+            TaskStatus::ToolExecuting { name, .. } => Some(format!("Running {name}")),
+            TaskStatus::WaitingApproval { tool } => {
+                if tool.is_empty() {
+                    Some("Awaiting approval".to_string())
+                } else {
+                    Some(format!("Awaiting {tool} approval"))
+                }
+            }
+            TaskStatus::WaitingModel => Some("Waiting for model".to_string()),
+        }
+    }
 }
 
 impl Default for TaskStatus {
     fn default() -> Self {
         Self::Idle
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TaskStatus;
+
+    #[test]
+    fn waiting_approval_without_tool_uses_generic_label() {
+        let status = TaskStatus::WaitingApproval {
+            tool: String::new(),
+        };
+        assert_eq!(
+            status.objective_label().as_deref(),
+            Some("Awaiting approval")
+        );
     }
 }

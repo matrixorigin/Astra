@@ -383,7 +383,7 @@ mod tests {
         let batches = partition_tool_batches(&[server_idx(0), server_idx(1)], &calls);
         match batches.as_slice() {
             [ToolBatch::Concurrent(items)] => assert_eq!(items.len(), 2),
-            _ => panic!("agent.spawn fan-out should be one concurrent batch"),
+            _ => panic!("agent spawn fan-out should be one concurrent batch"),
         }
     }
 

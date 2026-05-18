@@ -187,11 +187,11 @@ fn skill_listing_contains_skill_invocation_nudge() {
 /// matching a skill (e.g. `review-changes` matching "review latest
 /// commit") through the skill, even when the user explicitly asked
 /// for parallel agents ("多agents review", "3 agents review"). The
-/// model never reached `agent.spawn`.
+/// model never reached the agent spawn action.
 ///
 /// Fix: soften the nudge so explicit user intent for parallel
 /// fan-out wins over skill routing. The nudge now must mention BOTH
-/// the parallel-agent override AND name `agent.spawn` as the path
+/// the parallel-agent override AND name the consolidated spawn syntax as the path
 /// (so the model has a concrete next step, not just "don't use the
 /// skill").
 #[test]
@@ -211,7 +211,7 @@ fn skill_listing_nudge_carves_out_parallel_agent_intent() {
     );
 
     // The nudge MUST tell the model that parallel-agent requests
-    // bypass skill routing and go to agent.spawn.
+    // bypass skill routing and go to the consolidated agent spawn action.
     let lower = body.to_ascii_lowercase();
     assert!(
         lower.contains("parallel")
@@ -221,9 +221,13 @@ fn skill_listing_nudge_carves_out_parallel_agent_intent() {
          that was being silently routed through skills). Got:\n{body}"
     );
     assert!(
-        body.contains("agent.spawn") || body.contains("agent(action='spawn')"),
-        "nudge must point at `agent.spawn` so the model has a concrete \
-         alternative path when the user wants parallel fan-out. \
-         Got:\n{body}"
+        body.contains("agent(action='spawn', ...)"),
+        "nudge must point at `agent(action='spawn', ...)` so the model has a concrete \
+          alternative path when the user wants parallel fan-out. \
+          Got:\n{body}"
+    );
+    assert!(
+        !body.contains("agent.spawn") && !body.contains("agent.get_result"),
+        "skill listing must actively reject the legacy dotted agent syntax. Got:\n{body}"
     );
 }

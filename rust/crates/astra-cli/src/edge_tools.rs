@@ -3209,7 +3209,7 @@ impl ToolExecutor {
                         // may replay tool_calls with the legacy action; (2) a
                         // sharp Error: result is far better than the silent
                         // success the placeholder produced. The error names
-                        // `agent.spawn` so the model has a working alternative
+                        // the agent spawn action so the model has a working alternative
                         // — one assistant message with N parallel spawns +
                         // run_in_background:true is the correct fan-out shape.
                         "delegate" => {

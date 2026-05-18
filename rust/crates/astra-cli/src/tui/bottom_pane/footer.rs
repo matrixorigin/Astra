@@ -4,6 +4,8 @@
 //! pure [`StatusContext`]; this struct remains as the mutable container
 //! the event loop writes into, to avoid churn across call sites.
 
+use std::time::Duration;
+
 use ratatui::{buffer::Buffer, layout::Rect};
 
 use crate::tui::status_line::{PermissionMode, StatusContext, StatusLine};
@@ -15,9 +17,10 @@ pub(crate) struct Footer {
     pub cwd: Option<String>,
     pub is_turn_active: bool,
     pub permission_mode: Option<String>,
-    pub cost_usd: Option<f64>,
     pub git_branch: Option<String>,
     pub token_budget: Option<(u64, u64)>,
+    pub current_objective: Option<String>,
+    pub turn_elapsed: Option<Duration>,
     pub pending_approvals: usize,
     pub task_counts: Option<(usize, usize)>,
     pub task_board_expanded: bool,
@@ -36,9 +39,10 @@ impl Footer {
             cwd: current_cwd_display(),
             is_turn_active: false,
             permission_mode: None,
-            cost_usd: None,
             git_branch: detect_git_branch(),
             token_budget: None,
+            current_objective: None,
+            turn_elapsed: None,
             pending_approvals: 0,
             task_counts: None,
             task_board_expanded: false,
@@ -69,6 +73,8 @@ impl Footer {
             model: self.model.clone(),
             cwd: self.cwd.clone(),
             token_budget: self.token_budget,
+            current_objective: self.current_objective.clone(),
+            turn_elapsed: self.turn_elapsed,
             permission_mode: self.permission_mode_enum(),
             turn_active: self.is_turn_active,
             session_id: self.session_id.clone(),
@@ -116,11 +122,15 @@ fn detect_git_branch() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::Footer;
+    use std::time::Duration;
 
     #[test]
-    fn footer_hides_cost_chip_from_status_line() {
+    fn footer_passes_objective_and_elapsed_to_status_line() {
         let mut footer = Footer::new();
-        footer.cost_usd = Some(3.47);
-        assert!(footer.to_context().cost_usd.is_none());
+        footer.current_objective = Some("Running bash".to_string());
+        footer.turn_elapsed = Some(Duration::from_secs(16));
+        let ctx = footer.to_context();
+        assert_eq!(ctx.current_objective.as_deref(), Some("Running bash"));
+        assert_eq!(ctx.turn_elapsed, Some(Duration::from_secs(16)));
     }
 }

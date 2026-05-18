@@ -212,6 +212,36 @@ fn tab_accepts_selection_into_composer() {
 }
 
 #[test]
+fn digit_shortcut_accepts_visible_match_into_composer() {
+    let mut bp = fresh();
+    type_string(&mut bp, "/");
+
+    let action = bp.handle_key(key('2'));
+
+    assert!(matches!(action, BottomPaneAction::Consumed));
+    assert!(!bp.slash_menu_is_open(), "menu closes after digit accept");
+    assert_eq!(bp.composer.text(), "/history ");
+}
+
+#[test]
+fn out_of_bounds_digit_shortcut_is_a_no_op() {
+    let mut bp = fresh();
+    type_string(&mut bp, "/");
+    let before = bp.composer.text().to_string();
+
+    let action = bp.handle_key(key('9'));
+
+    assert!(matches!(action, BottomPaneAction::Consumed));
+    assert!(bp.slash_menu_is_open(), "menu stays open after OOB digit");
+    assert_eq!(bp.composer.text(), before, "composer must stay unchanged");
+    assert_eq!(
+        bp.slash_menu_selected_name(),
+        Some("/help"),
+        "OOB digit must not disturb current selection"
+    );
+}
+
+#[test]
 fn enter_submits_selected_command() {
     let mut bp = fresh();
     type_string(&mut bp, "/hel");

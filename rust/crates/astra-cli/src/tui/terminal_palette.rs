@@ -38,10 +38,6 @@ pub(crate) fn best_color(target: (u8, u8, u8)) -> Color {
     }
 }
 
-pub(crate) fn requery_default_colors() {
-    imp::requery_default_colors();
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DefaultColors {
     pub fg: (u8, u8, u8),
@@ -204,16 +200,9 @@ static DEFAULT_COLORS: OnceLock<Option<DefaultColors>> = OnceLock::new();
 
 mod imp {
     use super::{DEFAULT_COLORS, DefaultColors, env_default_colors};
-    use std::io::IsTerminal as _;
 
     pub(super) fn default_colors() -> Option<DefaultColors> {
         *DEFAULT_COLORS.get_or_init(env_default_colors)
-    }
-
-    pub(super) fn requery_default_colors() {
-        if std::io::stderr().is_terminal() {
-            eprint!("\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
-        }
     }
 }
 

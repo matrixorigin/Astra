@@ -56,7 +56,7 @@ pub(crate) enum ActiveView {
 /// user sees N agents as a tidy panel, not N stacked frames.
 pub(crate) struct MultiAgentEntry {
     pub agent_id: String,
-    /// Display label — name from `agent.spawn` if set, falling back
+    /// Display label — name from the agent spawn action if set, falling back
     /// to description. Building it lives in `agents_drilldown_rows`-
     /// adjacent territory; here we just render the prepared string.
     pub label: String,
@@ -114,7 +114,7 @@ pub(crate) fn active_viewport(
     let inner_w = width.saturating_sub(2).max(20);
 
     // Multi-agent strip: one compact row per logical background
-    // agent, not per control-plane `agent.spawn/get_result` tool
+    // agent, not per control-plane spawn/get_result action
     // call. Co-exists with `active_cell` (assistant streaming WHILE
     // sub-agents run shows both).
     //

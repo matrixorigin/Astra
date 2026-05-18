@@ -414,7 +414,7 @@ mod tests {
     /// REGRESSION: a sub-agent in `Prompt` mode whose tool IS in the
     /// agent_type's `allowed_tools` allowlist must be auto-approved
     /// without trying to ask the parent. The user already authorized
-    /// the agent.spawn that created this sub-agent, knowing its
+    /// the spawn action that created this sub-agent, knowing its
     /// agent_type's tool surface (e.g. `code-review` ⇒ bash, grep,
     /// glob, view). Asking them again per-tool-call is friction
     /// without consent value.
