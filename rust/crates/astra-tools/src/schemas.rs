@@ -621,7 +621,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
         - `get_result`: REQUIRES `action`, `agent_id`.\n\
         - `run_chain`: REQUIRES `action`, `steps`.\n\
         - `send_message`: REQUIRES `action`, `to`, `message`.\n\n\
-        Calling `agent(action='spawn')` WITHOUT `prompt` fails validation. The `description` is a one-line summary the user sees in the UI; `prompt` is the full task brief the sub-agent receives. Both are required — they are not interchangeable. Do NOT pass a top-level `task` field; put the child work brief in `prompt`.\n\n\
+        For `spawn`, pass at least one non-empty field: `description` (short UI summary) or `prompt` (full child brief). If one is missing, Astra derives it from the other. Prefer sending both. Do NOT pass a top-level `task` field.\n\n\
         ## Spawn example\n\
         `agent(action='spawn', description='Audit auth flow', prompt='Read src/auth/* and report any token-handling bugs. Focus on session expiry and refresh logic. Return findings as a numbered list.', agent_type='general-purpose')`\n\n\
         ## Execution mode\n\
@@ -636,8 +636,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "properties": {
                         "action": {"type": "string", "enum": ["spawn","get_result","run_chain","send_message"]},
                         "steps": {"type": "array", "description": "REQUIRED for action='run_chain'. Sequence of chain steps to execute."},
-                        "description": {"type": "string", "description": "REQUIRED for action='spawn'. One-line task summary shown in the UI Task card. Distinct from `prompt` — both are required for spawn."},
-                        "prompt": {"type": "string", "description": "REQUIRED for action='spawn'. Full task brief sent to the sub-agent. This is the prompt the child sees, not the UI label. Without this field, spawn fails validation."},
+                        "description": {"type": "string", "description": "Spawn summary shown in the UI Task card. Short, specific, non-empty."},
+                        "prompt": {"type": "string", "description": "Full child task brief for spawn. Non-empty. If omitted, Astra falls back to `description`."},
                         "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Sub-agent persona (spawn). Default: general-purpose."},
                         "model": {"type": "string", "description": "Model override (spawn). Default: parent's model."},
                         "run_in_background": {"type": "boolean", "description": "If true, return immediately with agent_id instead of blocking on the sub-agent's final result. Default false (sync). Applies to spawn."},
@@ -1217,6 +1217,27 @@ mod tests {
         assert!(
             desc.contains("3-7 leaf tasks") || desc.contains("separate tasks"),
             "task schema should steer complex work toward multiple actionable tasks: {desc}"
+        );
+    }
+
+    #[test]
+    fn task_schema_exposes_lifecycle_progress_and_dependencies() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let task = find_schema(&schemas, "task").expect("task schema must exist");
+        let properties = &task["function"]["parameters"]["properties"];
+
+        for field in ["active_form", "add_blocks", "add_blocked_by"] {
+            assert!(
+                properties.get(field).is_some(),
+                "task schema must expose {field} to the model"
+            );
+        }
+        assert!(
+            properties["active_form"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Spinner text"),
+            "active_form should stay product-facing spinner guidance"
         );
     }
 

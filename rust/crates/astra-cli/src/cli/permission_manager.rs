@@ -81,7 +81,7 @@ pub(super) fn format_denied_message(reason: &str) -> String {
 
 fn cloud_always_feedback_message(
     remember_preview: &str,
-    scope: &str,
+    workspace_persistence_available: bool,
     persist_error: Option<&str>,
     sensitive_path: bool,
 ) -> String {
@@ -93,10 +93,13 @@ To auto-allow sensitive paths across sessions, set allow_sensitive_path_writes=t
     }
     if let Some(err) = persist_error {
         return format!(
-            "  ⚠ {remember_preview}: allowed for this session; failed to save {scope} rule: {err}"
+            "  ⚠ {remember_preview}: allowed for this session; failed to save the workspace trust rule: {err}"
         );
     }
-    format!("  ✓ Always remembers: {remember_preview}")
+    if !workspace_persistence_available {
+        return format!("  ✓ {remember_preview}: allowed for this session");
+    }
+    format!("  ✓ Always allow this command pattern in workspace: {remember_preview}")
 }
 
 /// Canonicalize an existing path, or a missing path whose parent chain
@@ -2386,11 +2389,7 @@ impl PermissionManager {
                 );
                 self.session_overrides.insert(fp, true);
                 let rule = Self::make_allow_rule(tool, &rule_args);
-                let scope = if self.project_root.is_some() {
-                    "workspace"
-                } else {
-                    "session"
-                };
+                let workspace_persistence_available = self.project_root.is_some();
                 let location = if self.project_root.is_some() {
                     "in this workspace"
                 } else {
@@ -2402,14 +2401,20 @@ impl PermissionManager {
                 if sensitive_path_match(&rule_args).is_some() {
                     eprintln!(
                         "{}",
-                        cloud_always_feedback_message(&remember_preview, scope, None, true).dim()
+                        cloud_always_feedback_message(
+                            &remember_preview,
+                            workspace_persistence_available,
+                            None,
+                            true,
+                        )
+                        .dim()
                     );
                 } else {
                     self.add_allow_rule(&rule);
                     let persist_error = self.take_last_save_error();
                     let feedback = cloud_always_feedback_message(
                         &remember_preview,
-                        scope,
+                        workspace_persistence_available,
                         persist_error.as_deref(),
                         false,
                     );
@@ -2996,18 +3001,28 @@ impl PermissionManager {
             'y' => true,
             'a' => {
                 self.session_overrides.insert(fp, true);
-                // Persist as a project-level allow rule with command pattern
                 let rule = Self::make_allow_rule(name, args);
                 self.add_allow_rule(&rule);
-                let scope = if self.project_root.is_some() {
-                    "workspace"
+                let location = if self.project_root.is_some() {
+                    "in this workspace"
                 } else {
-                    "session"
+                    "in this session"
                 };
-                eprintln!(
-                    "  {}",
-                    format!("  ✓ {rule}: always allowed ({scope})").dim()
+                let remember_preview = astra_turn_core::permission_match_target::remember_preview(
+                    name, args, location,
                 );
+                let persist_error = self.take_last_save_error();
+                let feedback = cloud_always_feedback_message(
+                    &remember_preview,
+                    self.project_root.is_some(),
+                    persist_error.as_deref(),
+                    false,
+                );
+                if persist_error.is_some() {
+                    eprintln!("{}", feedback.yellow());
+                } else {
+                    eprintln!("{}", feedback.dim());
+                }
                 true
             }
             's' => {
@@ -3544,7 +3559,7 @@ mod tests {
     fn cloud_always_feedback_message_explains_sensitive_path_session_only() {
         let out = super::cloud_always_feedback_message(
             "this file edit in this workspace",
-            "workspace",
+            true,
             None,
             true,
         );
@@ -3562,13 +3577,28 @@ mod tests {
     fn cloud_always_feedback_message_uses_command_family_language() {
         let out = super::cloud_always_feedback_message(
             "the `cargo test` command family in this workspace",
-            "workspace",
+            true,
             None,
             false,
         );
         assert_eq!(
             out,
-            "  ✓ Always remembers: the `cargo test` command family in this workspace"
+            "  ✓ Always allow this command pattern in workspace: the `cargo test` command family in this workspace"
+        );
+    }
+
+    #[test]
+    fn cloud_always_feedback_message_falls_back_to_session_when_workspace_persistence_unavailable()
+    {
+        let out = super::cloud_always_feedback_message(
+            "the `cargo test` command family in this session",
+            false,
+            None,
+            false,
+        );
+        assert_eq!(
+            out,
+            "  ✓ the `cargo test` command family in this session: allowed for this session"
         );
     }
 

@@ -29,6 +29,7 @@ use uuid::Uuid;
 use astra_core::SharedPool;
 use astra_services::{SessionArtifactJsonRecord, SessionArtifactJsonStore};
 use astra_tools::executor::DefaultToolExecutor;
+use astra_tools::exit_semantics::classify_exit;
 use astra_tools::task_mgmt::{
     InMemoryTaskStore, SessionTask, TaskManager, TaskManagerSnapshot, TaskStore,
 };
@@ -42,7 +43,7 @@ use async_trait::async_trait;
 use crate::orchestration::AgentToolContext;
 use crate::tool_sandbox::{
     IsolatedOutput, IsolationConfig, SandboxMode, SandboxPolicy, ToolTier, effective_tier,
-    execute_isolated, filter_environment,
+    execute_isolated, filter_environment, wrap_command_with_limits,
 };
 use astra_turn_core::file_edit_journal::{EditType, FileEditJournal};
 
@@ -1317,6 +1318,7 @@ impl ServerToolExecutor {
             output,
             metadata: Some(result_metadata),
             is_error: false,
+            exit_semantics: None,
         }
     }
 
@@ -1723,6 +1725,7 @@ impl ServerToolExecutor {
                     output: result.output,
                     metadata: None,
                     is_error: result.is_error,
+                    exit_semantics: None,
                 };
             }
         }
@@ -1935,7 +1938,7 @@ impl ServerToolExecutor {
             // ── Shell operations ───────────────────────────────────────
             // bash uses tiered process isolation (server-specific).
             // grep + glob delegate to DefaultToolExecutor.
-            "bash" => tool_result_from_output(self.server_bash(args).await),
+            "bash" => self.server_bash(args).await,
             "grep" => self.default_executor.execute("grep", args).await,
             "glob" => self.default_executor.execute("glob", args).await,
             // ── Git operations ─────────────────────────────────────────
@@ -2487,6 +2490,7 @@ impl ServerToolExecutor {
             is_error: is_mo_error(&output),
             output,
             metadata,
+            exit_semantics: None,
         }
     }
 
@@ -4549,13 +4553,17 @@ impl ServerToolExecutor {
     // Shell operations (sandboxed)
     // ────────────────────────────────────────────────────────────────────────
 
-    async fn server_bash(&self, args: &Value) -> String {
+    async fn server_bash(&self, args: &Value) -> astra_tools::ToolResult {
         let command = match args.get("command").and_then(|v| v.as_str()) {
             Some(c) => c,
-            None => return "Error: Missing 'command' parameter".to_string(),
+            None => {
+                return astra_tools::ToolResult::error(
+                    "Error: Missing 'command' parameter".to_string(),
+                );
+            }
         };
         if let Err(reason) = astra_tools::shell_ops::validate_execute_bash_command(command) {
-            return reason;
+            return astra_tools::ToolResult::error(reason);
         }
         let timeout_secs = args
             .get("timeout")
@@ -4564,35 +4572,53 @@ impl ServerToolExecutor {
             .min(self.sandbox_policy.max_execution_secs);
 
         let tier = effective_tier("bash", self.sandbox_policy.mode);
+        let wrapped_command = wrap_command_with_limits(&self.sandbox_policy, command);
         match tier {
             ToolTier::Isolated => {
                 let mut config = IsolationConfig::strict(self.workspace_root.clone());
                 config.timeout = Duration::from_secs_f64(timeout_secs);
                 config.net_namespace = !self.sandbox_policy.network_allowed;
                 let env = filter_environment(&self.sandbox_policy);
-                let out = execute_isolated(command, &env, &config).await;
-                format_server_bash_output(out, timeout_secs)
+                let out = execute_isolated(&wrapped_command, &env, &config).await;
+                tool_result_from_server_bash_output(command, out, timeout_secs)
             }
             ToolTier::Sandboxed => {
                 let mut config = IsolationConfig::sandboxed(self.workspace_root.clone());
                 config.timeout = Duration::from_secs_f64(timeout_secs);
                 let env = filter_environment(&self.sandbox_policy);
-                let out = execute_isolated(command, &env, &config).await;
-                format_server_bash_output(out, timeout_secs)
+                let out = execute_isolated(&wrapped_command, &env, &config).await;
+                tool_result_from_server_bash_output(command, out, timeout_secs)
             }
-            ToolTier::InProcess => {
-                let result = self.default_executor.execute("bash", args).await;
-                if result.is_error && !result.output.starts_with("Error:") {
-                    format!("Error: {}", result.output)
-                } else {
-                    result.output
-                }
-            }
+            ToolTier::InProcess => self.default_executor.execute("bash", args).await,
         }
     }
 }
 
-fn format_server_bash_output(output: IsolatedOutput, timeout_secs: f64) -> String {
+fn tool_result_from_server_bash_output(
+    command: &str,
+    output: IsolatedOutput,
+    timeout_secs: f64,
+) -> astra_tools::ToolResult {
+    let body = format_server_bash_output(&output, timeout_secs);
+    if output.timed_out {
+        return astra_tools::ToolResult::error(format!("Error: {body}"));
+    }
+    let semantics = output.exit_code.map(|code| classify_exit(command, code));
+    let mut result = if output.exit_code.is_some_and(|code| code != 0)
+        && semantics.is_some_and(|semantics| semantics.is_tool_error())
+        || output.exit_code.is_none() && output.stdout.is_empty() && !output.stderr.is_empty()
+    {
+        astra_tools::ToolResult::error(format!("Error: {body}"))
+    } else {
+        astra_tools::ToolResult::text(body)
+    };
+    if let Some(semantics) = semantics {
+        result = result.with_exit_semantics(semantics);
+    }
+    result
+}
+
+fn format_server_bash_output(output: &IsolatedOutput, timeout_secs: f64) -> String {
     let mut body = String::new();
     if !output.stdout.is_empty() {
         body.push_str(&output.stdout);
@@ -4630,14 +4656,6 @@ fn format_server_bash_output(output: IsolatedOutput, timeout_secs: f64) -> Strin
             "[bash timed out after {}; partial output shown]",
             format_timeout_seconds(timeout_secs)
         ));
-        return format!("Error: {body}");
-    }
-
-    if output.exit_code.is_some_and(|code| code != 0) {
-        return format!("Error: {body}");
-    }
-    if output.exit_code.is_none() && output.stdout.is_empty() && !output.stderr.is_empty() {
-        return format!("Error: {body}");
     }
 
     body
@@ -5048,8 +5066,31 @@ esac
             _request_id: &str,
             prompt: &AskUserPrompt,
         ) -> AskUserDecision {
-            assert_eq!(serde_json::to_value(prompt).unwrap(), self.expected_prompt);
+            let mut actual = serde_json::to_value(prompt).unwrap();
+            let mut expected = self.expected_prompt.clone();
+            strip_null_timeout_ms(&mut actual);
+            strip_null_timeout_ms(&mut expected);
+            assert_eq!(actual, expected);
             self.decision.clone()
+        }
+    }
+
+    fn strip_null_timeout_ms(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                if matches!(map.get("timeout_ms"), Some(Value::Null)) {
+                    map.remove("timeout_ms");
+                }
+                for nested in map.values_mut() {
+                    strip_null_timeout_ms(nested);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    strip_null_timeout_ms(item);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -5863,7 +5904,8 @@ esac
         let result = exec
             .server_bash(&json!({"command": "cat marker.txt"}))
             .await;
-        assert_eq!(result.trim(), "found");
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(result.output.trim(), "found");
     }
 
     #[tokio::test]
@@ -5907,7 +5949,7 @@ esac
             namespace_active: false,
             cgroup_active: false,
         };
-        let result = format_server_bash_output(output, 0.2);
+        let result = format_server_bash_output(&output, 0.2);
         assert!(result.contains("start"), "got: {result}");
         assert!(result.contains("timed out after 0.2s"), "got: {result}");
         assert!(!result.contains("done"), "got: {result}");
@@ -5925,10 +5967,31 @@ esac
             namespace_active: false,
             cgroup_active: false,
         };
-        let result = tool_result_from_output(format_server_bash_output(output, 0.2));
+        let result = tool_result_from_server_bash_output("sleep 10", output, 0.2);
         assert!(result.is_error, "got: {}", result.output);
         assert!(result.output.contains("start"), "got: {}", result.output);
         assert!(result.output.contains("timed out after 0.2s"));
+    }
+
+    #[tokio::test]
+    async fn bash_domain_negative_exit_keeps_non_error_semantics() {
+        let output = IsolatedOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(1),
+            timed_out: false,
+            stdout_capped: false,
+            stderr_capped: false,
+            namespace_active: false,
+            cgroup_active: false,
+        };
+        let result = tool_result_from_server_bash_output("test -f missing", output, 0.2);
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(
+            result.exit_semantics,
+            Some(astra_tools::exit_semantics::ExitSemantics::DomainNegative)
+        );
+        assert!(result.output.contains("(exit code: 1)"), "{result:?}");
     }
 
     // ── Grep ───────────────────────────────────────────────────────────

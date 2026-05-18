@@ -35,6 +35,7 @@ fn outcome_to_result(outcome: crate::git_gix::ToolExecutionOutcome) -> ToolResul
         output: outcome.output,
         metadata: outcome.tool_result_fields,
         is_error: outcome.is_error,
+        exit_semantics: None,
     }
 }
 
@@ -979,7 +980,7 @@ mod tests {
         // both calls re-execute.
         let (_tmp, exec) = test_executor();
         let args = serde_json::json!({
-            "command": "n=$(cat dedup-count 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > dedup-count; cat dedup-count"
+            "command": "printf 'tick\\n' >> dedup-count; wc -l dedup-count"
         });
 
         let first = exec.execute("bash", &args).await;
@@ -992,7 +993,7 @@ mod tests {
         // the first call's output and the file would stay at 1.
         assert_eq!(
             std::fs::read_to_string(_tmp.path().join("dedup-count")).unwrap(),
-            "2\n",
+            "tick\ntick\n",
             "compound command must re-execute both times — never cache shell pipelines"
         );
         assert_ne!(

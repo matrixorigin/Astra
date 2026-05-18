@@ -12,6 +12,7 @@ pub mod engine;
 pub mod event;
 pub mod feedback_extraction;
 pub mod feedback_store;
+pub mod output_stream;
 pub mod reflection_feedback;
 pub mod routing;
 pub mod scheduling;

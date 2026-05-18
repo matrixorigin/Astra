@@ -7,8 +7,8 @@ expression: "render_at(&cell, 80)"
 │ ⚑ BashExecute
 │ npm test --filter auth -- --verbose
 │ ⚠ This command needs your approval before it runs.
-│ Always remembers: similar `npm test` commands in this workspace
+│ Always allow this command pattern in workspace: similar `npm test` commands in this workspace
 │ Always disabled: sub-agent request
 │
-│  Allow once   Always×   Reject
+│  Allow once   Always allow this command pattern in workspace×   Reject
 ╰─ ↑↓←→ select · Enter confirm · Esc reject · Ctrl+Enter quick accept

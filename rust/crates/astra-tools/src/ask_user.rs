@@ -6,6 +6,8 @@ use serde_json::{Map, Value};
 const MAX_QUESTIONS: usize = 6;
 const MIN_CHOICES: usize = 2;
 const MAX_CHOICES: usize = 9;
+const MIN_TIMEOUT_MS: u64 = 1_000;
+const MAX_TIMEOUT_MS: u64 = 3_600_000;
 const ASK_USER_EXAMPLE: &str = r#"{"questions":[{"header":"Scope","question":"Which scope should we ship first?","options":["Core flow","Full workflow"],"allow_freeform":true}]}"#;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +30,8 @@ pub struct AskUserQuestion {
 pub struct AskUserPrompt {
     pub context: Option<String>,
     pub questions: Vec<AskUserQuestion>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,16 +112,41 @@ pub fn parse_ask_user_prompt(args: &Value) -> Result<AskUserPrompt, String> {
     let questions_value = if let Some(questions) = args.get("questions") {
         questions
     } else if let Some(nested) = nested_questionnaire.as_ref() {
-        nested
-            .get("questions")
-            .expect("nested questionnaire must contain questions")
+        nested.get("questions").ok_or_else(|| {
+            ask_user_contract_error(
+                "embedded questionnaire is missing a top-level 'questions' array",
+            )
+        })?
     } else {
         return Err(ask_user_contract_error(
             "ask_user requires top-level 'questions': [...]. Do not send top-level 'question' or 'choices'.",
         ));
     };
     let questions = parse_questions(questions_value)?;
-    Ok(AskUserPrompt { context, questions })
+    let timeout_ms = parse_timeout_ms(args)?;
+    Ok(AskUserPrompt {
+        context,
+        questions,
+        timeout_ms,
+    })
+}
+
+fn parse_timeout_ms(args: &Value) -> Result<Option<u64>, String> {
+    let Some(value) = args.get("timeout_ms").or_else(|| args.get("timeout")) else {
+        return Ok(None);
+    };
+    let timeout = value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        .ok_or_else(|| {
+            ask_user_contract_error("'timeout_ms' must be an integer milliseconds value")
+        })?;
+    if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&timeout) {
+        return Err(ask_user_contract_error(format!(
+            "'timeout_ms' must be between {MIN_TIMEOUT_MS} and {MAX_TIMEOUT_MS} milliseconds"
+        )));
+    }
+    Ok(Some(timeout))
 }
 
 fn maybe_parse_embedded_json<'a>(value: &'a Value) -> std::borrow::Cow<'a, Value> {
@@ -374,6 +403,7 @@ pub fn build_ask_user_prompt_telemetry(prompt: &AskUserPrompt) -> Value {
         "freeform_count": freeform_count,
         "preview_count": preview_count,
         "context_present": prompt.context.is_some(),
+        "timeout_ms": prompt.timeout_ms,
         "headers": headers,
         "questions": questions,
     })
@@ -700,6 +730,55 @@ mod tests {
         );
         assert!(prompt.questions[1].multi_select);
         assert!(!prompt.questions[1].allow_freeform);
+    }
+
+    #[test]
+    fn parse_accepts_bounded_timeout_ms() {
+        let prompt = parse_ask_user_prompt(&json!({
+            "questions": [{
+                "header": "Scope",
+                "question": "Which scope?",
+                "options": ["Core", "Full"]
+            }],
+            "timeout_ms": "5000"
+        }))
+        .unwrap();
+
+        assert_eq!(prompt.timeout_ms, Some(5000));
+        let telemetry = build_ask_user_prompt_telemetry(&prompt);
+        assert_eq!(telemetry["timeout_ms"], json!(5000));
+    }
+
+    #[test]
+    fn parse_accepts_timeout_ms_at_inclusive_bounds() {
+        for timeout in [MIN_TIMEOUT_MS, MAX_TIMEOUT_MS] {
+            let prompt = parse_ask_user_prompt(&json!({
+                "questions": [{
+                    "header": "Scope",
+                    "question": "Which scope?",
+                    "options": ["Core", "Full"]
+                }],
+                "timeout_ms": timeout
+            }))
+            .unwrap();
+            assert_eq!(prompt.timeout_ms, Some(timeout), "{timeout}");
+        }
+    }
+
+    #[test]
+    fn parse_rejects_unbounded_or_invalid_timeout() {
+        for timeout in [json!(999), json!(3_600_001), json!("soon")] {
+            let err = parse_ask_user_prompt(&json!({
+                "questions": [{
+                    "header": "Scope",
+                    "question": "Which scope?",
+                    "options": ["Core", "Full"]
+                }],
+                "timeout_ms": timeout
+            }))
+            .unwrap_err();
+            assert!(err.contains("timeout_ms"), "{err}");
+        }
     }
 
     #[test]

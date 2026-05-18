@@ -7,7 +7,7 @@
 //!   rm -rf /tmp/scratch
 //!   destructive path outside cwd
 //!
-//! ▸ Allow once    Always    Reject
+//! ▸ Allow once    Always allow this command pattern in workspace    Reject
 //!   ← → navigate · Enter confirm · Esc reject
 //! ```
 //!
@@ -492,7 +492,10 @@ impl HistoryCell for ApprovalCell {
         if let Some(preview) = &self.remember_preview {
             lines.push(Line::from(vec![
                 bar.clone(),
-                Span::styled("Always remembers: ".to_string(), muted),
+                Span::styled(
+                    "Always allow this command pattern in workspace: ".to_string(),
+                    muted,
+                ),
                 Span::styled(preview.clone(), body_style.add_modifier(Modifier::BOLD)),
             ]));
         }
@@ -694,7 +697,9 @@ mod tests {
         .with_remember_preview("similar `npm test` commands in this workspace");
         let rendered = render(&cell);
         assert!(
-            rendered.contains("Always remembers: similar `npm test` commands in this workspace"),
+            rendered.contains(
+                "Always allow this command pattern in workspace: similar `npm test` commands in this workspace"
+            ),
             "expected remember preview line, got:\n{rendered}"
         );
         assert!(
@@ -776,7 +781,7 @@ mod tests {
         let rendered = render(&cell);
         assert!(!rendered.contains("⚑ "), "no risk badge expected");
         assert!(
-            !rendered.contains("Always remembers:"),
+            !rendered.contains("Always allow this command pattern in workspace:"),
             "no remember-preview row expected"
         );
         assert!(!rendered.contains("[agent:"), "no agent chip expected");
@@ -959,11 +964,12 @@ mod tests {
             true,
         )
         .with_selection_hint(
-            "Always remembers for this session only. Run `astra permissions trust` to save workspace rules.",
+            "Always allow stays session-only until you trust this workspace. Run `astra permissions trust` to save workspace rules.",
         );
         let rendered = render(&cell);
         assert!(
-            rendered.contains("Note: Always remembers for this session only."),
+            rendered
+                .contains("Note: Always allow stays session-only until you trust this workspace."),
             "selection hints should render as a note, got:\n{rendered}"
         );
         assert!(

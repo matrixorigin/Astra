@@ -149,6 +149,7 @@ pub fn commit(workspace_root: &Path, args: &Value) -> ToolResult {
                 output: format!("✓ Committed: {short_hash} {message}"),
                 metadata,
                 is_error: false,
+                exit_semantics: None,
             }
         }
         Ok(out) => {
@@ -212,6 +213,7 @@ pub fn revert_commit(workspace_root: &Path, args: &Value) -> ToolResult {
                 ),
                 metadata,
                 is_error: false,
+                exit_semantics: None,
             }
         }
         Ok(out) => {

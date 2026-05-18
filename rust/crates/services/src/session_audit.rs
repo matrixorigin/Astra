@@ -3,11 +3,15 @@
 //! Provides turn-level, tool-level, and session-level audit views.
 //! All queries run against MatrixOne `agent_events` + `agent_sessions` tables.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
+
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, query};
 
+use crate::cost_ledger::{CostLedger, CostLedgerEntry};
+use crate::models::PricingData;
 use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
@@ -66,6 +70,8 @@ pub struct SessionAuditSummary {
     pub approval_decision_count: u32,
     pub approval_timeout_count: u32,
     pub models_used: Vec<String>,
+    #[serde(default)]
+    pub cost: SessionCostSummary,
     pub duration_secs: f64,
     pub created_at: String,
     pub ended_at: Option<String>,
@@ -88,7 +94,10 @@ pub struct TurnSummary {
     pub user_input_preview: String,
     pub tool_calls: Vec<ToolCallBrief>,
     pub tokens_in: u64,
+    pub cached_input_tokens: u64,
+    pub cache_creation_tokens: u64,
     pub tokens_out: u64,
+    pub total_tokens: u64,
     pub duration_ms: u64,
     pub has_error: bool,
     pub has_stall: bool,
@@ -132,7 +141,10 @@ pub struct TurnDetail {
     pub assistant_output: String,
     pub tool_calls: Vec<ToolCallBrief>,
     pub tokens_in: u64,
+    pub cached_input_tokens: u64,
+    pub cache_creation_tokens: u64,
     pub tokens_out: u64,
+    pub total_tokens: u64,
     pub duration_ms: u64,
     pub ttft_ms: Option<u64>,
     pub context_ms: Option<u64>,
@@ -147,6 +159,175 @@ pub struct TurnDetail {
     pub created_at: String,
     /// Child events (tool_call, tool_error) from event expansion.
     pub child_events: Vec<ChildEvent>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SessionCostSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub per_model_cost_usd: BTreeMap<String, f64>,
+    pub priced_turn_count: u32,
+    pub unpriced_turn_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ParsedTurnTokenUsage {
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    cache_creation_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+}
+
+fn parse_turn_token_usage(raw: &str) -> ParsedTurnTokenUsage {
+    let value: serde_json::Value = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
+    let Some(obj) = value.as_object() else {
+        return ParsedTurnTokenUsage::default();
+    };
+    let read = |primary: &str, legacy: &str| -> u64 {
+        obj.get(primary)
+            .or_else(|| obj.get(legacy))
+            .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
+            .unwrap_or(0)
+    };
+    let input_tokens = read("input_tokens", "input");
+    let cached_input_tokens = read("cached_input_tokens", "cached_input");
+    let cache_creation_tokens = read("cache_creation_tokens", "cache_creation");
+    let output_tokens = read("output_tokens", "output");
+    let total_tokens = obj
+        .get("total_tokens")
+        .or_else(|| obj.get("total"))
+        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
+        .unwrap_or_else(|| {
+            input_tokens
+                .saturating_add(cached_input_tokens)
+                .saturating_add(cache_creation_tokens)
+                .saturating_add(output_tokens)
+        });
+    ParsedTurnTokenUsage {
+        input_tokens,
+        cached_input_tokens,
+        cache_creation_tokens,
+        output_tokens,
+        total_tokens,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TurnCostSample {
+    turn_id: String,
+    agent_id: String,
+    model: String,
+    usage: ParsedTurnTokenUsage,
+}
+
+fn summarize_session_cost(
+    session_id: &str,
+    turns: impl IntoIterator<Item = TurnCostSample>,
+    pricing_by_model: &HashMap<String, PricingData>,
+) -> SessionCostSummary {
+    let mut ledger = CostLedger::new(session_id);
+    let mut priced_turn_count = 0;
+    let mut unpriced_turn_count = 0;
+
+    for turn in turns {
+        let Some(pricing) = pricing_by_model.get(&turn.model) else {
+            unpriced_turn_count += 1;
+            continue;
+        };
+        match CostLedgerEntry::priced(
+            session_id,
+            turn.turn_id,
+            turn.agent_id,
+            None,
+            turn.model,
+            turn.usage.input_tokens,
+            turn.usage.output_tokens,
+            turn.usage.cached_input_tokens,
+            turn.usage.cache_creation_tokens,
+            pricing,
+        ) {
+            Ok(entry) => {
+                if ledger.append(entry).is_ok() {
+                    priced_turn_count += 1;
+                } else {
+                    unpriced_turn_count += 1;
+                }
+            }
+            Err(_) => unpriced_turn_count += 1,
+        }
+    }
+
+    let summary = ledger.summary();
+    SessionCostSummary {
+        estimated_cost_usd: (priced_turn_count > 0).then_some(summary.total_cost_usd),
+        per_model_cost_usd: summary.per_model_cost_usd,
+        priced_turn_count,
+        unpriced_turn_count,
+    }
+}
+
+async fn load_active_model_pricing_map(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    models: &[String],
+) -> AuditResult<HashMap<String, PricingData>> {
+    if models.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let wanted: HashSet<&str> = models.iter().map(String::as_str).collect();
+    let rows = query(
+        "SELECT model_name, IFNULL(CAST(pricing AS CHAR), '{}') AS pricing_json \
+         FROM infra_llm_models WHERE is_active = 1",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(internal_error)?;
+
+    let mut pricing_by_model = HashMap::new();
+    for row in rows {
+        let model_name: String = row.try_get("model_name").unwrap_or_default();
+        if !wanted.contains(model_name.as_str()) {
+            continue;
+        }
+        let pricing_json: String = row.try_get("pricing_json").unwrap_or_else(|_| "{}".into());
+        let pricing = serde_json::from_str::<PricingData>(&pricing_json).unwrap_or_default();
+        pricing_by_model.insert(model_name, pricing);
+    }
+    Ok(pricing_by_model)
+}
+
+async fn load_session_turn_cost_samples(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+) -> AuditResult<Vec<TurnCostSample>> {
+    let rows = query(
+        "SELECT event_id, llm_model_used, CAST(token_usage AS CHAR) AS token_usage \
+         FROM agent_events \
+         WHERE session_id = ? AND user_id = ? \
+           AND event_type = 'user_query' \
+           AND llm_model_used IS NOT NULL AND llm_model_used != '' \
+           AND token_usage IS NOT NULL \
+         ORDER BY created_at ASC",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(internal_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| TurnCostSample {
+            turn_id: row.try_get("event_id").unwrap_or_default(),
+            agent_id: "root".to_string(),
+            model: row.try_get("llm_model_used").unwrap_or_default(),
+            usage: parse_turn_token_usage(
+                &row.try_get::<String, _>("token_usage").unwrap_or_default(),
+            ),
+        })
+        .collect())
 }
 
 /// A child event (tool call or error) linked to a turn via parent_event_id.
@@ -778,6 +959,9 @@ impl SessionAuditService for DatabaseSessionAuditService {
                     .collect()
             })
             .unwrap_or_default();
+        let turn_costs = load_session_turn_cost_samples(&pool, user_id, session_id).await?;
+        let pricing_by_model = load_active_model_pricing_map(&pool, &models_used).await?;
+        let cost = summarize_session_cost(session_id, turn_costs, &pricing_by_model);
 
         Ok(SessionAuditSummary {
             session_id: session_id.to_string(),
@@ -798,6 +982,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
             approval_decision_count,
             approval_timeout_count,
             models_used,
+            cost,
             duration_secs,
             created_at,
             ended_at,
@@ -860,8 +1045,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
                 let meta_json: serde_json::Value =
                     serde_json::from_str(&meta).unwrap_or(serde_json::Value::Null);
                 let token_str: String = row.try_get("token_usage").unwrap_or_default();
-                let token_json: serde_json::Value =
-                    serde_json::from_str(&token_str).unwrap_or(serde_json::Value::Null);
+                let token_usage = parse_turn_token_usage(&token_str);
                 let model: Option<String> = row.try_get("llm_model_used").ok();
                 let created_at: String = row.try_get("created_at").unwrap_or_default();
 
@@ -885,14 +1069,11 @@ impl SessionAuditService for DatabaseSessionAuditService {
                     turn: turn_num,
                     user_input_preview: truncate_str(&content, 200),
                     tool_calls,
-                    tokens_in: token_json
-                        .get("input")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    tokens_out: token_json
-                        .get("output")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
+                    tokens_in: token_usage.input_tokens,
+                    cached_input_tokens: token_usage.cached_input_tokens,
+                    cache_creation_tokens: token_usage.cache_creation_tokens,
+                    tokens_out: token_usage.output_tokens,
+                    total_tokens: token_usage.total_tokens,
                     duration_ms: meta_json
                         .get("duration_ms")
                         .and_then(|v| v.as_u64())
@@ -949,8 +1130,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let meta: serde_json::Value =
             serde_json::from_str(&meta_str).unwrap_or(serde_json::Value::Null);
         let token_str: String = row.try_get("token_usage").unwrap_or_default();
-        let token_json: serde_json::Value =
-            serde_json::from_str(&token_str).unwrap_or(serde_json::Value::Null);
+        let token_usage = parse_turn_token_usage(&token_str);
         let model: Option<String> = row.try_get("llm_model_used").ok();
         let created_at: String = row.try_get("created_at").unwrap_or_default();
 
@@ -1008,14 +1188,11 @@ impl SessionAuditService for DatabaseSessionAuditService {
             user_input: content,
             assistant_output,
             tool_calls,
-            tokens_in: token_json
-                .get("input")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            tokens_out: token_json
-                .get("output")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
+            tokens_in: token_usage.input_tokens,
+            cached_input_tokens: token_usage.cached_input_tokens,
+            cache_creation_tokens: token_usage.cache_creation_tokens,
+            tokens_out: token_usage.output_tokens,
+            total_tokens: token_usage.total_tokens,
             duration_ms: meta
                 .get("duration_ms")
                 .and_then(|v| v.as_u64())
@@ -1988,6 +2165,127 @@ mod tests {
     }
 
     #[test]
+    fn parse_turn_token_usage_supports_canonical_shape() {
+        let usage = parse_turn_token_usage(
+            r#"{
+                "input_tokens": 100,
+                "cached_input_tokens": 25,
+                "cache_creation_tokens": 5,
+                "output_tokens": 40,
+                "total_tokens": 170
+            }"#,
+        );
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.cached_input_tokens, 25);
+        assert_eq!(usage.cache_creation_tokens, 5);
+        assert_eq!(usage.output_tokens, 40);
+        assert_eq!(usage.total_tokens, 170);
+    }
+
+    #[test]
+    fn parse_turn_token_usage_supports_legacy_shape() {
+        let usage = parse_turn_token_usage(r#"{"input": 100, "output": 40, "total": 140}"#);
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.cached_input_tokens, 0);
+        assert_eq!(usage.cache_creation_tokens, 0);
+        assert_eq!(usage.output_tokens, 40);
+        assert_eq!(usage.total_tokens, 140);
+    }
+
+    #[test]
+    fn parse_turn_token_usage_invalid_json_falls_back_to_zeroes() {
+        let usage = parse_turn_token_usage("{not json");
+        assert_eq!(usage, ParsedTurnTokenUsage::default());
+    }
+
+    #[test]
+    fn parse_turn_token_usage_clamps_negative_values_to_zero() {
+        let usage = parse_turn_token_usage(
+            r#"{"input_tokens": -100, "cached_input_tokens": -5, "output_tokens": 50}"#,
+        );
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.cached_input_tokens, 0);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.total_tokens, 50);
+    }
+
+    #[test]
+    fn summarize_session_cost_aggregates_priced_turns_and_flags_unpriced_ones() {
+        let turns = vec![
+            TurnCostSample {
+                turn_id: "t1".into(),
+                agent_id: "root".into(),
+                model: "claude".into(),
+                usage: ParsedTurnTokenUsage {
+                    input_tokens: 1_000_000,
+                    cached_input_tokens: 0,
+                    cache_creation_tokens: 0,
+                    output_tokens: 500_000,
+                    total_tokens: 1_500_000,
+                },
+            },
+            TurnCostSample {
+                turn_id: "t2".into(),
+                agent_id: "root".into(),
+                model: "unknown".into(),
+                usage: ParsedTurnTokenUsage {
+                    input_tokens: 100,
+                    cached_input_tokens: 0,
+                    cache_creation_tokens: 0,
+                    output_tokens: 50,
+                    total_tokens: 150,
+                },
+            },
+        ];
+        let pricing_by_model = HashMap::from([(
+            "claude".to_string(),
+            PricingData {
+                prompt: 2.0,
+                completion: 8.0,
+                cache_read: None,
+                cache_write: None,
+            },
+        )]);
+
+        let summary = summarize_session_cost("s1", turns, &pricing_by_model);
+        assert_eq!(summary.priced_turn_count, 1);
+        assert_eq!(summary.unpriced_turn_count, 1);
+        assert_eq!(summary.estimated_cost_usd, Some(6.0));
+        assert_eq!(summary.per_model_cost_usd.get("claude"), Some(&6.0));
+    }
+
+    #[test]
+    fn summarize_session_cost_marks_missing_cache_pricing_as_unpriced() {
+        let turns = vec![TurnCostSample {
+            turn_id: "t1".into(),
+            agent_id: "root".into(),
+            model: "claude".into(),
+            usage: ParsedTurnTokenUsage {
+                input_tokens: 100,
+                cached_input_tokens: 10,
+                cache_creation_tokens: 0,
+                output_tokens: 20,
+                total_tokens: 130,
+            },
+        }];
+        let pricing_by_model = HashMap::from([(
+            "claude".to_string(),
+            PricingData {
+                prompt: 2.0,
+                completion: 8.0,
+                cache_read: None,
+                cache_write: None,
+            },
+        )]);
+
+        let summary = summarize_session_cost("s1", turns, &pricing_by_model);
+        assert_eq!(summary.priced_turn_count, 0);
+        assert_eq!(summary.unpriced_turn_count, 1);
+        assert_eq!(summary.estimated_cost_usd, None);
+        assert!(summary.per_model_cost_usd.is_empty());
+    }
+
+    #[test]
     fn compute_duration_rfc3339() {
         let d = compute_duration_secs(
             Some("2026-04-01T10:00:00+08:00"),
@@ -2060,6 +2358,7 @@ mod tests {
             approval_decision_count: 2,
             approval_timeout_count: 1,
             models_used: vec!["gpt-4".into()],
+            cost: SessionCostSummary::default(),
             duration_secs: 120.5,
             created_at: "2026-04-01T10:00:00Z".into(),
             ended_at: None,
@@ -2425,6 +2724,7 @@ mod tests {
             approval_decision_count: 0,
             approval_timeout_count: 0,
             models_used: vec![],
+            cost: SessionCostSummary::default(),
             duration_secs: 0.0,
             created_at: "2024-01-01".into(),
             ended_at: None,

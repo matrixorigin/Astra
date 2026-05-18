@@ -63,6 +63,7 @@ fn ask_user_single_question_digit_submits_answer() {
                 multi_select: false,
                 allow_freeform: true,
             }],
+            timeout_ms: None,
         },
     );
 
@@ -104,6 +105,7 @@ fn ask_user_questionnaire_renders_tabs_and_multi_select_checkboxes() {
                     allow_freeform: true,
                 },
             ],
+            timeout_ms: None,
         },
     );
 
@@ -145,6 +147,7 @@ fn ask_user_questionnaire_submits_answers_across_tabs() {
                     allow_freeform: false,
                 },
             ],
+            timeout_ms: None,
         },
     );
 
@@ -200,6 +203,7 @@ fn preview_question_renders_preview_panel_and_notes_hint() {
                 multi_select: false,
                 allow_freeform: false,
             }],
+            timeout_ms: None,
         },
     );
 
@@ -233,6 +237,7 @@ fn preview_question_submits_notes_and_selected_preview_annotation() {
                 multi_select: false,
                 allow_freeform: false,
             }],
+            timeout_ms: None,
         },
     );
 
@@ -276,6 +281,7 @@ fn freeform_other_renders_visible_input_box_and_cursor() {
                 multi_select: false,
                 allow_freeform: true,
             }],
+            timeout_ms: None,
         },
     );
 
@@ -307,6 +313,7 @@ fn freeform_only_question_without_options_submits_typed_answer() {
                 multi_select: false,
                 allow_freeform: true,
             }],
+            timeout_ms: None,
         },
     );
 
@@ -343,6 +350,7 @@ fn ask_user_escape_reports_cancellation_not_answer_sentinel() {
                 multi_select: false,
                 allow_freeform: true,
             }],
+            timeout_ms: None,
         },
     );
 

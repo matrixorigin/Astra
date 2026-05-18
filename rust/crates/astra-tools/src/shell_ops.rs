@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use astra_sandbox::{CommandRisk, analyze_command_risks, is_rm_catastrophic_rm_path};
 
+use crate::exit_semantics::{ExitSemantics, classify_exit};
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
 const GREP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -486,9 +487,9 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
         match &risk {
             // Allowed here only — still constrained by local rules + permission layer.
             CommandRisk::PathTraversal | CommandRisk::NetworkAccess => {}
-            // Intentionally still allowed: benign redirects / `$(...)` are common in build scripts;
-            // AST marks them aggressively; blocking would break typical `cargo`/`make` usage.
-            CommandRisk::OutputRedirection | CommandRisk::CommandSubstitution => {}
+            // Intentionally still allowed: benign redirects are common in build scripts;
+            // AST marks them aggressively, and the permission layer still sees the command.
+            CommandRisk::OutputRedirection => {}
             // PrivilegeEscalation (sudo, doas) is handled by the permission layer as Ask.
             CommandRisk::PrivilegeEscalation => {}
             // Fail closed on every other sandbox-reported risk (eval, process substitution, etc.).
@@ -497,7 +498,11 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
             | CommandRisk::EnvManipulation
             | CommandRisk::ZshDangerous(_)
             | CommandRisk::SensitivePathAccess(_)
+            | CommandRisk::DestructiveCommand(_)
+            | CommandRisk::CredentialAccess(_)
+            | CommandRisk::WorkspaceOutWrite(_)
             | CommandRisk::Eval
+            | CommandRisk::CommandSubstitution
             | CommandRisk::ProcessSubstitution => {
                 return Err(format!("Error: bash command blocked ({risk})"));
             }
@@ -707,8 +712,13 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
         return ToolResult::error(truncate_output(result, output_limit));
     }
 
+    let exit_semantics = classify_exit(command, output.exit_code);
     if output.exit_code != 0 {
-        return ToolResult::error(truncate_output(result, output_limit));
+        let output = truncate_output(result, output_limit);
+        if exit_semantics.is_tool_error() {
+            return ToolResult::error(output).with_exit_semantics(exit_semantics);
+        }
+        return ToolResult::text(output).with_exit_semantics(exit_semantics);
     }
 
     if command_has_background_operator(command) {
@@ -725,8 +735,10 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
 
     if result.is_empty() {
         ToolResult::text("(command completed with no output)".into())
+            .with_exit_semantics(ExitSemantics::Success)
     } else {
         ToolResult::text(truncate_output(result, output_limit))
+            .with_exit_semantics(ExitSemantics::Success)
     }
 }
 
@@ -4261,6 +4273,22 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[test]
+    fn validate_execute_bash_blocks_top5_security_risks() {
+        for command in [
+            "dd if=/dev/zero of=/dev/sda",
+            "cat ~/.ssh/id_rsa",
+            "echo data > ../outside.txt",
+            "eval \"echo hi\"",
+            "echo $(whoami)",
+        ] {
+            assert!(
+                validate_execute_bash_command(command).is_err(),
+                "{command} should be blocked"
+            );
+        }
+    }
+
+    #[test]
     fn validate_execute_bash_allows_typical_build_commands() {
         assert!(validate_execute_bash_command("cargo test -p foo --quiet").is_ok());
         assert!(validate_execute_bash_command("echo hello && ls").is_ok());
@@ -4289,6 +4317,30 @@ printf 'probe.txt:1:needle\n'
             result.output.contains("[exit code: 7]"),
             "got: {}",
             result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_domain_negative_exit_is_not_tool_error() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "test -f definitely-missing"
+            }),
+        )
+        .await;
+
+        assert!(
+            !result.is_error,
+            "test false is a domain-negative answer, not an execution error: {}",
+            result.output
+        );
+        assert_eq!(
+            result.exit_semantics,
+            Some(crate::exit_semantics::ExitSemantics::DomainNegative)
         );
     }
 
@@ -4346,12 +4398,11 @@ printf 'probe.txt:1:needle\n'
         ctx.cancel_token = Some(token);
 
         // The command creates a sentinel file after the first echo, then sleeps.
-        let sentinel_str = sentinel.display();
         let result = execute_bash(
             &ctx,
             &serde_json::json!({
                 "command": format!(
-                    "echo line_1; touch {sentinel_str}; sleep 0.1; echo line_2; sleep 10"
+                    "echo line_1; touch .cancel_sentinel; sleep 0.1; echo line_2; sleep 10"
                 )
             }),
         )

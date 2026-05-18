@@ -508,6 +508,9 @@ fn shell_action_profile(command: Option<&str>) -> ActionCompensationProfile {
                     | CommandRisk::PrivilegeEscalation
                     | CommandRisk::RemoteCodeExecution
                     | CommandRisk::OutputRedirection
+                    | CommandRisk::DestructiveCommand(_)
+                    | CommandRisk::CredentialAccess(_)
+                    | CommandRisk::WorkspaceOutWrite(_)
             )
         });
 

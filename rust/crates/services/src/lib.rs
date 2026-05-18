@@ -10,6 +10,7 @@ pub mod context;
 pub mod context_manifest;
 pub mod contract_generator;
 pub mod coordination;
+pub mod cost_ledger;
 pub mod data_versioning;
 pub mod decisions;
 pub mod durable_task;

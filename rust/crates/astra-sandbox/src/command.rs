@@ -188,6 +188,18 @@ pub fn analyze_command_risks(command: &str) -> Vec<CommandRisk> {
         }
     }
 
+    if let Some(path) = credential_access_target(&lower) {
+        push_unique(&mut risks, CommandRisk::CredentialAccess(path));
+    }
+
+    if let Some(cmd) = destructive_command(&lower) {
+        push_unique(&mut risks, CommandRisk::DestructiveCommand(cmd.to_string()));
+    }
+
+    if let Some(target) = workspace_out_write_target(&lower) {
+        push_unique(&mut risks, CommandRisk::WorkspaceOutWrite(target));
+    }
+
     // Environment variable manipulation
     if lower.contains("export ") && (lower.contains("path=") || lower.contains("ld_")) {
         push_unique(&mut risks, CommandRisk::EnvManipulation);
@@ -245,6 +257,234 @@ pub fn analyze_command_risks(command: &str) -> Vec<CommandRisk> {
     risks
 }
 
+const DESTRUCTIVE_COMMANDS: &[&str] = &[
+    "dd",
+    "mkfs",
+    "mkfs.ext4",
+    "mkfs.xfs",
+    "truncate",
+    "shred",
+    "wipefs",
+    "blkdiscard",
+    "fdisk",
+    "sfdisk",
+    "parted",
+    "cryptsetup",
+    "pvremove",
+    "vgremove",
+    "lvremove",
+    "zpool",
+    "zfs",
+];
+
+const CREDENTIAL_PATH_PREFIXES: &[&str] = &[
+    "/.ssh/",
+    "~/.ssh/",
+    "/.aws/",
+    "~/.aws/",
+    "/.kube/",
+    "~/.kube/",
+    "/.docker/config.json",
+    "~/.docker/config.json",
+    "/.gnupg/",
+    "~/.gnupg/",
+    "/.config/gh/",
+    "~/.config/gh/",
+    "/.config/gcloud/",
+    "~/.config/gcloud/",
+    "/.azure/",
+    "~/.azure/",
+    "/.git-credentials",
+    "~/.git-credentials",
+    "/.netrc",
+    "~/.netrc",
+];
+
+const CREDENTIAL_FILE_NAMES: &[&str] = &["id_rsa", "id_ed25519", "id_ecdsa", "id_ed25519_sk"];
+
+fn destructive_command(lower: &str) -> Option<&'static str> {
+    for command in DESTRUCTIVE_COMMANDS {
+        if lower
+            .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_'))
+            .any(|token| token == *command)
+        {
+            return Some(*command);
+        }
+    }
+    None
+}
+
+fn credential_access_target(lower: &str) -> Option<String> {
+    for fragment in lower.split(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '|' | '&')) {
+        let token = normalize_shell_token(fragment);
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(path) = credential_path_match(token) {
+            return Some(path.to_string());
+        }
+        if let Some((_, value)) = token.rsplit_once('=')
+            && let Some(path) = credential_path_match(normalize_shell_token(value))
+        {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+fn credential_path_match(token: &str) -> Option<&str> {
+    if token.is_empty() {
+        return None;
+    }
+
+    for prefix in CREDENTIAL_PATH_PREFIXES {
+        if token.contains(prefix) {
+            return Some(token);
+        }
+    }
+
+    let filename = token
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(token)
+        .trim_matches(['"', '\'']);
+    if CREDENTIAL_FILE_NAMES.contains(&filename) || is_sensitive_dotenv_name(filename) {
+        return Some(token);
+    }
+
+    None
+}
+
+fn is_sensitive_dotenv_name(name: &str) -> bool {
+    if name == ".env" {
+        return true;
+    }
+    let Some(suffix) = name.strip_prefix(".env.") else {
+        return false;
+    };
+    !matches!(
+        suffix,
+        "example" | "sample" | "template" | "dist" | "defaults" | "local.example"
+    )
+}
+
+fn normalize_shell_token(token: &str) -> &str {
+    token.trim_matches(|ch: char| matches!(ch, '"' | '\'' | '(' | ')' | ',' | ';'))
+}
+
+fn workspace_out_write_target(lower: &str) -> Option<String> {
+    if let Some(target) = redirected_write_target(lower) {
+        return Some(target);
+    }
+
+    if let Some(target) = download_output_target(lower) {
+        return Some(target);
+    }
+
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    let write_commands = ["cp", "mv", "touch", "mkdir", "install", "tee", "rsync"];
+    let mut iter = tokens.iter();
+    while let Some(token) = iter.next() {
+        let command = token.trim_matches([';', '|', '&']);
+        if !write_commands.contains(&command) {
+            continue;
+        }
+        for arg in iter.clone() {
+            let target = arg.trim_matches(['"', '\'', ';', '&']);
+            if target.starts_with('-') {
+                continue;
+            }
+            if is_workspace_out_path(target) {
+                return Some(target.to_string());
+            }
+        }
+        break;
+    }
+    None
+}
+
+fn download_output_target(command: &str) -> Option<String> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut iter = tokens.iter();
+    while let Some(token) = iter.next() {
+        let command = token.trim_matches([';', '|', '&']);
+        if !matches!(command, "curl" | "wget") {
+            continue;
+        }
+        while let Some(arg) = iter.next() {
+            let arg = normalize_shell_token(arg);
+            let target = match arg {
+                "-o" | "-O" | "--output" => iter.next().copied(),
+                _ => None,
+            };
+            if let Some(target) = target {
+                let target = normalize_shell_token(target);
+                if is_workspace_out_path(target) {
+                    return Some(target.to_string());
+                }
+            }
+        }
+        break;
+    }
+    None
+}
+
+fn redirected_write_target(command: &str) -> Option<String> {
+    let mut scan_from = 0;
+    while let Some(op_index) = next_redirect_operator(command, scan_from) {
+        let bytes = command.as_bytes();
+        let mut target_index = op_index + 1;
+        if bytes.get(target_index) == Some(&b'>') {
+            target_index += 1;
+        }
+        while let Some(b' ' | b'\t') = bytes.get(target_index).copied() {
+            target_index += 1;
+        }
+        if target_index >= bytes.len() {
+            break;
+        }
+        let rest = &command[target_index..];
+        let target_end = rest
+            .find(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '&' | '|'))
+            .unwrap_or(rest.len());
+        let target = rest[..target_end].trim_matches(['"', '\'']);
+        if is_workspace_out_path(target) {
+            return Some(target.to_string());
+        }
+        scan_from = target_index;
+    }
+    None
+}
+
+fn next_redirect_operator(command: &str, scan_from: usize) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut idx = scan_from;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'>' if !in_single && !in_double => {
+                let previous = idx.checked_sub(1).and_then(|i| bytes.get(i)).copied();
+                let next = bytes.get(idx + 1).copied();
+                if matches!(previous, Some(b'=' | b'-')) || matches!(next, Some(b'=')) {
+                    idx += 1;
+                    continue;
+                }
+                return Some(idx);
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn is_workspace_out_path(path: &str) -> bool {
+    path.starts_with("../") || path.starts_with("..\\") || path.starts_with('/')
+}
+
 fn push_unique(risks: &mut Vec<CommandRisk>, risk: CommandRisk) {
     if !risks.contains(&risk) {
         risks.push(risk);
@@ -278,6 +518,12 @@ pub enum CommandRisk {
     ProcessSubstitution,
     /// Command uses Zsh-specific dangerous builtins or patterns.
     ZshDangerous(String),
+    /// Command invokes a high-impact destructive binary.
+    DestructiveCommand(String),
+    /// Command touches common credential stores or secret files.
+    CredentialAccess(String),
+    /// Command writes to a path outside the workspace boundary.
+    WorkspaceOutWrite(String),
 }
 
 impl std::fmt::Display for CommandRisk {
@@ -295,6 +541,9 @@ impl std::fmt::Display for CommandRisk {
             Self::CommandSubstitution => write!(f, "command substitution ($() or backticks)"),
             Self::ProcessSubstitution => write!(f, "process substitution (<(cmd) / >(cmd))"),
             Self::ZshDangerous(d) => write!(f, "zsh dangerous pattern ({d})"),
+            Self::DestructiveCommand(cmd) => write!(f, "destructive command ({cmd})"),
+            Self::CredentialAccess(path) => write!(f, "credential path access ({path})"),
+            Self::WorkspaceOutWrite(path) => write!(f, "workspace-out write ({path})"),
         }
     }
 }
@@ -427,6 +676,110 @@ mod tests {
     }
 
     #[test]
+    fn detects_top5_destructive_commands() {
+        for command in [
+            "dd if=/dev/zero of=/dev/sda",
+            "mkfs.ext4 /dev/sda1",
+            "shred -u secrets.txt",
+            "wipefs -a /dev/sdb",
+            "cryptsetup luksformat /dev/sdc",
+            "truncate -s 0 ~/.ssh/known_hosts",
+        ] {
+            let risks = analyze_command_risks(command);
+            assert!(
+                risks
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::DestructiveCommand(_))),
+                "{command}: {risks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_credential_path_access() {
+        for command in [
+            "cat ~/.ssh/id_rsa",
+            "cat ~/.ssh/id_ecdsa",
+            "cat ~/.ssh/id_ed25519_sk",
+            "cat ~/.aws/credentials",
+            "cat ~/.kube/config",
+            "cat ~/.config/gh/hosts.yml",
+            "cat ~/.config/gcloud/application_default_credentials.json",
+            "cat ~/.netrc",
+            "cat ~/.git-credentials",
+            "gpg --import ~/.gnupg/private.key",
+            "cat .env.production",
+        ] {
+            let risks = analyze_command_risks(command);
+            assert!(
+                risks
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::CredentialAccess(_))),
+                "{command}: {risks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dotenv_examples_do_not_trigger_credential_risk() {
+        for command in [
+            "cat .env.example",
+            "cat config/.env.sample",
+            "cat deployment/.env.template",
+            "cat .environment",
+        ] {
+            let risks = analyze_command_risks(command);
+            assert!(
+                !risks
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::CredentialAccess(_))),
+                "{command}: {risks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_workspace_out_write_targets() {
+        for command in [
+            "echo secret > ../outside.txt",
+            "echo secret>../outside-no-space.txt",
+            "touch /tmp/outside-workspace",
+            "mv report.txt ../../report.txt",
+            "curl -o ../payload.tgz https://example.com/payload.tgz",
+            "wget -O /tmp/payload.tgz https://example.com/payload.tgz",
+            "rsync build/out.txt ../out.txt",
+        ] {
+            let risks = analyze_command_risks(command);
+            assert!(
+                risks
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+                "{command}: {risks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_workspace_local_write_has_no_workspace_out_risk() {
+        for command in [
+            "echo ok > reports/out.txt",
+            "cp -p report.txt reports/out.txt",
+            "curl -o reports/payload.tgz https://example.com/payload.tgz",
+            "rsync build/out.txt reports/out.txt",
+            "python -c \"print('> ../outside.txt')\"",
+            "test 5 >= 3",
+        ] {
+            let risks = analyze_command_risks(command);
+            assert!(
+                !risks
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+                "{command}: {risks:?}"
+            );
+        }
+    }
+
+    #[test]
     fn detects_chmod_setuid_via_ast() {
         let risks = analyze_command_risks("chmod u+s ./helper");
         assert!(risks.contains(&CommandRisk::PrivilegeEscalation));
@@ -455,6 +808,20 @@ mod tests {
     fn safe_command_no_risks() {
         let risks = analyze_command_risks("echo hello && ls -la");
         assert!(risks.is_empty());
+    }
+
+    #[test]
+    fn safe_git_status_has_no_top5_risks() {
+        let risks = analyze_command_risks("git status --short");
+        assert!(
+            !risks.iter().any(|risk| matches!(
+                risk,
+                CommandRisk::DestructiveCommand(_)
+                    | CommandRisk::CredentialAccess(_)
+                    | CommandRisk::WorkspaceOutWrite(_)
+            )),
+            "{risks:?}"
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ expression: "render_at(&fixture_full(), 100)"
 │ ⚑ BashExecute
 │ npm test --filter auth -- --verbose
 │ ⚠ This command needs your approval before it runs.
-│ Always remembers: similar `npm test` commands in this workspace
+│ Always allow this command pattern in workspace: similar `npm test` commands in this workspace
 │
-│  Allow once   Always   Reject
+│  Allow once   Always allow this command pattern in workspace   Reject
 ╰─ ↑↓←→ select · Enter confirm · Esc reject · Ctrl+Enter quick accept

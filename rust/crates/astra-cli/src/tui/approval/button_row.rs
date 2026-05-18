@@ -35,7 +35,7 @@ pub(crate) const PRIMARY_BUTTONS: &[Button] = &[
         action: ButtonAction::Respond(ApprovalResponse::AllowOnce),
     },
     Button {
-        label: "Always",
+        label: "Always allow this command pattern in workspace",
         action: ButtonAction::Respond(ApprovalResponse::AlwaysAllow),
     },
     Button {
@@ -65,7 +65,7 @@ pub(crate) const PRIMARY_WITH_BATCH: &[Button] = &[
         action: ButtonAction::Respond(ApprovalResponse::AllowOnce),
     },
     Button {
-        label: "Always",
+        label: "Always allow this command pattern in workspace",
         action: ButtonAction::Respond(ApprovalResponse::AlwaysAllow),
     },
     Button {
