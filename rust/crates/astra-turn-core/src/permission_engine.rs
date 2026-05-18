@@ -1754,6 +1754,23 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_execute_hard_deny_allows_in_auto_mode() {
+        let ctx = crate::permission_types::PermissionSyncContext::root(
+            crate::permission_types::PermissionMode::Auto,
+        );
+        let envelope = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": "shred /dev/sda"}),
+            &ctx,
+        );
+        assert!(matches!(envelope.decision, HardDecision::Allow));
+        assert!(matches!(
+            envelope.source,
+            DecisionSource::ExecuteHardDeny { .. }
+        ));
+    }
+
+    #[test]
     fn accept_edits_mode_allows_workspace_write_tools() {
         let ctx = crate::permission_types::PermissionSyncContext::root(
             crate::permission_types::PermissionMode::AcceptEdits,
