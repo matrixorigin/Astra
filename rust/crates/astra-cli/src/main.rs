@@ -205,6 +205,8 @@ mod streaming_md;
 mod streaming_types;
 #[path = "cli/task_summary.rs"]
 mod task_summary;
+#[path = "cli/terminal_hyperlinks.rs"]
+mod terminal_hyperlinks;
 #[path = "cli/terminal_region.rs"]
 mod terminal_region;
 #[path = "cli/theme.rs"]

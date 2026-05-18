@@ -123,6 +123,14 @@ pub(super) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<
             pref_keys::NOTIFICATIONS_ENABLED => {
                 state.notifications_enabled = parse_bool_pref(value, true);
             }
+            pref_keys::NOTIFICATION_METHOD => match value.parse() {
+                Ok(method) => state.notification_method = method,
+                Err(err) => tracing::warn!(
+                    value = %value,
+                    error = %err,
+                    "ignoring invalid notification_method preference"
+                ),
+            },
             pref_keys::NOTIFICATION_THRESHOLD_SECS => {
                 if let Ok(n) = value.parse::<u64>() {
                     state.notification_threshold_secs = n;
@@ -164,6 +172,10 @@ pub(super) async fn try_cloud_push_preferences(state: &SessionState) {
         (
             pref_keys::NOTIFICATIONS_ENABLED,
             state.notifications_enabled.to_string(),
+        ),
+        (
+            pref_keys::NOTIFICATION_METHOD,
+            state.notification_method.to_string(),
         ),
         (
             pref_keys::NOTIFICATION_THRESHOLD_SECS,

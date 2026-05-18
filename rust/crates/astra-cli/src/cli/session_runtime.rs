@@ -780,17 +780,22 @@ pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
         "    astra",
         "",
     ];
-    let left_footer = format!(" {} · v{} · {}", model_display, version, pname);
+    let left_footer = format!(
+        " {} {} {}",
+        model_display.bold().yellow(),
+        "·".white().bold(),
+        format!("v{version} · {pname}").white().bold()
+    );
 
     // Right column: Vec of (styled_content)
     let sep_line = "─".repeat(right_col_w);
     let mut right: Vec<String> = Vec::new();
-    right.push("Tips".bold().to_string());
-    right.push("/help for all commands".dim().to_string());
-    right.push("Ctrl+K command picker".dim().to_string());
-    right.push("Alt+Enter multi-line input".dim().to_string());
-    right.push(sep_line.as_str().dim().to_string());
-    right.push("Status".bold().to_string());
+    right.push("Tips".white().bold().to_string());
+    right.push("/help for all commands".white().bold().to_string());
+    right.push("Ctrl+K command picker".white().bold().to_string());
+    right.push("Alt+Enter multi-line input".white().bold().to_string());
+    right.push(sep_line.as_str().white().bold().to_string());
+    right.push("Status".white().bold().to_string());
     right.push(
         format!(
             "{skills_count} skills · {}",
@@ -800,11 +805,12 @@ pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
                 "not logged in"
             }
         )
-        .dim()
+        .white()
+        .bold()
         .to_string(),
     );
     if let Some(line) = pending_recovery_status_line(state) {
-        right.push(line.dim().to_string());
+        right.push(line.yellow().bold().to_string());
     }
     if let Ok(proxy) = std::env::var("http_proxy").or_else(|_| std::env::var("HTTP_PROXY")) {
         if !proxy.is_empty() {
@@ -814,7 +820,7 @@ pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
             } else {
                 proxy
             };
-            right.push(format!("proxy: {short}").dim().to_string());
+            right.push(format!("proxy: {short}").white().bold().to_string());
         }
     }
 
@@ -829,7 +835,7 @@ pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
             left.push(format!("{}", line.magenta()));
         }
     }
-    left.push(format!("{}", left_footer.dim()));
+    left.push(left_footer);
 
     // Equalize heights
     let total_rows = left.len().max(right.len());
@@ -912,28 +918,33 @@ pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
         };
 
         // Header — title is embedded inline; brighter so it stands out.
-        eprint!("{}", "╭".grey());
-        eprint!("{}", "─".repeat(*lead_dash).grey());
+        eprint!("{}", "╭".white().bold());
+        eprint!("{}", "─".repeat(*lead_dash).white().bold());
         eprint!("{}", title_padded.bold().magenta());
-        eprint!("{}", "─".repeat(*trail_dash).grey());
-        eprintln!("{}", "╮".grey());
+        eprint!("{}", "─".repeat(*trail_dash).white().bold());
+        eprintln!("{}", "╮".white().bold());
         // Body
         for row in 0..*total_rows {
             let l_pad = starfield_pad(*left_col_w, vis_w(&left[row]), &mut rng_seed, 12);
             let r_pad = starfield_pad(*right_col_w, vis_w(&right[row]), &mut rng_seed, 8);
             eprintln!(
                 "{} {}{} {} {}{} {}",
-                "│".grey(),
+                "│".white().bold(),
                 left[row],
                 l_pad,
-                "│".grey(),
+                "│".white().bold(),
                 right[row],
                 r_pad,
-                "│".grey(),
+                "│".white().bold(),
             );
         }
         // Footer
-        eprintln!("{}{}{}", "╰".grey(), h_bar.grey(), "╯".grey());
+        eprintln!(
+            "{}{}{}",
+            "╰".white().bold(),
+            h_bar.white().bold(),
+            "╯".white().bold()
+        );
         let _ = std::io::stderr().flush();
     }
 
@@ -980,11 +991,34 @@ pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     }
 
     eprintln!();
+    let welcome = banner_welcome_text(&pname, p, logged_in);
+    let model_hint = if model_display == "auto" {
+        format!("{} {}", "auto".yellow(), "mode".grey())
+    } else {
+        format!("{} {}", model_display.magenta(), "mode".grey())
+    };
     eprintln!(
-        "  {}",
-        format!("Using {} · /model to change", model_display).dim()
+        "  {} {} {}",
+        welcome.cyan(),
+        model_hint,
+        "· /model to change".grey()
     );
     eprintln!();
+}
+
+fn banner_welcome_text(
+    profile_name: &str,
+    profile: Option<&astra_credentials::Profile>,
+    logged_in: bool,
+) -> String {
+    if !logged_in {
+        return "Welcome to astra".to_string();
+    }
+    let user = profile
+        .and_then(|profile| profile.username.as_deref())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(profile_name);
+    format!("Welcome back, {user}")
 }
 
 #[cfg(test)]
@@ -1598,6 +1632,39 @@ mod tests {
         };
         let display = state.model.as_deref().unwrap_or("auto");
         assert_eq!(display, "gpt-5");
+    }
+
+    #[test]
+    fn banner_welcome_uses_username_when_logged_in() {
+        let profile = Profile {
+            username: Some("xupeng".to_string()),
+            access_token: Some("token".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            banner_welcome_text("default", Some(&profile), true),
+            "Welcome back, xupeng"
+        );
+    }
+
+    #[test]
+    fn banner_welcome_falls_back_to_profile_name() {
+        let profile = Profile {
+            access_token: Some("token".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            banner_welcome_text("test", Some(&profile), true),
+            "Welcome back, test"
+        );
+    }
+
+    #[test]
+    fn banner_welcome_handles_logged_out_state() {
+        assert_eq!(
+            banner_welcome_text("default", None, false),
+            "Welcome to astra"
+        );
     }
 
     // ─── auto-auth regression guards ──────────────────────────

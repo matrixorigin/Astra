@@ -1179,6 +1179,8 @@ pub mod pref_keys {
     pub const AUTO_MEMORY_ENABLED: &str = "auto_memory_enabled";
     /// Desktop notifications on turn completion. "true"/"false". Default: true.
     pub const NOTIFICATIONS_ENABLED: &str = "notifications_enabled";
+    /// Notification delivery method: "auto", "osc9", "bell", or "off". Default: "auto".
+    pub const NOTIFICATION_METHOD: &str = "notification_method";
     /// Minimum elapsed seconds before a desktop notification is sent. Default: 10.
     pub const NOTIFICATION_THRESHOLD_SECS: &str = "notification_threshold_secs";
 }
@@ -1297,6 +1299,7 @@ mod tests {
         assert_eq!(pref_keys::EXPLAIN_MODE, "explain_mode");
         assert_eq!(pref_keys::DEFAULT_MODEL, "default_model");
         assert_eq!(pref_keys::TOOL_BUDGET, "tool_budget_tokens");
+        assert_eq!(pref_keys::NOTIFICATION_METHOD, "notification_method");
     }
 
     // ── SyncStatus ──

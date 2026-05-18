@@ -72,7 +72,7 @@ impl Footer {
             permission_mode: self.permission_mode_enum(),
             turn_active: self.is_turn_active,
             session_id: self.session_id.clone(),
-            cost_usd: self.cost_usd,
+            cost_usd: None,
             git_branch: self.git_branch.clone(),
             pending_approvals: self.pending_approvals,
             task_counts: self.task_counts,
@@ -111,4 +111,16 @@ fn current_cwd_display() -> Option<String> {
 /// render. See `crate::git_branch_cache`.
 fn detect_git_branch() -> Option<String> {
     crate::git_branch_cache::detect_git_branch_cached()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Footer;
+
+    #[test]
+    fn footer_hides_cost_chip_from_status_line() {
+        let mut footer = Footer::new();
+        footer.cost_usd = Some(3.47);
+        assert!(footer.to_context().cost_usd.is_none());
+    }
 }

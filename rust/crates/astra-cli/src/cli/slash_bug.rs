@@ -1,7 +1,5 @@
 use super::*;
 use crate::{cli_dim, cli_err, cli_ok, cli_warn};
-use std::io::Write;
-use std::process::{Command as SysCommand, Stdio};
 
 /// Handle the `/bug` slash command — generate a diagnostic report for bug reports.
 ///
@@ -13,14 +11,14 @@ pub(super) fn handle_bug_command(arg: &str, state: &SessionState) {
     let report = build_bug_report(state);
 
     match arg.trim() {
-        "copy" => {
-            if copy_to_clipboard(&report) {
-                cli_ok!("Bug report copied to clipboard.");
-            } else {
-                cli_warn!("Could not copy to clipboard — printing instead:");
+        "copy" => match crate::slash_info::copy_to_clipboard(&report) {
+            Ok(()) => cli_ok!("Bug report copied to clipboard."),
+            Err(error) => {
+                cli_warn!("Could not copy to clipboard: {}", error);
+                cli_warn!("Printing bug report instead:");
                 eprintln!("{report}");
             }
-        }
+        },
         "save" => {
             let filename = format!(
                 "astra-bug-{}.md",
@@ -44,34 +42,6 @@ pub(super) fn handle_bug_command(arg: &str, state: &SessionState) {
             cli_warn!("Unknown sub-command '{}'. Usage: /bug [copy|save]", other);
         }
     }
-}
-
-fn copy_to_clipboard(text: &str) -> bool {
-    let wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
-    let mut candidates: Vec<(&str, &[&str])> = Vec::new();
-    if wayland {
-        candidates.push(("wl-copy", &[]));
-    }
-    candidates.extend_from_slice(&[
-        ("xclip", &["-selection", "clipboard"] as &[&str]),
-        ("xsel", &["--clipboard", "--input"]),
-        ("pbcopy", &[]),
-    ]);
-    for (cmd, args) in &candidates {
-        if let Ok(mut child) = SysCommand::new(cmd)
-            .args(*args)
-            .stdin(Stdio::piped())
-            .spawn()
-        {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            if child.wait().map(|s| s.success()).unwrap_or(false) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 fn build_bug_report(state: &SessionState) -> String {

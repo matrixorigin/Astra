@@ -21,7 +21,7 @@ fn format_bytes(bytes: u32) -> String {
     }
 }
 
-pub(crate) fn copy_to_clipboard(text: &str) -> bool {
+pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
     // Try Wayland first (if WAYLAND_DISPLAY is set), then X11 tools, then macOS.
     let wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
     let mut candidates: Vec<(&str, &[&str])> = Vec::new();
@@ -33,21 +33,48 @@ pub(crate) fn copy_to_clipboard(text: &str) -> bool {
         ("xsel", &["--clipboard", "--input"]),
         ("pbcopy", &[]),
     ]);
+    let mut attempts = Vec::new();
     for (cmd, args) in &candidates {
-        if let Ok(mut child) = SysCommand::new(cmd)
+        let mut child = match SysCommand::new(cmd)
             .args(*args)
             .stdin(Stdio::piped())
             .spawn()
         {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
+            Ok(child) => child,
+            Err(error) => {
+                attempts.push(format!("{cmd}: failed to start: {error}"));
+                continue;
             }
-            if child.wait().map(|s| s.success()).unwrap_or(false) {
-                return true;
+        };
+        match child.stdin.take() {
+            Some(mut stdin) => {
+                if let Err(error) = stdin.write_all(text.as_bytes()) {
+                    attempts.push(format!("{cmd}: failed to write clipboard payload: {error}"));
+                    if let Err(wait_error) = child.wait() {
+                        attempts.push(format!(
+                            "{cmd}: failed to reap after write error: {wait_error}"
+                        ));
+                    }
+                    continue;
+                }
+            }
+            None => {
+                attempts.push(format!("{cmd}: stdin pipe was unavailable"));
+                if let Err(wait_error) = child.wait() {
+                    attempts.push(format!(
+                        "{cmd}: failed to reap after missing stdin: {wait_error}"
+                    ));
+                }
+                continue;
             }
         }
+        match child.wait() {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => attempts.push(format!("{cmd}: exited with status {status}")),
+            Err(error) => attempts.push(format!("{cmd}: failed to wait for process: {error}")),
+        }
     }
-    false
+    Err(format!("clipboard unavailable ({})", attempts.join("; ")))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1324,14 +1351,12 @@ pub(super) async fn handle_info_command(
                 } else {
                     preview
                 };
-                if copy_to_clipboard(&text) {
-                    eprintln!("{}", format!("  ✓ Copied ({n} chars)").green());
+                if let Err(error) = copy_to_clipboard(&text) {
+                    eprintln!("{}", format!("  ✗ Could not copy: {error}").yellow());
                     eprintln!("  {}", preview_display.dim());
                 } else {
-                    eprintln!(
-                        "{}",
-                        "  ✗ No clipboard tool found (install xclip or xsel)".yellow()
-                    );
+                    eprintln!("{}", format!("  ✓ Copied ({n} chars)").green());
+                    eprintln!("  {}", preview_display.dim());
                 }
             }
             None => eprintln!("{}", "  ✗ No response to copy yet".yellow()),

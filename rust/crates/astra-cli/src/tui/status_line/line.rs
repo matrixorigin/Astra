@@ -4,7 +4,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthStr;
@@ -99,18 +99,15 @@ pub(crate) struct StatusLine {
     pub right: Vec<Segment>,
 }
 
-/// Idle hint: input-prefix legend only. The `⇧Tab mode` /
-/// `Ctrl+O transcript` cheatsheet that used to live here was
-/// duplicating signal already conveyed by the permission-mode chip
-/// to the right (default / auto / edit / plan); once a user knows
-/// the shortcut the hint is permanent noise. The remaining `/ @ $`
-/// triplet stays because those characters change the *meaning* of
-/// the next keystroke (slash command / mention / shell), which is
-/// not visible from any other chip.
-pub(crate) const IDLE_HINT_FULL: &str = "/ @ $";
-/// Same hint at narrow widths — `IDLE_HINT_FULL` already fits in
-/// most terminals; keep an alias so existing layout code that
-/// distinguishes the two has a tiny form to fall back to.
+/// Idle hint: make each prefix legible instead of showing raw symbols.
+/// These prefixes change the meaning of the next keystroke, so the
+/// footer should label them directly rather than expecting the user to
+/// remember `/ @ $` by heart.
+pub(crate) const IDLE_HINT_FULL: &str = "/commands @mention $shell";
+/// Same hint, but compressed enough to preserve the right-side model/cwd
+/// chips on 80-column terminals.
+pub(crate) const IDLE_HINT_SHORT: &str = "/cmd @mention $sh";
+/// Same hint collapsed for narrow terminals so the model chip still fits.
 pub(crate) const IDLE_HINT_TINY: &str = "/ @ $";
 
 /// Threshold below which the budget chip is dim, above which it warns.
@@ -122,7 +119,8 @@ const CWD_MAX_WIDTH: usize = 28;
 impl StatusLine {
     /// Build a status line from context.
     pub fn from_context(ctx: &StatusContext) -> Self {
-        let dim = Style::default().fg(Color::DarkGray);
+        let muted = Style::default().fg(Color::Gray);
+        let hint = Style::default().fg(Color::White);
         let mut out = Self::default();
 
         // ── Left: short hint, then permission chip if non-default ─
@@ -135,35 +133,45 @@ impl StatusLine {
         } else {
             IDLE_HINT_FULL.to_string()
         };
-        out.left.push(Segment::styled(hint_text, dim));
+        out.left.push(Segment::styled(hint_text, hint));
 
         match ctx.permission_mode {
             PermissionMode::Ask => {
-                out.left
-                    .push(Segment::styled(PermissionMode::Ask.chip_text(), dim));
+                out.left.push(Segment::styled(
+                    PermissionMode::Ask.chip_text(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ));
             }
             PermissionMode::Auto => {
                 out.left.push(Segment::styled(
                     PermissionMode::Auto.chip_text(),
-                    Style::default().fg(Color::Yellow),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ));
             }
             PermissionMode::Plan => {
                 out.left.push(Segment::styled(
                     PermissionMode::Plan.chip_text(),
-                    Style::default().fg(Color::Blue),
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
                 ));
             }
             PermissionMode::AcceptEdits => {
                 out.left.push(Segment::styled(
                     PermissionMode::AcceptEdits.chip_text(),
-                    Style::default().fg(Color::Cyan),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ));
             }
             PermissionMode::Deny => {
                 out.left.push(Segment::styled(
                     PermissionMode::Deny.chip_text(),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ));
             }
         }
@@ -173,7 +181,7 @@ impl StatusLine {
         // modes (the previous global "⇧Tab mode" hint was deleted
         // for being repetitive and unanchored). Dim so it reads as
         // metadata of the chip, not an action of its own.
-        out.left.push(Segment::styled("⇧Tab", dim));
+        out.left.push(Segment::styled("⇧Tab", muted));
 
         if ctx.pending_approvals > 0 {
             let text = if ctx.pending_approvals == 1 {
@@ -181,12 +189,8 @@ impl StatusLine {
             } else {
                 format!("⏸ {} pending", ctx.pending_approvals)
             };
-            out.left.push(Segment::styled(
-                text,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(ratatui::style::Modifier::BOLD),
-            ));
+            out.left
+                .push(Segment::styled(text, Style::default().fg(Color::Yellow)));
         }
 
         // Task-board chip. `▶` = collapsed (Ctrl+T to expand),
@@ -205,7 +209,7 @@ impl StatusLine {
                         Style::default().fg(Color::Green),
                     )
                 } else {
-                    (format!("{glyph} {open}/{total}"), dim)
+                    (format!("{glyph} {open}/{total}"), muted)
                 };
                 out.left.push(Segment::styled(text, style));
             }
@@ -228,7 +232,7 @@ impl StatusLine {
                 let style = if stalled > 0 {
                     Style::default().fg(Color::Yellow)
                 } else {
-                    dim
+                    muted
                 };
                 out.left.push(Segment::styled(text, style));
             }
@@ -236,16 +240,20 @@ impl StatusLine {
 
         // ── Right: model · branch · cwd · tokens · cost ───────────
         if let Some(model) = ctx.model.as_deref() {
-            out.right.push(Segment::styled(model.to_string(), dim));
+            out.right.push(Segment::styled(
+                model.to_string(),
+                Style::default().fg(Color::White),
+            ));
         }
 
         if let Some(branch) = ctx.git_branch.as_deref() {
-            out.right.push(Segment::styled(format!("⎇ {branch}"), dim));
+            out.right
+                .push(Segment::styled(format!("⎇ {branch}"), muted));
         }
 
         if let Some(cwd) = ctx.cwd.as_deref() {
             out.right
-                .push(Segment::styled(truncate_cwd(cwd, CWD_MAX_WIDTH), dim));
+                .push(Segment::styled(truncate_cwd(cwd, CWD_MAX_WIDTH), muted));
         }
 
         if let Some((used, limit)) = ctx.token_budget {
@@ -256,7 +264,7 @@ impl StatusLine {
                 } else if pct >= BUDGET_WARN_PERCENT {
                     Style::default().fg(Color::Yellow)
                 } else {
-                    dim
+                    muted
                 };
                 out.right.push(Segment::styled(
                     format!("{pct:.0}% ({})", format_tokens_compact(used)),
@@ -266,7 +274,8 @@ impl StatusLine {
         }
 
         if let Some(cost) = ctx.cost_usd {
-            out.right.push(Segment::styled(format!("${cost:.2}"), dim));
+            out.right
+                .push(Segment::styled(format!("${cost:.2}"), muted));
         }
 
         out
@@ -296,7 +305,7 @@ impl StatusLine {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let sep = Span::styled(" · ", Style::default().fg(Color::DarkGray));
+        let sep = Span::styled(" · ", Style::default().fg(Color::Gray));
 
         // Narrow-width degradation of the idle hint. When the full hint
         // won't leave room for the model name / key stats on the right,
@@ -358,19 +367,22 @@ impl StatusLine {
             .skip(1)
             .map(|s| s.text.chars().count() + sep_w)
             .sum();
-        // Protect the first right segment (model name) minimum. Others
-        // drop naturally in render().
-        let right_floor = self
+        // Prefer preserving the current right-side context (model, branch,
+        // cwd, budget) before spending width on a verbose legend.
+        let right_desired: usize = self
             .right
-            .first()
-            .map(|s| s.text.chars().count() + sep_w)
-            .unwrap_or(0);
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| s.text.chars().count() + if idx > 0 { sep_w } else { 0 })
+            .sum();
 
-        let overhead = lead_indent + other_left_w + right_floor + trailing_margin;
+        let overhead = lead_indent + other_left_w + right_desired + trailing_margin;
         let available = (width as usize).saturating_sub(overhead);
 
         let chosen = if IDLE_HINT_FULL.chars().count() <= available {
             IDLE_HINT_FULL
+        } else if IDLE_HINT_SHORT.chars().count() <= available {
+            IDLE_HINT_SHORT
         } else {
             IDLE_HINT_TINY
         };

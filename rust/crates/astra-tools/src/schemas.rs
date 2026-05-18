@@ -873,7 +873,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
         ## When to Use This Tool\n\
         - **Long-running shell** (builds, test suites, servers, scripts > ~10s): use `shell` instead of blocking `bash` — keeps the conversation responsive.\n\
         - **Durable sub-agent fan-out**: use `agent` to spawn an agent that should survive until it produces a result. The job ID returned is durable across CLI restart.\n\
-        - **Need output later**: pair `shell` / `agent` with a follow-up `output` call. With `block: true` (default), `output` waits up to `timeout_ms` for completion.\n\
+        - **Need output later**: pair `shell` / `agent` with a follow-up `output` call. With `block: true` (default), `output` waits up to `timeout_ms` for completion. Use `offset` to resume from the last byte you already consumed.\n\
         - **Cancel a stuck job**: `kill` terminates immediately.\n\
         \n\
         ## When NOT to Use This Tool\n\
@@ -927,6 +927,16 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "block": {
                             "type": "boolean",
                             "description": "(output) Wait for the job to complete before returning. Default true."
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "(output) Resume reading from this byte offset. Default 0."
+                        },
+                        "max_bytes": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "(output) Maximum bytes to return from the current offset. Default 8192, max 65536."
                         },
                         "timeout_ms": {
                             "type": "integer",

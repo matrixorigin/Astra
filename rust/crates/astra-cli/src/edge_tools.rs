@@ -471,6 +471,12 @@ pub(crate) enum BgTaskCommand {
         tail_bytes: usize,
         reply: tokio::sync::oneshot::Sender<Result<(String, u64), String>>,
     },
+    GetOutputSince {
+        task_id: String,
+        offset: u64,
+        max_bytes: usize,
+        reply: tokio::sync::oneshot::Sender<Result<(String, u64, u64), String>>,
+    },
     /// Returns whether the task has reached terminal status. Used by
     /// `agent_job(action='output', block=true)` so an empty-output job
     /// that completed doesn't spin until the timeout.
@@ -1904,6 +1910,12 @@ impl ToolExecutor {
             None => return "Error: 'task_id' is required for output".to_string(),
         };
         let block = args.get("block").and_then(Value::as_bool).unwrap_or(true);
+        let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
+        let max_bytes = args
+            .get("max_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(8_192)
+            .min(65_536) as usize;
         let timeout_ms = args
             .get("timeout_ms")
             .and_then(Value::as_u64)
@@ -1933,20 +1945,21 @@ impl ToolExecutor {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 {
                     let mut cmds = bg_commands.lock().unwrap();
-                    cmds.push(BgTaskCommand::GetOutput {
+                    cmds.push(BgTaskCommand::GetOutputSince {
                         task_id: task_id.clone(),
-                        tail_bytes: 8192,
+                        offset,
+                        max_bytes,
                         reply: tx,
                     });
                 }
                 match rx.await {
-                    Ok(Ok((output, total_bytes))) => {
+                    Ok(Ok((output, end_offset, total_bytes))) => {
                         if is_terminal
                             || !output.is_empty()
                             || tokio::time::Instant::now() >= deadline
                         {
                             return format!(
-                                "<task_output task_id=\"{task_id}\" total_bytes=\"{total_bytes}\" terminal=\"{is_terminal}\">\n{output}\n</task_output>"
+                                "<task_output task_id=\"{task_id}\" start_offset=\"{offset}\" end_offset=\"{end_offset}\" total_bytes=\"{total_bytes}\" terminal=\"{is_terminal}\">\n{output}\n</task_output>"
                             );
                         }
                     }
@@ -1964,16 +1977,17 @@ impl ToolExecutor {
             let (tx, rx) = tokio::sync::oneshot::channel();
             {
                 let mut cmds = bg_commands.lock().unwrap();
-                cmds.push(BgTaskCommand::GetOutput {
+                cmds.push(BgTaskCommand::GetOutputSince {
                     task_id: task_id.clone(),
-                    tail_bytes: 8192,
+                    offset,
+                    max_bytes,
                     reply: tx,
                 });
             }
             match rx.await {
-                Ok(Ok((output, total_bytes))) => {
+                Ok(Ok((output, end_offset, total_bytes))) => {
                     format!(
-                        "<task_output task_id=\"{task_id}\" total_bytes=\"{total_bytes}\">\n{output}\n</task_output>"
+                        "<task_output task_id=\"{task_id}\" start_offset=\"{offset}\" end_offset=\"{end_offset}\" total_bytes=\"{total_bytes}\">\n{output}\n</task_output>"
                     )
                 }
                 Ok(Err(e)) => format!("Error: {e}"),

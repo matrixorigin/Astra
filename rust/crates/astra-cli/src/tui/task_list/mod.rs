@@ -118,10 +118,19 @@ fn max_display(rows: u16) -> usize {
 }
 
 /// Conservative per-line subject width. Matches the reference TUI's
-/// `max(15, columns - 15 - ownerWidth)` with ownerWidth = 0 in Phase 4.1
-/// since the owner badge isn't rendered yet.
+/// `max(15, columns - 15 - ownerWidth)` before subtracting any
+/// per-row owner badge width.
 fn max_subject_width(columns: u16) -> usize {
     (columns as usize).saturating_sub(15).max(15)
+}
+
+fn owner_badge(task: &SessionTask) -> Option<String> {
+    let owner = task.owner.as_deref()?.trim();
+    if owner.is_empty() {
+        return None;
+    }
+    let owner = owner.strip_prefix('@').unwrap_or(owner);
+    Some(format!(" (@{})", truncate_to_width(owner, 14)))
 }
 
 /// Truncate a string to fit within `max_cols` display columns, adding a
@@ -227,7 +236,16 @@ fn render_task_line(
     let is_in_progress = task.status == "in_progress";
     let is_blocked = !open_blockers.is_empty();
 
-    let subject = truncate_to_width(&task.title, max_subject_width(columns));
+    let owner_badge = owner_badge(task);
+    let subject = truncate_to_width(
+        &task.title,
+        max_subject_width(columns).saturating_sub(
+            owner_badge
+                .as_deref()
+                .map(unicode_width::UnicodeWidthStr::width)
+                .unwrap_or(0),
+        ),
+    );
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     // In-progress and completed get BOLD; pending and fallback statuses
@@ -250,6 +268,13 @@ fn render_task_line(
         subject_style = subject_style.add_modifier(Modifier::DIM);
     }
     spans.push(Span::styled(subject, subject_style));
+
+    if let Some(owner_badge) = owner_badge {
+        spans.push(Span::styled(
+            owner_badge,
+            Style::default().fg(colors.dim).add_modifier(Modifier::DIM),
+        ));
+    }
 
     if is_blocked {
         let mut ids: Vec<&String> = open_blockers.iter().collect();
@@ -921,6 +946,17 @@ mod tests {
         assert!(header.contains("1 done"));
         assert!(header.contains("1 in progress"));
         assert!(header.contains("1 open"));
+    }
+
+    #[test]
+    fn owner_badge_is_rendered_inline() {
+        let mut task = mk_task("task-1", "delegate audit", "in_progress");
+        task.owner = Some("agent-7".into());
+
+        let line = render_task_line(&task, &[], 80, TaskBoardColors::from_theme());
+        let text = spans_text(&line);
+        assert!(text.contains("delegate audit"));
+        assert!(text.contains("(@agent-7)"), "{text}");
     }
 
     #[test]

@@ -703,12 +703,12 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             match &ctx.state.last_response {
                 Some(resp) if !resp.is_empty() => {
                     let n = resp.chars().count();
-                    if crate::slash_info::copy_to_clipboard(resp) {
+                    if let Err(error) = crate::slash_info::copy_to_clipboard(resp) {
+                        ctx.show_error(format!("Copy failed: {error}"));
+                    } else {
                         let preview: String = resp.chars().take(60).collect();
                         let suffix = if n > 60 { "…" } else { "" };
                         ctx.show_response(format!("Copied {n} chars: {preview}{suffix}"));
-                    } else {
-                        ctx.show_error("No clipboard tool found (install xclip or xsel)".into());
                     }
                 }
                 _ => ctx.show_info("No response to copy".into()),

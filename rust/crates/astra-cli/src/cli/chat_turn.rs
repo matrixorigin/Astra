@@ -1827,6 +1827,7 @@ async fn apply_turn_success_async(
     let elapsed = turn_start.elapsed();
     let notif_config = super::notifications::NotificationConfig {
         enabled: state.notifications_enabled,
+        method: state.notification_method,
         min_duration_secs: state.notification_threshold_secs,
     };
     if notif_config.enabled && notif_config.exceeds_threshold(elapsed) {

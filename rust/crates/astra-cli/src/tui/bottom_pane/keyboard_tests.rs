@@ -31,3 +31,16 @@ fn backtab_keeps_approval_navigation_when_approval_is_pending() {
 
     assert!(matches!(action, BottomPaneAction::Consumed));
 }
+
+#[test]
+fn ctrl_e_requests_external_editor_for_composer() {
+    let mut pane = BottomPane::new();
+    pane.composer.set_text("draft from tui");
+
+    let action = pane.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+
+    match action {
+        BottomPaneAction::OpenExternalEditor(text) => assert_eq!(text, "draft from tui"),
+        other => panic!("expected OpenExternalEditor, got {other:?}"),
+    }
+}
