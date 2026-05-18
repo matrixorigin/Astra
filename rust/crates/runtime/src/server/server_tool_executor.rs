@@ -4591,9 +4591,8 @@ fn tool_result_from_server_bash_output(
     let semantics = output.exit_code.map(|code| classify_exit(command, code));
     let mut result = if output.exit_code.is_some_and(|code| code != 0)
         && semantics.is_some_and(|semantics| semantics.is_tool_error())
+        || output.exit_code.is_none() && output.stdout.is_empty() && !output.stderr.is_empty()
     {
-        astra_tools::ToolResult::error(format!("Error: {body}"))
-    } else if output.exit_code.is_none() && output.stdout.is_empty() && !output.stderr.is_empty() {
         astra_tools::ToolResult::error(format!("Error: {body}"))
     } else {
         astra_tools::ToolResult::text(body)

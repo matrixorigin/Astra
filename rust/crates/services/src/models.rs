@@ -375,10 +375,10 @@ fn normalize_model_selector_for_resolution(requested: &str) -> &str {
         if matches!(effort, "low" | "medium" | "high" | "max") {
             return base;
         }
-        if let Some(budget) = effort.strip_prefix("budget:") {
-            if budget.parse::<u32>().is_ok() {
-                return base;
-            }
+        if let Some(budget) = effort.strip_prefix("budget:")
+            && budget.parse::<u32>().is_ok()
+        {
+            return base;
         }
     }
     trimmed

@@ -35,7 +35,7 @@ pub fn classify_exit(command: &str, exit_code: i32) -> ExitSemantics {
     if exit_code == 0 {
         return ExitSemantics::Success;
     }
-    if matches!(exit_code, 126 | 127) || exit_code < 0 || exit_code >= 128 {
+    if matches!(exit_code, 126 | 127) || !(0..128).contains(&exit_code) {
         return ExitSemantics::ExecutionError;
     }
 

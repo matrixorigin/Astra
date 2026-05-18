@@ -323,10 +323,10 @@ fn credential_access_target(lower: &str) -> Option<String> {
         if let Some(path) = credential_path_match(token) {
             return Some(path.to_string());
         }
-        if let Some((_, value)) = token.rsplit_once('=') {
-            if let Some(path) = credential_path_match(normalize_shell_token(value)) {
-                return Some(path.to_string());
-            }
+        if let Some((_, value)) = token.rsplit_once('=')
+            && let Some(path) = credential_path_match(normalize_shell_token(value))
+        {
+            return Some(path.to_string());
         }
     }
     None
