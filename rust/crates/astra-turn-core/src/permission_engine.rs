@@ -584,6 +584,24 @@ pub fn evaluate_permission(
     );
 
     if let Some(reason) = execute_hard_deny_reason(tool_name, args) {
+        if ctx.mode() == PermissionMode::Deny {
+            let decision = HardDecision::Deny {
+                reason: "Command hard-denied (deny mode)".to_string(),
+            };
+            push_matched(
+                &mut trace,
+                EvaluationStep::ExecuteHardDeny,
+                &decision,
+                &reason,
+            );
+            return envelope(
+                decision,
+                DecisionSource::ExecuteHardDeny { reason },
+                trace,
+                will_save,
+                risk_tags,
+            );
+        }
         if ctx.mode() == PermissionMode::Auto {
             let decision = HardDecision::Allow;
             push_matched(
