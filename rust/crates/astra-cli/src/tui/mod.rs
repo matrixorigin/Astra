@@ -22,6 +22,7 @@ mod diff_render;
 mod draw;
 mod event;
 mod event_loop;
+mod external_editor;
 mod frame_rate_limiter;
 mod frame_requester;
 mod history_cell;

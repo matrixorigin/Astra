@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use astra_pipeline::output_stream::OutputStream;
 use astra_text_utils::str_preview::truncate_line;
 use tokio::process::Command;
 use tokio::task::JoinSet;
@@ -379,6 +380,21 @@ impl BackgroundTaskRegistry {
             .get(id)
             .ok_or_else(|| format!("no background task with id '{id}'"))?;
         read_tail_str(&handle.stdout_path, tail_bytes)
+    }
+
+    /// Read output from a task's stdout file starting at `offset`.
+    /// Returns `(content, end_offset, total_bytes)`.
+    pub fn get_output_since(
+        &self,
+        id: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<(String, u64, u64), String> {
+        let handle = self
+            .tasks
+            .get(id)
+            .ok_or_else(|| format!("no background task with id '{id}'"))?;
+        read_from_str(&handle.stdout_path, offset, max_bytes)
     }
 
     /// Read stderr from a task.
@@ -829,6 +845,23 @@ fn read_tail_str(path: &Path, max_bytes: usize) -> Result<(String, u64), String>
     Ok((text, len))
 }
 
+fn read_from_str(path: &Path, offset: u64, max_bytes: usize) -> Result<(String, u64, u64), String> {
+    let stream = OutputStream::create(path.to_path_buf())
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let buf = stream
+        .read_from(offset, max_bytes)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let end_offset = offset.saturating_add(buf.len() as u64);
+    let total_bytes = std::fs::metadata(path)
+        .map(|m| m.len())
+        .unwrap_or(end_offset);
+    Ok((
+        String::from_utf8_lossy(&buf).to_string(),
+        end_offset,
+        total_bytes,
+    ))
+}
+
 fn read_combined_tail_str(
     stdout_path: &Path,
     stderr_path: &Path,
@@ -1026,6 +1059,43 @@ mod tests {
             .unwrap_or_else(|| panic!("expected Completed in events; got {events:?}"));
         assert_eq!(completed.0, id);
         assert!(completed.1.contains("hello"), "summary: {}", completed.1);
+    }
+
+    #[tokio::test]
+    async fn get_output_since_reads_incremental_chunks_by_offset() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell("printf 'hello\\nworld\\n'", "test chunks");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = reg.poll_completions();
+
+        let (first, first_end, total) = reg.get_output_since(&id, 0, 6).expect("first chunk");
+        assert_eq!(first, "hello\n");
+        assert_eq!(first_end, 6);
+        assert_eq!(total, 12);
+
+        let (second, second_end, second_total) = reg
+            .get_output_since(&id, first_end, 1024)
+            .expect("second chunk");
+        assert_eq!(second, "world\n");
+        assert_eq!(second_end, 12);
+        assert_eq!(second_total, 12);
+    }
+
+    #[tokio::test]
+    async fn get_output_since_rejects_offsets_past_end() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell("printf 'short'", "test offset bounds");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = reg.poll_completions();
+
+        let err = reg
+            .get_output_since(&id, 99, 16)
+            .expect_err("offset beyond end must fail");
+        assert!(err.contains("offset 99"), "{err}");
     }
 
     #[tokio::test]

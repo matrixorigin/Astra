@@ -25,7 +25,10 @@ const DEFAULT_VISIBLE_LINES: u16 = 16;
 pub(crate) struct TranscriptView {
     lines: Vec<Line<'static>>,
     scroll: usize,
+    cursor: usize,
+    selection_anchor: Option<usize>,
     completed: bool,
+    status: Option<String>,
     /// Max content rows to show at once. Derived from the terminal
     /// height at push time so tall windows get a full-screen overlay
     /// instead of a fixed 16-line peephole.
@@ -47,13 +50,97 @@ impl TranscriptView {
             budget.saturating_sub(CHROME_LINES).max(MIN_VISIBLE_LINES)
         };
         let scroll = lines.len().saturating_sub(max_visible as usize);
+        let cursor = scroll
+            .saturating_add(max_visible as usize)
+            .min(lines.len())
+            .saturating_sub(1);
         Self {
             lines,
             scroll,
+            cursor,
+            selection_anchor: None,
             completed: false,
+            status: None,
             max_visible,
         }
     }
+
+    fn max_scroll(&self) -> usize {
+        self.lines.len().saturating_sub(self.max_visible as usize)
+    }
+
+    fn selection_bounds(&self) -> Option<(usize, usize)> {
+        let anchor = self.selection_anchor?;
+        Some((anchor.min(self.cursor), anchor.max(self.cursor)))
+    }
+
+    fn is_selected_row(&self, index: usize) -> bool {
+        self.selection_bounds()
+            .is_some_and(|(start, end)| (start..=end).contains(&index))
+    }
+
+    fn visible_end(&self) -> usize {
+        (self.scroll + self.max_visible as usize).min(self.lines.len())
+    }
+
+    fn ensure_cursor_visible(&mut self) {
+        let max_scroll = self.max_scroll();
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        } else if self.cursor >= self.scroll + self.max_visible as usize {
+            self.scroll = self
+                .cursor
+                .saturating_add(1)
+                .saturating_sub(self.max_visible as usize)
+                .min(max_scroll);
+        }
+    }
+
+    fn move_cursor_to(&mut self, cursor: usize) {
+        self.cursor = cursor.min(self.lines.len().saturating_sub(1));
+        self.ensure_cursor_visible();
+    }
+
+    fn selected_text(&self) -> String {
+        if self.lines.is_empty() {
+            return String::new();
+        }
+        let (start, end) = self
+            .selection_bounds()
+            .unwrap_or((self.cursor, self.cursor));
+        self.lines[start..=end]
+            .iter()
+            .map(line_plain_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn copy_selection_with<F>(&mut self, copy: F)
+    where
+        F: FnOnce(&str) -> Result<(), String>,
+    {
+        let text = self.selected_text();
+        if text.is_empty() {
+            self.status = Some("Nothing to copy".to_string());
+            return;
+        }
+        let line_count = text.lines().count();
+        match copy(&text) {
+            Ok(()) => {
+                self.status = Some(format!("Copied {line_count} line(s) to clipboard"));
+            }
+            Err(error) => {
+                self.status = Some(format!("Copy failed: {error}"));
+            }
+        }
+    }
+}
+
+fn line_plain_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
 }
 
 impl BottomPaneView for TranscriptView {
@@ -64,6 +151,10 @@ impl BottomPaneView for TranscriptView {
 
         let dim = Style::default().fg(Color::DarkGray);
         let bold = Style::default().add_modifier(Modifier::BOLD);
+        let cursor_style = Style::default().bg(Color::Rgb(40, 40, 48));
+        let selection_style = Style::default()
+            .bg(Color::Rgb(33, 66, 99))
+            .add_modifier(Modifier::BOLD);
         let mut y = area.y;
         let bottom = area.bottom();
 
@@ -88,16 +179,18 @@ impl BottomPaneView for TranscriptView {
 
         // Content
         let max_visible = self.max_visible as usize;
-        let visible_end = (self.scroll + max_visible).min(self.lines.len());
+        let visible_end = self.visible_end();
         for i in self.scroll..visible_end {
             if y >= bottom {
                 break;
             }
-            Widget::render(
-                self.lines[i].clone(),
-                Rect::new(area.x, y, area.width, 1),
-                buf,
-            );
+            let mut line = self.lines[i].clone();
+            if self.is_selected_row(i) {
+                line.style = selection_style;
+            } else if i == self.cursor {
+                line.style = cursor_style;
+            }
+            Widget::render(line, Rect::new(area.x, y, area.width, 1), buf);
             y = next_y(y);
         }
 
@@ -126,7 +219,9 @@ impl BottomPaneView for TranscriptView {
         if y < bottom {
             Widget::render(
                 Line::from(Span::styled(
-                    "  ↑/↓ scroll  PgUp/PgDn page  Home/End  Esc close",
+                    self.status.as_deref().unwrap_or(
+                        "  ↑/↓ move  PgUp/PgDn page  Home/End  V select  Y copy  Esc close",
+                    ),
                     dim,
                 )),
                 Rect::new(area.x, y, area.width, 1),
@@ -149,24 +244,50 @@ impl BottomPaneView for TranscriptView {
 
     fn handle_key(&mut self, key: KeyEvent) {
         let max_visible = self.max_visible as usize;
-        let max_scroll = self.lines.len().saturating_sub(max_visible);
+        let max_scroll = self.max_scroll();
         match key.code {
             KeyCode::Esc => self.completed = true,
             KeyCode::Up | KeyCode::Char('k') => {
-                self.scroll = self.scroll.saturating_sub(1);
+                self.move_cursor_to(self.cursor.saturating_sub(1));
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.scroll = (self.scroll + 1).min(max_scroll);
+                self.move_cursor_to((self.cursor + 1).min(self.lines.len().saturating_sub(1)));
             }
             KeyCode::PageUp => {
-                self.scroll = self.scroll.saturating_sub(max_visible);
+                self.move_cursor_to(self.cursor.saturating_sub(max_visible));
             }
             KeyCode::PageDown => {
-                self.scroll = (self.scroll + max_visible).min(max_scroll);
+                self.move_cursor_to(
+                    (self.cursor + max_visible).min(self.lines.len().saturating_sub(1)),
+                );
             }
-            KeyCode::Home => self.scroll = 0,
-            KeyCode::End => self.scroll = max_scroll,
+            KeyCode::Home => self.move_cursor_to(0),
+            KeyCode::End => self.move_cursor_to(self.lines.len().saturating_sub(1)),
+            KeyCode::Char('v') => {
+                self.selection_anchor = match self.selection_anchor {
+                    Some(_) => None,
+                    None => Some(self.cursor),
+                };
+                self.status = None;
+            }
+            KeyCode::Char('y') | KeyCode::Char('c') => {
+                self.copy_selection_with(crate::slash_info::copy_to_clipboard);
+            }
             _ => {}
+        }
+        if matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Char('k')
+                | KeyCode::Down
+                | KeyCode::Char('j')
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End
+        ) {
+            self.status = None;
+            self.scroll = self.scroll.min(max_scroll);
         }
     }
 
@@ -231,6 +352,7 @@ mod tests {
         let v = TranscriptView::new(lines(100), 50);
         let visible_end = v.scroll + v.max_visible as usize;
         assert_eq!(visible_end, 100, "initial view must show the last line");
+        assert_eq!(v.cursor, 99);
     }
 
     #[test]
@@ -245,11 +367,45 @@ mod tests {
     fn pgdn_respects_dynamic_window() {
         // PageDown pages by max_visible, not by a fixed 16.
         let mut v = TranscriptView::new(lines(200), 50);
-        v.scroll = 0;
+        v.move_cursor_to(0);
         v.handle_key(KeyEvent::new(
             KeyCode::PageDown,
             crossterm::event::KeyModifiers::NONE,
         ));
-        assert_eq!(v.scroll, v.max_visible as usize);
+        assert_eq!(v.cursor, v.max_visible as usize);
+    }
+
+    #[test]
+    fn selection_copies_full_range_text() {
+        let mut v = TranscriptView::new(lines(6), 0);
+        v.move_cursor_to(1);
+        v.handle_key(KeyEvent::new(
+            KeyCode::Char('v'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        v.move_cursor_to(3);
+
+        let copied = std::cell::RefCell::new(String::new());
+        v.copy_selection_with(|text| {
+            copied.replace(text.to_string());
+            Ok(())
+        });
+
+        assert_eq!(copied.into_inner(), "line 1\nline 2\nline 3");
+        assert_eq!(v.status.as_deref(), Some("Copied 3 line(s) to clipboard"));
+    }
+
+    #[test]
+    fn copy_without_selection_uses_cursor_line() {
+        let mut v = TranscriptView::new(lines(6), 0);
+        v.move_cursor_to(4);
+
+        let copied = std::cell::RefCell::new(String::new());
+        v.copy_selection_with(|text| {
+            copied.replace(text.to_string());
+            Ok(())
+        });
+
+        assert_eq!(copied.into_inner(), "line 4");
     }
 }

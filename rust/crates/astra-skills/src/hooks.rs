@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 const TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT: u32 = 3;
 const TOOL_HOOK_CIRCUIT_BREAKER_SKIP_MATCHES: u32 = 3;
+const SHELL_HOOK_POLICY_PREFIX: &str = "shell hook command blocked";
 
 // ── Skill lifecycle hooks (existing) ─────────────────────────────────────
 
@@ -172,6 +173,185 @@ pub struct ToolEventHook {
 
 fn default_hook_timeout() -> u32 {
     10
+}
+
+fn shell_hook_policy_error(command: &str) -> Option<String> {
+    let risks = shell_hook_risks(command);
+    if risks.is_empty() {
+        return None;
+    }
+    let reasons = risks.join(", ");
+    Some(format!("{SHELL_HOOK_POLICY_PREFIX} ({reasons})"))
+}
+
+fn shell_hook_risks(command: &str) -> Vec<String> {
+    let lower = command.to_ascii_lowercase();
+    let mut risks = Vec::new();
+
+    if lower.contains("../") || lower.contains("..\\") {
+        risks.push("path traversal (../)".to_string());
+    }
+
+    for sensitive in ["/etc/", "/root/", "/var/log/", "/proc/", "/sys/"] {
+        if lower.contains(sensitive) {
+            risks.push(format!("sensitive path access ({sensitive})"));
+            break;
+        }
+    }
+
+    for credential in [
+        "~/.ssh",
+        "/.ssh/",
+        "~/.aws",
+        "/.aws/",
+        "~/.config/gcloud",
+        "/.config/gcloud/",
+        "~/.config/gh",
+        "/.config/gh/",
+        "~/.npmrc",
+        "~/.pypirc",
+        "id_rsa",
+        "id_ed25519",
+    ] {
+        if lower.contains(credential) {
+            risks.push(format!("credential path access ({credential})"));
+            break;
+        }
+    }
+
+    if lower.contains("curl ")
+        || lower.contains("wget ")
+        || lower.starts_with("curl")
+        || lower.starts_with("wget")
+    {
+        risks.push("network access".to_string());
+        if ["| sh", "| bash", "| zsh", "| fish", "| dash", "| ksh"]
+            .iter()
+            .any(|pattern| lower.contains(pattern))
+        {
+            risks.push("remote code execution".to_string());
+        }
+    }
+
+    if lower.starts_with("sudo ")
+        || lower.contains(" sudo ")
+        || lower.starts_with("doas ")
+        || lower.contains(" doas ")
+        || lower.contains("su -")
+        || lower.contains("chmod +s")
+        || lower.contains("chmod u+s")
+        || lower.contains("chmod g+s")
+    {
+        risks.push("privilege escalation".to_string());
+    }
+
+    if lower.starts_with("kill ")
+        || lower.contains(" kill ")
+        || lower.starts_with("pkill ")
+        || lower.contains(" pkill ")
+        || lower.starts_with("killall ")
+        || lower.contains(" killall ")
+    {
+        risks.push("process control".to_string());
+    }
+
+    if lower.starts_with("eval ") || lower.contains(" eval ") {
+        risks.push("eval usage".to_string());
+    }
+
+    if lower.contains("$(") || lower.contains('`') {
+        risks.push("command substitution ($() or backticks)".to_string());
+    }
+
+    if lower.contains("<(") || lower.contains(">(") {
+        risks.push("process substitution (<(cmd) / >(cmd))".to_string());
+    }
+
+    if lower.contains("path=") || lower.contains("export path=") || lower.contains("ld_") {
+        risks.push("environment manipulation".to_string());
+    }
+
+    if lower.contains("rm -rf /")
+        || lower.contains("rm -fr /")
+        || lower.contains("mkfs")
+        || lower.contains("dd if=")
+    {
+        risks.push("destructive command".to_string());
+    }
+
+    for token in [
+        "> /", ">> /", "> ~", ">> ~", "> ../", ">> ../", "> ..\\", ">> ..\\",
+    ] {
+        if lower.contains(token) {
+            risks.push(format!("workspace-out write ({})", token.trim()));
+            break;
+        }
+    }
+
+    risks
+}
+
+fn log_blocked_shell_hook(
+    scope: &'static str,
+    command: &str,
+    error: &str,
+    path: Option<&std::path::Path>,
+) {
+    match path {
+        Some(path) => tracing::warn!(
+            target: "hook",
+            "Skipping unsafe {scope} shell hook '{}' from {}: {}",
+            command,
+            path.display(),
+            error
+        ),
+        None => tracing::warn!(
+            target: "hook",
+            "Blocking unsafe {scope} shell hook '{}': {}",
+            command,
+            error
+        ),
+    }
+}
+
+fn sanitize_tool_hooks(
+    hooks: Vec<ToolEventHook>,
+    path: Option<&std::path::Path>,
+) -> Vec<ToolEventHook> {
+    hooks
+        .into_iter()
+        .filter_map(|hook| match &hook.action {
+            HookAction::Shell { command } => {
+                if let Some(error) = shell_hook_policy_error(command) {
+                    log_blocked_shell_hook("tool", command, &error, path);
+                    None
+                } else {
+                    Some(hook)
+                }
+            }
+            _ => Some(hook),
+        })
+        .collect()
+}
+
+fn sanitize_session_hooks(
+    hooks: Vec<SessionEventHook>,
+    path: Option<&std::path::Path>,
+) -> Vec<SessionEventHook> {
+    hooks
+        .into_iter()
+        .filter_map(|hook| match &hook.action {
+            HookAction::Shell { command } => {
+                if let Some(error) = shell_hook_policy_error(command) {
+                    log_blocked_shell_hook("session", command, &error, path);
+                    None
+                } else {
+                    Some(hook)
+                }
+            }
+            _ => Some(hook),
+        })
+        .collect()
 }
 
 impl ToolEventHook {
@@ -379,6 +559,8 @@ pub fn load_all_hooks(
                     } else {
                         parse_all_hooks_yaml(&content, &path)
                     };
+                    let tool_hooks = sanitize_tool_hooks(tool_hooks, Some(path.as_path()));
+                    let session_hooks = sanitize_session_hooks(session_hooks, Some(path.as_path()));
                     if !tool_hooks.is_empty() || !session_hooks.is_empty() {
                         tracing::info!(
                             target: "hook",
@@ -747,6 +929,11 @@ async fn run_shell_pre_hook(
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
+    if let Some(error) = shell_hook_policy_error(command) {
+        log_blocked_shell_hook("pre-tool", command, &error, None);
+        return PreToolHookOutcome::Decision(PreToolDecision::Block(error));
+    }
+
     let input = serde_json::json!({
         "hook_event": "pre_tool_use",
         "tool_name": tool_name,
@@ -823,6 +1010,11 @@ async fn run_shell_post_hook(
 ) -> Option<String> {
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
+
+    if let Some(error) = shell_hook_policy_error(command) {
+        log_blocked_shell_hook("post-tool", command, &error, None);
+        return Some(format!("Error: {error}"));
+    }
 
     let input = serde_json::json!({
         "hook_event": "post_tool_use",
@@ -1307,6 +1499,14 @@ async fn run_shell_session_hook(
 ) -> Option<SessionHookOutput> {
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
+
+    if let Some(error) = shell_hook_policy_error(command) {
+        log_blocked_shell_hook("session", command, &error, None);
+        return Some(SessionHookOutput {
+            context: Some(error),
+            env_vars: Vec::new(),
+        });
+    }
 
     let input = serde_json::json!({
         "hook_event": event,
@@ -1984,6 +2184,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn e2e_pre_hook_unsafe_shell_command_is_blocked_by_policy() {
+        let registry = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PreToolUse,
+            matcher: "bash".into(),
+            action: HookAction::Shell {
+                command: "sudo rm -rf /".into(),
+            },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+
+        let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+        match decision {
+            PreToolDecision::Block(reason) => {
+                assert!(reason.contains(SHELL_HOOK_POLICY_PREFIX));
+                assert!(reason.contains("privilege escalation"));
+                assert!(reason.contains("destructive command"));
+            }
+            other => panic!("expected policy block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn e2e_pre_hook_shell_allow_with_context() {
         let registry = ToolEventHookRegistry::new(vec![ToolEventHook {
             event: ToolEventKind::PreToolUse,
@@ -2141,7 +2367,7 @@ mod tests {
             event: ToolEventKind::PreToolUse,
             matcher: "*".into(),
             action: HookAction::Shell {
-                command: r#"INPUT=$(cat); TOOL=$(echo "$INPUT" | grep -o '"tool_name":"[^"]*"' | head -1); if echo "$TOOL" | grep -q 'write_file'; then echo '{"decision":"block","reason":"writes blocked"}'; else echo '{"decision":"allow"}'; fi"#.into(),
+                command: r#"IFS= read -r input; case "$input" in *'"tool_name":"write_file"'*) echo '{"decision":"block","reason":"writes blocked"}' ;; *) echo '{"decision":"allow"}' ;; esac"#.into(),
             },
             timeout_secs: 5,
         is_async: false,
@@ -2197,6 +2423,29 @@ mod tests {
             evaluate_post_tool_hooks(&registry, "bash", &serde_json::json!({}), "original output")
                 .await;
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn e2e_post_hook_unsafe_shell_command_returns_policy_error() {
+        let registry = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PostToolUse,
+            matcher: "bash".into(),
+            action: HookAction::Shell {
+                command: "cat ~/.ssh/id_rsa".into(),
+            },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+
+        let result =
+            evaluate_post_tool_hooks(&registry, "bash", &serde_json::json!({}), "original output")
+                .await;
+        let modified = result.expect("post hook should surface policy error");
+        assert!(modified.contains(SHELL_HOOK_POLICY_PREFIX));
+        assert!(modified.contains("credential path access"));
     }
 
     #[tokio::test]
@@ -2344,6 +2593,33 @@ hooks:
 
         let registry = load_tool_event_hooks(dir.path());
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn load_hooks_drops_unsafe_shell_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra).unwrap();
+        let json = r#"{
+            "hooks": [
+                {
+                    "event": "pre_tool_use",
+                    "matcher": "bash",
+                    "action": {"type": "shell", "command": "sudo rm -rf /"}
+                }
+            ],
+            "session_hooks": [
+                {
+                    "event": "session_start",
+                    "action": {"type": "shell", "command": "cat ~/.ssh/id_rsa"}
+                }
+            ]
+        }"#;
+        std::fs::write(astra.join("hooks.json"), json).unwrap();
+
+        let (tool_hooks, session_hooks) = load_all_hooks(dir.path());
+        assert!(tool_hooks.is_empty());
+        assert!(session_hooks.is_empty());
     }
 
     #[test]

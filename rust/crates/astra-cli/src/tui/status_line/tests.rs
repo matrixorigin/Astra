@@ -15,11 +15,17 @@ fn idle_shows_command_hints_on_left() {
     let s = StatusLine::from_context(&ctx());
     let plain = s.plain();
     assert!(
-        plain.contains('/'),
-        "left hint should mention the slash trigger; got {plain:?}"
+        plain.contains("/commands"),
+        "left hint should label the slash trigger; got {plain:?}"
     );
-    assert!(plain.contains('@'), "should hint the @-mention too");
-    assert!(plain.contains('$'), "should hint skills too");
+    assert!(
+        plain.contains("@mention"),
+        "should label the @ mention trigger; got {plain:?}"
+    );
+    assert!(
+        plain.contains("$shell"),
+        "should label the shell trigger; got {plain:?}"
+    );
 }
 
 #[test]
@@ -54,6 +60,7 @@ fn very_narrow_width_degrades_idle_hint_to_tiny_form() {
         ..ctx()
     };
     let s = StatusLine::from_context(&c);
+    assert!(s.plain().contains("/commands"));
     let area = Rect::new(0, 0, 40, 1);
     let mut buf = Buffer::empty(area);
     s.render(area, &mut buf);
@@ -97,6 +104,11 @@ fn auto_mode_renders_yellow_chip() {
         .find(|seg| seg.text == "auto")
         .expect("auto chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Yellow));
+    assert!(
+        chip.style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    );
 }
 
 #[test]
@@ -112,6 +124,11 @@ fn accept_edits_mode_renders_cyan_chip() {
         .find(|seg| seg.text == "edit")
         .expect("accept_edits chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Cyan));
+    assert!(
+        chip.style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    );
 }
 
 #[test]
@@ -127,6 +144,11 @@ fn plan_mode_renders_blue_chip() {
         .find(|seg| seg.text == "plan")
         .expect("plan chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Blue));
+    assert!(
+        chip.style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    );
 }
 
 #[test]
@@ -142,6 +164,11 @@ fn deny_mode_renders_red_chip() {
         .find(|seg| seg.text == "deny")
         .expect("deny chip");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Red));
+    assert!(
+        chip.style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    );
 }
 
 // ─── Right-side segments: model · dir · tokens · cost · branch ────

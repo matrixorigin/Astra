@@ -952,6 +952,9 @@ impl BottomPane {
                 self.close_mention();
                 BottomPaneAction::SubmitInput(text)
             }
+            ComposerAction::OpenExternalEditor => {
+                BottomPaneAction::OpenExternalEditor(self.composer.text())
+            }
             ComposerAction::Interrupt => BottomPaneAction::Interrupt,
             ComposerAction::Quit => BottomPaneAction::Quit,
             ComposerAction::Consumed => BottomPaneAction::Consumed,
@@ -969,6 +972,11 @@ impl BottomPane {
         if self.composer.flush_paste_burst() {
             self.sync_popups();
         }
+    }
+
+    pub fn replace_composer_text(&mut self, text: &str) {
+        self.composer.set_text(text);
+        self.sync_popups();
     }
 
     /// True when something in the bottom pane is currently animating and
@@ -1149,6 +1157,7 @@ pub(crate) enum ApprovalActivation {
 #[derive(Debug)]
 pub(crate) enum BottomPaneAction {
     SubmitInput(String),
+    OpenExternalEditor(String),
     CyclePermissionMode,
     ViewCompleted {
         result: Option<String>,

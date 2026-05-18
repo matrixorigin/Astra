@@ -8,6 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::color::is_light;
+use super::render::highlight::highlight_code_to_lines;
 use super::terminal_palette::default_bg;
 
 /// Dark terminal diff colors (muted tints).
@@ -72,6 +73,7 @@ pub fn render_diff_lines(diff_text: &str, max_lines: usize) -> Vec<Line<'static>
     let mut lines = Vec::new();
     let mut line_num_add: u32 = 0;
     let mut line_num_del: u32 = 0;
+    let mut current_lang: Option<String> = None;
 
     for raw in diff_text.lines().take(max_lines) {
         if raw.starts_with("@@") {
@@ -87,6 +89,7 @@ pub fn render_diff_lines(diff_text: &str, max_lines: usize) -> Vec<Line<'static>
         }
 
         if raw.starts_with("--- ") || raw.starts_with("+++ ") {
+            current_lang = diff_header_language(raw);
             lines.push(Line::from(Span::styled(
                 format!("    {raw}"),
                 header_style(),
@@ -98,30 +101,36 @@ pub fn render_diff_lines(diff_text: &str, max_lines: usize) -> Vec<Line<'static>
             line_num_add += 1;
             let num = format!("{:>4} ", line_num_add);
             let content = &raw[1..];
-            lines.push(Line::from(vec![
-                Span::styled(num, gutter_style()),
-                Span::styled("+ ", add_style()),
-                Span::styled(content.to_string(), add_style()),
-            ]));
+            lines.push(render_content_line(
+                &num,
+                "+ ",
+                content,
+                add_style(),
+                current_lang.as_deref(),
+            ));
         } else if raw.starts_with('-') {
             line_num_del += 1;
             let num = format!("{:>4} ", line_num_del);
             let content = &raw[1..];
-            lines.push(Line::from(vec![
-                Span::styled(num, gutter_style()),
-                Span::styled("- ", del_style()),
-                Span::styled(content.to_string(), del_style()),
-            ]));
+            lines.push(render_content_line(
+                &num,
+                "- ",
+                content,
+                del_style(),
+                current_lang.as_deref(),
+            ));
         } else if raw.starts_with(' ') {
             line_num_add += 1;
             line_num_del += 1;
             let num = format!("{:>4} ", line_num_add);
             let content = &raw[1..];
-            lines.push(Line::from(vec![
-                Span::styled(num, gutter_style()),
-                Span::styled("  ", ctx_style()),
-                Span::styled(content.to_string(), ctx_style()),
-            ]));
+            lines.push(render_content_line(
+                &num,
+                "  ",
+                content,
+                ctx_style(),
+                current_lang.as_deref(),
+            ));
         } else {
             // Summary lines like "3+ 0-" or other non-diff content
             lines.push(Line::from(Span::styled(
@@ -143,6 +152,51 @@ pub fn render_diff_lines(diff_text: &str, max_lines: usize) -> Vec<Line<'static>
     lines
 }
 
+fn render_content_line(
+    number: &str,
+    prefix: &str,
+    content: &str,
+    style: Style,
+    lang: Option<&str>,
+) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(number.to_string(), gutter_style()),
+        Span::styled(prefix.to_string(), style),
+    ];
+    spans.extend(highlighted_diff_content(content, lang, style).spans);
+    Line::from(spans)
+}
+
+fn highlighted_diff_content(content: &str, lang: Option<&str>, style: Style) -> Line<'static> {
+    let mut line = lang
+        .and_then(|lang| {
+            let mut highlighted = highlight_code_to_lines(content, lang).into_iter();
+            highlighted.next()
+        })
+        .unwrap_or_else(|| Line::raw(content.to_string()));
+    line.style = style;
+    line
+}
+
+fn diff_header_language(header: &str) -> Option<String> {
+    let path = header
+        .strip_prefix("--- ")
+        .or_else(|| header.strip_prefix("+++ "))?
+        .split_whitespace()
+        .next()?;
+    if path == "/dev/null" {
+        return None;
+    }
+    let path = path
+        .strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path);
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(ToOwned::to_owned)
+}
+
 /// Parse hunk header `@@ -old_start,old_count +new_start,new_count @@`
 fn parse_hunk_header(header: &str) -> Option<(u32, u32)> {
     let parts: Vec<&str> = header.split_whitespace().collect();
@@ -156,4 +210,24 @@ fn parse_hunk_header(header: &str) -> Option<(u32, u32)> {
         }
     }
     Some((old_start.saturating_sub(1), new_start.saturating_sub(1)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_headers_set_language_for_highlighted_content() {
+        let lines = render_diff_lines(
+            "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-fn old_name() {}\n+fn new_name() {}\n",
+            20,
+        );
+
+        assert!(lines[4].spans.len() > 3, "expected highlighted code spans");
+    }
+
+    #[test]
+    fn dev_null_headers_disable_language_detection() {
+        assert_eq!(diff_header_language("--- /dev/null"), None);
+    }
 }

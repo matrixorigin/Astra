@@ -51,6 +51,7 @@ pub(crate) struct ChatComposer {
 /// expect URLs and one-liners to appear verbatim.
 const PASTE_INLINE_MAX_CHARS: usize = 800;
 const PASTE_INLINE_MAX_LINES: usize = 2;
+const COMPOSER_PLACEHOLDER: &str = "Ask astra to do anything  · Ctrl+E editor";
 
 impl ChatComposer {
     pub fn new() -> Self {
@@ -340,6 +341,13 @@ impl ChatComposer {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ComposerAction {
+        if key.code == crossterm::event::KeyCode::Char('e')
+            && key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+        {
+            return ComposerAction::OpenExternalEditor;
+        }
         match self.textarea.handle_key(key) {
             TextAreaAction::Submit => {
                 if self.textarea.is_empty() {
@@ -434,10 +442,8 @@ impl ChatComposer {
         );
 
         if self.textarea.is_empty() {
-            let placeholder = Span::styled(
-                "Ask astra to do anything",
-                Style::default().fg(Color::DarkGray),
-            );
+            let placeholder =
+                Span::styled(COMPOSER_PLACEHOLDER, Style::default().fg(Color::DarkGray));
             Widget::render(Line::from(placeholder), text_area, buf);
         } else {
             self.textarea.render(text_area, buf);
@@ -459,6 +465,7 @@ impl ChatComposer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ComposerAction {
     Submit,
+    OpenExternalEditor,
     Interrupt,
     Quit,
     Consumed,
@@ -629,5 +636,11 @@ mod paste_tests {
         c.clear_draft();
         assert_eq!(c.pasted_blob_count(), 0);
         assert!(c.text().is_empty());
+    }
+
+    #[test]
+    fn placeholder_mentions_external_editor_shortcut() {
+        assert!(COMPOSER_PLACEHOLDER.contains("Ctrl+E"));
+        assert!(COMPOSER_PLACEHOLDER.contains("editor"));
     }
 }

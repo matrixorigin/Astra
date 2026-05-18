@@ -2074,6 +2074,39 @@ pub(crate) async fn run_tui_repl(
                                     inject_submit = bottom_pane.take_next_queued();
                                 }
                             }
+                            BottomPaneAction::OpenExternalEditor(initial) => {
+                                let _ = crossterm::terminal::disable_raw_mode();
+                                let _ = crossterm::execute!(
+                                    std::io::stdout(),
+                                    crossterm::event::DisableBracketedPaste,
+                                    crossterm::cursor::Show
+                                );
+                                let edit_result =
+                                    crate::tui::external_editor::edit_in_external_editor(&initial);
+                                if let Err(err) = guard.ensure_tui_modes() {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::error(
+                                        format!("Failed to restore TUI modes after external editor: {err}"),
+                                    ));
+                                }
+                                guard.terminal.invalidate_viewport();
+                                match edit_result {
+                                    Ok(edited) => {
+                                        bottom_pane.replace_composer_text(&edited);
+                                        chat_widget.commit_system(
+                                            history_cell::system::SystemCell::response(
+                                                "  ⎿  loaded draft from external editor".to_string(),
+                                            ),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        chat_widget.commit_system(
+                                            history_cell::system::SystemCell::error(format!(
+                                                "External editor failed: {error}"
+                                            )),
+                                        );
+                                    }
+                                }
+                            }
                             BottomPaneAction::ViewCompleted { result, reopen } => {
                                 if let Some(name) = result {
                                     // LoginView / RegisterView completion:
@@ -2644,6 +2677,16 @@ pub(crate) async fn run_tui_repl(
                             }
                             crate::edge_tools::BgTaskCommand::GetOutput { task_id, tail_bytes, reply } => {
                                 let output = background_registry.get_combined_output(&task_id, tail_bytes);
+                                let _ = reply.send(output);
+                            }
+                            crate::edge_tools::BgTaskCommand::GetOutputSince {
+                                task_id,
+                                offset,
+                                max_bytes,
+                                reply,
+                            } => {
+                                let output =
+                                    background_registry.get_output_since(&task_id, offset, max_bytes);
                                 let _ = reply.send(output);
                             }
                             crate::edge_tools::BgTaskCommand::IsTerminal { task_id, reply } => {
