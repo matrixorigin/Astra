@@ -274,10 +274,10 @@ pub fn inject_skill_allowed_tools(
     allowed_tools: &[String],
     all_schemas: &[Value],
 ) -> u32 {
-    let selected_names: HashSet<String> = report.tools_selected.iter().cloned().collect();
+    let mut selected_names: HashSet<String> = report.tools_selected.iter().cloned().collect();
     let mut injected = 0u32;
     for name in allowed_tools {
-        if !selected_names.contains(name.as_str()) {
+        if selected_names.insert(name.clone()) {
             if let Some(schema) = all_schemas
                 .iter()
                 .find(|s| schema_tool_name(s) == Some(name))
@@ -300,10 +300,10 @@ pub fn inject_required_tool_names(
     required_tools: &[&str],
     all_schemas: &[Value],
 ) -> u32 {
-    let selected_names: HashSet<String> = report.tools_selected.iter().cloned().collect();
+    let mut selected_names: HashSet<String> = report.tools_selected.iter().cloned().collect();
     let mut injected = 0u32;
     for name in required_tools {
-        if !selected_names.contains(*name)
+        if selected_names.insert((*name).to_string())
             && let Some(schema) = all_schemas
                 .iter()
                 .find(|s| schema_tool_name(s) == Some(*name))
@@ -698,8 +698,25 @@ mod tests {
 
         assert_eq!(injected, 2);
         assert_eq!(selected.len(), 3);
+        assert_eq!(report.selected_count, 3);
         assert!(report.tools_selected.contains(&"grep".to_string()));
         assert!(report.tools_selected.contains(&"glob".to_string()));
+        assert_eq!(
+            report
+                .tools_selected
+                .iter()
+                .filter(|name| name.as_str() == "grep")
+                .count(),
+            1
+        );
+        assert_eq!(
+            report
+                .tools_selected
+                .iter()
+                .filter(|name| name.as_str() == "glob")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -718,6 +735,62 @@ mod tests {
 
         assert_eq!(injected, 0);
         assert_eq!(selected.len(), 1);
+    }
+
+    #[test]
+    fn inject_skill_tools_deduplicates_duplicate_allowed_names() {
+        let all = vec![
+            make_tool_schema("bash", "run", false),
+            make_tool_schema("grep", "search", false),
+        ];
+        let mut selected = vec![make_tool_schema("bash", "run", false)];
+        let mut report = SelectionReport {
+            tools_selected: vec!["bash".into()],
+            selected_count: 1,
+            budget_used: 0,
+            budget_total: 100,
+        };
+        let allowed: Vec<String> = vec!["grep".into(), "grep".into()];
+
+        let injected = inject_skill_allowed_tools(&mut selected, &mut report, &allowed, &all);
+
+        assert_eq!(injected, 1);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(report.selected_count, 2);
+        assert_eq!(
+            report
+                .tools_selected
+                .iter()
+                .filter(|name| name.as_str() == "grep")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn inject_skill_tools_noop_for_empty_inputs() {
+        let all = vec![make_tool_schema("bash", "run", false)];
+        let mut selected = vec![make_tool_schema("bash", "run", false)];
+        let mut report = SelectionReport {
+            tools_selected: vec!["bash".into()],
+            selected_count: 1,
+            budget_used: 0,
+            budget_total: 100,
+        };
+        let empty_allowed: Vec<String> = Vec::new();
+
+        let injected = inject_skill_allowed_tools(&mut selected, &mut report, &empty_allowed, &all);
+
+        assert_eq!(injected, 0);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(report.selected_count, 1);
+
+        let injected =
+            inject_skill_allowed_tools(&mut selected, &mut report, &["grep".into()], &[]);
+
+        assert_eq!(injected, 0);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(report.selected_count, 1);
     }
 
     #[test]
@@ -740,6 +813,7 @@ mod tests {
 
         assert_eq!(injected, 2);
         assert_eq!(selected.len(), 3);
+        assert_eq!(report.selected_count, 3);
         assert!(
             report
                 .tools_selected
@@ -749,6 +823,22 @@ mod tests {
             report
                 .tools_selected
                 .contains(&"exit_plan_mode".to_string())
+        );
+        assert_eq!(
+            report
+                .tools_selected
+                .iter()
+                .filter(|name| name.as_str() == "enter_plan_mode")
+                .count(),
+            1
+        );
+        assert_eq!(
+            report
+                .tools_selected
+                .iter()
+                .filter(|name| name.as_str() == "exit_plan_mode")
+                .count(),
+            1
         );
     }
 
@@ -780,5 +870,61 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn inject_required_tool_names_deduplicates_duplicate_required_names() {
+        let all = vec![make_tool_schema("exit_plan_mode", "exit", false)];
+        let mut selected = vec![make_tool_schema("read_file", "read", false)];
+        let mut report = SelectionReport {
+            tools_selected: vec!["read_file".into()],
+            selected_count: 1,
+            budget_used: 0,
+            budget_total: 100,
+        };
+
+        let injected = inject_required_tool_names(
+            &mut selected,
+            &mut report,
+            &["exit_plan_mode", "exit_plan_mode"],
+            &all,
+        );
+
+        assert_eq!(injected, 1);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(report.selected_count, 2);
+        assert_eq!(
+            report
+                .tools_selected
+                .iter()
+                .filter(|name| name.as_str() == "exit_plan_mode")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn inject_required_tool_names_noop_for_empty_inputs() {
+        let all = vec![make_tool_schema("exit_plan_mode", "exit", false)];
+        let mut selected = vec![make_tool_schema("read_file", "read", false)];
+        let mut report = SelectionReport {
+            tools_selected: vec!["read_file".into()],
+            selected_count: 1,
+            budget_used: 0,
+            budget_total: 100,
+        };
+
+        let injected = inject_required_tool_names(&mut selected, &mut report, &[], &all);
+
+        assert_eq!(injected, 0);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(report.selected_count, 1);
+
+        let injected =
+            inject_required_tool_names(&mut selected, &mut report, &["exit_plan_mode"], &[]);
+
+        assert_eq!(injected, 0);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(report.selected_count, 1);
     }
 }
