@@ -111,9 +111,34 @@ PID=$SETSID_PID
 echo $PID > "$PID_FILE"
 
 API_PORT="${ASTRA_API_PORT:-8000}"
+API_START_TIMEOUT_SECONDS="${API_START_TIMEOUT_SECONDS:-180}"
+API_HEALTH_INTERVAL_SECONDS="${API_HEALTH_INTERVAL_SECONDS:-2}"
+
+case "$API_START_TIMEOUT_SECONDS" in
+    ''|*[!0-9]*)
+        echo "❌ API_START_TIMEOUT_SECONDS must be a positive integer"
+        exit 1
+        ;;
+esac
+if [ "$API_START_TIMEOUT_SECONDS" -le 0 ]; then
+    echo "❌ API_START_TIMEOUT_SECONDS must be a positive integer"
+    exit 1
+fi
+case "$API_HEALTH_INTERVAL_SECONDS" in
+    ''|*[!0-9]*)
+        echo "❌ API_HEALTH_INTERVAL_SECONDS must be a positive integer"
+        exit 1
+        ;;
+esac
+if [ "$API_HEALTH_INTERVAL_SECONDS" -le 0 ]; then
+    echo "❌ API_HEALTH_INTERVAL_SECONDS must be a positive integer"
+    exit 1
+fi
 
 # Wait until the process is alive and the health endpoint reports a connected DB.
-for i in {1..30}; do
+echo "Waiting for API health (timeout: ${API_START_TIMEOUT_SECONDS}s)..."
+START_SECONDS=$SECONDS
+while [ $((SECONDS - START_SECONDS)) -lt "$API_START_TIMEOUT_SECONDS" ]; do
     if ! kill -0 "$PID" 2>/dev/null; then
         break
     fi
@@ -123,14 +148,26 @@ for i in {1..30}; do
         echo "✅ API server started (PID: $PID, port: $API_PORT)"
         exit 0
     fi
-    sleep 2
+    sleep "$API_HEALTH_INTERVAL_SECONDS"
 done
 
 if kill -0 "$PID" 2>/dev/null; then
     echo "❌ API server did not become healthy in time"
+    echo "Stopping unhealthy API server (PID: $PID)..."
+    kill "$PID" 2>/dev/null || true
+    for _ in {1..20}; do
+        if ! kill -0 "$PID" 2>/dev/null; then
+            break
+        fi
+        sleep 0.2
+    done
+    if kill -0 "$PID" 2>/dev/null; then
+        kill -9 "$PID" 2>/dev/null || true
+    fi
 else
     echo "❌ API server failed to start"
 fi
+rm -f "$PID_FILE"
 echo ""
 echo "Troubleshooting:"
 echo "  1. Check if port $API_PORT is in use: lsof -i :$API_PORT"

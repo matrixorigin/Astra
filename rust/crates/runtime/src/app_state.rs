@@ -815,21 +815,36 @@ impl MatrixOneHealthChecker {
 #[async_trait]
 impl HealthChecker for MatrixOneHealthChecker {
     async fn database_healthy(&self) -> bool {
+        let query_timeout = Duration::from_secs(2);
         if let Some(shared_pool) = &self.shared_pool {
-            return query("SELECT 1").execute(shared_pool.get()).await.is_ok();
+            return tokio::time::timeout(
+                query_timeout,
+                query("SELECT 1").execute(shared_pool.get()),
+            )
+            .await
+            .map(|result| result.is_ok())
+            .unwrap_or(false);
         }
 
-        let pool = match MySqlPoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(Duration::from_secs(2))
-            .connect(&self.settings.database_url_with_password())
-            .await
+        let database_url = self.settings.database_url_with_password();
+        let pool = match tokio::time::timeout(
+            query_timeout,
+            MySqlPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(Duration::from_secs(2))
+                .connect(&database_url),
+        )
+        .await
         {
-            Ok(pool) => pool,
+            Ok(Ok(pool)) => pool,
             Err(_) => return false,
+            Ok(Err(_)) => return false,
         };
 
-        let result = query("SELECT 1").execute(&pool).await.is_ok();
+        let result = tokio::time::timeout(query_timeout, query("SELECT 1").execute(&pool))
+            .await
+            .map(|result| result.is_ok())
+            .unwrap_or(false);
         pool.close().await;
         result
     }

@@ -35,7 +35,9 @@ pub(super) fn build_core_state(
 ) -> AppState {
     AppState::new(
         ServiceInfo::default(),
-        Arc::new(MatrixOneHealthChecker::new(settings.matrixone.clone())),
+        Arc::new(
+            MatrixOneHealthChecker::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
+        ),
     )
     .with_cors_origins(settings.api.cors_origins.clone())
     .with_shared_pool(shared_pool.clone())

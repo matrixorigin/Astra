@@ -384,6 +384,93 @@ async fn add_index_if_missing(
     Ok(())
 }
 
+fn sql_decode_error(message: impl Into<String>) -> sqlx::Error {
+    sqlx::Error::Decode(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message.into(),
+    )))
+}
+
+fn json_value_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn promote_legacy_fallback_model_quirks(raw: &str) -> Result<Option<String>, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("parse quirks JSON: {e}"))?;
+    let Some(object) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    let Some(legacy_value) = object.remove("fallback_model") else {
+        return Ok(None);
+    };
+
+    let fallback_model = match legacy_value {
+        serde_json::Value::String(model) => model.trim().to_string(),
+        serde_json::Value::Null => String::new(),
+        other => {
+            return Err(format!(
+                "legacy fallback_model must be a string, got {}",
+                json_value_type(&other)
+            ));
+        }
+    };
+
+    if !fallback_model.is_empty() && !object.contains_key("fallback_chain") {
+        object.insert(
+            "fallback_chain".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String(fallback_model)]),
+        );
+    }
+
+    serde_json::to_string(&value)
+        .map(Some)
+        .map_err(|e| format!("serialize migrated quirks JSON: {e}"))
+}
+
+async fn migrate_model_fallback_chain(pool: &Pool<MySql>) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let rows = query(
+        "SELECT model_id, CAST(quirks AS CHAR) AS quirks_json \
+         FROM infra_llm_models \
+         WHERE quirks IS NOT NULL",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut migrated = 0;
+    for row in rows {
+        let model_id: String = row.try_get("model_id")?;
+        let quirks_json: String = row.try_get("quirks_json")?;
+        let Some(updated_quirks) =
+            promote_legacy_fallback_model_quirks(&quirks_json).map_err(|e| {
+                sql_decode_error(format!(
+                    "fallback_model to fallback_chain migration failed for model_id={model_id}: {e}"
+                ))
+            })?
+        else {
+            continue;
+        };
+
+        let result = query("UPDATE infra_llm_models SET quirks = ? WHERE model_id = ?")
+            .bind(updated_quirks)
+            .bind(&model_id)
+            .execute(&mut *tx)
+            .await?;
+        migrated += result.rows_affected();
+    }
+
+    tx.commit().await?;
+    Ok(migrated)
+}
+
 pub async fn ensure_core_schema(
     settings: &MatrixOneSettings,
     bootstrap_catalog: &str,
@@ -1969,22 +2056,15 @@ pub async fn ensure_core_schema(
         add_column_if_missing(&pool, &settings.database, "infra_llm_models", column, ddl).await?;
     }
 
-    // Migration: promote legacy quirks.fallback_model (string) → quirks.fallback_chain (array).
-    // Runs once — rows with the old key get it moved; rows already migrated are unaffected.
-    if let Err(e) = query(
-        "UPDATE infra_llm_models
-            SET quirks = JSON_REPLACE(
-                JSON_REMOVE(quirks, '$.fallback_model'),
-                '$.fallback_chain',
-                JSON_ARRAY(JSON_EXTRACT(quirks, '$.fallback_model'))
-            )
-          WHERE JSON_EXTRACT(quirks, '$.fallback_model') IS NOT NULL
-            AND JSON_EXTRACT(quirks, '$.fallback_chain') IS NULL",
-    )
-    .execute(&pool)
-    .await
-    {
-        tracing::warn!("fallback_model→fallback_chain migration skip: {e}");
+    // Migration: promote legacy quirks.fallback_model into quirks.fallback_chain.
+    // Keep this in Rust instead of SQL JSON functions because MatrixOne does not
+    // support the full MySQL JSON mutation surface.
+    let migrated_model_rows = migrate_model_fallback_chain(&pool).await?;
+    if migrated_model_rows > 0 {
+        tracing::info!(
+            rows = migrated_model_rows,
+            "migrated legacy model fallback_chain config"
+        );
     }
 
     // Server-wide admin config KV store. Holds settings that the admin explicitly manages
@@ -3713,4 +3793,58 @@ pub async fn cleanup_expired_data(
     });
 
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn migrate(raw: &str) -> serde_json::Value {
+        let updated = promote_legacy_fallback_model_quirks(raw)
+            .expect("migration should parse")
+            .expect("migration should update");
+        serde_json::from_str(&updated).expect("updated quirks should be valid JSON")
+    }
+
+    #[test]
+    fn fallback_model_migration_creates_fallback_chain() {
+        let value = migrate(r#"{"fallback_model":"model-b","no_system_message":true}"#);
+
+        assert_eq!(value.get("fallback_model"), None);
+        assert_eq!(
+            value.get("fallback_chain"),
+            Some(&serde_json::json!(["model-b"]))
+        );
+        assert_eq!(
+            value.get("no_system_message"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn fallback_model_migration_preserves_existing_fallback_chain() {
+        let value = migrate(r#"{"fallback_model":"model-b","fallback_chain":["model-c"]}"#);
+
+        assert_eq!(value.get("fallback_model"), None);
+        assert_eq!(
+            value.get("fallback_chain"),
+            Some(&serde_json::json!(["model-c"]))
+        );
+    }
+
+    #[test]
+    fn fallback_model_migration_ignores_rows_without_legacy_key() {
+        let updated = promote_legacy_fallback_model_quirks(r#"{"fallback_chain":["model-c"]}"#)
+            .expect("migration should parse");
+
+        assert!(updated.is_none());
+    }
+
+    #[test]
+    fn fallback_model_migration_rejects_non_string_legacy_key() {
+        let error = promote_legacy_fallback_model_quirks(r#"{"fallback_model":["model-b"]}"#)
+            .expect_err("non-string legacy fallback_model should fail");
+
+        assert!(error.contains("must be a string"));
+    }
 }

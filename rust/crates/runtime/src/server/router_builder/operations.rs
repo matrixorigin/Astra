@@ -1,7 +1,7 @@
 use super::*;
 
-mod insights;
 mod harnesses;
+mod insights;
 mod work;
 
 pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
