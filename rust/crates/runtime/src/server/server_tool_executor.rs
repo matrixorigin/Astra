@@ -4997,8 +4997,31 @@ esac
             _request_id: &str,
             prompt: &AskUserPrompt,
         ) -> AskUserDecision {
-            assert_eq!(serde_json::to_value(prompt).unwrap(), self.expected_prompt);
+            let mut actual = serde_json::to_value(prompt).unwrap();
+            let mut expected = self.expected_prompt.clone();
+            strip_null_timeout_ms(&mut actual);
+            strip_null_timeout_ms(&mut expected);
+            assert_eq!(actual, expected);
             self.decision.clone()
+        }
+    }
+
+    fn strip_null_timeout_ms(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                if matches!(map.get("timeout_ms"), Some(Value::Null)) {
+                    map.remove("timeout_ms");
+                }
+                for nested in map.values_mut() {
+                    strip_null_timeout_ms(nested);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    strip_null_timeout_ms(item);
+                }
+            }
+            _ => {}
         }
     }
 

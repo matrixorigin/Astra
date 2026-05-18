@@ -4398,12 +4398,11 @@ printf 'probe.txt:1:needle\n'
         ctx.cancel_token = Some(token);
 
         // The command creates a sentinel file after the first echo, then sleeps.
-        let sentinel_str = sentinel.display();
         let result = execute_bash(
             &ctx,
             &serde_json::json!({
                 "command": format!(
-                    "echo line_1; touch {sentinel_str}; sleep 0.1; echo line_2; sleep 10"
+                    "echo line_1; touch .cancel_sentinel; sleep 0.1; echo line_2; sleep 10"
                 )
             }),
         )
