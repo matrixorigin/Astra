@@ -243,7 +243,11 @@ impl ToolEventHookRegistry {
             .collect()
     }
 
-    fn matching_indexed(&self, event: ToolEventKind, tool_name: &str) -> Vec<(usize, &ToolEventHook)> {
+    fn matching_indexed(
+        &self,
+        event: ToolEventKind,
+        tool_name: &str,
+    ) -> Vec<(usize, &ToolEventHook)> {
         let fired = self.fired_once.lock().unwrap_or_else(|e| e.into_inner());
         let mut tripped = self
             .tripped_circuits
@@ -785,9 +789,13 @@ async fn run_shell_pre_hook(
 
     let wait_result = tokio::time::timeout(timeout, read_fut).await;
     match wait_result {
-        Ok((_, Ok(status))) if !status.success() => PreToolHookOutcome::OperationalFailure(
-            format!("Hook '{}' exited with status {}", command, status.code().unwrap_or(-1)),
-        ),
+        Ok((_, Ok(status))) if !status.success() => {
+            PreToolHookOutcome::OperationalFailure(format!(
+                "Hook '{}' exited with status {}",
+                command,
+                status.code().unwrap_or(-1)
+            ))
+        }
         Ok((buf, Ok(_))) => parse_pre_hook_output(&buf),
         Ok((_, Err(e))) => {
             tracing::warn!(target: "hook", "Hook I/O error for '{}': {}", command, e);
@@ -2060,8 +2068,7 @@ mod tests {
         }]);
 
         for _ in 0..(TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT - 1) {
-            let decision =
-                evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+            let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
             match decision {
                 PreToolDecision::Block(reason) => assert!(reason.contains("not JSON")),
                 _ => panic!("expected Block before circuit opens, got {:?}", decision),
@@ -2076,8 +2083,7 @@ mod tests {
         );
 
         for _ in 0..TOOL_HOOK_CIRCUIT_BREAKER_SKIP_MATCHES {
-            let decision =
-                evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+            let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
             assert_eq!(decision, PreToolDecision::Allow);
         }
 
@@ -2104,8 +2110,7 @@ mod tests {
         }]);
 
         for _ in 0..(TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT + 1) {
-            let decision =
-                evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+            let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
             assert_eq!(decision, PreToolDecision::Block("still blocked".into()));
         }
     }

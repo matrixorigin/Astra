@@ -48,7 +48,9 @@ pub enum OutputStreamError {
         offset: u64,
         len: u64,
     },
-    #[error("append would grow output stream '{path}' beyond configured max {max_bytes} bytes (attempted {attempted_end})")]
+    #[error(
+        "append would grow output stream '{path}' beyond configured max {max_bytes} bytes (attempted {attempted_end})"
+    )]
     MaxBytesExceeded {
         path: PathBuf,
         attempted_end: u64,
@@ -262,7 +264,8 @@ mod tests {
     #[test]
     fn append_rejects_writes_that_exceed_max_bytes() {
         let dir = tempfile::tempdir().unwrap();
-        let stream = OutputStream::create_with_max_bytes(dir.path().join("bounded.out"), 8).unwrap();
+        let stream =
+            OutputStream::create_with_max_bytes(dir.path().join("bounded.out"), 8).unwrap();
         let first = stream.append(b"1234").unwrap();
         assert_eq!(first.end_offset, 4);
 

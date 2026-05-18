@@ -203,7 +203,8 @@ impl AgentTreeState {
                 break;
             };
             if let Some(removed) = self.agents.remove(&run_id) {
-                self.run_id_by_agent_id.remove(removed.info.agent_id.as_str());
+                self.run_id_by_agent_id
+                    .remove(removed.info.agent_id.as_str());
             }
         }
     }

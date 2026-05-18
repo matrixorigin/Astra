@@ -10,11 +10,11 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, query};
 
+use crate::cost_ledger::{CostLedger, CostLedgerEntry};
+use crate::models::PricingData;
 use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
-use crate::cost_ledger::{CostLedger, CostLedgerEntry};
-use crate::models::PricingData;
 
 fn normalize_tool_name(name: String) -> String {
     let trimmed = name.trim_matches('"').trim();
@@ -323,7 +323,9 @@ async fn load_session_turn_cost_samples(
             turn_id: row.try_get("event_id").unwrap_or_default(),
             agent_id: "root".to_string(),
             model: row.try_get("llm_model_used").unwrap_or_default(),
-            usage: parse_turn_token_usage(&row.try_get::<String, _>("token_usage").unwrap_or_default()),
+            usage: parse_turn_token_usage(
+                &row.try_get::<String, _>("token_usage").unwrap_or_default(),
+            ),
         })
         .collect())
 }

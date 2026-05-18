@@ -106,15 +106,7 @@ fn primary_row_does_not_expose_legacy_scope_or_match_target_labels() {
         .collect::<Vec<_>>()
         .join(" ");
     for forbidden in [
-        "Turn",
-        "Session",
-        "Project",
-        "User",
-        "Skip",
-        "Exact",
-        "Prefix",
-        "Scope",
-        "Policy",
+        "Turn", "Session", "Project", "User", "Skip", "Exact", "Prefix", "Scope", "Policy",
     ] {
         assert!(
             !text.contains(forbidden),

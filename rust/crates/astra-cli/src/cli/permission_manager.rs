@@ -3008,8 +3008,9 @@ impl PermissionManager {
                 } else {
                     "in this session"
                 };
-                let remember_preview =
-                    astra_turn_core::permission_match_target::remember_preview(name, args, location);
+                let remember_preview = astra_turn_core::permission_match_target::remember_preview(
+                    name, args, location,
+                );
                 let persist_error = self.take_last_save_error();
                 let feedback = cloud_always_feedback_message(
                     &remember_preview,
@@ -3587,7 +3588,8 @@ mod tests {
     }
 
     #[test]
-    fn cloud_always_feedback_message_falls_back_to_session_when_workspace_persistence_unavailable() {
+    fn cloud_always_feedback_message_falls_back_to_session_when_workspace_persistence_unavailable()
+    {
         let out = super::cloud_always_feedback_message(
             "the `cargo test` command family in this session",
             false,

@@ -157,7 +157,9 @@ impl CostLedger {
                 .entry(entry.agent_id.clone())
                 .or_insert(0.0) += entry.cost_usd;
             if let Some(parent) = &entry.parent_agent_id {
-                *rolled_up_agent_cost_usd.entry(parent.clone()).or_insert(0.0) += entry.cost_usd;
+                *rolled_up_agent_cost_usd
+                    .entry(parent.clone())
+                    .or_insert(0.0) += entry.cost_usd;
             }
         }
         CostLedgerSummary {
@@ -275,28 +277,27 @@ impl CostLedger {
             if trimmed.is_empty() {
                 continue;
             }
-            let entry: CostLedgerEntry =
-                match serde_json::from_str(trimmed) {
-                    Ok(entry) => entry,
-                    Err(_source)
-                        if allow_partial_final_line
-                            && iter.peek().is_none()
-                            && looks_like_partial_json_line(trimmed) =>
-                    {
-                        tracing::warn!(
-                            target: "cost_ledger",
-                            "Recovering cost ledger by ignoring truncated final line {}",
-                            idx + 1
-                        );
-                        break;
-                    }
-                    Err(source) => {
-                        return Err(CostLedgerLoadError::Parse {
-                            line: idx + 1,
-                            source,
-                        });
-                    }
-                };
+            let entry: CostLedgerEntry = match serde_json::from_str(trimmed) {
+                Ok(entry) => entry,
+                Err(_source)
+                    if allow_partial_final_line
+                        && iter.peek().is_none()
+                        && looks_like_partial_json_line(trimmed) =>
+                {
+                    tracing::warn!(
+                        target: "cost_ledger",
+                        "Recovering cost ledger by ignoring truncated final line {}",
+                        idx + 1
+                    );
+                    break;
+                }
+                Err(source) => {
+                    return Err(CostLedgerLoadError::Parse {
+                        line: idx + 1,
+                        source,
+                    });
+                }
+            };
             ledger
                 .append(entry)
                 .map_err(|source| CostLedgerLoadError::Ledger {
@@ -528,16 +529,7 @@ mod tests {
             cache_write: Some(1.5),
         };
         let entry = CostLedgerEntry::priced(
-            "s1",
-            "t1",
-            "root",
-            None,
-            "claude",
-            1_000_000,
-            500_000,
-            2_000_000,
-            1_000_000,
-            &pricing,
+            "s1", "t1", "root", None, "claude", 1_000_000, 500_000, 2_000_000, 1_000_000, &pricing,
         )
         .unwrap();
 
@@ -553,18 +545,7 @@ mod tests {
             cache_write: Some(1.5),
         };
         assert_eq!(
-            CostLedgerEntry::priced(
-                "s1",
-                "t1",
-                "root",
-                None,
-                "claude",
-                1,
-                1,
-                10,
-                0,
-                &pricing,
-            ),
+            CostLedgerEntry::priced("s1", "t1", "root", None, "claude", 1, 1, 10, 0, &pricing,),
             Err(CostLedgerPricingError::MissingCacheReadRate)
         );
     }
@@ -610,9 +591,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                CostLedgerEntry::priced(
-                    "s1", "t1", "root", None, "claude", 1, 1, 1, 1, &pricing
-                ),
+                CostLedgerEntry::priced("s1", "t1", "root", None, "claude", 1, 1, 1, 1, &pricing),
                 Err(CostLedgerPricingError::InvalidRate { field }),
                 "{field}"
             );

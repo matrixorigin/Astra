@@ -300,12 +300,7 @@ const CREDENTIAL_PATH_PREFIXES: &[&str] = &[
     "~/.netrc",
 ];
 
-const CREDENTIAL_FILE_NAMES: &[&str] = &[
-    "id_rsa",
-    "id_ed25519",
-    "id_ecdsa",
-    "id_ed25519_sk",
-];
+const CREDENTIAL_FILE_NAMES: &[&str] = &["id_rsa", "id_ed25519", "id_ecdsa", "id_ed25519_sk"];
 
 fn destructive_command(lower: &str) -> Option<&'static str> {
     for command in DESTRUCTIVE_COMMANDS {

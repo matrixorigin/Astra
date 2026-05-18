@@ -968,7 +968,8 @@ mod tests {
         );
         let rendered = render(&cell);
         assert!(
-            rendered.contains("Note: Always allow stays session-only until you trust this workspace."),
+            rendered
+                .contains("Note: Always allow stays session-only until you trust this workspace."),
             "selection hints should render as a note, got:\n{rendered}"
         );
         assert!(
