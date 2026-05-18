@@ -10,6 +10,7 @@ if (!process.env.no_proxy?.includes('localhost')) {
 }
 
 const nextConfig: NextConfig = {
+  distDir: process.env.ASTRA_NEXT_DIST_DIR ?? '.next',
   reactStrictMode: true,
 };
 

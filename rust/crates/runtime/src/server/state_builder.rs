@@ -15,6 +15,7 @@ pub async fn build_server_state(
         FernetTokenEncryptor::from_key(settings.token_encryption_key.as_deref())
             .map_err(Box::<dyn std::error::Error>::from)?,
     );
+    let skillify_matrixone = settings.matrixone.clone();
     let auth_mode = std::env::var("ASTRA_AUTH_MODE")
         .unwrap_or_else(|_| "local_jwt".to_string())
         .trim()
@@ -385,6 +386,19 @@ pub async fn build_server_state(
         .with_delegation_engine(delegation_engine)
         .with_team_store(team_store)
         .with_resource_governor(resource_governor.clone());
+
+    let skillify_agent_executor = Arc::new(
+        super::skillify_agent_executor::RuntimeSkillifyAgentExecutor::new(
+            skillify_matrixone,
+            Arc::clone(&shared_encryptor),
+            state.admin_config_service.clone(),
+            shared_pool.clone(),
+        ),
+    );
+    let state = state.with_harness_service(Arc::new(
+        DatabaseHarnessService::new(shared_pool.clone())
+            .with_skillify_agent_executor(skillify_agent_executor),
+    ));
 
     // Wire in-process chat turn bridge with matrix_rt as the persist tracker.
     // HIGH #4: attach matrix_rt as BridgePersistTracker so SSE persist tasks drain on shutdown.

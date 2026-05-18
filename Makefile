@@ -31,7 +31,7 @@ help:
 	@echo "Web UI:"
 	@echo "  make dev-sdk-deps       - Install/build local @astra/sdk for web UI"
 	@echo "  make dev-web-deps       - Install web UI dependencies"
-	@echo "  make dev-web-start      - Start web UI on http://localhost:3536"
+	@echo "  make dev-web-start      - Start web UI (default http://localhost:3536; override with ASTRA_WEB_PORT=<port>)"
 	@echo "  make dev-web-stop       - Stop web UI"
 	@echo "  make dev-web-restart    - Restart web UI"
 	@echo "  make dev-web-logs       - Show web UI logs"
@@ -357,8 +357,14 @@ dev-web-status:
 	echo "Web UI Status:"; \
 	echo "=============="; \
 	if [ -f "$$PID_FILE" ] && kill -0 $$(cat "$$PID_FILE") 2>/dev/null; then \
-		echo "  ✅ Running (PID: $$(cat "$$PID_FILE"), URL: http://localhost:$$WEB_PORT)"; \
-		NO_PROXY=localhost,127.0.0.1 curl -s --connect-timeout 1 --max-time 2 "http://127.0.0.1:$$WEB_PORT" >/dev/null 2>&1 || echo "  ⚠️  HTTP check failed"; \
+		PID=$$(cat "$$PID_FILE"); \
+		RUNNING_PORT=$$(ps -p "$$PID" -o command= 2>/dev/null | sed -nE 's/.*--port[[:space:]]+([0-9]+).*/\1/p' | tail -1); \
+		if [ -n "$$RUNNING_PORT" ] && [ "$$RUNNING_PORT" != "$$WEB_PORT" ]; then \
+			echo "  ⚠️  Running on different port (PID: $$PID, URL: http://localhost:$$RUNNING_PORT; configured: $$WEB_PORT)"; \
+		else \
+			echo "  ✅ Running (PID: $$PID, URL: http://localhost:$$WEB_PORT)"; \
+			NO_PROXY=localhost,127.0.0.1 curl -s --connect-timeout 1 --max-time 2 "http://127.0.0.1:$$WEB_PORT" >/dev/null 2>&1 || echo "  ⚠️  HTTP check failed"; \
+		fi; \
 	else \
 		echo "  ❌ Not running"; \
 	fi

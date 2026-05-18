@@ -348,6 +348,9 @@ changes later, old runs remain auditable against the source snapshot they used.
 The atomic unit of work inside a run.
 
 For the bid Excel case, one item can be one requirement row or one answer cell.
+For Skillify, the user-facing review object is a `HarnessSkillDraft`; the
+individual rules inside that draft are still item-like review units, but they
+must stay grouped under the skill they explain.
 
 Fields:
 
@@ -378,6 +381,89 @@ Status:
 - `finalized`
 - `blocked`
 
+### HarnessSkillDraft
+
+One proposed skill produced by the Skillify harness.
+
+Skillify is skill-centered from the user's point of view. A run may produce
+multiple skill drafts. The UI reviews one draft at a time: full skill content on
+the left, rule/evidence review on the right. Users can approve, reject, or edit
+individual rules, and can also approve or reject the entire skill draft.
+
+Fields:
+
+- `skill_draft_id`
+- `harness_run_id`
+- `candidate_name`
+- `description`
+- `target_scope`: `personal | project`
+- `publish_visibility`: `private | public`
+- `content_markdown`
+- `source_summary_json`
+- `status`
+- `confidence`
+- `created_by_node_id`
+- `revision`
+- `created_at`
+- `updated_at`
+
+Status:
+
+- `drafting`
+- `pending_rule_review`
+- `pending_skill_review`
+- `needs_revision`
+- `approved`
+- `rejected`
+- `ready_to_publish`
+- `published`
+- `failed`
+
+Rules:
+
+- A skill draft is not publishable while any required rule is unresolved.
+- Rejecting a skill draft rejects its unpublished rules but preserves citations
+  for audit.
+- Editing the markdown creates a new revision and invalidates stale rule
+  approvals only when the edited text changes their meaning.
+- Published skills are created from approved draft revisions only.
+
+### HarnessSkillRule
+
+A reviewable instruction inside a `HarnessSkillDraft`.
+
+Fields:
+
+- `skill_rule_id`
+- `skill_draft_id`
+- `harness_run_id`
+- `rule_type`: `preference | workflow | convention | tool_habit | constraint | style`
+- `statement`
+- `rationale`
+- `status`
+- `confidence`
+- `source_count`
+- `created_by_node_id`
+- `created_at`
+- `updated_at`
+
+Status:
+
+- `proposed`
+- `approved`
+- `rejected`
+- `edited`
+- `needs_revision`
+- `conflicted`
+
+Rules:
+
+- Every rule must have at least one `HarnessCitation`.
+- Rejected rules must not appear in the final `content_markdown`.
+- Conflicting rules remain visible but block whole-skill approval until resolved.
+- Rule edits update the rendered draft skill immediately, keeping the skill
+  preview and review list consistent.
+
 ### HarnessCitation
 
 A structured evidence link. Citations are first-class records, not text pasted
@@ -388,6 +474,8 @@ Fields:
 - `citation_id`
 - `harness_run_id`
 - `item_id`
+- `skill_draft_id`
+- `skill_rule_id`
 - `source_id`
 - `source_locator_json`
 - `artifact_id`
@@ -404,6 +492,10 @@ The citation locator must be source-specific:
 - artifact: artifact id and JSON pointer,
 - connector: connector object id and provider locator.
 
+For Skillify, citations attach primarily to `HarnessSkillRule`. A draft skill
+can only summarize cited rules; it should not introduce uncited instructions in
+the final markdown.
+
 ### HarnessDecision
 
 Human decisions and edits.
@@ -412,9 +504,12 @@ Fields:
 
 - `decision_id`
 - `harness_run_id`
+- `target_type`: `item | skill_draft | skill_rule | external_action`
 - `item_id`
+- `skill_draft_id`
+- `skill_rule_id`
 - `reviewer_user_id`
-- `decision`: `approve | reject | edit | request_revision`
+- `decision`: `approve | reject | edit | request_revision | publish_private | publish_public`
 - `before_json`
 - `after_json`
 - `reason`
@@ -795,6 +890,8 @@ Initial node families:
 Initial nodes:
 
 - `source.snapshot`
+- `source.snapshot_sessions_and_files`
+- `source.normalize_skillify_inputs`
 - `connector.read_record`
 - `connector.draft_write`
 - `connector.create_review_task`
@@ -803,18 +900,23 @@ Initial nodes:
 - `ocr.extract_visible_text`
 - `rule.apply_ruleset`
 - `agent.extract_requirements`
+- `agent.extract_skill_signals`
+- `agent.synthesize_skill_drafts`
 - `agent.fanout`
 - `agent.reduce`
 - `agent.critic`
 - `retrieval.search_evidence`
 - `agent.answer_with_citations`
 - `validate.citations`
+- `validate.skill_drafts`
 - `validate.output_schema`
 - `human.review`
+- `human.review_skill_drafts`
 - `artifact.write_excel`
 - `artifact.audit_report`
-- `skill.draft_from_sessions`
+- `skill.render_approved_draft`
 - `skill.validate_draft`
+- `skill.queue_publish_candidate`
 
 Each node definition must specify:
 
@@ -974,6 +1076,7 @@ Responsibilities:
 - collect child-run outputs into blackboard entries,
 - run explicit reducers and critics for multi-subagent fan-in,
 - create and update harness items,
+- create and update Skillify skill drafts and rules,
 - enforce evidence and review policy,
 - map node execution to agent runs and workflow runs,
 - persist projections for Web UI,
@@ -1223,42 +1326,56 @@ User effort should be:
 The template page presents:
 
 ```text
-Skillify From Sessions
+Skillify From Sources
 
 Inputs
   Selected sessions
+  Uploaded or project files
+  Extraction target
   Skill scope
 
 Flow
-  Snapshot sessions
-  -> Extract candidate rules
-  -> Merge duplicates
-  -> Review candidates
-  -> Generate draft skill
-  -> Validate skill
+  Snapshot sessions and files
+  -> Normalize source excerpts
+  -> Extract evidence-backed skill signals
+  -> Synthesize one or more draft skills
+  -> Validate skills and rules
+  -> Review draft skills
+  -> Queue approved skills for publish
   -> Publish decision
 ```
 
 The user configures:
 
-- sessions to learn from,
+- sessions and files to learn from,
 - extraction target: writing preferences, workflow steps, tool habits, project
   conventions, or all,
 - target scope: personal or project,
-- review mode: review every candidate or review merged candidate groups,
-- publish mode: create draft only or ask for publish decision after validation.
+- review mode: review every rule or allow whole-skill approval after validation,
+- publish visibility: private or public,
+- publish mode: keep approved drafts in a publish queue or ask immediately after
+  each validated skill.
 
 User effort should be:
 
-1. Select chats.
+1. Select chats and files.
 2. Choose extraction target and scope.
-3. Review candidate rules with citations.
-4. Edit or reject noisy candidates.
-5. Generate and validate a draft skill.
-6. Approve activation.
+3. Review one generated skill draft at a time.
+4. Edit or reject noisy rules with citations.
+5. Approve or reject the whole skill.
+6. Publish approved skills privately or publicly.
 
 The graph and node catalog make this repeatable, but the UI should feel like a
-guided setup plus review queue, not a workflow programming environment.
+guided Skillify workspace, not a workflow programming environment. The primary
+object is a skill draft. Rules are supporting review and audit units.
+
+The Skillify review layout should be:
+
+- left pane: complete rendered `SKILL.md` for the current draft,
+- right pane: rule list with source citations, confidence, and conflict state,
+- actions: approve/reject/edit rule, approve/reject whole skill, move to next
+  skill draft,
+- bottom queue: approved skills waiting for private or public publish.
 
 ## Scenario Walkthrough Corrections
 
@@ -1440,6 +1557,11 @@ Runtime API:
 - `GET /harnesses/runs/{harness_run_id}/items`
 - `GET /harnesses/runs/{harness_run_id}/review`
 - `POST /harnesses/runs/{harness_run_id}/items/{item_id}/decision`
+- `GET /harnesses/runs/{harness_run_id}/skill-drafts`
+- `GET /harnesses/runs/{harness_run_id}/skill-drafts/{skill_draft_id}`
+- `POST /harnesses/runs/{harness_run_id}/skill-drafts/{skill_draft_id}/decision`
+- `POST /harnesses/runs/{harness_run_id}/skill-drafts/{skill_draft_id}/rules/{skill_rule_id}/decision`
+- `POST /harnesses/runs/{harness_run_id}/skill-drafts/{skill_draft_id}/publish`
 - `GET /harnesses/runs/{harness_run_id}/subagents`
 - `GET /harnesses/runs/{harness_run_id}/blackboard`
 - `GET /harnesses/runs/{harness_run_id}/external-actions`
@@ -1460,6 +1582,8 @@ Proposed tables:
 - `harness_runs`
 - `harness_sources`
 - `harness_items`
+- `harness_skill_drafts`
+- `harness_skill_rules`
 - `harness_citations`
 - `harness_decisions`
 - `harness_artifacts`
@@ -1481,7 +1605,10 @@ Indexes should support:
 - run lookup by harness/version/session/user/status,
 - pending review queues,
 - item lookup by status and run,
+- skill draft lookup by run/status/revision,
+- skill rule lookup by draft/status,
 - citation lookup by item,
+- citation lookup by skill rule,
 - external action lookup by run/status/action kind,
 - rule-set lookup by run and rule type,
 - subagent lookup by run/node/item/role/status,
@@ -1565,49 +1692,264 @@ Initial built-in template:
 Inputs:
 
 - selected sessions,
+- uploaded or project files,
 - optional topic or goal,
+- extraction target: preferences, workflows, conventions, tool habits, style, or
+  all,
 - target scope: personal or project.
 
 Workflow:
 
 ```text
-source.snapshot_sessions
-  -> agent.extract_skill_candidates
-  -> validate.skill_candidates
-  -> human.review
-  -> skill.draft_from_sessions
+source.snapshot_sessions_and_files
+  -> source.normalize_skillify_inputs
+  -> agent.extract_skill_signals
+  -> agent.synthesize_skill_drafts
+  -> validate.skill_drafts
+  -> human.review_skill_drafts
+  -> skill.render_approved_draft
   -> skill.validate_draft
+  -> skill.queue_publish_candidate
   -> human.publish_decision
 ```
 
-Multi-subagent variant for large session sets:
+Multi-subagent variant for large source sets:
 
 ```text
-source.snapshot_sessions
+source.snapshot_sessions_and_files
+  -> source.normalize_skillify_inputs
   -> agent.fanout(
        roles = [
          preference_extractor,
          workflow_pattern_extractor,
          writing_style_extractor,
+         convention_extractor,
          contradiction_critic
        ],
-       foreach = session_chunk
+       foreach = source_chunk
      )
   -> agent.reduce
-  -> validate.skill_candidates
-  -> human.review
-  -> skill.draft_from_sessions
+  -> agent.synthesize_skill_drafts
+  -> validate.skill_drafts
+  -> human.review_skill_drafts
+  -> skill.render_approved_draft
   -> skill.validate_draft
+  -> skill.queue_publish_candidate
   -> human.publish_decision
 ```
+
+### Skillify Source Preparation
+
+Skillify V1 accepts only:
+
+- selected sessions,
+- uploaded files,
+- project files.
+
+Other connectors can be added later through the same `HarnessSource` contract,
+but they are not required for the first Skillify product slice.
+
+Before any agent runs, sources are normalized into `SourcePacket` records:
+
+- `source_id`
+- `source_type`: `session | upload | project_file`
+- `title`
+- `created_or_modified_at`
+- `locator`
+- `author_or_role` when available
+- `content_excerpt`
+- `content_hash`
+- `metadata_json`
+
+Session packets preserve speaker role, event id, message sequence, and message
+span. File packets preserve file id, path/name, parser version, page/sheet/row
+or text-span locators. Unsupported file types block the run or source according
+to declared policy; they must not silently become model-only context.
+
+For large inputs, chunking happens after normalization. Chunks should follow
+semantic boundaries where possible: session turn ranges, document headings,
+pages, sheets, or sections. The reducer receives both extracted signals and a
+compact source map so it can reason globally without losing citation precision.
+
+### Skillify Agent Prompt Contract
+
+Skillify should use a two-stage prompt shape so large source sets do not turn
+into a noisy list of local observations.
+
+The parent Skillify agent owns orchestration and final synthesis. When the
+normalized source set is too large for one focused extraction pass, the runtime
+should run `agent.fanout` before synthesis. This is graph-controlled behavior,
+not a hidden best-effort fallback.
+
+Parent orchestration prompt:
+
+```text
+You are the parent Skillify agent.
+
+Goal:
+Turn selected sessions and files into a small set of coherent, reviewable draft
+skills.
+
+When sources are large:
+- Split normalized SourcePackets into semantic source chunks.
+- Assign bounded extraction work to subagents.
+- Use subagents only to extract evidence-backed signals from their assigned
+  chunks or specialist lens.
+- Do not let subagents write final SKILL.md content.
+- Collect all subagent outputs, source summaries, conflicts, and dropped-signal
+  notes.
+- You own the global synthesis step: cluster signals across chunks, resolve
+  duplicates, expose conflicts, decide how many skills are justified, and draft
+  the final SkillDraft[].
+
+Subagent roles:
+- preference_extractor: user preferences, corrections, do/don't instructions.
+- workflow_pattern_extractor: repeated procedures, step order, success criteria.
+- writing_style_extractor: tone, structure, formatting, explanation style.
+- convention_extractor: project-specific norms, repo practices, naming,
+  commands, file layout, review expectations.
+- contradiction_critic: conflicting or over-generalized signals.
+
+Hard rules:
+- Preserve source citations through every aggregation step.
+- Prefer global abstractions over per-source summaries.
+- Prefer fewer, stronger skills over many source-shaped skills.
+- If subagents disagree, keep the conflict visible for review instead of
+  silently choosing one side.
+```
+
+Stage 1 extracts evidence-backed signals. It does not write final skills.
+
+```text
+You are the Skillify extraction agent.
+
+Goal:
+Extract durable, reusable signals that could become personal or project skills.
+Focus on user preferences, repeated workflows, project conventions, tool habits,
+style constraints, corrections, and explicit "do/don't" instructions.
+
+Inputs:
+- Source packets with stable source ids, source type, title, locator metadata,
+  and excerpted content.
+- Optional topic/goal filter.
+- Extraction target.
+
+Rules:
+- Only extract a signal when it is supported by source evidence.
+- Prefer durable patterns over one-off task instructions.
+- Treat user corrections as high-value evidence.
+- Preserve uncertainty. Do not over-generalize from a single weak example.
+- Do not generate SKILL.md content in this stage.
+- Do not merge unrelated domains just because they came from the same source.
+- Return structured JSON only.
+
+Output schema:
+{
+  "signals": [
+    {
+      "signal_id": "stable local id",
+      "kind": "preference|workflow|convention|tool_habit|style|constraint",
+      "statement": "concise reusable rule candidate",
+      "scope_hint": "personal|project|unknown",
+      "rationale": "why this is durable",
+      "confidence": 0.0,
+      "citations": [
+        {
+          "source_id": "...",
+          "locator": {...},
+          "quote": "short evidence excerpt"
+        }
+      ],
+      "possible_conflicts": ["signal ids or short descriptions"]
+    }
+  ],
+  "source_summary": "brief summary of what this chunk contributed"
+}
+```
+
+Stage 2 synthesizes global skills from all signals and source summaries. This is
+where the agent should abstract across sources instead of preserving chunk
+boundaries.
+
+```text
+You are the Skillify synthesis agent.
+
+Goal:
+Create a small set of coherent draft skills from extracted signals. A skill is
+useful only if it describes a repeatable behavior the assistant can apply in
+future work.
+
+Inputs:
+- All extracted signals with citations.
+- Source summaries.
+- Optional topic/goal filter.
+- Target scope and publish visibility defaults.
+
+Synthesis rules:
+- Think globally before drafting. Cluster signals by the future behavior they
+  enable, not by source file or session.
+- Prefer fewer, stronger skills over many narrow skills.
+- Split into multiple skills only when the invocation intent, workflow, or
+  audience is materially different.
+- Every rule in a skill must map back to one or more signal citations.
+- If signals conflict, keep the conflict visible and mark the affected rule as
+  conflicted instead of hiding it.
+- The skill markdown must be operational: when to use it, goal, required inputs,
+  steps, success criteria, and constraints.
+- Do not include rejected, unsupported, or citation-free rules.
+- Return structured JSON only.
+
+Output schema:
+{
+  "skill_drafts": [
+    {
+      "candidate_name": "kebab-case-name",
+      "description": "one-line purpose",
+      "target_scope": "personal|project",
+      "publish_visibility": "private|public",
+      "content_markdown": "complete draft SKILL.md content",
+      "rules": [
+        {
+          "rule_id": "stable local id",
+          "rule_type": "preference|workflow|convention|tool_habit|constraint|style",
+          "statement": "reviewable rule",
+          "rationale": "why it belongs in this skill",
+          "confidence": 0.0,
+          "citation_refs": ["signal_id:citation_index"],
+          "status": "proposed|conflicted"
+        }
+      ],
+      "source_summary": "why these sources justify this skill",
+      "confidence": 0.0
+    }
+  ],
+  "dropped_signals": [
+    {
+      "signal_id": "...",
+      "reason": "too weak|duplicate|one_off|conflicted|out_of_scope"
+    }
+  ]
+}
+```
+
+Recommended synthesis limits:
+
+- 1 to 5 draft skills per run by default.
+- 3 to 12 rules per skill by default.
+- Each rule should have at least one citation; high-impact rules should prefer
+  two or more independent citations.
+- A single-source rule is allowed only when it is explicit and high confidence.
 
 Rules:
 
 - The harness creates a draft skill, not an automatically active skill.
-- User review is required before activation.
-- Each learned preference or workflow rule must cite the session source it came
-  from.
-- Rejected candidate rules must not leak into the final skill draft.
+- User review is required before activation or publication.
+- Each learned preference, workflow, or convention rule must cite a session or
+  file source.
+- Rejected rules must not leak into the final skill draft.
+- Rejected skill drafts must not create publish candidates.
+- The runtime must block publication when required citations are missing,
+  unresolved conflicts remain, or markdown validation fails.
 
 ## Failure Policy
 

@@ -138,9 +138,12 @@ pub use events::{
     EventService, UnconfiguredEventService,
 };
 pub use harness::{
-    DatabaseHarnessService, HarnessDecisionRequest, HarnessItemRecord, HarnessNodeCatalogRecord,
-    HarnessRunRecord, HarnessService, HarnessTemplateRecord, SkillifyDraftRecord,
-    SkillifyDraftRequest, SkillifyRunRequest, UnconfiguredHarnessService,
+    DatabaseHarnessService, HarnessCitationRecord, HarnessDecisionRequest, HarnessItemRecord,
+    HarnessNodeCatalogRecord, HarnessRunRecord, HarnessService, HarnessSkillDraftRecord,
+    HarnessSkillRuleRecord, HarnessTemplateRecord, SkillifyAgentCitation, SkillifyAgentDraft,
+    SkillifyAgentExecutor, SkillifyAgentOutput, SkillifyAgentRequest, SkillifyAgentRule,
+    SkillifyDraftRecord, SkillifyDraftRequest, SkillifyPublishRecord, SkillifyPublishRequest,
+    SkillifyRunRequest, SkillifySourceFile, SkillifySourcePacket, UnconfiguredHarnessService,
 };
 pub use introspection::{
     DatabaseIntrospectionService, IntrospectionService, UnconfiguredIntrospectionService,

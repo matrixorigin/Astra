@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "../scripts/dev/run-web-dev.sh",
     "build": "next build",
-    "start": "next start",
+    "start": "../scripts/dev/run-web-start.sh",
     "lint": "ESLINT_USE_FLAT_CONFIG=false eslint . --ext .js,.jsx,.ts,.tsx",
     "test": "jest",
     "test:watch": "jest --watch"

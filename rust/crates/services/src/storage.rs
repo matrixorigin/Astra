@@ -1498,10 +1498,57 @@ pub async fn ensure_core_schema(
     .await?;
 
     query(
+        "CREATE TABLE IF NOT EXISTS harness_skill_drafts (
+            skill_draft_id VARCHAR(128) PRIMARY KEY,
+            harness_run_id VARCHAR(128) NOT NULL,
+            candidate_name VARCHAR(128) NOT NULL,
+            description TEXT NOT NULL,
+            target_scope VARCHAR(32) NOT NULL,
+            publish_visibility VARCHAR(32) NOT NULL,
+            content_markdown LONGTEXT NOT NULL,
+            source_summary_json LONGTEXT NOT NULL,
+            status VARCHAR(64) NOT NULL,
+            confidence DOUBLE NULL,
+            created_by_node_id VARCHAR(128) NULL,
+            revision BIGINT NOT NULL DEFAULT 1,
+            published_version_id VARCHAR(128) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_harness_skill_drafts_run_status (harness_run_id, status, updated_at),
+            INDEX idx_harness_skill_drafts_run_revision (harness_run_id, revision)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_skill_rules (
+            skill_rule_id VARCHAR(128) PRIMARY KEY,
+            skill_draft_id VARCHAR(128) NOT NULL,
+            harness_run_id VARCHAR(128) NOT NULL,
+            rule_type VARCHAR(64) NOT NULL,
+            statement TEXT NOT NULL,
+            rationale TEXT NOT NULL,
+            status VARCHAR(64) NOT NULL,
+            confidence DOUBLE NULL,
+            source_count BIGINT NOT NULL DEFAULT 0,
+            created_by_node_id VARCHAR(128) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_harness_skill_rules_draft_status (skill_draft_id, status, updated_at),
+            INDEX idx_harness_skill_rules_run_status (harness_run_id, status, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
         "CREATE TABLE IF NOT EXISTS harness_citations (
             citation_id VARCHAR(128) PRIMARY KEY,
             harness_run_id VARCHAR(128) NOT NULL,
             item_id VARCHAR(128) NOT NULL,
+            skill_draft_id VARCHAR(128) NULL,
+            skill_rule_id VARCHAR(128) NULL,
             source_id VARCHAR(128) NULL,
             source_locator_json LONGTEXT NOT NULL,
             artifact_id VARCHAR(128) NULL,
@@ -1511,6 +1558,7 @@ pub async fn ensure_core_schema(
             created_by_node_id VARCHAR(128) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             INDEX idx_harness_citations_item (item_id, created_at),
+            INDEX idx_harness_citations_skill_rule (skill_rule_id, created_at),
             INDEX idx_harness_citations_run (harness_run_id, created_at)
         )",
     )
@@ -1521,7 +1569,10 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS harness_decisions (
             decision_id VARCHAR(128) PRIMARY KEY,
             harness_run_id VARCHAR(128) NOT NULL,
+            target_type VARCHAR(64) NULL,
             item_id VARCHAR(128) NOT NULL,
+            skill_draft_id VARCHAR(128) NULL,
+            skill_rule_id VARCHAR(128) NULL,
             reviewer_user_id VARCHAR(128) NOT NULL,
             decision VARCHAR(64) NOT NULL,
             before_json LONGTEXT NOT NULL,
@@ -1531,11 +1582,62 @@ pub async fn ensure_core_schema(
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             UNIQUE KEY uq_harness_decision_idempotency (harness_run_id, idempotency_key),
             INDEX idx_harness_decisions_item (item_id, created_at),
+            INDEX idx_harness_decisions_skill_draft (skill_draft_id, created_at),
+            INDEX idx_harness_decisions_skill_rule (skill_rule_id, created_at),
             INDEX idx_harness_decisions_reviewer (reviewer_user_id, created_at)
         )",
     )
     .execute(&pool)
     .await?;
+
+    for (table, column, ddl) in [
+        (
+            "harness_citations",
+            "skill_draft_id",
+            "ALTER TABLE harness_citations ADD COLUMN skill_draft_id VARCHAR(128) NULL",
+        ),
+        (
+            "harness_citations",
+            "skill_rule_id",
+            "ALTER TABLE harness_citations ADD COLUMN skill_rule_id VARCHAR(128) NULL",
+        ),
+        (
+            "harness_decisions",
+            "target_type",
+            "ALTER TABLE harness_decisions ADD COLUMN target_type VARCHAR(64) NULL",
+        ),
+        (
+            "harness_decisions",
+            "skill_draft_id",
+            "ALTER TABLE harness_decisions ADD COLUMN skill_draft_id VARCHAR(128) NULL",
+        ),
+        (
+            "harness_decisions",
+            "skill_rule_id",
+            "ALTER TABLE harness_decisions ADD COLUMN skill_rule_id VARCHAR(128) NULL",
+        ),
+    ] {
+        add_column_if_missing(&pool, &settings.database, table, column, ddl).await?;
+    }
+    for (table, index, ddl) in [
+        (
+            "harness_citations",
+            "idx_harness_citations_skill_rule",
+            "ALTER TABLE harness_citations ADD INDEX idx_harness_citations_skill_rule (skill_rule_id, created_at)",
+        ),
+        (
+            "harness_decisions",
+            "idx_harness_decisions_skill_draft",
+            "ALTER TABLE harness_decisions ADD INDEX idx_harness_decisions_skill_draft (skill_draft_id, created_at)",
+        ),
+        (
+            "harness_decisions",
+            "idx_harness_decisions_skill_rule",
+            "ALTER TABLE harness_decisions ADD INDEX idx_harness_decisions_skill_rule (skill_rule_id, created_at)",
+        ),
+    ] {
+        add_index_if_missing(&pool, &settings.database, table, index, ddl).await?;
+    }
 
     query(
         "CREATE TABLE IF NOT EXISTS harness_artifacts (

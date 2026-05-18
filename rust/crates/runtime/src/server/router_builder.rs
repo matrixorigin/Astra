@@ -436,6 +436,26 @@ pub(super) fn build_router(state: AppState) -> Router {
             post(product_harness_handlers::decide_harness_item_handler),
         )
         .route(
+            "/harnesses/runs/{harness_run_id}/skill-drafts",
+            get(product_harness_handlers::list_skill_drafts_handler),
+        )
+        .route(
+            "/harnesses/runs/{harness_run_id}/skill-drafts/{skill_draft_id}",
+            get(product_harness_handlers::get_skill_draft_handler),
+        )
+        .route(
+            "/harnesses/runs/{harness_run_id}/skill-drafts/{skill_draft_id}/decision",
+            post(product_harness_handlers::decide_skill_draft_handler),
+        )
+        .route(
+            "/harnesses/runs/{harness_run_id}/skill-drafts/{skill_draft_id}/rules/{skill_rule_id}/decision",
+            post(product_harness_handlers::decide_skill_rule_handler),
+        )
+        .route(
+            "/harnesses/runs/{harness_run_id}/skill-drafts/{skill_draft_id}/publish",
+            post(product_harness_handlers::publish_skill_draft_handler),
+        )
+        .route(
             "/harnesses/runs/{harness_run_id}/skillify/draft",
             post(product_harness_handlers::create_skillify_draft_handler),
         )

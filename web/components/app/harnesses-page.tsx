@@ -9,9 +9,11 @@ import {
   FileCode2,
   GitBranch,
   Layers3,
+  Pencil,
   Play,
   Plus,
   RefreshCw,
+  Save,
   Sparkles,
   UploadCloud,
   X,
@@ -19,20 +21,23 @@ import {
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { listChats } from '@/lib/api/chats';
 import {
-  createSkillifyDraft,
   createSkillifyRun,
-  decideHarnessItem,
+  decideSkillDraft,
+  decideSkillRule,
   listHarnessNodeCatalog,
-  listHarnessRunItems,
   listHarnessTemplates,
+  listSkillDrafts,
+  publishSkillDraft,
 } from '@/lib/api/harnesses';
 import type {
   ChatSummary,
-  HarnessItem,
   HarnessNodeCatalogItem,
   HarnessRun,
+  HarnessCitation,
+  HarnessSkillDraft,
+  HarnessSkillRule,
   HarnessTemplate,
-  SkillifyDraft,
+  SkillifyPublishRecord,
 } from '@/lib/api/types';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -42,14 +47,25 @@ import { Textarea } from '@/components/ui/textarea';
 import { cn } from '@/lib/utils/cn';
 
 type HarnessView = 'catalog' | 'skillify' | 'custom';
-
-function outputString(item: HarnessItem, key: string) {
-  const value = item.final_output_json[key] ?? item.proposed_output_json[key];
-  return typeof value === 'string' ? value : '';
-}
+type SkillifySourceFileInput = {
+  file_name: string;
+  mime_type?: string | null;
+  content: string;
+};
+type RuleEditState = {
+  statement: string;
+  rationale: string;
+};
 
 function statusClass(status: string) {
-  if (status === 'approved' || status === 'completed' || status === 'ready') {
+  if (
+    status === 'approved' ||
+    status === 'edited' ||
+    status === 'completed' ||
+    status === 'ready' ||
+    status === 'ready_to_publish' ||
+    status === 'published'
+  ) {
     return 'border-success/30 bg-success/10 text-success';
   }
   if (status === 'rejected' || status === 'blocked') {
@@ -77,17 +93,39 @@ function defaultCustomWorkflow() {
   ].join('\n');
 }
 
+function stringFromUnknown(value: unknown) {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+}
+
+function citationSourceLabel(citation: HarnessCitation) {
+  const locator = citation.source_locator_json ?? {};
+  return (
+    stringFromUnknown(locator.title) ??
+    stringFromUnknown(locator.file_name) ??
+    stringFromUnknown(locator.session_id) ??
+    stringFromUnknown(locator.source_id) ??
+    citation.source_id ??
+    'Unknown source'
+  );
+}
+
+function sourceCitationLabel(count: number) {
+  return `${count} source citation${count === 1 ? '' : 's'}`;
+}
+
 export function HarnessesPage() {
   const [view, setView] = useState<HarnessView>('catalog');
   const [templates, setTemplates] = useState<HarnessTemplate[]>([]);
   const [nodeCatalog, setNodeCatalog] = useState<HarnessNodeCatalogItem[]>([]);
   const [sessions, setSessions] = useState<ChatSummary[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
+  const [sourceFiles, setSourceFiles] = useState<SkillifySourceFileInput[]>([]);
   const [skillName, setSkillName] = useState('');
   const [topic, setTopic] = useState('');
   const [run, setRun] = useState<HarnessRun | null>(null);
-  const [items, setItems] = useState<HarnessItem[]>([]);
-  const [draft, setDraft] = useState<SkillifyDraft | null>(null);
+  const [skillDrafts, setSkillDrafts] = useState<HarnessSkillDraft[]>([]);
+  const [activeDraftId, setActiveDraftId] = useState<string | null>(null);
+  const [published, setPublished] = useState<SkillifyPublishRecord[]>([]);
   const [customName, setCustomName] = useState('New harness');
   const [customPurpose, setCustomPurpose] = useState('');
   const [customSources, setCustomSources] = useState('sessions, uploaded files, external data source');
@@ -96,8 +134,18 @@ export function HarnessesPage() {
   const [error, setError] = useState<string | null>(null);
 
   const skillifyTemplate = templates.find((template) => template.template_id === 'skillify.v1');
-  const approvedCount = useMemo(() => items.filter((item) => item.status === 'approved').length, [items]);
-  const pendingCount = useMemo(() => items.filter((item) => item.status === 'pending_review').length, [items]);
+  const activeDraft = useMemo(
+    () => skillDrafts.find((draft) => draft.skill_draft_id === activeDraftId) ?? skillDrafts[0] ?? null,
+    [activeDraftId, skillDrafts],
+  );
+  const approvedCount = useMemo(
+    () => skillDrafts.reduce((sum, draft) => sum + draft.rules.filter((rule) => rule.status === 'approved' || rule.status === 'edited').length, 0),
+    [skillDrafts],
+  );
+  const pendingCount = useMemo(
+    () => skillDrafts.reduce((sum, draft) => sum + draft.rules.filter((rule) => rule.status === 'proposed' || rule.status === 'conflicted' || rule.status === 'needs_revision').length, 0),
+    [skillDrafts],
+  );
 
   const loadInitial = useCallback(async () => {
     setError(null);
@@ -119,8 +167,12 @@ export function HarnessesPage() {
     void loadInitial();
   }, [loadInitial]);
 
-  const refreshItems = useCallback(async (runId: string) => {
-    setItems(await listHarnessRunItems(runId));
+  const refreshDrafts = useCallback(async (runId: string) => {
+    const drafts = await listSkillDrafts(runId);
+    setSkillDrafts(drafts);
+    setActiveDraftId((current) => (current && drafts.some((draft) => draft.skill_draft_id === current)
+      ? current
+      : drafts[0]?.skill_draft_id ?? null));
   }, []);
 
   const toggleSession = useCallback((sessionId: string) => {
@@ -142,64 +194,166 @@ export function HarnessesPage() {
 
   const startSkillify = useCallback(async () => {
     setError(null);
-    setDraft(null);
-    if (selected.length === 0) {
-      setError('Select at least one session.');
+    setPublished([]);
+    if (selected.length === 0 && sourceFiles.length === 0) {
+      setError('Select at least one session or text file.');
       return;
     }
     setBusy(true);
     try {
       const created = await createSkillifyRun({
         session_ids: selected,
+        source_files: sourceFiles,
         skill_name: skillName.trim() || null,
         topic: topic.trim() || null,
         target_scope: 'personal',
       });
       setRun(created);
-      await refreshItems(created.harness_run_id);
+      await refreshDrafts(created.harness_run_id);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to start Skillify.');
     } finally {
       setBusy(false);
     }
-  }, [refreshItems, selected, skillName, topic]);
+  }, [refreshDrafts, selected, skillName, sourceFiles, topic]);
 
-  const decide = useCallback(async (item: HarnessItem, decision: 'approve' | 'reject') => {
+  const decideRule = useCallback(async (
+    draft: HarnessSkillDraft,
+    rule: HarnessSkillRule,
+    decision: 'approve' | 'reject',
+  ) => {
     if (!run) {
       return;
     }
     setBusy(true);
     setError(null);
     try {
-      const updated = await decideHarnessItem(run.harness_run_id, item.item_id, {
+      const updated = await decideSkillRule(run.harness_run_id, draft.skill_draft_id, rule.skill_rule_id, {
         decision,
-        reason: decision === 'approve' ? 'Approved from harness review UI.' : 'Rejected from harness review UI.',
+        reason: decision === 'approve' ? 'Approved rule from Skillify review UI.' : 'Rejected rule from Skillify review UI.',
       });
-      setItems((current) => current.map((entry) => (entry.item_id === updated.item_id ? updated : entry)));
+      setSkillDrafts((current) => current.map((entry) => (entry.skill_draft_id === updated.skill_draft_id ? updated : entry)));
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to update candidate.');
+      setError(err instanceof Error ? err.message : 'Failed to update rule.');
     } finally {
       setBusy(false);
     }
   }, [run]);
 
-  const createDraft = useCallback(async () => {
+  const editRule = useCallback(async (
+    draft: HarnessSkillDraft,
+    rule: HarnessSkillRule,
+    edit: RuleEditState,
+  ) => {
+    if (!run) {
+      return false;
+    }
+    const statement = edit.statement.trim();
+    const rationale = edit.rationale.trim();
+    if (!statement) {
+      setError('Rule statement must not be empty.');
+      return false;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const updated = await decideSkillRule(run.harness_run_id, draft.skill_draft_id, rule.skill_rule_id, {
+        decision: 'edit',
+        after_json: { statement, rationale },
+        reason: 'Edited rule from Skillify review UI.',
+      });
+      setSkillDrafts((current) => current.map((entry) => (entry.skill_draft_id === updated.skill_draft_id ? updated : entry)));
+      return true;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to edit rule.');
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }, [run]);
+
+  const decideDraft = useCallback(async (draft: HarnessSkillDraft, decision: 'approve' | 'reject') => {
     if (!run) {
       return;
     }
     setBusy(true);
     setError(null);
     try {
-      setDraft(await createSkillifyDraft(run.harness_run_id, {
-        skill_name: skillName.trim() || null,
-        version: '0.1.0',
-      }));
+      const updated = await decideSkillDraft(run.harness_run_id, draft.skill_draft_id, {
+        decision,
+        reason: decision === 'approve' ? 'Approved skill from Skillify review UI.' : 'Rejected skill from Skillify review UI.',
+      });
+      setSkillDrafts((current) => current.map((entry) => (entry.skill_draft_id === updated.skill_draft_id ? updated : entry)));
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create draft skill.');
+      setError(err instanceof Error ? err.message : 'Failed to update skill draft.');
     } finally {
       setBusy(false);
     }
-  }, [run, skillName]);
+  }, [run]);
+
+  const editDraft = useCallback(async (draft: HarnessSkillDraft, contentMarkdown: string) => {
+    if (!run) {
+      return false;
+    }
+    const content_markdown = contentMarkdown.trim();
+    if (!content_markdown) {
+      setError('Skill content must not be empty.');
+      return false;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const updated = await decideSkillDraft(run.harness_run_id, draft.skill_draft_id, {
+        decision: 'edit',
+        after_json: { content_markdown },
+        reason: 'Edited skill content from Skillify review UI.',
+      });
+      setSkillDrafts((current) => current.map((entry) => (entry.skill_draft_id === updated.skill_draft_id ? updated : entry)));
+      return true;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to edit skill draft.');
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }, [run]);
+
+  const publishDraft = useCallback(async (draft: HarnessSkillDraft, visibility: 'private' | 'public') => {
+    if (!run) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const record = await publishSkillDraft(run.harness_run_id, draft.skill_draft_id, {
+        visibility,
+        version: '0.1.0',
+      });
+      setPublished((current) => [...current, record]);
+      await refreshDrafts(run.harness_run_id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to publish skill draft.');
+    } finally {
+      setBusy(false);
+    }
+  }, [refreshDrafts, run]);
+
+  const addSourceFiles = useCallback(async (files: FileList | null) => {
+    if (!files?.length) {
+      return;
+    }
+    setError(null);
+    try {
+      const next = await Promise.all(Array.from(files).map(async (file) => ({
+        file_name: file.name,
+        mime_type: file.type || 'text/plain',
+        content: await file.text(),
+      })));
+      setSourceFiles((current) => [...current, ...next]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to read source file.');
+    }
+  }, []);
 
   const goCatalog = useCallback(() => {
     setError(null);
@@ -247,20 +401,28 @@ export function HarnessesPage() {
             busy={busy}
             sessions={sessions}
             selected={selected}
+            sourceFiles={sourceFiles}
             skillName={skillName}
             topic={topic}
             run={run}
-            items={items}
-            draft={draft}
+            skillDrafts={skillDrafts}
+            activeDraft={activeDraft}
+            published={published}
             approvedCount={approvedCount}
             pendingCount={pendingCount}
             template={skillifyTemplate}
             onSkillNameChange={setSkillName}
             onTopicChange={setTopic}
             onToggleSession={toggleSession}
+            onAddSourceFiles={addSourceFiles}
+            onRemoveSourceFile={(index) => setSourceFiles((current) => current.filter((_, i) => i !== index))}
+            onSelectDraft={setActiveDraftId}
             onStart={startSkillify}
-            onDecide={decide}
-            onCreateDraft={createDraft}
+            onDecideRule={decideRule}
+            onEditRule={editRule}
+            onDecideDraft={decideDraft}
+            onEditDraft={editDraft}
+            onPublishDraft={publishDraft}
           />
         ) : null}
 
@@ -389,39 +551,126 @@ function SkillifyView({
   busy,
   sessions,
   selected,
+  sourceFiles,
   skillName,
   topic,
   run,
-  items,
-  draft,
+  skillDrafts,
+  activeDraft,
+  published,
   approvedCount,
   pendingCount,
   template,
   onSkillNameChange,
   onTopicChange,
   onToggleSession,
+  onAddSourceFiles,
+  onRemoveSourceFile,
+  onSelectDraft,
   onStart,
-  onDecide,
-  onCreateDraft,
+  onDecideRule,
+  onEditRule,
+  onDecideDraft,
+  onEditDraft,
+  onPublishDraft,
 }: {
   busy: boolean;
   sessions: ChatSummary[];
   selected: string[];
+  sourceFiles: SkillifySourceFileInput[];
   skillName: string;
   topic: string;
   run: HarnessRun | null;
-  items: HarnessItem[];
-  draft: SkillifyDraft | null;
+  skillDrafts: HarnessSkillDraft[];
+  activeDraft: HarnessSkillDraft | null;
+  published: SkillifyPublishRecord[];
   approvedCount: number;
   pendingCount: number;
   template?: HarnessTemplate;
   onSkillNameChange: (value: string) => void;
   onTopicChange: (value: string) => void;
   onToggleSession: (sessionId: string) => void;
+  onAddSourceFiles: (files: FileList | null) => void;
+  onRemoveSourceFile: (index: number) => void;
+  onSelectDraft: (draftId: string) => void;
   onStart: () => void;
-  onDecide: (item: HarnessItem, decision: 'approve' | 'reject') => void;
-  onCreateDraft: () => void;
+  onDecideRule: (draft: HarnessSkillDraft, rule: HarnessSkillRule, decision: 'approve' | 'reject') => void;
+  onEditRule: (draft: HarnessSkillDraft, rule: HarnessSkillRule, edit: RuleEditState) => Promise<boolean>;
+  onDecideDraft: (draft: HarnessSkillDraft, decision: 'approve' | 'reject') => void;
+  onEditDraft: (draft: HarnessSkillDraft, contentMarkdown: string) => Promise<boolean>;
+  onPublishDraft: (draft: HarnessSkillDraft, visibility: 'private' | 'public') => void;
 }) {
+  const [editingDraftId, setEditingDraftId] = useState<string | null>(null);
+  const [draftMarkdown, setDraftMarkdown] = useState('');
+  const [ruleEdits, setRuleEdits] = useState<Record<string, RuleEditState>>({});
+  const activeDraftKey = activeDraft?.skill_draft_id ?? null;
+  const isEditingDraft = activeDraftKey !== null && editingDraftId === activeDraftKey;
+  const readyDrafts = skillDrafts.filter((draft) => draft.status === 'ready_to_publish');
+
+  useEffect(() => {
+    setEditingDraftId(null);
+    setDraftMarkdown('');
+    setRuleEdits({});
+  }, [activeDraftKey]);
+
+  const startDraftEdit = useCallback(() => {
+    if (!activeDraft) {
+      return;
+    }
+    setEditingDraftId(activeDraft.skill_draft_id);
+    setDraftMarkdown(activeDraft.content_markdown);
+  }, [activeDraft]);
+
+  const saveDraftEdit = useCallback(async () => {
+    if (!activeDraft) {
+      return;
+    }
+    const saved = await onEditDraft(activeDraft, draftMarkdown);
+    if (saved) {
+      setEditingDraftId(null);
+      setDraftMarkdown('');
+    }
+  }, [activeDraft, draftMarkdown, onEditDraft]);
+
+  const startRuleEdit = useCallback((rule: HarnessSkillRule) => {
+    setRuleEdits((current) => ({
+      ...current,
+      [rule.skill_rule_id]: {
+        statement: rule.statement,
+        rationale: rule.rationale,
+      },
+    }));
+  }, []);
+
+  const updateRuleEdit = useCallback((ruleId: string, field: keyof RuleEditState, value: string) => {
+    setRuleEdits((current) => ({
+      ...current,
+      [ruleId]: {
+        ...(current[ruleId] ?? { statement: '', rationale: '' }),
+        [field]: value,
+      },
+    }));
+  }, []);
+
+  const cancelRuleEdit = useCallback((ruleId: string) => {
+    setRuleEdits((current) => {
+      const next = { ...current };
+      delete next[ruleId];
+      return next;
+    });
+  }, []);
+
+  const saveRuleEdit = useCallback(async (draft: HarnessSkillDraft, rule: HarnessSkillRule) => {
+    const edit = ruleEdits[rule.skill_rule_id];
+    if (!edit) {
+      return;
+    }
+    const saved = await onEditRule(draft, rule, edit);
+    if (saved) {
+      cancelRuleEdit(rule.skill_rule_id);
+    }
+  }, [cancelRuleEdit, onEditRule, ruleEdits]);
+
   return (
     <div className="grid gap-6 xl:grid-cols-[360px_minmax(0,1fr)]">
       <section className="space-y-4">
@@ -433,7 +682,7 @@ function SkillifyView({
             <div className="min-w-0">
               <h2 className="text-base font-semibold">Skillify</h2>
               <p className="mt-1 text-sm text-text-secondary">
-                {template?.description ?? 'Extract reviewed personal skill rules from selected sessions.'}
+                {template?.description ?? 'Create reviewed draft skills from selected sessions and files.'}
               </p>
             </div>
           </div>
@@ -461,12 +710,43 @@ function SkillifyView({
               variant="primary"
               leadingIcon={Play}
               onClick={onStart}
-              disabled={busy || selected.length === 0}
+              disabled={busy || (selected.length === 0 && sourceFiles.length === 0)}
               className="w-full"
             >
               Run Skillify
             </Button>
           </div>
+        </Card>
+
+        <Card>
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="text-base font-semibold">File Sources</h2>
+            <span className="text-xs text-text-muted">{sourceFiles.length} selected</span>
+          </div>
+          <label className="mt-3 block rounded-control border border-dashed border-border bg-surface-muted px-3 py-3 text-sm text-text-secondary">
+            <input
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(event) => {
+                onAddSourceFiles(event.target.files);
+                event.currentTarget.value = '';
+              }}
+            />
+            Add text files
+          </label>
+          {sourceFiles.length ? (
+            <div className="mt-3 space-y-2">
+              {sourceFiles.map((file, index) => (
+                <div key={`${file.file_name}-${index}`} className="flex items-center justify-between gap-2 rounded-control border border-border px-3 py-2 text-sm">
+                  <span className="min-w-0 truncate">{file.file_name}</span>
+                  <Button size="sm" variant="ghost" leadingIcon={X} onClick={() => onRemoveSourceFile(index)}>
+                    Remove
+                  </Button>
+                </div>
+              ))}
+            </div>
+          ) : null}
         </Card>
 
         <Card>
@@ -517,7 +797,7 @@ function SkillifyView({
             <div>
               <h2 className="text-base font-semibold">Run Review</h2>
               <p className="mt-1 text-sm text-text-secondary">
-                Candidates stay pending until a human approves or rejects them.
+                Review each draft skill as a whole, then inspect its cited rules.
               </p>
             </div>
             <div className="flex gap-2 text-xs">
@@ -534,89 +814,289 @@ function SkillifyView({
           </div>
         </Card>
 
-        {items.length ? (
-          <div className="space-y-3">
-            {items.map((item) => (
-              <Card key={item.item_id}>
-                <div className="flex items-start justify-between gap-4">
-                  <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className={cn('rounded-full border px-2 py-1 text-xs', statusClass(item.status))}>
-                        {item.status}
-                      </span>
-                      <span className="rounded-full border border-border bg-surface-muted px-2 py-1 text-xs text-text-secondary">
-                        {outputString(item, 'kind') || item.item_type}
-                      </span>
-                      {item.confidence !== null ? (
-                        <span className="text-xs text-text-muted">
-                          confidence {Math.round(item.confidence * 100)}%
-                        </span>
-                      ) : null}
-                    </div>
-                    <p className="mt-3 text-sm font-medium">{outputString(item, 'statement')}</p>
-                    <p className="mt-2 line-clamp-3 text-sm text-text-secondary">
-                      {outputString(item, 'source_excerpt')}
-                    </p>
-                  </div>
-                  <div className="flex shrink-0 gap-2">
+	        {skillDrafts.length ? (
+	          <div className="grid gap-4 2xl:grid-cols-[minmax(0,1fr)_420px]">
+	            <Card>
+	              <div className="flex flex-wrap items-center justify-between gap-3">
+	                <div>
+	                  <h2 className="text-base font-semibold">{activeDraft?.candidate_name ?? 'Draft Skill'}</h2>
+	                  <p className="mt-1 text-sm text-text-secondary">{activeDraft?.description}</p>
+	                </div>
+	                {activeDraft ? (
+	                  <div className="flex flex-wrap items-center gap-2">
+	                    <span className={cn('rounded-full border px-2 py-1 text-xs', statusClass(activeDraft.status))}>
+	                      {activeDraft.status}
+	                    </span>
+	                    {isEditingDraft ? (
+	                      <>
+	                        <Button size="sm" leadingIcon={Save} onClick={() => void saveDraftEdit()} disabled={busy}>
+	                          Save
+	                        </Button>
+	                        <Button
+	                          size="sm"
+	                          variant="ghost"
+	                          leadingIcon={X}
+	                          onClick={() => {
+	                            setEditingDraftId(null);
+	                            setDraftMarkdown('');
+	                          }}
+	                          disabled={busy}
+	                        >
+	                          Cancel
+	                        </Button>
+	                      </>
+	                    ) : (
+	                      <Button
+	                        size="sm"
+	                        variant="ghost"
+	                        leadingIcon={Pencil}
+	                        onClick={startDraftEdit}
+	                        disabled={busy || activeDraft.status === 'published'}
+	                      >
+	                        Edit
+	                      </Button>
+	                    )}
+	                  </div>
+	                ) : null}
+	              </div>
+              {skillDrafts.length > 1 ? (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {skillDrafts.map((draft) => (
                     <Button
+                      key={draft.skill_draft_id}
                       size="sm"
-                      leadingIcon={Check}
-                      onClick={() => onDecide(item, 'approve')}
-                      disabled={busy || item.status === 'approved'}
+                      variant={activeDraft?.skill_draft_id === draft.skill_draft_id ? 'primary' : 'ghost'}
+                      onClick={() => onSelectDraft(draft.skill_draft_id)}
                     >
-                      Approve
+                      {draft.candidate_name}
                     </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      leadingIcon={X}
-                      onClick={() => onDecide(item, 'reject')}
-                      disabled={busy || item.status === 'rejected'}
-                    >
-                      Reject
-                    </Button>
-                  </div>
+                  ))}
                 </div>
-              </Card>
-            ))}
+              ) : null}
+	              {isEditingDraft ? (
+	                <Textarea
+	                  value={draftMarkdown}
+	                  onChange={(event) => setDraftMarkdown(event.target.value)}
+	                  className="mt-4 min-h-[620px] font-mono text-xs"
+	                />
+	              ) : (
+	                <pre className="mt-4 max-h-[620px] overflow-auto whitespace-pre-wrap rounded-control border border-border bg-bg p-4 text-xs text-text-secondary">
+	                  {activeDraft?.content_markdown ?? ''}
+	                </pre>
+	              )}
+            </Card>
+
+            <div className="space-y-4">
+              {activeDraft ? (
+                <Card>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h2 className="text-base font-semibold">Rules</h2>
+                    <div className="flex gap-2">
+                      <Button
+                        size="sm"
+                        leadingIcon={Check}
+                        onClick={() => onDecideDraft(activeDraft, 'approve')}
+                        disabled={busy || activeDraft.status === 'ready_to_publish' || activeDraft.status === 'published'}
+                      >
+                        Approve skill
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        leadingIcon={X}
+                        onClick={() => onDecideDraft(activeDraft, 'reject')}
+                        disabled={busy || activeDraft.status === 'rejected' || activeDraft.status === 'published'}
+                      >
+                        Reject
+                      </Button>
+                    </div>
+                  </div>
+	                  <div className="mt-3 space-y-3">
+	                    {activeDraft.rules.map((rule) => {
+	                      const ruleEdit = ruleEdits[rule.skill_rule_id];
+	                      return (
+	                        <div key={rule.skill_rule_id} className="rounded-control border border-border bg-surface-muted p-3">
+	                          <div className="flex flex-wrap items-center gap-2">
+	                            <span className={cn('rounded-full border px-2 py-0.5 text-xs', statusClass(rule.status))}>
+	                              {rule.status}
+	                            </span>
+	                          <span className="rounded-full border border-border bg-surface px-2 py-0.5 text-xs text-text-secondary">
+	                            {rule.rule_type}
+	                          </span>
+                          {rule.confidence !== null ? (
+                            <span className="text-xs text-text-muted">
+                              confidence {Math.round(rule.confidence * 100)}%
+                            </span>
+	                            ) : null}
+	                          </div>
+	                          {ruleEdit ? (
+	                            <div className="mt-3 space-y-2">
+	                              <Textarea
+	                                value={ruleEdit.statement}
+	                                onChange={(event) => updateRuleEdit(rule.skill_rule_id, 'statement', event.target.value)}
+	                                className="min-h-24 text-sm"
+	                                aria-label="Rule statement"
+	                              />
+	                              <Textarea
+	                                value={ruleEdit.rationale}
+	                                onChange={(event) => updateRuleEdit(rule.skill_rule_id, 'rationale', event.target.value)}
+	                                className="min-h-20 text-xs"
+	                                aria-label="Rule rationale"
+	                              />
+	                            </div>
+	                          ) : (
+	                            <>
+	                              <p className="mt-3 text-sm font-medium">{rule.statement}</p>
+	                              <p className="mt-2 text-xs text-text-secondary">{rule.rationale}</p>
+	                            </>
+	                          )}
+	                          <div className="mt-3 space-y-2">
+	                            <div className="text-xs font-medium text-text-muted">
+	                              {sourceCitationLabel(rule.source_count)}
+	                            </div>
+                          {rule.citations.length ? (
+                            <div className="space-y-2">
+                              {rule.citations.map((citation) => (
+                                <div
+                                  key={citation.citation_id}
+                                  className="rounded-control border border-border bg-surface px-2.5 py-2"
+                                >
+                                  <div className="text-xs font-medium text-text-secondary">
+                                    {citationSourceLabel(citation)}
+                                  </div>
+                                  {citation.evidence_text_preview ? (
+                                    <p className="mt-1 text-xs leading-relaxed text-text-muted">
+                                      {citation.evidence_text_preview}
+                                    </p>
+                                  ) : null}
+                                </div>
+                              ))}
+                            </div>
+	                          ) : (
+	                            <p className="text-xs text-text-muted">No citation details returned.</p>
+	                          )}
+	                        </div>
+	                        <div className="mt-3 flex gap-2">
+	                          {ruleEdit ? (
+	                            <>
+	                              <Button
+	                                size="sm"
+	                                leadingIcon={Save}
+	                                onClick={() => void saveRuleEdit(activeDraft, rule)}
+	                                disabled={busy}
+	                              >
+	                                Save
+	                              </Button>
+	                              <Button
+	                                size="sm"
+	                                variant="ghost"
+	                                leadingIcon={X}
+	                                onClick={() => cancelRuleEdit(rule.skill_rule_id)}
+	                                disabled={busy}
+	                              >
+	                                Cancel
+	                              </Button>
+	                            </>
+	                          ) : (
+	                            <>
+	                              <Button
+	                                size="sm"
+	                                leadingIcon={Check}
+	                                onClick={() => onDecideRule(activeDraft, rule, 'approve')}
+	                                disabled={busy || rule.status === 'approved' || activeDraft.status === 'published'}
+	                              >
+	                                Approve
+	                              </Button>
+	                              <Button
+	                                size="sm"
+	                                variant="ghost"
+	                                leadingIcon={X}
+	                                onClick={() => onDecideRule(activeDraft, rule, 'reject')}
+	                                disabled={busy || rule.status === 'rejected' || activeDraft.status === 'published'}
+	                              >
+	                                Reject
+	                              </Button>
+	                              <Button
+	                                size="sm"
+	                                variant="ghost"
+	                                leadingIcon={Pencil}
+	                                onClick={() => startRuleEdit(rule)}
+	                                disabled={busy || activeDraft.status === 'published'}
+	                              >
+	                                Edit
+	                              </Button>
+	                            </>
+	                          )}
+	                        </div>
+	                      </div>
+	                    );
+	                  })}
+                  </div>
+                </Card>
+              ) : null}
+
+	              {activeDraft ? (
+	                <Card>
+	                  <div>
+	                    <h2 className="text-base font-semibold">Publish Queue</h2>
+	                    <p className="mt-1 text-sm text-text-secondary">Approved skills can be published privately or publicly.</p>
+	                  </div>
+	                  {readyDrafts.length ? (
+	                    <div className="mt-3 space-y-2">
+	                      {readyDrafts.map((draft) => (
+	                        <div
+	                          key={draft.skill_draft_id}
+	                          className="flex flex-wrap items-center justify-between gap-2 rounded-control border border-border bg-surface-muted px-3 py-2"
+	                        >
+	                          <div className="min-w-0">
+	                            <div className="truncate text-sm font-medium">{draft.candidate_name}</div>
+	                            <div className="mt-0.5 text-xs text-text-muted">{draft.rules.length} reviewed rules</div>
+	                          </div>
+	                          <div className="flex gap-2">
+	                            <Button
+	                              size="sm"
+	                              leadingIcon={FileCode2}
+	                              onClick={() => onPublishDraft(draft, 'private')}
+	                              disabled={busy}
+	                            >
+	                              Private
+	                            </Button>
+	                            <Button
+	                              size="sm"
+	                              variant="ghost"
+	                              leadingIcon={UploadCloud}
+	                              onClick={() => onPublishDraft(draft, 'public')}
+	                              disabled={busy}
+	                            >
+	                              Public
+	                            </Button>
+	                          </div>
+	                        </div>
+	                      ))}
+	                    </div>
+	                  ) : (
+	                    <p className="mt-3 text-sm text-text-secondary">No approved skills are waiting to publish.</p>
+	                  )}
+	                  {published.length ? (
+	                    <div className="mt-3 space-y-2">
+                      {published.map((record) => (
+                        <div key={record.version_id} className="rounded-control border border-success/30 bg-success/10 px-3 py-2 text-sm text-success">
+                          {record.skill_name} published {record.visibility}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </Card>
+              ) : null}
+            </div>
           </div>
         ) : (
           <Card>
             <p className="text-sm text-text-secondary">
-              Select sessions and run Skillify to extract reviewable candidate rules.
+              Select sessions or text files and run Skillify to generate reviewable draft skills.
             </p>
           </Card>
         )}
-
-        <Card>
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="min-w-0">
-              <h2 className="text-base font-semibold">Draft Skill</h2>
-              <p className="mt-1 text-sm text-text-secondary">
-                Creates a draft personal skill from approved candidates. Activation remains a separate human action.
-              </p>
-            </div>
-            <Button
-              leadingIcon={FileCode2}
-              onClick={onCreateDraft}
-              disabled={busy || !run || approvedCount === 0}
-            >
-              Create draft
-            </Button>
-          </div>
-          {draft ? (
-            <div className="mt-4 rounded-control border border-border bg-bg p-3">
-              <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
-                <span className="font-medium">{draft.skill_name}</span>
-                <span className="text-text-muted">{draft.approved_item_count} rules</span>
-              </div>
-              <pre className="mt-3 max-h-72 overflow-auto whitespace-pre-wrap text-xs text-text-secondary">
-                {draft.content_markdown}
-              </pre>
-            </div>
-          ) : null}
-        </Card>
       </section>
     </div>
   );

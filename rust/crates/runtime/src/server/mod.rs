@@ -57,6 +57,7 @@ mod session_quota;
 mod session_todo_handlers;
 pub mod session_todo_sweeper;
 mod session_trace;
+mod skillify_agent_executor;
 mod state_builder;
 mod task_handlers;
 mod team_handlers;

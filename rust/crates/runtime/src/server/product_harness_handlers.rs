@@ -74,6 +74,80 @@ pub async fn decide_harness_item_handler(
         .map(Json)
 }
 
+pub async fn list_skill_drafts_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(harness_run_id): Path<String>,
+) -> Result<Json<Vec<HarnessSkillDraftRecord>>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .harness_service
+        .list_skill_drafts(user.user_id, harness_run_id)
+        .await
+        .map(Json)
+}
+
+pub async fn get_skill_draft_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((harness_run_id, skill_draft_id)): Path<(String, String)>,
+) -> Result<Json<HarnessSkillDraftRecord>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .harness_service
+        .get_skill_draft(user.user_id, harness_run_id, skill_draft_id)
+        .await
+        .map(Json)
+}
+
+pub async fn decide_skill_draft_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((harness_run_id, skill_draft_id)): Path<(String, String)>,
+    Json(request): Json<HarnessDecisionRequest>,
+) -> Result<Json<HarnessSkillDraftRecord>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .harness_service
+        .decide_skill_draft(user.user_id, harness_run_id, skill_draft_id, request)
+        .await
+        .map(Json)
+}
+
+pub async fn decide_skill_rule_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((harness_run_id, skill_draft_id, skill_rule_id)): Path<(String, String, String)>,
+    Json(request): Json<HarnessDecisionRequest>,
+) -> Result<Json<HarnessSkillDraftRecord>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .harness_service
+        .decide_skill_rule(
+            user.user_id,
+            harness_run_id,
+            skill_draft_id,
+            skill_rule_id,
+            request,
+        )
+        .await
+        .map(Json)
+}
+
+pub async fn publish_skill_draft_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((harness_run_id, skill_draft_id)): Path<(String, String)>,
+    Json(request): Json<SkillifyPublishRequest>,
+) -> Result<(StatusCode, Json<SkillifyPublishRecord>), (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .harness_service
+        .publish_skill_draft(user.user_id, harness_run_id, skill_draft_id, request)
+        .await
+        .map(|record| (StatusCode::CREATED, Json(record)))
+}
+
 pub async fn create_skillify_draft_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

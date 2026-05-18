@@ -251,8 +251,64 @@ export type HarnessItem = {
   updated_at: string;
 };
 
+export type HarnessCitation = {
+  citation_id: string;
+  harness_run_id: string;
+  item_id: string;
+  skill_draft_id: string | null;
+  skill_rule_id: string | null;
+  source_id: string | null;
+  source_locator_json: Record<string, unknown>;
+  artifact_id: string | null;
+  quote_hash: string | null;
+  evidence_text_preview: string | null;
+  relevance_score: number | null;
+  created_by_node_id: string | null;
+  created_at: string;
+};
+
+export type HarnessSkillRule = {
+  skill_rule_id: string;
+  skill_draft_id: string;
+  harness_run_id: string;
+  rule_type: string;
+  statement: string;
+  rationale: string;
+  status: string;
+  confidence: number | null;
+  source_count: number;
+  created_by_node_id: string | null;
+  created_at: string;
+  updated_at: string;
+  citations: HarnessCitation[];
+};
+
+export type HarnessSkillDraft = {
+  skill_draft_id: string;
+  harness_run_id: string;
+  candidate_name: string;
+  description: string;
+  target_scope: string;
+  publish_visibility: string;
+  content_markdown: string;
+  source_summary_json: Record<string, unknown>;
+  status: string;
+  confidence: number | null;
+  created_by_node_id: string | null;
+  revision: number;
+  published_version_id: string | null;
+  created_at: string;
+  updated_at: string;
+  rules: HarnessSkillRule[];
+};
+
 export type SkillifyRunRequest = {
   session_ids: string[];
+  source_files?: Array<{
+    file_name: string;
+    mime_type?: string | null;
+    content: string;
+  }>;
   skill_name?: string | null;
   topic?: string | null;
   target_scope?: 'personal' | 'project';
@@ -277,4 +333,20 @@ export type SkillifyDraft = {
   version_id: string;
   content_markdown: string;
   approved_item_count: number;
+};
+
+export type SkillifyPublishRequest = {
+  visibility?: 'private' | 'public';
+  version?: string | null;
+  description?: string | null;
+};
+
+export type SkillifyPublishRecord = {
+  harness_run_id: string;
+  skill_draft_id: string;
+  skill_name: string;
+  version_id: string;
+  visibility: string;
+  content_markdown: string;
+  approved_rule_count: number;
 };
