@@ -457,10 +457,11 @@ mod tests {
         t.finalize();
 
         let out = render(&t, 100, 4);
+        let normalized = out.replace('\n', " ");
         assert!(out.contains("Task interrupted"), "{out}");
         assert!(!out.contains("Task failed"), "{out}");
         assert!(
-            out.contains(
+            normalized.contains(
                 "Parent turn budget was exhausted and cancelled the child agent before it returned a final result"
             ),
             "{out}"
