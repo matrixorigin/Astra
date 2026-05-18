@@ -1219,7 +1219,7 @@ fn server_trace_context(
     let turn_id = server_turn_id(run_id);
     TraceContext {
         root_event_id: trace_event_id("user", &[session_id, &turn_id]),
-        causal_chain_id: trace_event_id("chain", &[session_id, &turn_id]),
+        causal_chain_id: server_loop_causal_chain_id("server-loop"),
         session_id: session_id.to_string(),
         user_id: user_id.to_string(),
         turn_id,

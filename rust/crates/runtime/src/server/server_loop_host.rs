@@ -136,6 +136,11 @@ fn record_full_llm_request_event(
                 "turn_chain_id": trace.turn_chain_id,
                 "user_query_event_id": trace.user_query_event_id,
             },
+            "request": crate::turn::llm_exchange_capture::build_capture_request_json(
+                messages,
+                tools,
+                max_output_tokens,
+            ),
             "prompt_request_id": prompt_request_plan.as_ref().map(|plan| plan.request_id.as_str()),
             "request_hash": prompt_request_plan.as_ref().map(|plan| plan.request_hash.as_str()),
             "request_summary": prompt_request_plan

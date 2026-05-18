@@ -496,6 +496,11 @@ fn record_full_llm_request_event(
                 "turn_chain_id": trace.turn_chain_id,
                 "user_query_event_id": trace.user_query_event_id,
             },
+            "request": crate::turn::llm_exchange_capture::build_capture_request_json(
+                messages,
+                tools,
+                max_output_tokens,
+            ),
             "prompt_request_id": prompt_request_plan.as_ref().map(|plan| plan.request_id.as_str()),
             "request_hash": prompt_request_plan.as_ref().map(|plan| plan.request_hash.as_str()),
             "request_summary": prompt_request_plan
@@ -5910,7 +5915,19 @@ mod tests {
         );
         assert_eq!(
             llm_events[0]["metadata"]["request_summary"]["message_count"].as_u64(),
-            Some(1)
+            Some(2)
+        );
+        assert_eq!(
+            llm_events[0]["metadata"]["request_summary"]["message_roles"][0]["role"].as_str(),
+            Some("system")
+        );
+        assert_eq!(
+            llm_events[0]["metadata"]["request_summary"]["message_roles"][1]["role"].as_str(),
+            Some("user")
+        );
+        assert_eq!(
+            llm_events[0]["metadata"]["request"]["messages"][1]["role"].as_str(),
+            Some("user")
         );
         assert!(
             llm_events[0]["metadata"]["trace"]["turn_chain_id"]

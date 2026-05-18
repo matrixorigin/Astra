@@ -133,7 +133,6 @@ impl OutputStream {
         }
         file.write_all(bytes)
             .and_then(|_| file.flush())
-            .and_then(|_| file.sync_data())
             .map_err(|source| OutputStreamError::Write {
                 path: self.path.clone(),
                 source,

@@ -574,6 +574,13 @@ fn run_blocks_session(status: &str, waiting_for: Option<&str>) -> bool {
     matches!(status, "running" | "waiting") || (status == "paused" && waiting_for.is_some())
 }
 
+fn run_requires_session_exclusive_start(record: &DurableRunRecord) -> bool {
+    record.parent_run_id.is_none()
+        && record.retry_of.is_none()
+        && record.delegation_id.is_none()
+        && record.agent_id.is_none()
+}
+
 fn checkpoint_metadata(
     run_id: &str,
     checkpoint_json: &str,
@@ -583,23 +590,25 @@ fn checkpoint_metadata(
     let object = value
         .as_object()
         .ok_or_else(|| "checkpoint payload must be a JSON object".to_string())?;
+    let checkpoint_kind = if object.contains_key("phase") {
+        "phase".to_string()
+    } else {
+        validate_checkpoint_payload(object)?;
+        if object
+            .get("graceful")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            "resume".to_string()
+        } else {
+            "checkpoint".to_string()
+        }
+    };
     let checkpoint_version = object
         .get("version")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("checkpoint_unversioned_v1")
+        .unwrap_or("phase_checkpoint_v1")
         .to_string();
-    let checkpoint_kind = if object
-        .get("graceful")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        "resume"
-    } else if object.contains_key("phase") {
-        "phase"
-    } else {
-        "generic"
-    }
-    .to_string();
     let idempotency_key = object
         .get("last_batch_id")
         .and_then(serde_json::Value::as_str)
@@ -609,6 +618,53 @@ fn checkpoint_metadata(
             format!("checkpoint:{run_id}:{checkpoint_kind}:{hash}")
         });
     Ok((checkpoint_kind, checkpoint_version, idempotency_key))
+}
+
+fn validate_checkpoint_payload(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let Some(version) = object.get("version").and_then(serde_json::Value::as_str) else {
+        return Err("version must be checkpoint_vN".to_string());
+    };
+    if !is_checkpoint_version(version) {
+        return Err("version must be checkpoint_vN".to_string());
+    }
+    if object.contains_key("graceful")
+        && !matches!(object.get("graceful"), Some(serde_json::Value::Bool(_)))
+    {
+        return Err("graceful must be boolean".to_string());
+    }
+    if object.contains_key("last_batch_id")
+        && object
+            .get("last_batch_id")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return Err("last_batch_id must be string".to_string());
+    }
+    let extra = match object.get("extra") {
+        Some(serde_json::Value::Object(extra)) => Some(extra),
+        Some(_) => return Err("extra must be object".to_string()),
+        None => None,
+    };
+    if let Some(partial) = extra.and_then(|extra| {
+        extra
+            .get("partial_progress")
+            .and_then(serde_json::Value::as_object)
+    }) {
+        for key in ["step_index", "total_steps", "resumable_marker"] {
+            if !partial.contains_key(key) {
+                return Err(format!("extra.partial_progress.{key} is required"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_checkpoint_version(version: &str) -> bool {
+    version
+        .strip_prefix("checkpoint_v")
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
 }
 
 fn checkpoint_summary_tuple(checkpoint: &DurableRunCheckpointRecord) -> (String, String, String) {
@@ -663,7 +719,7 @@ impl RunStateStore for InMemoryRunStateStore {
     async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
         let mut runs = self.runs.write().await;
         let run_id = record.run_id.clone();
-        if record.parent_run_id.is_none()
+        if run_requires_session_exclusive_start(&record)
             && runs.values().any(|run| {
                 run.user_id == record.user_id
                     && run.session_id == record.session_id
@@ -1560,7 +1616,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 .unwrap_or_else(|_| chrono::Duration::seconds(45));
         let events = std::mem::take(&mut record.events);
 
-        let insert_result = if record.parent_run_id.is_none() {
+        let insert_result = if run_requires_session_exclusive_start(&record) {
             sqlx::query(
                 "INSERT INTO agent_runs
                  (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
@@ -2576,8 +2632,82 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn durable_run_record(run_id: &str) -> DurableRunRecord {
+        DurableRunRecord {
+            run_id: run_id.to_string(),
+            session_id: "s1".into(),
+            user_id: "u1".into(),
+            status: "running".into(),
+            parent_run_id: None,
+            root_run_id: Some(run_id.to_string()),
+            ancestor_path: Some(run_id.to_string()),
+            depth: 0,
+            delegation_id: None,
+            agent_id: None,
+            retry_of: None,
+            retry_scope: None,
+            waiting_for: None,
+            owner_pod_id: None,
+            owner_lease_expires_at: None,
+            run_generation: 0,
+            last_event_idx: -1,
+            checkpoint_version: None,
+            checkpoint_json: None,
+            error_code: None,
+            error_message: None,
+            retry_count: 0,
+            total_prompt_tokens: 0,
+            total_completion_tokens: 0,
+            total_tool_calls: 0,
+            events: vec![],
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
     fn make_event(event_type: &str, data: serde_json::Value) -> serde_json::Value {
         json!({"event_type": event_type, "data": data})
+    }
+
+    #[test]
+    fn session_exclusive_start_applies_only_to_user_root_runs() {
+        let root = durable_run_record("root");
+        assert!(run_requires_session_exclusive_start(&root));
+
+        let mut retry = durable_run_record("retry");
+        retry.retry_of = Some("root".into());
+        assert!(!run_requires_session_exclusive_start(&retry));
+
+        let mut child = durable_run_record("child");
+        child.parent_run_id = Some("root".into());
+        assert!(!run_requires_session_exclusive_start(&child));
+
+        let mut delegated = durable_run_record("delegated");
+        delegated.delegation_id = Some("delegation-1".into());
+        assert!(!run_requires_session_exclusive_start(&delegated));
+
+        let mut team_parent = durable_run_record("team-parent");
+        team_parent.agent_id = Some("orchestrator".into());
+        assert!(!run_requires_session_exclusive_start(&team_parent));
+    }
+
+    #[test]
+    fn checkpoint_metadata_validates_versioned_checkpoints() {
+        assert!(checkpoint_metadata("run", r#"{"version":"bad"}"#).is_err());
+
+        let (kind, version, idempotency_key) = checkpoint_metadata(
+            "run",
+            r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"batch-1"}"#,
+        )
+        .expect("valid checkpoint");
+        assert_eq!(kind, "resume");
+        assert_eq!(version, "checkpoint_v2");
+        assert_eq!(idempotency_key, "checkpoint:run:resume:batch-1");
+
+        let (kind, version, _) =
+            checkpoint_metadata("run", r#"{"phase":"shutdown"}"#).expect("phase checkpoint");
+        assert_eq!(kind, "phase");
+        assert_eq!(version, "phase_checkpoint_v1");
     }
 
     #[test]
