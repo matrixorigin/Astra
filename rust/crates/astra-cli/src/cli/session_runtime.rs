@@ -920,7 +920,7 @@ pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
         // Header — title is embedded inline; brighter so it stands out.
         eprint!("{}", "╭".white().bold());
         eprint!("{}", "─".repeat(*lead_dash).white().bold());
-        eprint!("{}", title_padded.bold().magenta());
+        eprint!("{}", title_padded.bold().cyan());
         eprint!("{}", "─".repeat(*trail_dash).white().bold());
         eprintln!("{}", "╮".white().bold());
         // Body
@@ -995,7 +995,7 @@ pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     let model_hint = if model_display == "auto" {
         format!("{} {}", "auto".yellow(), "mode".grey())
     } else {
-        format!("{} {}", model_display.magenta(), "mode".grey())
+        format!("{} {}", model_display.cyan(), "mode".grey())
     };
     eprintln!(
         "  {} {} {}",

@@ -66,7 +66,7 @@ pub struct ThemeConfig {
     /// Theme display name
     pub name: String,
     /// Prompt color (default: magenta)
-    #[serde(default = "default_magenta")]
+    #[serde(default = "default_cyan")]
     pub prompt: ThemeColor,
     /// Success messages (default: green)
     #[serde(default = "default_green")]
@@ -78,13 +78,13 @@ pub struct ThemeConfig {
     #[serde(default = "default_yellow")]
     pub warning: ThemeColor,
     /// Info/accent color (default: magenta)
-    #[serde(default = "default_magenta")]
+    #[serde(default = "default_cyan")]
     pub info: ThemeColor,
     /// Section headers (default: magenta)
-    #[serde(default = "default_magenta")]
+    #[serde(default = "default_cyan")]
     pub section_color: ThemeColor,
     /// Tool call display (default: magenta)
-    #[serde(default = "default_magenta")]
+    #[serde(default = "default_cyan")]
     pub tool: ThemeColor,
     /// Use bold for headers
     #[serde(default = "default_true")]
@@ -94,8 +94,8 @@ pub struct ThemeConfig {
     pub dim_secondary: bool,
 }
 
-fn default_magenta() -> ThemeColor {
-    ThemeColor::Magenta
+fn default_cyan() -> ThemeColor {
+    ThemeColor::Cyan
 }
 fn default_green() -> ThemeColor {
     ThemeColor::Green
@@ -114,13 +114,13 @@ impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
             name: "default".to_string(),
-            prompt: ThemeColor::Magenta,
+            prompt: ThemeColor::Cyan,
             success: ThemeColor::Green,
             error: ThemeColor::Red,
             warning: ThemeColor::Yellow,
-            info: ThemeColor::Magenta,
-            section_color: ThemeColor::Magenta,
-            tool: ThemeColor::Magenta,
+            info: ThemeColor::Cyan,
+            section_color: ThemeColor::Cyan,
+            tool: ThemeColor::Cyan,
             bold_headers: true,
             dim_secondary: true,
         }
@@ -150,7 +150,7 @@ pub fn current_theme() -> ThemeConfig {
 // treats them as width=0.
 
 /// Default prompt: magenta bold `>`
-pub const PROMPT_DEFAULT: &str = "\x1b[1;35m>\x1b[0m ";
+pub const PROMPT_DEFAULT: &str = "\x1b[1;36m>\x1b[0m ";
 
 /// Plan mode prompt: yellow bold `plan>`
 pub const PROMPT_PLAN: &str = "\x1b[1;33mplan>\x1b[0m ";
@@ -159,7 +159,7 @@ pub const PROMPT_PLAN: &str = "\x1b[1;33mplan>\x1b[0m ";
 pub const PROMPT_PAUSE: &str = "\x1b[1;33mpause>\x1b[0m ";
 
 /// Background plan running prompt: magenta bold `bg>`
-pub const PROMPT_BG: &str = "\x1b[1;35mbg>\x1b[0m ";
+pub const PROMPT_BG: &str = "\x1b[1;36mbg>\x1b[0m ";
 
 /// Chat plan-only mode prompt: yellow bold `plan.`
 pub const PROMPT_PLAN_ONLY: &str = "\x1b[1;33mplan.\x1b[0m ";
