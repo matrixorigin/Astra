@@ -768,6 +768,20 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         self.capabilities.clone()
     }
 
+    async fn cancel_child_agents(&mut self, agent_ids: &[String], reason: &str) -> Vec<String> {
+        let Some(spawn_context) = self.executor.spawn_context.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut cancelled = Vec::new();
+        for agent_id in agent_ids {
+            if spawn_context.spawner.cancel_agent(agent_id, reason).await {
+                cancelled.push(agent_id.clone());
+            }
+        }
+        cancelled
+    }
+
     fn inject_tool_schema(&mut self, schema: Value) {
         if let Some(name) = schema
             .get("function")

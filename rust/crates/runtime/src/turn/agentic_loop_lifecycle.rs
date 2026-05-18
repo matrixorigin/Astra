@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -60,7 +61,7 @@ pub(crate) fn completed_tool_calls(state: &AgenticLoopState) -> u32 {
         .min(u32::MAX as usize) as u32
 }
 
-fn budget_exhaustion_completion_text(state: &AgenticLoopState) -> String {
+fn default_budget_exhaustion_completion_text(state: &AgenticLoopState) -> String {
     let checkpoint_note = if state.stall.last_heavy_checkpoint.is_some() {
         " The latest checkpoint was saved, so you can continue in the next message."
     } else {
@@ -79,6 +80,312 @@ fn budget_exhaustion_completion_text(state: &AgenticLoopState) -> String {
             completed_agentic_turns, checkpoint_note
         )
     }
+}
+
+#[derive(Default)]
+struct ParallelAgentSummary {
+    label: Option<String>,
+    completed_result: Option<String>,
+    incomplete_reason: Option<String>,
+    control_errors: Vec<String>,
+}
+
+struct CompletedParallelAgent {
+    label: String,
+    result: String,
+}
+
+struct UnfinishedParallelAgent {
+    agent_id: String,
+    label: String,
+    incomplete_reason: Option<String>,
+    control_errors: Vec<String>,
+}
+
+struct ParallelAgentBudgetRollup {
+    completed: Vec<CompletedParallelAgent>,
+    unfinished: Vec<UnfinishedParallelAgent>,
+}
+
+fn parse_embedded_json(raw: Option<&str>) -> Option<Value> {
+    raw.and_then(|text| serde_json::from_str::<Value>(text).ok())
+}
+
+fn agent_id_from_record(
+    record: &astra_services::session_journal::ToolCallRecord,
+    parsed_result: Option<&Value>,
+) -> Option<String> {
+    record
+        .args_full
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| {
+            value
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            parsed_result
+                .and_then(|value| value.get("agent_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn summarize_agent_result(text: &str) -> String {
+    const MAX_CHARS: usize = 320;
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= MAX_CHARS {
+        trimmed.to_string()
+    } else {
+        let mut clipped: String = trimmed.chars().take(MAX_CHARS.saturating_sub(1)).collect();
+        clipped.push('…');
+        clipped
+    }
+}
+
+fn summarize_control_error(error: &str) -> String {
+    if error.contains("duplicate_within_turn") {
+        "same-turn retries hit duplicate_within_turn".to_string()
+    } else if error.contains("blocked_tool") {
+        "later retries were blocked after the tool was restricted".to_string()
+    } else {
+        error.lines().next().unwrap_or(error).trim().to_string()
+    }
+}
+
+fn summarize_incomplete_agent_state(parsed: &Value) -> Option<String> {
+    match parsed.get("status").and_then(Value::as_str) {
+        Some("still_running") => {
+            let detail = parsed
+                .get("current_status")
+                .and_then(Value::as_str)
+                .unwrap_or("still running");
+            Some(format!(
+                "still running when the wait window expired ({detail})"
+            ))
+        }
+        Some("timeout") => Some(
+            parsed
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("timed out while waiting for the child result")
+                .to_string(),
+        ),
+        Some("failed") => Some(
+            parsed
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("child result retrieval failed")
+                .to_string(),
+        ),
+        Some("unknown") => Some(
+            parsed
+                .get("detail")
+                .and_then(Value::as_str)
+                .unwrap_or("child agent returned an unknown status")
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+fn collect_parallel_agent_budget_rollup(
+    state: &AgenticLoopState,
+) -> Option<ParallelAgentBudgetRollup> {
+    let mut summaries: BTreeMap<String, ParallelAgentSummary> = BTreeMap::new();
+    let mut order: Vec<String> = Vec::new();
+
+    for record in &state.stall.tool_call_records {
+        if record.name != "agent" {
+            continue;
+        }
+        let action = record.args_preview.as_deref().unwrap_or_default();
+        let parsed_result = parse_embedded_json(
+            record
+                .result_full
+                .as_deref()
+                .or(record.result_preview.as_deref()),
+        );
+
+        match action {
+            "spawn" => {
+                let Some(agent_id) = agent_id_from_record(record, parsed_result.as_ref()) else {
+                    continue;
+                };
+                if !order.iter().any(|id| id == &agent_id) {
+                    order.push(agent_id.clone());
+                }
+                let entry = summaries.entry(agent_id).or_default();
+                if entry.label.is_none() {
+                    entry.label = parsed_result
+                        .as_ref()
+                        .and_then(|value| value.get("description"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| {
+                            record
+                                .args_full
+                                .as_deref()
+                                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                                .and_then(|value| {
+                                    value
+                                        .get("description")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_string)
+                                })
+                        });
+                }
+            }
+            "get_result" => {
+                let Some(agent_id) = agent_id_from_record(record, parsed_result.as_ref()) else {
+                    continue;
+                };
+                if !order.iter().any(|id| id == &agent_id) {
+                    order.push(agent_id.clone());
+                }
+                let entry = summaries.entry(agent_id).or_default();
+                if let Some(error) = record.error.as_deref() {
+                    let summarized = summarize_control_error(error);
+                    if !entry
+                        .control_errors
+                        .iter()
+                        .any(|existing| existing == &summarized)
+                    {
+                        entry.control_errors.push(summarized);
+                    }
+                }
+                if let Some(parsed) = parsed_result.as_ref() {
+                    match parsed.get("status").and_then(Value::as_str) {
+                        Some("completed") | Some("interrupted") => {
+                            if let Some(result) = parsed.get("result").and_then(Value::as_str) {
+                                entry.completed_result = Some(result.to_string());
+                            }
+                        }
+                        _ => {
+                            if entry.completed_result.is_none() {
+                                entry.incomplete_reason = summarize_incomplete_agent_state(parsed);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let completed: Vec<_> = order
+        .iter()
+        .filter_map(|agent_id| {
+            summaries.get(agent_id).and_then(|entry| {
+                entry
+                    .completed_result
+                    .as_ref()
+                    .map(|result| CompletedParallelAgent {
+                        label: entry.label.clone().unwrap_or_else(|| agent_id.clone()),
+                        result: result.clone(),
+                    })
+            })
+        })
+        .collect();
+    let unfinished: Vec<_> = order
+        .iter()
+        .filter_map(|agent_id| {
+            summaries.get(agent_id).and_then(|entry| {
+                if entry.completed_result.is_some() {
+                    return None;
+                }
+                Some(UnfinishedParallelAgent {
+                    agent_id: agent_id.clone(),
+                    label: entry.label.clone().unwrap_or_else(|| agent_id.clone()),
+                    incomplete_reason: entry.incomplete_reason.clone(),
+                    control_errors: entry.control_errors.clone(),
+                })
+            })
+        })
+        .collect();
+
+    if completed.is_empty() || unfinished.is_empty() {
+        return None;
+    }
+
+    Some(ParallelAgentBudgetRollup {
+        completed,
+        unfinished,
+    })
+}
+
+fn parallel_agent_budget_exhaustion_summary(
+    state: &AgenticLoopState,
+    cancelled_agents: &HashSet<String>,
+) -> Option<String> {
+    let rollup = collect_parallel_agent_budget_rollup(state)?;
+
+    let checkpoint_note = if state.stall.last_heavy_checkpoint.is_some() {
+        " The latest checkpoint was saved, so you can continue in the next message."
+    } else {
+        " You can continue in the next message."
+    };
+    let mut lines = vec![
+        format!(
+            "[Turn budget exhausted after {} agentic turn(s). {} parallel sub-agent result(s) completed; {} did not finish before the turn ended.{}]",
+            current_agentic_step(state),
+            rollup.completed.len(),
+            rollup.unfinished.len(),
+            checkpoint_note
+        ),
+        String::new(),
+        "Completed sub-agent results:".to_string(),
+    ];
+    for (idx, entry) in rollup.completed.iter().enumerate() {
+        lines.push(format!(
+            "{}. {} — {}",
+            idx + 1,
+            entry.label,
+            summarize_agent_result(&entry.result)
+        ));
+    }
+    lines.push(String::new());
+    lines.push("Unfinished sub-agent results:".to_string());
+    for (idx, entry) in rollup.unfinished.iter().enumerate() {
+        let mut detail = entry
+            .incomplete_reason
+            .as_deref()
+            .map(str::to_string)
+            .unwrap_or_else(|| "did not finish before the turn budget was exhausted".to_string());
+        if cancelled_agents.contains(&entry.agent_id) {
+            detail.push_str(
+                "; the parent turn budget was exhausted and the parent cancelled this sub-agent",
+            );
+        }
+        if !entry.control_errors.is_empty() {
+            detail.push_str("; ");
+            detail.push_str(&entry.control_errors.join("; "));
+        }
+        lines.push(format!("{}. {} — {}", idx + 1, entry.label, detail));
+    }
+    Some(lines.join("\n"))
+}
+
+fn unfinished_parallel_agent_ids(state: &AgenticLoopState) -> Vec<String> {
+    collect_parallel_agent_budget_rollup(state)
+        .map(|rollup| {
+            rollup
+                .unfinished
+                .into_iter()
+                .map(|entry| entry.agent_id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn budget_exhaustion_completion_text(
+    state: &AgenticLoopState,
+    cancelled_agents: &HashSet<String>,
+) -> String {
+    parallel_agent_budget_exhaustion_summary(state, cancelled_agents)
+        .unwrap_or_else(|| default_budget_exhaustion_completion_text(state))
 }
 
 fn used_budget_extensions(state: &AgenticLoopState) -> u32 {
@@ -504,7 +811,15 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 ResumeAction::ContinueImmediately,
                 interruption_state_summary(state, None),
             ));
-            state.final_text = budget_exhaustion_completion_text(state);
+            let cancelled_agents: HashSet<String> = host
+                .cancel_child_agents(
+                    &unfinished_parallel_agent_ids(state),
+                    "parent turn budget exhausted",
+                )
+                .await
+                .into_iter()
+                .collect();
+            state.final_text = budget_exhaustion_completion_text(state, &cancelled_agents);
             state.final_text_streamed = false;
             if !quiet {
                 host.emit_headless_line(
@@ -1081,12 +1396,31 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 
 #[cfg(test)]
 mod tests {
+    use astra_services::session_journal::ToolCallRecord;
     use serde_json::json;
 
     use crate::turn::agentic_loop_host::run_agentic_loop_with_host;
     use crate::turn::agentic_loop_host::tests::{MockHost, make_state, text_result};
 
     use super::*;
+
+    fn agent_record(
+        action: &str,
+        args: serde_json::Value,
+        result: Option<serde_json::Value>,
+        error: Option<&str>,
+    ) -> ToolCallRecord {
+        ToolCallRecord {
+            name: "agent".into(),
+            ok: error.is_none(),
+            ms: 0,
+            error: error.map(str::to_string),
+            args_preview: Some(action.to_string()),
+            args_full: Some(args.to_string()),
+            result_full: result.map(|value| value.to_string()),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn open_ended_file_exploration_detection_requires_file_and_loop_signal() {
@@ -1171,6 +1505,173 @@ mod tests {
             current_agentic_step(&state),
             14,
             "agentic_step must not skip when control-only loop iterations consume remaining_turns"
+        );
+    }
+
+    #[test]
+    fn budget_exhaustion_summary_prefers_partial_parallel_agent_results() {
+        let mut state = make_state();
+        state.max_turns = 13;
+        state.remaining_turns = 0;
+        state.llm_rounds_completed = 13;
+        state.total_tool_calls = 8;
+        state.stall.tool_call_records = vec![
+            agent_record(
+                "spawn",
+                json!({"description":"Review architecture"}),
+                Some(json!({
+                    "status":"launched",
+                    "agent_id":"agent-a",
+                    "description":"Review architecture"
+                })),
+                None,
+            ),
+            agent_record(
+                "spawn",
+                json!({"description":"Review bugs"}),
+                Some(json!({
+                    "status":"launched",
+                    "agent_id":"agent-b",
+                    "description":"Review bugs"
+                })),
+                None,
+            ),
+            agent_record(
+                "spawn",
+                json!({"description":"Review security"}),
+                Some(json!({
+                    "status":"launched",
+                    "agent_id":"agent-c",
+                    "description":"Review security"
+                })),
+                None,
+            ),
+            agent_record(
+                "get_result",
+                json!({"agent_id":"agent-a"}),
+                Some(json!({
+                    "status":"completed",
+                    "agent_id":"agent-a",
+                    "result":"Architecture review finished: layout looks good."
+                })),
+                None,
+            ),
+            agent_record(
+                "get_result",
+                json!({"agent_id":"agent-b"}),
+                Some(json!({
+                    "status":"completed",
+                    "agent_id":"agent-b",
+                    "result":"Bug review finished: no blocker found."
+                })),
+                None,
+            ),
+            agent_record(
+                "get_result",
+                json!({"agent_id":"agent-c"}),
+                Some(json!({
+                    "status":"still_running",
+                    "agent_id":"agent-c",
+                    "current_status":"Running { activity: \"executing\" }"
+                })),
+                None,
+            ),
+            agent_record(
+                "get_result",
+                json!({"agent_id":"agent-c"}),
+                None,
+                Some("duplicate_within_turn"),
+            ),
+            agent_record(
+                "get_result",
+                json!({"agent_id":"agent-c"}),
+                None,
+                Some("blocked_tool: Tool 'agent' is currently restricted in this session."),
+            ),
+        ];
+
+        let text = budget_exhaustion_completion_text(&state, &HashSet::new());
+
+        assert!(text.contains("Turn budget exhausted"), "{text}");
+        assert!(text.contains("Review architecture"), "{text}");
+        assert!(text.contains("Architecture review finished"), "{text}");
+        assert!(text.contains("Review bugs"), "{text}");
+        assert!(text.contains("Bug review finished"), "{text}");
+        assert!(text.contains("Review security"), "{text}");
+        assert!(
+            text.contains("still running") || text.contains("did not finish"),
+            "{text}"
+        );
+        assert!(
+            text.contains("duplicate_within_turn") || text.contains("restricted"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_exhaustion_wrapup_cancels_unfinished_parallel_agents() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.max_turns = 13;
+        state.remaining_turns = 0;
+        state.llm_rounds_completed = 13;
+        state.total_tool_calls = 8;
+        state.stall.tool_call_records = vec![
+            agent_record(
+                "spawn",
+                json!({"description":"Review architecture"}),
+                Some(json!({
+                    "status":"launched",
+                    "agent_id":"agent-a",
+                    "description":"Review architecture"
+                })),
+                None,
+            ),
+            agent_record(
+                "spawn",
+                json!({"description":"Review security"}),
+                Some(json!({
+                    "status":"launched",
+                    "agent_id":"agent-c",
+                    "description":"Review security"
+                })),
+                None,
+            ),
+            agent_record(
+                "get_result",
+                json!({"agent_id":"agent-a"}),
+                Some(json!({
+                    "status":"completed",
+                    "agent_id":"agent-a",
+                    "result":"Architecture review finished."
+                })),
+                None,
+            ),
+            agent_record(
+                "get_result",
+                json!({"agent_id":"agent-c"}),
+                Some(json!({
+                    "status":"still_running",
+                    "agent_id":"agent-c",
+                    "current_status":"Running { activity: \"executing\" }"
+                })),
+                None,
+            ),
+        ];
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 13)
+            .await
+            .expect("budget exhaustion should finish cleanly");
+
+        assert!(matches!(
+            prepared,
+            PreparedTurnIteration::Finished(AgenticLoopOutcome::Completed)
+        ));
+        assert_eq!(host.cancelled_agent_ids, vec!["agent-c".to_string()]);
+        assert!(
+            state.final_text.contains("parent cancelled this sub-agent"),
+            "{}",
+            state.final_text
         );
     }
 

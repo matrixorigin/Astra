@@ -321,6 +321,9 @@ pub struct DynamicAgentSpawner {
     /// JoinSet tracking all in-flight background agent tasks for graceful shutdown drain.
     /// Shared across `clone_for_task` clones so every background handle lands here.
     background_tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
+    /// Per-agent abort handles for background children so the parent can cancel
+    /// a single lagging sub-agent without killing siblings.
+    background_abort_handles: Arc<RwLock<HashMap<String, tokio::task::AbortHandle>>>,
     /// Agent IDs spawned in background mode, for result collection after drain.
     background_agent_ids: Arc<std::sync::Mutex<Vec<String>>>,
     /// Completion notifiers: get_agent_result awaits these instead of polling.
@@ -356,6 +359,7 @@ impl DynamicAgentSpawner {
                 astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            background_abort_handles: Arc::new(RwLock::new(HashMap::new())),
             background_agent_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             completion_notifiers: Arc::new(RwLock::new(HashMap::new())),
             prefix_store: None,
@@ -871,10 +875,15 @@ impl DynamicAgentSpawner {
                     let result = executor.execute(run_config).await;
                     spawner.handle_completion(&agent_id_clone, result).await;
                 };
-                self.background_tasks
+                let abort_handle = self
+                    .background_tasks
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .spawn(spawn_future);
+                self.background_abort_handles
+                    .write()
+                    .await
+                    .insert(agent_id.clone(), abort_handle);
             }
 
             Ok(SpawnAgentOutput::Launched {
@@ -1020,29 +1029,6 @@ impl DynamicAgentSpawner {
     async fn handle_completion(&self, agent_id: &str, result: Result<SpawnRunResult, String>) {
         match result {
             Ok(run_result) => {
-                if let Some(state) = self.active_agents.write().await.get_mut(agent_id) {
-                    state.metrics.tool_calls = run_result.tool_calls;
-                    state.metrics.prompt_tokens = run_result.prompt_tokens;
-                    state.metrics.completion_tokens = run_result.completion_tokens;
-                    state.metrics.permission_requests = run_result.permission_requests;
-                    state.metrics.permission_requests_approved =
-                        run_result.permission_requests_approved;
-                    state.metrics.tools_blocked = run_result.tools_blocked;
-                    if let Some(summary) = run_result.permission_summary.clone() {
-                        state.permission_summary = summary;
-                    }
-                }
-                if let Some(state) = self.active_agents.read().await.get(agent_id).cloned() {
-                    self.emit_agent_terminal_trace(
-                        &state,
-                        &run_result.status,
-                        Some(run_result.finish_reason.as_str()),
-                        run_result.output.as_deref(),
-                        run_result.error.as_deref(),
-                    )
-                    .await;
-                }
-
                 let status = match run_result.status.as_str() {
                     "cancelled" => AgentStatus::Cancelled,
                     "failed" => AgentStatus::Failed {
@@ -1054,62 +1040,146 @@ impl DynamicAgentSpawner {
                     },
                     "waiting" => AgentStatus::Idle,
                     _ => AgentStatus::Completed {
-                        result: run_result.output.unwrap_or_default(),
+                        result: run_result.output.clone().unwrap_or_default(),
                         finish_reason: Some(run_result.finish_reason.clone()),
                     },
                 };
-                // Persist to journal before updating status
-                self.persist_agent_terminated(
-                    agent_id,
-                    &run_result.status,
-                    Some(run_result.finish_reason.as_str()),
-                )
-                .await;
-                self.update_status(agent_id, status).await;
-                // Unregister mailbox before archive removes the agent from active_agents.
-                self.unregister_mailbox(agent_id).await;
-                self.archive_agent(agent_id).await;
-                self.notify_completion(agent_id).await;
+                let _ = self
+                    .finalize_background_agent(
+                        agent_id,
+                        status,
+                        &run_result.status,
+                        Some(run_result.finish_reason.as_str()),
+                        Some(&run_result),
+                        run_result.output.as_deref(),
+                        run_result.error.as_deref(),
+                    )
+                    .await;
             }
             Err(e) => {
-                if let Some(state) = self.active_agents.read().await.get(agent_id).cloned() {
-                    self.emit_agent_terminal_trace(&state, "failed", None, None, Some(e.as_str()))
-                        .await;
-                }
-                self.persist_agent_terminated(agent_id, "failed", None)
+                let _ = self
+                    .finalize_background_agent(
+                        agent_id,
+                        AgentStatus::Failed {
+                            error: e.clone(),
+                            finish_reason: None,
+                        },
+                        "failed",
+                        None,
+                        None,
+                        None,
+                        Some(e.as_str()),
+                    )
                     .await;
-                self.update_status(
-                    agent_id,
-                    AgentStatus::Failed {
-                        error: e,
-                        finish_reason: None,
-                    },
-                )
-                .await;
-                // Unregister mailbox before archive removes the agent from active_agents.
-                self.unregister_mailbox(agent_id).await;
-                self.archive_agent(agent_id).await;
-                self.notify_completion(agent_id).await;
             }
         }
     }
 
-    /// Persist final agent state to session journal (best-effort).
-    async fn persist_agent_terminated(
+    /// Cancel a single background agent by id. Returns true only when this call
+    /// actually owned the cancellation and archived the agent as cancelled.
+    pub async fn cancel_agent(&self, agent_id: &str, reason: &str) -> bool {
+        let Some(abort_handle) = self
+            .background_abort_handles
+            .read()
+            .await
+            .get(agent_id)
+            .cloned()
+        else {
+            return false;
+        };
+        if abort_handle.is_finished() {
+            return false;
+        }
+
+        let Some(abort_handle) = self.background_abort_handles.write().await.remove(agent_id)
+        else {
+            return false;
+        };
+        if abort_handle.is_finished() {
+            return false;
+        }
+
+        abort_handle.abort();
+        self.finalize_background_agent(
+            agent_id,
+            AgentStatus::Cancelled,
+            "cancelled",
+            Some(reason),
+            None,
+            Some(reason),
+            None,
+        )
+        .await
+    }
+
+    async fn finalize_background_agent(
         &self,
         agent_id: &str,
+        status: AgentStatus,
+        journal_status: &str,
+        finish_reason: Option<&str>,
+        run_result: Option<&SpawnRunResult>,
+        output: Option<&str>,
+        error: Option<&str>,
+    ) -> bool {
+        self.background_abort_handles.write().await.remove(agent_id);
+        let (state, messaging_address) = {
+            let mut active_agents = self.active_agents.write().await;
+            let Some(mut state) = active_agents.remove(agent_id) else {
+                return false;
+            };
+            if let Some(run_result) = run_result {
+                state.metrics.tool_calls = run_result.tool_calls;
+                state.metrics.prompt_tokens = run_result.prompt_tokens;
+                state.metrics.completion_tokens = run_result.completion_tokens;
+                state.metrics.permission_requests = run_result.permission_requests;
+                state.metrics.permission_requests_approved =
+                    run_result.permission_requests_approved;
+                state.metrics.tools_blocked = run_result.tools_blocked;
+                if let Some(summary) = run_result.permission_summary.clone() {
+                    state.permission_summary = summary;
+                }
+            }
+            state.status = status;
+            let messaging_address = state.messaging_address.take();
+            (state, messaging_address)
+        };
+
+        self.emit_agent_terminal_trace(&state, journal_status, finish_reason, output, error)
+            .await;
+        self.persist_agent_terminated_state(&state, journal_status, finish_reason)
+            .await;
+        if let Some(addr) = messaging_address
+            && let Err(err) = self.mailbox_router.unregister(&addr).await
+        {
+            eprintln!(
+                "  ⚠ messaging: failed to unregister mailbox for '{}': {}",
+                agent_id, err
+            );
+        }
+        self.archive_state(state).await;
+        self.notify_completion(agent_id).await;
+        true
+    }
+
+    /// Persist final agent state to session journal (best-effort).
+    async fn persist_agent_terminated_state(
+        &self,
+        state: &SpawnedAgentState,
         status: &str,
         finish_reason: Option<&str>,
     ) {
         let Some(ref sid) = self.session_id else {
             return;
         };
-        let state = self.active_agents.read().await.get(agent_id).cloned();
-        let Some(state) = state else { return };
         let writer = match astra_services::session_journal::JournalWriter::new(sid) {
             Ok(w) => w,
             Err(e) => {
-                astra_core::agent_warn!("spawner", "journal writer init failed: {e}");
+                astra_core::agent_warn!(
+                    "spawner",
+                    "journal writer init failed for {}: {e}",
+                    state.agent_id
+                );
                 return;
             }
         };
@@ -1120,7 +1190,7 @@ impl DynamicAgentSpawner {
             .unwrap_or(0);
         let event = astra_services::session_journal::JournalEvent::agent_terminated(
             Some(sid.as_str()),
-            agent_id,
+            &state.agent_id,
             &state.run_id,
             &state.agent_type,
             status,
@@ -1132,21 +1202,21 @@ impl DynamicAgentSpawner {
             duration_ms,
         );
         if let Err(e) = writer.append(&event) {
-            astra_core::agent_warn!("spawner", "journal append failed for {agent_id}: {e}");
+            astra_core::agent_warn!(
+                "spawner",
+                "journal append failed for {}: {e}",
+                state.agent_id
+            );
         }
     }
 
-    /// Archive a completed agent state for history queries.
-    async fn archive_agent(&self, agent_id: &str) {
-        if let Some(state) = self.active_agents.write().await.remove(agent_id) {
-            let mut completed = self.completed_agents.write().await;
-            // Cap history to prevent unbounded memory growth.
-            const MAX_COMPLETED_AGENTS: usize = 256;
-            if completed.len() >= MAX_COMPLETED_AGENTS {
-                completed.remove(0);
-            }
-            completed.push(state);
+    async fn archive_state(&self, state: SpawnedAgentState) {
+        let mut completed = self.completed_agents.write().await;
+        const MAX_COMPLETED_AGENTS: usize = 256;
+        if completed.len() >= MAX_COMPLETED_AGENTS {
+            completed.remove(0);
         }
+        completed.push(state);
     }
 
     async fn unregister_mailbox(&self, agent_id: &str) {
@@ -1283,6 +1353,7 @@ impl DynamicAgentSpawner {
             completed_agents: Arc::clone(&self.completed_agents),
             // Share the same JoinSet so shutdown can drain tasks spawned by clones.
             background_tasks: Arc::clone(&self.background_tasks),
+            background_abort_handles: Arc::clone(&self.background_abort_handles),
             background_agent_ids: Arc::clone(&self.background_agent_ids),
             completion_notifiers: Arc::clone(&self.completion_notifiers),
             // Share prefix-store + resolve-outcomes map so clones
@@ -1336,6 +1407,7 @@ impl DynamicAgentSpawner {
         }
 
         // Clean up any leftover completion notifiers (e.g. from timed-out tasks).
+        self.background_abort_handles.write().await.clear();
         self.completion_notifiers.write().await.clear();
 
         // Collect results for all background-spawned agents.
@@ -2485,6 +2557,55 @@ mod tests {
         let (a, b) = tokio::join!(waiter_a, waiter_b);
         assert!(matches!(a, Some(AgentStatus::Completed { .. })), "a={a:?}");
         assert!(matches!(b, Some(AgentStatus::Completed { .. })), "b={b:?}");
+    }
+
+    #[tokio::test]
+    async fn cancel_agent_marks_only_target_as_cancelled() {
+        let factory = BlockingExecutorFactory::new();
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(factory as Arc<dyn SpawnAgentExecutor>);
+
+        let result = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .unwrap();
+        let agent_id = match result {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected Launched, got {other:?}"),
+        };
+
+        assert!(
+            spawner
+                .cancel_agent(&agent_id, "turn budget exhausted")
+                .await,
+            "cancel_agent should report success for running background child"
+        );
+
+        let status = spawner
+            .wait_for_agent(&agent_id, std::time::Duration::from_secs(1))
+            .await;
+        assert!(
+            matches!(status, Some(AgentStatus::Cancelled)),
+            "status={status:?}"
+        );
+
+        let archived = spawner
+            .get_agent_state_any(&agent_id)
+            .await
+            .expect("cancelled agent should remain queryable");
+        assert!(
+            matches!(archived.status, AgentStatus::Cancelled),
+            "archived status must be cancelled: {:?}",
+            archived.status
+        );
+
+        let bg_results = spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(1))
+            .await;
+        assert!(
+            bg_results.iter().all(|(id, _)| id != &agent_id),
+            "cancelled agent must not surface as completed result: {bg_results:?}"
+        );
     }
 
     /// REGRESSION (reviewer L2-3): after `spawn(run_in_background:true)`

@@ -55,6 +55,8 @@ pub(crate) enum ChildStatus {
     Failed,
 }
 
+const GET_AGENT_RESULT_INTERRUPTED_ERROR: &str = "Parent turn budget was exhausted and cancelled the child agent before it returned a final result.";
+
 #[derive(Debug, Clone)]
 pub(crate) struct TaskCell {
     pub tool_use_id: String,
@@ -143,6 +145,16 @@ impl TaskCell {
         self.error = error;
     }
 
+    fn is_get_agent_result_wait(&self) -> bool {
+        self.description.starts_with("Get agent result:")
+    }
+
+    pub(crate) fn is_interrupted_wait(&self) -> bool {
+        self.status == TaskStatus::Failed
+            && self.is_get_agent_result_wait()
+            && self.error.as_deref() == Some(GET_AGENT_RESULT_INTERRUPTED_ERROR)
+    }
+
     fn arrow(&self) -> Span<'static> {
         match self.status {
             TaskStatus::Running => {
@@ -150,6 +162,9 @@ impl TaskCell {
                 Span::styled("▶ ", Style::default().fg(theme.accent).bold())
             }
             TaskStatus::Completed => Span::styled("▶ ", Style::default().fg(Color::Green).bold()),
+            TaskStatus::Failed if self.is_interrupted_wait() => {
+                Span::styled("▶ ", Style::default().fg(Color::Yellow).bold())
+            }
             TaskStatus::Failed => Span::styled("▶ ", Style::default().fg(Color::Red).bold()),
         }
     }
@@ -158,6 +173,7 @@ impl TaskCell {
         match self.status {
             TaskStatus::Running => "Task",
             TaskStatus::Completed => "Task done",
+            TaskStatus::Failed if self.is_interrupted_wait() => "Task interrupted",
             TaskStatus::Failed => "Task failed",
         }
     }
@@ -304,9 +320,20 @@ impl HistoryCell for TaskCell {
         }
 
         if let Some(ref err) = self.error {
+            let (icon_style, text_style) = if self.is_interrupted_wait() {
+                (
+                    Style::default().fg(Color::Yellow).bold(),
+                    Style::default().fg(Color::Yellow),
+                )
+            } else {
+                (
+                    Style::default().fg(Color::Red).bold(),
+                    Style::default().fg(Color::Red),
+                )
+            };
             lines.push(Line::from(vec![
-                Span::styled("  ⚠ ", Style::default().fg(Color::Red).bold()),
-                Span::styled(err.clone(), Style::default().fg(Color::Red)),
+                Span::styled("  ⚠ ", icon_style),
+                Span::styled(err.clone(), text_style),
             ]));
         }
 
@@ -333,7 +360,11 @@ impl HistoryCell for TaskCell {
                 self.duration_ms = Some(self.started_at.elapsed().as_millis() as u64);
             }
             if self.error.is_none() {
-                self.error = Some("Task did not complete before the turn ended.".into());
+                self.error = Some(if self.is_get_agent_result_wait() {
+                    GET_AGENT_RESULT_INTERRUPTED_ERROR.into()
+                } else {
+                    "Task did not complete before the turn ended.".into()
+                });
             }
         }
     }
@@ -415,6 +446,25 @@ mod tests {
             "finalize is a terminal transition and must stamp local completion time"
         );
         assert!(t.error.is_some(), "finalize must stamp a reason");
+    }
+
+    #[test]
+    fn finalize_get_agent_result_renders_as_interrupted_not_failed() {
+        let mut t = TaskCell::new_running("tu_parent", "Get agent result: reviewer@abc");
+        t.push_child_started("child-1", "bash", "git diff");
+        t.push_child_completed("child-1", "success", 20);
+
+        t.finalize();
+
+        let out = render(&t, 100, 4);
+        assert!(out.contains("Task interrupted"), "{out}");
+        assert!(!out.contains("Task failed"), "{out}");
+        assert!(
+            out.contains(
+                "Parent turn budget was exhausted and cancelled the child agent before it returned a final result"
+            ),
+            "{out}"
+        );
     }
 
     // ── Children ───────────────────────────────────────────────────

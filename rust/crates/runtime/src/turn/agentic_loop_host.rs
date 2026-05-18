@@ -218,6 +218,16 @@ pub trait AgenticLoopHost: Send {
     /// Default: no-op (tests, headless, sub-run hosts).
     fn render_final_text(&mut self, _text: &str) {}
 
+    /// Best-effort cancellation hook for child agents that should no longer
+    /// continue running after the parent has decided to stop waiting.
+    ///
+    /// Default: no-op so hosts without dynamic-agent control preserve legacy
+    /// behaviour. Returns the subset of `agent_ids` that were actually
+    /// cancelled.
+    async fn cancel_child_agents(&mut self, _agent_ids: &[String], _reason: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Post-sampling turn-completed hook — fires exactly once
     /// immediately after a successful LLM response has been received
     /// AND cleanly ingested (`state.current_run_id`, `state.messages`,
@@ -1904,6 +1914,7 @@ pub(crate) mod tests {
         /// assert the hook runs AFTER `ingest_agentic_turn_stream`
         /// populated that field.
         pub(crate) turn_completed_run_ids: Vec<Option<String>>,
+        pub(crate) cancelled_agent_ids: Vec<String>,
     }
 
     impl MockHost {
@@ -1919,6 +1930,7 @@ pub(crate) mod tests {
                 rendered_final_text: Vec::new(),
                 executed_messages: Vec::new(),
                 turn_completed_run_ids: Vec::new(),
+                cancelled_agent_ids: Vec::new(),
             }
         }
 
@@ -1984,6 +1996,15 @@ pub(crate) mod tests {
 
         fn render_final_text(&mut self, text: &str) {
             self.rendered_final_text.push(text.to_string());
+        }
+
+        async fn cancel_child_agents(
+            &mut self,
+            agent_ids: &[String],
+            _reason: &str,
+        ) -> Vec<String> {
+            self.cancelled_agent_ids.extend(agent_ids.iter().cloned());
+            agent_ids.to_vec()
         }
 
         fn on_turn_completed(&mut self, state: &AgenticLoopState) {

@@ -193,16 +193,23 @@ fn build_detail_lines(cell: &TaskCell) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let dim = Style::default().fg(Color::DarkGray);
     let bold = Style::default().add_modifier(Modifier::BOLD);
+    let interrupted_wait = cell.is_interrupted_wait();
 
     // Header
     let status_text = match cell.status {
         TaskStatus::Running => "Running",
         TaskStatus::Completed => "Completed",
+        TaskStatus::Failed if interrupted_wait => "Interrupted",
         TaskStatus::Failed => "Failed",
+    };
+    let status_style = if interrupted_wait {
+        Style::default().fg(Color::Yellow)
+    } else {
+        status_style(&cell.status)
     };
     out.push(Line::from(vec![
         Span::styled("  Status: ", dim),
-        Span::styled(status_text, status_style(&cell.status)),
+        Span::styled(status_text, status_style),
     ]));
     if !matches!(cell.status, TaskStatus::Running) {
         out.push(Line::from(Span::styled(
@@ -219,8 +226,13 @@ fn build_detail_lines(cell: &TaskCell) -> Vec<Line<'static>> {
     }
 
     if let Some(ref err) = cell.error {
+        let err_style = if interrupted_wait {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Red)
+        };
         out.push(Line::from(vec![
-            Span::styled("  Error: ", Style::default().fg(Color::Red)),
+            Span::styled("  Error: ", err_style),
             Span::raw(err.clone()),
         ]));
     }
@@ -407,6 +419,7 @@ impl BottomPaneView for TaskDetailView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::history_cell::HistoryCell;
     use crate::tui::history_cell::task::TaskCell;
     use astra_tools::task_mgmt::SessionTask;
 
@@ -444,6 +457,23 @@ mod tests {
         let cell = TaskCell::new_running("tool-1", "🚀🔥💥".repeat(20));
         let view = TaskDetailView::from_task_cell(&cell);
         assert!(view.title.starts_with("Task:"));
+    }
+
+    #[test]
+    fn interrupted_get_agent_result_shows_interrupted_status() {
+        let mut cell = TaskCell::new_running("tool-1", "Get agent result: reviewer@abc");
+        cell.finalize();
+
+        let view = TaskDetailView::from_task_cell(&cell);
+        let rendered = view
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(rendered.contains("Interrupted"), "{rendered}");
+        assert!(!rendered.contains("Status: Failed"), "{rendered}");
     }
 
     /// C-TUI-1 regression: large scroll offset must not write past the
