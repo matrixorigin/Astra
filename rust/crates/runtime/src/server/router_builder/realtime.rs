@@ -53,6 +53,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(run_handlers::get_run_status_handler).delete(run_handlers::cancel_run_handler),
         )
         .route(
+            "/chat/runs/{run_id}/projection",
+            get(run_handlers::get_run_projection_handler),
+        )
+        .route(
             "/chat/runs/{run_id}/stream",
             get(run_handlers::stream_run_handler),
         )

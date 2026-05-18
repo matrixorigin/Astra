@@ -103,6 +103,17 @@ fn record_full_llm_request_event(
         return;
     };
     let round = buf.current_round();
+    let prompt_request_plan = astra_services::plan_prompt_request(
+        session_id,
+        state.session_turn,
+        round,
+        attempt,
+        source,
+        messages,
+        tools,
+        max_output_tokens,
+    )
+    .ok();
     let trace = crate::turn::llm_exchange_capture::CaptureTrace {
         session_turn_source: Some("state"),
         turn_chain_id: None,
@@ -124,11 +135,16 @@ fn record_full_llm_request_event(
                 "turn_chain_id": trace.turn_chain_id,
                 "user_query_event_id": trace.user_query_event_id,
             },
-            "request": crate::turn::llm_exchange_capture::build_capture_request_json(
-                messages,
-                tools,
-                max_output_tokens,
-            ),
+            "prompt_request_id": prompt_request_plan.as_ref().map(|plan| plan.request_id.as_str()),
+            "request_hash": prompt_request_plan.as_ref().map(|plan| plan.request_hash.as_str()),
+            "request_summary": prompt_request_plan
+                .as_ref()
+                .map(|plan| plan.summary_json.clone())
+                .unwrap_or_else(|| crate::turn::llm_exchange_capture::build_capture_request_summary_json(
+                    messages,
+                    tools,
+                    max_output_tokens,
+                )),
         }),
     );
     evt.offset_ms = Some(buf.offset_ms());
@@ -2458,6 +2474,22 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut streamed_text = String::new();
         let mut streamed_reasoning = String::new();
         let result = loop {
+            let prompt_round = state
+                .turn_event_buffer
+                .as_ref()
+                .map(|buffer| buffer.current_round())
+                .unwrap_or(state.llm_rounds_completed);
+            let prompt_request_plan = astra_services::plan_prompt_request(
+                &self.session_id,
+                state.session_turn,
+                prompt_round,
+                attempt_in_round,
+                "server_loop_host",
+                &llm_messages,
+                &final_tools,
+                Some(effective_max_output),
+            )
+            .ok();
             record_full_llm_request_event(
                 state,
                 self.full_llm_capture,
@@ -2470,6 +2502,25 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &final_tools,
                 Some(effective_max_output),
             );
+            if let Some(prompt_request_plan) = prompt_request_plan.as_ref() {
+                crate::turn::llm_exchange_capture::persist_prompt_request_plan_or_log(
+                    "server_loop_host",
+                    self.shared_pool.as_ref(),
+                    astra_services::PromptRequestPersistInput {
+                        session_id: self.session_id.clone(),
+                        user_id: self.user_id.clone(),
+                        run_id: state.current_run_id.clone(),
+                        turn: state.session_turn,
+                        round: prompt_round,
+                        attempt: attempt_in_round,
+                        source: "server_loop_host".to_string(),
+                        model: llm_cfg.model_name.clone(),
+                        provider: llm_cfg.provider.clone(),
+                    },
+                    prompt_request_plan,
+                )
+                .await;
+            }
             state.step_recorder.begin_llm_round(&llm_cfg.model_name);
             let llm_round_start = std::time::Instant::now();
             let llm_cancel = llm_cancel_for_state(state);
@@ -5369,14 +5420,17 @@ mod tests {
             Some("llm_response_full")
         );
         assert_eq!(
-            llm_events[0]["metadata"]["request"]["messages"][0]["role"].as_str(),
-            Some("system")
+            llm_events[0]["metadata"]["request_summary"]["message_count"].as_u64(),
+            Some(2)
         );
         assert!(
-            llm_events[0]["metadata"]["request"]["messages"]
-                .as_array()
-                .map(|messages| messages.iter().any(|msg| msg["role"] == "user"))
-                .unwrap_or(false)
+            llm_events[0]["metadata"]["prompt_request_id"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_eq!(
+            llm_events[0]["metadata"]["request_summary"]["message_roles"][0]["role"].as_str(),
+            Some("system")
         );
         assert_eq!(
             llm_events[1]["metadata"]["response"]["outcome"].as_str(),

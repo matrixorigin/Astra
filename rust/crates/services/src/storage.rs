@@ -730,6 +730,51 @@ pub async fn ensure_core_schema(
     .await?;
 
     query(
+        "CREATE TABLE IF NOT EXISTS run_checkpoints (
+            checkpoint_id VARCHAR(64) PRIMARY KEY,
+            run_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            node_seq BIGINT NOT NULL DEFAULT 0,
+            checkpoint_kind VARCHAR(32) NOT NULL,
+            checkpoint_version VARCHAR(32) NOT NULL,
+            idempotency_key VARCHAR(191) NOT NULL,
+            checkpoint_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uniq_run_checkpoint_idem (run_id, checkpoint_kind, idempotency_key),
+            INDEX idx_run_checkpoints_run_created (run_id, created_at),
+            INDEX idx_run_checkpoints_session_kind_created (session_id, checkpoint_kind, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS run_display_projections (
+            run_id VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            status VARCHAR(32) NOT NULL,
+            waiting_for VARCHAR(64) NULL,
+            error_message TEXT NULL,
+            projection_event_idx BIGINT NOT NULL DEFAULT -1,
+            latest_event_type VARCHAR(64) NULL,
+            latest_checkpoint_id VARCHAR(64) NULL,
+            latest_checkpoint_kind VARCHAR(32) NULL,
+            latest_checkpoint_version VARCHAR(32) NULL,
+            total_prompt_tokens BIGINT NOT NULL DEFAULT 0,
+            total_completion_tokens BIGINT NOT NULL DEFAULT 0,
+            total_tool_calls BIGINT NOT NULL DEFAULT 0,
+            projection_hash VARCHAR(64) NOT NULL,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_run_display_projections_session_updated (session_id, updated_at),
+            INDEX idx_run_display_projections_user_updated (user_id, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
         "CREATE TABLE IF NOT EXISTS session_tool_output_batches (
             batch_id VARCHAR(64) PRIMARY KEY,
             session_id VARCHAR(64) NOT NULL,
@@ -871,6 +916,84 @@ pub async fn ensure_core_schema(
         128,
         "ALTER TABLE session_transcript_items MODIFY COLUMN content_hash VARCHAR(128) NOT NULL",
     )
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS transcript_pages (
+            session_id VARCHAR(64) NOT NULL,
+            page_seq BIGINT NOT NULL,
+            start_item_seq BIGINT NOT NULL,
+            end_item_seq BIGINT NOT NULL,
+            item_count INT NOT NULL,
+            page_hash VARCHAR(128) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (session_id, page_seq),
+            INDEX idx_transcript_pages_session_end (session_id, end_item_seq),
+            INDEX idx_transcript_pages_session_updated (session_id, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS prompt_request_records (
+            request_id VARCHAR(64) PRIMARY KEY,
+            session_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
+            run_id VARCHAR(64) NULL,
+            turn BIGINT NOT NULL,
+            round BIGINT NOT NULL,
+            attempt BIGINT NOT NULL,
+            source VARCHAR(64) NOT NULL,
+            model VARCHAR(128) NOT NULL,
+            provider VARCHAR(64) NOT NULL,
+            max_output_tokens BIGINT NULL,
+            message_count BIGINT NOT NULL,
+            tool_count BIGINT NOT NULL,
+            previous_request_id VARCHAR(64) NULL,
+            request_hash VARCHAR(64) NOT NULL,
+            summary_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_prompt_request_attempt (session_id, turn, round, source, attempt),
+            INDEX idx_prompt_requests_session_created (session_id, created_at),
+            INDEX idx_prompt_requests_run_created (run_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS prompt_chunks (
+            chunk_id VARCHAR(80) PRIMARY KEY,
+            chunk_hash VARCHAR(64) NOT NULL,
+            chunk_kind VARCHAR(32) NOT NULL,
+            payload_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_prompt_chunk_hash (chunk_hash)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS prompt_deltas (
+            delta_id VARCHAR(64) PRIMARY KEY,
+            request_id VARCHAR(64) NOT NULL,
+            delta_seq INT NOT NULL,
+            logical_key VARCHAR(191) NOT NULL,
+            chunk_kind VARCHAR(32) NOT NULL,
+            position INT NOT NULL,
+            op VARCHAR(16) NOT NULL,
+            chunk_id VARCHAR(80) NULL,
+            chunk_hash VARCHAR(64) NULL,
+            previous_chunk_hash VARCHAR(64) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_prompt_delta_request_seq (request_id, delta_seq),
+            INDEX idx_prompt_deltas_request_position (request_id, position, delta_seq)
+        )",
+    )
+    .execute(&pool)
     .await?;
 
     query(

@@ -589,6 +589,18 @@ async fn hard_delete_session_rows(
             "DELETE FROM session_transcript_items WHERE session_id = ?",
         ),
         (
+            "transcript_pages",
+            "DELETE FROM transcript_pages WHERE session_id = ?",
+        ),
+        (
+            "prompt_deltas",
+            "DELETE FROM prompt_deltas WHERE request_id IN (SELECT request_id FROM prompt_request_records WHERE session_id = ?)",
+        ),
+        (
+            "prompt_request_records",
+            "DELETE FROM prompt_request_records WHERE session_id = ?",
+        ),
+        (
             "session_state_revisions",
             "DELETE FROM session_state_revisions WHERE session_id = ?",
         ),
@@ -673,6 +685,14 @@ async fn hard_delete_session_rows(
         (
             "agent_run_events",
             "DELETE FROM agent_run_events WHERE session_id = ?",
+        ),
+        (
+            "run_checkpoints",
+            "DELETE FROM run_checkpoints WHERE session_id = ?",
+        ),
+        (
+            "run_display_projections",
+            "DELETE FROM run_display_projections WHERE session_id = ?",
         ),
         ("agent_runs", "DELETE FROM agent_runs WHERE session_id = ?"),
         (

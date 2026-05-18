@@ -1,8 +1,10 @@
 use super::*;
 use astra_core::{STATUS_CANCELLED, is_duplicate_key_error};
+use astra_services::session_workspace::{WORKSPACE_METADATA_ARTIFACT_KIND, WorkspaceMetadata};
 use astra_services::{
     DatabaseSessionArtifactStore, DatabaseStateProjectionStore, PresignedArtifactDownload,
-    SessionArtifactJsonStore, UserAnchorMemoryItem, build_presigned_artifact_download,
+    SessionArtifactJsonStore, StoredSessionArtifact, UserAnchorMemoryItem,
+    build_presigned_artifact_download,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,7 +37,12 @@ pub(super) struct SessionStateResponse {
     pub state_revision: StateRevisionResponse,
     pub transcript_high_watermark: i64,
     pub active_run: Option<ActiveRunProjection>,
+    pub workspace_authority: Option<WorkspaceAuthorityResponse>,
+    pub latest_context_manifest: Option<ContextManifestSummaryResponse>,
+    pub state_summary: Vec<StateCategorySummaryResponse>,
+    pub artifact_previews: Vec<ArtifactPreviewResponse>,
     pub anchor_memory: Vec<UserAnchorMemoryResponse>,
+    pub projection_observability: SessionProjectionObservabilityResponse,
     pub replay_required: bool,
     pub transcript_replay_required: bool,
     pub run_event_replay_required: bool,
@@ -64,6 +71,75 @@ pub(super) struct UserAnchorMemoryResponse {
     pub token_estimate: u32,
 }
 
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub(super) struct WorkspaceAuthorityResponse {
+    pub cwd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub(super) struct ContextManifestSummaryResponse {
+    pub manifest_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub turn_id: String,
+    pub reason: String,
+    pub total_estimated_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_template_id: Option<String>,
+    pub policy_version: String,
+    pub created_at: String,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub(super) struct StateCategorySummaryResponse {
+    pub category: String,
+    pub count: u32,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub(super) struct ArtifactPreviewResponse {
+    pub artifact_id: String,
+    pub artifact_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub(super) struct PromptRequestObservabilityResponse {
+    pub request_id: String,
+    pub request_hash: String,
+    pub message_count: u32,
+    pub tool_count: u32,
+    pub delta_counts: astra_services::PromptDeltaCounts,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub(super) struct SessionProjectionObservabilityResponse {
+    pub observability_available: bool,
+    pub transcript_page_count: u32,
+    pub transcript_page_high_watermark: i64,
+    pub transcript_page_lag_items: i64,
+    pub active_run_projection_lag_events: i64,
+    pub prompt_request_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_prompt_request: Option<PromptRequestObservabilityResponse>,
+}
+
 fn user_anchor_memory_response(item: UserAnchorMemoryItem) -> UserAnchorMemoryResponse {
     UserAnchorMemoryResponse {
         item_id: item.item_id,
@@ -85,8 +161,18 @@ pub(super) struct TranscriptQuery {
 pub(super) struct TranscriptResponse {
     pub session_id: String,
     pub items: Vec<TranscriptItemResponse>,
+    pub page_refs: Vec<TranscriptPageRefResponse>,
     pub next_before_seq: Option<i64>,
     pub has_more: bool,
+}
+
+#[derive(Serialize)]
+pub(super) struct TranscriptPageRefResponse {
+    pub page_seq: i64,
+    pub start_item_seq: i64,
+    pub end_item_seq: i64,
+    pub item_count: i64,
+    pub page_hash: String,
 }
 
 #[derive(Serialize)]
@@ -343,6 +429,22 @@ pub(super) async fn get_session_state_handler(
     let transcript_replay_required = cold_start && transcript_high_watermark > 0;
     let run_event_replay_required = cold_start && run_event_high_watermark > 0;
     let replay_required = transcript_replay_required || run_event_replay_required;
+    let workspace_authority = load_workspace_authority(&state, &session.session_id).await?;
+    let latest_context_manifest = load_latest_context_manifest(
+        pool,
+        &session.session_id,
+        active_run.as_ref().map(|run| run.run_id.as_str()),
+    )
+    .await?;
+    let state_summary = load_state_summary(pool, &session.session_id).await?;
+    let artifact_previews = load_artifact_previews(&state, &session.session_id).await?;
+    let projection_observability = load_session_projection_observability(
+        pool,
+        &session.session_id,
+        transcript_high_watermark,
+        active_run.as_ref(),
+    )
+    .await?;
     let active_run = active_run.map(|mut run| {
         run.replay_required = run_event_replay_required;
         run.replay_start_event_idx = if run_event_replay_required {
@@ -373,7 +475,12 @@ pub(super) async fn get_session_state_handler(
         },
         transcript_high_watermark,
         active_run,
+        workspace_authority,
+        latest_context_manifest,
+        state_summary,
+        artifact_previews,
         anchor_memory,
+        projection_observability,
         replay_required,
         transcript_replay_required,
         run_event_replay_required,
@@ -455,11 +562,24 @@ pub(super) async fn get_session_transcript_handler(
         })
         .collect::<Vec<_>>();
     items.reverse();
+    let page_refs = load_transcript_page_refs(
+        pool,
+        &session_id,
+        items.first().map(|item| item.item_seq),
+        items.last().map(|item| item.item_seq),
+    )
+    .await
+    .map_err(|error| {
+        internal_error(format!(
+            "load transcript page refs failed for session {session_id}: {error}"
+        ))
+    })?;
     let next_before_seq = items.first().map(|item| item.item_seq);
     let has_more = items.len() == limit as usize && next_before_seq.unwrap_or(0) > 1;
     Ok(Json(TranscriptResponse {
         session_id,
         items,
+        page_refs,
         next_before_seq,
         has_more,
     }))
@@ -481,6 +601,248 @@ fn transcript_assistant_run_ids(rows: &[sqlx::mysql::MySqlRow]) -> Vec<String> {
         }
     }
     run_ids
+}
+
+async fn load_transcript_page_refs(
+    pool: &SharedPool,
+    session_id: &str,
+    start_item_seq: Option<i64>,
+    end_item_seq: Option<i64>,
+) -> Result<Vec<TranscriptPageRefResponse>, sqlx::Error> {
+    let (Some(start_item_seq), Some(end_item_seq)) = (start_item_seq, end_item_seq) else {
+        return Ok(Vec::new());
+    };
+    let rows = sqlx::query(
+        "SELECT page_seq, start_item_seq, end_item_seq, item_count, page_hash
+         FROM transcript_pages
+         WHERE session_id = ? AND end_item_seq >= ? AND start_item_seq <= ?
+         ORDER BY page_seq ASC",
+    )
+    .bind(session_id)
+    .bind(start_item_seq)
+    .bind(end_item_seq)
+    .fetch_all(pool.get())
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| TranscriptPageRefResponse {
+            page_seq: row.try_get("page_seq").unwrap_or_default(),
+            start_item_seq: row.try_get("start_item_seq").unwrap_or_default(),
+            end_item_seq: row.try_get("end_item_seq").unwrap_or_default(),
+            item_count: row.try_get::<i64, _>("item_count").unwrap_or_default(),
+            page_hash: row.try_get("page_hash").unwrap_or_default(),
+        })
+        .collect())
+}
+
+async fn load_session_projection_observability(
+    pool: &SharedPool,
+    session_id: &str,
+    transcript_high_watermark: i64,
+    active_run: Option<&ActiveRunProjection>,
+) -> Result<SessionProjectionObservabilityResponse, (StatusCode, Json<ErrorResponse>)> {
+    let transcript_page_row = sqlx::query(
+        "SELECT COUNT(*) AS page_count, COALESCE(MAX(end_item_seq), 0) AS page_high_watermark
+         FROM transcript_pages
+         WHERE session_id = ?",
+    )
+    .bind(session_id)
+    .fetch_one(pool.get())
+    .await
+    .map_err(internal_error)?;
+    let transcript_page_count = transcript_page_row
+        .try_get::<i64, _>("page_count")
+        .unwrap_or(0)
+        .max(0) as u32;
+    let transcript_page_high_watermark = transcript_page_row
+        .try_get::<i64, _>("page_high_watermark")
+        .unwrap_or(0)
+        .max(0);
+    let active_run_projection_lag_events = if let Some(active_run) = active_run {
+        let row = sqlx::query(
+            "SELECT projection_event_idx
+             FROM run_display_projections
+             WHERE run_id = ?",
+        )
+        .bind(&active_run.run_id)
+        .fetch_optional(pool.get())
+        .await
+        .map_err(internal_error)?;
+        let projection_event_idx = row
+            .and_then(|row| row.try_get::<i64, _>("projection_event_idx").ok())
+            .unwrap_or(-1);
+        (active_run.run_event_high_watermark - projection_event_idx).max(0)
+    } else {
+        0
+    };
+    let prompt_request_count = astra_services::count_prompt_requests_for_session(pool, session_id)
+        .await
+        .map_err(internal_error)?;
+    let latest_prompt_request =
+        astra_services::load_latest_prompt_observability_for_session(pool, session_id)
+            .await
+            .map_err(internal_error)?
+            .map(|request| PromptRequestObservabilityResponse {
+                request_id: request.request_id,
+                request_hash: request.request_hash,
+                message_count: request.message_count,
+                tool_count: request.tool_count,
+                delta_counts: request.delta_counts,
+            });
+    Ok(SessionProjectionObservabilityResponse {
+        observability_available: true,
+        transcript_page_count,
+        transcript_page_high_watermark,
+        transcript_page_lag_items: (transcript_high_watermark - transcript_page_high_watermark)
+            .max(0),
+        active_run_projection_lag_events,
+        prompt_request_count,
+        latest_prompt_request,
+    })
+}
+
+fn workspace_authority_from_artifact(
+    artifact: &StoredSessionArtifact,
+) -> Result<WorkspaceAuthorityResponse, String> {
+    let metadata = serde_json::from_value::<WorkspaceMetadata>(artifact.content.clone())
+        .map_err(|error| format!("workspace authority artifact decode failed: {error}"))?;
+    Ok(WorkspaceAuthorityResponse {
+        cwd: metadata.cwd,
+        git_root: metadata.git_root,
+        git_branch: metadata.git_branch,
+        git_head: metadata.git_head,
+        model: metadata.model,
+        updated_at: metadata.updated_at,
+    })
+}
+
+async fn load_workspace_authority(
+    state: &AppState,
+    session_id: &str,
+) -> Result<Option<WorkspaceAuthorityResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let artifact = session_artifact_store(state)?
+        .load_latest_json_artifact(session_id, WORKSPACE_METADATA_ARTIFACT_KIND)
+        .await
+        .map_err(internal_error)?;
+    artifact
+        .as_ref()
+        .map(workspace_authority_from_artifact)
+        .transpose()
+        .map_err(internal_error)
+}
+
+async fn load_state_summary(
+    pool: &SharedPool,
+    session_id: &str,
+) -> Result<Vec<StateCategorySummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let rows = sqlx::query(
+        "SELECT category, COUNT(*) AS total
+         FROM session_state_items
+         WHERE session_id = ? AND status IN ('active', 'backlog')
+         GROUP BY category
+         ORDER BY total DESC, category ASC
+         LIMIT 16",
+    )
+    .bind(session_id)
+    .fetch_all(pool.get())
+    .await
+    .map_err(internal_error)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| StateCategorySummaryResponse {
+            category: row.try_get("category").unwrap_or_default(),
+            count: row.try_get::<i64, _>("total").unwrap_or(0).max(0) as u32,
+        })
+        .collect())
+}
+
+async fn load_artifact_previews(
+    state: &AppState,
+    session_id: &str,
+) -> Result<Vec<ArtifactPreviewResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let artifacts = session_artifact_store(state)?
+        .list_json_artifacts(session_id, None, 8)
+        .await
+        .map_err(internal_error)?;
+    Ok(artifacts
+        .into_iter()
+        .filter(|artifact| artifact.artifact_kind != WORKSPACE_METADATA_ARTIFACT_KIND)
+        .take(5)
+        .map(|artifact| ArtifactPreviewResponse {
+            artifact_id: artifact.artifact_id,
+            artifact_kind: artifact.artifact_kind,
+            source: artifact.source,
+            turn: artifact.turn,
+            round: artifact.round,
+            created_at: artifact.created_at,
+        })
+        .collect())
+}
+
+async fn load_latest_context_manifest(
+    pool: &SharedPool,
+    session_id: &str,
+    preferred_run_id: Option<&str>,
+) -> Result<Option<ContextManifestSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if let Some(run_id) = preferred_run_id
+        && let Some(summary) = fetch_latest_context_manifest(pool, session_id, Some(run_id)).await?
+    {
+        return Ok(Some(summary));
+    }
+    fetch_latest_context_manifest(pool, session_id, None).await
+}
+
+async fn fetch_latest_context_manifest(
+    pool: &SharedPool,
+    session_id: &str,
+    run_id: Option<&str>,
+) -> Result<Option<ContextManifestSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let row = if let Some(run_id) = run_id {
+        sqlx::query(
+            "SELECT manifest_id, run_id, turn_id, reason, total_estimated_tokens,
+                    budget_template_id, policy_version,
+                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+             FROM context_manifests
+             WHERE session_id = ? AND run_id = ?
+             ORDER BY created_at DESC, manifest_id DESC
+             LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(run_id)
+        .fetch_optional(pool.get())
+        .await
+        .map_err(internal_error)?
+    } else {
+        sqlx::query(
+            "SELECT manifest_id, run_id, turn_id, reason, total_estimated_tokens,
+                    budget_template_id, policy_version,
+                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+             FROM context_manifests
+             WHERE session_id = ?
+             ORDER BY created_at DESC, manifest_id DESC
+             LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(pool.get())
+        .await
+        .map_err(internal_error)?
+    };
+    Ok(row.map(|row| ContextManifestSummaryResponse {
+        manifest_id: row.try_get("manifest_id").unwrap_or_default(),
+        run_id: row.try_get::<Option<String>, _>("run_id").ok().flatten(),
+        turn_id: row.try_get("turn_id").unwrap_or_default(),
+        reason: row.try_get("reason").unwrap_or_default(),
+        total_estimated_tokens: row
+            .try_get::<i64, _>("total_estimated_tokens")
+            .unwrap_or(0)
+            .max(0) as u32,
+        budget_template_id: row
+            .try_get::<Option<String>, _>("budget_template_id")
+            .ok()
+            .flatten(),
+        policy_version: row.try_get("policy_version").unwrap_or_default(),
+        created_at: row.try_get("created_at").unwrap_or_default(),
+    }))
 }
 
 async fn load_transcript_reasoning_by_run(
@@ -1483,6 +1845,7 @@ mod tests {
         AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
         AuthTokenRecord, AuthUserRecord, SessionCreateRequestData, SessionListFilter,
         SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
+        StoredSessionArtifact,
     };
     use async_trait::async_trait;
     use axum::{
@@ -1754,5 +2117,50 @@ mod tests {
             projection.done,
             "thinking_done should mark the block complete"
         );
+    }
+
+    #[test]
+    fn workspace_authority_reads_workspace_metadata_artifact() {
+        let artifact = StoredSessionArtifact {
+            artifact_id: "artifact-1".to_string(),
+            session_id: "session-1".to_string(),
+            user_id: "user-1".to_string(),
+            artifact_kind: WORKSPACE_METADATA_ARTIFACT_KIND.to_string(),
+            source: Some("workspace_metadata".to_string()),
+            turn: Some(3),
+            round: None,
+            content: json!({
+                "session_id": "session-1",
+                "cwd": "/tmp/project",
+                "git_root": "/tmp/project",
+                "git_branch": "main",
+                "git_head": "abc123",
+                "model": "gpt-5.4",
+                "created_at": "2026-05-18T00:00:00Z",
+                "updated_at": "2026-05-18T00:01:00Z",
+                "turn_count": 3,
+                "total_tokens_in": 10,
+                "total_tokens_out": 20,
+                "status": "active",
+                "checkpoints": []
+            }),
+            metadata: None,
+            retention_policy: None,
+            retention_until: None,
+            status: Some("active".to_string()),
+            referenced_by_manifest_count: 0,
+            referenced_by_state_items_count: 0,
+            referenced_by_citation_count: 0,
+            created_at: Some("2026-05-18T00:01:00Z".to_string()),
+        };
+
+        let authority =
+            workspace_authority_from_artifact(&artifact).expect("workspace metadata should decode");
+
+        assert_eq!(authority.cwd, "/tmp/project");
+        assert_eq!(authority.git_branch.as_deref(), Some("main"));
+        assert_eq!(authority.git_head.as_deref(), Some("abc123"));
+        assert_eq!(authority.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(authority.updated_at, "2026-05-18T00:01:00Z");
     }
 }

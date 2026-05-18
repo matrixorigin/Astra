@@ -359,10 +359,13 @@ async fn orchestrator_persists_events_and_checkpoint() {
     assert!(event_types.contains(&"team_execute_start".to_string()));
     assert!(event_types.contains(&"team_complete".to_string()));
 
-    // Checkpoint should be set
-    assert!(run.checkpoint_json.is_some());
-    let cp: serde_json::Value =
-        serde_json::from_str(run.checkpoint_json.as_ref().unwrap()).unwrap();
+    // Typed checkpoint should be set
+    let checkpoint = run_engine
+        .load_latest_checkpoint(&report.parent_run_id, Some("phase"))
+        .await
+        .unwrap()
+        .expect("typed team checkpoint should be persisted");
+    let cp: serde_json::Value = serde_json::from_str(&checkpoint.checkpoint_json).unwrap();
     assert_eq!(cp["phase"], "prepared");
 }
 

@@ -39,6 +39,18 @@ pub trait RunLifecycleService: Send + Sync {
         user_id: String,
     ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)>;
 
+    async fn get_run_projection(
+        &self,
+        _run_id: String,
+        _user_id: String,
+        _recent_limit: u32,
+    ) -> Result<RunProjectionRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Run projection not supported",
+        ))
+    }
+
     async fn stream_run(
         &self,
         run_id: String,
@@ -283,6 +295,34 @@ pub struct RunStatusRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunProjectionCheckpointRecord {
+    pub checkpoint_id: String,
+    pub checkpoint_kind: String,
+    pub checkpoint_version: String,
+    pub node_seq: i64,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunProjectionRecord {
+    pub run_id: String,
+    pub session_id: String,
+    pub status: String,
+    pub waiting_for: Option<String>,
+    pub error_message: Option<String>,
+    pub run_event_high_watermark: i64,
+    pub projection_event_idx: i64,
+    pub projection_updated_at: String,
+    pub projection_hash: String,
+    pub latest_event_type: Option<String>,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub total_tool_calls: u32,
+    pub latest_checkpoint: Option<RunProjectionCheckpointRecord>,
+    pub recent_events: Vec<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CancelRunRecord {
     pub run_id: String,
     pub status: String,
@@ -361,10 +401,44 @@ pub struct DurableRunRecord {
     pub updated_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableRunCheckpointRecord {
+    pub checkpoint_id: String,
+    pub run_id: String,
+    pub user_id: String,
+    pub session_id: String,
+    pub node_seq: i64,
+    pub checkpoint_kind: String,
+    pub checkpoint_version: String,
+    pub idempotency_key: String,
+    pub checkpoint_json: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableRunDisplayProjectionRecord {
+    pub run_id: String,
+    pub user_id: String,
+    pub session_id: String,
+    pub status: String,
+    pub waiting_for: Option<String>,
+    pub error_message: Option<String>,
+    pub projection_event_idx: i64,
+    pub latest_event_type: Option<String>,
+    pub latest_checkpoint_id: Option<String>,
+    pub latest_checkpoint_kind: Option<String>,
+    pub latest_checkpoint_version: Option<String>,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub total_tool_calls: u32,
+    pub projection_hash: String,
+    pub updated_at: String,
+}
+
 /// Abstraction for durable run persistence.
 ///
 /// Implementations:
-/// - `InMemoryRunStateStore` — for tests and single-process deployments
+/// - `InMemoryRunStateStore` — deterministic durable fake for tests
 /// - `DatabaseRunStateStore` — MatrixOne-backed persistence
 #[async_trait]
 pub trait RunStateStore: Send + Sync {
@@ -395,6 +469,19 @@ pub trait RunStateStore: Send + Sync {
     /// Save checkpoint JSON for crash recovery.
     async fn save_checkpoint(&self, run_id: &str, checkpoint_json: &str) -> Result<bool, String>;
 
+    /// Load the newest checkpoint for a run, optionally filtered by kind.
+    async fn load_latest_checkpoint(
+        &self,
+        run_id: &str,
+        checkpoint_kind: Option<&str>,
+    ) -> Result<Option<DurableRunCheckpointRecord>, String>;
+
+    /// Load the current typed display projection for a durable run.
+    async fn load_run_projection(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String>;
+
     /// Append an event to the run's event log.
     async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String>;
 
@@ -412,6 +499,13 @@ pub trait RunStateStore: Send + Sync {
     /// Find runs in RUNNING status (for crash recovery — mark them failed on restart).
     async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String>;
 
+    /// Find the newest run that blocks starting another run in the same session.
+    async fn find_blocking_session_run(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<DurableRunRecord>, String>;
+
     /// Find all sub-runs belonging to a delegation.
     async fn find_sub_runs(&self, delegation_id: &str) -> Result<Vec<DurableRunRecord>, String>;
 
@@ -422,6 +516,10 @@ pub trait RunStateStore: Send + Sync {
 /// In-memory run state store for tests and single-process deployments.
 pub struct InMemoryRunStateStore {
     runs: tokio::sync::RwLock<std::collections::HashMap<String, DurableRunRecord>>,
+    checkpoints:
+        tokio::sync::RwLock<std::collections::HashMap<String, Vec<DurableRunCheckpointRecord>>>,
+    projections:
+        tokio::sync::RwLock<std::collections::HashMap<String, DurableRunDisplayProjectionRecord>>,
 }
 
 impl InMemoryRunStateStore {
@@ -432,7 +530,39 @@ impl InMemoryRunStateStore {
     pub fn new() -> Self {
         Self {
             runs: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            checkpoints: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            projections: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         }
+    }
+
+    async fn sync_projection(
+        &self,
+        run: &DurableRunRecord,
+        latest_event_type: Option<String>,
+        latest_checkpoint: Option<&DurableRunCheckpointRecord>,
+    ) {
+        let mut projections = self.projections.write().await;
+        let existing = projections.get(&run.run_id).cloned();
+        let projection = build_run_display_projection(
+            run,
+            latest_event_type.or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|entry| entry.latest_event_type.clone())
+            }),
+            latest_checkpoint
+                .map(|checkpoint| checkpoint_summary_tuple(checkpoint))
+                .or_else(|| {
+                    existing.as_ref().and_then(|entry| {
+                        Some((
+                            entry.latest_checkpoint_id.clone()?,
+                            entry.latest_checkpoint_kind.clone()?,
+                            entry.latest_checkpoint_version.clone()?,
+                        ))
+                    })
+                }),
+        );
+        projections.insert(run.run_id.clone(), projection);
     }
 }
 
@@ -442,13 +572,116 @@ impl Default for InMemoryRunStateStore {
     }
 }
 
+fn run_blocks_session(status: &str, waiting_for: Option<&str>) -> bool {
+    matches!(status, "running" | "waiting") || (status == "paused" && waiting_for.is_some())
+}
+
+fn checkpoint_metadata(
+    run_id: &str,
+    checkpoint_json: &str,
+) -> Result<(String, String, String), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(checkpoint_json).map_err(|error| error.to_string())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "checkpoint payload must be a JSON object".to_string())?;
+    let checkpoint_version = object
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("checkpoint_unversioned_v1")
+        .to_string();
+    let checkpoint_kind = if object
+        .get("graceful")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        "resume"
+    } else if object.contains_key("phase") {
+        "phase"
+    } else {
+        "generic"
+    }
+    .to_string();
+    let idempotency_key = object
+        .get("last_batch_id")
+        .and_then(serde_json::Value::as_str)
+        .map(|batch_id| format!("checkpoint:{run_id}:{checkpoint_kind}:{batch_id}"))
+        .unwrap_or_else(|| {
+            let hash = sha256_hex(checkpoint_json.as_bytes());
+            format!("checkpoint:{run_id}:{checkpoint_kind}:{hash}")
+        });
+    Ok((checkpoint_kind, checkpoint_version, idempotency_key))
+}
+
+fn checkpoint_summary_tuple(checkpoint: &DurableRunCheckpointRecord) -> (String, String, String) {
+    (
+        checkpoint.checkpoint_id.clone(),
+        checkpoint.checkpoint_kind.clone(),
+        checkpoint.checkpoint_version.clone(),
+    )
+}
+
+fn build_run_display_projection(
+    run: &DurableRunRecord,
+    latest_event_type: Option<String>,
+    latest_checkpoint: Option<(String, String, String)>,
+) -> DurableRunDisplayProjectionRecord {
+    let payload = serde_json::json!({
+        "run_id": run.run_id,
+        "status": run.status,
+        "waiting_for": run.waiting_for,
+        "error_message": run.error_message,
+        "projection_event_idx": run.last_event_idx,
+        "latest_event_type": latest_event_type.clone(),
+        "latest_checkpoint_id": latest_checkpoint.as_ref().map(|value| value.0.as_str()),
+        "latest_checkpoint_kind": latest_checkpoint.as_ref().map(|value| value.1.as_str()),
+        "latest_checkpoint_version": latest_checkpoint.as_ref().map(|value| value.2.as_str()),
+        "total_prompt_tokens": run.total_prompt_tokens,
+        "total_completion_tokens": run.total_completion_tokens,
+        "total_tool_calls": run.total_tool_calls,
+    });
+    DurableRunDisplayProjectionRecord {
+        run_id: run.run_id.clone(),
+        user_id: run.user_id.clone(),
+        session_id: run.session_id.clone(),
+        status: run.status.clone(),
+        waiting_for: run.waiting_for.clone(),
+        error_message: run.error_message.clone(),
+        projection_event_idx: run.last_event_idx,
+        latest_event_type,
+        latest_checkpoint_id: latest_checkpoint.as_ref().map(|value| value.0.clone()),
+        latest_checkpoint_kind: latest_checkpoint.as_ref().map(|value| value.1.clone()),
+        latest_checkpoint_version: latest_checkpoint.as_ref().map(|value| value.2.clone()),
+        total_prompt_tokens: run.total_prompt_tokens,
+        total_completion_tokens: run.total_completion_tokens,
+        total_tool_calls: run.total_tool_calls,
+        projection_hash: sha256_hex(payload.to_string().as_bytes()),
+        updated_at: run.updated_at.clone(),
+    }
+}
+
 #[async_trait]
 impl RunStateStore for InMemoryRunStateStore {
     async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
         let mut runs = self.runs.write().await;
-        runs.insert(record.run_id.clone(), record);
+        let run_id = record.run_id.clone();
+        if record.parent_run_id.is_none()
+            && runs.values().any(|run| {
+                run.user_id == record.user_id
+                    && run.session_id == record.session_id
+                    && run_blocks_session(&run.status, run.waiting_for.as_deref())
+            })
+        {
+            return Err("session already has an active run".to_string());
+        }
+        runs.insert(run_id.clone(), record);
+        let inserted = runs
+            .get(run_id.as_str())
+            .cloned()
+            .expect("inserted run must be readable");
 
         // Evict oldest completed/failed runs when over capacity
+        let mut evicted_ids = Vec::new();
         if runs.len() > Self::MAX_RUNS {
             let terminal = ["completed", "failed", "cancelled"];
             let mut evictable: Vec<_> = runs
@@ -460,8 +693,20 @@ impl RunStateStore for InMemoryRunStateStore {
             let to_remove = runs.len() - Self::MAX_RUNS;
             for (id, _) in evictable.into_iter().take(to_remove) {
                 runs.remove(&id);
+                evicted_ids.push(id);
             }
         }
+        drop(runs);
+        if !evicted_ids.is_empty() {
+            let mut projections = self.projections.write().await;
+            let mut checkpoints = self.checkpoints.write().await;
+            for id in evicted_ids {
+                projections.remove(&id);
+                checkpoints.remove(&id);
+            }
+        }
+        self.sync_projection(&inserted, Some("run_started".to_string()), None)
+            .await;
         Ok(())
     }
 
@@ -477,14 +722,22 @@ impl RunStateStore for InMemoryRunStateStore {
         waiting_for: Option<&str>,
         error_message: Option<&str>,
     ) -> Result<bool, String> {
-        let mut runs = self.runs.write().await;
-        if let Some(run) = runs.get_mut(run_id) {
-            run.status = status.to_string();
-            run.waiting_for = waiting_for.map(ToString::to_string);
-            if let Some(msg) = error_message {
-                run.error_message = Some(msg.to_string());
+        let updated = {
+            let mut runs = self.runs.write().await;
+            if let Some(run) = runs.get_mut(run_id) {
+                run.status = status.to_string();
+                run.waiting_for = waiting_for.map(ToString::to_string);
+                if let Some(msg) = error_message {
+                    run.error_message = Some(msg.to_string());
+                }
+                run.updated_at = chrono::Utc::now().to_rfc3339();
+                Some(run.clone())
+            } else {
+                None
             }
-            run.updated_at = chrono::Utc::now().to_rfc3339();
+        };
+        if let Some(run) = updated {
+            self.sync_projection(&run, None, None).await;
             Ok(true)
         } else {
             Ok(false)
@@ -498,12 +751,20 @@ impl RunStateStore for InMemoryRunStateStore {
         completion_tokens: u64,
         tool_calls: u32,
     ) -> Result<bool, String> {
-        let mut runs = self.runs.write().await;
-        if let Some(run) = runs.get_mut(run_id) {
-            run.total_prompt_tokens = prompt_tokens;
-            run.total_completion_tokens = completion_tokens;
-            run.total_tool_calls = tool_calls;
-            run.updated_at = chrono::Utc::now().to_rfc3339();
+        let updated = {
+            let mut runs = self.runs.write().await;
+            if let Some(run) = runs.get_mut(run_id) {
+                run.total_prompt_tokens = prompt_tokens;
+                run.total_completion_tokens = completion_tokens;
+                run.total_tool_calls = tool_calls;
+                run.updated_at = chrono::Utc::now().to_rfc3339();
+                Some(run.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(run) = updated {
+            self.sync_projection(&run, None, None).await;
             Ok(true)
         } else {
             Ok(false)
@@ -511,21 +772,92 @@ impl RunStateStore for InMemoryRunStateStore {
     }
 
     async fn save_checkpoint(&self, run_id: &str, checkpoint_json: &str) -> Result<bool, String> {
-        let mut runs = self.runs.write().await;
-        if let Some(run) = runs.get_mut(run_id) {
+        let (run, checkpoint) = {
+            let mut runs = self.runs.write().await;
+            let Some(run) = runs.get_mut(run_id) else {
+                return Ok(false);
+            };
+            let (checkpoint_kind, checkpoint_version, idempotency_key) =
+                checkpoint_metadata(run_id, checkpoint_json)?;
             run.checkpoint_json = Some(checkpoint_json.to_string());
+            run.checkpoint_version = Some(checkpoint_version.clone());
             run.updated_at = chrono::Utc::now().to_rfc3339();
-            Ok(true)
+            let checkpoint = DurableRunCheckpointRecord {
+                checkpoint_id: uuid::Uuid::now_v7().to_string(),
+                run_id: run.run_id.clone(),
+                user_id: run.user_id.clone(),
+                session_id: run.session_id.clone(),
+                node_seq: run.last_event_idx.max(0),
+                checkpoint_kind,
+                checkpoint_version,
+                idempotency_key,
+                checkpoint_json: checkpoint_json.to_string(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            (run.clone(), checkpoint)
+        };
+        let mut checkpoints = self.checkpoints.write().await;
+        let entries = checkpoints.entry(run_id.to_string()).or_default();
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|entry| entry.idempotency_key == checkpoint.idempotency_key)
+        {
+            *existing = checkpoint.clone();
         } else {
-            Ok(false)
+            entries.push(checkpoint.clone());
         }
+        drop(checkpoints);
+        self.sync_projection(&run, None, Some(&checkpoint)).await;
+        Ok(true)
+    }
+
+    async fn load_latest_checkpoint(
+        &self,
+        run_id: &str,
+        checkpoint_kind: Option<&str>,
+    ) -> Result<Option<DurableRunCheckpointRecord>, String> {
+        let checkpoints = self.checkpoints.read().await;
+        let mut matches = checkpoints
+            .get(run_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|checkpoint| {
+                checkpoint_kind.is_none_or(|kind| checkpoint.checkpoint_kind == kind)
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.checkpoint_id.cmp(&a.checkpoint_id))
+        });
+        Ok(matches.into_iter().next())
+    }
+
+    async fn load_run_projection(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
+        let projections = self.projections.read().await;
+        Ok(projections.get(run_id).cloned())
     }
 
     async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String> {
-        let mut runs = self.runs.write().await;
-        if let Some(run) = runs.get_mut(run_id) {
-            run.events.push(event);
-            run.updated_at = chrono::Utc::now().to_rfc3339();
+        let latest_event_type = extract_event_type(&event);
+        let updated = {
+            let mut runs = self.runs.write().await;
+            if let Some(run) = runs.get_mut(run_id) {
+                run.events.push(event);
+                run.last_event_idx = run.events.len() as i64 - 1;
+                run.updated_at = chrono::Utc::now().to_rfc3339();
+                Some(run.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(run) = updated {
+            self.sync_projection(&run, Some(latest_event_type), None)
+                .await;
         }
         Ok(())
     }
@@ -568,6 +900,26 @@ impl RunStateStore for InMemoryRunStateStore {
             .filter(|r| r.status == "running")
             .cloned()
             .collect())
+    }
+
+    async fn find_blocking_session_run(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<DurableRunRecord>, String> {
+        let runs = self.runs.read().await;
+        let mut matches = runs
+            .values()
+            .filter(|run| {
+                run.user_id == user_id
+                    && run.session_id == session_id
+                    && (matches!(run.status.as_str(), "running" | "waiting")
+                        || (run.status == "paused" && run.waiting_for.is_some()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        matches.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(matches.into_iter().next())
     }
 
     async fn find_sub_runs(&self, delegation_id: &str) -> Result<Vec<DurableRunRecord>, String> {
@@ -627,8 +979,6 @@ pub enum DatabaseRunStateStoreError {
     },
     #[error("invalid retry_scope for run {run_id}: {retry_scope}")]
     InvalidRetryScope { run_id: String, retry_scope: String },
-    #[error("invalid checkpoint_v1 for run {run_id}: {reason}")]
-    InvalidCheckpoint { run_id: String, reason: String },
     #[error("tool output batch too large: run_id={run_id}, rows={rows}, bytes={bytes}")]
     ToolOutputBatchTooLarge {
         run_id: String,
@@ -1012,7 +1362,7 @@ impl DatabaseRunStateStore {
         .bind(event_idx)
         .bind(&run.user_id)
         .bind(&run.session_id)
-        .bind(event_type)
+        .bind(&event_type)
         .bind(event_id)
         .bind(&run.agent_id)
         .bind(idempotency_key)
@@ -1039,6 +1389,9 @@ impl DatabaseRunStateStore {
         .await
         .map_err(|source| db_error("update_run_last_event_idx", run_id, source))?;
 
+        self.sync_projection(run_id, Some(event_type.as_str()), None)
+            .await?;
+
         Ok(())
     }
 
@@ -1049,6 +1402,95 @@ impl DatabaseRunStateStore {
             .await
             .map_err(|source| db_error("load_run_metadata", run_id, source))?;
         row.map(run_record_from_row).transpose()
+    }
+
+    async fn load_run_projection_metadata(
+        &self,
+        run_id: &str,
+    ) -> DbStoreResult<Option<DurableRunDisplayProjectionRecord>> {
+        let row = sqlx::query("SELECT * FROM run_display_projections WHERE run_id = ?")
+            .bind(run_id)
+            .fetch_optional(self.pool.get())
+            .await
+            .map_err(|source| db_error("load_run_projection", run_id, source))?;
+        row.map(run_projection_record_from_row).transpose()
+    }
+
+    async fn upsert_run_projection(
+        &self,
+        projection: &DurableRunDisplayProjectionRecord,
+    ) -> DbStoreResult<()> {
+        sqlx::query(
+            "INSERT INTO run_display_projections
+             (run_id, user_id, session_id, status, waiting_for, error_message,
+              projection_event_idx, latest_event_type, latest_checkpoint_id,
+              latest_checkpoint_kind, latest_checkpoint_version, total_prompt_tokens,
+              total_completion_tokens, total_tool_calls, projection_hash, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))
+             ON DUPLICATE KEY UPDATE
+               status = VALUES(status),
+               waiting_for = VALUES(waiting_for),
+               error_message = VALUES(error_message),
+               projection_event_idx = VALUES(projection_event_idx),
+               latest_event_type = VALUES(latest_event_type),
+               latest_checkpoint_id = VALUES(latest_checkpoint_id),
+               latest_checkpoint_kind = VALUES(latest_checkpoint_kind),
+               latest_checkpoint_version = VALUES(latest_checkpoint_version),
+               total_prompt_tokens = VALUES(total_prompt_tokens),
+               total_completion_tokens = VALUES(total_completion_tokens),
+               total_tool_calls = VALUES(total_tool_calls),
+               projection_hash = VALUES(projection_hash),
+               updated_at = NOW(6)",
+        )
+        .bind(&projection.run_id)
+        .bind(&projection.user_id)
+        .bind(&projection.session_id)
+        .bind(&projection.status)
+        .bind(&projection.waiting_for)
+        .bind(&projection.error_message)
+        .bind(projection.projection_event_idx)
+        .bind(&projection.latest_event_type)
+        .bind(&projection.latest_checkpoint_id)
+        .bind(&projection.latest_checkpoint_kind)
+        .bind(&projection.latest_checkpoint_version)
+        .bind(projection.total_prompt_tokens as i64)
+        .bind(projection.total_completion_tokens as i64)
+        .bind(projection.total_tool_calls as i64)
+        .bind(&projection.projection_hash)
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| db_error("upsert_run_projection", &projection.run_id, source))?;
+        Ok(())
+    }
+
+    async fn sync_projection(
+        &self,
+        run_id: &str,
+        latest_event_type: Option<&str>,
+        latest_checkpoint: Option<&DurableRunCheckpointRecord>,
+    ) -> DbStoreResult<()> {
+        let Some(run) = self.load_run_metadata(run_id).await? else {
+            return Ok(());
+        };
+        let existing = self.load_run_projection_metadata(run_id).await?;
+        let projection = build_run_display_projection(
+            &run,
+            latest_event_type.map(ToOwned::to_owned).or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|entry| entry.latest_event_type.clone())
+            }),
+            latest_checkpoint.map(checkpoint_summary_tuple).or_else(|| {
+                existing.as_ref().and_then(|entry| {
+                    Some((
+                        entry.latest_checkpoint_id.clone()?,
+                        entry.latest_checkpoint_kind.clone()?,
+                        entry.latest_checkpoint_version.clone()?,
+                    ))
+                })
+            }),
+        );
+        self.upsert_run_projection(&projection).await
     }
 
     async fn allocate_event_idx(&self, run_id: &str) -> DbStoreResult<i64> {
@@ -1120,44 +1562,98 @@ impl RunStateStore for DatabaseRunStateStore {
                 .unwrap_or_else(|_| chrono::Duration::seconds(45));
         let events = std::mem::take(&mut record.events);
 
-        sqlx::query(
-            "INSERT INTO agent_runs
-             (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
-              delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
-              owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
-              checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
-              total_prompt_tokens, total_completion_tokens, total_tool_calls, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
-             ON DUPLICATE KEY UPDATE updated_at = NOW(6)",
-        )
-        .bind(&record.run_id)
-        .bind(&record.user_id)
-        .bind(&record.session_id)
-        .bind(&record.parent_run_id)
-        .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
-        .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
-        .bind(record.depth as i64)
-        .bind(&record.delegation_id)
-        .bind(&record.agent_id)
-        .bind(&record.retry_of)
-        .bind(retry_scope)
-        .bind(&record.status)
-        .bind(&record.waiting_for)
-        .bind(&self.owner_pod_id)
-        .bind(lease_expires_at.naive_utc())
-        .bind(record.run_generation as i64)
-        .bind(record.last_event_idx)
-        .bind(&record.checkpoint_version)
-        .bind(&record.checkpoint_json)
-        .bind(&record.error_code)
-        .bind(&record.error_message)
-        .bind(record.retry_count as i64)
-        .bind(record.total_prompt_tokens as i64)
-        .bind(record.total_completion_tokens as i64)
-        .bind(record.total_tool_calls as i64)
-        .execute(self.pool.get())
-        .await
-        .map_err(|source| db_error("insert_run", &record.run_id, source).to_string())?;
+        let insert_result = if record.parent_run_id.is_none() {
+            sqlx::query(
+                "INSERT INTO agent_runs
+                 (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
+                  delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
+                  owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
+                  checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
+                  total_prompt_tokens, total_completion_tokens, total_tool_calls, created_at, updated_at)
+                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6)
+                 FROM DUAL
+                 WHERE NOT EXISTS (
+                     SELECT 1
+                     FROM agent_runs
+                     WHERE user_id = ?
+                       AND session_id = ?
+                       AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL))
+                     LIMIT 1
+                 )",
+            )
+            .bind(&record.run_id)
+            .bind(&record.user_id)
+            .bind(&record.session_id)
+            .bind(&record.parent_run_id)
+            .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
+            .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
+            .bind(record.depth as i64)
+            .bind(&record.delegation_id)
+            .bind(&record.agent_id)
+            .bind(&record.retry_of)
+            .bind(&retry_scope)
+            .bind(&record.status)
+            .bind(&record.waiting_for)
+            .bind(&self.owner_pod_id)
+            .bind(lease_expires_at.naive_utc())
+            .bind(record.run_generation as i64)
+            .bind(record.last_event_idx)
+            .bind(&record.checkpoint_version)
+            .bind(&record.checkpoint_json)
+            .bind(&record.error_code)
+            .bind(&record.error_message)
+            .bind(record.retry_count as i64)
+            .bind(record.total_prompt_tokens as i64)
+            .bind(record.total_completion_tokens as i64)
+            .bind(record.total_tool_calls as i64)
+            .bind(&record.user_id)
+            .bind(&record.session_id)
+            .execute(self.pool.get())
+            .await
+            .map_err(|source| db_error("insert_run", &record.run_id, source).to_string())?
+        } else {
+            sqlx::query(
+                "INSERT INTO agent_runs
+                 (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
+                  delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
+                  owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
+                  checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
+                  total_prompt_tokens, total_completion_tokens, total_tool_calls, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
+                 ON DUPLICATE KEY UPDATE updated_at = NOW(6)",
+            )
+            .bind(&record.run_id)
+            .bind(&record.user_id)
+            .bind(&record.session_id)
+            .bind(&record.parent_run_id)
+            .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
+            .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
+            .bind(record.depth as i64)
+            .bind(&record.delegation_id)
+            .bind(&record.agent_id)
+            .bind(&record.retry_of)
+            .bind(&retry_scope)
+            .bind(&record.status)
+            .bind(&record.waiting_for)
+            .bind(&self.owner_pod_id)
+            .bind(lease_expires_at.naive_utc())
+            .bind(record.run_generation as i64)
+            .bind(record.last_event_idx)
+            .bind(&record.checkpoint_version)
+            .bind(&record.checkpoint_json)
+            .bind(&record.error_code)
+            .bind(&record.error_message)
+            .bind(record.retry_count as i64)
+            .bind(record.total_prompt_tokens as i64)
+            .bind(record.total_completion_tokens as i64)
+            .bind(record.total_tool_calls as i64)
+            .execute(self.pool.get())
+            .await
+            .map_err(|source| db_error("insert_run", &record.run_id, source).to_string())?
+        };
+        if insert_result.rows_affected() == 0 {
+            return Err("session already has an active run".to_string());
+        }
 
         sqlx::query(
             "INSERT INTO run_counters
@@ -1178,6 +1674,13 @@ impl RunStateStore for DatabaseRunStateStore {
                 .await
                 .map_err(|e| e.to_string())?;
         }
+        self.sync_projection(
+            &record.run_id,
+            record.events.last().map(extract_event_type).as_deref(),
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -1248,6 +1751,11 @@ impl RunStateStore for DatabaseRunStateStore {
             .await
             .map_err(|source| db_error("update_run_status", run_id, source).to_string())?
         };
+        if result.rows_affected() > 0 {
+            self.sync_projection(run_id, None, None)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         Ok(result.rows_affected() > 0)
     }
 
@@ -1270,22 +1778,149 @@ impl RunStateStore for DatabaseRunStateStore {
         .execute(self.pool.get())
         .await
         .map_err(|source| db_error("update_run_usage", run_id, source).to_string())?;
+        if result.rows_affected() > 0 {
+            self.sync_projection(run_id, None, None)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         Ok(result.rows_affected() > 0)
     }
 
     async fn save_checkpoint(&self, run_id: &str, checkpoint_json: &str) -> Result<bool, String> {
-        validate_checkpoint_v1(run_id, checkpoint_json).map_err(|e| e.to_string())?;
+        let Some(run) = self
+            .load_run_metadata(run_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
+        let (checkpoint_kind, checkpoint_version, idempotency_key) =
+            checkpoint_metadata(run_id, checkpoint_json)?;
+        let checkpoint_id = format!("ckpt-{}", uuid::Uuid::now_v7());
+        let created_at = chrono::Utc::now().naive_utc();
+        let mut tx = self
+            .pool
+            .get()
+            .begin()
+            .await
+            .map_err(|source| db_error("begin_save_checkpoint", run_id, source).to_string())?;
+        sqlx::query(
+            "INSERT INTO run_checkpoints
+             (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
+              checkpoint_version, idempotency_key, checkpoint_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+              checkpoint_json = VALUES(checkpoint_json),
+              checkpoint_version = VALUES(checkpoint_version),
+              node_seq = VALUES(node_seq)",
+        )
+        .bind(&checkpoint_id)
+        .bind(run_id)
+        .bind(&run.user_id)
+        .bind(&run.session_id)
+        .bind(run.last_event_idx.max(0))
+        .bind(&checkpoint_kind)
+        .bind(&checkpoint_version)
+        .bind(&idempotency_key)
+        .bind(checkpoint_json)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|source| db_error("insert_run_checkpoint", run_id, source).to_string())?;
         let result = sqlx::query(
             "UPDATE agent_runs
-             SET checkpoint_version = 'checkpoint_v1', checkpoint_json = ?, updated_at = NOW(6)
+             SET checkpoint_version = ?, checkpoint_json = ?, updated_at = NOW(6)
              WHERE run_id = ?",
         )
+        .bind(&checkpoint_version)
         .bind(checkpoint_json)
         .bind(run_id)
-        .execute(self.pool.get())
+        .execute(&mut *tx)
         .await
         .map_err(|source| db_error("save_checkpoint", run_id, source).to_string())?;
-        Ok(result.rows_affected() > 0)
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+        tx.commit()
+            .await
+            .map_err(|source| db_error("commit_save_checkpoint", run_id, source).to_string())?;
+        self.sync_projection(
+            run_id,
+            None,
+            Some(&DurableRunCheckpointRecord {
+                checkpoint_id,
+                run_id: run.run_id,
+                user_id: run.user_id,
+                session_id: run.session_id,
+                node_seq: run.last_event_idx.max(0),
+                checkpoint_kind,
+                checkpoint_version,
+                idempotency_key,
+                checkpoint_json: checkpoint_json.to_string(),
+                created_at: created_at.to_string(),
+            }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
+    async fn load_latest_checkpoint(
+        &self,
+        run_id: &str,
+        checkpoint_kind: Option<&str>,
+    ) -> Result<Option<DurableRunCheckpointRecord>, String> {
+        let row = if let Some(checkpoint_kind) = checkpoint_kind {
+            sqlx::query(
+                "SELECT checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
+                        checkpoint_version, idempotency_key, checkpoint_json,
+                        DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+                 FROM run_checkpoints
+                 WHERE run_id = ? AND checkpoint_kind = ?
+                 ORDER BY created_at DESC, checkpoint_id DESC
+                 LIMIT 1",
+            )
+            .bind(run_id)
+            .bind(checkpoint_kind)
+            .fetch_optional(self.pool.get())
+            .await
+            .map_err(|source| db_error("load_latest_checkpoint", run_id, source).to_string())?
+        } else {
+            sqlx::query(
+                "SELECT checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
+                        checkpoint_version, idempotency_key, checkpoint_json,
+                        DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+                 FROM run_checkpoints
+                 WHERE run_id = ?
+                 ORDER BY created_at DESC, checkpoint_id DESC
+                 LIMIT 1",
+            )
+            .bind(run_id)
+            .fetch_optional(self.pool.get())
+            .await
+            .map_err(|source| db_error("load_latest_checkpoint", run_id, source).to_string())?
+        };
+        Ok(row.map(|row| DurableRunCheckpointRecord {
+            checkpoint_id: row.try_get("checkpoint_id").unwrap_or_default(),
+            run_id: row.try_get("run_id").unwrap_or_default(),
+            user_id: row.try_get("user_id").unwrap_or_default(),
+            session_id: row.try_get("session_id").unwrap_or_default(),
+            node_seq: row.try_get("node_seq").unwrap_or(0),
+            checkpoint_kind: row.try_get("checkpoint_kind").unwrap_or_default(),
+            checkpoint_version: row.try_get("checkpoint_version").unwrap_or_default(),
+            idempotency_key: row.try_get("idempotency_key").unwrap_or_default(),
+            checkpoint_json: row.try_get("checkpoint_json").unwrap_or_default(),
+            created_at: row.try_get("created_at").unwrap_or_default(),
+        }))
+    }
+
+    async fn load_run_projection(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
+        self.load_run_projection_metadata(run_id)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String> {
@@ -1329,6 +1964,28 @@ impl RunStateStore for DatabaseRunStateStore {
 
     async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         self.find_runs_by_status("running").await
+    }
+
+    async fn find_blocking_session_run(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<DurableRunRecord>, String> {
+        let row = sqlx::query(
+            "SELECT * FROM agent_runs \
+             WHERE user_id = ? AND session_id = ? \
+               AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL)) \
+             ORDER BY updated_at DESC \
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| db_error("find_blocking_session_run", session_id, source).to_string())?;
+        row.map(run_record_from_row)
+            .transpose()
+            .map_err(|e| e.to_string())
     }
 
     async fn find_sub_runs(&self, delegation_id: &str) -> Result<Vec<DurableRunRecord>, String> {
@@ -1399,66 +2056,6 @@ fn validate_retry_scope(run_id: &str, retry_scope: &str) -> DbStoreResult<()> {
             retry_scope: other.to_string(),
         }),
     }
-}
-
-fn validate_checkpoint_v1(run_id: &str, checkpoint_json: &str) -> DbStoreResult<()> {
-    let value: serde_json::Value = serde_json::from_str(checkpoint_json).map_err(|source| {
-        DatabaseRunStateStoreError::Json {
-            operation: "parse_checkpoint",
-            entity: run_id.to_string(),
-            source,
-        }
-    })?;
-    let object =
-        value
-            .as_object()
-            .ok_or_else(|| DatabaseRunStateStoreError::InvalidCheckpoint {
-                run_id: run_id.to_string(),
-                reason: "checkpoint root must be an object".to_string(),
-            })?;
-    if object.get("version").and_then(serde_json::Value::as_str) != Some("checkpoint_v1") {
-        return Err(DatabaseRunStateStoreError::InvalidCheckpoint {
-            run_id: run_id.to_string(),
-            reason: "version must be checkpoint_v1".to_string(),
-        });
-    }
-    if !matches!(object.get("graceful"), Some(serde_json::Value::Bool(_))) {
-        return Err(DatabaseRunStateStoreError::InvalidCheckpoint {
-            run_id: run_id.to_string(),
-            reason: "graceful must be boolean".to_string(),
-        });
-    }
-    if object
-        .get("last_batch_id")
-        .and_then(serde_json::Value::as_str)
-        .is_none()
-    {
-        return Err(DatabaseRunStateStoreError::InvalidCheckpoint {
-            run_id: run_id.to_string(),
-            reason: "last_batch_id must be string".to_string(),
-        });
-    }
-    let extra = object.get("extra").and_then(serde_json::Value::as_object);
-    if extra.is_none() {
-        return Err(DatabaseRunStateStoreError::InvalidCheckpoint {
-            run_id: run_id.to_string(),
-            reason: "extra must be object".to_string(),
-        });
-    }
-    if let Some(partial) = extra
-        .and_then(|m| m.get("partial_progress"))
-        .and_then(serde_json::Value::as_object)
-    {
-        for key in ["step_index", "total_steps", "resumable_marker"] {
-            if !partial.contains_key(key) {
-                return Err(DatabaseRunStateStoreError::InvalidCheckpoint {
-                    run_id: run_id.to_string(),
-                    reason: format!("extra.partial_progress.{key} is required"),
-                });
-            }
-        }
-    }
-    Ok(())
 }
 
 fn build_tool_output_preview_row(
@@ -1552,6 +2149,45 @@ fn run_record_from_row(row: sqlx::mysql::MySqlRow) -> DbStoreResult<DurableRunRe
     })
 }
 
+fn run_projection_record_from_row(
+    row: sqlx::mysql::MySqlRow,
+) -> DbStoreResult<DurableRunDisplayProjectionRecord> {
+    let run_id = row.try_get::<String, _>("run_id").map_err(|source| {
+        db_error(
+            "decode_run_projection_row.run_id",
+            "run_display_projections",
+            source,
+        )
+    })?;
+    Ok(DurableRunDisplayProjectionRecord {
+        run_id,
+        user_id: row.try_get("user_id").unwrap_or_default(),
+        session_id: row.try_get("session_id").unwrap_or_default(),
+        status: row.try_get("status").unwrap_or_default(),
+        waiting_for: row.try_get("waiting_for").ok(),
+        error_message: row.try_get("error_message").ok(),
+        projection_event_idx: row.try_get::<i64, _>("projection_event_idx").unwrap_or(-1),
+        latest_event_type: row.try_get("latest_event_type").ok(),
+        latest_checkpoint_id: row.try_get("latest_checkpoint_id").ok(),
+        latest_checkpoint_kind: row.try_get("latest_checkpoint_kind").ok(),
+        latest_checkpoint_version: row.try_get("latest_checkpoint_version").ok(),
+        total_prompt_tokens: row
+            .try_get::<i64, _>("total_prompt_tokens")
+            .unwrap_or(0)
+            .max(0) as u64,
+        total_completion_tokens: row
+            .try_get::<i64, _>("total_completion_tokens")
+            .unwrap_or(0)
+            .max(0) as u64,
+        total_tool_calls: row
+            .try_get::<i64, _>("total_tool_calls")
+            .unwrap_or(0)
+            .max(0) as u32,
+        projection_hash: row.try_get("projection_hash").unwrap_or_default(),
+        updated_at: datetime_string(&row, "updated_at").unwrap_or_default(),
+    })
+}
+
 fn datetime_string(row: &sqlx::mysql::MySqlRow, column: &str) -> Option<String> {
     row.try_get::<chrono::NaiveDateTime, _>(column)
         .ok()
@@ -1559,7 +2195,7 @@ fn datetime_string(row: &sqlx::mysql::MySqlRow, column: &str) -> Option<String> 
         .or_else(|| row.try_get::<String, _>(column).ok())
 }
 
-fn extract_event_type(event: &serde_json::Value) -> String {
+pub fn extract_event_type(event: &serde_json::Value) -> String {
     extract_optional_string(event, "event_type")
         .or_else(|| extract_optional_string(event, "type"))
         .unwrap_or_else(|| "unknown".to_string())
