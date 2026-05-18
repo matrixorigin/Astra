@@ -12,6 +12,7 @@
 )]
 
 pub mod agent_live_event;
+pub mod agent_tree_state;
 pub mod agentic_recursion_guard;
 pub mod agentic_verdict_audit;
 pub mod alert_dispatcher;
@@ -94,6 +95,7 @@ pub mod stop_hooks_yaml;
 pub mod streaming_tool_exec;
 pub mod tail_persist;
 pub mod task;
+pub mod task_context;
 pub mod thinking_config;
 pub mod token_accounting;
 pub mod tool_args_repair;
@@ -124,6 +126,7 @@ pub mod approval_batch_group;
 pub mod approval_fingerprint;
 pub mod approval_request_key;
 pub mod approval_sink;
+pub mod approval_ux_layer;
 pub mod chat_turn_sse_dispatch;
 pub mod cloud_approval_policy;
 pub mod cloud_attachments;

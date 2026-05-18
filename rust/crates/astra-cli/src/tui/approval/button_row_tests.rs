@@ -11,7 +11,10 @@ use crate::chat_stream::ApprovalResponse;
 fn primary_row_has_simple_ux_buttons_in_expected_order() {
     let row = ButtonRow::primary();
     let labels: Vec<&str> = row.buttons().iter().map(|b| b.label).collect();
-    assert_eq!(labels, vec!["Allow once", "Always", "Reject"]);
+    assert_eq!(
+        labels,
+        vec!["Allow once", "Always allow similar in workspace", "Reject"]
+    );
 }
 
 #[test]
@@ -38,7 +41,10 @@ fn right_arrow_advances_focus() {
     let mut row = ButtonRow::primary();
     row.move_right();
     assert_eq!(row.focus(), 1);
-    assert_eq!(row.focused().unwrap().label, "Always");
+    assert_eq!(
+        row.focused().unwrap().label,
+        "Always allow similar in workspace"
+    );
 }
 
 #[test]
@@ -89,10 +95,25 @@ fn activate_reject_returns_deny() {
 #[test]
 fn primary_row_does_not_expose_legacy_scope_or_match_target_labels() {
     let row = ButtonRow::primary();
-    let labels: Vec<&str> = row.buttons().iter().map(|b| b.label).collect();
-    for forbidden in ["Turn", "Session", "Project", "User", "Skip", "Exact"] {
+    let text = row
+        .buttons()
+        .iter()
+        .map(|b| b.label)
+        .collect::<Vec<_>>()
+        .join(" ");
+    for forbidden in [
+        "Turn",
+        "Session",
+        "Project",
+        "User",
+        "Skip",
+        "Exact",
+        "Prefix",
+        "Scope",
+        "Policy",
+    ] {
         assert!(
-            !labels.contains(&forbidden),
+            !text.contains(forbidden),
             "{forbidden} must not appear in the primary approval UI"
         );
     }

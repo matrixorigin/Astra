@@ -4147,6 +4147,7 @@ mod tests {
                     multi_select: false,
                     allow_freeform: false,
                 }],
+                timeout_ms: None,
             },
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -4210,6 +4211,7 @@ mod tests {
                         multi_select: false,
                         allow_freeform: false,
                     }],
+                    timeout_ms: None,
                 },
             },
             WsServerMessage::Error {

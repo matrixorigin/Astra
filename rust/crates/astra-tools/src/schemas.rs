@@ -1221,6 +1221,27 @@ mod tests {
     }
 
     #[test]
+    fn task_schema_exposes_lifecycle_progress_and_dependencies() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let task = find_schema(&schemas, "task").expect("task schema must exist");
+        let properties = &task["function"]["parameters"]["properties"];
+
+        for field in ["active_form", "add_blocks", "add_blocked_by"] {
+            assert!(
+                properties.get(field).is_some(),
+                "task schema must expose {field} to the model"
+            );
+        }
+        assert!(
+            properties["active_form"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Spinner text"),
+            "active_form should stay product-facing spinner guidance"
+        );
+    }
+
+    #[test]
     fn plan_and_task_schemas_use_semantic_guidance_not_lexical_triggers() {
         let schemas = all_tool_schemas_with_env(|_| None);
         let task = find_schema(&schemas, "task").expect("task schema must exist");

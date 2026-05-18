@@ -67,7 +67,11 @@ impl AskUserGate for WebSocketUserPromptGate {
         }
 
         let key = user_prompt_callback_key(&self.user_id, request_id);
-        match take_ledger_entry(&self.edge_callback_ledger, &key, self.timeout).await {
+        let timeout = prompt
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(self.timeout);
+        match take_ledger_entry(&self.edge_callback_ledger, &key, timeout).await {
             Some(value) => {
                 if value
                     .get("cancelled")
@@ -158,6 +162,7 @@ mod tests {
                         multi_select: false,
                         allow_freeform: false,
                     }],
+                    timeout_ms: None,
                 },
             )
             .await;
@@ -198,10 +203,44 @@ mod tests {
                         multi_select: false,
                         allow_freeform: true,
                     }],
+                    timeout_ms: None,
                 },
             )
             .await;
         assert_eq!(decision, AskUserDecision::Timeout);
+    }
+
+    #[tokio::test]
+    async fn prompt_timeout_overrides_gate_default() {
+        let ledger = Arc::new(TokioMutex::new(HashMap::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let gate = WebSocketUserPromptGate {
+            user_id: "u1".into(),
+            edge_callback_ledger: ledger,
+            request_tx: tx,
+            timeout: Duration::from_secs(5),
+        };
+
+        let start = std::time::Instant::now();
+        let decision = gate
+            .request_questionnaire(
+                "req-timeout",
+                &AskUserPrompt {
+                    context: None,
+                    questions: vec![astra_tools::AskUserQuestion {
+                        header: "Confirm".into(),
+                        question: "Continue?".into(),
+                        options: vec![],
+                        multi_select: false,
+                        allow_freeform: true,
+                    }],
+                    timeout_ms: Some(10),
+                },
+            )
+            .await;
+        assert_eq!(decision, AskUserDecision::Timeout);
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]
@@ -229,6 +268,7 @@ mod tests {
                         multi_select: false,
                         allow_freeform: true,
                     }],
+                    timeout_ms: None,
                 },
             )
             .await;
@@ -270,6 +310,7 @@ mod tests {
                         multi_select: false,
                         allow_freeform: true,
                     }],
+                    timeout_ms: None,
                 },
             )
             .await;

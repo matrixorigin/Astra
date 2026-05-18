@@ -354,7 +354,7 @@ impl PendingApproval {
     fn selection_hint(&self) -> Option<String> {
         if self.always_uses_session_fallback() {
             return Some(
-                "Always remembers for this session only. Choose Trust Workspace or run `/allow trust` to save workspace rules."
+                "Always allow stays session-only until you trust this workspace. Choose Trust Workspace or run `/allow trust` to save workspace rules."
                     .to_string(),
             );
         }
@@ -1364,7 +1364,7 @@ mod tests {
         assert_eq!(
             view.selection_hint.as_deref(),
             Some(
-                "Always remembers for this session only. Choose Trust Workspace or run `/allow trust` to save workspace rules."
+                "Always allow stays session-only until you trust this workspace. Choose Trust Workspace or run `/allow trust` to save workspace rules."
             )
         );
     }

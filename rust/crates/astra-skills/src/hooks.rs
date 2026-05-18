@@ -78,6 +78,58 @@ pub enum PreToolDecision {
     Block(String),
 }
 
+impl PreToolDecision {
+    pub fn from_json_contract(
+        value: &serde_json::Value,
+    ) -> Result<Self, HookDecisionContractError> {
+        let obj = value
+            .as_object()
+            .ok_or(HookDecisionContractError::ExpectedObject)?;
+        let decision = obj
+            .get("decision")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(HookDecisionContractError::MissingDecision)?;
+        match decision {
+            "allow" => Ok(Self::Allow),
+            "allow_with_context" => {
+                let context = obj
+                    .get("context")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or(HookDecisionContractError::MissingContext)?;
+                Ok(Self::AllowWithContext(context.to_string()))
+            }
+            "block" => {
+                let reason = obj
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or(HookDecisionContractError::MissingBlockReason)?;
+                Ok(Self::Block(reason.to_string()))
+            }
+            other => Err(HookDecisionContractError::UnknownDecision(
+                other.to_string(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum HookDecisionContractError {
+    #[error("hook output must be a JSON object")]
+    ExpectedObject,
+    #[error("hook output is missing string field 'decision'")]
+    MissingDecision,
+    #[error("allow_with_context hook output requires non-empty string field 'context'")]
+    MissingContext,
+    #[error("block hook output requires non-empty string field 'reason'")]
+    MissingBlockReason,
+    #[error("unknown hook decision '{0}'")]
+    UnknownDecision(String),
+}
+
 /// A single tool event hook configuration.
 ///
 /// Configured in project settings (`.astra/hooks.json`) or skill frontmatter.
@@ -410,7 +462,7 @@ pub async fn fire_session_end(registry: &SessionEventHookRegistry, session_id: &
 /// ```json
 /// {"decision": "allow"}
 /// {"decision": "block", "reason": "dangerous command"}
-/// {"decision": "allow", "context": "extra info to append"}
+/// {"decision": "allow_with_context", "context": "extra info to append"}
 /// ```
 pub async fn evaluate_pre_tool_hooks(
     registry: &ToolEventHookRegistry,
@@ -587,7 +639,7 @@ async fn run_shell_pre_hook(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(target: "hook", "Failed to spawn hook '{}': {}", command, e);
-            return PreToolDecision::Allow;
+            return PreToolDecision::Block(format!("Hook '{command}' failed to spawn: {e}"));
         }
     };
 
@@ -619,7 +671,7 @@ async fn run_shell_pre_hook(
         Ok((buf, Ok(_))) => parse_pre_hook_output(&buf),
         Ok((_, Err(e))) => {
             tracing::warn!(target: "hook", "Hook I/O error for '{}': {}", command, e);
-            PreToolDecision::Allow
+            PreToolDecision::Block(format!("Hook '{command}' failed during I/O: {e}"))
         }
         Err(_) => {
             let _ = child.kill().await;
@@ -699,26 +751,12 @@ fn parse_pre_hook_output(stdout: &[u8]) -> PreToolDecision {
     }
 
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        match v.get("decision").and_then(|d| d.as_str()) {
-            Some("block") => {
-                let reason = v
-                    .get("reason")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("blocked by hook")
-                    .to_string();
-                PreToolDecision::Block(reason)
-            }
-            Some("allow") => {
-                if let Some(ctx) = v.get("context").and_then(|c| c.as_str()) {
-                    PreToolDecision::AllowWithContext(ctx.to_string())
-                } else {
-                    PreToolDecision::Allow
-                }
-            }
-            _ => PreToolDecision::Allow,
+        match PreToolDecision::from_json_contract(&v) {
+            Ok(decision) => decision,
+            Err(err) => PreToolDecision::Block(format!("invalid hook decision contract: {err}")),
         }
     } else {
-        PreToolDecision::Allow
+        PreToolDecision::Block("invalid hook decision contract: stdout was not JSON".into())
     }
 }
 
@@ -755,7 +793,7 @@ async fn run_http_pre_hook(
 
     match http_post_json(url, headers, &payload, timeout_secs).await {
         Some(body) => parse_pre_hook_output(body.as_bytes()),
-        None => PreToolDecision::Allow,
+        None => PreToolDecision::Block(format!("HTTP hook '{url}' failed")),
     }
 }
 
@@ -1817,7 +1855,9 @@ mod tests {
             event: ToolEventKind::PreToolUse,
             matcher: "*".into(),
             action: HookAction::Shell {
-                command: r#"echo '{"decision": "allow", "context": "hook injected info"}'"#.into(),
+                command:
+                    r#"echo '{"decision": "allow_with_context", "context": "hook injected info"}'"#
+                        .into(),
             },
             timeout_secs: 5,
             is_async: false,
@@ -1852,6 +1892,28 @@ mod tests {
         let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
         match decision {
             PreToolDecision::Block(reason) => assert!(reason.contains("exited with status")),
+            _ => panic!("expected Block, got {:?}", decision),
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_pre_hook_non_json_stdout_blocks() {
+        let registry = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PreToolUse,
+            matcher: "bash".into(),
+            action: HookAction::Shell {
+                command: "echo definitely-not-json".into(),
+            },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+
+        let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+        match decision {
+            PreToolDecision::Block(reason) => assert!(reason.contains("not JSON")),
             _ => panic!("expected Block, got {:?}", decision),
         }
     }
@@ -1973,7 +2035,8 @@ mod tests {
                 event: ToolEventKind::PreToolUse,
                 matcher: "*".into(),
                 action: HookAction::Shell {
-                    command: r#"echo '{"decision":"allow","context":"hook1 info"}'"#.into(),
+                    command: r#"echo '{"decision":"allow_with_context","context":"hook1 info"}'"#
+                        .into(),
                 },
                 timeout_secs: 5,
                 is_async: false,
@@ -1985,7 +2048,8 @@ mod tests {
                 event: ToolEventKind::PreToolUse,
                 matcher: "*".into(),
                 action: HookAction::Shell {
-                    command: r#"echo '{"decision":"allow","context":"hook2 info"}'"#.into(),
+                    command: r#"echo '{"decision":"allow_with_context","context":"hook2 info"}'"#
+                        .into(),
                 },
                 timeout_secs: 5,
                 is_async: false,
@@ -2562,5 +2626,47 @@ session_hooks:
             evaluate_session_hooks(&registry, SessionEvent::SessionStart, "s1", None).await;
         assert!(output.context.is_none());
         assert!(output.env_vars.is_empty());
+    }
+
+    #[test]
+    fn typed_hook_decision_contract_accepts_valid_shapes() {
+        assert_eq!(
+            PreToolDecision::from_json_contract(&serde_json::json!({"decision":"allow"})).unwrap(),
+            PreToolDecision::Allow
+        );
+        assert_eq!(
+            PreToolDecision::from_json_contract(
+                &serde_json::json!({"decision":"allow_with_context","context":"policy note"})
+            )
+            .unwrap(),
+            PreToolDecision::AllowWithContext("policy note".into())
+        );
+        assert_eq!(
+            PreToolDecision::from_json_contract(
+                &serde_json::json!({"decision":"block","reason":"dangerous"})
+            )
+            .unwrap(),
+            PreToolDecision::Block("dangerous".into())
+        );
+    }
+
+    #[test]
+    fn typed_hook_decision_contract_rejects_success_shaped_bad_outputs() {
+        for (value, expected) in [
+            (
+                serde_json::json!({"decision":"block"}),
+                HookDecisionContractError::MissingBlockReason,
+            ),
+            (
+                serde_json::json!({"decision":"allow_with_context","context":" "}),
+                HookDecisionContractError::MissingContext,
+            ),
+            (
+                serde_json::json!({"decision":"retry"}),
+                HookDecisionContractError::UnknownDecision("retry".into()),
+            ),
+        ] {
+            assert_eq!(PreToolDecision::from_json_contract(&value), Err(expected));
+        }
     }
 }

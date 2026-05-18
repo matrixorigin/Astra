@@ -24,6 +24,7 @@ pub mod config_tool;
 pub mod detach;
 pub mod env_tools;
 pub mod executor;
+pub mod exit_semantics;
 pub mod fs_ops;
 pub mod fuzzy_replacer;
 pub mod git_gix;
@@ -66,6 +67,10 @@ pub struct ToolResult {
     pub metadata: Option<serde_json::Map<String, Value>>,
     /// Whether this result represents an error condition.
     pub is_error: bool,
+    /// Semantic meaning of a process exit code when the tool surfaced
+    /// one. This keeps domain-negative outcomes (grep no-match, diff
+    /// differs, test false) distinct from execution failures.
+    pub exit_semantics: Option<exit_semantics::ExitSemantics>,
 }
 
 impl ToolResult {
@@ -75,6 +80,7 @@ impl ToolResult {
             output,
             metadata: None,
             is_error: false,
+            exit_semantics: None,
         }
     }
 
@@ -84,7 +90,14 @@ impl ToolResult {
             output: message,
             metadata: None,
             is_error: true,
+            exit_semantics: None,
         }
+    }
+
+    /// Attach exit-code semantics while preserving the existing output/error shape.
+    pub fn with_exit_semantics(mut self, semantics: exit_semantics::ExitSemantics) -> Self {
+        self.exit_semantics = Some(semantics);
+        self
     }
 
     /// Convert a legacy `String` output into a `ToolResult`.

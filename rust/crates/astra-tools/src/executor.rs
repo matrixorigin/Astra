@@ -35,6 +35,7 @@ fn outcome_to_result(outcome: crate::git_gix::ToolExecutionOutcome) -> ToolResul
         output: outcome.output,
         metadata: outcome.tool_result_fields,
         is_error: outcome.is_error,
+        exit_semantics: None,
     }
 }
 
