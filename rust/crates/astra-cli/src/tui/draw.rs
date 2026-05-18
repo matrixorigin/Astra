@@ -446,10 +446,13 @@ pub(crate) fn do_draw(
         RenderableItem::Owned(Box::new(framed) as Box<dyn Renderable>)
     });
 
-    // Thin dim separator between scrollback area and composer
+    // Stronger separator between scrollback area and composer so the
+    // input region stays visually anchored even on low-contrast themes.
     let sep_line = Line::from(ratatui::text::Span::styled(
-        "─".repeat(width as usize),
-        ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
+        "━".repeat(width as usize),
+        ratatui::style::Style::default()
+            .fg(ratatui::style::Color::Gray)
+            .add_modifier(ratatui::style::Modifier::BOLD),
     ));
     let sep_renderable = RenderableItem::Owned(Box::new(sep_line));
 

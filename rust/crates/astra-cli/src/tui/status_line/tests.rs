@@ -335,7 +335,7 @@ fn multi_pending_uses_numeric_count() {
 }
 
 #[test]
-fn pending_chip_is_yellow_bold() {
+fn pending_chip_is_yellow_without_extra_bold() {
     let c = StatusContext {
         pending_approvals: 2,
         ..ctx()
@@ -348,7 +348,8 @@ fn pending_chip_is_yellow_bold() {
         .expect("pending chip");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Yellow));
     assert!(
-        chip.style
+        !chip
+            .style
             .add_modifier
             .contains(ratatui::style::Modifier::BOLD)
     );

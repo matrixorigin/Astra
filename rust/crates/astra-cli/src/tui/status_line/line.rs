@@ -120,9 +120,7 @@ impl StatusLine {
     /// Build a status line from context.
     pub fn from_context(ctx: &StatusContext) -> Self {
         let muted = Style::default().fg(Color::Gray);
-        let hint = Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD);
+        let hint = Style::default().fg(Color::White);
         let mut out = Self::default();
 
         // ── Left: short hint, then permission chip if non-default ─
@@ -191,12 +189,8 @@ impl StatusLine {
             } else {
                 format!("⏸ {} pending", ctx.pending_approvals)
             };
-            out.left.push(Segment::styled(
-                text,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            out.left
+                .push(Segment::styled(text, Style::default().fg(Color::Yellow)));
         }
 
         // Task-board chip. `▶` = collapsed (Ctrl+T to expand),
@@ -212,17 +206,10 @@ impl StatusLine {
                 let (text, style) = if open == 0 {
                     (
                         format!("{glyph} {total} done"),
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(Color::Green),
                     )
                 } else {
-                    (
-                        format!("{glyph} {open}/{total}"),
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    )
+                    (format!("{glyph} {open}/{total}"), muted)
                 };
                 out.left.push(Segment::styled(text, style));
             }
@@ -243,13 +230,9 @@ impl StatusLine {
                     text.push_str(&format!(" · {stalled} stalled"));
                 }
                 let style = if stalled > 0 {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
+                    Style::default().fg(Color::Yellow)
                 } else {
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD)
+                    muted
                 };
                 out.left.push(Segment::styled(text, style));
             }
@@ -259,9 +242,7 @@ impl StatusLine {
         if let Some(model) = ctx.model.as_deref() {
             out.right.push(Segment::styled(
                 model.to_string(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::White),
             ));
         }
 

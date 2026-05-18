@@ -993,19 +993,15 @@ pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     eprintln!();
     let welcome = banner_welcome_text(&pname, p, logged_in);
     let model_hint = if model_display == "auto" {
-        format!("{} {}", "auto".yellow().bold(), "mode".white().bold())
+        format!("{} {}", "auto".yellow(), "mode".grey())
     } else {
-        format!(
-            "{} {}",
-            model_display.magenta().bold(),
-            "mode".white().bold()
-        )
+        format!("{} {}", model_display.magenta(), "mode".grey())
     };
     eprintln!(
         "  {} {} {}",
-        welcome.white().bold(),
+        welcome.cyan(),
         model_hint,
-        "· /model to change".white().bold()
+        "· /model to change".grey()
     );
     eprintln!();
 }
