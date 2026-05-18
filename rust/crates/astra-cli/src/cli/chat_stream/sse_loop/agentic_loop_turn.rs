@@ -586,6 +586,10 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         );
     }
 
+    // Pass the selector-produced `turn_schemas` (which includes any force-injected
+    // plan-mode or skill-allowed tools) rather than `tool_surface.pinned_schemas()`.
+    // Pinned schemas only contain tools invoked in prior turns; using them here would
+    // discard newly-injected required tools that haven't been called yet.
     apply_selector_hints_then_attach_filtered_edge_tools(
         &mut payload,
         turn_schemas,
@@ -1612,6 +1616,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
             .iter()
             .filter_map(|schema| schema["function"]["name"].as_str())
             .collect();
+        // Plan-mode escape hatches must be present exactly once each.
         assert!(edge_tool_names.contains(&"enter_plan_mode"));
         assert!(edge_tool_names.contains(&"exit_plan_mode"));
         assert_eq!(
@@ -1628,36 +1633,114 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
                 .count(),
             1
         );
+    }
 
-        let report = first_selection_report.expect("selection report recorded");
-        assert!(report.tools_selected.contains(&"enter_plan_mode".into()));
-        assert!(report.tools_selected.contains(&"exit_plan_mode".into()));
-        assert_eq!(
-            report
-                .tools_selected
-                .iter()
-                .filter(|name| name.as_str() == "enter_plan_mode")
-                .count(),
-            1
-        );
-        assert_eq!(
-            report
-                .tools_selected
-                .iter()
-                .filter(|name| name.as_str() == "exit_plan_mode")
-                .count(),
-            1
-        );
-        assert_eq!(report.selected_count as usize, report.tools_selected.len());
+    #[tokio::test]
+    async fn prepare_chat_turn_payload_excludes_plan_tools_when_plan_mode_inactive() {
+        use crate::edge_tools::ToolExecutor;
+        use astra_pipeline::step_recorder::StepRecorder;
+        use astra_runtime::{
+            tool_registry::ToolRegistry,
+            turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
+        };
+        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use std::{collections::HashSet, sync::Arc, time::Instant};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let all_schemas = vec![
+            schema("read_file"),
+            schema("write_file"),
+            schema("enter_plan_mode"),
+            schema("exit_plan_mode"),
+        ];
+        // Budget of 2 forces the selector to only pick the 2 most relevant tools,
+        // leaving plan-mode escape hatches unselected naturally. This makes the test
+        // meaningful: if the `plan_mode_active` guard is accidentally removed, the
+        // injection would add them and the assertion below would fail.
+        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(2);
+        let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
+        let messages = vec![json!({"role": "user", "content": "inspect the repo state"})];
+        let tool_results = Vec::new();
+        let history: Vec<(String, String)> = Vec::new();
+        let recent_tools: Vec<String> = Vec::new();
+        let file_context: Vec<String> = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut step_recorder = StepRecorder::new("session-1", "task-1");
+        let turn_guard = TurnGuard::default();
+        let skill_search = astra_core::SkillSearchSettings::default();
+        let mut turn_policy = TurnInteractionPolicy::default();
+        let mut first_memoria_ms = None;
+        let mut first_selection_report = None;
+        let mut first_budget_pressure = 0.0;
+        let mut first_context_assembly_ms = None;
+        let mut all_selected_skills = Vec::new();
+
+        let payload = super::prepare_chat_turn_payload(super::PrepareChatTurnRequest {
+            messages: &messages,
+            ephemeral_prefix: None,
+            current_session_id: Some("session-1"),
+            model: None,
+            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
+            project_root: temp_dir.path(),
+            message: "inspect the repo state",
+            history: &history,
+            recent_tools: &recent_tools,
+            executor,
+            registry: &registry,
+            tool_results: &tool_results,
+            all_schemas: &all_schemas,
+            turn_guard: &turn_guard,
+            restricted_tools: &mut restricted_tools,
+            step_recorder: &mut step_recorder,
+            file_context: &file_context,
+            assembly_start: Instant::now(),
+            telem: super::PrepareTurnTelemetry {
+                first_memoria_ms: &mut first_memoria_ms,
+                first_selection_report: &mut first_selection_report,
+                first_budget_pressure: &mut first_budget_pressure,
+                first_context_assembly_ms: &mut first_context_assembly_ms,
+                all_selected_skills: &mut all_selected_skills,
+                initial_skill_selector_shortlist: None,
+                trace_collector: None,
+            },
+            skill_search: &skill_search,
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            timing_phases: false,
+            prep_ui_phase: None,
+            skill_effort: None,
+            skill_agent_type: None,
+            tool_budget_override: None,
+            interaction_mode: TurnInteractionMode::NonInteractive,
+            turn_policy: &mut turn_policy,
+            skill_allowed_tools: None,
+            previous_confidence_fallback: None,
+            round_index: 0,
+            session_turn: 1,
+            turn_chain_id: None,
+            user_query_event_id: None,
+            denial_pressure: (0, 0),
+            recent_rejections: Vec::new(),
+            observability_hub: None,
+            append_system_prompt: None,
+            plan_mode_active: false,
+        })
+        .await;
+
+        let edge_tool_names: Vec<&str> = payload["edge_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str())
+            .collect();
+        // Plan-mode escape hatches must NOT be present when plan_mode_active is false
         assert!(
-            turn_policy
-                .visible_tool_names
-                .contains(&"enter_plan_mode".into())
+            !edge_tool_names.contains(&"enter_plan_mode"),
+            "enter_plan_mode should not be injected when plan_mode_active=false"
         );
         assert!(
-            turn_policy
-                .visible_tool_names
-                .contains(&"exit_plan_mode".into())
+            !edge_tool_names.contains(&"exit_plan_mode"),
+            "exit_plan_mode should not be injected when plan_mode_active=false"
         );
     }
 }

@@ -267,6 +267,34 @@ pub fn pin_invoked_tool_schemas(
 ///
 /// The selector picks tools by relevance, but a skill's `allowed_tools` are
 /// contractual — the skill instructions reference them, so they must be present.
+/// Shared implementation: inject tool names that are not yet in `selected`.
+/// Deduplicates against both existing selections and within the input list.
+fn inject_tool_names_inner(
+    selected: &mut Vec<Value>,
+    report: &mut SelectionReport,
+    names: impl IntoIterator<Item = impl AsRef<str>>,
+    all_schemas: &[Value],
+) -> u32 {
+    let mut selected_names: HashSet<String> = report.tools_selected.iter().cloned().collect();
+    let mut injected = 0u32;
+    for name in names {
+        let name = name.as_ref();
+        if selected_names.insert(name.to_owned()) {
+            if let Some(schema) = all_schemas
+                .iter()
+                .find(|s| schema_tool_name(s) == Some(name))
+            {
+                selected.push(schema.clone());
+                report.tools_selected.push(name.to_owned());
+                report.selected_count += 1;
+                injected += 1;
+            }
+        }
+    }
+    injected
+}
+
+/// Inject skill-allowed tool names that the selector may have missed.
 /// Mutates `selected` and `report` in-place, returning the count of injected schemas.
 pub fn inject_skill_allowed_tools(
     selected: &mut Vec<Value>,
@@ -274,22 +302,7 @@ pub fn inject_skill_allowed_tools(
     allowed_tools: &[String],
     all_schemas: &[Value],
 ) -> u32 {
-    let mut selected_names: HashSet<String> = report.tools_selected.iter().cloned().collect();
-    let mut injected = 0u32;
-    for name in allowed_tools {
-        if selected_names.insert(name.clone()) {
-            if let Some(schema) = all_schemas
-                .iter()
-                .find(|s| schema_tool_name(s) == Some(name))
-            {
-                selected.push(schema.clone());
-                report.tools_selected.push(name.clone());
-                report.selected_count += 1;
-                injected += 1;
-            }
-        }
-    }
-    injected
+    inject_tool_names_inner(selected, report, allowed_tools, all_schemas)
 }
 
 /// Force-inject required tool names that must always be callable when a
@@ -300,21 +313,7 @@ pub fn inject_required_tool_names(
     required_tools: &[&str],
     all_schemas: &[Value],
 ) -> u32 {
-    let mut selected_names: HashSet<String> = report.tools_selected.iter().cloned().collect();
-    let mut injected = 0u32;
-    for name in required_tools {
-        if selected_names.insert((*name).to_string())
-            && let Some(schema) = all_schemas
-                .iter()
-                .find(|s| schema_tool_name(s) == Some(*name))
-        {
-            selected.push(schema.clone());
-            report.tools_selected.push((*name).to_string());
-            report.selected_count += 1;
-            injected += 1;
-        }
-    }
-    injected
+    inject_tool_names_inner(selected, report, required_tools, all_schemas)
 }
 
 #[cfg(test)]
