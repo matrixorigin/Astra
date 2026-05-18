@@ -48,7 +48,7 @@
 //! persistence), so it is being migrated in stages; new pure checks should be
 //! added here first and consumed by call sites instead of being copied.
 
-use astra_sandbox::{is_dangerous_file_path, validate_git_command};
+use astra_sandbox::{is_dangerous_file_path, is_soft_violation, validate_git_command};
 use serde_json::Value;
 
 use crate::action_compensation::{explicit_approval_reason, primary_approval_reason};
@@ -480,6 +480,7 @@ pub fn evaluate_permission(
             .unwrap_or_default();
         if !git_violations.is_empty() {
             let reasons: Vec<String> = git_violations.iter().map(ToString::to_string).collect();
+            let has_hard_violation = git_violations.iter().any(|v| !is_soft_violation(v));
             if ctx.mode() == PermissionMode::Deny {
                 let decision = HardDecision::Deny {
                     reason: "Git safety violation (deny mode)".to_string(),
@@ -500,7 +501,7 @@ pub fn evaluate_permission(
                     risk_tags,
                 );
             }
-            if ctx.mode() == PermissionMode::Auto {
+            if ctx.mode() == PermissionMode::Auto && !has_hard_violation {
                 let decision = HardDecision::Allow;
                 push_matched(
                     &mut trace,
@@ -549,13 +550,11 @@ pub fn evaluate_permission(
             );
         }
         if ctx.mode() == PermissionMode::Auto {
-            let decision = HardDecision::Allow;
-            push_matched(
-                &mut trace,
-                EvaluationStep::SensitivePath,
-                &decision,
-                "sensitive path allowed by mode",
-            );
+            let reason = "Targets a sensitive file path and requires manual approval".to_string();
+            let decision = HardDecision::NeedExternal {
+                prompt: approval_prompt(tool_name, args, reason.clone(), risk_tags.clone()),
+            };
+            push_matched(&mut trace, EvaluationStep::SensitivePath, &decision, &path);
             return envelope(
                 decision,
                 DecisionSource::SensitivePath { path },
@@ -593,22 +592,6 @@ pub fn evaluate_permission(
                 EvaluationStep::ExecuteHardDeny,
                 &decision,
                 &reason,
-            );
-            return envelope(
-                decision,
-                DecisionSource::ExecuteHardDeny { reason },
-                trace,
-                will_save,
-                risk_tags,
-            );
-        }
-        if ctx.mode() == PermissionMode::Auto {
-            let decision = HardDecision::Allow;
-            push_matched(
-                &mut trace,
-                EvaluationStep::ExecuteHardDeny,
-                &decision,
-                "hard-deny overridden by mode",
             );
             return envelope(
                 decision,
@@ -908,8 +891,15 @@ pub fn evaluate_permission(
                 )
             }
             PermissionMode::Auto => {
-                // Auto mode trusts the user — skip allowlist check.
-                let decision = HardDecision::Allow;
+                let decision = if ctx.inherited.allowed_tools.is_some()
+                    && !ctx.inherited.is_tool_allowed_by_allowlist(tool_name)
+                {
+                    HardDecision::Deny {
+                        reason: format!("Tool '{tool_name}' not in allowed tools list"),
+                    }
+                } else {
+                    HardDecision::Allow
+                };
                 push_matched(
                     &mut trace,
                     EvaluationStep::ExplicitApproval,
@@ -1009,10 +999,19 @@ pub fn evaluate_permission(
 
     let mode = ctx.mode();
     let (decision, mode_label) = match mode {
-        PermissionMode::Auto => {
-            // Auto mode trusts the user fully — no allowlist, no block.
-            (HardDecision::Allow, mode.to_string())
+        PermissionMode::Auto if ctx.inherited.allowed_tools.is_some() => {
+            if ctx.inherited.is_tool_allowed_by_allowlist(tool_name) {
+                (HardDecision::Allow, "agent policy allowlist".to_string())
+            } else {
+                (
+                    HardDecision::Deny {
+                        reason: format!("Tool '{tool_name}' not in allowed tools list"),
+                    },
+                    "agent policy allowlist".to_string(),
+                )
+            }
         }
+        PermissionMode::Auto => (HardDecision::Allow, mode.to_string()),
         PermissionMode::Plan => (
             HardDecision::Deny {
                 reason: format!("Tool '{tool_name}' denied by permission mode"),
@@ -1512,7 +1511,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_allowlist_allows_unlisted_tool_after_read_short_circuit() {
+    fn auto_mode_allowlist_blocks_unlisted_tool() {
         let ctx = crate::permission_types::PermissionSyncContext::new(
             crate::permission_types::InheritedPermissions {
                 mode: crate::permission_types::PermissionMode::Auto,
@@ -1522,10 +1521,19 @@ mod tests {
         );
         let envelope = evaluate_permission("bash", &serde_json::json!({}), &ctx);
         assert!(
-            matches!(envelope.decision, HardDecision::Allow),
+            matches!(envelope.decision, HardDecision::Deny { .. }),
             "unexpected decision from {:?}: {:?}",
             envelope.source,
             envelope.trace
+        );
+        assert!(
+            matches!(
+                envelope.source,
+                DecisionSource::Mode { ref mode }
+                    if mode == "agent policy allowlist"
+            ) || matches!(envelope.source, DecisionSource::ExplicitApprovalGate { .. }),
+            "unexpected source for auto allowlist denial: {:?}",
+            envelope.source
         );
     }
 
@@ -1737,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_sensitive_path_allows_in_auto_mode() {
+    fn evaluate_sensitive_path_requests_external_approval_in_auto_mode() {
         let ctx = crate::permission_types::PermissionSyncContext::root(
             crate::permission_types::PermissionMode::Auto,
         );
@@ -1746,7 +1754,10 @@ mod tests {
             &serde_json::json!({"path": ".env", "content": "TOKEN=x"}),
             &ctx,
         );
-        assert!(matches!(envelope.decision, HardDecision::Allow));
+        assert!(matches!(
+            envelope.decision,
+            HardDecision::NeedExternal { .. }
+        ));
         assert!(matches!(
             envelope.source,
             DecisionSource::SensitivePath { .. }
@@ -1754,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_execute_hard_deny_allows_in_auto_mode() {
+    fn evaluate_execute_hard_deny_stays_denied_in_auto_mode() {
         let ctx = crate::permission_types::PermissionSyncContext::root(
             crate::permission_types::PermissionMode::Auto,
         );
@@ -1763,7 +1774,7 @@ mod tests {
             &serde_json::json!({"command": "shred /dev/sda"}),
             &ctx,
         );
-        assert!(matches!(envelope.decision, HardDecision::Allow));
+        assert!(matches!(envelope.decision, HardDecision::Deny { .. }));
         assert!(matches!(
             envelope.source,
             DecisionSource::ExecuteHardDeny { .. }

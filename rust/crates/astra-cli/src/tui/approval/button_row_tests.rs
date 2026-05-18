@@ -2,7 +2,7 @@
 
 #![cfg(test)]
 
-use super::button_row::{ButtonAction, ButtonRow, BATCH_BUTTONS, PRIMARY_BUTTONS};
+use super::button_row::{BATCH_BUTTONS, ButtonAction, ButtonRow, PRIMARY_BUTTONS};
 use crate::chat_stream::ApprovalResponse;
 
 // ─── Primary row invariants ───────────────────────────────────────
