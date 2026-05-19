@@ -58,13 +58,18 @@ pub fn plan_resume_digest(state: &PlanModeState) -> Option<String> {
 
 pub fn plan_resume_prompt_hint(state: &PlanModeState) -> Option<String> {
     let digest = plan_resume_digest(state)?;
-    Some(format!(
-        "\n\n## Active Plan\n{digest}\n\n\
-         A plan is currently in-flight for this session. Treat the next turn as a \
+    let guidance = if state.plan.subtasks.is_empty() {
+        "A plan draft is currently attached to this session, but it has no executable \
+         subtasks yet. Stay in planning/decomposition mode until the work is broken \
+         down, and only call `exit_plan_mode` once the draft is either approved or \
+         intentionally abandoned."
+    } else {
+        "A plan is currently in-flight for this session. Treat the next turn as a \
          continuation — resume from the in-progress subtask, respect the approved \
          plan structure, and call `exit_plan_mode` only if the plan needs to be \
          abandoned before completion."
-    ))
+    };
+    Some(format!("\n\n## Active Plan\n{digest}\n\n{guidance}"))
 }
 
 /// Fetch the rendered system-prompt section for the session's active plan, if
@@ -124,6 +129,18 @@ mod tests {
         assert!(hint.contains("goal=\"Ship auth overhaul\""), "{hint}");
         assert!(
             hint.contains("in_progress=\"middleware refactor\""),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn plan_resume_prompt_hint_handles_zero_subtasks_without_execution_language() {
+        let state = PlanModeState::new("Design slash commands".into());
+        let hint = plan_resume_prompt_hint(&state).expect("hint");
+        assert!(hint.contains("goal=\"Design slash commands\""), "{hint}");
+        assert!(hint.contains("no executable subtasks yet"), "{hint}");
+        assert!(
+            !hint.contains("resume from the in-progress subtask"),
             "{hint}"
         );
     }

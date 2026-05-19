@@ -720,6 +720,7 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::VerificationCompleted => "verification_completed",
         JournalEventType::PlanEdit => "plan_edit",
         JournalEventType::PlanLifecycle => "plan_lifecycle",
+        JournalEventType::TaskLifecycle => "task_lifecycle",
         JournalEventType::GoalSteered => "goal_steered",
         JournalEventType::ApprovalRequired => "approval_required",
         JournalEventType::ApprovalDecision => "approval_decision",

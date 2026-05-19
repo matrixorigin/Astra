@@ -1332,6 +1332,29 @@ pub(super) async fn handle_session_command(
                                     summary,
                                 );
                             }
+                            session_journal::JournalEventType::TaskLifecycle => {
+                                let summary = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("summary"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("task_updated");
+                                let task_id = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("detail"))
+                                    .and_then(|v| v.get("task_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("task");
+                                eprintln!(
+                                    "  {} {} T{} {} ({})",
+                                    ts_short.dim(),
+                                    "☑".cyan(),
+                                    evt.turn.unwrap_or(0),
+                                    summary,
+                                    task_id,
+                                );
+                            }
                             session_journal::JournalEventType::GoalSteered => {
                                 let source = evt
                                     .metadata
@@ -4872,7 +4895,7 @@ async fn apply_restored_session(
             .find(|e| e.event_type == session_journal::JournalEventType::Turn)
             .cloned();
     }
-    chat_turn::rebuild_continuation_anchor_from_state(state);
+    chat_turn::rebuild_continuation_anchor_from_live_state(state).await;
 
     if let Some(ref json) = restored.executing_plan_json {
         state.executing_plan = serde_json::from_str(json).ok();

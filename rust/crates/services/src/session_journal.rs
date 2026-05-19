@@ -798,6 +798,8 @@ pub enum JournalEventType {
     PlanEdit,
     /// Plan lifecycle event (created, completed, abandoned, replanned).
     PlanLifecycle,
+    /// Durable task lifecycle event (created, updated, completed, failed, cancelled).
+    TaskLifecycle,
     /// Effective goal steering changed (manual goal set, active plan goal took over).
     GoalSteered,
     /// An approval prompt was emitted for a tool call.
@@ -2892,6 +2894,22 @@ impl JournalEvent {
         metadata: Option<serde_json::Value>,
     ) -> Self {
         let mut evt = Self::base(JournalEventType::PlanLifecycle, session_id);
+        evt.metadata = Some(serde_json::json!({
+            "summary": summary,
+            "detail": metadata,
+        }));
+        evt
+    }
+
+    /// Task lifecycle event — created, updated, completed, failed, cancelled.
+    pub fn task_lifecycle(
+        session_id: Option<&str>,
+        turn: u32,
+        summary: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::TaskLifecycle, session_id);
+        evt.turn = Some(turn);
         evt.metadata = Some(serde_json::json!({
             "summary": summary,
             "detail": metadata,
