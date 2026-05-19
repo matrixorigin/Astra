@@ -118,6 +118,9 @@ fn split_surrounding_punctuation(token: &str) -> (&str, &str, &str) {
         .find(|(_, c)| !is_trailing_trimmed_token_punctuation(*c))
         .map(|(idx, c)| idx + c.len_utf8())
         .unwrap_or(start);
+    if start >= end {
+        return (token, "", "");
+    }
     (&token[..start], &token[start..end], &token[end..])
 }
 
@@ -196,4 +199,23 @@ fn file_uri_for_path(path: &str, cwd: Option<&Path>) -> Option<String> {
     url::Url::from_file_path(candidate)
         .ok()
         .map(|url| url.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_surrounding_punctuation_handles_empty_core() {
+        let (prefix, core, suffix) = split_surrounding_punctuation(r#"<<")"#);
+        assert_eq!(prefix, r#"<<")"#);
+        assert_eq!(core, "");
+        assert_eq!(suffix, "");
+    }
+
+    #[test]
+    fn hyperlink_text_file_paths_ignores_punctuation_only_tokens() {
+        let text = r#"prefix <<") suffix"#;
+        assert_eq!(hyperlink_text_file_paths(text, None), text);
+    }
 }
