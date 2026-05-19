@@ -47,13 +47,15 @@ fn items_with_aliases() -> Vec<SlashItem> {
             subcommands: &[],
             aliases: &["h", "?"],
             usage_boost: 0,
+            ..Default::default()
         },
         SlashItem {
             name: "/history",
             description: "browse history",
             subcommands: &[],
             aliases: &[],
-            usage_boost: 100, // boosted so it wins ties with /help
+            usage_boost: 100,
+            ..Default::default()
         },
         SlashItem::simple("/model", "pick a model"),
         SlashItem::simple("/resume", "resume a session"),

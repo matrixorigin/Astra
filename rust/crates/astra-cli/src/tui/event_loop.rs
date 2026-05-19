@@ -596,6 +596,9 @@ pub(crate) async fn run_tui_repl(
                 name: m.name,
                 description: m.description,
                 subcommands: m.subcommands,
+                group: Some(m.group),
+                tui_handler: m.tui_handler,
+                usage_examples: m.usage_examples,
                 ..Default::default()
             })
             .collect();
@@ -1193,6 +1196,9 @@ pub(crate) async fn run_tui_repl(
                                                     chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Terminal restore failed: {e}")));
                                                 }
                                             }
+                                        }
+                                        slash_dispatch::SlashResult::Forward(ref forward_text) => {
+                                            bottom_pane.composer.set_text(forward_text);
                                         }
                                     }
                                     // Flush the slash-command response

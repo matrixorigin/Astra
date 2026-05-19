@@ -6,9 +6,10 @@
 //! fall back to `with_restored()` which temporarily exits the TUI.
 
 use crate::command_registry;
+use crate::command_registry::TuiHandler;
 use crate::session_state::SessionState;
-use crate::tui::bottom_pane::BottomPane;
 use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
+use crate::tui::bottom_pane::BottomPane;
 use crate::tui::history_cell::system::SystemCell;
 use crate::tui::terminal::TerminalGuard;
 
@@ -17,6 +18,9 @@ pub(crate) enum SlashResult {
     Deferred,
     Exit,
     Fallback,
+    /// Forward the raw slash command text to the chat composer for the user
+    /// to review and send as a normal message (ChatForward handler).
+    Forward(String),
 }
 
 /// Context needed by slash dispatch — avoids passing 8+ loose arguments.
@@ -372,6 +376,23 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Fallback
         }
 
+        // ── Inspect (TUI-native) ────────────────────────────────────
+        //
+        // Routes to the harness snapshot for session introspection.
+        //   `/inspect`                → subcommand picker
+        //   `/inspect budget`         → token budget breakdown
+        //   `/inspect tools`          → tool call dashboard
+        //   `/inspect context`        → context window snapshot
+        //   `/inspect json`           → raw snapshot as JSON
+        //   `/inspect diff`           → state diff vs start-of-session
+        //   `/inspect history [N]`    → recent turn history
+        //   `/inspect trace`          → permission trace
+        //   `/inspect forensics`      → forensics dump
+        //   `/inspect export [path]`  → export to file
+        "/inspect" => {
+            return handle_inspect_dispatch(args, ctx).await;
+        }
+
         // ── Context panel (TUI-native) ──────────────────────────────
         //
         // Only two forms are supported:
@@ -581,7 +602,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         // ── Worktrees (TUI-native) ──────────────────────────────────
         "/worktrees" => {
             use crate::tui::bottom_pane::worktrees_view::WorktreesView;
-            use crate::tui::worktrees::{WorktreeList, parse};
+            use crate::tui::worktrees::{parse, WorktreeList};
 
             // `git worktree list --porcelain` on a blocking thread.
             let porcelain = tokio::task::spawn_blocking(|| {
@@ -846,8 +867,40 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
         }
 
-        // ── Everything else → with_restored fallback ────────────────
-        _ => SlashResult::Fallback,
+        // ── Everything else → route via TuiHandler metadata ────────
+        _ => match cmd {
+            // Commands already explicitly handled above → shouldn't reach here.
+            // The catch-all routes everything else according to its TuiHandler:
+            _ => {
+                match command_registry::resolve_command_meta(cmd).map(|m| m.tui_handler) {
+                    // ChatForward (default, no tui_handler set) → forward to chat composer
+                    None | Some(TuiHandler::ChatForward) => SlashResult::Forward(text.to_string()),
+                    // Fallback → tear down TUI, run REPL handler, restore
+                    Some(TuiHandler::Fallback) => SlashResult::Fallback,
+                    // Panel → open native TUI panel (portals built in later phases)
+                    Some(TuiHandler::Panel) => {
+                        ctx.show_info(format!(
+                            "`{}` panel is not yet implemented in TUI — forwarding to chat",
+                            resolved
+                        ));
+                        SlashResult::Forward(text.to_string())
+                    }
+                    // Selector → open picker/selector (built in later phases)
+                    Some(TuiHandler::Selector) => {
+                        ctx.show_info(format!(
+                            "`{}` selector is not yet implemented in TUI — forwarding to chat",
+                            resolved
+                        ));
+                        SlashResult::Forward(text.to_string())
+                    }
+                    // Inline → should have been matched explicitly above
+                    Some(TuiHandler::Inline) => {
+                        ctx.show_error(format!("Command `{resolved}` not handled inline"));
+                        SlashResult::Handled
+                    }
+                }
+            }
+        },
     }
 }
 
@@ -2339,6 +2392,39 @@ fn handle_context_dump(arg: &str, ctx: &mut DispatchContext<'_>) -> SlashResult 
         path.display()
     )));
     SlashResult::Handled
+}
+
+// ── /inspect dispatch ────────────────────────────────────────────────
+//
+// Routes `/inspect` subcommands. Full TUI-native panels (budget, tools,
+// context, diff, history) will be wired in later phases once the
+// ViewStack portal infrastructure is ready.  For Phase 1.2 the
+// handler forwards unimplemented subcommands to chat so the user sees
+// progress instead of an error.
+async fn handle_inspect_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashResult {
+    let sub = args.trim();
+    match sub {
+        "" => {
+            // No subcommand → show picker (Phase 1.4)
+            ctx.show_info(
+                "`/inspect` subcommands: budget, tools, context, json, diff, history, trace, forensics, export"
+                    .to_string(),
+            );
+            SlashResult::Handled
+        }
+        "budget" | "tools" | "context" | "json" | "diff" | "history" | "trace" | "forensics"
+        | "export" => {
+            // Subcommand recognized but panel not yet built
+            ctx.show_info(format!(
+                "`/inspect {sub}` panel will be available soon — forwarding to chat for now"
+            ));
+            SlashResult::Forward(format!("/inspect {}", args))
+        }
+        _ => {
+            ctx.show_error(format!("Unknown `/inspect` subcommand: `{sub}`"));
+            SlashResult::Handled
+        }
+    }
 }
 
 #[cfg(test)]

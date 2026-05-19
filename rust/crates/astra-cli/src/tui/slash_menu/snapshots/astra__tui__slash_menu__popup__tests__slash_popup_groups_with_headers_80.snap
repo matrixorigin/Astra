@@ -1,0 +1,13 @@
+---
+source: crates/astra-cli/src/tui/slash_menu/popup.rs
+expression: "render_menu(&menu, 80, 10)"
+---
+▌ /help    show help
+  /clear   clear screen
+  ── Session & Plan ────────────────────────────────────────────────────────────
+  /resume  resume a session
+  /plan    manage plan
+  ── Core ──────────────────────────────────────────────────────────────────────
+  /model   pick a model
+  ── Observability ─────────────────────────────────────────────────────────────
+  /config  runtime config

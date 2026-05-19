@@ -12,13 +12,14 @@
 
 #![allow(dead_code)]
 
+use crate::command_registry::TuiHandler;
 use nucleo_matcher::{
-    Config, Matcher, Utf32Str,
     pattern::{Atom, AtomKind, CaseMatching, Normalization},
+    Config, Matcher, Utf32Str,
 };
 
 /// A single slash command exposed to the menu.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SlashItem {
     /// Full command token including leading `/`, e.g. `/help`.
     pub name: &'static str,
@@ -32,6 +33,27 @@ pub(crate) struct SlashItem {
     pub aliases: &'static [&'static str],
     /// Frequency hint — higher means "show sooner on ties".
     pub usage_boost: u32,
+    /// Command group for categorized rendering in the popup.
+    pub group: Option<crate::command_registry::CommandGroup>,
+    /// How the command behaves in the TUI — e.g. shows a panel or modal.
+    pub tui_handler: crate::command_registry::TuiHandler,
+    /// Example usages shown in help output.
+    pub usage_examples: &'static [&'static str],
+}
+
+impl Default for SlashItem {
+    fn default() -> Self {
+        Self {
+            name: "",
+            description: "",
+            subcommands: &[],
+            aliases: &[],
+            usage_boost: 0,
+            group: None,
+            tui_handler: TuiHandler::Inline,
+            usage_examples: &[],
+        }
+    }
 }
 
 impl SlashItem {
@@ -43,6 +65,9 @@ impl SlashItem {
             subcommands: &[],
             aliases: &[],
             usage_boost: 0,
+            group: None,
+            tui_handler: TuiHandler::Inline,
+            usage_examples: &[],
         }
     }
 }
