@@ -202,31 +202,23 @@ pub(super) async fn handle_chat_input_with_ui(
     ctx: TurnContext<'_>,
     ui: &mut dyn crate::ui_adapter::ReplUiAdapter,
 ) -> Result<(), String> {
-    // ! prefix: execute the rest as a shell command
+    // ! prefix: execute the rest as a shell command with the real TTY
+    // (inherited stdio) so interactive programs like vim work. Using
+    // Command::output() here would pipe stdout/stderr — vim then sees
+    // "stdout is not a terminal" and hangs waiting for stdin.
     if let Some(cmd) = line.trim_start().strip_prefix('!') {
         let cmd = cmd.trim();
         if !cmd.is_empty() {
-            return match std::process::Command::new("sh")
-                .arg("-c")
-                .arg(cmd)
-                .output()
-            {
-                Ok(out) => {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let combined = format!("{stdout}{stderr}");
-                    if combined.trim().is_empty() {
-                        println!("! {cmd}");
-                    } else {
-                        println!("! {cmd}\n{combined}");
-                    }
-                    Ok(())
+            println!("! {cmd}");
+            match std::process::Command::new("sh").arg("-c").arg(cmd).status() {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    eprintln!("! {cmd}: exit {}", status.code().unwrap_or(-1));
                 }
                 Err(e) => {
                     eprintln!("! {cmd}: {e}");
-                    Ok(())
                 }
-            };
+            }
         }
         return Ok(());
     }

@@ -244,6 +244,43 @@ fn should_flush_submitted_user_cell_immediately(text: &str) -> bool {
     !text.trim_start().starts_with('/')
 }
 
+/// Whether a `!cmd` shell command needs a real TTY (inherited stdio) rather
+/// than the default Command::output() pipe-capture path. Used by the `!`
+/// prefix handler in the TUI to pick a strategy: pipe-capture commits output
+/// to chat scrollback (good for `!ls`), inherited stdio hands the terminal
+/// to the child (required for `!vim`, `!less`, etc.).
+///
+/// We look at the basename of the first whitespace-delimited token. This
+/// misses sudo-wrapped commands (`sudo vim`) and env-prefixed forms
+/// (`EDITOR=vim git commit`), which intentionally fall back to capture; if
+/// those become a problem, extend the check, don't try to parse the shell.
+fn shell_command_needs_tty(cmd: &str) -> bool {
+    let first = cmd.split_whitespace().next().unwrap_or("");
+    let basename = first.rsplit('/').next().unwrap_or("");
+    matches!(
+        basename,
+        "vim"
+            | "vi"
+            | "nvim"
+            | "nano"
+            | "emacs"
+            | "ed"
+            | "less"
+            | "more"
+            | "most"
+            | "man"
+            | "htop"
+            | "top"
+            | "btop"
+            | "btm"
+            | "tmux"
+            | "screen"
+            | "ssh"
+            | "mosh"
+            | "telnet"
+    )
+}
+
 fn should_flush_after_slash_dispatch(result: &slash_dispatch::SlashResult) -> bool {
     !matches!(result, slash_dispatch::SlashResult::Deferred)
 }
@@ -885,46 +922,144 @@ pub(crate) async fn run_tui_repl(
                             BottomPaneAction::SubmitInput(text) => {
                                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
 
-                                // ! prefix: execute the rest as a shell command
-                                if let Some(cmd) = text.trim_start().strip_prefix('!') {
-                                    let cmd = cmd.trim();
+                                // ! prefix: execute the rest as a shell command.
+                                //
+                                // Two paths, selected by a whitelist of programs known
+                                // to require a real TTY:
+                                //
+                                //   - TTY commands (vim, less, htop, ssh, ...) — run
+                                //     with inherited stdio (same as Ctrl-E external
+                                //     editor flow). The child takes over the terminal;
+                                //     we don't capture output. Output stays on screen
+                                //     but only an "! cmd" marker goes to chat.
+                                //
+                                //   - Everything else (ls, grep, cat, git, ...) — run
+                                //     with Command::output() pipes; the captured stdout
+                                //     and stderr are committed into chat scrollback as
+                                //     a SystemCell so they survive the next TUI redraw.
+                                //
+                                // The whitelist is intentionally short; add commands as
+                                // they come up.
+                                if let Some(cmd_ref) = text.trim_start().strip_prefix('!') {
+                                    let cmd = cmd_ref.trim().to_string();
                                     if !cmd.is_empty() {
-                                        match std::process::Command::new("sh")
-                                            .arg("-c")
-                                            .arg(cmd)
-                                            .output()
-                                        {
-                                            Ok(out) => {
-                                                let stdout = String::from_utf8_lossy(&out.stdout);
-                                                let stderr = String::from_utf8_lossy(&out.stderr);
-                                                let combined =
-                                                    format!("{stdout}{stderr}").trim().to_string();
-                                                if combined.is_empty() {
+                                        if shell_command_needs_tty(&cmd) {
+                                            // Interactive path — same pattern as
+                                            // BottomPaneAction::OpenExternalEditor.
+                                            let _ = crossterm::terminal::disable_raw_mode();
+                                            let _ = crossterm::execute!(
+                                                std::io::stdout(),
+                                                crossterm::event::DisableBracketedPaste,
+                                                crossterm::cursor::Show
+                                            );
+                                            println!("! {cmd}");
+                                            let status = std::process::Command::new("sh")
+                                                .arg("-c")
+                                                .arg(&cmd)
+                                                .status();
+                                            if let Err(err) = guard.ensure_tui_modes() {
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::error(format!(
+                                                        "! {cmd}: failed to restore TUI modes: {err}"
+                                                    )),
+                                                );
+                                            }
+                                            guard.terminal.invalidate_viewport();
+                                            match status {
+                                                Ok(s) if s.success() => {
                                                     chat_widget.commit_system(
                                                         history_cell::system::SystemCell::response(
                                                             format!("! {cmd}"),
                                                         ),
                                                     );
-                                                } else {
-                                                    // Prefix each output line with ┃ for visual separation
-                                                    let prefixed: String = combined
-                                                        .lines()
-                                                        .map(|l| format!("┃ {l}"))
-                                                        .collect::<Vec<_>>()
-                                                        .join("\n");
+                                                }
+                                                Ok(s) => {
                                                     chat_widget.commit_system(
-                                                        history_cell::system::SystemCell::info(
-                                                            format!("! {cmd}\n{prefixed}"),
+                                                        history_cell::system::SystemCell::error(
+                                                            format!(
+                                                                "! {cmd}: exit {}",
+                                                                s.code().unwrap_or(-1)
+                                                            ),
+                                                        ),
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    chat_widget.commit_system(
+                                                        history_cell::system::SystemCell::error(
+                                                            format!("! {cmd}: {e}"),
                                                         ),
                                                     );
                                                 }
                                             }
-                                            Err(e) => {
-                                                chat_widget.commit_system(
-                                                    history_cell::system::SystemCell::error(
-                                                        format!("! {cmd}: {e}"),
-                                                    ),
-                                                );
+                                        } else {
+                                            // Capture path — pipes, commit captured
+                                            // output to chat scrollback.
+                                            match std::process::Command::new("sh")
+                                                .arg("-c")
+                                                .arg(&cmd)
+                                                .output()
+                                            {
+                                                Ok(out) => {
+                                                    let stdout =
+                                                        String::from_utf8_lossy(&out.stdout);
+                                                    let stderr =
+                                                        String::from_utf8_lossy(&out.stderr);
+                                                    let combined =
+                                                        format!("{stdout}{stderr}")
+                                                            .trim()
+                                                            .to_string();
+                                                    if combined.is_empty() {
+                                                        if out.status.success() {
+                                                            chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::response(
+                                                                    format!("! {cmd}"),
+                                                                ),
+                                                            );
+                                                        } else {
+                                                            chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::error(
+                                                                    format!(
+                                                                        "! {cmd}: exit {}",
+                                                                        out.status
+                                                                            .code()
+                                                                            .unwrap_or(-1)
+                                                                    ),
+                                                                ),
+                                                            );
+                                                        }
+                                                    } else {
+                                                        let prefixed: String = combined
+                                                            .lines()
+                                                            .map(|l| format!("┃ {l}"))
+                                                            .collect::<Vec<_>>()
+                                                            .join("\n");
+                                                        let body =
+                                                            format!("! {cmd}\n{prefixed}");
+                                                        if out.status.success() {
+                                                            chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::info(body),
+                                                            );
+                                                        } else {
+                                                            chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::error(
+                                                                    format!(
+                                                                        "{body}\n┃ exit {}",
+                                                                        out.status
+                                                                            .code()
+                                                                            .unwrap_or(-1)
+                                                                    ),
+                                                                ),
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    chat_widget.commit_system(
+                                                        history_cell::system::SystemCell::error(
+                                                            format!("! {cmd}: {e}"),
+                                                        ),
+                                                    );
+                                                }
                                             }
                                         }
                                     }
