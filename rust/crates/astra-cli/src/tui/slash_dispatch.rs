@@ -859,6 +859,92 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
         }
 
+        // ── /memory — list / search / inspect in a TUI panel ───────
+        "/memory" => {
+            let subcmd = args.split_whitespace().next().unwrap_or("list");
+            let sub_arg = args.strip_prefix(subcmd).unwrap_or("").trim();
+            let token = crate::session_runtime::fresh_access_token(ctx.api, ctx.profile).await;
+            let Some(token) = token else {
+                ctx.show_error("Not logged in. Use /login.".into());
+                return SlashResult::Handled;
+            };
+
+            let (query, top_k) = match subcmd {
+                "search" if !sub_arg.is_empty() => (sub_arg.to_string(), 20),
+                "list" | "" => ("user preferences knowledge plans tasks".to_string(), 20),
+                "inspect" if !sub_arg.is_empty() => {
+                    // Inspect a single memory by id — forward to chat
+                    // which has richer formatting for the detail view.
+                    return SlashResult::Forward(text.to_string());
+                }
+                _ => return SlashResult::Forward(text.to_string()),
+            };
+
+            let payload = serde_json::json!({
+                "query": query,
+                "top_k": top_k,
+            });
+            match ctx.api.post_memory_search_json(&token, &payload).await {
+                Ok(r) if r.status().is_success() => {
+                    let body = r.text().await.unwrap_or_default();
+                    match serde_json::from_str::<Vec<serde_json::Value>>(&body) {
+                        Ok(arr) if !arr.is_empty() => {
+                            let items: Vec<SelectionItem> = arr
+                                .iter()
+                                .map(|m| {
+                                    let content =
+                                        m.get("content").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let id = m
+                                        .get("memory_id")
+                                        .or(m.get("id"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let short_id = &id[..std::cmp::min(8, id.len())];
+                                    let mtype = m
+                                        .get("memory_type")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("?");
+                                    let preview: String = content.chars().take(80).collect();
+                                    SelectionItem {
+                                        name: format!("[{mtype}] {preview}"),
+                                        description: Some(format!("id:{short_id}")),
+                                        is_current: false,
+                                    }
+                                })
+                                .collect();
+                            let header = format!(
+                                "Memory — {} result{} for: {}",
+                                items.len(),
+                                if items.len() == 1 { "" } else { "s" },
+                                query
+                            );
+                            ctx.bottom_pane.push_view(Box::new(
+                                ListSelectionView::new(items, Some(header))
+                                    .with_footer_hint("↑↓ navigate · q / Esc close"),
+                            ));
+                            SlashResult::Handled
+                        }
+                        Ok(_) => {
+                            ctx.show_info("No memories found.".into());
+                            SlashResult::Handled
+                        }
+                        Err(_) => {
+                            ctx.show_error("Failed to parse memory results.".into());
+                            SlashResult::Handled
+                        }
+                    }
+                }
+                Ok(r) => {
+                    ctx.show_error(format!("Memory search failed (HTTP {})", r.status()));
+                    SlashResult::Handled
+                }
+                Err(e) => {
+                    ctx.show_error(format!("Memory unreachable: {e}"));
+                    SlashResult::Handled
+                }
+            }
+        }
+
         // ── Everything else → route via TuiHandler metadata ────────
         _ => match cmd {
             // Commands already explicitly handled above → shouldn't reach here.
@@ -1015,6 +1101,11 @@ pub(crate) fn build_panels_cheat_sheet_lines() -> Vec<String> {
             "/skill",
             "browse, search, install, and manage skills",
             "type to filter · Enter select · Esc close",
+        ),
+        (
+            "/memory [list|search <q>|inspect <id>]",
+            "browse, search, and inspect episodic and semantic memories",
+            "↑↓ navigate · Enter select · Esc close",
         ),
         (
             "/session",
@@ -2480,6 +2571,19 @@ mod panels_tests {
             assert!(
                 text.contains(sub),
                 "cheat sheet /config entry missing subcommand: {sub}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_entry_lists_all_subcommands() {
+        let text = build_panels_cheat_sheet_lines().join("\n");
+        // The /memory entry MUST mention list / search / inspect
+        // so users discover they can search and inspect memories.
+        for sub in &["list", "search", "inspect"] {
+            assert!(
+                text.contains(sub),
+                "cheat sheet /memory entry missing subcommand: {sub}"
             );
         }
     }

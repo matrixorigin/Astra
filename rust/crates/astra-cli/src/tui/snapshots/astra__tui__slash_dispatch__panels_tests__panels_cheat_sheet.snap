@@ -34,6 +34,10 @@ expression: "build_panels_cheat_sheet_lines().join(\"\\n\")"
       browse, search, install, and manage skills
       type to filter · Enter select · Esc close
 
+  /memory [list|search <q>|inspect <id>]
+      browse, search, and inspect episodic and semantic memories
+      ↑↓ navigate · Enter select · Esc close
+
   /session
       list, fork, history, analyze, or export sessions
       ↑↓ navigate · Enter select · Esc close
