@@ -2238,6 +2238,37 @@ fn is_run_finished_event(event: &Value) -> bool {
     event.get("event_type").and_then(Value::as_str) == Some("run_finished")
 }
 
+fn is_completed_run_finished_event(event: &Value) -> bool {
+    if !is_run_finished_event(event) {
+        return false;
+    }
+    let data = event.get("data").and_then(Value::as_object);
+    let cancelled = data
+        .and_then(|obj| obj.get("cancelled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let interrupted = data
+        .and_then(|obj| obj.get("interrupted"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    !cancelled && !interrupted
+}
+
+fn has_buffered_terminal_completion(events: &[Value]) -> bool {
+    events
+        .iter()
+        .rev()
+        .find(|event| is_run_finished_event(event))
+        .is_some_and(is_completed_run_finished_event)
+}
+
+fn should_preserve_manual_pause_on_completion(
+    current_status: &RunStatus,
+    final_status: &RunStatus,
+) -> bool {
+    *current_status == RunStatus::Paused && *final_status == RunStatus::Completed
+}
+
 fn merge_run_finished_event_data(target: &mut Value, source: &Value) {
     let source_data = source
         .get("data")
@@ -4095,21 +4126,17 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             bg_progress_channels.lock().await.remove(&bg_run_id);
             let terminal_events = terminal_events_for_persistence(&events);
 
-            // Schedule eviction of the terminal run from the in-memory cache.
-            // Waiting runs are NOT evicted — they need to remain in memory for resume.
-            if final_status != RunStatus::Waiting {
-                Self::schedule_run_eviction(&runs, bg_run_id.clone());
-            }
-
             // Publish terminal run state before best-effort post-run side effects
             // so background observers do not stay stuck in "running" because a
             // hook, event write, or learning save is slow.
-            let status_str = final_status.as_str();
-            let mut persist_terminal_state = true;
+            let mut persisted_status = final_status.clone();
+            let mut persist_status_update = true;
+            let mut persist_terminal_events = true;
 
             if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
                 if run.status == RunStatus::Cancelled {
-                    persist_terminal_state = false;
+                    persist_status_update = false;
+                    persist_terminal_events = false;
                     merge_cancelled_run_events(run, events);
                     if final_status != RunStatus::Waiting {
                         run.live_tx = None;
@@ -4117,19 +4144,36 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     flush_turn_observability(&mut loop_state, &bg_session_id, true);
                 } else {
                     run.events.extend(events);
-                    if run.status.try_transition(&final_status).is_ok() {
+                    if should_preserve_manual_pause_on_completion(&run.status, &final_status) {
+                        persist_status_update = false;
+                        persisted_status = RunStatus::Paused;
+                        run.waiting_for
+                            .get_or_insert_with(|| "user_resume".to_string());
+                        run.live_tx = None;
+                    } else if run.status.try_transition(&final_status).is_ok() {
                         run.status = final_status.clone();
                     }
-                    if run.status != RunStatus::Waiting {
+                    if run.status != RunStatus::Waiting && run.status != RunStatus::Paused {
                         run.live_tx = None;
                     }
                 }
             }
 
-            if persist_terminal_state {
+            // Schedule eviction of the terminal run from the in-memory cache.
+            // Waiting and paused runs are NOT evicted — they may still be resumed.
+            if persisted_status != RunStatus::Waiting && persisted_status != RunStatus::Paused {
+                Self::schedule_run_eviction(&runs, bg_run_id.clone());
+            }
+
+            if persist_status_update {
                 astra_core::log_persist!(
                     run_engine
-                        .persist_status(&bg_run_id, status_str, None, error_msg.as_deref())
+                        .persist_status(
+                            &bg_run_id,
+                            persisted_status.as_str(),
+                            None,
+                            error_msg.as_deref()
+                        )
                         .await,
                     "run_lifecycle",
                     &bg_run_id,
@@ -4156,7 +4200,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     gov.record_tokens(&bg_user_id, total).await;
                 }
             }
-            if persist_terminal_state {
+            if persist_terminal_events {
                 for event in terminal_events {
                     astra_core::log_persist!(
                         run_engine.append_event(&bg_run_id, event).await,
@@ -4167,7 +4211,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
             }
 
-            if persist_terminal_state {
+            if persist_terminal_events {
                 flush_turn_observability(&mut loop_state, &bg_session_id, false);
                 persist_turn_evaluation_journal(&bg_session_id, "server_runtime", &loop_state);
             }
@@ -4496,13 +4540,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let mut all_events = vec![json!({"event_type": "run_started", "data": {}})];
             all_events.append(&mut final_events);
 
-            let mut persist_terminal_state = true;
+            let mut persisted_status = final_status.clone();
+            let mut persist_status_update = true;
             // Extract terminal events before the branch — both branches consume
             // all_events by move, so this must happen first.
             let terminal_events = terminal_events_for_persistence(&all_events);
             if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
                 if run.status == RunStatus::Cancelled {
-                    persist_terminal_state = false;
+                    persist_status_update = false;
                     merge_cancelled_run_events(run, all_events);
                     if final_status != RunStatus::Waiting {
                         run.live_tx = None;
@@ -4510,10 +4555,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     flush_turn_observability(&mut state, &bg_session_id, true);
                 } else {
                     run.events.extend(all_events);
-                    if run.status.try_transition(&final_status).is_ok() {
+                    if should_preserve_manual_pause_on_completion(&run.status, &final_status) {
+                        persist_status_update = false;
+                        persisted_status = RunStatus::Paused;
+                        run.waiting_for
+                            .get_or_insert_with(|| "user_resume".to_string());
+                        run.live_tx = None;
+                    } else if run.status.try_transition(&final_status).is_ok() {
                         run.status = final_status.clone();
                     }
-                    if run.status != RunStatus::Waiting {
+                    if run.status != RunStatus::Waiting && run.status != RunStatus::Paused {
                         run.live_tx = None;
                     }
                     flush_turn_observability(&mut state, &bg_session_id, false);
@@ -4521,8 +4572,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
 
             // Schedule eviction of the terminal run from the in-memory cache.
-            // Waiting runs are NOT evicted — they need to remain in memory for resume.
-            if final_status != RunStatus::Waiting {
+            // Waiting and paused runs are NOT evicted — they may still be resumed.
+            if persisted_status != RunStatus::Waiting && persisted_status != RunStatus::Paused {
                 Self::schedule_run_eviction(&runs, bg_run_id.clone());
             }
 
@@ -4535,12 +4586,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
             }
 
-            if persist_terminal_state {
+            if persist_status_update {
                 astra_core::log_persist!(
                     run_engine
                         .persist_status(
                             &bg_run_id,
-                            final_status.as_str(),
+                            persisted_status.as_str(),
                             None,
                             error_msg.as_deref()
                         )
@@ -5037,6 +5088,28 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let durable = self.require_durable_run_for_user(&run_id, &user_id).await?;
         if durable.status != STATUS_PAUSED {
             return Err(Self::run_state_conflict("resume", &durable.status));
+        }
+
+        if has_buffered_terminal_completion(&durable.events) {
+            self.run_engine
+                .persist_status(&run_id, STATUS_COMPLETED, None, None)
+                .await
+                .map_err(|error| Self::durable_persist_error("resume completed status", error))?;
+            {
+                let mut runs = self.runs.write().await;
+                if let Some(run) = runs.get_mut(&run_id) {
+                    run.status = RunStatus::Completed;
+                    run.pause_flag.store(false, Ordering::SeqCst);
+                    run.waiting_for = None;
+                    run.live_tx = None;
+                }
+            }
+            Self::schedule_run_eviction(&self.runs, run_id.clone());
+            return Ok(RunMutationRecord {
+                run_id,
+                status: STATUS_COMPLETED.to_string(),
+                previous_status: durable.status,
+            });
         }
 
         let resume_event = json!({"event_type": "run_resumed", "data": {}});
@@ -7468,6 +7541,38 @@ mod tests {
         assert!(server_loop_causal_chain_id("server-loop-tools").len() <= 64);
     }
 
+    #[test]
+    fn has_buffered_terminal_completion_ignores_cancelled_and_interrupted_finishes() {
+        assert!(has_buffered_terminal_completion(&[json!({
+            "event_type": "run_finished",
+            "data": {"total_prompt_tokens": 1, "total_completion_tokens": 1}
+        })]));
+        assert!(!has_buffered_terminal_completion(&[json!({
+            "event_type": "run_finished",
+            "data": {"cancelled": true}
+        })]));
+        assert!(!has_buffered_terminal_completion(&[json!({
+            "event_type": "run_finished",
+            "data": {"interrupted": true}
+        })]));
+    }
+
+    #[test]
+    fn preserve_manual_pause_wins_over_late_completed_status() {
+        assert!(should_preserve_manual_pause_on_completion(
+            &RunStatus::Paused,
+            &RunStatus::Completed
+        ));
+        assert!(!should_preserve_manual_pause_on_completion(
+            &RunStatus::Paused,
+            &RunStatus::Failed
+        ));
+        assert!(!should_preserve_manual_pause_on_completion(
+            &RunStatus::Running,
+            &RunStatus::Completed
+        ));
+    }
+
     #[tokio::test]
     async fn pause_run_transitions_running_to_paused() {
         let svc = test_service();
@@ -7513,6 +7618,29 @@ mod tests {
         assert_eq!(result.previous_status, "paused");
         let status = ok(svc.get_run_status(run.run_id, "user-1".into()).await);
         assert_eq!(status.status, "running");
+    }
+
+    #[tokio::test]
+    async fn resume_run_promotes_buffered_completed_pause_to_completed() {
+        let svc = test_service_with_engine();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
+        svc.run_engine
+            .append_event(
+                &run.run_id,
+                json!({
+                    "event_type": "run_finished",
+                    "data": {"total_prompt_tokens": 1, "total_completion_tokens": 1}
+                }),
+            )
+            .await
+            .unwrap();
+
+        let result = ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.previous_status, "paused");
+        let status = ok(svc.get_run_status(run.run_id, "user-1".into()).await);
+        assert_eq!(status.status, "completed");
     }
 
     #[tokio::test]
@@ -8300,8 +8428,9 @@ mod tests {
         assert_eq!(events[0]["data"]["reason"], "waiting: tool_approval");
     }
 
-    /// P1-F: stream_chat must persist usage unconditionally (not gated by persist_terminal_state).
-    /// Cancelled runs still consumed tokens and must have accurate durable records.
+    /// P1-F: stream_chat must persist usage unconditionally.
+    /// Cancelled runs still consumed tokens and must have accurate durable records,
+    /// even when status persistence is skipped.
     #[test]
     fn stream_chat_persists_usage_unconditionally() {
         let source = include_str!("run_lifecycle.rs");
@@ -8315,12 +8444,15 @@ mod tests {
             .unwrap_or(source.len());
         let fn_body = &source[fn_start..fn_end];
 
-        // persist_usage must NOT be inside the persist_terminal_state block.
-        // Find the persist_terminal_state block and verify persist_usage is outside it.
+        let usage_pos = fn_body
+            .find(".persist_usage(")
+            .expect("stream_chat must call persist_usage");
+
+        // persist_usage must NOT be inside the status-persistence guard.
+        // Cancelled runs skip persist_status, but usage must still be written.
         let guard_pos = fn_body
-            .find("if persist_terminal_state {")
-            .expect("persist_terminal_state guard must exist");
-        // Find the closing brace of the guard block
+            .find("if persist_status_update {")
+            .expect("persist_status_update guard must exist");
         let guard_block = &fn_body[guard_pos..];
         let mut depth = 0;
         let mut guard_end = 0;
@@ -8335,17 +8467,10 @@ mod tests {
                 }
             }
         }
-        let guard_body = &fn_body[guard_pos..guard_end];
         assert!(
-            !guard_body.contains("persist_usage"),
-            "persist_usage must NOT be inside persist_terminal_state guard — \
+            usage_pos > guard_end,
+            "persist_usage must remain outside the persist_status_update guard — \
              cancelled stream_chat runs must still persist usage for billing/audit"
-        );
-
-        // persist_usage must exist somewhere in stream_chat
-        assert!(
-            fn_body.contains("persist_usage"),
-            "stream_chat must call persist_usage"
         );
     }
 
