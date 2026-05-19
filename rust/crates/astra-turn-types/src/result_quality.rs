@@ -44,6 +44,17 @@ pub fn classify_result(result_str: &str) -> ResultQuality {
         {
             return ResultQuality::Error;
         }
+        // Non-terminal status without payload: any non-empty status that is
+        // not a well-known terminal status, with no result/output/data.
+        if let Some(status) = value.get("status").and_then(|s| s.as_str())
+            && !status.is_empty()
+            && !matches!(status, "ok" | "done" | "success" | "complete" | "finished")
+            && value.get("result").is_none()
+            && value.get("output").is_none()
+            && value.get("data").is_none()
+        {
+            return ResultQuality::Empty;
+        }
         // Empty JSON structures
         if value.is_null() {
             return ResultQuality::Empty;
@@ -101,8 +112,9 @@ pub fn quality_feedback(tool_name: &str, quality: ResultQuality) -> Option<Strin
             tool_name
         )),
         ResultQuality::Empty => Some(format!(
-            "ℹ {} returned empty results. The query may need different parameters, \
-             or the resource may not exist. Do NOT retry with the same arguments.",
+            "ℹ {} returned no finished result. The query may need different parameters, \
+             the resource may not exist, or the work may not be ready yet. Do NOT retry \
+             with the same arguments.",
             tool_name
         )),
         ResultQuality::Truncated => Some(format!(
@@ -148,6 +160,14 @@ mod tests {
     #[test]
     fn empty_string_json() {
         assert_eq!(classify_result(r#""""#), ResultQuality::Empty);
+    }
+
+    #[test]
+    fn json_still_running_status_is_empty() {
+        assert_eq!(
+            classify_result(r#"{"status":"still_running","agent_id":"agent-123"}"#),
+            ResultQuality::Empty
+        );
     }
 
     // ── Error detection ──

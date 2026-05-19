@@ -2093,6 +2093,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validate_slot_backs_off_repeated_identical_nonprogress_outcomes() {
+        let mut harness = PipelineHarness::new();
+        harness.valid_tool_names.insert("agent".to_string());
+        let args = json!({"action":"get_result","agent_id":"general-purpose_demo@123"});
+        harness.tool_calls.push(json!({
+            "id": "call-agent-0",
+            "function": { "name": "agent", "arguments": serde_json::to_string(&args).unwrap() }
+        }));
+        let sig = astra_turn_core::tool_result_semantics::tool_dedup_signature("agent", &args);
+        let still_running = r#"{"status":"still_running","agent_id":"general-purpose_demo@123"}"#;
+        harness.turn_guard.record_tool_outcome(
+            &sig,
+            astra_turn_core::result_quality::ResultQuality::Empty,
+            10,
+            still_running,
+        );
+        harness.turn_guard.record_tool_outcome(
+            &sig,
+            astra_turn_core::result_quality::ResultQuality::Empty,
+            11,
+            still_running,
+        );
+
+        let mut pipeline = harness.pipeline();
+        let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+        assert!(matches!(result, HeadlessPipelineStage::ShortCircuit));
+        assert!(
+            pipeline.ctx.tool_results[0]
+                .to_string()
+                .contains("Busy-poll backoff"),
+            "repeated non-progress outcomes should trigger a short-term backoff"
+        );
+    }
+
+    #[test]
+    fn validate_slot_allows_poll_again_after_nonprogress_cooldown() {
+        let mut harness = PipelineHarness::new();
+        harness.valid_tool_names.insert("agent".to_string());
+        let args = json!({"action":"get_result","agent_id":"general-purpose_demo@123"});
+        harness.tool_calls.push(json!({
+            "id": "call-agent-1",
+            "function": { "name": "agent", "arguments": serde_json::to_string(&args).unwrap() }
+        }));
+        let sig = astra_turn_core::tool_result_semantics::tool_dedup_signature("agent", &args);
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for at_epoch in [now_epoch.saturating_sub(30), now_epoch.saturating_sub(29)] {
+            harness.turn_guard.health.record_outcome(
+                &sig,
+                astra_turn_core::tool_health::ToolOutcome {
+                    success: true,
+                    latency_ms: 12,
+                    result_hash: 7,
+                    at_epoch,
+                    failure_category: Some(
+                        astra_turn_core::action_compensation::FailureCategory::NonProgress,
+                    ),
+                },
+            );
+        }
+
+        let mut pipeline = harness.pipeline();
+        let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+        assert!(
+            matches!(result, HeadlessPipelineStage::Continue(_)),
+            "non-progress backoff must expire so long-running tasks can be polled again later"
+        );
+    }
+
     #[tokio::test]
     async fn repeated_identical_cached_reads_are_suppressed_after_threshold() {
         let mut harness = PipelineHarness::new();

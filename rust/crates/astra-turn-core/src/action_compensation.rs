@@ -58,6 +58,7 @@ pub enum FailureCategory {
     Timeout,
     ResourceExhaustion,
     ValidationError,
+    NonProgress,
     Unknown,
 }
 

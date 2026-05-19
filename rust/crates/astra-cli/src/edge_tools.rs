@@ -1396,7 +1396,7 @@ impl ToolExecutor {
         }
         let turn = self
             .journal_turn_index
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .load(std::sync::atomic::Ordering::Acquire);
         if let Ok(writer) = astra_services::session_journal::JournalWriter::new(&session_id) {
             let _ = writer.append(
                 &astra_services::session_journal::JournalEvent::task_lifecycle(

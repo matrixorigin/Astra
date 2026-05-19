@@ -31,10 +31,10 @@ pub struct ToolOutcome {
     pub result_hash: u64,
     /// Unix epoch seconds when the outcome was recorded.
     pub at_epoch: u64,
-    /// Structured failure class when `success == false`; `None` otherwise.
-    /// Surfaced back into the agent's self-awareness prompt so identical
-    /// failures can be reasoned about by *kind* (timeout / perm / net / …)
-    /// rather than only by signature.
+    /// Structured outcome tag. Usually this is a failure class when
+    /// `success == false`, but callers may also attach metadata for
+    /// syntactically successful yet unfinished results (for example
+    /// `FailureCategory::NonProgress` on a `still_running` poll).
     pub failure_category: Option<FailureCategory>,
 }
 
@@ -119,7 +119,7 @@ impl ToolOutcome {
             latency_ms,
             result_hash,
             at_epoch,
-            failure_category: if success { None } else { failure_category },
+            failure_category,
         }
     }
 }
@@ -139,6 +139,7 @@ pub fn failure_category_tag(category: FailureCategory) -> &'static str {
         FailureCategory::Timeout => "timeout",
         FailureCategory::ResourceExhaustion => "resource_exhaustion",
         FailureCategory::ValidationError => "validation_error",
+        FailureCategory::NonProgress => "non_progress",
         FailureCategory::Unknown => "unknown",
     }
 }
@@ -158,6 +159,7 @@ pub fn failure_category_from_tag(tag: &str) -> Option<FailureCategory> {
         "timeout" => FailureCategory::Timeout,
         "resource_exhaustion" => FailureCategory::ResourceExhaustion,
         "validation_error" => FailureCategory::ValidationError,
+        "non_progress" => FailureCategory::NonProgress,
         "unknown" => FailureCategory::Unknown,
         _ => return None,
     })
@@ -1807,6 +1809,7 @@ mod tests {
             FailureCategory::Timeout,
             FailureCategory::ResourceExhaustion,
             FailureCategory::ValidationError,
+            FailureCategory::NonProgress,
             FailureCategory::Unknown,
         ] {
             let tag = failure_category_tag(cat);
@@ -1828,6 +1831,32 @@ mod tests {
         assert_eq!(
             hints[0].failure_category,
             Some(FailureCategory::NetworkError)
+        );
+    }
+
+    #[test]
+    fn successful_outcome_can_carry_nonprogress_metadata() {
+        let mut tracker = ToolHealthTracker::new();
+        let sig = r#"agent:{"action":"get_result","agent_id":"demo"}"#;
+        tracker.record_success("agent");
+        tracker.record_outcome(
+            sig,
+            ToolOutcome::with_category(
+                true,
+                15,
+                r#"{"status":"still_running","agent_id":"demo"}"#,
+                Some(FailureCategory::NonProgress),
+            ),
+        );
+
+        let exported = tracker.export();
+        let restored = ToolHealthTracker::from_entries(&exported);
+        let hints = restored.latest_outcomes(1);
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].success);
+        assert_eq!(
+            hints[0].failure_category,
+            Some(FailureCategory::NonProgress)
         );
     }
 

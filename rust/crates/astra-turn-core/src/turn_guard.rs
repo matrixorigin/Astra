@@ -292,10 +292,17 @@ impl TurnGuard {
         latency_ms: u64,
         result_str: &str,
     ) {
-        let success = !matches!(quality, ResultQuality::Error);
+        let (success, category) = match quality {
+            ResultQuality::Error => (false, None),
+            ResultQuality::Empty => (
+                true,
+                Some(crate::action_compensation::FailureCategory::NonProgress),
+            ),
+            ResultQuality::Success | ResultQuality::Truncated => (true, None),
+        };
         self.health.record_outcome(
             sig,
-            tool_health::ToolOutcome::new(success, latency_ms, result_str),
+            tool_health::ToolOutcome::with_category(success, latency_ms, result_str, category),
         );
     }
 

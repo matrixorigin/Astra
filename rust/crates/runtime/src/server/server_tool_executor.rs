@@ -2298,7 +2298,7 @@ impl ServerToolExecutor {
 
     /// Set the current turn index for journal entries.
     pub fn set_turn_index(&self, idx: u32) {
-        self.journal_turn_index.store(idx, Ordering::Relaxed);
+        self.journal_turn_index.store(idx, Ordering::Release);
     }
 
     fn memory_args_with_context(&self, args: &Value) -> Value {
