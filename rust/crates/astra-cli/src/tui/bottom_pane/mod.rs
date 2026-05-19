@@ -880,23 +880,25 @@ impl BottomPane {
                 }
                 Some(BottomPaneAction::Consumed)
             }
-            KeyCode::Char(digit)
-                if key.modifiers.is_empty()
-                    && let Some(index) = digit.to_digit(10)
-                    && index > 0 =>
-            {
-                if self
-                    .slash_menu
-                    .as_mut()
-                    .is_some_and(|menu| menu.select(index as usize - 1))
-                    && let Some(picked) = self
-                        .slash_menu
-                        .as_ref()
-                        .and_then(|m| m.selected_item())
-                        .map(|i| i.name.to_string())
-                {
-                    self.composer.set_text(&format!("{picked} "));
-                    self.slash_menu = None;
+            KeyCode::Char(digit) if key.modifiers.is_empty() => {
+                if let Some(index) = digit.to_digit(10) {
+                    if index > 0 {
+                        if self
+                            .slash_menu
+                            .as_mut()
+                            .is_some_and(|menu| menu.select(index as usize - 1))
+                        {
+                            if let Some(picked) = self
+                                .slash_menu
+                                .as_ref()
+                                .and_then(|m| m.selected_item())
+                                .map(|i| i.name.to_string())
+                            {
+                                self.composer.set_text(&format!("{picked} "));
+                                self.slash_menu = None;
+                            }
+                        }
+                    }
                 }
                 Some(BottomPaneAction::Consumed)
             }

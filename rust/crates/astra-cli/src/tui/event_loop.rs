@@ -884,6 +884,56 @@ pub(crate) async fn run_tui_repl(
                             }
                             BottomPaneAction::SubmitInput(text) => {
                                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+
+                                // ! prefix: execute the rest as a shell command
+                                if let Some(cmd) = text.trim_start().strip_prefix('!') {
+                                    let cmd = cmd.trim();
+                                    if !cmd.is_empty() {
+                                        match std::process::Command::new("sh")
+                                            .arg("-c")
+                                            .arg(cmd)
+                                            .output()
+                                        {
+                                            Ok(out) => {
+                                                let stdout = String::from_utf8_lossy(&out.stdout);
+                                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                                let combined =
+                                                    format!("{stdout}{stderr}").trim().to_string();
+                                                if combined.is_empty() {
+                                                    chat_widget.commit_system(
+                                                        history_cell::system::SystemCell::response(
+                                                            format!("! {cmd}"),
+                                                        ),
+                                                    );
+                                                } else {
+                                                    // Prefix each output line with ┃ for visual separation
+                                                    let prefixed: String = combined
+                                                        .lines()
+                                                        .map(|l| format!("┃ {l}"))
+                                                        .collect::<Vec<_>>()
+                                                        .join("\n");
+                                                    chat_widget.commit_system(
+                                                        history_cell::system::SystemCell::info(
+                                                            format!("! {cmd}\n{prefixed}"),
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::error(
+                                                        format!("! {cmd}: {e}"),
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                    refresh_footer_from_state(&mut bottom_pane, &state);
+                                    frame_requester.schedule_frame();
+                                    continue;
+                                }
+
                                 let flush_user_immediately =
                                     should_flush_submitted_user_cell_immediately(&text);
                                 // Shadow: mirror the user submit into

@@ -202,6 +202,35 @@ pub(super) async fn handle_chat_input_with_ui(
     ctx: TurnContext<'_>,
     ui: &mut dyn crate::ui_adapter::ReplUiAdapter,
 ) -> Result<(), String> {
+    // ! prefix: execute the rest as a shell command
+    if let Some(cmd) = line.trim_start().strip_prefix('!') {
+        let cmd = cmd.trim();
+        if !cmd.is_empty() {
+            return match std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .output()
+            {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let combined = format!("{stdout}{stderr}");
+                    if combined.trim().is_empty() {
+                        println!("! {cmd}");
+                    } else {
+                        println!("! {cmd}\n{combined}");
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("! {cmd}: {e}");
+                    Ok(())
+                }
+            };
+        }
+        return Ok(());
+    }
+
     let token = match current_token {
         Some(token) => token,
         None => {
