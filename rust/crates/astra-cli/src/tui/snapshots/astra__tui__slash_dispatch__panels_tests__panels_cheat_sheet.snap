@@ -50,6 +50,10 @@ expression: "build_panels_cheat_sheet_lines().join(\"\\n\")"
       session introspection: budget, tools, history, traces
       type subcommand · Esc close
 
+  /info
+      system info at a glance — version, model, session, skills
+      ↑↓ scroll · Esc close
+
   /help
       list every slash command grouped by category
       ↑↓ browse · Esc close

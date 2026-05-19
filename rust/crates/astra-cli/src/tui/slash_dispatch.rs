@@ -945,6 +945,31 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
         }
 
+        // ── /info — system info at a glance ────────────────────────
+        "/info" => {
+            use crate::tui::bottom_pane::info_view::InfoView;
+
+            let model = ctx.state.model.as_deref().unwrap_or("<unset>");
+            let session = ctx.state.session_id.as_deref().unwrap_or("<none>");
+            let perm = format!("{:?}", ctx.state.perm_manager.mode());
+            let skills = ctx.state.unified_skill_registry.len();
+            let version = env!("CARGO_PKG_VERSION");
+
+            let pairs: Vec<(&str, String)> = vec![
+                ("version", format!("astra v{version}")),
+                ("session", session.to_string()),
+                ("model", model.to_string()),
+                ("permission", perm),
+                ("skills loaded", skills.to_string()),
+                ("context width", format!("{} cols", ctx.width)),
+            ];
+
+            ctx.bottom_pane.push_view(Box::new(
+                InfoView::from_key_value("System Info", pairs).with_reopen("/info"),
+            ));
+            SlashResult::Handled
+        }
+
         // ── Everything else → route via TuiHandler metadata ────────
         _ => match cmd {
             // Commands already explicitly handled above → shouldn't reach here.
@@ -1121,6 +1146,11 @@ pub(crate) fn build_panels_cheat_sheet_lines() -> Vec<String> {
             "/inspect",
             "session introspection: budget, tools, history, traces",
             "type subcommand · Esc close",
+        ),
+        (
+            "/info",
+            "system info at a glance — version, model, session, skills",
+            "↑↓ scroll · Esc close",
         ),
         (
             "/help",
@@ -2584,6 +2614,19 @@ mod panels_tests {
             assert!(
                 text.contains(sub),
                 "cheat sheet /memory entry missing subcommand: {sub}"
+            );
+        }
+    }
+
+    #[test]
+    fn info_entry_shows_system_info() {
+        let text = build_panels_cheat_sheet_lines().join("\n");
+        assert!(text.contains("/info"), "cheat sheet missing /info");
+        // The /info entry should mention key system details.
+        for kw in &["version", "model", "session", "skills"] {
+            assert!(
+                text.contains(kw),
+                "cheat sheet /info entry missing keyword: {kw}"
             );
         }
     }
