@@ -268,7 +268,9 @@ fn build_skill_listing_section_with_budget_and_caps(
              separate `agent` calls in a single assistant message, each with \
              `action='spawn'`, top-level `prompt` for the full child brief \
              (never top-level `task`), and `run_in_background: true`, then collect with \
-             `agent(action='get_result', agent_id=...)`. Skills usually run \
+             `agent(action='get_result', agent_id=...)` using the exact \
+             `agent_id` returned by each spawn result (never the optional \
+             spawn `name`). Skills usually run \
              sequentially inside the parent turn, which contradicts the \
              user's explicit fan-out intent.",
         );

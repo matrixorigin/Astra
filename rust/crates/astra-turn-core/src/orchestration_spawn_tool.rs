@@ -36,6 +36,9 @@ pub struct InheritPrefixSpec {
 /// every captured parent prefix across a deploy. Add new fields at
 /// the end; never reorder existing ones without a coordinated
 /// migration.
+///
+/// The caller never supplies `agent_id` here: the runtime generates the
+/// child agent's id and returns it in [`SpawnAgentOutput`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct SpawnAgentInput {
     /// Short (3-5 word) description of the task.
@@ -465,7 +468,7 @@ pub fn spawn_agent_schema() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "spawn_agent",
-            "description": "Launch a sub-agent for independent work. Types: explore, code-review, task, general-purpose. Use `inherit_prefix: {}` when the child builds on current context.",
+            "description": "Launch a sub-agent for independent work. Types: explore, code-review, task, general-purpose. Use `inherit_prefix: {}` when the child builds on current context. When `run_in_background` is true, use the exact runtime-generated `agent_id` returned by spawn_agent with get_agent_result; do not invent one or reuse `name`.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -489,12 +492,12 @@ pub fn spawn_agent_schema() -> serde_json::Value {
                     },
                     "run_in_background": {
                         "type": "boolean",
-                        "description": "If true, return immediately with agent_id and you MUST call get_agent_result(agent_id) to collect the output. Default false waits for the result synchronously.",
+                        "description": "If true, return immediately with a runtime-generated agent_id and you MUST call get_agent_result(agent_id) with that exact returned value to collect the output. Default false waits for the result synchronously.",
                         "default": false
                     },
                     "name": {
                         "type": "string",
-                        "description": "Name for agent-to-agent messaging. Makes agent addressable via send_message."
+                        "description": "Name for agent-to-agent messaging. Makes agent addressable via send_message. This is not the runtime agent_id used by get_agent_result."
                     },
                     "max_turns": {
                         "type": "integer",
@@ -548,7 +551,8 @@ pub fn spawn_agent_schema() -> serde_json::Value {
                         }
                     }
                 },
-                "required": ["description", "prompt"]
+                "required": ["description", "prompt"],
+                "additionalProperties": false
             }
         }
     })
@@ -749,6 +753,11 @@ mod tests {
             "top-level description must mention inherit_prefix so \
              models discover the opportunity; got: {desc}"
         );
+        assert!(
+            desc.contains("runtime-generated `agent_id`")
+                || desc.contains("runtime-generated agent_id"),
+            "top-level description must explain that spawn returns the runtime-generated agent_id; got: {desc}"
+        );
     }
 
     // ─── Lenient deserializer for inherit_prefix (MiniMax regression) ───
@@ -869,6 +878,15 @@ mod tests {
             ip_desc.contains("{}"),
             "inherit_prefix description must show the `{{}}` opt-in \
              shorthand so models know the minimum call form; got: {ip_desc}"
+        );
+    }
+
+    #[test]
+    fn schema_rejects_unknown_top_level_fields() {
+        let schema = spawn_agent_schema();
+        assert_eq!(
+            schema["function"]["parameters"]["additionalProperties"],
+            false
         );
     }
 }

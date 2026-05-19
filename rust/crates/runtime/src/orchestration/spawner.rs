@@ -67,6 +67,17 @@ pub use astra_turn_core::orchestration_types::{
     AgentStatus, SpawnedAgentInfo, SpawnedAgentMetrics,
 };
 
+/// Outcome of waiting on a child agent ID.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WaitForAgentOutcome {
+    /// The agent exists and produced a terminal status.
+    Status(AgentStatus),
+    /// The agent exists, but did not reach a terminal status before timeout.
+    TimedOut,
+    /// No agent with this exact runtime ID is known to the spawner.
+    Unknown,
+}
+
 /// Permission summary for display purposes.
 #[derive(Debug, Clone, Default)]
 pub struct PermissionSummary {
@@ -859,11 +870,21 @@ impl DynamicAgentSpawner {
                 let spawner = self.clone_for_task();
                 let agent_id_clone = agent_id.clone();
 
-                // Notify on completion (or panic) via a drop guard so
-                // get_agent_result/wait_for_agent unblocks even if the child panics.
-                // The Notify Arc is captured directly — no map lookup
-                // needed in Drop (which runs in sync context).
+                // Notify AFTER handle_completion has written the terminal
+                // status, not before. We use a drop guard *as a fallback*
+                // (panics, abort, future drop) but the happy path notifies
+                // explicitly inside the future so any waiter that wakes
+                // immediately is guaranteed to see the entry in
+                // `completed_agents`.
+                //
+                // On panic the Notify Arc is captured directly so we do
+                // not need a map lookup in Drop (which runs in sync
+                // context). Waiters that wake via the Drop path may still
+                // see no terminal status — `wait_for_agent_outcome` then
+                // falls back to `classify_wait_failure`, which returns
+                // `TimedOut` while the agent is still tracked.
                 let notify_guard = Arc::clone(&notify);
+                let notify_after_completion = Arc::clone(&notify);
                 let spawn_future = async move {
                     struct NotifyOnDrop(Arc<tokio::sync::Notify>);
                     impl Drop for NotifyOnDrop {
@@ -871,9 +892,13 @@ impl DynamicAgentSpawner {
                             self.0.notify_waiters();
                         }
                     }
-                    let _guard = NotifyOnDrop(notify_guard);
+                    let guard = NotifyOnDrop(notify_guard);
                     let result = executor.execute(run_config).await;
                     spawner.handle_completion(&agent_id_clone, result).await;
+                    // Status is now written. Wake waiters explicitly and
+                    // disarm the drop guard so we don't double-notify.
+                    notify_after_completion.notify_waiters();
+                    std::mem::forget(guard);
                 };
                 let abort_handle = self
                     .background_tasks
@@ -1299,10 +1324,34 @@ impl DynamicAgentSpawner {
         agent_id: &str,
         timeout: std::time::Duration,
     ) -> Option<AgentStatus> {
+        match self.wait_for_agent_outcome(agent_id, timeout).await {
+            WaitForAgentOutcome::Status(status) => Some(status),
+            WaitForAgentOutcome::TimedOut | WaitForAgentOutcome::Unknown => None,
+        }
+    }
+
+    /// Classify a wait that did NOT find a terminal status: if the agent is
+    /// still tracked anywhere we treat it as a timeout; otherwise the caller
+    /// gave us an id that was never registered.
+    async fn classify_wait_failure(&self, agent_id: &str) -> WaitForAgentOutcome {
+        if self.get_agent_state_any(agent_id).await.is_some() {
+            WaitForAgentOutcome::TimedOut
+        } else {
+            WaitForAgentOutcome::Unknown
+        }
+    }
+
+    /// Wait for a background agent to complete and distinguish timeout from
+    /// "unknown id" in the same code path that owns notifier registration.
+    pub async fn wait_for_agent_outcome(
+        &self,
+        agent_id: &str,
+        timeout: std::time::Duration,
+    ) -> WaitForAgentOutcome {
         // Already completed?
         for s in self.completed_agents.read().await.iter() {
             if s.agent_id == agent_id {
-                return Some(s.status.clone());
+                return WaitForAgentOutcome::Status(s.status.clone());
             }
         }
 
@@ -1313,7 +1362,9 @@ impl DynamicAgentSpawner {
             let map = self.completion_notifiers.read().await;
             map.get(agent_id).cloned()
         };
-        let notifier = notifier?;
+        let Some(notifier) = notifier else {
+            return self.classify_wait_failure(agent_id).await;
+        };
         let notify_future = notifier.notified();
         tokio::pin!(notify_future);
         notify_future.as_mut().enable();
@@ -1322,22 +1373,22 @@ impl DynamicAgentSpawner {
         // that raced between the first check and notified() registration.
         for s in self.completed_agents.read().await.iter() {
             if s.agent_id == agent_id {
-                return Some(s.status.clone());
+                return WaitForAgentOutcome::Status(s.status.clone());
             }
         }
 
-        // Wait for notification with timeout.
-        match tokio::time::timeout(timeout, notify_future).await {
-            Ok(()) => {
-                for s in self.completed_agents.read().await.iter() {
-                    if s.agent_id == agent_id {
-                        return Some(s.status.clone());
-                    }
-                }
-                None
+        // Wait for notification with timeout. Whether the notifier fired
+        // (Ok) or the timeout elapsed (Err), the same recovery applies:
+        // re-check completed_agents (the notifier may have woken us
+        // before handle_completion finished writing) and otherwise fall
+        // through to classify_wait_failure.
+        let _ = tokio::time::timeout(timeout, notify_future).await;
+        for s in self.completed_agents.read().await.iter() {
+            if s.agent_id == agent_id {
+                return WaitForAgentOutcome::Status(s.status.clone());
             }
-            Err(_) => None,
         }
+        self.classify_wait_failure(agent_id).await
     }
 
     /// Clone the spawner for use in spawned tasks.
@@ -2659,6 +2710,48 @@ mod tests {
             .wait_for_agent("nonexistent", std::time::Duration::from_millis(100))
             .await;
         assert!(status.is_none(), "unknown agent should return None");
+    }
+
+    #[tokio::test]
+    async fn wait_for_agent_outcome_distinguishes_unknown_agent() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let outcome = spawner
+            .wait_for_agent_outcome("nonexistent", std::time::Duration::from_millis(100))
+            .await;
+        assert_eq!(outcome, WaitForAgentOutcome::Unknown);
+    }
+
+    /// wait_for_agent_outcome returns TimedOut when the agent is known
+    /// (registered in the tracker) but doesn't complete before the timeout.
+    #[tokio::test]
+    async fn wait_for_agent_outcome_distinguishes_timed_out_agent() {
+        let factory = BlockingExecutorFactory::new();
+        let factory2 = Arc::clone(&factory);
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(factory as Arc<dyn SpawnAgentExecutor>);
+
+        let result = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .unwrap();
+        let agent_id = match result {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected Launched, got {other:?}"),
+        };
+
+        // The executor blocks until explicitly unblocked, so a short
+        // timeout should yield TimedOut — the agent is known (registered
+        // in the tracker) but hasn't completed.
+        let outcome = spawner
+            .wait_for_agent_outcome(&agent_id, std::time::Duration::from_millis(100))
+            .await;
+        assert_eq!(outcome, WaitForAgentOutcome::TimedOut);
+
+        // Clean up: unblock and drain.
+        factory2.unblock();
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
     }
 
     /// Regression: background task completes BEFORE shutdown_and_wait is called.

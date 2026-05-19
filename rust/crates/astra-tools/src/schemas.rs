@@ -616,21 +616,21 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "function": {
                 "name": "agent",
                 "description": "Multi-agent operations. Actions: spawn, get_result, run_chain, send_message.\n\n\
-        ## Required fields per action\n\
-        - `spawn`: REQUIRES `action`, `description`, `prompt`. (Optional: `agent_type`, `run_in_background`, `model`, `max_turns`, `complexity`, `isolated`, `allowed_tools`, `name`.)\n\
-        - `get_result`: REQUIRES `action`, `agent_id`.\n\
-        - `run_chain`: REQUIRES `action`, `steps`.\n\
-        - `send_message`: REQUIRES `action`, `to`, `message`.\n\n\
-        For `spawn`, pass at least one non-empty field: `description` (short UI summary) or `prompt` (full child brief). If one is missing, Astra derives it from the other. Prefer sending both. Do NOT pass a top-level `task` field.\n\n\
-        ## Spawn example\n\
-        `agent(action='spawn', description='Audit auth flow', prompt='Read src/auth/* and report any token-handling bugs. Focus on session expiry and refresh logic. Return findings as a numbered list.', agent_type='general-purpose')`\n\n\
-        ## Execution mode\n\
-        - **Default (synchronous)**: `spawn` blocks until the sub-agent's final result is ready. Use this for work you depend on in the current turn. The sub-agent's tool calls stream back inline — the TUI renders them inside the parent Task card so the user sees progress live.\n\
-        - **Background**: pass `run_in_background: true` to return immediately with `{agent_id}`. Use this for fire-and-forget or long-running work you don't need to await; follow up with `get_result` later. Durable-task store persists the run across session death so it survives `astra` restarts.\n\n\
-        ## Parallel sub-agent fan-out\n\
-        To run N sub-agents in parallel (e.g. multi-angle code review), emit N `agent` tool calls **in a single assistant message**, each with `action='spawn'` and `run_in_background: true`. They run concurrently. After all are spawned, call `agent(action='get_result', agent_id=...)` for each one — `get_result` blocks until that child finishes. This is the ONLY way to fan out parallel agents; do not use `action='delegate'` (removed: it had no execution backend).\n\
-        For plan lifecycle, call `enter_plan_mode` / `exit_plan_mode` directly. Do NOT wrap them inside `agent(action='run_chain', ...)`.\n\
-        Do NOT pass an `agents:[...]` payload, do NOT pass a top-level `task` field, and do NOT wrap spawn arguments under a `spawn` field. Each child must be its own `agent(...)` tool call.",
+         ## Required fields per action\n\
+         - `spawn`: REQUIRES `action`, `description`, `prompt`. (Optional: `agent_type`, `run_in_background`, `model`, `max_turns`, `complexity`, `isolated`, `allowed_tools`, `name`.)\n\
+         - `get_result`: REQUIRES `action`, `agent_id`.\n\
+         - `run_chain`: REQUIRES `action`, `steps`.\n\
+         - `send_message`: REQUIRES `action`, `to`, `message`.\n\n\
+         For `spawn`, pass at least one non-empty field: `description` (short UI summary) or `prompt` (full child brief). If one is missing, Astra derives it from the other. Prefer sending both. Do NOT pass a top-level `task` field. Do NOT pass `agent_id` to spawn; Astra generates that runtime id for you. If you need a mailbox label, use `name`, but `name` is not valid for `get_result`.\n\n\
+         ## Spawn example\n\
+         `agent(action='spawn', description='Audit auth flow', prompt='Read src/auth/* and report any token-handling bugs. Focus on session expiry and refresh logic. Return findings as a numbered list.', agent_type='general-purpose')`\n\n\
+         ## Execution mode\n\
+         - **Default (synchronous)**: `spawn` blocks until the sub-agent's final result is ready. Use this for work you depend on in the current turn. The sub-agent's tool calls stream back inline — the TUI renders them inside the parent Task card so the user sees progress live.\n\
+         - **Background**: pass `run_in_background: true` to return immediately with `{agent_id}`. Use this for fire-and-forget or long-running work you don't need to await; follow up with `get_result` later using the exact returned `agent_id`. Durable-task store persists the run across session death so it survives `astra` restarts.\n\n\
+         ## Parallel sub-agent fan-out\n\
+         To run N sub-agents in parallel (e.g. multi-angle code review), emit N `agent` tool calls **in a single assistant message**, each with `action='spawn'` and `run_in_background: true`. They run concurrently. After all are spawned, capture each spawn result's returned `agent_id`, then call `agent(action='get_result', agent_id=...)` with that exact value for each one — `get_result` blocks until that child finishes. Do not substitute `name` or invent ids. This is the ONLY way to fan out parallel agents; do not use `action='delegate'` (removed: it had no execution backend).\n\
+         For plan lifecycle, call `enter_plan_mode` / `exit_plan_mode` directly. Do NOT wrap them inside `agent(action='run_chain', ...)`.\n\
+         Do NOT pass an `agents:[...]` payload, do NOT pass a top-level `task` field, and do NOT wrap spawn arguments under a `spawn` field. Each child must be its own `agent(...)` tool call.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -640,19 +640,20 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "prompt": {"type": "string", "description": "Full child task brief for spawn. Non-empty. If omitted, Astra falls back to `description`."},
                         "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Sub-agent persona (spawn). Default: general-purpose."},
                         "model": {"type": "string", "description": "Model override (spawn). Default: parent's model."},
-                        "run_in_background": {"type": "boolean", "description": "If true, return immediately with agent_id instead of blocking on the sub-agent's final result. Default false (sync). Applies to spawn."},
-                        "name": {"type": "string", "description": "Addressable name (spawn). Optional; auto-generated if omitted."},
+                        "run_in_background": {"type": "boolean", "description": "If true, return immediately with a runtime-generated agent_id instead of blocking on the sub-agent's final result. Use that exact returned value with get_result. Default false (sync). Applies to spawn."},
+                        "name": {"type": "string", "description": "Addressable mailbox name (spawn). Optional; auto-generated if omitted. Not the runtime agent_id used by get_result."},
                         "max_turns": {"type": "integer", "description": "Max turns (spawn). Explicit value wins over `complexity`."},
                         "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Task-complexity hint scaling the default budget when `max_turns` is absent. `light`≈10 turns, `normal`=agent default, `deep`=2× default. Use `deep` for review/refactor/multi-file tasks that routinely exhaust the default."},
                         "isolated": {"type": "boolean", "description": "Use isolated worktree (spawn)"},
                         "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
-                        "agent_id": {"type": "string", "description": "REQUIRED for action='get_result'. The agent_id returned by a prior spawn."},
+                        "agent_id": {"type": "string", "description": "REQUIRED for action='get_result'. Must be the exact runtime-generated agent_id returned by a prior spawn, not the optional spawn name."},
                         "to": {"type": "string", "description": "REQUIRED for action='send_message'. Recipient agent_id, or '*' for broadcast."},
                         "message": {"description": "REQUIRED for action='send_message'. Message content."},
                         "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"]},
                         "priority": {"type": "string", "enum": ["low","normal","high"]}
                     },
                     "required": ["action"],
+                    "additionalProperties": false,
                     "x-astra-per-action-required": {
                         "spawn": ["description", "prompt"],
                         "run_chain": ["steps"],
@@ -1145,6 +1146,34 @@ mod tests {
         assert!(
             desc.contains("exit_plan_mode") && desc.contains("run_chain"),
             "agent description should steer plan lifecycle away from run_chain"
+        );
+    }
+
+    #[test]
+    fn agent_schema_pins_exact_runtime_agent_id_contract() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
+        let desc = agent
+            .get("function")
+            .and_then(|f| f.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let params = &agent["function"]["parameters"];
+        assert_eq!(params["additionalProperties"], false);
+        assert!(
+            desc.contains("Do NOT pass `agent_id` to spawn"),
+            "agent description must explicitly forbid spawn-time agent_id misuse"
+        );
+        assert!(
+            desc.contains("exact returned `agent_id`") || desc.contains("exact value"),
+            "agent description must require reusing the returned runtime agent_id"
+        );
+        assert!(
+            params["properties"]["name"]["description"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Not the runtime agent_id"),
+            "name field must say it is not the get_result identifier"
         );
     }
 
