@@ -1066,6 +1066,10 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
     eprintln!();
 }
 
+/// Retention: REPL fallback handler for `/info` — called from slash_router.rs.
+/// In TUI mode this is shadowed by TuiHandler::Panel (InfoView).
+/// Kept for headless / non-interactive execution paths.
+#[allow(dead_code)]
 pub(super) async fn handle_info_command(
     cmd: &str,
     arg: &str,

@@ -228,6 +228,31 @@ pub(crate) fn render(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
             line = line.style(Style::default().bg(theme.selected_bg));
         }
         lines.push(line);
+        // Show subcommands below the selected item (single-line, compact).
+        if is_selected && !item.subcommands.is_empty() {
+            let max_subs = 3.min(item.subcommands.len());
+            for (name, desc) in item.subcommands.iter().take(max_subs) {
+                let mut sub_spans: Vec<Span<'static>> = Vec::new();
+                sub_spans.push(Span::raw("   · "));
+                sub_spans.push(Span::styled(
+                    format!("{name}"),
+                    Style::default()
+                        .fg(theme.accent_dim())
+                        .add_modifier(Modifier::ITALIC),
+                ));
+                sub_spans.push(Span::styled(
+                    format!(" — {desc}"),
+                    Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
+                ));
+                lines.push(Line::from(sub_spans));
+            }
+            if item.subcommands.len() > max_subs {
+                lines.push(Line::from(Span::styled(
+                    format!("   … {} more", item.subcommands.len() - max_subs),
+                    Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
+                )));
+            }
+        }
     }
 
     // ── Scroll-down hint ────────────────────────────────────────
@@ -567,5 +592,36 @@ mod tests {
             "narrow popup should not draw box: {out}"
         );
         assert!(out.contains("/help"), "name must still render: {out}");
+    }
+
+    #[test]
+    fn selected_item_shows_subcommands() {
+        use crate::command_registry::TuiHandler;
+
+        const SUBS: &[(&str, &str)] = &[
+            ("list", "List all memories"),
+            ("search", "Search memories by query"),
+            ("inspect", "Inspect a single memory by ID"),
+        ];
+        let item = SlashItem {
+            name: "/memory",
+            description: "Memory operations",
+            subcommands: SUBS,
+            aliases: &[],
+            usage_boost: 0,
+            group: Some(CommandGroup::MemoryTasks),
+            tui_handler: TuiHandler::Panel,
+            usage_examples: &[],
+        };
+        let menu = SlashMenu::new(vec![item]);
+        let output = render_menu(&menu, 80, 10);
+        assert!(
+            output.contains("list"),
+            "should show 'list' subcommand: {output}"
+        );
+        assert!(
+            output.contains("Search memories"),
+            "should show 'search' subcommand desc: {output}"
+        );
     }
 }

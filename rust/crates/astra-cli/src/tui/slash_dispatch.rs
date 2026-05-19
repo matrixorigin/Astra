@@ -877,7 +877,12 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     // which has richer formatting for the detail view.
                     return SlashResult::Forward(text.to_string());
                 }
-                _ => return SlashResult::Forward(text.to_string()),
+                _ => {
+                    ctx.show_error(
+                        "Unknown subcommand. Try: list, search <query>, inspect <id>".into(),
+                    );
+                    return SlashResult::Handled;
+                }
             };
 
             let payload = serde_json::json!({

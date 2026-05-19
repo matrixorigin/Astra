@@ -24,6 +24,10 @@ pub struct ProfileCommandContext<'a> {
 }
 
 /// Handle `/profile [subcommand]` command.
+/// Retention: REPL fallback handler for `/profile` — called from main.rs / slash_router.rs.
+/// In TUI mode this is shadowed by TuiHandler::Selector (ConfigEditView).
+/// Kept for headless / non-interactive execution paths.
+#[allow(dead_code)]
 pub fn handle_profile_command(arg: &str, ctx: &ProfileCommandContext<'_>) {
     let parts: Vec<&str> = arg.split_whitespace().collect();
     let subcmd = parts.first().copied().unwrap_or("show");
