@@ -880,7 +880,7 @@ impl BottomPane {
                 }
                 Some(BottomPaneAction::Consumed)
             }
-            KeyCode::Char(digit) if key.modifiers.is_empty() => {
+            KeyCode::Char(digit) if key.modifiers.is_empty() && digit.is_ascii_digit() => {
                 if let Some(index) = digit.to_digit(10) {
                     if index > 0 {
                         if self
