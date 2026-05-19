@@ -506,19 +506,11 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
-        // ── /config (TUI-native, matches the reference CLI) ──────────
-        //
-        // `/config` with no args opens the interactive panel directly —
-        // this is the user's primary entry point, same as the reference
-        // implementation's `/config` (aliased `/settings`).
-        //
-        // `/config edit` is kept as an alias for muscle memory / docs.
-        //
-        // Subcommands that only print static text (`show`, `paths`,
-        // `diff`, `sources`, `export`) fall back to the line-mode
-        // printer via `with_restored`. Those briefly tear down the TUI
-        // which is acceptable for a print-and-done flow.
-        "/config" if args.trim().is_empty() || args.trim() == "edit" => {
+        // ── /config (TUI-native panel) ─────────────────────────────
+        // All /config subcommands (edit, show, paths, sources, diff,
+        // export) open the interactive ConfigEditView.  The panel
+        // provides search, pick, edit, diff, and export in one place.
+        "/config" => {
             use crate::tui::bottom_pane::config_edit_view::ConfigEditView;
             let cfg = astra_config::runtime_config::RuntimeConfig::load();
             ctx.bottom_pane
@@ -1010,9 +1002,9 @@ pub(crate) fn build_panels_cheat_sheet_lines() -> Vec<String> {
             "↑↓ navigate · q / Esc close",
         ),
         (
-            "/config",
-            "interactive panel — search, pick, and edit runtime config",
-            "↑↓ navigate · Enter edit · type to search · Esc save/close",
+            "/config [edit|show|paths|sources|diff|export]",
+            "interactive panel — search, pick, edit, diff, and export config",
+            "↑↓ navigate · Enter edit/set · type to search · Esc save/close",
         ),
         (
             "/model",
@@ -2477,6 +2469,19 @@ mod panels_tests {
             "panels_cheat_sheet",
             build_panels_cheat_sheet_lines().join("\n")
         );
+    }
+
+    #[test]
+    fn config_entry_lists_all_subcommands() {
+        let text = build_panels_cheat_sheet_lines().join("\n");
+        // The /config entry MUST mention each subcommand so users
+        // discover show / paths / sources / diff / export.
+        for sub in &["show", "paths", "sources", "diff", "export"] {
+            assert!(
+                text.contains(sub),
+                "cheat sheet /config entry missing subcommand: {sub}"
+            );
+        }
     }
 }
 

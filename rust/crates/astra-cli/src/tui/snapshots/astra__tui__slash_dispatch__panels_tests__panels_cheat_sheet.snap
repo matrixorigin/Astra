@@ -1,6 +1,5 @@
 ---
 source: crates/astra-cli/src/tui/slash_dispatch.rs
-assertion_line: 2476
 expression: "build_panels_cheat_sheet_lines().join(\"\\n\")"
 ---
   /resume
@@ -23,9 +22,9 @@ expression: "build_panels_cheat_sheet_lines().join(\"\\n\")"
       list git worktrees with per-worktree session counts
       ↑↓ navigate · q / Esc close
 
-  /config
-      interactive panel — search, pick, and edit runtime config
-      ↑↓ navigate · Enter edit · type to search · Esc save/close
+  /config [edit|show|paths|sources|diff|export]
+      interactive panel — search, pick, edit, diff, and export config
+      ↑↓ navigate · Enter edit/set · type to search · Esc save/close
 
   /model
       fuzzy-search model picker; switch or inspect current model
