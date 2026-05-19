@@ -1015,6 +1015,31 @@ pub(crate) fn build_panels_cheat_sheet_lines() -> Vec<String> {
             "↑↓ navigate · Enter edit · type to search · Esc save/close",
         ),
         (
+            "/model",
+            "fuzzy-search model picker; switch or inspect current model",
+            "type to filter · Enter select · Esc close",
+        ),
+        (
+            "/skill",
+            "browse, search, install, and manage skills",
+            "type to filter · Enter select · Esc close",
+        ),
+        (
+            "/session",
+            "list, fork, history, analyze, or export sessions",
+            "↑↓ navigate · Enter select · Esc close",
+        ),
+        (
+            "/stats",
+            "view token cost, tool usage, and session statistics",
+            "Enter / q / Esc close",
+        ),
+        (
+            "/inspect",
+            "session introspection: budget, tools, history, traces",
+            "type subcommand · Esc close",
+        ),
+        (
             "/help",
             "list every slash command grouped by category",
             "↑↓ browse · Esc close",

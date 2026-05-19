@@ -1,6 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/slash_dispatch.rs
-assertion_line: 1211
+assertion_line: 2476
 expression: "build_panels_cheat_sheet_lines().join(\"\\n\")"
 ---
   /resume
@@ -26,6 +26,26 @@ expression: "build_panels_cheat_sheet_lines().join(\"\\n\")"
   /config
       interactive panel — search, pick, and edit runtime config
       ↑↓ navigate · Enter edit · type to search · Esc save/close
+
+  /model
+      fuzzy-search model picker; switch or inspect current model
+      type to filter · Enter select · Esc close
+
+  /skill
+      browse, search, install, and manage skills
+      type to filter · Enter select · Esc close
+
+  /session
+      list, fork, history, analyze, or export sessions
+      ↑↓ navigate · Enter select · Esc close
+
+  /stats
+      view token cost, tool usage, and session statistics
+      Enter / q / Esc close
+
+  /inspect
+      session introspection: budget, tools, history, traces
+      type subcommand · Esc close
 
   /help
       list every slash command grouped by category
