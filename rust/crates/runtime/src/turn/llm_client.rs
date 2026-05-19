@@ -17,7 +17,7 @@
 //! Re-exported as [`apply_env_proxy`] for in-crate call sites.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
@@ -1032,6 +1032,168 @@ pub(crate) fn repair_openai_tool_pairing_for_bedrock(messages: &[Value]) -> Vec<
     repaired
 }
 
+fn anthropic_tool_use_ids(msg: &Value) -> Vec<String> {
+    msg.get("content")
+        .map(anthropic_content_as_blocks)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .filter_map(|block| block.get("id").and_then(Value::as_str).map(String::from))
+        .collect()
+}
+
+fn is_anthropic_tool_result_block(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("tool_result")
+}
+
+fn synthetic_anthropic_tool_result_block(tool_use_id: &str) -> Value {
+    json!({
+        "type": "tool_result",
+        "tool_use_id": tool_use_id,
+        "content": SYNTHETIC_TOOL_INTERRUPTED_CONTENT,
+    })
+}
+
+/// Repair Anthropic Messages tool_use/tool_result mismatches after conversion to
+/// Anthropic-native roles/content blocks.
+///
+/// Anthropic enforces a stricter adjacency rule than OpenAI wire format: any
+/// `tool_result` block must live on the `user` message immediately following the
+/// `assistant` message that declared the matching `tool_use`. Compaction and
+/// resume can leave three classes of corruption:
+///
+/// 1. Missing tool_result for a declared tool_use.
+/// 2. Orphaned tool_result whose `tool_use_id` no longer appears in the
+///    previous assistant message.
+/// 3. Duplicate tool_result blocks for the same `tool_use_id`.
+///
+/// We repair in-place at the Anthropic wire layer so both native `role=tool`
+/// inputs (after conversion) and already-native `role=user` tool_result blocks
+/// are handled consistently.
+fn repair_anthropic_tool_pairing(messages: &[Value]) -> Vec<Value> {
+    let mut repaired: Vec<Value> = Vec::with_capacity(messages.len() + 1);
+    let mut missing_counts: usize = 0;
+    let mut orphan_counts: usize = 0;
+    let mut dup_counts: usize = 0;
+
+    let mut i = 0;
+    while i < messages.len() {
+        let msg = &messages[i];
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or_default();
+
+        if role == "assistant" {
+            let declared_ids = anthropic_tool_use_ids(msg);
+            repaired.push(msg.clone());
+            i += 1;
+
+            if declared_ids.is_empty() {
+                continue;
+            }
+
+            let declared_set: HashSet<&str> = declared_ids.iter().map(String::as_str).collect();
+
+            if i < messages.len() && messages[i].get("role").and_then(Value::as_str) == Some("user")
+            {
+                let mut user_msg = messages[i].clone();
+                let mut seen_ids: HashSet<String> = HashSet::new();
+                let mut kept_tool_results: Vec<Value> = Vec::new();
+                let mut other_blocks: Vec<Value> = Vec::new();
+
+                for block in messages[i]
+                    .get("content")
+                    .map(anthropic_content_as_blocks)
+                    .unwrap_or_default()
+                {
+                    if !is_anthropic_tool_result_block(&block) {
+                        other_blocks.push(block);
+                        continue;
+                    }
+                    let tool_use_id = block
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if tool_use_id.is_empty() || !declared_set.contains(tool_use_id) {
+                        orphan_counts += 1;
+                        continue;
+                    }
+                    if !seen_ids.insert(tool_use_id.to_string()) {
+                        dup_counts += 1;
+                        continue;
+                    }
+                    kept_tool_results.push(block);
+                }
+
+                for declared in &declared_ids {
+                    if !seen_ids.contains(declared) {
+                        missing_counts += 1;
+                        kept_tool_results.push(synthetic_anthropic_tool_result_block(declared));
+                    }
+                }
+
+                kept_tool_results.extend(other_blocks);
+                user_msg["content"] = Value::Array(kept_tool_results);
+                repaired.push(user_msg);
+                i += 1;
+                continue;
+            }
+
+            missing_counts += declared_ids.len();
+            repaired.push(json!({
+                "role": "user",
+                "content": declared_ids
+                    .iter()
+                    .map(|id| synthetic_anthropic_tool_result_block(id))
+                    .collect::<Vec<_>>(),
+            }));
+            continue;
+        }
+
+        if role == "user" {
+            let blocks = msg
+                .get("content")
+                .map(anthropic_content_as_blocks)
+                .unwrap_or_default();
+            if blocks.iter().any(is_anthropic_tool_result_block) {
+                let kept_blocks: Vec<Value> = blocks
+                    .into_iter()
+                    .filter_map(|block| {
+                        if is_anthropic_tool_result_block(&block) {
+                            orphan_counts += 1;
+                            None
+                        } else {
+                            Some(block)
+                        }
+                    })
+                    .collect();
+                if kept_blocks.is_empty() {
+                    i += 1;
+                    continue;
+                }
+                let mut user_msg = msg.clone();
+                user_msg["content"] = Value::Array(kept_blocks);
+                repaired.push(user_msg);
+                i += 1;
+                continue;
+            }
+        }
+
+        repaired.push(msg.clone());
+        i += 1;
+    }
+
+    if missing_counts + orphan_counts + dup_counts > 0 {
+        tracing::warn!(
+            missing = missing_counts,
+            orphaned = orphan_counts,
+            duplicate = dup_counts,
+            input_len = messages.len(),
+            output_len = repaired.len(),
+            "repaired tool_use/tool_result pairing for Anthropic request"
+        );
+    }
+    repaired
+}
+
 fn flush_tool_buffer(out: &mut Vec<Value>, buffer: &mut Vec<Value>) {
     if buffer.is_empty() {
         return;
@@ -1371,6 +1533,7 @@ pub(crate) fn build_provider_request_body(
             let is_anthropic = provider_uses_anthropic_messages(provider);
             if is_anthropic {
                 let (system, anthropic_messages) = build_anthropic_system_and_messages(messages);
+                let anthropic_messages = repair_anthropic_tool_pairing(&anthropic_messages);
                 let mut body = json!({
                     "model": model_name,
                     "messages": anthropic_messages,
@@ -5918,6 +6081,160 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn repair_anthropic_tool_pairing_strips_orphaned_leading_tool_results() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "resume"},
+                {"type": "text", "text": " context"},
+                {"type": "tool_result", "tool_use_id": "ghost", "content": "stale output"},
+            ],
+        })];
+
+        let repaired = repair_anthropic_tool_pairing(&messages);
+        assert_eq!(repaired.len(), 1, "{repaired:#?}");
+        let blocks = repaired[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "{blocks:#?}");
+        assert!(blocks.iter().all(|b| !is_anthropic_tool_result_block(b)));
+        assert_eq!(blocks[0]["text"], "resume");
+        assert_eq!(blocks[1]["text"], " context");
+    }
+
+    #[test]
+    fn repair_anthropic_tool_pairing_synthesizes_missing_results_into_next_user_message() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "call_a",
+                    "name": "glob",
+                    "input": {"pattern": "**/*.rs"},
+                }],
+            }),
+            json!({
+                "role": "user",
+                "content": [{"type": "text", "text": "continue"}],
+            }),
+        ];
+
+        let repaired = repair_anthropic_tool_pairing(&messages);
+        assert_eq!(repaired.len(), 2, "{repaired:#?}");
+        let blocks = repaired[1]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "call_a");
+        assert_eq!(
+            blocks[0]["content"].as_str(),
+            Some(SYNTHETIC_TOOL_INTERRUPTED_CONTENT)
+        );
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "continue");
+    }
+
+    #[test]
+    fn build_provider_request_body_anthropic_drops_orphaned_tool_result_history() {
+        let messages = vec![
+            json!({"role": "tool", "tool_call_id": "ghost", "content": "stale output"}),
+            json!({"role": "user", "content": "continue"}),
+        ];
+
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "claude-test",
+            "anthropic",
+            None,
+            None,
+            true,
+            &ThinkingConfig::Off,
+        );
+
+        let wire_messages = body["messages"].as_array().unwrap();
+        assert_eq!(wire_messages.len(), 1, "{wire_messages:#?}");
+        assert_eq!(wire_messages[0]["role"], "user");
+        let blocks = wire_messages[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "{blocks:#?}");
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "continue");
+    }
+
+    #[test]
+    fn build_provider_request_body_anthropic_strips_mixed_user_orphan_without_losing_cache_control()
+    {
+        // Minimal shape from the real 400: `messages[0].content[2]` is an
+        // orphaned tool_result inside an otherwise normal user content array.
+        // We intentionally keep only the trigger shape — not a full session log.
+        let messages = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "resume", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": " context"},
+                {"type": "tool_result", "tool_use_id": "ghost", "content": "stale output"},
+            ],
+        })];
+
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "claude-test",
+            "anthropic",
+            None,
+            None,
+            true,
+            &ThinkingConfig::Off,
+        );
+
+        let wire_messages = body["messages"].as_array().unwrap();
+        assert_eq!(wire_messages.len(), 1, "{wire_messages:#?}");
+        let blocks = wire_messages[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "{blocks:#?}");
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "resume");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], " context");
+        assert!(
+            blocks
+                .iter()
+                .all(|block| block.get("type").and_then(Value::as_str) != Some("tool_result")),
+            "orphaned tool_result must be removed without touching text cache markers: {blocks:#?}"
+        );
+    }
+
+    #[test]
+    fn repair_anthropic_tool_pairing_is_noop_for_valid_cached_tool_result() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "call_a",
+                    "name": "glob",
+                    "input": {"pattern": "**/*.rs"},
+                }],
+            }),
+            json!({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_a",
+                        "content": "ok",
+                        "cache_control": {"type": "ephemeral"}
+                    },
+                    {"type": "text", "text": "continue"},
+                ],
+            }),
+        ];
+
+        let repaired = repair_anthropic_tool_pairing(&messages);
+        assert_eq!(
+            repaired, messages,
+            "valid cached tool_result must survive unchanged"
+        );
     }
 
     #[test]
