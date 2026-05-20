@@ -431,19 +431,28 @@ fn maybe_emit_turn_budget_self_pacing_hint(state: &mut AgenticLoopState) {
     let pct_remaining = remaining * 100 / max;
 
     // 20 % crossing: hard nudge. 50 % crossing: soft nudge.
+    // 90 %-remaining (≤10 % consumed) crossing: gentle early heads-up.
     // Emit the highest-priority (lowest %) threshold that newly
-    // triggered, not both.
+    // triggered, not multiple.
     if pct_remaining <= 20 && !state.turn_budget_hint_emitted_20 {
         state.turn_budget_hint_emitted_20 = true;
         state.turn_budget_hint_emitted_50 = true; // hoist so we don't re-emit 50 later
+        state.turn_budget_hint_emitted_90 = true;
         let msg = format!(
             "[turn-budget] {remaining}/{max} turns remaining (≤20%). Wrap up now: write your final answer or last tool call. Further discovery will be cut off."
         );
         state.push_volatile(super::agentic_loop_host::VolatileKind::BudgetAdvisory, msg);
     } else if pct_remaining <= 50 && !state.turn_budget_hint_emitted_50 {
         state.turn_budget_hint_emitted_50 = true;
+        state.turn_budget_hint_emitted_90 = true;
         let msg = format!(
             "[turn-budget] {remaining}/{max} turns remaining (≤50%). Start converging: prioritise the deliverable over exploration."
+        );
+        state.push_volatile(super::agentic_loop_host::VolatileKind::BudgetAdvisory, msg);
+    } else if pct_remaining <= 90 && !state.turn_budget_hint_emitted_90 {
+        state.turn_budget_hint_emitted_90 = true;
+        let msg = format!(
+            "[turn-budget] {remaining}/{max} turns remaining (~10% consumed). On track — continue, but if the task looks larger than this budget, consider creating a plan to split it into subtasks."
         );
         state.push_volatile(super::agentic_loop_host::VolatileKind::BudgetAdvisory, msg);
     }
@@ -634,6 +643,7 @@ fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<String> {
     // crash off the new cliff with no warning.
     state.turn_budget_hint_emitted_50 = false;
     state.turn_budget_hint_emitted_20 = false;
+    state.turn_budget_hint_emitted_90 = false;
     let review_message = format!(
         "[Budget review] Recent progress looks real for this {}task, so continuing with {} extra turn(s). Hard limit: {} total turns.",
         if state.task_profile.exploratory_task {

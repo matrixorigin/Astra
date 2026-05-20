@@ -3459,6 +3459,7 @@ impl AgenticRunLifecycleService {
             has_any_usage: false,
             max_turns,
             remaining_turns: max_turns,
+            turn_budget_hint_emitted_90: false,
             turn_budget_hint_emitted_50: false,
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget,
@@ -5707,6 +5708,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
+            turn_budget_hint_emitted_90: false,
             turn_budget_hint_emitted_50: false,
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget:

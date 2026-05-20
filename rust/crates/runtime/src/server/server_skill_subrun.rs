@@ -12,18 +12,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use tokio::sync::Mutex as TokioMutex;
 
 use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;
 
+use crate::turn::agentic_loop_host::{
+    run_agentic_loop_with_host, AgenticLoopHost as _, AgenticLoopState, CancellationState,
+    RequestConstraints, SkillState, StopHookState, TurnInteractionPolicy,
+};
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
-use crate::turn::agentic_loop_host::{
-    AgenticLoopHost as _, AgenticLoopState, CancellationState, RequestConstraints, SkillState,
-    StopHookState, TurnInteractionPolicy, run_agentic_loop_with_host,
-};
 use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
@@ -375,6 +375,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             has_any_usage: false,
             max_turns: SUBRUN_MAX_TURNS,
             remaining_turns: SUBRUN_MAX_TURNS,
+            turn_budget_hint_emitted_90: false,
             turn_budget_hint_emitted_50: false,
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget: task_profile.agentic_turn_budget,

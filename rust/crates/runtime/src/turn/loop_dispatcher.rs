@@ -61,7 +61,7 @@
 use std::collections::HashSet;
 
 use super::agentic_loop_host::{
-    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, run_agentic_loop_with_host,
+    run_agentic_loop_with_host, AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState,
 };
 
 // ─── Wait reason ─────────────────────────────────────────────────────────────
@@ -196,8 +196,8 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use std::collections::HashMap;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
     // ── Test host ────────────────────────────────────────────────────────────
@@ -285,6 +285,7 @@ mod tests {
             has_any_usage: false,
             max_turns: 3,
             remaining_turns: 3,
+            turn_budget_hint_emitted_90: false,
             turn_budget_hint_emitted_50: false,
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,

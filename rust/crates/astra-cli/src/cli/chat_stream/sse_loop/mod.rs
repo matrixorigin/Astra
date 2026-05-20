@@ -634,6 +634,7 @@ pub(crate) async fn stream_chat_sse(
         has_any_usage: false,
         max_turns,
         remaining_turns: max_turns,
+        turn_budget_hint_emitted_90: false,
         turn_budget_hint_emitted_50: false,
         turn_budget_hint_emitted_20: false,
         agentic_turn_budget: task_profile.agentic_turn_budget,
