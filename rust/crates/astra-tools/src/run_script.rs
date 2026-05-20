@@ -52,8 +52,8 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -62,10 +62,10 @@ use tokio::io::{AsyncReadExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 
-use crate::ToolExecutor;
 use crate::rpc_bridge::{
-    AuthToken, RpcOutcome, RpcPolicy, STDOUT_HEAD_RATIO, handle_rpc_connection, kill_process_group,
+    handle_rpc_connection, kill_process_group, AuthToken, RpcOutcome, RpcPolicy, STDOUT_HEAD_RATIO,
 };
+use crate::ToolExecutor;
 
 // Re-export only what external callers need. The char-boundary helpers are
 // implementation details of `truncate_head_tail`; keep them crate-private.
@@ -638,6 +638,8 @@ pub fn build_run_script_schema(
          need to filter/reduce large outputs before they enter context, \
          need conditional branching, or need to loop.\n\n\
          {available_block}\n\n\
+         Tool calls are async: `result = await tool_name(param=value)`. \
+         Each call returns a dict with the tool's output fields.\n\n\
          Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script.\n\n\
          {mode_note}\n\n\
          Also available (built-in, no import needed):\n  \

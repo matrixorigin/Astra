@@ -3,7 +3,7 @@
 //! Each schema is a JSON object following the OpenAI function-calling format:
 //! `{ "type": "function", "function": { "name": ..., "description": ..., "parameters": ... } }`
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// RPC tools exposed inside server-side `run_script`.
 ///
@@ -54,7 +54,7 @@ pub fn all_tool_schemas_with_env<F: Fn(&str) -> Option<String>>(env: F) -> Vec<V
         "type": "function",
         "function": {
             "name": "powershell",
-            "description": "Execute a PowerShell command. Use for Windows shell tasks, pwsh scripts, and cross-platform automation when PowerShell syntax is preferred over bash.",
+            "description": "Execute a PowerShell command. Use for Windows shell tasks, pwsh scripts, and cross-platform automation when PowerShell syntax is preferred over bash. PREFER dedicated tools (git, glob, grep, read_file, write_file, str_replace) over shell commands when they cover the operation.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -119,7 +119,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Execute a shell command in the project root. Use for builds, tests, installs, and CLI tasks; prefer dedicated read/search/edit/git tools when possible.",
+                "description": "Execute a shell command in the project root. PREFER dedicated tools: git for VCS, glob for file search, grep for content search, read_file for file reading, write_file/str_replace for edits. Use bash only for bespoke scripting, chain pipelines, builds/tests/installs, or actions with no dedicated tool. Shell commands bypass safety validations (no path-traversal or shell-meta guards) — prefer dedicated tools whenever they cover the operation. Identical commands are cached per session; use `force: true` to bypass the cache.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -152,7 +152,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create, overwrite, or delete a file. For writes, provide `path` and `content`. For deletes, set `delete=true` and omit `content`. Retry `write_file` with corrected args; do not switch to bash or python just to write a file.",
+                "description": "Create, overwrite, or delete a file. For writes, provide `path` and `content`. WARNING: overwrites existing files silently — read first if you need to preserve content. For deletes, set `delete=true` and omit `content`. Retry `write_file` with corrected args; do not switch to bash or python just to write a file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -172,7 +172,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "str_replace",
-                "description": "Replace text in a file. Supports single replacement or batched `edits`.",
+                "description": "Replace text in a file. Supports single replacement or batched `edits`. WARNING: old_str must match exactly (including whitespace); if it matches multiple locations the edit is rejected — add surrounding context lines to disambiguate. Use replace_all=true to replace all matching occurrences.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -203,7 +203,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "list_dir",
-                "description": "List directory contents. Use to explore project structure or find files.",
+                "description": "List directory contents. Use to explore project structure or find files. For pattern-based file search (e.g. '**/*.rs'), use glob instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -238,7 +238,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "glob",
-                "description": "Find files matching a glob pattern. Supports pagination via offset/head_limit.",
+                "description": "Find files matching a glob pattern. Supports pagination via offset/head_limit and sorting by mtime or path. Use for pattern-based file search (e.g. '**/*.rs', 'src/**/test_*'); use list_dir for interactive directory exploration instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -256,7 +256,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "symbols",
-                "description": "Extract code symbols (functions, classes, structs, methods) from a file using AST parsing (tree-sitter). Supports Rust, Python, TypeScript/JavaScript, Go, Java, C/C++, Ruby. Returns structured symbol info with signatures, line numbers, and nesting. Use for: understanding file structure, finding specific symbols by name, generating documentation outlines.",
+                "description": "Extract code symbols (functions, classes, structs, methods) from a file using AST parsing (tree-sitter). Supports Rust, Python, TypeScript/JavaScript, Go, Java, C/C++, Ruby. Returns structured symbol info with signatures, line numbers, and nesting. Set calls=true to show function calls within each symbol body (understand code flow without reading full source). Use kinds[] to filter by symbol type (fn, method, class, struct, trait, etc.), and pattern for regex name filtering. Use for: understanding file structure, finding specific symbols, generating documentation outlines.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -321,7 +321,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "lsp",
-                "description": "Language Server Protocol operations. Set dry_run=false to apply writes (rename, format, code_action).",
+                "description": "Language Server Protocol operations. Set dry_run=false to apply writes (rename, format, code_action). WARNING: dry_run=false is a third write path alongside write_file and str_replace — it modifies files in-place via the LSP. Default true (preview-only).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -359,7 +359,17 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "git",
-                "description": "Git operations. Actions: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree.",
+                "description": "Git operations. Actions: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree.\n\n\
+         ## Diff modes\n\
+         - **Default (no flags)**: worktree vs index — shows UNSTAGED changes only (like `git diff`)\n\
+         - **staged=true**: index vs HEAD — shows `git add`ed changes (like `git diff --staged`)\n\
+         - **ref=<commit/branch/tag>**: compares that ref vs worktree\n\
+         - **ref + base_ref**: range diff base_ref..ref\n\n\
+         ## Limits\n\
+         - diff output capped at 40 KB; show output at 16 KB\n\
+         - log / file_history `n` max: 500 (auto-throttled); log_search `n` default 200\n\
+         - commit references and file paths are validated for safety (no shell metacharacters, no path traversal)\n\
+         Use `staged=true` to review changes you have already `git add`ed — the default diff only shows unstaged modifications.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -394,7 +404,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "n": {
                             "type": "integer",
-                            "description": "Max entries to return. Used by: log (default 10, max 100), file_history (default 10), log_search (default 200)."
+                            "description": "Max entries to return. Used by: log (default 10, max 500 auto-throttled), file_history (default 10), log_search (default 200)."
                         },
                         "query": {
                             "type": "string",
@@ -446,7 +456,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "github",
-                "description": "GitHub operations. Per-action required fields: get_pr/ci_status→pr_number, get_issue→issue_number, create_issue→title. `repo` (owner/name or bare name) is inferred from git remote when omitted.",
+                "description": "GitHub operations. Per-action required fields: get_pr/ci_status→pr_number, get_issue→issue_number, create_issue→title. `repo` (owner/name or bare name) defaults to the first preferred repo or is inferred from git remote; pass explicitly when querying cross-repo or a repo not in the preferred list.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -471,7 +481,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory",
-                "description": "Memory operations: `remember` (store), `recall` (search), `expand` (open by id), `forget` (soft-delete), `update` (correct), `focus` (temporary recall boost), `reflect` (synthesize patterns), `profile` (user profile), `feedback` (mark quality). `visibility=\"team\"` shares within a team; `agent_type` scopes by persona.",
+                "description": "Memory ops: `remember`(store)/`recall`(search)/`expand`(by id)/`forget`(soft-delete)/`update`(correct); `reflect`(synthesize)/`feedback`(mark quality); `profile`(prefs); `focus`(temp boost). Required: remember→content,recall→query,expand→memory_id,forget/update→reason,feedback→memory_id+signal. `visibility=\"team\"` shares; `agent_type` scopes persona.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -556,7 +566,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session lifecycle and introspection. Actions: config, prioritize, deprioritize, set_goal, compact, rollback_edits, sleep, timeline, summary, history_page, history_search, history_around. Use the first-class `ask_user` tool for user questions. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools — they're not session sub-actions any more. Use the history_* actions when the user refers to older turns in this same chat and the visible context is insufficient.",
+                "description": "Session lifecycle and introspection. Actions grouped by category:\n  Config: `config`(set key=value), `prioritize`/`deprioritize`(tool priority).\n  Lifecycle: `set_goal`, `compact`(compress context), `rollback_edits`(revert file changes to previous turn), `sleep`(pause, max 300s).\n  History: `timeline`, `summary`, `history_page`, `history_search`, `history_around` — use when the user refers to older turns and visible context is insufficient.\nFor plan mode use the dedicated `enter_plan_mode`/`exit_plan_mode` tools — they are not session sub-actions. Use `ask_user` for user questions.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -594,7 +604,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "mo",
-                "description": "MatrixOne database operations. Actions: query, snapshot, branch.",
+                "description": "MatrixOne database operations. Actions: query (run SQL), snapshot (create named snapshot), branch (create named branch).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -630,7 +640,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
          ## Parallel sub-agent fan-out\n\
          To run N sub-agents in parallel (e.g. multi-angle code review), emit N `agent` tool calls **in a single assistant message**, each with `action='spawn'` and `run_in_background: true`. They run concurrently. After all are spawned, capture each spawn result's returned `agent_id`, then call `agent(action='get_result', agent_id=...)` with that exact value for each one — `get_result` blocks until that child finishes. Do not substitute `name` or invent ids. This is the ONLY way to fan out parallel agents; do not use `action='delegate'` (removed: it had no execution backend).\n\
          For plan lifecycle, call `enter_plan_mode` / `exit_plan_mode` directly. Do NOT wrap them inside `agent(action='run_chain', ...)`.\n\
-         Do NOT pass an `agents:[...]` payload, do NOT pass a top-level `task` field, and do NOT wrap spawn arguments under a `spawn` field. Each child must be its own `agent(...)` tool call.",
+         Do NOT pass an `agents:[...]` payload, do NOT pass a top-level `task` field, and do NOT wrap spawn arguments under a `spawn` field. Each child must be its own `agent(...)` tool call.
+
+         ## agent vs agent_job vs task
+         - `agent(spawn)` + `agent(get_result)`: synchronous or background sub-agents you plan to collect results from. Supports fan-out coalescing.
+         - `agent_job(action='agent', ...)`: fire-and-forget long-running sub-agents that survive session restarts. Simpler API, no get_result needed (use output/kill).
+         - `agent_job(action='shell', ...)`: background shell processes (builds, test suites, servers).
+         - `task`: session checklist / progress tracking — NOT an executor. Tasks track work; agent_job runs it.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -667,7 +683,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "introspect",
-                "description": "Query runtime state. Subtopics: `session` (default: token pressure, cache hit rate, tool health, alerts, working memory, and plan/task/session lifecycle context including restore/resume state and last lifecycle event when available), `cache` (cache-regression diagnosis), `recent` (recent LLM-round summaries), `volatile` (runtime nudges / working-set / coaching queued for next turn), `stall` (loop-guard state), `all` (session + recent + volatile + stall).",
+                "description": "Query runtime state. Subtopics: `session` (default: token pressure, cache hit rate, tool health, alerts, working memory, plan/task/session lifecycle context including restore/resume state and last lifecycle event when available), `cache` (cache-regression diagnosis), `recent` (recent LLM-round summaries), `volatile` (runtime nudges/coaching queued for next turn), `stall` (loop-guard state), `all` (session + recent + volatile + stall). Use `detail: full` for deep diagnosis (stall forensics, context pressure, performance); use `detail: summary` (default) for quick health checks.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -708,7 +724,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "notify",
-                "description": "Send a notification to the user. Use for proactive updates (background task done, blocker found, unsolicited insight). Gateways route based on notification_type: 'normal' = in-chat reply, 'proactive' = push notification. CLI mode: both render as text.",
+                "description": "Send a notification to the user. Use for proactive updates (background task done, blocker found, unsolicited insight). Gateways route based on notification_type: 'normal' = in-chat reply, 'proactive' = push notification. CLI mode: both render as text. Example: notify(message='Build completed successfully', notification_type='proactive').",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1016,10 +1032,15 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "name": "exit_plan_mode",
                 "description": "Present the plan for user approval and exit plan mode. The `plan` argument is a markdown string (numbered list, nested bullets ok) that the user reads and either approves or rejects. On approval, write tools unlock and the items seed `session_plan_todos`. On rejection (`approved=false`), the plan stays open for another authoring pass.\n\
         \n\
+        ## Plan structure (what makes a good plan)\n\
+        - Numbered list of concrete, executable leaf steps — each step maps to ONE artifact, API surface, or validation target.\n\
+        - Each step includes: what files to touch, what to change, and the acceptance criteria.\n\
+        - Avoid umbrella phases like \"build the system\" — split into scaffold → implement → test → verify.\n\
+        - Prefer 3-7 steps for most work; >10 steps signals over-decomposition.\n\
+        \n\
         ## Important\n\
         - Do NOT call this tool to ask 'is the plan ready?' — that's exactly what THIS tool does. It inherently requests approval.\n\
         - Pass the FULL plan as a single markdown string in `plan`. The user sees this verbatim.\n\
-        - Prefer executable leaf steps over umbrella phases so approval seeds actionable tasks instead of one coarse catch-all item.\n\
         - Only call this when the plan is concrete and unambiguous. If you have unresolved decisions, use `ask_user` first.",
                 "parameters": {
                     "type": "object",
