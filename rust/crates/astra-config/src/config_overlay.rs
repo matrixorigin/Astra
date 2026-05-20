@@ -23,7 +23,7 @@
 //!    that's regression-guarded by `every_catalog_item_is_editable_via_apply_edit`.
 
 use crate::runtime_config::RuntimeConfig;
-use astra_core::runtime_limits::{RuntimeLimits, context_window_for_model};
+use astra_core::runtime_limits::{context_window_for_model, RuntimeLimits};
 use serde_json::Value;
 use std::path::Path;
 
@@ -109,7 +109,11 @@ pub fn effective_budget_for_model(config: &RuntimeConfig, model: Option<&str>) -
         // Keep the local-limit fallback consistent with RuntimeLimits:
         // env can override the configured value, so consult it too.
         let env_limit = RuntimeLimits::global().max_turn_input_tokens;
-        if env_limit > 0 { env_limit } else { configured }
+        if env_limit > 0 {
+            env_limit
+        } else {
+            configured
+        }
     }
 }
 
@@ -301,6 +305,27 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
             kind: SettingKind::Bool,
             value: Value::from(config.telemetry.persist_to_journal),
         },
+        // ── Runtime limits (per-turn agentic budget) ──
+        SettingItem {
+            id: "runtime_limits.max_turns".to_string(),
+            label: "Max tool calls per user message (0 = inherit env / built-in 150)".to_string(),
+            kind: SettingKind::Number {
+                min: 0.0,
+                max: 2000.0,
+                allow_fraction: false,
+            },
+            value: Value::from(config.runtime_limits.max_turns),
+        },
+        SettingItem {
+            id: "runtime_limits.plan_subtask_max_turns".to_string(),
+            label: "Max tool calls per plan subtask (0 = fall back to max_turns)".to_string(),
+            kind: SettingKind::Number {
+                min: 0.0,
+                max: 2000.0,
+                allow_fraction: false,
+            },
+            value: Value::from(config.runtime_limits.plan_subtask_max_turns),
+        },
     ]
 }
 
@@ -466,6 +491,16 @@ pub fn apply_edit(
         }
         "telemetry.persist_to_journal" => {
             config.telemetry.persist_to_journal = as_bool(&new_value, id)?;
+        }
+        "runtime_limits.max_turns" => {
+            let n = as_u32(&new_value, id)?;
+            ensure_range(n as f64, 0.0, 2000.0, id)?;
+            config.runtime_limits.max_turns = n;
+        }
+        "runtime_limits.plan_subtask_max_turns" => {
+            let n = as_u32(&new_value, id)?;
+            ensure_range(n as f64, 0.0, 2000.0, id)?;
+            config.runtime_limits.plan_subtask_max_turns = n;
         }
         unknown => return Err(OverlayError::UnknownPath(unknown.to_string())),
     }

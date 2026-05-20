@@ -812,7 +812,7 @@ pub(crate) enum BugSubcommand {
 #[derive(Subcommand, Debug)]
 #[command(
     after_help = "Examples:\n  astra session list\n  astra session show 550e8400-e29b-41d4-a716-446655440000\n  astra session capture latest\n  astra session capture download --output llm_capture.json"
-)]]
+)]
 pub(crate) enum SessionCmd {
     /// List sessions
     List(SessionListArgs),

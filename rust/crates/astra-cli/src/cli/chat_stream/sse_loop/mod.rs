@@ -444,10 +444,24 @@ pub(crate) async fn stream_chat_sse(
         TurnGuard::with_health_and_profile(health, task_profile)
     };
 
-    let max_turns = if p.is_plan_subtask {
-        RuntimeLimits::global().effective_plan_subtask_turns()
-    } else {
-        RuntimeLimits::global().max_turns
+    let max_turns = {
+        let cfg = astra_config::RuntimeConfig::cached();
+        let env_limits = RuntimeLimits::global();
+        if p.is_plan_subtask {
+            // Config wins when set; else fall back to env-driven helper
+            // (which itself falls back to max_turns when its plan field is 0).
+            if cfg.runtime_limits.plan_subtask_max_turns > 0 {
+                cfg.runtime_limits.plan_subtask_max_turns as usize
+            } else if cfg.runtime_limits.max_turns > 0 {
+                cfg.runtime_limits.max_turns as usize
+            } else {
+                env_limits.effective_plan_subtask_turns()
+            }
+        } else if cfg.runtime_limits.max_turns > 0 {
+            cfg.runtime_limits.max_turns as usize
+        } else {
+            env_limits.max_turns
+        }
     };
     let step_recorder = if let Some(session_id) = current_session_id.as_deref() {
         StepRecorder::with_persistence(

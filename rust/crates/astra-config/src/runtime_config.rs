@@ -81,6 +81,45 @@ pub struct RuntimeConfig {
     /// system-reminder listing. See [`ToolSurfaceConfig`].
     #[serde(default)]
     pub tool_surface: ToolSurfaceConfig,
+
+    /// Per-turn agentic-loop budget (max tool calls per user message).
+    ///
+    /// Mirrors the env-driven [`astra_core::RuntimeLimits`] knobs but
+    /// lives in `runtime.toml` so operators can edit them via the
+    /// `/config` panel without exporting environment variables.
+    /// `RuntimeLimits` env values still apply when this section is left
+    /// at defaults (the CLI prefers config values > 0 over env).
+    #[serde(default)]
+    pub runtime_limits: RuntimeLimitsConfig,
+}
+
+// ─── Runtime Limits Configuration ────────────────────────────────────────────
+
+/// Per-turn agentic-loop budget knobs editable via `/config`.
+///
+/// Defaults of 0 mean "fall through to [`astra_core::RuntimeLimits`]"
+/// (which itself defaults to 150/0). Setting a positive value here
+/// overrides the env-driven default for the CLI without requiring a
+/// process restart with new `ASTRA_*` exports.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeLimitsConfig {
+    /// Max tool calls per user message (regular chat turn).
+    /// 0 = inherit from `RuntimeLimits::max_turns` (env / built-in 150).
+    #[serde(default)]
+    pub max_turns: u32,
+
+    /// Max tool calls per plan subtask. 0 = fall back to `max_turns`.
+    #[serde(default)]
+    pub plan_subtask_max_turns: u32,
+}
+
+impl Default for RuntimeLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_turns: 0,
+            plan_subtask_max_turns: 0,
+        }
+    }
 }
 
 // ─── Fork-Prefix Configuration ───────────────────────────────────────────────
@@ -240,6 +279,7 @@ impl Default for RuntimeConfig {
             safety: SafetyConfig::default(),
             fork_prefix: ForkPrefixConfig::default(),
             tool_surface: ToolSurfaceConfig::default(),
+            runtime_limits: RuntimeLimitsConfig::default(),
         }
     }
 }
@@ -1505,6 +1545,7 @@ impl RuntimeConfig {
             safety,
             fork_prefix,
             tool_surface,
+            runtime_limits,
         } = other;
 
         merge_if_non_default(&mut self.version, version, default_config_version());
@@ -1977,6 +2018,17 @@ impl RuntimeConfig {
             self.tool_surface = tool_surface;
         }
 
+        let RuntimeLimitsConfig {
+            max_turns,
+            plan_subtask_max_turns,
+        } = runtime_limits;
+        merge_if_non_default(&mut self.runtime_limits.max_turns, max_turns, 0);
+        merge_if_non_default(
+            &mut self.runtime_limits.plan_subtask_max_turns,
+            plan_subtask_max_turns,
+            0,
+        );
+
         self
     }
 
@@ -2268,6 +2320,10 @@ mod tests {
             safety: SafetyConfig::default(),
             fork_prefix: ForkPrefixConfig::default(),
             tool_surface: ToolSurfaceConfig::default(),
+            runtime_limits: RuntimeLimitsConfig {
+                max_turns: 250,
+                plan_subtask_max_turns: 175,
+            },
         });
 
         assert_eq!(merged.version, "2.0");
