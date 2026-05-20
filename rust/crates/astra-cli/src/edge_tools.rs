@@ -1244,6 +1244,7 @@ impl ToolExecutor {
         plan.get("status")
             // Older server payloads used `phase`; keep accepting that shape so
             // newer CLIs can talk to pre-migration servers during rolling upgrades.
+            // TODO(#plans): remove this fallback once all servers ship `status` field (≥v2.1).
             .or_else(|| plan.get("phase"))
             .and_then(Value::as_str)
     }

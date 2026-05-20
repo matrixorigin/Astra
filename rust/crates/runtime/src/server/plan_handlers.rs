@@ -286,6 +286,8 @@ pub(super) struct PlanStatusResponse {
 #[derive(Serialize)]
 pub(super) struct PlanListResponse {
     pub plans: Vec<PlanSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -591,7 +593,7 @@ pub(super) async fn list_plans_handler(
             .await
             .map_err(map_plan_load_err)?
         else {
-            return Ok(Json(PlanListResponse { plans: Vec::new() }));
+            return Ok(Json(PlanListResponse { plans: Vec::new(), warning: None }));
         };
         let plan_state = match state
             .plan_repo
@@ -600,7 +602,7 @@ pub(super) async fn list_plans_handler(
         {
             Ok(state) => state,
             Err(PlanLoadError::NotFound(_)) => {
-                return Ok(Json(PlanListResponse { plans: Vec::new() }));
+                return Ok(Json(PlanListResponse { plans: Vec::new(), warning: None }));
             }
             Err(err) => return Err(map_plan_load_err(err)),
         };
@@ -608,10 +610,17 @@ pub(super) async fn list_plans_handler(
         if let Some(phase) = q.phase.as_deref()
             && summary.status != phase
         {
-            return Ok(Json(PlanListResponse { plans: Vec::new() }));
+            return Ok(Json(PlanListResponse {
+                plans: Vec::new(),
+                warning: Some(format!(
+                    "active plan is in \"{}\" phase, not \"{phase}\"",
+                    summary.status,
+                )),
+            }));
         }
         return Ok(Json(PlanListResponse {
             plans: vec![summary],
+            warning: None,
         }));
     }
 
@@ -635,7 +644,7 @@ pub(super) async fn list_plans_handler(
         })
         .collect();
 
-    Ok(Json(PlanListResponse { plans }))
+    Ok(Json(PlanListResponse { plans, warning: None }))
 }
 
 /// `GET /plans/{plan_id}` — get plan details.
@@ -1713,5 +1722,21 @@ mod tests {
         assert_eq!(plan.subtasks[0].status, TaskStatus::Completed);
         assert_eq!(plan.subtasks[1].status, TaskStatus::Pending);
         assert_eq!(plan.subtasks[2].status, TaskStatus::Pending);
+    }
+
+    /// active_session_only + phase filter：当 active plan 的 phase 不匹配时，
+    /// 返回空列表 + warning 提示调用方是 phase 不匹配而非没有 active plan。
+    #[test]
+    fn active_session_only_phase_filter_returns_warning_when_mismatch() {
+        let empty_but_warn = PlanListResponse {
+            plans: vec![],
+            warning: Some("active plan is in \"refining\" phase, not \"planning\"".into()),
+        };
+        assert_eq!(empty_but_warn.plans.len(), 0);
+        assert!(empty_but_warn.warning.is_some());
+        assert!(empty_but_warn
+            .warning
+            .unwrap()
+            .contains("active plan is in"));
     }
 }

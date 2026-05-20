@@ -235,8 +235,7 @@ fn show_config() {
     );
     println!(
         "{}",
-        "    Global default for full request/response capture; /session trace still overrides per session."
-            .dim()
+        "    Global default for full request/response capture.".dim()
     );
     println!(
         "  capture_explanations: {}",
@@ -664,7 +663,7 @@ fn print_help() {
 /// Esc from inquire is surfaced as a graceful cancel.
 fn run_config_edit() {
     use astra_config::config_overlay::{
-        SettingItem, apply_edit, build_settings_catalog, filter_settings,
+        apply_edit, build_settings_catalog, filter_settings, SettingItem,
     };
 
     let config = RuntimeConfig::load();

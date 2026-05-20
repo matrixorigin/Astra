@@ -451,8 +451,9 @@ fn maybe_emit_turn_budget_self_pacing_hint(state: &mut AgenticLoopState) {
         state.push_volatile(super::agentic_loop_host::VolatileKind::BudgetAdvisory, msg);
     } else if pct_remaining <= 90 && !state.turn_budget_hint_emitted_90 {
         state.turn_budget_hint_emitted_90 = true;
+        let pct_consumed = 100 - pct_remaining;
         let msg = format!(
-            "[turn-budget] {remaining}/{max} turns remaining (~10% consumed). On track — continue, but if the task looks larger than this budget, consider creating a plan to split it into subtasks."
+            "[turn-budget] {remaining}/{max} turns remaining (~{pct_consumed}% consumed). On track — continue, but if the task looks larger than this budget, consider creating a plan to split it into subtasks."
         );
         state.push_volatile(super::agentic_loop_host::VolatileKind::BudgetAdvisory, msg);
     }
@@ -1700,6 +1701,47 @@ mod tests {
         assert!(
             prod_code.contains("session_env_overlay::set"),
             "hook env vars must be set via session_env_overlay"
+        );
+    }
+
+    /// 90% hint must compute the consumed percentage dynamically —
+    /// small budgets (e.g. max=4) can skip from 100% to 75% remaining in
+    /// one turn, so hardcoding "~10% consumed" is misleading.
+    #[test]
+    fn budget_hint_90_reports_actual_consumption_not_hardcoded() {
+        let mut state = make_state();
+        state.max_turns = 4;
+        state.remaining_turns = 3;
+        state.turn_budget_hint_emitted_90 = false;
+        state.turn_budget_hint_emitted_50 = false;
+        state.turn_budget_hint_emitted_20 = false;
+        state.volatile_pending.clear();
+
+        maybe_emit_turn_budget_self_pacing_hint(&mut state);
+
+        assert!(
+            state.turn_budget_hint_emitted_90,
+            "90% hint should fire when pct_remaining <= 90%"
+        );
+
+        let msg = state
+            .volatile_pending
+            .iter()
+            .find(|inj| inj.content.contains("[turn-budget]"))
+            .map(|inj| inj.content.as_str())
+            .expect("expected budget hint in volatile_pending");
+
+        assert!(
+            !msg.contains("~10% consumed"),
+            "must not hardcode ~10% consumed — remaining={}, max={}; msg: {msg}",
+            state.remaining_turns,
+            state.max_turns,
+        );
+
+        // 3/4 = 75% remaining → ~25% consumed
+        assert!(
+            msg.contains("~25% consumed") || msg.contains("75% remaining"),
+            "expected actual consumption in message; msg: {msg}",
         );
     }
 }

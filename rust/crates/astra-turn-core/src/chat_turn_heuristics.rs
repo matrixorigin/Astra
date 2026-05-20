@@ -9,7 +9,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::chat_history_openai::openai_user_content_message;
-use crate::interaction_types::{ASK_USER_TOOL_NAME, TurnInteractionPolicy};
+use crate::interaction_types::{TurnInteractionPolicy, ASK_USER_TOOL_NAME};
 
 const DEFAULT_STALL_WINDOW: usize = 3;
 const DEFAULT_EXPLORATION_ROUND_BUDGET: usize = 5;
@@ -626,6 +626,53 @@ pub fn extract_repos_from_memory(text: &str) -> Vec<String> {
     repos
 }
 
+// ── Shared low-information continuation detection ──────────────────────────
+//
+/// Trim trailing punctuation, ellipsis markers, and Chinese tone particles
+/// from a user message.  Used by both the CLI continuation short-circuit and
+/// the server adaptive-tuning routing path.
+pub fn trim_trailing_punctuation(s: &str) -> &str {
+    s.trim().trim_end_matches(|ch: char| {
+        matches!(
+            ch,
+            '?' | '？'
+                | '!'
+                | '！'
+                | '.'
+                | '。'
+                | ','
+                | '，'
+                | '啊'
+                | '呀'
+                | '呢'
+                | '吧'
+                | '嘛'
+                | '啦'
+        )
+    })
+}
+
+/// Check whether the (already trimmed) text starts with a Chinese
+/// low-information continuation prefix such as "继续", "还有呢", etc.
+///
+/// This list is the single source of truth for both CLI and server
+/// continuation heuristics.
+pub fn starts_with_chinese_continuation_prefix(trimmed: &str) -> bool {
+    [
+        "继续",
+        "接着",
+        "补下",
+        "补一下",
+        "还有什么",
+        "还有呢",
+        "然后呢",
+        "下一步",
+        "接下来",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,5 +1054,44 @@ mod tests {
         let repos = extract_repos_from_memory(text);
         assert!(repos.iter().any(|r| r == "my-org/my-project"));
         assert!(repos.iter().any(|r| r == "some-user/cool-lib"));
+    }
+
+    // ── trim_trailing_punctuation ────────────────────────────────────────
+
+    #[test]
+    fn trim_trailing_punctuation_removes_chinese_tone_particles() {
+        assert_eq!(trim_trailing_punctuation("继续吧"), "继续");
+        assert_eq!(trim_trailing_punctuation("好的呢"), "好的");
+        assert_eq!(trim_trailing_punctuation("行啊"), "行");
+    }
+
+    #[test]
+    fn trim_trailing_punctuation_removes_trailing_punctuation() {
+        assert_eq!(trim_trailing_punctuation("继续？"), "继续");
+        assert_eq!(trim_trailing_punctuation("继续！"), "继续");
+        assert_eq!(trim_trailing_punctuation("go."), "go");
+    }
+
+    #[test]
+    fn trim_trailing_punctuation_preserves_non_trailing() {
+        assert_eq!(trim_trailing_punctuation("继续啊呀"), "继续");
+        assert_eq!(trim_trailing_punctuation("next step"), "next step");
+    }
+
+    // ── starts_with_chinese_continuation_prefix ───────────────────────────
+
+    #[test]
+    fn chinese_continuation_prefix_positive() {
+        assert!(starts_with_chinese_continuation_prefix("继续改代码"));
+        assert!(starts_with_chinese_continuation_prefix("还有呢？"));
+        assert!(starts_with_chinese_continuation_prefix("下一步"));
+        assert!(starts_with_chinese_continuation_prefix("接下来做什么"));
+    }
+
+    #[test]
+    fn chinese_continuation_prefix_negative() {
+        assert!(!starts_with_chinese_continuation_prefix("补充说明架构"));
+        assert!(!starts_with_chinese_continuation_prefix("修复 bug"));
+        assert!(!starts_with_chinese_continuation_prefix("你好"));
     }
 }

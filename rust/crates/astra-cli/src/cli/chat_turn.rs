@@ -4,6 +4,7 @@ use astra_services::session_workspace::ContextTraceSignal;
 #[cfg(test)]
 use astra_services::session_workspace::{ContextTraceBudgetSignal, ContextTraceToolSelection};
 use astra_tools::task_mgmt::SessionTask;
+use astra_text_utils::str_preview::truncate_str;
 
 use super::*;
 
@@ -540,7 +541,8 @@ If the follow-up asks to fix / patch / test / continue, apply that action to thi
 }
 
 pub(super) fn is_short_continuation_prompt(line: &str) -> bool {
-    let trimmed = trim_short_followup_prompt(line);
+    use astra_turn_core::chat_turn_heuristics::{starts_with_chinese_continuation_prefix, trim_trailing_punctuation};
+    let trimmed = trim_trailing_punctuation(line);
     if trimmed.is_empty() || trimmed.chars().count() > 16 {
         return false;
     }
@@ -578,53 +580,7 @@ pub(super) fn is_short_continuation_prompt(line: &str) -> bool {
         return true;
     }
 
-    [
-        "继续",
-        "接着",
-        "补",
-        "补下",
-        "补一下",
-        "还有什么",
-        "还有呢",
-        "然后呢",
-        "下一步",
-        "接下来",
-    ]
-    .iter()
-    .any(|prefix| trimmed.starts_with(prefix))
-}
-
-fn trim_short_followup_prompt(line: &str) -> &str {
-    line.trim().trim_end_matches(|ch: char| {
-        matches!(
-            ch,
-            '?' | '？'
-                | '!'
-                | '！'
-                | '.'
-                | '。'
-                | ','
-                | '，'
-                | '啊'
-                | '呀'
-                | '呢'
-                | '吧'
-                | '嘛'
-                | '啦'
-        )
-    })
-}
-
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for (idx, ch) in text.chars().enumerate() {
-        if idx >= max_chars {
-            out.push('…');
-            break;
-        }
-        out.push(ch);
-    }
-    out
+    starts_with_chinese_continuation_prefix(trimmed)
 }
 
 fn contains_any_token(haystack: &str, tokens: &[&str]) -> bool {
@@ -858,7 +814,7 @@ fn summarize_assistant_for_anchor(full_text: &str) -> Option<String> {
         if lines.len() >= 3 || total_chars >= 420 {
             break;
         }
-        let clipped = truncate_chars(line, 160);
+        let clipped = truncate_str(line, 160);
         total_chars += clipped.chars().count();
         lines.push(clipped);
     }
@@ -894,7 +850,7 @@ fn summarize_anchor_artifacts(result: &StreamResult) -> Vec<String> {
             lines.push(format!(
                 "Artifact: {} → {}",
                 call.name,
-                truncate_chars(preview.trim(), 120)
+                truncate_str(preview.trim(), 120)
             ));
         }
     }
@@ -932,7 +888,7 @@ fn summarize_event_anchor_artifacts(event: Option<&session_journal::JournalEvent
                 lines.push(format!(
                     "Artifact: {} → {}",
                     call.name,
-                    truncate_chars(preview.trim(), 120)
+                    truncate_str(preview.trim(), 120)
                 ));
             }
         }
@@ -965,7 +921,7 @@ fn active_task_anchor_section(active_tasks: &[SessionTask]) -> Option<String> {
             "- [{}] {}: {}{}",
             task.status,
             task.id,
-            truncate_chars(&task.title, 120),
+            truncate_str(&task.title, 120),
             blocked
         ));
     }
@@ -1000,7 +956,7 @@ fn build_continuation_anchor_with_active_tasks(
         return state.continuation_anchor.clone();
     }
 
-    let user_summary = truncate_chars(user_line, 220);
+    let user_summary = truncate_str(user_line, 220);
     let mut sections = vec![format!("Latest user task: {user_summary}")];
     if let Some(task_section) = active_task_anchor_section(active_tasks) {
         sections.push(task_section);
@@ -1045,7 +1001,7 @@ fn rebuild_continuation_anchor_from_state_with_active_tasks(
         return;
     }
 
-    let user_summary = truncate_chars(user_line, 220);
+    let user_summary = truncate_str(user_line, 220);
     let mut sections = vec![format!("Latest user task: {user_summary}")];
     if let Some(task_section) = active_task_anchor_section(active_tasks) {
         sections.push(task_section);
@@ -4206,7 +4162,7 @@ mod tests {
     fn short_continuation_prompt_detects_colloquial_followups() {
         assert!(is_short_continuation_prompt("继续啊"));
         assert!(is_short_continuation_prompt("继续完成所有的啊"));
-        assert!(is_short_continuation_prompt("补啊"));
+        assert!(is_short_continuation_prompt("接着啊"));
         assert!(is_short_continuation_prompt("还有什么？"));
     }
 
