@@ -149,7 +149,10 @@ pub fn build_extraction_prompt(current_memory: &str, recent_messages: &[Value]) 
          - Only update content below each section's comment line.\n\
          - Keep each section under 200 words.\n\
          - Be factual and concise.\n\
-         - Output the complete updated document.";
+         - Output the complete updated document.\n\
+         - Active Goals: only record goals explicitly stated by the user or assistant. Do NOT invent or infer goals.\n\
+         - Pending Todos: list tasks planned but NOT yet completed.\n\
+         - Completed: list tasks finished this session. Cross-check: if an item appears in Completed it MUST NOT appear in Pending Todos.";
     let user = format!(
         "## Current session memory:\n\n{current_memory}\n\n\
          ## Recent conversation:\n\n{recent_text}\n\n\
