@@ -115,6 +115,63 @@ fn looks_like_quick_answer_query(message: &str) -> bool {
     has_question_mark || has_english_interrogative || has_chinese_interrogative
 }
 
+fn looks_like_continuation_query(message: &str) -> bool {
+    let trimmed = message.trim().trim_end_matches(|ch: char| {
+        matches!(
+            ch,
+            '?' | '？'
+                | '!'
+                | '！'
+                | '.'
+                | '。'
+                | ','
+                | '，'
+                | '啊'
+                | '呀'
+                | '呢'
+                | '吧'
+                | '嘛'
+                | '啦'
+        )
+    });
+    if trimmed.is_empty() || trimmed.chars().count() > 32 {
+        return false;
+    }
+
+    let lower = trimmed.to_lowercase();
+    if [
+        "continue",
+        "go on",
+        "go ahead",
+        "resume",
+        "next",
+        "what else",
+        "anything else",
+        "what next",
+        "next step",
+    ]
+    .iter()
+    .any(|phrase| lower == *phrase || lower.starts_with(&format!("{phrase} ")))
+    {
+        return true;
+    }
+
+    [
+        "继续",
+        "接着",
+        "补",
+        "补下",
+        "补一下",
+        "还有什么",
+        "还有呢",
+        "然后呢",
+        "下一步",
+        "接下来",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
+}
+
 fn looks_like_debug_query(message: &str) -> bool {
     let lower = message.to_lowercase();
     [
@@ -136,6 +193,7 @@ fn fallback_scenario_from_routing(
     if !task_profile.mutates_workspace
         && !looks_like_code_review_query(message)
         && !looks_like_debug_query(message)
+        && !looks_like_continuation_query(message)
         && looks_like_quick_answer_query(message)
     {
         return Some(astra_config::user_profile::Scenario::QuickAnswer);
@@ -1167,6 +1225,14 @@ mod tests {
             fallback_scenario_from_routing(q, task_profile, TaskType::Code),
             Some(Scenario::QuickAnswer)
         );
+    }
+
+    #[test]
+    fn generic_followup_question_does_not_route_to_quick_answer() {
+        let q = "还有什么？";
+        let task_profile = infer_task_execution_profile(q);
+        let res = fallback_scenario_from_routing(q, task_profile, TaskType::Code);
+        assert_ne!(res, Some(Scenario::QuickAnswer));
     }
 
     #[test]

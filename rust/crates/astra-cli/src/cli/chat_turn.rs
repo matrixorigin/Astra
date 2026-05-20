@@ -521,11 +521,17 @@ pub(super) fn build_effective_line(
         .as_deref()
         .filter(|_| is_low_information_followup(line))
     {
+        let task_board_reanchor = if anchor.contains("Active task board:") {
+            "If the active thread already has a task board, reconcile it before proceeding: create any missing tasks implied by the approved plan, set the current task to in_progress before doing the work, and update statuses as tasks complete.\n"
+        } else {
+            ""
+        };
         effective_line = format!(
             "[Active task attachment]\n\
 Resume the active task/thread below unless the user explicitly changes topic.\n\
 Treat brief follow-ups as actions on this active thread, not as brand-new unrelated tasks.\n\
 If the follow-up asks to fix / patch / test / continue, apply that action to this active thread.\n\
+{task_board_reanchor}\
 {anchor}\n\n[User follow-up]\n{effective_line}"
         );
     }
@@ -534,13 +540,14 @@ If the follow-up asks to fix / patch / test / continue, apply that action to thi
 }
 
 pub(super) fn is_short_continuation_prompt(line: &str) -> bool {
-    let trimmed = line.trim();
+    let trimmed = trim_short_followup_prompt(line);
     if trimmed.is_empty() || trimmed.chars().count() > 16 {
         return false;
     }
 
-    matches!(
-        trimmed.to_ascii_lowercase().as_str(),
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
         "continue"
             | "continue."
             | "continue!"
@@ -560,10 +567,52 @@ pub(super) fn is_short_continuation_prompt(line: &str) -> bool {
             | "proceed"
             | "next"
             | "keep going"
-    ) || matches!(
+    ) {
+        return true;
+    }
+
+    if matches!(
         trimmed,
         "继续" | "继续。" | "继续！" | "好的" | "好" | "可以" | "是的" | "对" | "行" | "嗯"
-    )
+    ) {
+        return true;
+    }
+
+    [
+        "继续",
+        "接着",
+        "补",
+        "补下",
+        "补一下",
+        "还有什么",
+        "还有呢",
+        "然后呢",
+        "下一步",
+        "接下来",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
+}
+
+fn trim_short_followup_prompt(line: &str) -> &str {
+    line.trim().trim_end_matches(|ch: char| {
+        matches!(
+            ch,
+            '?' | '？'
+                | '!'
+                | '！'
+                | '.'
+                | '。'
+                | ','
+                | '，'
+                | '啊'
+                | '呀'
+                | '呢'
+                | '吧'
+                | '嘛'
+                | '啦'
+        )
+    })
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
@@ -4154,10 +4203,19 @@ mod tests {
     }
 
     #[test]
+    fn short_continuation_prompt_detects_colloquial_followups() {
+        assert!(is_short_continuation_prompt("继续啊"));
+        assert!(is_short_continuation_prompt("继续完成所有的啊"));
+        assert!(is_short_continuation_prompt("补啊"));
+        assert!(is_short_continuation_prompt("还有什么？"));
+    }
+
+    #[test]
     fn low_information_followup_detects_repair_prompts() {
         assert!(is_low_information_followup("修复?"));
         assert!(is_low_information_followup("fix this"));
         assert!(is_low_information_followup("test it"));
+        assert!(is_low_information_followup("还有什么？"));
         assert!(!is_low_information_followup("修一下输入法问题"));
         assert!(!is_low_information_followup(
             "implement request batching in runtime selector"
@@ -4180,6 +4238,24 @@ mod tests {
         assert!(effective.contains("review commit aa1f419b"));
         assert!(effective.contains("fix / patch / test / continue"));
         assert!(effective.contains("[User follow-up]\n修复?"));
+    }
+
+    #[test]
+    fn build_effective_line_reanchors_generic_followup_to_task_board() {
+        let state = SessionState {
+            continuation_anchor: Some(
+                "Latest user task: improve session memory flow\nActive task board:\n- [in_progress] task-1: Phase 1: /memory show — TDD"
+                    .to_string(),
+            ),
+            ..SessionState::default()
+        };
+
+        let effective =
+            build_effective_line("还有什么？", &state, &mut crate::ui_adapter::LineUiAdapter);
+        assert!(effective.contains("[Active task attachment]"));
+        assert!(effective.contains("reconcile it before proceeding"));
+        assert!(effective.contains("Active task board:"));
+        assert!(effective.contains("[User follow-up]\n还有什么？"));
     }
 
     #[test]
