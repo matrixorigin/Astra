@@ -761,9 +761,6 @@ pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
 
     // Layout: │ <left_col> │ <right_col> │
     // outer border = 2 chars (│...│), divider = 3 chars ( │ ), padding = 2 (spaces inside)
-    let left_col_w = 24;
-    let right_col_w = term_w.saturating_sub(left_col_w + 7); // 7 = │ + sp + │ + sp + │ + sp + │
-    let total_inner = left_col_w + right_col_w + 3; // 3 = " │ " between columns
 
     let rng = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -787,30 +784,79 @@ pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
         format!("v{version} · {pname}").white().bold()
     );
 
-    // Right column: Vec of (styled_content)
+    // Build left column first so we can measure its actual width
+    let mut left: Vec<String> = Vec::new();
+    for line in logo_plain {
+        if line.is_empty() {
+            left.push(String::new());
+        } else if *line == "    astra" {
+            left.push(format!("{}", line.magenta().bold()));
+        } else {
+            left.push(format!("{}", line.magenta()));
+        }
+    }
+    left.push(left_footer);
+
+    // Derive left column width from content (was hardcoded 24)
+    let left_col_w = left
+        .iter()
+        .map(|l| crate::terminal_region::visible_char_width(l))
+        .max()
+        .unwrap_or(20)
+        .max(10);
+    // 7 = │ + sp + │ + sp + │ + sp + │
+    let right_col_w = term_w.saturating_sub(left_col_w + 7);
+    let total_inner = left_col_w + right_col_w + 3; // 3 = " │ " between columns
+
+    // Truncation helper: ensure visible text fits within max_vis columns.
+    // Operates on plain text before ANSI styling; appends "…" when truncated.
+    let trunc_vis = |text: &str, max_vis: usize| -> String {
+        let w = crate::terminal_region::visible_char_width(text);
+        if w <= max_vis {
+            return text.to_string();
+        }
+        let mut out = String::new();
+        let mut used = 0usize;
+        for ch in text.chars() {
+            let ch_w = if ch.is_ascii() { 1 } else { 2 };
+            if used + ch_w + 1 > max_vis {
+                break;
+            }
+            out.push(ch);
+            used += ch_w;
+        }
+        out.push('…');
+        out
+    };
+
+    // Right column: build with truncation safety on every line
     let sep_line = "─".repeat(right_col_w);
     let mut right: Vec<String> = Vec::new();
-    right.push("Tips".white().bold().to_string());
-    right.push("/help for all commands".white().bold().to_string());
-    right.push("Ctrl+K command picker".white().bold().to_string());
-    right.push("Alt+Enter multi-line input".white().bold().to_string());
+    right.push(trunc_vis("Tips", right_col_w).white().bold().to_string());
+    right.push(trunc_vis("/help for all commands", right_col_w).white().bold().to_string());
+    right.push(trunc_vis("Ctrl+K command picker", right_col_w).white().bold().to_string());
+    right.push(trunc_vis("Alt+Enter multi-line input", right_col_w).white().bold().to_string());
     right.push(sep_line.as_str().white().bold().to_string());
-    right.push("Status".white().bold().to_string());
+    right.push(trunc_vis("Status", right_col_w).white().bold().to_string());
     right.push(
-        format!(
-            "{skills_count} skills · {}",
-            if logged_in {
-                "logged in"
-            } else {
-                "not logged in"
-            }
+        trunc_vis(
+            &format!(
+                "{skills_count} skills · {}",
+                if logged_in {
+                    "logged in"
+                } else {
+                    "not logged in"
+                }
+            ),
+            right_col_w,
         )
         .white()
         .bold()
         .to_string(),
     );
     if let Some(line) = pending_recovery_status_line(state) {
-        right.push(line.yellow().bold().to_string());
+        let truncated = trunc_vis(&line, right_col_w);
+        right.push(truncated.yellow().bold().to_string());
     }
     if let Ok(proxy) = std::env::var("http_proxy").or_else(|_| std::env::var("HTTP_PROXY")) {
         if !proxy.is_empty() {
@@ -823,19 +869,6 @@ pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
             right.push(format!("proxy: {short}").white().bold().to_string());
         }
     }
-
-    // Build left column (styled)
-    let mut left: Vec<String> = Vec::new();
-    for line in logo_plain {
-        if line.is_empty() {
-            left.push(String::new());
-        } else if *line == "    astra" {
-            left.push(format!("{}", line.magenta().bold()));
-        } else {
-            left.push(format!("{}", line.magenta()));
-        }
-    }
-    left.push(left_footer);
 
     // Equalize heights
     let total_rows = left.len().max(right.len());
