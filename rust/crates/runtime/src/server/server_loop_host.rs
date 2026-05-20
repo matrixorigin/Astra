@@ -704,6 +704,9 @@ pub struct ServerAgenticLoopHost {
     /// Keeps prompt and introspection lifecycle context byte-consistent across
     /// multi-round tool loops.
     turn_start_lifecycle_summary: Option<String>,
+    /// Tracks which plan hint was baked into the latched lifecycle summary so
+    /// mid-turn plan enter/exit can refresh only the plan line.
+    turn_start_plan_resume_hint: Option<String>,
 
     // ── Test hooks ──
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -1000,6 +1003,7 @@ impl ServerAgenticLoopHostBuilder {
             client_cancel_token: None,
             progress_rx,
             turn_start_lifecycle_summary: None,
+            turn_start_plan_resume_hint: None,
             plan_resume_hint: Arc::new(std::sync::RwLock::new(self.plan_resume_hint)),
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds: std::collections::VecDeque::from(self.test_llm_rounds),
@@ -1028,6 +1032,25 @@ impl ServerAgenticLoopHostBuilder {
 }
 
 impl ServerAgenticLoopHost {
+    fn update_latched_plan_resume_line(summary: &str, plan_hint: Option<&str>) -> String {
+        let plan_line = plan_hint
+            .map(str::trim)
+            .filter(|hint| !hint.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| "none".to_string());
+        summary
+            .lines()
+            .map(|line| {
+                if line.starts_with("- Plan resume: ") {
+                    format!("- Plan resume: {plan_line}")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Handle to the shared plan-resume hint slot. Mid-run callers
     /// (tool executions that mutate plan-mode state) clone this handle and
     /// swap in a fresh hint so the next turn's system prompt reflects the
@@ -2034,10 +2057,18 @@ impl ServerAgenticLoopHost {
     ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
         let plan_hint = self.read_plan_resume_hint();
         let lifecycle_summary = if let Some(existing) = &self.turn_start_lifecycle_summary {
-            existing.clone()
+            if self.turn_start_plan_resume_hint.as_deref() != plan_hint.as_deref() {
+                let updated = Self::update_latched_plan_resume_line(existing, plan_hint.as_deref());
+                self.turn_start_lifecycle_summary = Some(updated.clone());
+                self.turn_start_plan_resume_hint = plan_hint.clone();
+                updated
+            } else {
+                existing.clone()
+            }
         } else {
             let summary = self.render_turn_start_lifecycle_summary(state, plan_hint.as_deref());
             self.turn_start_lifecycle_summary = Some(summary.clone());
+            self.turn_start_plan_resume_hint = plan_hint.clone();
             summary
         };
         let lifecycle_sections = vec![crate::prompts::PromptSection::dynamic(
@@ -2196,6 +2227,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
     fn turn_start_lifecycle_summary(&self, state: &AgenticLoopState) -> String {
         if let Some(summary) = &self.turn_start_lifecycle_summary {
+            let plan_hint = self.read_plan_resume_hint();
+            if self.turn_start_plan_resume_hint.as_deref() != plan_hint.as_deref() {
+                return Self::update_latched_plan_resume_line(summary, plan_hint.as_deref());
+            }
             return summary.clone();
         }
         let plan_hint = self.read_plan_resume_hint();
@@ -4153,7 +4188,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_turn_pipeline_latches_turn_start_lifecycle_summary_across_rounds() {
+    async fn run_turn_pipeline_refreshes_only_plan_resume_line_when_hint_changes() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -4193,8 +4228,8 @@ mod tests {
             .expect("round 3 pipeline should succeed");
         let round3_text = pipeline_outcome_text(&round3);
         assert!(
-            round3_text.contains("Plan resume: [plan-resume] goal=\"initial\""),
-            "later rounds must keep turn-start lifecycle summary immutable: {round3_text}"
+            round3_text.contains("Plan resume: [plan-resume] goal=\"mutated\""),
+            "plan line must refresh when the shared plan hint changes: {round3_text}"
         );
         assert!(
             round3_text.contains("this_turn=0"),

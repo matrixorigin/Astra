@@ -3,6 +3,7 @@ use std::time::Instant;
 use astra_services::session_workspace::ContextTraceSignal;
 #[cfg(test)]
 use astra_services::session_workspace::{ContextTraceBudgetSignal, ContextTraceToolSelection};
+use astra_tools::task_mgmt::SessionTask;
 
 use super::*;
 
@@ -891,10 +892,59 @@ fn summarize_event_anchor_artifacts(event: Option<&session_journal::JournalEvent
     lines
 }
 
-fn build_continuation_anchor(
+fn prioritize_active_tasks_for_anchor(mut tasks: Vec<SessionTask>) -> Vec<SessionTask> {
+    tasks.sort_by_key(|task| match task.status.as_str() {
+        "in_progress" => 0,
+        "pending" => 1,
+        _ => 2,
+    });
+    tasks
+}
+
+fn active_task_anchor_section(active_tasks: &[SessionTask]) -> Option<String> {
+    if active_tasks.is_empty() {
+        return None;
+    }
+    let mut lines = vec!["Active task board:".to_string()];
+    for task in active_tasks.iter().take(3) {
+        let blocked = if task.blocked_by.is_empty() {
+            String::new()
+        } else {
+            format!(" [blocked by: {}]", task.blocked_by.join(", "))
+        };
+        lines.push(format!(
+            "- [{}] {}: {}{}",
+            task.status,
+            task.id,
+            truncate_chars(&task.title, 120),
+            blocked
+        ));
+    }
+    if active_tasks.len() > 3 {
+        lines.push(format!(
+            "- ... {} more active task(s)",
+            active_tasks.len() - 3
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
+async fn load_active_tasks_for_anchor(state: &SessionState) -> Vec<SessionTask> {
+    let session_id = state.task_manager.session_id();
+    let tasks = state
+        .task_manager
+        .store()
+        .load_active(&session_id)
+        .await
+        .unwrap_or_default();
+    prioritize_active_tasks_for_anchor(tasks)
+}
+
+fn build_continuation_anchor_with_active_tasks(
     state: &SessionState,
     line: &str,
     result: &StreamResult,
+    active_tasks: &[SessionTask],
 ) -> Option<String> {
     let user_line = line.trim();
     if user_line.is_empty() {
@@ -903,6 +953,9 @@ fn build_continuation_anchor(
 
     let user_summary = truncate_chars(user_line, 220);
     let mut sections = vec![format!("Latest user task: {user_summary}")];
+    if let Some(task_section) = active_task_anchor_section(active_tasks) {
+        sections.push(task_section);
+    }
 
     if let Some(assistant_summary) = summarize_assistant_for_anchor(&result.full_text) {
         sections.push(format!("Latest assistant summary:\n{assistant_summary}"));
@@ -920,7 +973,18 @@ fn build_continuation_anchor(
     }
 }
 
-pub(super) fn rebuild_continuation_anchor_from_state(state: &mut SessionState) {
+fn build_continuation_anchor(
+    state: &SessionState,
+    line: &str,
+    result: &StreamResult,
+) -> Option<String> {
+    build_continuation_anchor_with_active_tasks(state, line, result, &[])
+}
+
+fn rebuild_continuation_anchor_from_state_with_active_tasks(
+    state: &mut SessionState,
+    active_tasks: &[SessionTask],
+) {
     state.last_response = state.history.last().map(|(_, assistant)| assistant.clone());
 
     let Some((user_line, assistant_text)) = state.history.last() else {
@@ -934,6 +998,9 @@ pub(super) fn rebuild_continuation_anchor_from_state(state: &mut SessionState) {
 
     let user_summary = truncate_chars(user_line, 220);
     let mut sections = vec![format!("Latest user task: {user_summary}")];
+    if let Some(task_section) = active_task_anchor_section(active_tasks) {
+        sections.push(task_section);
+    }
 
     if let Some(assistant_summary) = summarize_assistant_for_anchor(assistant_text) {
         sections.push(format!("Latest assistant summary:\n{assistant_summary}"));
@@ -943,6 +1010,15 @@ pub(super) fn rebuild_continuation_anchor_from_state(state: &mut SessionState) {
         state.last_turn_event.as_ref(),
     ));
     state.continuation_anchor = Some(sections.join("\n"));
+}
+
+pub(super) fn rebuild_continuation_anchor_from_state(state: &mut SessionState) {
+    rebuild_continuation_anchor_from_state_with_active_tasks(state, &[]);
+}
+
+pub(super) async fn rebuild_continuation_anchor_from_live_state(state: &mut SessionState) {
+    let active_tasks = load_active_tasks_for_anchor(state).await;
+    rebuild_continuation_anchor_from_state_with_active_tasks(state, &active_tasks);
 }
 
 pub(super) fn history_as_messages(history: &[(String, String)]) -> Vec<serde_json::Value> {
@@ -1756,6 +1832,7 @@ async fn apply_turn_success_async(
     let final_messages = std::mem::take(&mut result.final_messages);
     let csl_checkpoint_fields = extract_csl_fields_from_result(&result);
     apply_turn_success_sync(state, profile, line, result, turn_start);
+    rebuild_continuation_anchor_from_live_state(state).await;
 
     // Persist CSL via CslManager.
     let turn = state.turn;
@@ -5408,6 +5485,41 @@ mod tests {
 
         let anchor = build_continuation_anchor(&state, "", &result);
         assert_eq!(anchor.as_deref(), Some("Previous anchor content"));
+    }
+
+    #[tokio::test]
+    async fn rebuild_continuation_anchor_from_live_state_includes_active_task_board() {
+        let mut state = SessionState::default();
+        state.task_manager.rebind("sess-anchor");
+        state.history.push((
+            "继续".into(),
+            "Patched slash parsing and prepared tests.".into(),
+        ));
+        let create = state
+            .task_manager
+            .create(&serde_json::json!({"title": "Finish slash command repair"}))
+            .await;
+        assert!(!create.starts_with("Error:"), "{create}");
+        let task_id = state
+            .task_manager
+            .snapshot()
+            .await
+            .into_iter()
+            .next()
+            .expect("task")
+            .id;
+        let update = state
+            .task_manager
+            .update(&serde_json::json!({"task_id": task_id, "new_status": "in_progress"}))
+            .await;
+        assert!(!update.starts_with("Error:"), "{update}");
+
+        rebuild_continuation_anchor_from_live_state(&mut state).await;
+
+        let anchor = state.continuation_anchor.expect("anchor");
+        assert!(anchor.contains("Active task board:"), "{anchor}");
+        assert!(anchor.contains("Finish slash command repair"), "{anchor}");
+        assert!(anchor.contains("[in_progress]"), "{anchor}");
     }
 
     /// Simulates a multi-turn error recovery scenario:

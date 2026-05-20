@@ -107,8 +107,10 @@ fn semantic_query_from_message(message: &str) -> Cow<'_, str> {
     }
 
     let mut latest_task = None;
+    let mut active_tasks = Vec::new();
     let mut assistant_summary = Vec::new();
     let mut followup = Vec::new();
+    let mut in_active_tasks = false;
     let mut in_summary = false;
     let mut in_followup = false;
 
@@ -119,26 +121,38 @@ fn semantic_query_from_message(message: &str) -> Cow<'_, str> {
     {
         if let Some(rest) = line.strip_prefix("Latest user task: ") {
             latest_task = Some(rest.to_string());
+            in_active_tasks = false;
+            in_summary = false;
+            in_followup = false;
+            continue;
+        }
+        if line == "Active task board:" {
+            in_active_tasks = true;
             in_summary = false;
             in_followup = false;
             continue;
         }
         if line == "Latest assistant summary:" {
+            in_active_tasks = false;
             in_summary = true;
             in_followup = false;
             continue;
         }
         if line == "[User follow-up]" {
+            in_active_tasks = false;
             in_summary = false;
             in_followup = true;
             continue;
         }
         if line.starts_with("Recent tools: ") || line.starts_with("Artifact: ") {
+            in_active_tasks = false;
             in_summary = false;
             in_followup = false;
             continue;
         }
-        if in_summary && assistant_summary.len() < 3 {
+        if in_active_tasks && active_tasks.len() < 3 {
+            active_tasks.push(line.trim_start_matches("- ").to_string());
+        } else if in_summary && assistant_summary.len() < 3 {
             assistant_summary.push(line.to_string());
         } else if in_followup {
             followup.push(line.to_string());
@@ -148,6 +162,9 @@ fn semantic_query_from_message(message: &str) -> Cow<'_, str> {
     let mut parts = Vec::new();
     if let Some(task) = latest_task {
         parts.push(format!("Task: {task}"));
+    }
+    if !active_tasks.is_empty() {
+        parts.push(format!("Active tasks: {}", active_tasks.join(" | ")));
     }
     if !assistant_summary.is_empty() {
         parts.push(format!(

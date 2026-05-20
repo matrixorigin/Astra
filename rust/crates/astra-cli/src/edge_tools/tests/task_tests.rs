@@ -1,4 +1,5 @@
 use super::*;
+use astra_services::session_journal::{JournalDirGuard, JournalEvent, JournalEventType};
 
 /// Parse a task-tool response into JSON, tolerating the human-readable
 /// summary line that `prefix_summary` prepends to success responses.
@@ -158,6 +159,63 @@ async fn task_update_reports_previous_subtask_status() {
     assert!(parsed["success"].as_bool().unwrap());
     assert_eq!(parsed["previous_status"], "pending");
     assert_eq!(parsed["status"], "completed");
+}
+
+#[tokio::test]
+async fn task_mutations_append_lifecycle_events_to_session_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(dir.path());
+    let exe = ToolExecutor::new(dir.path()).with_active_session_id("task-journal-session");
+    exe.journal_turn_index
+        .store(7, std::sync::atomic::Ordering::Release);
+
+    exe.task_create(&json!({"title": "Journaled task"})).await;
+    exe.task_update(&json!({"task_id": "task-1", "status": "in_progress"}))
+        .await;
+    exe.task_stop(&json!({"task_id": "task-1", "reason": "user cancelled"}))
+        .await;
+
+    let raw = std::fs::read_to_string(dir.path().join("task-journal-session.jsonl")).unwrap();
+    let events: Vec<JournalEvent> = raw
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|evt: &JournalEvent| evt.event_type == JournalEventType::TaskLifecycle)
+        .collect();
+    assert_eq!(events.len(), 3, "got lifecycle events: {events:#?}");
+    assert!(events.iter().all(|evt| evt.turn == Some(7)));
+
+    let summaries: Vec<&str> = events
+        .iter()
+        .map(|evt| {
+            evt.metadata
+                .as_ref()
+                .and_then(|meta| meta.get("summary"))
+                .and_then(serde_json::Value::as_str)
+                .expect("task lifecycle events must carry a summary")
+        })
+        .collect();
+    assert_eq!(
+        summaries,
+        vec!["task_created", "task_updated", "task_cancelled"]
+    );
+
+    let create_detail = events[0]
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("detail"))
+        .expect("create detail");
+    assert_eq!(create_detail["task_id"], "task-1");
+    assert_eq!(create_detail["title"], "Journaled task");
+    assert_eq!(create_detail["status"], "pending");
+
+    let cancel_detail = events[2]
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("detail"))
+        .expect("cancel detail");
+    assert_eq!(cancel_detail["task_id"], "task-1");
+    assert_eq!(cancel_detail["status"], "cancelled");
+    assert_eq!(cancel_detail["reason"], "user cancelled");
 }
 
 // ── Sleep tool tests ─────────────────────────────────────────────────────

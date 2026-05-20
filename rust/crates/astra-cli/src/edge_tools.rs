@@ -1296,9 +1296,9 @@ impl ToolExecutor {
         )
     }
 
-    fn task_output_success(output: &str) -> bool {
+    fn task_output_json(output: &str) -> Option<Value> {
         if output.starts_with("Error:") {
-            return false;
+            return None;
         }
         // task_mgmt now prefixes success responses with a human-readable
         // summary line followed by the JSON body (see `prefix_summary`).
@@ -1308,12 +1308,105 @@ impl ToolExecutor {
         // a pure-JSON string returns 0 and we parse the whole string.
         let json_body = match output.find('{') {
             Some(pos) => &output[pos..],
-            None => return false,
+            None => return None,
         };
-        serde_json::from_str::<Value>(json_body)
-            .ok()
+        serde_json::from_str::<Value>(json_body).ok()
+    }
+
+    fn task_output_success(output: &str) -> bool {
+        Self::task_output_json(output)
             .and_then(|value| value.get("success").and_then(Value::as_bool))
             .unwrap_or(false)
+    }
+
+    fn task_lifecycle_summary(action: &str, payload: &Value) -> &'static str {
+        if payload.get("subtask_id").and_then(Value::as_str).is_some() {
+            return "subtask_updated";
+        }
+        match action {
+            "create" => "task_created",
+            "stop" => "task_cancelled",
+            "update" => match payload.get("status").and_then(Value::as_str) {
+                Some("completed") => "task_completed",
+                Some("failed") => "task_failed",
+                Some("cancelled") => "task_cancelled",
+                Some("deleted") => "task_deleted",
+                _ => "task_updated",
+            },
+            _ => "task_updated",
+        }
+    }
+
+    fn task_lifecycle_detail(action: &str, args: &Value, payload: &Value) -> Value {
+        let mut detail = serde_json::Map::new();
+        detail.insert("action".to_string(), json!(action));
+        if let Some(value) = payload
+            .get("task_id")
+            .cloned()
+            .or_else(|| args.get("task_id").cloned())
+        {
+            detail.insert("task_id".to_string(), value);
+        }
+        if let Some(value) = payload
+            .get("subtask_id")
+            .cloned()
+            .or_else(|| args.get("subtask_id").cloned())
+        {
+            detail.insert("subtask_id".to_string(), value);
+        }
+        if let Some(value) = args.get("title").cloned() {
+            detail.insert("title".to_string(), value);
+        }
+        if let Some(value) = payload.get("previous_status").cloned() {
+            detail.insert("previous_status".to_string(), value);
+        }
+        let final_status = payload.get("status").cloned().or_else(|| match action {
+            "create" => Some(json!("pending")),
+            "stop" => Some(json!("cancelled")),
+            _ => None,
+        });
+        if let Some(value) = final_status {
+            detail.insert("status".to_string(), value);
+        }
+        if let Some(value) = payload
+            .get("reason")
+            .cloned()
+            .or_else(|| args.get("reason").cloned())
+        {
+            detail.insert("reason".to_string(), value);
+        }
+        if let Some(value) = payload.get("cancelled_subtasks").cloned() {
+            detail.insert("cancelled_subtasks".to_string(), value);
+        }
+        Value::Object(detail)
+    }
+
+    fn record_task_lifecycle_event(&self, action: &str, args: &Value, output: &str) {
+        let Some(session_id) = self
+            .active_session_id()
+            .filter(|sid| !sid.trim().is_empty())
+        else {
+            return;
+        };
+        let Some(payload) = Self::task_output_json(output) else {
+            return;
+        };
+        if payload.get("success").and_then(Value::as_bool) != Some(true) {
+            return;
+        }
+        let turn = self
+            .journal_turn_index
+            .load(std::sync::atomic::Ordering::Acquire);
+        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(&session_id) {
+            let _ = writer.append(
+                &astra_services::session_journal::JournalEvent::task_lifecycle(
+                    Some(&session_id),
+                    turn,
+                    Self::task_lifecycle_summary(action, &payload),
+                    Some(Self::task_lifecycle_detail(action, args, &payload)),
+                ),
+            );
+        }
     }
 
     /// Route a `task` action either to the cloud (production) or the
@@ -1461,6 +1554,15 @@ impl ToolExecutor {
         }
     }
 
+    fn stage_pending_permission_mode_change(
+        &self,
+        mode: crate::permission_manager::PermissionMode,
+    ) {
+        if let Ok(mut slot) = self.pending_permission_mode_change.lock() {
+            *slot = Some(mode);
+        }
+    }
+
     async fn exit_plan_mode_remote(&self, args: &Value) -> String {
         // `exit_plan_mode` has two structurally different sources of
         // truth depending on how plan mode was entered:
@@ -1591,16 +1693,12 @@ impl ToolExecutor {
             .to_string();
 
         if approved {
+            let next_mode =
+                follow_up_mode.unwrap_or(crate::permission_manager::PermissionMode::Auto);
             self.set_plan_mode_authoring_cache_for_active_session(false)
                 .await;
-            if let Some(mode) = follow_up_mode {
-                if let Ok(mut slot) = self.pending_permission_mode_change.lock() {
-                    *slot = Some(mode);
-                }
-            }
-            let mode_suffix = follow_up_mode
-                .map(|mode| format!(" Next turn will run in {mode} mode."))
-                .unwrap_or_default();
+            self.stage_pending_permission_mode_change(next_mode);
+            let mode_suffix = format!(" Next turn will run in {next_mode} mode.");
             format!(
                 "Exited plan mode. plan_id={resolved_plan_id} is approved; write tools unlocked.{mode_suffix}"
             )
@@ -1632,6 +1730,8 @@ impl ToolExecutor {
         };
 
         if approved {
+            let next_mode =
+                follow_up_mode.unwrap_or(crate::permission_manager::PermissionMode::Auto);
             // Local guard cache is informational only here — there
             // is no cloud guard to mirror. Setting it to `Some(false)`
             // keeps the cached flag consistent with "writes are
@@ -1639,20 +1739,14 @@ impl ToolExecutor {
             // outcome the cloud path would have set.
             self.set_plan_mode_authoring_cache_for_active_session(false)
                 .await;
-            if let Some(mode) = follow_up_mode {
-                if let Ok(mut slot) = self.pending_permission_mode_change.lock() {
-                    *slot = Some(mode);
-                }
-            }
+            self.stage_pending_permission_mode_change(next_mode);
             let plan_suffix = match plan_markdown {
                 Some(plan) if !plan.is_empty() => {
                     format!(" Plan recorded:\n{plan}")
                 }
                 _ => String::new(),
             };
-            let mode_suffix = follow_up_mode
-                .map(|mode| format!(" Next turn will run in {mode} mode."))
-                .unwrap_or_default();
+            let mode_suffix = format!(" Next turn will run in {next_mode} mode.");
             format!("Exited plan mode; user approved.{mode_suffix}{plan_suffix}")
         } else {
             // Keep planning: the local perm_manager mode is unchanged
@@ -1711,6 +1805,7 @@ impl ToolExecutor {
 
     async fn task_create(&self, args: &Value) -> String {
         if let Some(output) = self.route_task_action("create", args).await {
+            self.record_task_lifecycle_event("create", args, &output);
             return output;
         }
         let snapshot = self.task_manager.snapshot_state().await;
@@ -1723,6 +1818,7 @@ impl ToolExecutor {
                     args.get("title").and_then(Value::as_str).unwrap_or("task")
                 ),
             );
+            self.record_task_lifecycle_event("create", args, &output);
         }
         output
     }
@@ -1740,6 +1836,7 @@ impl ToolExecutor {
     }
     async fn task_update(&self, args: &Value) -> String {
         if let Some(output) = self.route_task_action("update", args).await {
+            self.record_task_lifecycle_event("update", args, &output);
             return output;
         }
         let snapshot = self.task_manager.snapshot_state().await;
@@ -1754,11 +1851,13 @@ impl ToolExecutor {
                         .unwrap_or("task")
                 ),
             );
+            self.record_task_lifecycle_event("update", args, &output);
         }
         output
     }
     async fn task_stop(&self, args: &Value) -> String {
         if let Some(output) = self.route_task_action("stop", args).await {
+            self.record_task_lifecycle_event("stop", args, &output);
             return output;
         }
         let snapshot = self.task_manager.snapshot_state().await;
@@ -1773,6 +1872,7 @@ impl ToolExecutor {
                         .unwrap_or("task")
                 ),
             );
+            self.record_task_lifecycle_event("stop", args, &output);
         }
         output
     }

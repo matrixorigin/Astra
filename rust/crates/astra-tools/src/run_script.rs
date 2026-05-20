@@ -638,6 +638,8 @@ pub fn build_run_script_schema(
          need to filter/reduce large outputs before they enter context, \
          need conditional branching, or need to loop.\n\n\
          {available_block}\n\n\
+         Tool calls are async: `result = await tool_name(param=value)`. \
+         Each call returns a dict with the tool's output fields.\n\n\
          Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script.\n\n\
          {mode_note}\n\n\
          Also available (built-in, no import needed):\n  \

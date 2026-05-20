@@ -44,6 +44,30 @@ pub fn classify_result(result_str: &str) -> ResultQuality {
         {
             return ResultQuality::Error;
         }
+        if let Some(status) = value.get("status").and_then(|s| s.as_str()) {
+            let status = status.trim().to_ascii_lowercase();
+            if matches!(
+                status.as_str(),
+                "failed" | "error" | "cancelled" | "canceled" | "aborted" | "timeout" | "timed_out"
+            ) {
+                return ResultQuality::Error;
+            }
+            if matches!(
+                status.as_str(),
+                "pending"
+                    | "queued"
+                    | "in_progress"
+                    | "running"
+                    | "still_running"
+                    | "processing"
+                    | "starting"
+            ) && value.get("result").is_none()
+                && value.get("output").is_none()
+                && value.get("data").is_none()
+            {
+                return ResultQuality::Empty;
+            }
+        }
         // Empty JSON structures
         if value.is_null() {
             return ResultQuality::Empty;
@@ -101,8 +125,9 @@ pub fn quality_feedback(tool_name: &str, quality: ResultQuality) -> Option<Strin
             tool_name
         )),
         ResultQuality::Empty => Some(format!(
-            "ℹ {} returned empty results. The query may need different parameters, \
-             or the resource may not exist. Do NOT retry with the same arguments.",
+            "ℹ {} returned no finished result. The query may need different parameters, \
+             the resource may not exist, or the work may not be ready yet. Do NOT retry \
+             with the same arguments.",
             tool_name
         )),
         ResultQuality::Truncated => Some(format!(
@@ -148,6 +173,38 @@ mod tests {
     #[test]
     fn empty_string_json() {
         assert_eq!(classify_result(r#""""#), ResultQuality::Empty);
+    }
+
+    #[test]
+    fn json_still_running_status_is_empty() {
+        assert_eq!(
+            classify_result(r#"{"status":"still_running","agent_id":"agent-123"}"#),
+            ResultQuality::Empty
+        );
+    }
+
+    #[test]
+    fn json_failed_status_is_error() {
+        assert_eq!(
+            classify_result(r#"{"status":"failed","agent_id":"agent-123"}"#),
+            ResultQuality::Error
+        );
+    }
+
+    #[test]
+    fn json_cancelled_status_is_error() {
+        assert_eq!(
+            classify_result(r#"{"status":"cancelled","agent_id":"agent-123"}"#),
+            ResultQuality::Error
+        );
+    }
+
+    #[test]
+    fn json_completed_status_without_payload_is_success() {
+        assert_eq!(
+            classify_result(r#"{"status":"completed","agent_id":"agent-123"}"#),
+            ResultQuality::Success
+        );
     }
 
     // ── Error detection ──

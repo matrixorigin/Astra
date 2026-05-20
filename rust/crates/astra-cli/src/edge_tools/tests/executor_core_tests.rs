@@ -286,6 +286,15 @@ async fn exit_plan_mode_accepts_plan_alias_and_explicit_approved_skips_overlay()
         result.contains("plan-2"),
         "result should mention the resolved plan id. Got: {result}"
     );
+    assert!(
+        result.contains("auto"),
+        "explicit approval should default the next turn back to auto mode. Got: {result}"
+    );
+    assert_eq!(
+        executor.take_pending_permission_mode_change(),
+        Some(crate::permission_manager::PermissionMode::Auto),
+        "headless explicit approval must still stage a non-plan permission mode"
+    );
 }
 
 #[tokio::test]
@@ -603,6 +612,46 @@ async fn enter_plan_mode_then_exit_full_cycle_offline() {
         executor.take_pending_permission_mode_change(),
         Some(crate::permission_manager::PermissionMode::Auto),
         "exit must stage Auto"
+    );
+}
+
+#[tokio::test]
+async fn exit_plan_mode_explicit_approved_defaults_to_auto_offline() {
+    let temp = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(temp.path().to_path_buf())
+        .with_active_session_id("sess-explicit-offline");
+
+    let enter_result = executor
+        .execute("enter_plan_mode", &json!({"goal": "Ship auth"}))
+        .await;
+    assert!(
+        !enter_result.starts_with("Error:"),
+        "offline enter should succeed. Got: {enter_result}"
+    );
+    assert_eq!(
+        executor.take_pending_permission_mode_change(),
+        Some(crate::permission_manager::PermissionMode::Plan),
+        "enter must stage Plan before the simulated host applies it"
+    );
+
+    let exit_result = executor
+        .execute(
+            "exit_plan_mode",
+            &json!({"approved": true, "plan": "1. Review auth flow"}),
+        )
+        .await;
+    assert!(
+        exit_result.starts_with("Exited plan mode"),
+        "explicit offline approval should succeed. Got: {exit_result}"
+    );
+    assert!(
+        exit_result.contains("auto"),
+        "explicit approval should advertise the default Auto mode. Got: {exit_result}"
+    );
+    assert_eq!(
+        executor.take_pending_permission_mode_change(),
+        Some(crate::permission_manager::PermissionMode::Auto),
+        "explicit approval without overlay must still leave plan mode on the next turn"
     );
 }
 

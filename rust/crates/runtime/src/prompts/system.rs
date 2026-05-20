@@ -698,10 +698,10 @@ fn turn_discipline_section() -> &'static str {
 /// Plan execution guidance. Pure static.
 fn plan_execution_section() -> &'static str {
     "\n## Plan Execution\n\
-      - **Don't skip ahead**: implement ONLY the current subtask. Don't scope-creep.\n\
-     - **Respect files list**: if the subtask specifies files to modify, start by reading those.\n\
-     - **Keep rollback boundaries honest**: in rollback-on-failure boundaries such as plan subtasks, `run_chain`, or explicit batch transactions, non-read-only `bash` is a manual boundary. Prefer structured mutation tools and use `run_build_test` for build/test loops when available.\n\
-     - **Meet acceptance criteria**: the subtask may include criteria — verify them before marking done.\n\
+      - **Don't skip ahead**: when the session already has a current subtask or active plan step, implement ONLY that unit of work. If no executable subtask exists yet, stay in planning/decomposition instead of inventing progress.\n\
+      - **Respect files list**: if the subtask specifies files to modify, start by reading those.\n\
+      - **Keep rollback boundaries honest**: in rollback-on-failure boundaries such as plan subtasks, `run_chain`, or explicit batch transactions, non-read-only `bash` is a manual boundary. Prefer structured mutation tools and use `run_build_test` for build/test loops when available.\n\
+      - **Meet acceptance criteria**: the subtask may include criteria — verify them before marking done.\n\
      - **Build/test after changes**: run the project's build and test commands to confirm.\n\
      - **Report clearly**: summarize what changed and whether criteria passed.\n"
 }

@@ -22,6 +22,8 @@ use astra_turn_core::tool_result_semantics::tool_dedup_signature;
 
 const OUTCOME_MEMORY_FAILURE_BLOCK_WINDOW: usize = 2;
 const OUTCOME_MEMORY_FAILURE_BLOCK_MAX_AGE_SECS: u64 = 60 * 60;
+const NON_PROGRESS_BACKOFF_WINDOW: usize = 2;
+const NON_PROGRESS_BACKOFF_SECS: u64 = 15;
 // `REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD` moved into `EffectiveToolPolicy`
 // as `repeated_cache_hit_suppression`; read from `ctx` on every call.
 const REASON_DUPLICATE_WITHIN_TURN: &str = "duplicate_within_turn";
@@ -427,6 +429,32 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             return HeadlessPipelineStage::ShortCircuit;
         }
 
+        if let Some((repeat_count, remaining_secs)) =
+            should_backoff_from_nonprogress(&self.ctx.turn_guard.health, &call_sig)
+        {
+            let (reason_code, err_msg, status_line) =
+                nonprogress_backoff_message(&slot.name, repeat_count, remaining_secs);
+            emit_blocked_tool_result(
+                HeadlessBlockedTool {
+                    id: &slot.id,
+                    name: &slot.name,
+                    args: &slot.args,
+                    reason_code,
+                    err_msg: err_msg.clone(),
+                    journal_reason: err_msg.clone(),
+                    early_exit_ms: 0,
+                    status_line: Some(status_line),
+                },
+                self.ctx.step_recorder,
+                self.ctx.quiet,
+                self.ctx.term,
+                self.ctx.messages,
+                self.ctx.tool_results,
+                self.ctx.tool_call_records,
+            );
+            return HeadlessPipelineStage::ShortCircuit;
+        }
+
         if let Some(failure_count) =
             should_block_from_outcome_memory(&self.ctx.turn_guard.health, &call_sig)
         {
@@ -691,6 +719,39 @@ fn should_block_from_outcome_memory(
     Some(recent.len())
 }
 
+fn should_backoff_from_nonprogress(
+    health: &astra_turn_core::tool_health::ToolHealthTracker,
+    call_sig: &str,
+) -> Option<(usize, u64)> {
+    use astra_turn_core::action_compensation::FailureCategory;
+
+    let history = health.outcome_history(call_sig)?;
+    let recent: Vec<_> = history
+        .iter()
+        .rev()
+        .take_while(|outcome| {
+            outcome.success && outcome.failure_category == Some(FailureCategory::NonProgress)
+        })
+        .take(NON_PROGRESS_BACKOFF_WINDOW)
+        .collect();
+    if recent.len() < NON_PROGRESS_BACKOFF_WINDOW {
+        return None;
+    }
+    let newest = recent.first()?;
+    if newest.at_epoch == 0 {
+        return Some((recent.len(), NON_PROGRESS_BACKOFF_SECS));
+    }
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let age = now_epoch.saturating_sub(newest.at_epoch);
+    if age >= NON_PROGRESS_BACKOFF_SECS {
+        return None;
+    }
+    Some((recent.len(), NON_PROGRESS_BACKOFF_SECS - age))
+}
+
 fn outcome_memory_block_message(
     tool_name: &str,
     args: &Value,
@@ -724,5 +785,22 @@ fn outcome_memory_block_message(
              necessary."
         ),
         format!("  ⚠ Outcome-memory block: {tool_name}"),
+    )
+}
+
+fn nonprogress_backoff_message(
+    tool_name: &str,
+    repeat_count: usize,
+    remaining_secs: u64,
+) -> (&'static str, String, String) {
+    (
+        "nonprogress_backoff",
+        format!(
+            "blocked_tool: Busy-poll backoff for '{tool_name}' with identical arguments: \
+             the last {repeat_count} recent call(s) produced no finished result. Wait about \
+             {remaining_secs}s before polling again, or continue with other completed work \
+             instead of repeating the same request immediately."
+        ),
+        format!("  ⚠ Busy-poll backoff: {tool_name} (~{remaining_secs}s)"),
     )
 }

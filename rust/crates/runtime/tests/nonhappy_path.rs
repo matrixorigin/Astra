@@ -1047,8 +1047,8 @@ mod chat_stream_turnguard_e2e {
         let fb = guard.result_feedback("grep", ResultQuality::Empty);
         assert!(fb.is_some(), "empty result should produce feedback");
         assert!(
-            fb.unwrap().contains("empty"),
-            "feedback should mention empty"
+            fb.unwrap().contains("no finished result"),
+            "feedback should indicate non-finished result"
         );
 
         // Success
