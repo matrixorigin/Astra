@@ -1696,7 +1696,7 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
             eprintln!(
                 "  {} Permission mode → {}",
                 theme::icon_info(),
-                next.to_string().magenta()
+                permission_mode_display_label(next).magenta()
             );
         }
         "all" => {
@@ -1720,7 +1720,7 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
             eprintln!(
                 "  {} Permission mode → {} (workspace-local edits auto-approved)",
                 theme::icon_info(),
-                "accept_edits".magenta()
+                permission_mode_display_label(PermissionMode::AcceptEdits).magenta()
             );
         }
         "rules" | "status" => {
@@ -1772,17 +1772,40 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
                 eprintln!(
                     "  {} Permission mode → {}",
                     theme::icon_info(),
-                    mode.to_string().magenta()
+                    permission_mode_display_label(mode).magenta()
                 );
             }
             Err(_) => {
                 eprintln!(
-                    "  {} Unknown mode '{}'. Use: auto, plan, accept_edits, prompt, deny, all, rules, trust, untrust, trace",
+                    "  {} Unknown mode '{}'. Use: auto, plan, accept-edits, prompt, deny, all, rules, trust, untrust, trace",
                     theme::icon_warn(),
                     arg
                 );
             }
         },
+    }
+}
+
+pub(crate) fn permission_mode_display_label(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Prompt => "prompt",
+        PermissionMode::Auto => "auto",
+        PermissionMode::AcceptEdits => "accept-edits",
+        PermissionMode::Plan => "plan",
+        PermissionMode::Deny => "deny",
+    }
+}
+
+#[cfg(test)]
+mod permission_mode_display_tests {
+    use super::{PermissionMode, permission_mode_display_label};
+
+    #[test]
+    fn accept_edits_displays_as_kebab_case() {
+        assert_eq!(
+            permission_mode_display_label(PermissionMode::AcceptEdits),
+            "accept-edits"
+        );
     }
 }
 
