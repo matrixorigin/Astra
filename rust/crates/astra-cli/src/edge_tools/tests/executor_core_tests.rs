@@ -239,11 +239,11 @@ async fn exit_plan_mode_accepts_plan_alias_and_explicit_approved_skips_overlay()
         .and(path("/plans"))
         .and(header("authorization", "Bearer token"))
         .and(query_param("session_id", "sess-1"))
-        .and(query_param("phase", "planning"))
+        .and(query_param("active_session_only", "true"))
         .and(query_param("limit", "1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "plans": [
-                { "plan_id": "plan-2", "goal": "Ship auth" }
+                { "plan_id": "plan-2", "goal": "Ship auth", "status": "planning" }
             ]
         })))
         .mount(&server)
@@ -303,17 +303,17 @@ async fn plan_mode_write_guard_cache_is_invalidated_when_session_changes() {
     Mock::given(method("GET"))
         .and(path("/plans"))
         .and(query_param("session_id", "sess-plan"))
-        .and(query_param("phase", "planning"))
+        .and(query_param("active_session_only", "true"))
         .and(query_param("limit", "1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plans": [{ "plan_id": "plan-1", "goal": "Ship auth" }]
+            "plans": [{ "plan_id": "plan-1", "goal": "Ship auth", "status": "planning" }]
         })))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/plans"))
         .and(query_param("session_id", "sess-normal"))
-        .and(query_param("phase", "planning"))
+        .and(query_param("active_session_only", "true"))
         .and(query_param("limit", "1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "plans": []
@@ -358,10 +358,10 @@ async fn exit_plan_mode_overlay_approve_auto_records_pending_mode_change() {
     Mock::given(method("GET"))
         .and(path("/plans"))
         .and(query_param("session_id", "sess-1"))
-        .and(query_param("phase", "planning"))
+        .and(query_param("active_session_only", "true"))
         .and(query_param("limit", "1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plans": [{ "plan_id": "plan-7", "goal": "Ship auth" }]
+            "plans": [{ "plan_id": "plan-7", "goal": "Ship auth", "status": "planning" }]
         })))
         .mount(&server)
         .await;
@@ -517,7 +517,7 @@ async fn exit_plan_mode_local_path_makes_zero_cloud_calls() {
     Mock::given(method("GET"))
         .and(path("/plans"))
         .and(query_param("session_id", "sess-no-cloud"))
-        .and(query_param("phase", "planning"))
+        .and(query_param("active_session_only", "true"))
         .and(query_param("limit", "1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"plans": []})))
         .mount(&server)
@@ -667,10 +667,10 @@ async fn exit_plan_mode_overlay_keep_planning_leaves_plan_open() {
     Mock::given(method("GET"))
         .and(path("/plans"))
         .and(query_param("session_id", "sess-1"))
-        .and(query_param("phase", "planning"))
+        .and(query_param("active_session_only", "true"))
         .and(query_param("limit", "1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plans": [{ "plan_id": "plan-8", "goal": "Ship auth" }]
+            "plans": [{ "plan_id": "plan-8", "goal": "Ship auth", "status": "planning" }]
         })))
         .mount(&server)
         .await;
@@ -747,7 +747,7 @@ async fn exit_plan_mode_shift_tab_path_works_without_cloud_plan_record() {
     Mock::given(method("GET"))
         .and(path("/plans"))
         .and(query_param("session_id", "sess-shift-tab"))
-        .and(query_param("phase", "planning"))
+        .and(query_param("active_session_only", "true"))
         .and(query_param("limit", "1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"plans": []})))
         .mount(&server)
@@ -816,10 +816,10 @@ async fn exit_plan_mode_without_overlay_or_approved_returns_actionable_error() {
     Mock::given(method("GET"))
         .and(path("/plans"))
         .and(query_param("session_id", "sess-1"))
-        .and(query_param("phase", "planning"))
+        .and(query_param("active_session_only", "true"))
         .and(query_param("limit", "1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plans": [{ "plan_id": "plan-3", "goal": "Ship auth" }]
+            "plans": [{ "plan_id": "plan-3", "goal": "Ship auth", "status": "planning" }]
         })))
         .mount(&server)
         .await;
@@ -857,28 +857,37 @@ async fn exit_plan_mode_without_overlay_or_approved_returns_actionable_error() {
 // `plan_mode_authoring_active`), but the CLI's local `ToolExecutor`
 // did NOT. These tests pin the parity contract.
 
-async fn mock_planning_plan_present(server: &MockServer, session_id: &str, plan_id: &str) {
+async fn mock_authoring_plan_present(
+    server: &MockServer,
+    session_id: &str,
+    plan_id: &str,
+    status: &str,
+) {
     Mock::given(method("GET"))
         .and(path("/plans"))
         .and(header("authorization", "Bearer token"))
         .and(query_param("session_id", session_id))
-        .and(query_param("phase", "planning"))
+        .and(query_param("active_session_only", "true"))
         .and(query_param("limit", "1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "plans": [
-                { "plan_id": plan_id, "goal": "Ship auth" }
+                { "plan_id": plan_id, "goal": "Ship auth", "status": status }
             ]
         })))
         .mount(server)
         .await;
 }
 
-async fn mock_no_planning_plan(server: &MockServer, session_id: &str) {
+async fn mock_planning_plan_present(server: &MockServer, session_id: &str, plan_id: &str) {
+    mock_authoring_plan_present(server, session_id, plan_id, "planning").await;
+}
+
+async fn mock_no_authoring_plan(server: &MockServer, session_id: &str) {
     Mock::given(method("GET"))
         .and(path("/plans"))
         .and(header("authorization", "Bearer token"))
         .and(query_param("session_id", session_id))
-        .and(query_param("phase", "planning"))
+        .and(query_param("active_session_only", "true"))
         .and(query_param("limit", "1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"plans": []})))
         .mount(server)
@@ -914,6 +923,34 @@ async fn write_file_is_blocked_while_plan_mode_is_authoring() {
     assert!(
         !target.exists(),
         "the guard must short-circuit BEFORE any file is created on disk"
+    );
+}
+
+#[tokio::test]
+async fn refining_plan_still_blocks_writes_during_authoring() {
+    let server = MockServer::start().await;
+    mock_authoring_plan_present(&server, "sess-refining", "plan-r", "refining").await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let canary = temp.path().join("canary.txt");
+    let executor = ToolExecutor::new(temp.path().to_path_buf())
+        .with_active_session_id("sess-refining")
+        .with_cloud(server.uri(), "token");
+
+    let result = executor
+        .execute(
+            "bash",
+            &json!({"command": format!("touch {}", canary.display())}),
+        )
+        .await;
+
+    assert!(
+        result.contains("blocked while plan mode is active"),
+        "refining plans remain authoring-active until approval. Got: {result}"
+    );
+    assert!(
+        !canary.exists(),
+        "authoring guard must stop the shell before side effects leak"
     );
 }
 
@@ -969,6 +1006,46 @@ async fn read_only_tools_are_not_blocked_while_plan_mode_is_authoring() {
     assert!(
         result.contains("hello"),
         "read_file must return the file contents. Got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn exit_plan_mode_finds_active_refining_cloud_plan() {
+    let server = MockServer::start().await;
+    mock_authoring_plan_present(&server, "sess-refining", "plan-r", "refining").await;
+    Mock::given(method("POST"))
+        .and(path("/plans/plan-r/exit-plan-mode"))
+        .and(header("authorization", "Bearer token"))
+        .and(body_json(json!({
+            "approved": true,
+            "plan_md": "1. Ship auth"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "plan_id": "plan-r",
+            "phase": "refining"
+        })))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(temp.path().to_path_buf())
+        .with_active_session_id("sess-refining")
+        .with_cloud(server.uri(), "token");
+
+    let result = executor
+        .execute(
+            "exit_plan_mode",
+            &json!({"approved": true, "plan": "1. Ship auth"}),
+        )
+        .await;
+
+    assert!(
+        result.starts_with("Exited plan mode."),
+        "refining active plans must exit through the cloud path. Got: {result}"
+    );
+    assert!(
+        result.contains("plan-r"),
+        "result should mention the resolved plan id. Got: {result}"
     );
 }
 
@@ -1030,7 +1107,7 @@ async fn writes_are_unblocked_after_exit_plan_mode_approved() {
 #[tokio::test]
 async fn write_guard_is_inactive_when_no_planning_plan_exists() {
     let server = MockServer::start().await;
-    mock_no_planning_plan(&server, "sess-1").await;
+    mock_no_authoring_plan(&server, "sess-1").await;
 
     let temp = tempfile::tempdir().unwrap();
     let target = temp.path().join("note.txt");

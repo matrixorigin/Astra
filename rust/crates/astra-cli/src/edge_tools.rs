@@ -1213,7 +1213,8 @@ impl ToolExecutor {
 
     // ─── Plan-mode write guard (parity with server_tool_executor) ───────────
     //
-    // While a plan is in `phase=planning`, world-mutating tools must be
+    // While a plan is in authoring (`phase=planning` or `phase=refining`),
+    // world-mutating tools must be
     // short-circuited so the model cannot bypass authoring by routing
     // writes through the local executor. The check fails open when the
     // CLI is offline / unauthenticated — without a cloud binding there
@@ -1239,31 +1240,57 @@ impl ToolExecutor {
         active
     }
 
-    async fn recompute_plan_mode_authoring_for_session(&self, session_id: &str) -> bool {
+    fn cloud_plan_summary_status<'a>(&self, plan: &'a Value) -> Option<&'a str> {
+        plan.get("status")
+            .or_else(|| plan.get("phase"))
+            .and_then(Value::as_str)
+    }
+
+    fn cloud_plan_summary_id(&self, plan: &Value) -> Option<String> {
+        plan.get("plan_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    fn cloud_plan_is_authoring(&self, plan: &Value) -> bool {
+        matches!(
+            self.cloud_plan_summary_status(plan),
+            Some("planning" | "refining")
+        )
+    }
+
+    async fn lookup_active_cloud_plan_summary(&self, session_id: &str) -> Option<Value> {
         let Some(token) = self.cloud_token() else {
-            return false;
+            return None;
         };
         let Ok(client) = self.remote_plan_client() else {
-            return false;
+            return None;
         };
         let plans = match client
             .get_plans_query_json(
                 &token,
                 &[
                     ("session_id", session_id.to_string()),
-                    ("phase", "planning".to_string()),
+                    ("active_session_only", "true".to_string()),
                     ("limit", "1".to_string()),
                 ],
             )
             .await
         {
             Ok(value) => value,
-            Err(_) => return false, // fail open: a transient lookup error must not block writes
+            Err(_) => return None,
         };
         plans
             .get("plans")
             .and_then(Value::as_array)
-            .is_some_and(|arr| !arr.is_empty())
+            .and_then(|arr| arr.first())
+            .cloned()
+    }
+
+    async fn recompute_plan_mode_authoring_for_session(&self, session_id: &str) -> bool {
+        self.lookup_active_cloud_plan_summary(session_id)
+            .await
+            .is_some_and(|plan| self.cloud_plan_is_authoring(&plan))
     }
 
     pub(crate) async fn invalidate_plan_mode_cache(&self) {
@@ -1599,7 +1626,7 @@ impl ToolExecutor {
             .map(str::to_string);
         let explicit_approved = args.get("approved").and_then(Value::as_bool);
 
-        let cloud_plan_id = self.lookup_active_planning_plan_id().await;
+        let cloud_plan_id = self.lookup_active_authoring_cloud_plan_id().await;
         match cloud_plan_id {
             Some(plan_id) => {
                 self.exit_plan_mode_cloud_path(plan_id, plan_markdown.as_deref(), explicit_approved)
@@ -1612,34 +1639,22 @@ impl ToolExecutor {
         }
     }
 
-    /// Best-effort lookup for an active `phase=planning` cloud plan
+    /// Best-effort lookup for an active authoring cloud plan
     /// for the current session. Returns `None` whenever any of the
     /// prerequisites for the cloud workflow are absent (no session,
     /// no token, no client, no row, network failure). The caller
     /// uses `None` as the signal to fall back to the purely local
     /// Shift+Tab plan-mode flow.
-    async fn lookup_active_planning_plan_id(&self) -> Option<String> {
+    async fn lookup_active_authoring_cloud_plan_id(&self) -> Option<String> {
         let session_id = self.active_session_id().filter(|sid| !sid.is_empty())?;
-        let token = self.cloud_token()?;
-        let client = self.remote_plan_client().ok()?;
-        let plans = client
-            .get_plans_query_json(
-                &token,
-                &[
-                    ("session_id", session_id),
-                    ("phase", "planning".to_string()),
-                    ("limit", "1".to_string()),
-                ],
-            )
-            .await
-            .ok()?;
-        plans
-            .get("plans")
-            .and_then(Value::as_array)
-            .and_then(|plans| plans.first())
-            .and_then(|plan| plan.get("plan_id"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
+        let plan = self
+            .lookup_active_cloud_plan_summary(session_id.as_str())
+            .await?;
+        if self.cloud_plan_is_authoring(&plan) {
+            self.cloud_plan_summary_id(&plan)
+        } else {
+            None
+        }
     }
 
     /// Cloud workflow exit path — there is a `phase=planning` row

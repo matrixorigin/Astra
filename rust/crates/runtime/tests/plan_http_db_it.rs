@@ -860,6 +860,96 @@ async fn exit_plan_mode_approved_clears_session_active_plan_id() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn list_plans_active_session_only_returns_true_active_plan() {
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
+    let session_id = format!("sit-active-list-{}", Uuid::new_v4().simple());
+    ensure_session(&pool, &session_id).await;
+
+    let (active_plan_id, _) =
+        seed_plan_with_subtasks(&app, &pool, "http-active-plan", &["s1"]).await;
+    sqlx::query("UPDATE plans SET session_id = ? WHERE plan_id = ?")
+        .bind(&session_id)
+        .bind(&active_plan_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (_, get_body) = request_json(
+        app.clone(),
+        "GET",
+        &format!("/plans/{active_plan_id}"),
+        None,
+    )
+    .await;
+    let v = get_body["version"].as_u64().unwrap();
+    let (status, body) = request_json(
+        app.clone(),
+        "POST",
+        &format!("/plans/{active_plan_id}/execute"),
+        Some(json!({
+            "session_id": session_id,
+            "step_by_step": true,
+            "expected_version": v
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "execute must pin the active plan: {body}"
+    );
+
+    let (newer_plan_id, _) = seed_plan_with_subtasks(&app, &pool, "http-newer-plan", &["s2"]).await;
+    sqlx::query("UPDATE plans SET session_id = ? WHERE plan_id = ?")
+        .bind(&session_id)
+        .bind(&newer_plan_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, ordinary) = request_json(
+        app.clone(),
+        "GET",
+        &format!("/plans?session_id={session_id}&limit=1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{ordinary}");
+    assert_eq!(
+        ordinary["plans"][0]["plan_id"].as_str(),
+        Some(newer_plan_id.as_str()),
+        "ordinary session list should still be recency-ordered for UI browsing"
+    );
+
+    let (status, active_only) = request_json(
+        app.clone(),
+        "GET",
+        &format!("/plans?session_id={session_id}&active_session_only=true&limit=1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{active_only}");
+    let plans = active_only["plans"].as_array().expect("plans array");
+    assert_eq!(plans.len(), 1, "{active_only}");
+    assert_eq!(
+        plans[0]["plan_id"].as_str(),
+        Some(active_plan_id.as_str()),
+        "active_session_only must return the session's true active plan, not the newest row"
+    );
+    assert_eq!(
+        plans[0]["status"].as_str(),
+        Some("refining"),
+        "active_session_only should surface the active plan's inferred phase"
+    );
+
+    cleanup_plan(&pool, &newer_plan_id).await;
+    cleanup_plan(&pool, &active_plan_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn exit_plan_mode_rejected_leaves_active_plan_id_pinned() {
     // Control: rejecting keeps the plan pinned so the next authoring pass
     // still benefits from the write guard.
