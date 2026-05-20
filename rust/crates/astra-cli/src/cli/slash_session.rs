@@ -9,7 +9,6 @@ use astra_turn_core::decision_explainer::{DriftDetector, FocusDriftAnalysis};
 use chrono::{DateTime, Utc};
 
 use super::*;
-use crate::cli_utils::{fetch_session_trace_state, update_session_trace_state};
 use crate::session_runtime;
 use crate::tool_call_groups;
 
@@ -728,24 +727,7 @@ pub(super) fn resolve_journal_target_session(
     }
 }
 
-async fn resolve_remote_trace_target(
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    state: &SessionState,
-    requested: &str,
-) -> Result<String, String> {
-    match requested.trim() {
-        value if !value.is_empty() => Ok(value.to_string()),
-        _ => match state.session_id.as_deref() {
-            Some(session_id) if !session_id.trim().is_empty() => Ok(session_id.to_string()),
-            _ => validated_resumable_last_session_id(api, profile)
-                .await
-                .ok_or_else(|| {
-                    "  No active session and no recent resumable session is available.".to_string()
-                }),
-        },
-    }
-}
+
 
 pub(super) async fn handle_session_command(
     arg: &str,
@@ -836,54 +818,12 @@ pub(super) async fn handle_session_command(
             eprintln!();
             eprintln!(
                 "  {}",
-                "Subcommands: history · context · errors · export · list [--here|--project|--active|search] · fork · cleanup · verify · drift · trace [on|off|status]"
+                "Subcommands: history · context · errors · export · list [--here|--project|--active|search] · fork · cleanup · verify · drift"
                     .dim()
             );
             eprintln!();
         }
-        "trace" => {
-            let Some(tok) = token else {
-                eprintln!("{}", "  Not logged in. Use /login.".yellow());
-                return;
-            };
-            let (mode, session_arg) = match sub_arg.find(char::is_whitespace) {
-                Some(pos) => (sub_arg[..pos].trim(), sub_arg[pos..].trim()),
-                None => (sub_arg.trim(), ""),
-            };
-            let session_id =
-                match resolve_remote_trace_target(api, profile, state, session_arg).await {
-                    Ok(session_id) => session_id,
-                    Err(msg) => {
-                        eprintln!("{msg}");
-                        return;
-                    }
-                };
-            let trace_state = match mode {
-                "" | "status" => fetch_session_trace_state(api, Some(tok), &session_id).await,
-                "on" => update_session_trace_state(api, Some(tok), &session_id, true).await,
-                "off" => update_session_trace_state(api, Some(tok), &session_id, false).await,
-                _ => {
-                    eprintln!(
-                        "{}",
-                        "  Usage: /session trace [status|on|off] [session_id]".dim()
-                    );
-                    return;
-                }
-            };
-            match trace_state {
-                Ok(trace_state) => {
-                    let icon = if trace_state.enabled { "🔎" } else { "○" };
-                    let state_label = if trace_state.enabled { "ON" } else { "OFF" };
-                    eprintln!(
-                        "  {} Full trace {} for session {}",
-                        icon.magenta(),
-                        state_label.magenta(),
-                        trace_state.session_id.as_str().magenta()
-                    );
-                }
-                Err(err) => eprintln!("  {} {}", theme::icon_err(), err.red()),
-            }
-        }
+
         "fork" => {
             let (parent_id, label) = match parse_fork_source(sub_arg, state) {
                 Ok(x) => x,
@@ -2414,7 +2354,7 @@ pub(super) async fn handle_session_command(
             eprintln!("{}", format!("  Unknown subcommand: {other}").red());
             eprintln!(
                 "  {}",
-                "Usage: /session [list|switch|history|context|errors|export|fork|cleanup|verify|drift|trace|adaptive|analyze] …"
+                "Usage: /session [list|switch|history|context|errors|export|fork|cleanup|verify|drift|adaptive|analyze] …"
                     .dim()
             );
         }
@@ -6029,49 +5969,6 @@ mod resume_tests {
         assert!(summary.contains("verified=1/2"));
         assert!(summary.contains("subtask=\"Verify restore contract\""));
         assert!(summary.contains("stage=awaiting_verification"));
-    }
-
-    #[tokio::test]
-    async fn session_trace_on_uses_active_session_and_preserves_metadata() {
-        let session_id = format!("trace-active-{}", uuid::Uuid::new_v4());
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path(format!("/sessions/{session_id}")))
-            .and(header_exists("authorization"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "session_id": session_id,
-                "metadata": {
-                    "owner": "alice"
-                }
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("PUT"))
-            .and(path(format!("/sessions/{session_id}")))
-            .and(header_exists("authorization"))
-            .and(body_json(serde_json::json!({
-                "metadata": {
-                    "owner": "alice",
-                    "full_llm_capture": true
-                }
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "session_id": session_id,
-                "metadata": {
-                    "owner": "alice",
-                    "full_llm_capture": true
-                }
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let mut state = SessionState::default();
-        state.set_session_id(session_id.clone());
-
-        handle_session_command("trace on", &api, None, &mut state, Some("test-token")).await;
     }
 
     // ── Fork CSL integration tests ──────────────────────────────────────

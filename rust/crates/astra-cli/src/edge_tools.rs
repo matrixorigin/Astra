@@ -1242,6 +1242,8 @@ impl ToolExecutor {
 
     fn cloud_plan_summary_status<'a>(&self, plan: &'a Value) -> Option<&'a str> {
         plan.get("status")
+            // Older server payloads used `phase`; keep accepting that shape so
+            // newer CLIs can talk to pre-migration servers during rolling upgrades.
             .or_else(|| plan.get("phase"))
             .and_then(Value::as_str)
     }

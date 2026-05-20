@@ -811,8 +811,8 @@ pub(crate) enum BugSubcommand {
 
 #[derive(Subcommand, Debug)]
 #[command(
-    after_help = "Examples:\n  astra session list\n  astra session show 550e8400-e29b-41d4-a716-446655440000\n  astra session trace on\n  astra session trace status 550e8400-e29b-41d4-a716-446655440000\n  astra session capture latest\n  astra session capture download --output llm_capture.json"
-)]
+    after_help = "Examples:\n  astra session list\n  astra session show 550e8400-e29b-41d4-a716-446655440000\n  astra session capture latest\n  astra session capture download --output llm_capture.json"
+)]]
 pub(crate) enum SessionCmd {
     /// List sessions
     List(SessionListArgs),
@@ -825,9 +825,6 @@ pub(crate) enum SessionCmd {
     /// Inspect or download session-scoped LLM captures
     #[command(subcommand)]
     Capture(SessionCaptureCmd),
-    /// Toggle or inspect per-session full LLM request/response capture
-    #[command(subcommand)]
-    Trace(SessionTraceCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -836,22 +833,6 @@ pub(crate) enum SessionCaptureCmd {
     Latest(SessionCaptureLatestArgs),
     /// Download the latest capture for a session to a JSON file
     Download(SessionCaptureDownloadArgs),
-}
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum SessionTraceCmd {
-    /// Enable full LLM request/response capture for a session
-    On(SessionTraceArgs),
-    /// Disable full LLM request/response capture for a session
-    Off(SessionTraceArgs),
-    /// Show whether full LLM request/response capture is enabled for a session
-    Status(SessionTraceArgs),
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct SessionTraceArgs {
-    /// Session id or unique prefix (defaults to the most recent resumable session)
-    pub session_id: Option<String>,
 }
 
 #[derive(Args, Debug)]

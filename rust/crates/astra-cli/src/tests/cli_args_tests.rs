@@ -856,38 +856,6 @@ fn cli_session_capture_download_parses_output() {
     }
 }
 
-#[test]
-fn cli_session_trace_on_parses() {
-    let cli = Cli::try_parse_from(["astra", "session", "trace", "on"]).unwrap();
-    match cli.command {
-        Some(Command::Session(SessionCmd::Trace(SessionTraceCmd::On(args)))) => {
-            assert!(args.session_id.is_none());
-        }
-        other => panic!("unexpected command: {other:?}"),
-    }
-}
-
-#[test]
-fn cli_session_trace_status_parses_session_id() {
-    let cli = Cli::try_parse_from([
-        "astra",
-        "session",
-        "trace",
-        "status",
-        "550e8400-e29b-41d4-a716-446655440000",
-    ])
-    .unwrap();
-    match cli.command {
-        Some(Command::Session(SessionCmd::Trace(SessionTraceCmd::Status(args)))) => {
-            assert_eq!(
-                args.session_id.as_deref(),
-                Some("550e8400-e29b-41d4-a716-446655440000")
-            );
-        }
-        other => panic!("unexpected command: {other:?}"),
-    }
-}
-
 // ── --max-budget tests ──
 
 #[test]
@@ -1070,7 +1038,7 @@ fn session_state_auto_approve_env_activates_auto_mode() {
 
 #[tokio::test]
 async fn task_run_stores_result_in_checkpoint() {
-    use astra_services::{TaskCreateRequest, TaskService, task_orchestrator::TaskCheckpoint};
+    use astra_services::{task_orchestrator::TaskCheckpoint, TaskCreateRequest, TaskService};
 
     // Use a temp dir for LocalTaskService
     let tmp = tempfile::tempdir().unwrap();
@@ -1162,11 +1130,9 @@ fn resolve_system_prompt_at_file_reads_content() {
 fn resolve_system_prompt_at_file_not_found() {
     let result = resolve_system_prompt("@/nonexistent/path/prompt.txt".to_string());
     assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .contains("cannot read system prompt file")
-    );
+    assert!(result
+        .unwrap_err()
+        .contains("cannot read system prompt file"));
 }
 
 #[test]
@@ -1229,11 +1195,9 @@ fn resolve_system_prompt_at_file_permission_denied() {
     let result = resolve_system_prompt(format!("@{}", path.display()));
     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
     assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .contains("cannot read system prompt file")
-    );
+    assert!(result
+        .unwrap_err()
+        .contains("cannot read system prompt file"));
 }
 
 // ── project instructions tests ──

@@ -1056,6 +1056,19 @@ async fn list_plans_active_session_only_hides_other_users_active_plan() {
         .await
         .unwrap();
 
+    let (status, owner_view) = request_json_as_user(
+        app.clone(),
+        owner_id.as_str(),
+        "GET",
+        &format!("/plans?session_id={session_id}&active_session_only=true&limit=1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{owner_view}");
+    let owner_plans = owner_view["plans"].as_array().expect("plans array");
+    assert_eq!(owner_plans.len(), 1, "{owner_view}");
+    assert_eq!(owner_plans[0]["plan_id"].as_str(), Some(plan_id.as_str()));
+
     let (status, body) = request_json_as_user(
         app.clone(),
         viewer_id.as_str(),
@@ -1072,6 +1085,21 @@ async fn list_plans_active_session_only_hides_other_users_active_plan() {
     );
 
     cleanup_plan(&pool, &plan_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn list_plans_active_session_only_requires_session_id() {
+    let Some((app, _pool)) = setup_app().await else {
+        return;
+    };
+
+    let (status, body) = request_json(app, "GET", "/plans?active_session_only=true", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"].as_str(),
+        Some("active_session_only requires session_id")
+    );
 }
 
 #[tokio::test]

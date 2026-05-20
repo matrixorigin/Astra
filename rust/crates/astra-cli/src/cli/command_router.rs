@@ -1,6 +1,5 @@
 use super::*;
 use crate::chat_turn::is_auth_error;
-use crate::cli_utils::{fetch_session_trace_state, update_session_trace_state};
 use crate::permission_manager::PermissionMode;
 use astra_thin_client::paths;
 use clap::CommandFactory;
@@ -636,12 +635,11 @@ async fn execute_headless_task_body(
     );
     state_map.insert(
         "background_agent_results".to_string(),
-        serde_json::json!(
-            sr.background_agent_results
-                .iter()
-                .map(|(id, text)| serde_json::json!({"agent_id": id, "result": text}))
-                .collect::<Vec<_>>()
-        ),
+        serde_json::json!(sr
+            .background_agent_results
+            .iter()
+            .map(|(id, text)| serde_json::json!({"agent_id": id, "result": text}))
+            .collect::<Vec<_>>()),
     );
     if let Err(e) = svc
         .save_checkpoint(
@@ -703,12 +701,11 @@ async fn execute_headless_task_body(
             );
             obj.insert(
                 "background_agent_results".to_string(),
-                serde_json::json!(
-                    sr.background_agent_results
-                        .iter()
-                        .map(|(id, text)| serde_json::json!({"agent_id": id, "result": text}))
-                        .collect::<Vec<_>>()
-                ),
+                serde_json::json!(sr
+                    .background_agent_results
+                    .iter()
+                    .map(|(id, text)| serde_json::json!({"agent_id": id, "result": text}))
+                    .collect::<Vec<_>>()),
             );
         }
         println!(
@@ -1264,8 +1261,8 @@ impl Drop for AbortGuard {
 #[cfg(test)]
 mod abort_guard_tests {
     use super::AbortGuard;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     /// Proves the guard aborts the spawned task on drop. Without the
@@ -1798,7 +1795,7 @@ pub(crate) fn permission_mode_display_label(mode: PermissionMode) -> &'static st
 
 #[cfg(test)]
 mod permission_mode_display_tests {
-    use super::{PermissionMode, permission_mode_display_label};
+    use super::{permission_mode_display_label, PermissionMode};
 
     #[test]
     fn accept_edits_displays_as_kebab_case() {
@@ -2510,14 +2507,11 @@ pub(super) async fn execute_cli_command(
                     obj.insert("context_ms".to_string(), serde_json::json!(sr.context_ms));
                     obj.insert(
                         "background_agent_results".to_string(),
-                        serde_json::json!(
-                            sr.background_agent_results
-                                .iter()
-                                .map(
-                                    |(id, text)| serde_json::json!({"agent_id": id, "result": text})
-                                )
-                                .collect::<Vec<_>>()
-                        ),
+                        serde_json::json!(sr
+                            .background_agent_results
+                            .iter()
+                            .map(|(id, text)| serde_json::json!({"agent_id": id, "result": text}))
+                            .collect::<Vec<_>>()),
                     );
                 }
                 println!(
@@ -2667,56 +2661,6 @@ pub(super) async fn execute_cli_command(
                 args.artifact_kind,
                 session_id,
                 output_path.display()
-            );
-            Ok(ExitCode::Success)
-        }
-
-        Some(Command::Session(SessionCmd::Trace(SessionTraceCmd::Status(args)))) => {
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let session_id =
-                resolve_remote_session_id(api, profile.as_deref(), args.session_id.as_deref())
-                    .await?;
-            let trace_state = fetch_session_trace_state(api, Some(&token), &session_id).await?;
-            print_json_or_raw(
-                &serde_json::json!({
-                    "session_id": trace_state.session_id,
-                    "full_llm_capture": trace_state.enabled,
-                })
-                .to_string(),
-            );
-            Ok(ExitCode::Success)
-        }
-
-        Some(Command::Session(SessionCmd::Trace(SessionTraceCmd::On(args)))) => {
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let session_id =
-                resolve_remote_session_id(api, profile.as_deref(), args.session_id.as_deref())
-                    .await?;
-            let trace_state =
-                update_session_trace_state(api, Some(&token), &session_id, true).await?;
-            print_json_or_raw(
-                &serde_json::json!({
-                    "session_id": trace_state.session_id,
-                    "full_llm_capture": trace_state.enabled,
-                })
-                .to_string(),
-            );
-            Ok(ExitCode::Success)
-        }
-
-        Some(Command::Session(SessionCmd::Trace(SessionTraceCmd::Off(args)))) => {
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let session_id =
-                resolve_remote_session_id(api, profile.as_deref(), args.session_id.as_deref())
-                    .await?;
-            let trace_state =
-                update_session_trace_state(api, Some(&token), &session_id, false).await?;
-            print_json_or_raw(
-                &serde_json::json!({
-                    "session_id": trace_state.session_id,
-                    "full_llm_capture": trace_state.enabled,
-                })
-                .to_string(),
             );
             Ok(ExitCode::Success)
         }
@@ -4254,12 +4198,10 @@ mod mcp_cli_tests {
 
         // Verify it's gone
         let config = read_mcp_config(&path).unwrap();
-        assert!(
-            !config["mcpServers"]
-                .as_object()
-                .unwrap()
-                .contains_key("test-server")
-        );
+        assert!(!config["mcpServers"]
+            .as_object()
+            .unwrap()
+            .contains_key("test-server"));
     }
 
     #[test]
