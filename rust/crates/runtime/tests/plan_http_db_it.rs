@@ -1,7 +1,8 @@
 //! Live HTTP integration tests for the plan REST surface.
 //!
 //! Exercises the real Axum router + real MatrixOne via `CloudPlanRepository`,
-//! with `StubAuthService` supplying `user_id="test-user"` on any bearer token.
+//! with a bearer-driven auth stub so tests can cover both owner and cross-user
+//! authorization paths.
 //!
 //! Each test:
 //!   - Builds an `AppState` with the real DB-backed plan repo
@@ -17,12 +18,18 @@ use std::sync::Arc;
 
 use astra_core::{MatrixOneSettings, SharedPool};
 use astra_plan::CloudPlanRepository;
-use astra_runtime::{AppState, HealthChecker, ServiceInfo, build_app};
-use astra_services::ensure_core_schema;
+use astra_runtime::{AppState, ErrorResponse, HealthChecker, ServiceInfo, build_app};
+use astra_services::{
+    auth::{
+        AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
+        AuthTokenRecord, AuthUserRecord,
+    },
+    ensure_core_schema,
+};
 use async_trait::async_trait;
 use axum::{
-    Router, body,
-    http::{Request, StatusCode},
+    Json, Router, body,
+    http::{HeaderMap, Request, StatusCode},
 };
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -79,18 +86,70 @@ async fn setup_app() -> Option<(Router, sqlx::Pool<sqlx::MySql>)> {
         .clone();
     let pool = shared.get().clone();
     let state = AppState::new(ServiceInfo::default(), Arc::new(HealthyStub))
-        .with_auth_service(Arc::new(astra_services::auth::StubAuthService))
+        .with_auth_service(Arc::new(BearerAuthService))
         .with_plan_repository(Arc::new(CloudPlanRepository::new(pool.clone())));
     Some((build_app(state), pool))
 }
 
 fn auth_bearer() -> &'static str {
-    // StubAuthService accepts any bearer and returns user_id="test-user".
-    "test-token"
+    "test-user"
 }
 
-async fn request_json(
+#[derive(Clone)]
+struct BearerAuthService;
+
+#[async_trait]
+impl AuthService for BearerAuthService {
+    async fn register(
+        &self,
+        _request: AuthRegisterRequestData,
+    ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+        unreachable!()
+    }
+
+    async fn login(
+        &self,
+        _request: AuthLoginRequestData,
+    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+        unreachable!()
+    }
+
+    async fn refresh(
+        &self,
+        _request: AuthRefreshRequestData,
+    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+        unreachable!()
+    }
+
+    async fn logout(
+        &self,
+        _request: AuthRefreshRequestData,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        unreachable!()
+    }
+
+    async fn current_user(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+        let bearer = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("test-user");
+        Ok(AuthUserRecord {
+            user_id: bearer.to_string(),
+            username: bearer.to_string(),
+            email: format!("{bearer}@example.test"),
+            display_name: None,
+        })
+    }
+}
+
+async fn request_json_as_user(
     app: Router,
+    bearer: &str,
     method: &str,
     path: &str,
     body_json: Option<Value>,
@@ -103,7 +162,7 @@ async fn request_json(
     let mut builder = Request::builder()
         .method(method)
         .uri(path)
-        .header("authorization", format!("Bearer {}", auth_bearer()));
+        .header("authorization", format!("Bearer {bearer}"));
     if has_body {
         builder = builder.header("content-type", "application/json");
     }
@@ -124,6 +183,15 @@ async fn request_json(
     (status, json)
 }
 
+async fn request_json(
+    app: Router,
+    method: &str,
+    path: &str,
+    body_json: Option<Value>,
+) -> (StatusCode, Value) {
+    request_json_as_user(app, auth_bearer(), method, path, body_json).await
+}
+
 async fn cleanup_plan(pool: &sqlx::Pool<sqlx::MySql>, plan_id: &str) {
     let _ = sqlx::query("DELETE FROM plan_step_runs WHERE plan_id = ?")
         .bind(plan_id)
@@ -140,12 +208,17 @@ async fn cleanup_plan(pool: &sqlx::Pool<sqlx::MySql>, plan_id: &str) {
 }
 
 async fn ensure_session(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
+    ensure_session_for_user(pool, session_id, "test-user").await;
+}
+
+async fn ensure_session_for_user(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str, user_id: &str) {
     let _ = sqlx::query(
         "INSERT IGNORE INTO agent_sessions \
              (session_id, user_id, status, event_count, created_at, updated_at, last_active_at) \
-         VALUES (?, 'test-user', 'active', 0, NOW(6), NOW(6), NOW(6))",
+         VALUES (?, ?, 'active', 0, NOW(6), NOW(6), NOW(6))",
     )
     .bind(session_id)
+    .bind(user_id)
     .execute(pool)
     .await;
 }
@@ -946,6 +1019,59 @@ async fn list_plans_active_session_only_returns_true_active_plan() {
 
     cleanup_plan(&pool, &newer_plan_id).await;
     cleanup_plan(&pool, &active_plan_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn list_plans_active_session_only_hides_other_users_active_plan() {
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
+    let owner_id = format!("owner-{}", Uuid::new_v4().simple());
+    let viewer_id = format!("viewer-{}", Uuid::new_v4().simple());
+    let session_id = format!("sit-active-hidden-{}", Uuid::new_v4().simple());
+    ensure_session_for_user(&pool, &session_id, &owner_id).await;
+
+    let (status, created) = request_json_as_user(
+        app.clone(),
+        owner_id.as_str(),
+        "POST",
+        "/plans",
+        Some(json!({ "goal": "http-foreign-active-plan" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let plan_id = created["plan_id"].as_str().expect("plan_id").to_string();
+
+    sqlx::query("UPDATE plans SET session_id = ? WHERE plan_id = ?")
+        .bind(&session_id)
+        .bind(&plan_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_sessions SET active_plan_id = ? WHERE session_id = ?")
+        .bind(&plan_id)
+        .bind(&session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = request_json_as_user(
+        app.clone(),
+        viewer_id.as_str(),
+        "GET",
+        &format!("/plans?session_id={session_id}&active_session_only=true&limit=1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let plans = body["plans"].as_array().expect("plans array");
+    assert!(
+        plans.is_empty(),
+        "cross-user active_session_only lookup must not leak another user's active plan: {body}"
+    );
+
+    cleanup_plan(&pool, &plan_id).await;
 }
 
 #[tokio::test]

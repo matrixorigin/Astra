@@ -1260,9 +1260,7 @@ impl ToolExecutor {
     }
 
     async fn lookup_active_cloud_plan_summary(&self, session_id: &str) -> Option<Value> {
-        let Some(token) = self.cloud_token() else {
-            return None;
-        };
+        let token = self.cloud_token()?;
         let Ok(client) = self.remote_plan_client() else {
             return None;
         };
