@@ -89,11 +89,4 @@ pub(crate) trait BottomPaneView: Send {
     fn reserve_status_footer(&self) -> bool {
         false
     }
-
-    /// Render this view as a draw-layer overlay instead of letting it
-    /// determine the inline viewport height. Use for large read-only
-    /// panels that must not resize the native terminal scrollback area.
-    fn render_as_overlay(&self) -> bool {
-        false
-    }
 }

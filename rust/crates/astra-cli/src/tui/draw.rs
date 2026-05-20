@@ -9,7 +9,7 @@
 //! See `ARCHITECTURE.md` for the visual-hierarchy grammar.
 
 use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Clear, Paragraph, Widget};
 
 use super::bottom_pane::{BottomPane, footer::Footer};
 use super::render::renderable::{FlexRenderable, Renderable, RenderableItem};
@@ -456,7 +456,6 @@ pub(crate) fn do_draw(
     ));
     let sep_renderable = RenderableItem::Owned(Box::new(sep_line));
 
-    let overlay_active = bottom_pane.has_overlay_view();
     let bp_renderable = BottomPaneRenderable(bottom_pane);
     let bp_item = RenderableItem::Owned(Box::new(bp_renderable) as Box<dyn Renderable>);
 
@@ -503,29 +502,15 @@ pub(crate) fn do_draw(
     }
     flex.push(0, bp_item);
 
-    let total_h = if overlay_active {
-        guard
-            .terminal
-            .size()
-            .map(|s| s.height)
-            .unwrap_or_else(|_| flex.desired_height(width))
-    } else {
-        flex.desired_height(width)
-    };
-
-    guard
-        .set_alternate_screen_overlay(overlay_active)
-        .map_err(|e| format!("alternate screen overlay: {e}"))?;
+    let total_h = flex.desired_height(width);
 
     guard
         .draw(total_h, |frame| {
             let area = frame.area();
+            Clear.render(area, frame.buffer_mut());
             flex.render(area, frame.buffer_mut());
-            if overlay_active {
-                bottom_pane.render_overlay(area, frame.buffer_mut());
-            }
 
-            if !overlay_active && let Some((x, y)) = flex.cursor_pos(area) {
+            if let Some((x, y)) = flex.cursor_pos(area) {
                 frame.set_cursor_position((x, y));
             }
         })
@@ -533,7 +518,7 @@ pub(crate) fn do_draw(
     Ok(())
 }
 
-struct BottomPaneRenderable<'a>(&'a BottomPane);
+struct BottomPaneRenderable<'a>(&'a mut BottomPane);
 
 impl<'a> Renderable for BottomPaneRenderable<'a> {
     fn render(&self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {

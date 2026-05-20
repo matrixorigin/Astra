@@ -295,10 +295,6 @@ impl BottomPaneView for TranscriptView {
         None
     }
 
-    fn render_as_overlay(&self) -> bool {
-        true
-    }
-
     fn on_ctrl_c(&mut self) -> CancellationEvent {
         self.completed = true;
         CancellationEvent::Consumed
@@ -333,21 +329,6 @@ mod tests {
         // 50-row terminal → 80% budget = 40 → minus chrome (4) = 36
         let v = TranscriptView::new(lines(100), 50);
         assert_eq!(v.max_visible, 36);
-    }
-
-    #[test]
-    fn transcript_overlay_does_not_inflate_bottom_pane_height() {
-        let mut pane = crate::tui::bottom_pane::BottomPane::new();
-        let before = pane.desired_height(80);
-
-        pane.push_view(Box::new(TranscriptView::new(lines(100), 50)));
-
-        assert!(pane.has_overlay_view());
-        assert_eq!(
-            pane.desired_height(80),
-            before,
-            "transcript must not resize the native scrollback viewport"
-        );
     }
 
     #[test]

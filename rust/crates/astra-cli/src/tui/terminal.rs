@@ -5,13 +5,9 @@ use crossterm::{
     event::{DisableBracketedPaste, EnableBracketedPaste},
     execute, queue,
     style::Print,
-    terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-        is_raw_mode_enabled,
-    },
+    terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled},
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Rect;
 use ratatui::text::Line;
 
 use super::custom_terminal;
@@ -22,8 +18,6 @@ pub(crate) struct TerminalGuard {
     pub terminal: CustomTerminal,
     pub pending_history: Vec<Line<'static>>,
     is_zellij: bool,
-    alternate_screen_active: bool,
-    saved_main_viewport_area: Option<Rect>,
 }
 
 struct RawModeGuard;
@@ -59,8 +53,6 @@ impl TerminalGuard {
             terminal,
             pending_history: Vec::new(),
             is_zellij,
-            alternate_screen_active: false,
-            saved_main_viewport_area: None,
         };
         std::mem::forget(early_guard);
         Ok(guard)
@@ -83,30 +75,7 @@ impl TerminalGuard {
         self.pending_history.extend(lines);
     }
 
-    pub fn set_alternate_screen_overlay(&mut self, enabled: bool) -> io::Result<()> {
-        if enabled == self.alternate_screen_active {
-            return Ok(());
-        }
-
-        if enabled {
-            self.saved_main_viewport_area = Some(self.terminal.viewport_area);
-            execute!(self.terminal.backend_mut(), EnterAlternateScreen)?;
-            self.terminal.set_viewport_area(Rect::new(0, 0, 0, 0));
-            self.terminal.invalidate_viewport();
-            self.alternate_screen_active = true;
-        } else {
-            execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
-            if let Some(area) = self.saved_main_viewport_area.take() {
-                self.terminal.set_viewport_area(area);
-            }
-            self.terminal.invalidate_viewport();
-            self.alternate_screen_active = false;
-        }
-
-        Ok(())
-    }
-
-    /// Draw the viewport using the same high-level ordering as Codex:
+    /// Draw the viewport — matches Codex tui.rs::draw() sequence:
     /// 1. update_inline_viewport (scroll if height changed, clear if viewport moved)
     /// 2. flush_pending_history (insert above viewport)
     /// 3. invalidate_viewport only when needed (viewport moved or Zellij flush)
@@ -119,15 +88,11 @@ impl TerminalGuard {
         stdout().sync_update(|_| {
             let terminal = &mut self.terminal;
 
-            let mut needs_full_repaint = Self::update_inline_viewport(terminal, height)?;
+            let mut needs_full_repaint =
+                Self::update_inline_viewport(terminal, height, self.is_zellij)?;
 
-            if !self.alternate_screen_active {
-                needs_full_repaint |= Self::flush_pending_history(
-                    terminal,
-                    &mut self.pending_history,
-                    self.is_zellij,
-                )?;
-            }
+            needs_full_repaint |=
+                Self::flush_pending_history(terminal, &mut self.pending_history, self.is_zellij)?;
 
             if needs_full_repaint {
                 terminal.invalidate_viewport();
@@ -145,13 +110,15 @@ impl TerminalGuard {
         self.terminal.clear()
     }
 
-    /// If viewport would extend past screen bottom, scroll the full screen with
-    /// newlines so rows displaced from the top enter native terminal scrollback.
-    /// A scroll-region update can discard those rows on some terminals.
+    /// Matches Codex tui.rs::update_inline_viewport():
+    /// If viewport would extend past screen bottom, scroll content above it up.
     /// If viewport area changed, clear old area and set new one.
-    fn update_inline_viewport(terminal: &mut CustomTerminal, height: u16) -> io::Result<bool> {
+    fn update_inline_viewport(
+        terminal: &mut CustomTerminal,
+        height: u16,
+        is_zellij: bool,
+    ) -> io::Result<bool> {
         let size = terminal.size()?;
-        let previous_area = terminal.viewport_area;
         let mut area = terminal.viewport_area;
         area.height = height.min(size.height);
         area.width = size.width;
@@ -159,21 +126,28 @@ impl TerminalGuard {
 
         if area.bottom() > size.height {
             let scroll_by = area.bottom() - size.height;
-            queue!(
-                terminal.backend_mut(),
-                cursor::MoveTo(0, size.height.saturating_sub(1))
-            )?;
-            for _ in 0..scroll_by {
-                queue!(terminal.backend_mut(), Print("\n"))?;
+            if is_zellij {
+                queue!(
+                    terminal.backend_mut(),
+                    cursor::MoveTo(0, size.height.saturating_sub(1))
+                )?;
+                for _ in 0..scroll_by {
+                    queue!(terminal.backend_mut(), Print("\n"))?;
+                }
+                needs_full_repaint = true;
+            } else {
+                let region_bottom = area.top();
+                if region_bottom > 0 {
+                    queue!(
+                        terminal.backend_mut(),
+                        Print(format!("\x1b[1;{}r", region_bottom)),
+                        cursor::MoveTo(0, 0),
+                        Print(format!("\x1b[{}S", scroll_by)),
+                        Print("\x1b[r"),
+                    )?;
+                }
             }
-            needs_full_repaint = true;
             area.y = size.height - area.height;
-        } else if previous_area.bottom() == size.height && area.height < previous_area.height {
-            // Keep the inline viewport bottom-anchored when a large overlay
-            // closes. Otherwise shrinking from fullscreen leaves y=0 and the
-            // subsequent clear starts at the top of the screen, erasing
-            // visible native scrollback.
-            area.y = size.height.saturating_sub(area.height);
         }
 
         if area != terminal.viewport_area {
@@ -262,9 +236,6 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        if self.alternate_screen_active {
-            let _ = execute!(stdout(), LeaveAlternateScreen);
-        }
         let area = self.terminal.viewport_area;
         let _ = execute!(stdout(), cursor::MoveTo(0, area.bottom()), cursor::Show);
         let _ = disable_raw_mode();

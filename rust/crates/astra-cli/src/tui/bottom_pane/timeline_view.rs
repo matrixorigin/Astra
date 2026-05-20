@@ -2,8 +2,6 @@
 
 #![allow(dead_code)]
 
-use std::cell::Cell;
-
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -13,8 +11,6 @@ use crate::tui::timeline::{Timeline, view as timeline_view};
 
 pub(crate) struct TimelineView {
     timeline: Timeline,
-    drill_scroll: u16,
-    last_drill_max_scroll: Cell<u16>,
     completed: bool,
 }
 
@@ -22,39 +18,14 @@ impl TimelineView {
     pub fn new(timeline: Timeline) -> Self {
         Self {
             timeline,
-            drill_scroll: 0,
-            last_drill_max_scroll: Cell::new(0),
             completed: false,
         }
-    }
-
-    fn enter_drill(&mut self) {
-        self.timeline.enter_drill();
-        self.drill_scroll = 0;
-        self.last_drill_max_scroll.set(0);
-    }
-
-    fn exit_drill(&mut self) {
-        self.timeline.exit_drill();
-        self.drill_scroll = 0;
-        self.last_drill_max_scroll.set(0);
-    }
-
-    fn scroll_drill_down(&mut self, amount: u16) {
-        let max = self.last_drill_max_scroll.get();
-        self.drill_scroll = self.drill_scroll.saturating_add(amount).min(max);
-    }
-
-    fn scroll_drill_up(&mut self, amount: u16) {
-        self.drill_scroll = self.drill_scroll.saturating_sub(amount);
     }
 }
 
 impl BottomPaneView for TimelineView {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let max_scroll =
-            timeline_view::render_with_drill_scroll(&self.timeline, area, buf, self.drill_scroll);
-        self.last_drill_max_scroll.set(max_scroll);
+        timeline_view::render(&self.timeline, area, buf);
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
@@ -63,21 +34,14 @@ impl BottomPaneView for TimelineView {
 
     fn handle_key(&mut self, key: KeyEvent) {
         if self.timeline.is_drilled() {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.exit_drill(),
-                KeyCode::Up => self.scroll_drill_up(1),
-                KeyCode::Down => self.scroll_drill_down(1),
-                KeyCode::PageUp => self.scroll_drill_up(10),
-                KeyCode::PageDown => self.scroll_drill_down(10),
-                KeyCode::Home => self.drill_scroll = 0,
-                KeyCode::End => self.drill_scroll = self.last_drill_max_scroll.get(),
-                _ => {}
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                self.timeline.exit_drill();
             }
             return;
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.completed = true,
-            KeyCode::Enter => self.enter_drill(),
+            KeyCode::Enter => self.timeline.enter_drill(),
             KeyCode::Up => self.timeline.move_up(),
             KeyCode::Down => self.timeline.move_down(),
             KeyCode::PageUp => {
@@ -124,17 +88,13 @@ impl BottomPaneView for TimelineView {
 
     fn hint_keys(&self) -> Option<String> {
         if self.timeline.is_drilled() {
-            Some("↑↓ scroll · PgUp/PgDn page · Home/End · Esc back".into())
+            Some("Esc back".into())
         } else {
             Some("↑↓ navigate · Enter trace · PgUp/PgDn page · Esc close".into())
         }
     }
 
     fn reserve_status_footer(&self) -> bool {
-        true
-    }
-
-    fn render_as_overlay(&self) -> bool {
         true
     }
 }
@@ -204,21 +164,6 @@ mod tests {
     }
 
     #[test]
-    fn timeline_overlay_does_not_inflate_bottom_pane_height() {
-        let mut pane = crate::tui::bottom_pane::BottomPane::new();
-        let before = pane.desired_height(80);
-
-        pane.push_view(Box::new(fixture()));
-
-        assert!(pane.has_overlay_view());
-        assert_eq!(
-            pane.desired_height(80),
-            before,
-            "timeline must not resize the native scrollback viewport"
-        );
-    }
-
-    #[test]
     fn esc_closes() {
         let mut v = fixture();
         v.handle_key(press(KeyCode::Esc));
@@ -240,31 +185,5 @@ mod tests {
         assert_eq!(v.timeline.selected(), Some(1));
         v.handle_key(press(KeyCode::Up));
         assert_eq!(v.timeline.selected(), Some(0));
-    }
-
-    #[test]
-    fn drilled_view_scrolls_detail() {
-        let mut v = fixture();
-        v.handle_key(press(KeyCode::Enter));
-        assert!(v.timeline.is_drilled());
-        assert_eq!(v.drill_scroll, 0);
-
-        v.last_drill_max_scroll.set(12);
-        v.handle_key(press(KeyCode::Down));
-        assert_eq!(v.drill_scroll, 1);
-        v.handle_key(press(KeyCode::PageDown));
-        assert_eq!(v.drill_scroll, 11);
-        v.handle_key(press(KeyCode::PageDown));
-        assert_eq!(v.drill_scroll, 12);
-        v.handle_key(press(KeyCode::Up));
-        assert_eq!(v.drill_scroll, 11);
-        v.handle_key(press(KeyCode::Home));
-        assert_eq!(v.drill_scroll, 0);
-        v.handle_key(press(KeyCode::End));
-        assert_eq!(v.drill_scroll, 12);
-
-        v.handle_key(press(KeyCode::Esc));
-        assert!(!v.timeline.is_drilled());
-        assert_eq!(v.drill_scroll, 0);
     }
 }

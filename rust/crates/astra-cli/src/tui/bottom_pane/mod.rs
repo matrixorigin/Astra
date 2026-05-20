@@ -256,11 +256,6 @@ impl BottomPane {
         !self.view_stack.is_empty()
     }
 
-    pub fn has_overlay_view(&self) -> bool {
-        self.active_view()
-            .is_some_and(|view| view.render_as_overlay())
-    }
-
     #[allow(clippy::borrowed_box)]
     fn active_view(&self) -> Option<&Box<dyn BottomPaneView>> {
         self.view_stack.last()
@@ -618,19 +613,17 @@ impl BottomPane {
 
     pub fn desired_height(&self, width: u16) -> u16 {
         if let Some(view) = self.active_view() {
-            if !view.render_as_overlay() {
-                let mut h = view.desired_height(width);
-                // Reserve a 1-row footer when the view advertises a hint.
-                if view.hint_keys().is_some() {
-                    h = h.saturating_add(1);
-                }
-                // …and another row for the status line when the view
-                // opts in (panels that want context preserved).
-                if view.reserve_status_footer() {
-                    h = h.saturating_add(1);
-                }
-                return h;
+            let mut h = view.desired_height(width);
+            // Reserve a 1-row footer when the view advertises a hint.
+            if view.hint_keys().is_some() {
+                h = h.saturating_add(1);
             }
+            // …and another row for the status line when the view
+            // opts in (panels that want context preserved).
+            if view.reserve_status_footer() {
+                h = h.saturating_add(1);
+            }
+            return h;
         }
         let content_h = self.composer.desired_height(width);
         let queue_h = self.queue_preview_height();
@@ -1062,36 +1055,35 @@ impl BottomPane {
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         if let Some(view) = self.active_view() {
-            if !view.render_as_overlay() {
-                // Stack optional footers under the view area:
-                //   [view]
-                //   [hint bar]        — when hint_keys() is Some
-                //   [status line]     — when reserve_status_footer()
-                let want_status = view.reserve_status_footer();
-                let hint = view.hint_keys();
-                let footer_rows = u16::from(want_status) + u16::from(hint.is_some());
-                if footer_rows > 0 && area.height > footer_rows {
-                    let view_h = area.height - footer_rows;
-                    let view_rect = Rect::new(area.x, area.y, area.width, view_h);
-                    view.render(view_rect, buf);
-                    let mut y = area.y + view_h;
-                    if let Some(h) = hint {
-                        render_hint_bar(&h, Rect::new(area.x, y, area.width, 1), buf);
-                        y += 1;
-                    }
-                    if want_status {
-                        self.footer.render(Rect::new(area.x, y, area.width, 1), buf);
-                    }
-                    return;
+            // Stack optional footers under the view area:
+            //   [view]
+            //   [hint bar]        — when hint_keys() is Some
+            //   [status line]     — when reserve_status_footer()
+            let want_status = view.reserve_status_footer();
+            let hint = view.hint_keys();
+            let footer_rows = u16::from(want_status) + u16::from(hint.is_some());
+            if footer_rows > 0 && area.height > footer_rows {
+                let view_h = area.height - footer_rows;
+                let view_rect = Rect::new(area.x, area.y, area.width, view_h);
+                view.render(view_rect, buf);
+                let mut y = area.y + view_h;
+                if let Some(h) = hint {
+                    render_hint_bar(&h, Rect::new(area.x, y, area.width, 1), buf);
+                    y += 1;
                 }
-                view.render(area, buf);
+                if want_status {
+                    self.footer.render(Rect::new(area.x, y, area.width, 1), buf);
+                }
                 return;
             }
+            view.render(area, buf);
+            return;
         }
 
         let popup_h = self.popup_height();
         let content_h = self.composer.desired_height(area.width);
         let queue_h = self.queue_preview_height();
+
         let approval_h = self.focused_approval_height(area.width);
         if popup_h > 0 {
             let chunks = Layout::vertical([
@@ -1147,9 +1139,7 @@ impl BottomPane {
 
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
         if let Some(view) = self.active_view() {
-            if !view.render_as_overlay() {
-                return view.cursor_pos(area);
-            }
+            return view.cursor_pos(area);
         }
 
         let content_h = self.composer.desired_height(area.width);
@@ -1157,18 +1147,6 @@ impl BottomPane {
             Layout::vertical([Constraint::Length(content_h), Constraint::Min(0)]).split(area);
 
         self.composer.cursor_position(chunks[0])
-    }
-
-    pub fn render_overlay(&self, area: Rect, buf: &mut Buffer) {
-        let Some(view) = self.active_view() else {
-            return;
-        };
-        if !view.render_as_overlay() {
-            return;
-        }
-        use ratatui::widgets::{Clear, Widget};
-        Clear.render(area, buf);
-        view.render(area, buf);
     }
 }
 
