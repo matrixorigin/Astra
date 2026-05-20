@@ -1,5 +1,25 @@
 use super::*;
 
+const SECTION_NAMES: &[&str] = &[
+    "Active Goals",
+    "Pending Todos",
+    "Completed",
+    "L0 Critical",
+    "L1 Important",
+    "L2 Contextual",
+    "Learnings",
+];
+
+const SECTION_DISPLAY_NAMES: &[(&str, &str)] = &[
+    ("Active Goals", "🎯 Active Goals"),
+    ("Pending Todos", "📌 Pending Todos"),
+    ("Completed", "✅ Completed"),
+    ("L0 Critical", "🔒 Critical (L0)"),
+    ("L1 Important", "📝 Important (L1)"),
+    ("Learnings", "💡 Learnings"),
+    ("L2 Contextual", "📋 Context (L2)"),
+];
+
 fn parse_memory_forget_args(input: &str) -> Result<(String, String), String> {
     let mut parts = input.splitn(2, "--reason");
     let memory_id = parts.next().unwrap_or("").trim().to_string();
@@ -424,18 +444,9 @@ pub(super) async fn handle_memory_domain_command(
                 }
                 // ─── Edit a session memory section ───────────────
                 "edit" => {
-                    let valid_sections = [
-                        "Active Goals",
-                        "Pending Todos",
-                        "Completed",
-                        "L0 Critical",
-                        "L1 Important",
-                        "L2 Contextual",
-                        "Learnings",
-                    ];
-                    if sub_arg.is_empty() || !valid_sections.contains(&sub_arg) {
+                    if sub_arg.is_empty() || !SECTION_NAMES.contains(&sub_arg) {
                         eprintln!("  {} /memory edit <section>", "Usage:".dim());
-                        eprintln!("  Sections: {}", valid_sections.join(" | "));
+                        eprintln!("  Sections: {}", SECTION_NAMES.join(" | "));
                         return Ok(());
                     }
                     let section = sub_arg;
@@ -446,28 +457,51 @@ pub(super) async fn handle_memory_domain_command(
                     {
                         Ok(r) if r.status().is_success() => {
                             let text = r.text().await.unwrap_or_default();
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-                                val.get("content")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or(&text)
-                                    .to_string()
-                            } else {
-                                text
-                            }
+                            decode_memory_body(&text)
                         }
-                        _ => String::new(),
+                        Ok(r) => {
+                            eprintln!(
+                                "  {} Memory retrieve failed ({})",
+                                theme::icon_err(),
+                                r.status()
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            eprintln!("  {} Memoria unreachable: {e}", theme::icon_err());
+                            return Ok(());
+                        }
                     };
                     // 2. Open $EDITOR with current section content
                     let current_section =
                         extract_md_section(&current_body, section).unwrap_or_default();
-                    let tmp = std::env::temp_dir().join(format!(
-                        "astra_memory_edit_{}.md",
-                        section.replace(' ', "_").to_lowercase()
-                    ));
-                    std::fs::write(&tmp, current_section.trim_start_matches('\n'))
-                        .unwrap_or_default();
+                    let mut tmp = match tempfile::Builder::new()
+                        .prefix(&format!(
+                            "astra_memory_edit_{}_",
+                            section.replace(' ', "_").to_lowercase()
+                        ))
+                        .suffix(".md")
+                        .rand_bytes(6)
+                        .tempfile_in(std::env::temp_dir())
+                    {
+                        Ok(tmp) => tmp,
+                        Err(e) => {
+                            eprintln!("  {} Failed to create temp file: {e}", theme::icon_err());
+                            return Ok(());
+                        }
+                    };
+                    if let Err(e) =
+                        std::io::Write::write_all(tmp.as_file_mut(), current_section.as_bytes())
+                    {
+                        eprintln!("  {} Failed to seed temp file: {e}", theme::icon_err());
+                        return Ok(());
+                    }
+                    if let Err(e) = tmp.as_file().sync_all() {
+                        eprintln!("  {} Failed to flush temp file: {e}", theme::icon_err());
+                        return Ok(());
+                    }
                     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-                    match std::process::Command::new(&editor).arg(&tmp).status() {
+                    match std::process::Command::new(&editor).arg(tmp.path()).status() {
                         Ok(s) if s.success() => {}
                         _ => {
                             eprintln!("  {} Editor exited with error", theme::icon_err());
@@ -475,8 +509,19 @@ pub(super) async fn handle_memory_domain_command(
                         }
                     }
                     // 3. Read edited content and store back
-                    let new_content = std::fs::read_to_string(&tmp).unwrap_or_default();
-                    let _ = std::fs::remove_file(&tmp);
+                    let new_content = match std::fs::read_to_string(tmp.path()) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            eprintln!("  {} Failed to read edited content: {e}", theme::icon_err());
+                            return Ok(());
+                        }
+                    };
+                    if normalize_section_content(&new_content)
+                        == normalize_section_content(&current_section)
+                    {
+                        eprintln!("  {} No changes for section {section:?}.", "⋯".dim());
+                        return Ok(());
+                    }
                     let updated = replace_md_section(&current_body, section, &new_content);
                     match api
                         .post_memory_store_json(tok, &serde_json::json!({ "content": updated }))
@@ -494,6 +539,14 @@ pub(super) async fn handle_memory_domain_command(
                     eprintln!("  {} /memory <subcommand>", "Usage:".dim());
                     eprintln!("  {}", "  list                    List all memories".dim());
                     eprintln!("  {}", "  search <query>          Search memories".dim());
+                    eprintln!(
+                        "  {}",
+                        "  session                 Show session memory".dim()
+                    );
+                    eprintln!(
+                        "  {}",
+                        "  edit <section>          Edit one session section".dim()
+                    );
                     eprintln!(
                         "  {}",
                         "  dismiss <query>         Mark memories as irrelevant".dim()
@@ -554,17 +607,7 @@ pub(crate) fn format_session_memory_display(body: &str) -> String {
     ));
 
     // Priority-ordered sections: actionable state first, then background
-    let sections: &[(&str, &str)] = &[
-        ("Active Goals", "🎯 Active Goals"),
-        ("Pending Todos", "📌 Pending Todos"),
-        ("Completed", "✅ Completed"),
-        ("L0 Critical", "🔒 Critical (L0)"),
-        ("L1 Important", "📝 Important (L1)"),
-        ("Learnings", "💡 Learnings"),
-        ("L2 Contextual", "📋 Context (L2)"),
-    ];
-
-    for (section_name, label) in sections {
+    for (section_name, label) in SECTION_DISPLAY_NAMES {
         if let Some(content) = extract_md_section(body, section_name) {
             let trimmed = content.trim();
             if !trimmed.is_empty() {
@@ -586,27 +629,22 @@ pub(crate) fn format_session_memory_display(body: &str) -> String {
 /// Extract a `## SectionName` block from a markdown string.
 /// Returns content between the header and the next `##` header (exclusive).
 fn extract_md_section(md: &str, section_name: &str) -> Option<String> {
-    let needle = format!("## {section_name}");
-    let start = md.find(&needle)?;
-    let after_header = start + needle.len();
-    let rest = &md[after_header..];
-    // Find start of next ## header (the newline before it)
-    let end = rest.find("\n## ").map(|i| i + 1).unwrap_or(rest.len());
-    Some(rest[..end].to_string())
+    let (_, content_start, section_end) = find_md_section_bounds(md, section_name)?;
+    Some(md[content_start..section_end].to_string())
 }
 
 /// Replace (or append) a `## SectionName` block in a markdown string.
 /// If the section exists its content is replaced; otherwise the section is appended.
 /// Pure function — no I/O.
 pub(crate) fn replace_md_section(md: &str, section_name: &str, new_content: &str) -> String {
-    let needle = format!("## {section_name}");
-    if let Some(start) = md.find(&needle) {
-        let after_header = start + needle.len();
-        let rest = &md[after_header..];
-        let end = rest.find("\n## ").map(|i| i + 1).unwrap_or(rest.len());
-        let before = &md[..after_header];
-        let after = &rest[end..];
-        format!("{}\n{}{}", before, new_content, after)
+    let normalized = normalize_section_content(new_content);
+    if let Some((_, content_start, section_end)) = find_md_section_bounds(md, section_name) {
+        format!(
+            "{}{}{}",
+            &md[..content_start],
+            normalized,
+            &md[section_end..]
+        )
     } else {
         // Section absent — append at end
         let sep = if md.is_empty() || md.ends_with('\n') {
@@ -614,13 +652,88 @@ pub(crate) fn replace_md_section(md: &str, section_name: &str, new_content: &str
         } else {
             "\n"
         };
-        format!("{}{}\n## {section_name}\n{}", md, sep, new_content)
+        format!("{}{}## {section_name}\n{}", md, sep, normalized)
+    }
+}
+
+fn decode_memory_body(text: &str) -> String {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
+        val.get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or(text)
+            .to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+fn normalize_section_content(content: &str) -> String {
+    if content.is_empty() || content.ends_with('\n') {
+        content.to_string()
+    } else {
+        format!("{content}\n")
+    }
+}
+
+fn find_md_section_bounds(md: &str, section_name: &str) -> Option<(usize, usize, usize)> {
+    let mut offset = 0usize;
+    let mut section_start = None;
+    let mut content_start = None;
+    let mut active_fence: Option<&'static str> = None;
+
+    for line in md.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let heading = if active_fence.is_none() {
+            markdown_h2_heading(trimmed)
+        } else {
+            None
+        };
+
+        if let Some(start) = section_start {
+            if heading.is_some() {
+                return Some((start, content_start.unwrap_or(offset), offset));
+            }
+        } else if heading == Some(section_name) {
+            section_start = Some(offset);
+            content_start = Some(offset + line.len());
+        }
+
+        update_fenced_code_block_state(trimmed, &mut active_fence);
+        offset += line.len();
+    }
+
+    section_start.map(|start| (start, content_start.unwrap_or(md.len()), md.len()))
+}
+
+fn markdown_h2_heading(line: &str) -> Option<&str> {
+    line.strip_prefix("## ").map(str::trim)
+}
+
+fn update_fenced_code_block_state(line: &str, active_fence: &mut Option<&'static str>) {
+    let trimmed = line.trim_start();
+    for fence in ["```", "~~~"] {
+        if trimmed.starts_with(fence) {
+            match *active_fence {
+                Some(active) if active == fence => *active_fence = None,
+                None => *active_fence = Some(fence),
+                _ => {}
+            }
+            break;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use regex::Regex;
+
+    fn strip_ansi(input: &str) -> String {
+        Regex::new(r"\x1b\[[0-9;]*m")
+            .unwrap()
+            .replace_all(input, "")
+            .into_owned()
+    }
 
     // ── /memory session display ──────────────────────────────────────────
 
@@ -664,14 +777,14 @@ mod tests {
     #[test]
     fn format_session_memory_display_omits_missing_sections() {
         let body = "## L0 Critical\n- only this section\n";
-        let result = format_session_memory_display(body);
+        let result = strip_ansi(&format_session_memory_display(body));
         // Missing sections must not produce empty labelled blocks
         assert!(
-            !result.contains("L1 Important:\n\n"),
+            !result.contains("📝 Important (L1)"),
             "spurious L1 block, got: {result:?}"
         );
         assert!(
-            !result.contains("L2 Contextual:\n\n"),
+            !result.contains("📋 Context (L2)"),
             "spurious L2 block, got: {result:?}"
         );
     }
@@ -698,6 +811,7 @@ mod tests {
             "dismiss",
             "list",
             "session",
+            "edit",
         ] {
             assert!(
                 prod.contains(&format!("\"{cmd}\"")),
@@ -720,12 +834,17 @@ mod tests {
             "branches",
             "reflect",
             "health",
+            "session",
         ] {
             assert!(
                 src.contains(&format!("  {cmd}")),
                 "/memory usage text missing {cmd}"
             );
         }
+        assert!(
+            src.contains("  edit <section>"),
+            "/memory usage text missing edit <section>"
+        );
     }
 
     #[test]
@@ -738,6 +857,31 @@ mod tests {
     }
 
     // ── /memory edit — replace_md_section ───────────────────────────────
+
+    #[test]
+    fn extract_md_section_returns_exact_named_section() {
+        let body = "## Active Goals\n- old goal\n\n## Pending Todos\n- do stuff\n";
+        let result = extract_md_section(body, "Active Goals").expect("section exists");
+        assert_eq!(result, "- old goal\n\n");
+    }
+
+    #[test]
+    fn extract_md_section_ignores_fenced_code_block_headers() {
+        let body = "## Active Goals\n```md\n## Pending Todos\n- fake header\n```\n- keep this\n\n## Pending Todos\n- real todo\n";
+        let result = extract_md_section(body, "Active Goals").expect("section exists");
+        assert!(
+            result.contains("## Pending Todos\n- fake header"),
+            "fenced header should stay inside section: {result:?}"
+        );
+        assert!(
+            result.contains("- keep this"),
+            "real content missing: {result:?}"
+        );
+        assert!(
+            !result.ends_with("## Pending Todos\n- real todo\n"),
+            "next real section should not leak into extracted section: {result:?}"
+        );
+    }
 
     #[test]
     fn replace_md_section_replaces_existing_section() {
@@ -800,15 +944,7 @@ mod tests {
     #[test]
     fn replace_md_section_valid_section_names() {
         // All recognised section names must work without error
-        for name in &[
-            "Active Goals",
-            "Pending Todos",
-            "Completed",
-            "L0 Critical",
-            "L1 Important",
-            "L2 Contextual",
-            "Learnings",
-        ] {
+        for name in SECTION_NAMES {
             let body = format!("## {name}\n- content\n");
             let result = replace_md_section(&body, name, "- replaced\n");
             assert!(
@@ -816,6 +952,46 @@ mod tests {
                 "replace failed for section {name:?}"
             );
         }
+    }
+
+    #[test]
+    fn replace_md_section_ignores_fenced_headers_inside_target_section() {
+        let body = "## Active Goals\n```md\n## Pending Todos\n- fake header\n```\n- keep goal\n\n## Pending Todos\n- real todo\n";
+        let result = replace_md_section(body, "Active Goals", "- rewritten goal\n");
+        assert!(
+            result.contains("## Active Goals\n- rewritten goal\n"),
+            "target section should be rewritten cleanly: {result:?}"
+        );
+        assert!(
+            !result.contains("```md\n## Pending Todos\n- fake header\n```"),
+            "old fenced content should be removed with the rewritten section: {result:?}"
+        );
+        assert!(
+            result.contains("## Pending Todos\n- real todo\n"),
+            "next real section should still be present: {result:?}"
+        );
+    }
+
+    #[test]
+    fn replace_md_section_ignores_fenced_headers_when_matching_target() {
+        let body = "## Active Goals\n```md\n## Pending Todos\n- fake header\n```\n- keep goal\n\n## Pending Todos\n- real todo\n";
+        let result = replace_md_section(body, "Pending Todos", "- updated todo\n");
+        assert!(
+            result.contains("```md\n## Pending Todos\n- fake header\n```"),
+            "code block content should stay untouched: {result:?}"
+        );
+        assert!(
+            result.contains("- keep goal"),
+            "preceding section content should stay untouched: {result:?}"
+        );
+        assert!(
+            result.contains("## Pending Todos\n- updated todo\n"),
+            "real section should be replaced: {result:?}"
+        );
+        assert!(
+            !result.contains("## Pending Todos\n- real todo\n"),
+            "old real section content should be replaced: {result:?}"
+        );
     }
 
     #[test]
