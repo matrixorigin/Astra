@@ -215,7 +215,7 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
     let wall_secs = wall_ms / 1000;
 
     let total_billable_input = total_prompt + total_cache_read + total_cache_create;
-    let cache_ratio_pct = if total_cache_read + total_cache_create > 0 {
+    let cache_ratio_pct = if total_cache_read > 0 {
         format!(
             " cache-read={:.0}%",
             total_cache_read as f64 / total_billable_input as f64 * 100.0
@@ -1097,6 +1097,44 @@ mod tests {
         assert!(
             out.contains("cache-read=40%"),
             "cache_creation_tokens must contribute to the denominator: {out}"
+        );
+    }
+
+    #[test]
+    fn render_text_omits_cache_read_share_when_no_cache_read_occurred() {
+        let r = SuiteReport {
+            runs: vec![CaseRunReport {
+                case_name: "cache-create-only".into(),
+                model: "m".into(),
+                passed: true,
+                run_index: 0,
+                capability: None,
+                weight: 1.0,
+                difficulty: None,
+                outcome: {
+                    let mut o = RunOutcome::new("m");
+                    o.prompt_tokens = 100;
+                    o.completion_tokens = 40;
+                    o.cached_input_tokens = 0;
+                    o.cache_creation_tokens = 200;
+                    o
+                },
+                criteria: vec![],
+                steps: vec![],
+                failure_class: None,
+                has_warnings: false,
+                session: None,
+                reproducer: None,
+                digest: None,
+                digest_error: None,
+            }],
+            ..Default::default()
+        };
+
+        let out = render_text(&r, false);
+        assert!(
+            !out.contains("cache-read="),
+            "cache-read share should stay hidden until some cached input was actually read: {out}"
         );
     }
 

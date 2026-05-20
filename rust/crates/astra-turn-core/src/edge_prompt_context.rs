@@ -120,24 +120,91 @@ pub fn detect_project_languages(root: &Path) -> Vec<String> {
 /// Keep only a small sample of changed paths in the volatile Git tail.
 const MAX_GIT_CHANGED_FILES: usize = 5;
 
-/// Run `git diff --shortstat` (staged or unstaged), returning a compact summary.
-fn git_diff_shortstat(project_root: &Path, staged: bool) -> Option<String> {
-    let mut args = vec!["diff", "--shortstat", "--no-color"];
-    if staged {
-        args.push("--cached");
-    }
-    std::process::Command::new("git")
-        .args(&args)
-        .current_dir(project_root)
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GitDiffSummary {
+    shortstat: Option<String>,
+    files: Vec<String>,
 }
 
-fn git_changed_files(project_root: &Path, staged: bool) -> Option<Vec<String>> {
-    let mut args = vec!["diff", "--name-only", "--no-color"];
+fn format_git_shortstat(files_changed: usize, insertions: u64, deletions: u64) -> Option<String> {
+    let mut parts = Vec::new();
+    parts.push(format!(
+        "{files_changed} {} changed",
+        if files_changed == 1 { "file" } else { "files" }
+    ));
+    if insertions > 0 {
+        parts.push(format!(
+            "{insertions} {}(+)",
+            if insertions == 1 {
+                "insertion"
+            } else {
+                "insertions"
+            }
+        ));
+    }
+    if deletions > 0 {
+        parts.push(format!(
+            "{deletions} {}(-)",
+            if deletions == 1 {
+                "deletion"
+            } else {
+                "deletions"
+            }
+        ));
+    }
+    Some(parts.join(", "))
+}
+
+fn parse_git_numstat_summary(output: &str) -> GitDiffSummary {
+    let mut files = Vec::new();
+    let mut insertions = 0_u64;
+    let mut deletions = 0_u64;
+    let mut saw_numeric_counts = false;
+
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let mut parts = line.splitn(3, '\t');
+        let Some(added) = parts.next() else {
+            continue;
+        };
+        let Some(removed) = parts.next() else {
+            continue;
+        };
+        let Some(path) = parts.next() else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        files.push(path.to_owned());
+        if let Ok(count) = added.parse::<u64>() {
+            insertions += count;
+            saw_numeric_counts = true;
+        }
+        if let Ok(count) = removed.parse::<u64>() {
+            deletions += count;
+            saw_numeric_counts = true;
+        }
+    }
+
+    GitDiffSummary {
+        shortstat: if files.is_empty() || !saw_numeric_counts {
+            None
+        } else {
+            format_git_shortstat(files.len(), insertions, deletions)
+        },
+        files,
+    }
+}
+
+/// Run one `git diff --numstat` (staged or unstaged) and derive both the
+/// compact summary and changed-file sample from the same snapshot.
+fn git_diff_summary(project_root: &Path, staged: bool) -> Option<GitDiffSummary> {
+    let mut args = vec!["diff", "--numstat", "--no-color"];
     if staged {
         args.push("--cached");
     }
@@ -146,14 +213,9 @@ fn git_changed_files(project_root: &Path, staged: bool) -> Option<Vec<String>> {
         .current_dir(project_root)
         .output()
         .ok()
+        .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| {
-            s.lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()
-        })
+        .map(|s| parse_git_numstat_summary(&s))
 }
 
 fn render_git_change_summary(
@@ -282,17 +344,17 @@ pub fn build_volatile_environment_context(project_root: &Path) -> String {
     lines.push(format!("- Git branch: {branch}{status}"));
 
     if dirty {
-        if let Some(staged) = render_git_change_summary(
-            "Staged changes",
-            git_diff_shortstat(project_root, true).as_deref(),
-            &git_changed_files(project_root, true).unwrap_or_default(),
-        ) {
+        let staged = git_diff_summary(project_root, true).unwrap_or_default();
+        if let Some(staged) =
+            render_git_change_summary("Staged changes", staged.shortstat.as_deref(), &staged.files)
+        {
             lines.push(staged);
         }
+        let unstaged = git_diff_summary(project_root, false).unwrap_or_default();
         if let Some(unstaged) = render_git_change_summary(
             "Unstaged changes",
-            git_diff_shortstat(project_root, false).as_deref(),
-            &git_changed_files(project_root, false).unwrap_or_default(),
+            unstaged.shortstat.as_deref(),
+            &unstaged.files,
         ) {
             lines.push(unstaged);
         }
@@ -729,6 +791,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_git_numstat_summary_collects_shortstat_and_files_together() {
+        let summary = parse_git_numstat_summary("10\t2\ta.rs\n3\t0\tb.rs\n-\t-\tbinary.dat\n");
+        assert_eq!(
+            summary.shortstat.as_deref(),
+            Some("3 files changed, 13 insertions(+), 2 deletions(-)")
+        );
+        assert_eq!(summary.files, vec!["a.rs", "b.rs", "binary.dat"]);
+    }
+
+    #[test]
+    fn parse_git_numstat_summary_falls_back_to_files_when_counts_are_non_numeric() {
+        let summary = parse_git_numstat_summary("-\t-\tbinary.dat\n");
+        assert_eq!(summary.shortstat, None);
+        assert_eq!(summary.files, vec!["binary.dat"]);
+    }
+
+    #[test]
     fn recent_commit_limit_prefers_tighter_budget_for_dirty_repos() {
         assert_eq!(recent_commit_limit_for_dirty(true), 1);
     }
@@ -769,20 +848,20 @@ mod tests {
     }
 
     #[test]
-    fn git_diff_shortstat_returns_some_in_git_repo() {
+    fn git_diff_summary_returns_some_in_git_repo() {
         let cwd = std::env::current_dir().unwrap();
-        // Should return Some (possibly empty string) or None — just ensure no panic
-        let _ = git_diff_shortstat(&cwd, true);
-        let _ = git_diff_shortstat(&cwd, false);
+        // Should return Some (possibly empty summary) or None — just ensure no panic
+        let _ = git_diff_summary(&cwd, true);
+        let _ = git_diff_summary(&cwd, false);
     }
 
     #[test]
-    fn git_diff_shortstat_returns_none_outside_repo() {
+    fn git_diff_summary_returns_none_outside_repo() {
         let tmp = tempdir().unwrap();
         unsafe {
             std::env::set_var("GIT_CEILING_DIRECTORIES", tmp.path().parent().unwrap());
         }
-        let result = git_diff_shortstat(tmp.path(), false);
+        let result = git_diff_summary(tmp.path(), false);
         unsafe {
             std::env::remove_var("GIT_CEILING_DIRECTORIES");
         }
