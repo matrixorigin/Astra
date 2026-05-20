@@ -833,9 +833,24 @@ pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     let sep_line = "─".repeat(right_col_w);
     let mut right: Vec<String> = Vec::new();
     right.push(trunc_vis("Tips", right_col_w).white().bold().to_string());
-    right.push(trunc_vis("/help for all commands", right_col_w).white().bold().to_string());
-    right.push(trunc_vis("Ctrl+K command picker", right_col_w).white().bold().to_string());
-    right.push(trunc_vis("Alt+Enter multi-line input", right_col_w).white().bold().to_string());
+    right.push(
+        trunc_vis("/help for all commands", right_col_w)
+            .white()
+            .bold()
+            .to_string(),
+    );
+    right.push(
+        trunc_vis("Ctrl+K command picker", right_col_w)
+            .white()
+            .bold()
+            .to_string(),
+    );
+    right.push(
+        trunc_vis("Alt+Enter multi-line input", right_col_w)
+            .white()
+            .bold()
+            .to_string(),
+    );
     right.push(sep_line.as_str().white().bold().to_string());
     right.push(trunc_vis("Status", right_col_w).white().bold().to_string());
     right.push(

@@ -156,10 +156,11 @@ fn auto_mode_renders_yellow_chip() {
         .find(|seg| seg.text == "auto")
         .expect("auto chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Yellow));
-    assert!(chip
-        .style
-        .add_modifier
-        .contains(ratatui::style::Modifier::BOLD));
+    assert!(
+        chip.style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    );
 }
 
 #[test]
@@ -175,10 +176,11 @@ fn accept_edits_mode_renders_cyan_chip() {
         .find(|seg| seg.text == "edit")
         .expect("accept_edits chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Cyan));
-    assert!(chip
-        .style
-        .add_modifier
-        .contains(ratatui::style::Modifier::BOLD));
+    assert!(
+        chip.style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    );
 }
 
 #[test]
@@ -194,10 +196,11 @@ fn plan_mode_renders_blue_chip() {
         .find(|seg| seg.text == "plan")
         .expect("plan chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Blue));
-    assert!(chip
-        .style
-        .add_modifier
-        .contains(ratatui::style::Modifier::BOLD));
+    assert!(
+        chip.style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    );
 }
 
 #[test]
@@ -213,10 +216,11 @@ fn deny_mode_renders_red_chip() {
         .find(|seg| seg.text == "deny")
         .expect("deny chip");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Red));
-    assert!(chip
-        .style
-        .add_modifier
-        .contains(ratatui::style::Modifier::BOLD));
+    assert!(
+        chip.style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    );
 }
 
 // ─── Right-side segments: model · dir · tokens · cost · branch ────
@@ -419,10 +423,12 @@ fn pending_chip_is_yellow_without_extra_bold() {
         .find(|seg| seg.text.contains("pending"))
         .expect("pending chip");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Yellow));
-    assert!(!chip
-        .style
-        .add_modifier
-        .contains(ratatui::style::Modifier::BOLD));
+    assert!(
+        !chip
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    );
 }
 
 // ── Phase 3b.2: background task chip ────────────────────────────────

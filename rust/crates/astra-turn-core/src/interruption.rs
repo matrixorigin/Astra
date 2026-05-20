@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 pub enum InterruptionKind {
     /// Inner-loop turn budget exhausted (`remaining_turns == 0`).
     BudgetExhausted,
+    /// The loop reached a terminal state but never produced a final answer.
+    EmptyCompletion,
     /// Per-turn input token limit exceeded.
     TokenBudgetExceeded,
     /// Cumulative token budget across turns exceeded.
@@ -47,6 +49,7 @@ impl InterruptionKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::BudgetExhausted => "budget_exhausted",
+            Self::EmptyCompletion => "empty_completion",
             Self::TokenBudgetExceeded => "token_budget_exceeded",
             Self::CumulativeBudgetExceeded => "cumulative_budget_exceeded",
             Self::RateLimited => "rate_limited",
@@ -67,6 +70,7 @@ impl InterruptionKind {
     pub fn is_resumable(self) -> bool {
         match self {
             Self::BudgetExhausted
+            | Self::EmptyCompletion
             | Self::TokenBudgetExceeded
             | Self::CumulativeBudgetExceeded
             | Self::RateLimited
@@ -217,10 +221,16 @@ impl InterruptionRecord {
             ResumeAction::CompactAndRetry => " Context will be compacted before retry.".to_string(),
             ResumeAction::StartNewSession => " Please start a new session.".to_string(),
         };
-        format!(
-            "[{kind}]{tool_note}{checkpoint_note}{action_note}",
-            kind = kind.label()
-        )
+        match kind {
+            InterruptionKind::EmptyCompletion => format!(
+                "[{}] The run ended without a final answer.{tool_note}{checkpoint_note}{action_note}",
+                kind.label()
+            ),
+            _ => format!(
+                "[{kind}]{tool_note}{checkpoint_note}{action_note}",
+                kind = kind.label()
+            ),
+        }
     }
 }
 
@@ -300,6 +310,12 @@ pub fn build_resume_guidance_with_context(
 
     // Kind-specific advice
     match kind {
+        "empty_completion" => {
+            guidance.push_str(
+                "  Action: Continue from the preserved context and produce a direct final answer. \
+                 Do not stop after hidden reasoning with no user-visible output.\n",
+            );
+        }
         "budget_exhausted" | "token_budget_exceeded" | "cumulative_budget_exceeded" => {
             guidance.push_str(
                 "  Action: Prioritize completing the most important remaining work first. \
@@ -543,6 +559,7 @@ mod tests {
     fn interruption_kind_labels_are_snake_case() {
         let kinds = [
             InterruptionKind::BudgetExhausted,
+            InterruptionKind::EmptyCompletion,
             InterruptionKind::TokenBudgetExceeded,
             InterruptionKind::RateLimited,
             InterruptionKind::UserCancelled,
@@ -563,6 +580,7 @@ mod tests {
     #[test]
     fn budget_exhausted_is_resumable() {
         assert!(InterruptionKind::BudgetExhausted.is_resumable());
+        assert!(InterruptionKind::EmptyCompletion.is_resumable());
         assert!(InterruptionKind::RateLimited.is_resumable());
         assert!(InterruptionKind::UserCancelled.is_resumable());
     }
@@ -667,6 +685,24 @@ mod tests {
         assert!(record.user_message.contains("compacted"));
     }
 
+    #[test]
+    fn empty_completion_has_explicit_user_message() {
+        let record = InterruptionRecord::new(
+            InterruptionKind::EmptyCompletion,
+            ResumeAction::ContinueImmediately,
+            InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 4,
+                turns_completed: 3,
+                remaining_turns: 7,
+                error_detail: Some("agentic loop completed without final text".to_string()),
+                stall_signal: None,
+            },
+        );
+        assert!(record.user_message.contains("without a final answer"));
+        assert!(record.user_message.contains("continue"));
+    }
+
     // ── resume guidance tests ──
 
     #[test]
@@ -751,6 +787,22 @@ mod tests {
         let guidance = build_resume_guidance(&irj).unwrap();
         assert!(guidance.contains("context_overflow"));
         assert!(guidance.contains("compacted"));
+    }
+
+    #[test]
+    fn resume_guidance_empty_completion() {
+        let irj = serde_json::json!({
+            "kind": "empty_completion",
+            "resumable": true,
+            "has_checkpoint": true,
+            "tool_calls_completed": 2,
+            "turns_completed": 5,
+            "remaining_turns": 3,
+            "user_message": "[empty_completion] The run ended without a final answer."
+        });
+        let guidance = build_resume_guidance(&irj).unwrap();
+        assert!(guidance.contains("empty_completion"));
+        assert!(guidance.contains("direct final answer"));
     }
 
     #[test]
@@ -935,6 +987,7 @@ mod tests {
     fn all_interruption_kinds_have_labels() {
         let kinds = [
             InterruptionKind::BudgetExhausted,
+            InterruptionKind::EmptyCompletion,
             InterruptionKind::TokenBudgetExceeded,
             InterruptionKind::CumulativeBudgetExceeded,
             InterruptionKind::RateLimited,

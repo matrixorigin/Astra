@@ -40,8 +40,12 @@ pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
         // File-based tools: key on normalized path + output-critical params
         "read_file" => {
             let path = arg_str(args, "path")?;
-            let start = arg_u64(args, "start_line").map(|v| v.to_string()).unwrap_or_default();
-            let end = arg_u64(args, "end_line").map(|v| v.to_string()).unwrap_or_default();
+            let start = arg_u64(args, "start_line")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let end = arg_u64(args, "end_line")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
             let outline = arg_bool(args, "outline").unwrap_or(false);
             Some(format!(
                 "read_file:{}:{}:{}:outline={}",
@@ -54,8 +58,12 @@ pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
         "glob" => {
             let pattern = arg_str(args, "pattern").unwrap_or("*");
             let path = arg_str(args, "path").unwrap_or(".");
-            let offset = arg_u64(args, "offset").map(|v| v.to_string()).unwrap_or_default();
-            let head_limit = arg_u64(args, "head_limit").map(|v| v.to_string()).unwrap_or_default();
+            let offset = arg_u64(args, "offset")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let head_limit = arg_u64(args, "head_limit")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
             Some(format!(
                 "glob:{}:{}:offset={}:limit={}",
                 normalize_path(path),
@@ -126,8 +134,12 @@ pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
         }
         "git_blame" => {
             let file = arg_str(args, "file")?;
-            let line_start = arg_u64(args, "line_start").map(|v| v.to_string()).unwrap_or_default();
-            let line_end = arg_u64(args, "line_end").map(|v| v.to_string()).unwrap_or_default();
+            let line_start = arg_u64(args, "line_start")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let line_end = arg_u64(args, "line_end")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
             Some(format!(
                 "git_blame:{}:line_start={}:line_end={}",
                 normalize_path(file),
@@ -147,11 +159,17 @@ pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
         "git_contributors" => {
             let path = arg_str(args, "path").unwrap_or("");
             let since = arg_str(args, "since").unwrap_or("");
-            Some(format!("git_contributors:path={}:since={}", normalize_path(path), since))
+            Some(format!(
+                "git_contributors:path={}:since={}",
+                normalize_path(path),
+                since
+            ))
         }
         "list_dir" => {
             let path = arg_str(args, "path").unwrap_or(".");
-            let depth = arg_u64(args, "depth").map(|v| v.to_string()).unwrap_or_default();
+            let depth = arg_u64(args, "depth")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
             Some(format!("list_dir:{}:depth={}", normalize_path(path), depth))
         }
         "git_log_search" => {
@@ -711,16 +729,28 @@ mod tests {
 
     #[test]
     fn read_file_different_line_ranges_differ() {
-        let k1 = semantic_call_key("read_file", &json!({"path": "foo.rs", "start_line": 1, "end_line": 120}));
-        let k2 = semantic_call_key("read_file", &json!({"path": "foo.rs", "start_line": 200, "end_line": 350}));
-        assert_ne!(k1, k2, "different line ranges must produce distinct keys — otherwise agent can't read different regions of the same file");
+        let k1 = semantic_call_key(
+            "read_file",
+            &json!({"path": "foo.rs", "start_line": 1, "end_line": 120}),
+        );
+        let k2 = semantic_call_key(
+            "read_file",
+            &json!({"path": "foo.rs", "start_line": 200, "end_line": 350}),
+        );
+        assert_ne!(
+            k1, k2,
+            "different line ranges must produce distinct keys — otherwise agent can't read different regions of the same file"
+        );
     }
 
     #[test]
     fn read_file_outline_vs_full_differ() {
         let k1 = semantic_call_key("read_file", &json!({"path": "foo.rs", "outline": true}));
         let k2 = semantic_call_key("read_file", &json!({"path": "foo.rs"}));
-        assert_ne!(k1, k2, "outline vs full read must differ — outline only returns signatures");
+        assert_ne!(
+            k1, k2,
+            "outline vs full read must differ — outline only returns signatures"
+        );
     }
 
     #[test]
@@ -735,15 +765,30 @@ mod tests {
 
     #[test]
     fn grep_different_output_mode_differs() {
-        let k1 = semantic_call_key("grep", &json!({"pattern": "foo", "path": "src/a.rs", "output_mode": "content"}));
-        let k2 = semantic_call_key("grep", &json!({"pattern": "foo", "path": "src/a.rs", "output_mode": "files_with_matches"}));
-        assert_ne!(k1, k2, "different output_mode must not share same key — results differ");
+        let k1 = semantic_call_key(
+            "grep",
+            &json!({"pattern": "foo", "path": "src/a.rs", "output_mode": "content"}),
+        );
+        let k2 = semantic_call_key(
+            "grep",
+            &json!({"pattern": "foo", "path": "src/a.rs", "output_mode": "files_with_matches"}),
+        );
+        assert_ne!(
+            k1, k2,
+            "different output_mode must not share same key — results differ"
+        );
     }
 
     #[test]
     fn grep_include_filter_differs() {
-        let k1 = semantic_call_key("grep", &json!({"pattern": "foo", "path": "src", "include": "*.rs"}));
-        let k2 = semantic_call_key("grep", &json!({"pattern": "foo", "path": "src", "include": "*.toml"}));
+        let k1 = semantic_call_key(
+            "grep",
+            &json!({"pattern": "foo", "path": "src", "include": "*.rs"}),
+        );
+        let k2 = semantic_call_key(
+            "grep",
+            &json!({"pattern": "foo", "path": "src", "include": "*.toml"}),
+        );
         assert_ne!(k1, k2, "different include file filters must differ");
     }
 
@@ -758,7 +803,10 @@ mod tests {
     fn glob_head_limit_differs() {
         let k1 = semantic_call_key("glob", &json!({"pattern": "**/*.rs", "head_limit": 10}));
         let k2 = semantic_call_key("glob", &json!({"pattern": "**/*.rs", "head_limit": 100}));
-        assert_ne!(k1, k2, "different head_limit values must differ — output size changes");
+        assert_ne!(
+            k1, k2,
+            "different head_limit values must differ — output size changes"
+        );
     }
 
     #[test]
@@ -907,8 +955,14 @@ mod tests {
     #[test]
     fn symbols_param_differs_kinds_and_calls() {
         let k1 = semantic_call_key("symbols", &json!({"path": "foo.rs"}));
-        let k2 = semantic_call_key("symbols", &json!({"path": "foo.rs", "kinds": ["fn"], "calls": true}));
-        assert_ne!(k1, k2, "symbols with kinds+calls must differ from bare path");
+        let k2 = semantic_call_key(
+            "symbols",
+            &json!({"path": "foo.rs", "kinds": ["fn"], "calls": true}),
+        );
+        assert_ne!(
+            k1, k2,
+            "symbols with kinds+calls must differ from bare path"
+        );
     }
 
     #[test]
@@ -920,15 +974,24 @@ mod tests {
 
     #[test]
     fn git_blame_line_range_differs() {
-        let k1 = semantic_call_key("git_blame", &json!({"file": "foo.rs", "line_start": 1, "line_end": 50}));
-        let k2 = semantic_call_key("git_blame", &json!({"file": "foo.rs", "line_start": 100, "line_end": 150}));
+        let k1 = semantic_call_key(
+            "git_blame",
+            &json!({"file": "foo.rs", "line_start": 1, "line_end": 50}),
+        );
+        let k2 = semantic_call_key(
+            "git_blame",
+            &json!({"file": "foo.rs", "line_start": 100, "line_end": 150}),
+        );
         assert_ne!(k1, k2, "different blame line ranges must differ");
     }
 
     #[test]
     fn git_blame_no_line_range_zero_defaults() {
         let k1 = semantic_call_key("git_blame", &json!({"file": "foo.rs"}));
-        let k2 = semantic_call_key("git_blame", &json!({"file": "foo.rs", "line_start": 0, "line_end": 0}));
+        let k2 = semantic_call_key(
+            "git_blame",
+            &json!({"file": "foo.rs", "line_start": 0, "line_end": 0}),
+        );
         // 0 serializes as "0" but arg_u64 returns None for missing,
         // Some(0) for explicit zero → default "" for missing, "0" for explicit.
         // These are intentionally different: explicit 0 vs no range are distinct requests.
@@ -942,7 +1005,10 @@ mod tests {
     fn git_file_history_n_differs() {
         let k1 = semantic_call_key("git_file_history", &json!({"file": "foo.rs", "n": 10}));
         let k2 = semantic_call_key("git_file_history", &json!({"file": "foo.rs", "n": 50}));
-        assert_ne!(k1, k2, "different n values must differ for git_file_history");
+        assert_ne!(
+            k1, k2,
+            "different n values must differ for git_file_history"
+        );
     }
 
     #[test]

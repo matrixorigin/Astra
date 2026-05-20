@@ -7,7 +7,9 @@ use super::agentic_adaptive_tuning::record_loop_completion_feedback;
 use super::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, VolatileKind, run_agentic_loop_impl,
 };
-use super::agentic_loop_lifecycle::{current_agentic_step, session_turn_number};
+use super::agentic_loop_lifecycle::{
+    current_agentic_step, interruption_state_summary, session_turn_number,
+};
 
 fn inject_hallucination_tripwire_nudge_if_fired(state: &mut AgenticLoopState) {
     use astra_turn_core::hallucination_tripwire::{
@@ -570,16 +572,31 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
         .messages
         .retain(|m| !crate::turn::agentic_loop_execution_phase::is_execution_corrective_message(m));
     reset_per_turn_corrective_state(state);
-    if state.final_text.trim().is_empty()
-        && let Some(interruption) = state.interruption.as_ref()
-    {
-        state.final_text = interruption.user_message.clone();
-        state.final_text_streamed = false;
-    }
+    ensure_terminal_text(state);
     try_write_heavy_checkpoint(state);
     if !state.final_text.is_empty() && !state.final_text_streamed {
         host.render_final_text(&state.final_text);
         state.final_text_streamed = true;
+    }
+}
+
+fn ensure_terminal_text(state: &mut AgenticLoopState) {
+    if !state.final_text.trim().is_empty() {
+        return;
+    }
+    if state.interruption.is_none() {
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+            interruption_state_summary(
+                state,
+                Some("agentic loop completed without final text".to_string()),
+            ),
+        ));
+    }
+    if let Some(interruption) = state.interruption.as_ref() {
+        state.final_text = interruption.user_message.clone();
+        state.final_text_streamed = false;
     }
 }
 
@@ -938,6 +955,28 @@ mod tests {
             state.final_text.contains("budget_exhausted"),
             "interrupted tool-only turns must not persist an empty or success-shaped final answer"
         );
+        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_converts_blank_completion_into_empty_completion() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.final_text = "   ".into();
+        state.total_tool_calls = 3;
+        state.remaining_turns = 2;
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        let interruption = state
+            .interruption
+            .as_ref()
+            .expect("blank completion should record an interruption");
+        assert_eq!(
+            interruption.kind,
+            astra_turn_core::interruption::InterruptionKind::EmptyCompletion
+        );
+        assert!(state.final_text.contains("without a final answer"));
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }
 

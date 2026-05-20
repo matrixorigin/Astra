@@ -1137,6 +1137,10 @@ mod tests {
             completion_status_from_finish_reason(Some("context_overflow")),
             "interrupted"
         );
+        assert_eq!(
+            completion_status_from_finish_reason(Some("empty_completion")),
+            "interrupted"
+        );
     }
 
     /// Bug1 regression: when inherited prefix ends with a user or tool
