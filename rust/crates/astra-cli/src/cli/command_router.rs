@@ -635,11 +635,12 @@ async fn execute_headless_task_body(
     );
     state_map.insert(
         "background_agent_results".to_string(),
-        serde_json::json!(sr
-            .background_agent_results
-            .iter()
-            .map(|(id, text)| serde_json::json!({"agent_id": id, "result": text}))
-            .collect::<Vec<_>>()),
+        serde_json::json!(
+            sr.background_agent_results
+                .iter()
+                .map(|(id, text)| serde_json::json!({"agent_id": id, "result": text}))
+                .collect::<Vec<_>>()
+        ),
     );
     if let Err(e) = svc
         .save_checkpoint(
@@ -701,11 +702,12 @@ async fn execute_headless_task_body(
             );
             obj.insert(
                 "background_agent_results".to_string(),
-                serde_json::json!(sr
-                    .background_agent_results
-                    .iter()
-                    .map(|(id, text)| serde_json::json!({"agent_id": id, "result": text}))
-                    .collect::<Vec<_>>()),
+                serde_json::json!(
+                    sr.background_agent_results
+                        .iter()
+                        .map(|(id, text)| serde_json::json!({"agent_id": id, "result": text}))
+                        .collect::<Vec<_>>()
+                ),
             );
         }
         println!(
@@ -1261,8 +1263,8 @@ impl Drop for AbortGuard {
 #[cfg(test)]
 mod abort_guard_tests {
     use super::AbortGuard;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     /// Proves the guard aborts the spawned task on drop. Without the
@@ -1795,7 +1797,7 @@ pub(crate) fn permission_mode_display_label(mode: PermissionMode) -> &'static st
 
 #[cfg(test)]
 mod permission_mode_display_tests {
-    use super::{permission_mode_display_label, PermissionMode};
+    use super::{PermissionMode, permission_mode_display_label};
 
     #[test]
     fn accept_edits_displays_as_kebab_case() {
@@ -2507,11 +2509,14 @@ pub(super) async fn execute_cli_command(
                     obj.insert("context_ms".to_string(), serde_json::json!(sr.context_ms));
                     obj.insert(
                         "background_agent_results".to_string(),
-                        serde_json::json!(sr
-                            .background_agent_results
-                            .iter()
-                            .map(|(id, text)| serde_json::json!({"agent_id": id, "result": text}))
-                            .collect::<Vec<_>>()),
+                        serde_json::json!(
+                            sr.background_agent_results
+                                .iter()
+                                .map(
+                                    |(id, text)| serde_json::json!({"agent_id": id, "result": text})
+                                )
+                                .collect::<Vec<_>>()
+                        ),
                     );
                 }
                 println!(
@@ -4198,10 +4203,12 @@ mod mcp_cli_tests {
 
         // Verify it's gone
         let config = read_mcp_config(&path).unwrap();
-        assert!(!config["mcpServers"]
-            .as_object()
-            .unwrap()
-            .contains_key("test-server"));
+        assert!(
+            !config["mcpServers"]
+                .as_object()
+                .unwrap()
+                .contains_key("test-server")
+        );
     }
 
     #[test]

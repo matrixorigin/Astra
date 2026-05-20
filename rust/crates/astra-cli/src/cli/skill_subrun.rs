@@ -19,24 +19,25 @@ use astra_runtime::{
     turn::agentic_headless_round::HeadlessStderrStyle,
     turn::agentic_loop_finalization::run_agentic_loop_with_host,
     turn::agentic_loop_host::{
-        interaction_scoped_tool_restrictions, AgenticLoopHost, AgenticLoopState, CancellationState,
-        HostTurnResult, SkillState, StopHookState, TurnInteractionMode, TurnInteractionPolicy,
+        AgenticLoopHost, AgenticLoopState, CancellationState, HostTurnResult, SkillState,
+        StopHookState, TurnInteractionMode, TurnInteractionPolicy,
+        interaction_scoped_tool_restrictions,
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::chat_turn_payload::{
-        chat_turn_base_payload, merge_edge_profile_extensions,
-        set_payload_tool_results_if_non_empty, ChatTurnBasePayloadInput,
+        ChatTurnBasePayloadInput, chat_turn_base_payload, merge_edge_profile_extensions,
+        set_payload_tool_results_if_non_empty,
     },
     turn::tool_schema_prune::openai_tool_names_from_schemas,
     turn::turn_guard::TurnGuard,
 };
 use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::edge_tools;
 use super::effects::ChatTurnPrepLineGuard;
 use super::permission_manager::{PermissionManager, PermissionMode};
-use super::stream_render::{consume_turn_sse, EdgeSseContext, RenderPolicy};
+use super::stream_render::{EdgeSseContext, RenderPolicy, consume_turn_sse};
 use crate::chat_stream::turn_policy_from_payload_edge_tools;
 
 const SUBRUN_MAX_TURNS: usize = 25;

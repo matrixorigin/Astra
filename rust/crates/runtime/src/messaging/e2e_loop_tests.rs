@@ -12,7 +12,7 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use crate::orchestration::permission_sync::{
         InheritedPermissions, PermissionMode, PermissionRequest, PermissionRequestMessaging,
@@ -20,11 +20,11 @@ mod tests {
     };
     use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
     use crate::turn::agentic_headless_round::{
-        run_agentic_headless_tool_round, HeadlessStderrStyle, HeadlessToolRoundCtx,
-        NoopHeadlessTerminal,
+        HeadlessStderrStyle, HeadlessToolRoundCtx, NoopHeadlessTerminal,
+        run_agentic_headless_tool_round,
     };
     use crate::turn::agentic_loop_host::{
-        run_agentic_loop_with_host, AgenticLoopHost, AgenticLoopState, HostTurnResult,
+        AgenticLoopHost, AgenticLoopState, HostTurnResult, run_agentic_loop_with_host,
     };
     use astra_messaging::in_process::InProcessTransport;
     use astra_messaging::router::AgentMailboxRouter;

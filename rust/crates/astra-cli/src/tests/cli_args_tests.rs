@@ -1038,7 +1038,7 @@ fn session_state_auto_approve_env_activates_auto_mode() {
 
 #[tokio::test]
 async fn task_run_stores_result_in_checkpoint() {
-    use astra_services::{task_orchestrator::TaskCheckpoint, TaskCreateRequest, TaskService};
+    use astra_services::{TaskCreateRequest, TaskService, task_orchestrator::TaskCheckpoint};
 
     // Use a temp dir for LocalTaskService
     let tmp = tempfile::tempdir().unwrap();
@@ -1130,9 +1130,11 @@ fn resolve_system_prompt_at_file_reads_content() {
 fn resolve_system_prompt_at_file_not_found() {
     let result = resolve_system_prompt("@/nonexistent/path/prompt.txt".to_string());
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .contains("cannot read system prompt file"));
+    assert!(
+        result
+            .unwrap_err()
+            .contains("cannot read system prompt file")
+    );
 }
 
 #[test]
@@ -1195,9 +1197,11 @@ fn resolve_system_prompt_at_file_permission_denied() {
     let result = resolve_system_prompt(format!("@{}", path.display()));
     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .contains("cannot read system prompt file"));
+    assert!(
+        result
+            .unwrap_err()
+            .contains("cannot read system prompt file")
+    );
 }
 
 // ── project instructions tests ──

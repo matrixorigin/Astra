@@ -23,7 +23,7 @@
 //!    that's regression-guarded by `every_catalog_item_is_editable_via_apply_edit`.
 
 use crate::runtime_config::RuntimeConfig;
-use astra_core::runtime_limits::{context_window_for_model, RuntimeLimits};
+use astra_core::runtime_limits::{RuntimeLimits, context_window_for_model};
 use serde_json::Value;
 use std::path::Path;
 
@@ -109,11 +109,7 @@ pub fn effective_budget_for_model(config: &RuntimeConfig, model: Option<&str>) -
         // Keep the local-limit fallback consistent with RuntimeLimits:
         // env can override the configured value, so consult it too.
         let env_limit = RuntimeLimits::global().max_turn_input_tokens;
-        if env_limit > 0 {
-            env_limit
-        } else {
-            configured
-        }
+        if env_limit > 0 { env_limit } else { configured }
     }
 }
 
