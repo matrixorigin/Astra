@@ -79,7 +79,10 @@ impl Footer {
             turn_active: self.is_turn_active,
             session_id: self.session_id.clone(),
             cost_usd: None,
-            git_branch: self.git_branch.clone(),
+            // Use the cached lookup directly so the branch chip
+            // auto-refreshes every ~2 s — no need to wait for the
+            // next idle→active transition.
+            git_branch: detect_git_branch(),
             pending_approvals: self.pending_approvals,
             task_counts: self.task_counts,
             task_board_expanded: self.task_board_expanded,

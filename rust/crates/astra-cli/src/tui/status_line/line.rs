@@ -285,11 +285,9 @@ impl StatusLine {
                 .push(Segment::styled(truncate_cwd(cwd, CWD_MAX_WIDTH), muted));
         }
 
-        let mut remaining_budget_segment = None;
         if let Some((used, limit)) = ctx.token_budget {
             if limit > 0 {
                 let pct = (used as f32 / limit as f32) * 100.0;
-                let remaining = limit.saturating_sub(used);
                 let style = if pct >= BUDGET_ERROR_PERCENT {
                     Style::default().fg(Color::Red)
                 } else if pct >= BUDGET_WARN_PERCENT {
@@ -301,22 +299,12 @@ impl StatusLine {
                     format!("{pct:.0}% ({})", format_tokens_compact(used)),
                     style,
                 ));
-                if ctx.turn_active {
-                    remaining_budget_segment = Some(Segment::styled(
-                        format!("{} left", format_tokens_compact(remaining)),
-                        style,
-                    ));
-                }
             }
         }
 
         if let Some(cost) = ctx.cost_usd {
             out.right
                 .push(Segment::styled(format!("${cost:.2}"), muted));
-        }
-
-        if let Some(segment) = remaining_budget_segment {
-            out.right.push(segment);
         }
 
         out

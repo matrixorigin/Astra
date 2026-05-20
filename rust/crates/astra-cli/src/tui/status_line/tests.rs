@@ -156,11 +156,10 @@ fn auto_mode_renders_yellow_chip() {
         .find(|seg| seg.text == "auto")
         .expect("auto chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Yellow));
-    assert!(
-        chip.style
-            .add_modifier
-            .contains(ratatui::style::Modifier::BOLD)
-    );
+    assert!(chip
+        .style
+        .add_modifier
+        .contains(ratatui::style::Modifier::BOLD));
 }
 
 #[test]
@@ -176,11 +175,10 @@ fn accept_edits_mode_renders_cyan_chip() {
         .find(|seg| seg.text == "edit")
         .expect("accept_edits chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Cyan));
-    assert!(
-        chip.style
-            .add_modifier
-            .contains(ratatui::style::Modifier::BOLD)
-    );
+    assert!(chip
+        .style
+        .add_modifier
+        .contains(ratatui::style::Modifier::BOLD));
 }
 
 #[test]
@@ -196,11 +194,10 @@ fn plan_mode_renders_blue_chip() {
         .find(|seg| seg.text == "plan")
         .expect("plan chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Blue));
-    assert!(
-        chip.style
-            .add_modifier
-            .contains(ratatui::style::Modifier::BOLD)
-    );
+    assert!(chip
+        .style
+        .add_modifier
+        .contains(ratatui::style::Modifier::BOLD));
 }
 
 #[test]
@@ -216,11 +213,10 @@ fn deny_mode_renders_red_chip() {
         .find(|seg| seg.text == "deny")
         .expect("deny chip");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Red));
-    assert!(
-        chip.style
-            .add_modifier
-            .contains(ratatui::style::Modifier::BOLD)
-    );
+    assert!(chip
+        .style
+        .add_modifier
+        .contains(ratatui::style::Modifier::BOLD));
 }
 
 // ─── Right-side segments: model · dir · tokens · cost · branch ────
@@ -273,9 +269,11 @@ fn token_budget_renders_as_percent_and_absolute() {
         plain.contains("25k") || plain.contains("25000") || plain.contains("25,000"),
         "absolute used count expected; got {plain:?}"
     );
+    // The "... left" chip was removed — it duplicated the percentage
+    // and wasted status-line width during active turns.
     assert!(
-        plain.contains("75k left") || plain.contains("75000 left"),
-        "remaining budget expected; got {plain:?}"
+        !plain.contains("left"),
+        "unexpected 'left' chip; got {plain:?}"
     );
 }
 
@@ -421,12 +419,10 @@ fn pending_chip_is_yellow_without_extra_bold() {
         .find(|seg| seg.text.contains("pending"))
         .expect("pending chip");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Yellow));
-    assert!(
-        !chip
-            .style
-            .add_modifier
-            .contains(ratatui::style::Modifier::BOLD)
-    );
+    assert!(!chip
+        .style
+        .add_modifier
+        .contains(ratatui::style::Modifier::BOLD));
 }
 
 // ── Phase 3b.2: background task chip ────────────────────────────────
