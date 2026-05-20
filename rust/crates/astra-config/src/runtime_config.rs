@@ -113,6 +113,31 @@ pub struct RuntimeLimitsConfig {
     pub plan_subtask_max_turns: u32,
 }
 
+impl RuntimeLimitsConfig {
+    /// Resolve the effective per-turn tool-call ceiling.
+    ///
+    /// Config values > 0 override the env-driven [`astra_core::RuntimeLimits`]
+    /// singleton. A plan subtask first consults `plan_subtask_max_turns`,
+    /// then falls back to `max_turns`, then finally to the env/built-in
+    /// `effective_plan_subtask_turns()` behavior.
+    pub fn resolve_turn_ceiling(&self, is_plan_subtask: bool) -> usize {
+        let env_limits = astra_core::RuntimeLimits::global();
+        if is_plan_subtask {
+            if self.plan_subtask_max_turns > 0 {
+                self.plan_subtask_max_turns as usize
+            } else if self.max_turns > 0 {
+                self.max_turns as usize
+            } else {
+                env_limits.effective_plan_subtask_turns()
+            }
+        } else if self.max_turns > 0 {
+            self.max_turns as usize
+        } else {
+            env_limits.max_turns
+        }
+    }
+}
+
 // ─── Fork-Prefix Configuration ───────────────────────────────────────────────
 
 /// Telemetry sink selection for fork-cache events.
@@ -2384,6 +2409,53 @@ mod tests {
         let cfg = ToolSelectionConfig::default();
         assert_eq!(cfg.effective_round_budget_warning(), 200);
         assert_eq!(cfg.effective_round_budget_limit(), 200);
+    }
+
+    #[test]
+    fn runtime_turn_ceiling_config_overrides_env() {
+        let cfg = RuntimeLimitsConfig {
+            max_turns: 8,
+            plan_subtask_max_turns: 0,
+        };
+        assert_eq!(cfg.resolve_turn_ceiling(false), 8);
+    }
+
+    #[test]
+    fn runtime_turn_ceiling_falls_back_to_env_when_zero() {
+        let env_max = astra_core::RuntimeLimits::global().max_turns;
+        let cfg = RuntimeLimitsConfig {
+            max_turns: 0,
+            plan_subtask_max_turns: 0,
+        };
+        assert_eq!(cfg.resolve_turn_ceiling(false), env_max);
+    }
+
+    #[test]
+    fn runtime_turn_ceiling_plan_subtask_config_wins() {
+        let cfg = RuntimeLimitsConfig {
+            max_turns: 100,
+            plan_subtask_max_turns: 20,
+        };
+        assert_eq!(cfg.resolve_turn_ceiling(true), 20);
+    }
+
+    #[test]
+    fn runtime_turn_ceiling_plan_subtask_falls_back_to_config_max() {
+        let cfg = RuntimeLimitsConfig {
+            max_turns: 30,
+            plan_subtask_max_turns: 0,
+        };
+        assert_eq!(cfg.resolve_turn_ceiling(true), 30);
+    }
+
+    #[test]
+    fn runtime_turn_ceiling_plan_subtask_falls_back_to_env() {
+        let env_effective = astra_core::RuntimeLimits::global().effective_plan_subtask_turns();
+        let cfg = RuntimeLimitsConfig {
+            max_turns: 0,
+            plan_subtask_max_turns: 0,
+        };
+        assert_eq!(cfg.resolve_turn_ceiling(true), env_effective);
     }
 
     #[test]

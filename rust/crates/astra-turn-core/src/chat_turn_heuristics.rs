@@ -9,7 +9,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::chat_history_openai::openai_user_content_message;
-use crate::interaction_types::{TurnInteractionPolicy, ASK_USER_TOOL_NAME};
+use crate::interaction_types::{ASK_USER_TOOL_NAME, TurnInteractionPolicy};
 
 const DEFAULT_STALL_WINDOW: usize = 3;
 const DEFAULT_EXPLORATION_ROUND_BUDGET: usize = 5;

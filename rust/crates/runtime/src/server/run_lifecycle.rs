@@ -3304,33 +3304,6 @@ impl AgenticRunLifecycleService {
         builder.build()
     }
 
-    /// Resolve the per-turn tool-call ceiling, layering
-    /// [`RuntimeConfig`]'s `runtime_limits` over the env-driven
-    /// [`RuntimeLimits::global()`].
-    ///
-    /// Config fields > 0 override the env default; 0 means "inherit".
-    fn resolve_runtime_turn_ceiling(
-        is_plan_subtask: bool,
-        limits_config: &astra_config::runtime_config::RuntimeLimitsConfig,
-    ) -> usize {
-        let env_limits = astra_core::RuntimeLimits::global();
-        if is_plan_subtask {
-            if limits_config.plan_subtask_max_turns > 0 {
-                limits_config.plan_subtask_max_turns as usize
-            } else if limits_config.max_turns > 0 {
-                limits_config.max_turns as usize
-            } else {
-                env_limits.effective_plan_subtask_turns()
-            }
-        } else {
-            if limits_config.max_turns > 0 {
-                limits_config.max_turns as usize
-            } else {
-                env_limits.max_turns
-            }
-        }
-    }
-
     /// Build the initial [`AgenticLoopState`] from a chat request.
     ///
     /// `workspace_override` — when the server provisions a workspace (web-agent
@@ -3376,10 +3349,9 @@ impl AgenticRunLifecycleService {
         });
 
         let task_profile = infer_task_execution_profile(&request.message);
-        let runtime_turn_ceiling = Self::resolve_runtime_turn_ceiling(
-            is_plan_subtask_from_chat_context(&request.context),
-            &astra_config::runtime_config::RuntimeConfig::cached().runtime_limits,
-        );
+        let runtime_turn_ceiling = astra_config::runtime_config::RuntimeConfig::cached()
+            .runtime_limits
+            .resolve_turn_ceiling(is_plan_subtask_from_chat_context(&request.context));
         let requested_budget = request.execution_budget.as_ref().map(|budget| {
             astra_turn_core::chat_turn_heuristics::AgenticTurnBudgetOverride {
                 initial_turns: budget.initial_turns.map(|value| value as usize),
@@ -8583,75 +8555,5 @@ mod tests {
         let durable = engine.load_run("waiting-run").await.unwrap().unwrap();
         assert_eq!(result.status, STATUS_CANCELLED);
         assert_eq!(durable.status, STATUS_CANCELLED);
-    }
-
-    // ── resolve_runtime_turn_ceiling config layering ──
-
-    /// Config max_turns > 0 overrides env RuntimeLimits::global().
-    #[test]
-    fn resolve_runtime_turn_ceiling_config_overrides_env() {
-        let cfg = astra_config::runtime_config::RuntimeLimitsConfig {
-            max_turns: 8,
-            plan_subtask_max_turns: 0,
-        };
-        assert_eq!(
-            AgenticRunLifecycleService::resolve_runtime_turn_ceiling(false, &cfg),
-            8
-        );
-    }
-
-    /// Config max_turns = 0 falls back through RuntimeLimits::global().max_turns.
-    #[test]
-    fn resolve_runtime_turn_ceiling_falls_back_to_env_when_zero() {
-        let env_max = astra_core::RuntimeLimits::global().max_turns;
-        let cfg = astra_config::runtime_config::RuntimeLimitsConfig {
-            max_turns: 0,
-            plan_subtask_max_turns: 0,
-        };
-        assert_eq!(
-            AgenticRunLifecycleService::resolve_runtime_turn_ceiling(false, &cfg),
-            env_max
-        );
-    }
-
-    /// Plan subtask uses config plan_subtask_max_turns first.
-    #[test]
-    fn resolve_runtime_turn_ceiling_plan_subtask_config_wins() {
-        let cfg = astra_config::runtime_config::RuntimeLimitsConfig {
-            max_turns: 100,
-            plan_subtask_max_turns: 20,
-        };
-        assert_eq!(
-            AgenticRunLifecycleService::resolve_runtime_turn_ceiling(true, &cfg),
-            20
-        );
-    }
-
-    /// Plan subtask with plan_subtask_max_turns=0 but max_turns>0 uses config max_turns.
-    #[test]
-    fn resolve_runtime_turn_ceiling_plan_subtask_falls_back_to_config_max() {
-        let cfg = astra_config::runtime_config::RuntimeLimitsConfig {
-            max_turns: 30,
-            plan_subtask_max_turns: 0,
-        };
-        assert_eq!(
-            AgenticRunLifecycleService::resolve_runtime_turn_ceiling(true, &cfg),
-            30
-        );
-    }
-
-    /// Plan subtask with both config fields zero falls back through env.
-    #[test]
-    fn resolve_runtime_turn_ceiling_plan_subtask_falls_back_to_env() {
-        let env_effective =
-            astra_core::RuntimeLimits::global().effective_plan_subtask_turns();
-        let cfg = astra_config::runtime_config::RuntimeLimitsConfig {
-            max_turns: 0,
-            plan_subtask_max_turns: 0,
-        };
-        assert_eq!(
-            AgenticRunLifecycleService::resolve_runtime_turn_ceiling(true, &cfg),
-            env_effective
-        );
     }
 }

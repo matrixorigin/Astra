@@ -593,7 +593,10 @@ pub(super) async fn list_plans_handler(
             .await
             .map_err(map_plan_load_err)?
         else {
-            return Ok(Json(PlanListResponse { plans: Vec::new(), warning: None }));
+            return Ok(Json(PlanListResponse {
+                plans: Vec::new(),
+                warning: None,
+            }));
         };
         let plan_state = match state
             .plan_repo
@@ -602,7 +605,10 @@ pub(super) async fn list_plans_handler(
         {
             Ok(state) => state,
             Err(PlanLoadError::NotFound(_)) => {
-                return Ok(Json(PlanListResponse { plans: Vec::new(), warning: None }));
+                return Ok(Json(PlanListResponse {
+                    plans: Vec::new(),
+                    warning: None,
+                }));
             }
             Err(err) => return Err(map_plan_load_err(err)),
         };
@@ -644,7 +650,10 @@ pub(super) async fn list_plans_handler(
         })
         .collect();
 
-    Ok(Json(PlanListResponse { plans, warning: None }))
+    Ok(Json(PlanListResponse {
+        plans,
+        warning: None,
+    }))
 }
 
 /// `GET /plans/{plan_id}` — get plan details.
@@ -1734,9 +1743,11 @@ mod tests {
         };
         assert_eq!(empty_but_warn.plans.len(), 0);
         assert!(empty_but_warn.warning.is_some());
-        assert!(empty_but_warn
-            .warning
-            .unwrap()
-            .contains("active plan is in"));
+        assert!(
+            empty_but_warn
+                .warning
+                .unwrap()
+                .contains("active plan is in")
+        );
     }
 }

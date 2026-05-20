@@ -116,7 +116,9 @@ fn looks_like_quick_answer_query(message: &str) -> bool {
 }
 
 fn looks_like_low_info_continuation(message: &str) -> bool {
-    use astra_turn_core::chat_turn_heuristics::{starts_with_chinese_continuation_prefix, trim_trailing_punctuation};
+    use astra_turn_core::chat_turn_heuristics::{
+        starts_with_chinese_continuation_prefix, trim_trailing_punctuation,
+    };
     let trimmed = trim_trailing_punctuation(message);
     if trimmed.is_empty() || trimmed.chars().count() > 32 {
         return false;

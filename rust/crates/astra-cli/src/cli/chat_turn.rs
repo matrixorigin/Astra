@@ -3,8 +3,8 @@ use std::time::Instant;
 use astra_services::session_workspace::ContextTraceSignal;
 #[cfg(test)]
 use astra_services::session_workspace::{ContextTraceBudgetSignal, ContextTraceToolSelection};
-use astra_tools::task_mgmt::SessionTask;
 use astra_text_utils::str_preview::truncate_str;
+use astra_tools::task_mgmt::SessionTask;
 
 use super::*;
 
@@ -541,7 +541,9 @@ If the follow-up asks to fix / patch / test / continue, apply that action to thi
 }
 
 pub(super) fn is_short_continuation_prompt(line: &str) -> bool {
-    use astra_turn_core::chat_turn_heuristics::{starts_with_chinese_continuation_prefix, trim_trailing_punctuation};
+    use astra_turn_core::chat_turn_heuristics::{
+        starts_with_chinese_continuation_prefix, trim_trailing_punctuation,
+    };
     let trimmed = trim_trailing_punctuation(line);
     if trimmed.is_empty() || trimmed.chars().count() > 16 {
         return false;
