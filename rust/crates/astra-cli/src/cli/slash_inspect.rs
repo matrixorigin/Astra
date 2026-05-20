@@ -2,7 +2,7 @@
 use super::*;
 
 #[cfg(feature = "harness")]
-/// Retention: REPL fallback handler for `/inspect` — called from slash_router.rs.
+/// Retention: fallback handler for `/inspect` — called from slash_router.rs.
 /// In TUI mode this is shadowed by TuiHandler::Panel (InfoView).
 /// Kept for headless / non-interactive execution paths.
 #[allow(dead_code)]

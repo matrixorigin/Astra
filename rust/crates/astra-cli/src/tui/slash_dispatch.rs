@@ -8,8 +8,8 @@
 use crate::command_registry;
 use crate::command_registry::TuiHandler;
 use crate::session_state::SessionState;
-use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
 use crate::tui::bottom_pane::BottomPane;
+use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
 use crate::tui::history_cell::system::SystemCell;
 use crate::tui::terminal::TerminalGuard;
 
@@ -409,11 +409,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 return handle_context_dump(rest.trim(), ctx);
             }
             if !args_trim.is_empty() {
-                use crate::tui::history_cell::system::SystemCell;
-                ctx.chat_widget.commit_system(SystemCell::info(
-                    "Usage: /context          — open the context panel\n       \
-                     /context dump [path] — write a JSON snapshot",
-                ));
+                ctx.show_info(CONTEXT_USAGE_MESSAGE.into());
                 return SlashResult::Handled;
             }
             use crate::tui::bottom_pane::context_panel_view::ContextPanelView;
@@ -506,17 +502,21 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
-        // ── /config (TUI-native panel) ─────────────────────────────
-        // All /config subcommands (edit, show, paths, sources, diff,
-        // export) open the interactive ConfigEditView.  The panel
-        // provides search, pick, edit, diff, and export in one place.
-        "/config" => {
-            use crate::tui::bottom_pane::config_edit_view::ConfigEditView;
-            let cfg = astra_config::runtime_config::RuntimeConfig::load();
-            ctx.bottom_pane
-                .push_view(Box::new(ConfigEditView::new(cfg)));
-            SlashResult::Handled
-        }
+        // ── /config (panel for edit, text fallback for read-only forms) ──
+        "/config" => match config_command_route(args) {
+            Ok(ConfigCommandRoute::Panel) => {
+                use crate::tui::bottom_pane::config_edit_view::ConfigEditView;
+                let cfg = astra_config::runtime_config::RuntimeConfig::load();
+                ctx.bottom_pane
+                    .push_view(Box::new(ConfigEditView::new(cfg)));
+                SlashResult::Handled
+            }
+            Ok(ConfigCommandRoute::Fallback) => SlashResult::Fallback,
+            Err(usage) => {
+                ctx.show_error(usage.to_string());
+                SlashResult::Handled
+            }
+        },
 
         // ── SQL table view (TUI-native, astra-unique) ───────────────
         //
@@ -594,7 +594,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         // ── Worktrees (TUI-native) ──────────────────────────────────
         "/worktrees" => {
             use crate::tui::bottom_pane::worktrees_view::WorktreesView;
-            use crate::tui::worktrees::{parse, WorktreeList};
+            use crate::tui::worktrees::{WorktreeList, parse};
 
             // `git worktree list --porcelain` on a blocking thread.
             let porcelain = tokio::task::spawn_blocking(|| {
@@ -735,8 +735,50 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
-        // /whoami is now folded into /session — redirect for muscle memory
-        "/whoami" => handle_session_hub(ctx),
+        "/whoami" | "/info" => {
+            use crate::tui::bottom_pane::info_view::InfoView;
+
+            let model = ctx.state.model.as_deref().unwrap_or("<unset>");
+            let session = ctx.state.session_id.as_deref().unwrap_or("<none>");
+            let perm = format!("{:?}", ctx.state.perm_manager.mode());
+            let skills = ctx.state.unified_skill_registry.len();
+            let version = env!("CARGO_PKG_VERSION");
+            let pending = ctx
+                .state
+                .skill_improvement_tracker
+                .pending_proposal
+                .as_ref()
+                .map(|p| p.skill_name.clone())
+                .unwrap_or_else(|| "<none>".into());
+            let recent_tools = if ctx.state.recent_tools.is_empty() {
+                "<none>".to_string()
+            } else {
+                ctx.state
+                    .recent_tools
+                    .iter()
+                    .take(8)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+
+            let pairs: Vec<(&str, String)> = vec![
+                ("version", format!("astra v{version}")),
+                ("session", session.to_string()),
+                ("model", model.to_string()),
+                ("permission", perm),
+                ("skills loaded", skills.to_string()),
+                ("turn", ctx.state.turn.to_string()),
+                ("pending improve", pending),
+                ("recent tools", recent_tools),
+                ("context width", format!("{} cols", ctx.width)),
+            ];
+
+            ctx.bottom_pane.push_view(Box::new(
+                InfoView::from_key_value("System Info", pairs).with_reopen("/info"),
+            ));
+            SlashResult::Handled
+        }
 
         // ── History — interactive search view ────────────────────────
         "/history" => {
@@ -859,30 +901,27 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
         }
 
-        // ── /memory — list / search / inspect in a TUI panel ───────
+        // ── /memory — list/search in TUI; inspect falls back to text detail ──
         "/memory" => {
-            let subcmd = args.split_whitespace().next().unwrap_or("list");
-            let sub_arg = args.strip_prefix(subcmd).unwrap_or("").trim();
+            let route = match memory_command_route(args) {
+                Ok(route) => route,
+                Err(msg) => {
+                    ctx.show_error(msg.into());
+                    return SlashResult::Handled;
+                }
+            };
             let token = crate::session_runtime::fresh_access_token(ctx.api, ctx.profile).await;
             let Some(token) = token else {
                 ctx.show_error("Not logged in. Use /login.".into());
                 return SlashResult::Handled;
             };
 
-            let (query, top_k) = match subcmd {
-                "search" if !sub_arg.is_empty() => (sub_arg.to_string(), 20),
-                "list" | "" => ("user preferences knowledge plans tasks".to_string(), 20),
-                "inspect" if !sub_arg.is_empty() => {
-                    // Inspect a single memory by id — forward to chat
-                    // which has richer formatting for the detail view.
-                    return SlashResult::Forward(text.to_string());
+            let (query, top_k) = match route {
+                MemoryCommandRoute::Search(query) => (query, 20),
+                MemoryCommandRoute::List => {
+                    ("user preferences knowledge plans tasks".to_string(), 20)
                 }
-                _ => {
-                    ctx.show_error(
-                        "Unknown subcommand. Try: list, search <query>, inspect <id>".into(),
-                    );
-                    return SlashResult::Handled;
-                }
+                MemoryCommandRoute::Inspect(_) => return SlashResult::Fallback,
             };
 
             let payload = serde_json::json!({
@@ -950,63 +989,32 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
         }
 
-        // ── /info — system info at a glance ────────────────────────
-        "/info" => {
-            use crate::tui::bottom_pane::info_view::InfoView;
-
-            let model = ctx.state.model.as_deref().unwrap_or("<unset>");
-            let session = ctx.state.session_id.as_deref().unwrap_or("<none>");
-            let perm = format!("{:?}", ctx.state.perm_manager.mode());
-            let skills = ctx.state.unified_skill_registry.len();
-            let version = env!("CARGO_PKG_VERSION");
-
-            let pairs: Vec<(&str, String)> = vec![
-                ("version", format!("astra v{version}")),
-                ("session", session.to_string()),
-                ("model", model.to_string()),
-                ("permission", perm),
-                ("skills loaded", skills.to_string()),
-                ("context width", format!("{} cols", ctx.width)),
-            ];
-
-            ctx.bottom_pane.push_view(Box::new(
-                InfoView::from_key_value("System Info", pairs).with_reopen("/info"),
-            ));
-            SlashResult::Handled
-        }
-
         // ── Everything else → route via TuiHandler metadata ────────
-        _ => match cmd {
-            // Commands already explicitly handled above → shouldn't reach here.
-            // The catch-all routes everything else according to its TuiHandler:
-            _ => {
-                match command_registry::resolve_command_meta(cmd).map(|m| m.tui_handler) {
-                    // ChatForward (default, no tui_handler set) → forward to chat composer
-                    None | Some(TuiHandler::ChatForward) => SlashResult::Forward(text.to_string()),
-                    // Fallback → tear down TUI, run REPL handler, restore
-                    Some(TuiHandler::Fallback) => SlashResult::Fallback,
-                    // Panel → open native TUI panel (portals built in later phases)
-                    Some(TuiHandler::Panel) => {
-                        ctx.show_info(format!(
-                            "`{}` panel is not yet implemented in TUI — forwarding to chat",
-                            resolved
-                        ));
-                        SlashResult::Forward(text.to_string())
-                    }
-                    // Selector → open picker/selector (built in later phases)
-                    Some(TuiHandler::Selector) => {
-                        ctx.show_info(format!(
-                            "`{}` selector is not yet implemented in TUI — forwarding to chat",
-                            resolved
-                        ));
-                        SlashResult::Forward(text.to_string())
-                    }
-                    // Inline → should have been matched explicitly above
-                    Some(TuiHandler::Inline) => {
-                        ctx.show_error(format!("Command `{resolved}` not handled inline"));
-                        SlashResult::Handled
-                    }
-                }
+        _ => match command_registry::resolve_command_meta(cmd).map(|m| m.tui_handler) {
+            // ChatForward (default, no tui_handler set) → forward to chat composer
+            None | Some(TuiHandler::ChatForward) => SlashResult::Forward(text.to_string()),
+            // Fallback → tear down TUI, run REPL handler, restore
+            Some(TuiHandler::Fallback) => SlashResult::Fallback,
+            // Panel → open native TUI panel (portals built in later phases)
+            Some(TuiHandler::Panel) => {
+                ctx.show_info(format!(
+                    "`{}` panel is not yet implemented in TUI — forwarding to chat",
+                    resolved
+                ));
+                SlashResult::Forward(text.to_string())
+            }
+            // Selector → open picker/selector (built in later phases)
+            Some(TuiHandler::Selector) => {
+                ctx.show_info(format!(
+                    "`{}` selector is not yet implemented in TUI — forwarding to chat",
+                    resolved
+                ));
+                SlashResult::Forward(text.to_string())
+            }
+            // Inline → should have been matched explicitly above
+            Some(TuiHandler::Inline) => {
+                ctx.show_error(format!("Command `{resolved}` not handled inline"));
+                SlashResult::Handled
             }
         },
     }
@@ -1119,8 +1127,8 @@ pub(crate) fn build_panels_cheat_sheet_lines() -> Vec<String> {
         ),
         (
             "/config [edit|show|paths|sources|diff|export]",
-            "interactive panel — search, pick, edit, diff, and export config",
-            "↑↓ navigate · Enter edit/set · type to search · Esc save/close",
+            "edit opens the panel; show/paths/sources/diff/export stay text-first",
+            "panel: ↑↓ navigate · Enter edit/set · type to search · Esc save/close",
         ),
         (
             "/model",
@@ -1676,6 +1684,62 @@ fn split_sub(text: &str) -> (&str, &str) {
         None => (t, ""),
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigCommandRoute {
+    Panel,
+    Fallback,
+}
+
+fn config_command_route(args: &str) -> Result<ConfigCommandRoute, &'static str> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Ok(ConfigCommandRoute::Panel);
+    }
+
+    let (sub, _) = split_sub(trimmed);
+    match sub {
+        "edit" => Ok(ConfigCommandRoute::Panel),
+        "show" | "paths" | "sources" | "diff" | "export" | "help" | "-h" | "--help" => {
+            Ok(ConfigCommandRoute::Fallback)
+        }
+        _ => Err("Usage: /config [edit|show|paths|sources|diff|export [path]]"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MemoryCommandRoute {
+    List,
+    Search(String),
+    Inspect(String),
+}
+
+fn memory_command_route(args: &str) -> Result<MemoryCommandRoute, &'static str> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Ok(MemoryCommandRoute::List);
+    }
+
+    let (sub, rest) = split_sub(trimmed);
+    match sub {
+        "list" if rest.is_empty() => Ok(MemoryCommandRoute::List),
+        "search" if !rest.is_empty() => Ok(MemoryCommandRoute::Search(rest.to_string())),
+        "inspect" if !rest.is_empty() => Ok(MemoryCommandRoute::Inspect(rest.to_string())),
+        _ => Err("Unknown subcommand. Try: list, search <query>, inspect <id>."),
+    }
+}
+
+fn inspect_command_supported(args: &str) -> Result<(), String> {
+    let sub = args.trim();
+    match sub {
+        "" => Ok(()),
+        "budget" | "tools" | "context" | "json" | "diff" | "history" | "trace" | "forensics"
+        | "export" => Ok(()),
+        _ => Err(format!("Unknown `/inspect` subcommand: `{sub}`.")),
+    }
+}
+
+const CONTEXT_USAGE_MESSAGE: &str = "Usage: /context — open the context panel\n       /context dump [path] — write a JSON snapshot.";
 
 // ── /model subcommand helpers ───────────────────────────────────
 
@@ -2539,32 +2603,14 @@ fn handle_context_dump(arg: &str, ctx: &mut DispatchContext<'_>) -> SlashResult 
 
 // ── /inspect dispatch ────────────────────────────────────────────────
 //
-// Routes `/inspect` subcommands. Full TUI-native panels (budget, tools,
-// context, diff, history) will be wired in later phases once the
-// ViewStack portal infrastructure is ready.  For Phase 1.2 the
-// handler forwards unimplemented subcommands to chat so the user sees
-// progress instead of an error.
+// Routes `/inspect` subcommands. Until the dedicated TUI panel ships,
+// all supported forms fall back to the text renderer immediately so the
+// command still executes instead of being bounced back into the composer.
 async fn handle_inspect_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashResult {
-    let sub = args.trim();
-    match sub {
-        "" => {
-            // No subcommand → show picker (Phase 1.4)
-            ctx.show_info(
-                "`/inspect` subcommands: budget, tools, context, json, diff, history, trace, forensics, export"
-                    .to_string(),
-            );
-            SlashResult::Handled
-        }
-        "budget" | "tools" | "context" | "json" | "diff" | "history" | "trace" | "forensics"
-        | "export" => {
-            // Subcommand recognized but panel not yet built
-            ctx.show_info(format!(
-                "`/inspect {sub}` panel will be available soon — forwarding to chat for now"
-            ));
-            SlashResult::Forward(format!("/inspect {}", args))
-        }
-        _ => {
-            ctx.show_error(format!("Unknown `/inspect` subcommand: `{sub}`"));
+    match inspect_command_supported(args) {
+        Ok(()) => SlashResult::Fallback,
+        Err(message) => {
+            ctx.show_error(message);
             SlashResult::Handled
         }
     }
@@ -2634,6 +2680,76 @@ mod panels_tests {
                 "cheat sheet /info entry missing keyword: {kw}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::{
+        CONTEXT_USAGE_MESSAGE, ConfigCommandRoute, MemoryCommandRoute, config_command_route,
+        inspect_command_supported, memory_command_route,
+    };
+
+    #[test]
+    fn config_route_keeps_read_only_forms_on_text_path() {
+        for form in [
+            "show",
+            "paths",
+            "sources",
+            "diff",
+            "export ./runtime.toml",
+            "help",
+        ] {
+            assert_eq!(
+                config_command_route(form),
+                Ok(ConfigCommandRoute::Fallback),
+                "{form} should keep the text fallback behavior"
+            );
+        }
+    }
+
+    #[test]
+    fn config_route_opens_panel_for_edit_forms() {
+        assert_eq!(config_command_route(""), Ok(ConfigCommandRoute::Panel));
+        assert_eq!(config_command_route("edit"), Ok(ConfigCommandRoute::Panel));
+    }
+
+    #[test]
+    fn memory_route_distinguishes_list_search_and_inspect() {
+        assert_eq!(memory_command_route(""), Ok(MemoryCommandRoute::List));
+        assert_eq!(memory_command_route("list"), Ok(MemoryCommandRoute::List));
+        assert_eq!(
+            memory_command_route("search auth preferences"),
+            Ok(MemoryCommandRoute::Search("auth preferences".into()))
+        );
+        assert_eq!(
+            memory_command_route("inspect mem_123"),
+            Ok(MemoryCommandRoute::Inspect("mem_123".into()))
+        );
+    }
+
+    #[test]
+    fn inspect_route_accepts_known_subcommands_and_rejects_unknown_ones() {
+        for form in [
+            "", "budget", "tools", "context", "json", "diff", "history", "trace",
+        ] {
+            assert!(
+                inspect_command_supported(form).is_ok(),
+                "{form} should be accepted"
+            );
+        }
+        assert_eq!(
+            inspect_command_supported("mystery"),
+            Err("Unknown `/inspect` subcommand: `mystery`.".into())
+        );
+    }
+
+    #[test]
+    fn context_usage_message_is_aligned() {
+        assert_eq!(
+            CONTEXT_USAGE_MESSAGE,
+            "Usage: /context — open the context panel\n       /context dump [path] — write a JSON snapshot."
+        );
     }
 }
 

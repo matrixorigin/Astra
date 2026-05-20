@@ -1,6 +1,6 @@
 //! TUI outer event loop.
 //!
-//! Owns [`run_tui_repl`] — the entry point that ratatui mode
+//! Owns [`run_tui_session`] — the entry point that ratatui mode
 //! runs under for the lifetime of the interactive session. The loop:
 //!
 //! 1. Completes business bootstrap (auth, state, task stores,
@@ -483,7 +483,7 @@ pub(crate) fn can_run_tui() -> bool {
         && std::env::var("TERM").map_or(true, |t| t != "dumb")
 }
 
-pub(crate) async fn run_tui_repl(
+pub(crate) async fn run_tui_session(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     initial_model: Option<&str>,
@@ -3087,7 +3087,7 @@ mod tests {
         let source = include_str!("event_loop.rs");
         assert!(
             source.contains("workspace_trust_startup_prompt()"),
-            "run_tui_repl should query the permission manager for a startup trust prompt"
+            "run_tui_session should query the permission manager for a startup trust prompt"
         );
         assert!(
             source.contains("Trust Workspace")
@@ -3273,7 +3273,7 @@ mod tests {
     }
 
     /// REGRESSION (review M4): every branch of the ViewCompleted arm
-    /// in `run_tui_repl` must clear `pending_deferred_slash_flush`,
+    /// in `run_tui_session` must clear `pending_deferred_slash_flush`,
     /// otherwise the flag can stick `true` forever and `should_flush_ambient_commits`
     /// permanently suppresses TUI tick + app-event flushes — breaking
     /// every subsequent slash menu, ambient banner, and live update.
@@ -3290,7 +3290,7 @@ mod tests {
     #[test]
     fn every_view_completed_branch_clears_deferred_flush_flag() {
         let source = include_str!("event_loop.rs");
-        // Locate the outer ViewCompleted arm in run_tui_repl by a
+        // Locate the outer ViewCompleted arm in run_tui_session by a
         // distinctive opening (the inner `tokio::select!` at line ~870
         // also has a ViewCompleted arm but its body is much shorter).
         // The outer arm runs from "BottomPaneAction::ViewCompleted { result, reopen }"

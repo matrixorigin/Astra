@@ -16,7 +16,7 @@ static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 pub(crate) const LIVE_GUTTER_PERIOD_SECS: f32 = 3.0;
 
 /// Eagerly initialize the shimmer time origin. Call once near the
-/// top of `run_tui_repl` so any `Instant` captured later by a cell's
+/// top of `run_tui_session` so any `Instant` captured later by a cell's
 /// `finalize()` is guaranteed to be `>= PROCESS_START`. Without this,
 /// the first cell to finalize before any `elapsed_since_start()` /
 /// `gradient_color_at_t` call would saturate `time_at` to 0 and the

@@ -1,8 +1,8 @@
 #![allow(unused_imports)]
 use super::*;
 
-/// Retention: REPL fallback handler for `/health` — called from slash_router.rs.
-/// In TUI mode this is shadowed by TuiHandler::Panel (InfoView).
+/// Retention: fallback handler for `/health` — called from slash_router.rs.
+/// In TUI mode this is typically reached via `/stats health` or the `/health` alias.
 /// Kept for headless / non-interactive execution paths.
 #[allow(dead_code)]
 pub(super) async fn handle_health_command(arg: &str, state: &SessionState) {

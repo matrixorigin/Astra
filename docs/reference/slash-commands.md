@@ -4,7 +4,7 @@ Complete reference for slash commands available in the `astra` TUI.
 
 ## Overview
 
-astra supports 62 slash commands organized into 9 groups. Type `/help` to see all available commands, or `/help keys` for keyboard shortcuts.
+astra supports dozens of slash commands organized into 9 groups. Type `/help` to see all available commands, or `/help keys` for keyboard shortcuts.
 
 ## Command Groups
 
@@ -33,13 +33,21 @@ Show available commands and usage hints.
 /help keys   # Show keyboard shortcuts
 ```
 
-### `/model [name]`
+### `/model [subcommand]`
 
-List available models or switch to a different model.
+Open the model picker, inspect the current model, or switch directly.
+
+| Subcommand           | Description                 |
+| -------------------- | --------------------------- |
+| (none) or `list`     | Open the model picker       |
+| `info`               | Show current model details  |
+| `clear`              | Reset to the API default    |
+| `<name>`             | Switch directly to a model  |
 
 ```
-/model                    # List models
-/model claude-sonnet-4   # Switch to Sonnet 4
+/model                      # Open picker
+/model info                 # Inspect current model
+/model claude-sonnet-4.6    # Switch directly
 ```
 
 ### `/clear`
@@ -225,13 +233,20 @@ Task management for async work.
 
 ## 🔭 Observability Commands
 
+Use these as:
+
+1. `/stats` for operator-facing analytics and health.
+2. `/inspect` for harness snapshots and exports.
+3. `/telemetry` for deep observability traces.
+4. `/debug` for developer-oriented low-level inspection.
+
 ### `/explain`
 
 Cycle through explanation modes: off → on (API) → verbose (+stderr).
 
-### `/verbose`
+### `/verbose` *(removed)*
 
-Enable verbose streaming output.
+Migration: use `/stats` for metrics and `/timeline` for turn traces.
 
 ### `/compact [mode]`
 
@@ -248,21 +263,30 @@ Summarize and trim conversation history.
 
 Reflect on session (skill_failure, performance, etc.).
 
-### `/turn [selector]`
+### `/turn` *(removed)*
 
-Inspect specific turns.
-
-```
-/turn              # Latest turn
-/turn list         # List all turns
-/turn 5            # Turn by index
-/turn -1           # Last turn
-/turn id:abc123    # By turn ID
-```
+Migration: use `/timeline` and press Enter to drill into a turn.
 
 ### `/debug`
 
-Interactive session inspector for messages, tools, and context injections.
+Developer-oriented low-level inspection for messages, tools, and context injections.
+
+### `/inspect [subcommand]`
+
+Harness inspection utilities. Today these open the text fallback view directly.
+
+| Subcommand   | Description                      |
+| ------------ | -------------------------------- |
+| (none)       | Show inspect help / overview     |
+| `budget`     | Token budget breakdown           |
+| `tools`      | Tool dashboard                   |
+| `context`    | Context snapshot                 |
+| `json`       | Raw snapshot JSON                |
+| `diff`       | Session state diff               |
+| `history`    | Recent turn history              |
+| `trace`      | Permission trace                 |
+| `forensics`  | Forensics dump                   |
+| `export`     | Export inspect output            |
 
 ### `/stats [subcommand]`
 
@@ -277,24 +301,35 @@ Session analytics.
 | `learn`    | Learning insights               |
 | `tools`    | Tool performance metrics        |
 
+### `/health [detail]`
+
+Alias for `/stats health`. Use `detail` for the per-tool breakdown.
+
+### `/config [subcommand]`
+
+Runtime configuration inspection and editing.
+
+| Subcommand | Description                                  |
+| ---------- | -------------------------------------------- |
+| (none)     | Open the interactive config editor panel     |
+| `edit`     | Explicit alias for opening the editor panel  |
+| `show`     | Print the current config                     |
+| `paths`    | Show config file locations                   |
+| `sources`  | Show where each value came from              |
+| `diff`     | Show differences from defaults               |
+| `export`   | Export config to a file or stdout            |
+
 ### `/lsp [status]`
 
 LSP (Language Server Protocol) backend status.
 
 ### `/telemetry [subcommand]`
 
-Session telemetry: turns, drift, decisions, profile.
+Deep observability traces: turns, drift, decisions, profile, and context.
 
-### `/tuning [subcommand]`
+### `/tuning` *(removed)*
 
-Auto-tuning status and history.
-
-| Subcommand | Description          |
-| ---------- | -------------------- |
-| `status`   | Current tuning state |
-| `history`  | Tuning history       |
-| `config`   | Tuning configuration |
-| `reset`    | Reset tuning state   |
+Migration: evolution/tuning commands were deleted; use `/stats`, `/inspect`, and `/profile experiments` instead.
 
 ### `/sync [subcommand]`
 
@@ -318,6 +353,10 @@ Rewind conversation to an earlier turn.
 ### `/version`
 
 Display version information.
+
+### `/info`, `/whoami`
+
+System and session identity at a glance: version, session, model, permissions, loaded skills, pending improvements, and recent tools.
 
 ---
 
@@ -444,6 +483,21 @@ Register a new account.
 
 Logout from the API.
 
+### `/profile [subcommand]`
+
+Manage user profile preferences.
+
+| Subcommand      | Description                    |
+| --------------- | ------------------------------ |
+| `show`          | Show current profile           |
+| `edit <k> <v>`  | Edit a preference              |
+| `scenario`      | Show detected work scenario    |
+| `stats`         | Show profile usage stats       |
+| `tools`         | Show tool preferences          |
+| `experiments`   | Show enrolled experiments      |
+| `reset`         | Reset preferences              |
+| `help`          | Show profile help              |
+
 ### `/memory-setup`
 
 Guided Memoria configuration wizard.
@@ -460,6 +514,8 @@ Set permission mode for tool execution.
 | -------- | ----------------------------- |
 | `auto`   | Auto-approve all tool use     |
 | `all`    | Alias for auto                |
+| `plan`   | Read-only investigation mode  |
+| `accept_edits` / `accept-edits` / `edit` | Auto-approve local file edits |
 | `prompt` | Prompt before each tool       |
 | `deny`   | Deny all tool use             |
 | `rules`  | Show current permission rules |

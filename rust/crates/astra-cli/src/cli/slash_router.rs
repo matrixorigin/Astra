@@ -1,4 +1,4 @@
-//! Slash command routing for the REPL.
+//! Slash command fallback routing for the interactive session.
 
 use std::io::IsTerminal;
 
@@ -330,7 +330,7 @@ pub(crate) async fn handle_slash_command(
         }
 
         "/history" | "/grep" | "/review" | "/copy" | "/diagnostics" | "/lsp" | "/context"
-        | "/version" | "/whoami" | "/rewind" | "/report" => {
+        | "/version" | "/info" | "/whoami" | "/rewind" | "/report" => {
             handle_info_command(cmd, arg, api, state, profile, token).await?;
         }
 

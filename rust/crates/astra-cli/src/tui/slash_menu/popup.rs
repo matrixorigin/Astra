@@ -232,18 +232,19 @@ pub(crate) fn render(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
         if is_selected && !item.subcommands.is_empty() {
             let max_subs = 3.min(item.subcommands.len());
             for (name, desc) in item.subcommands.iter().take(max_subs) {
-                let mut sub_spans: Vec<Span<'static>> = Vec::new();
-                sub_spans.push(Span::raw("   · "));
-                sub_spans.push(Span::styled(
-                    format!("{name}"),
-                    Style::default()
-                        .fg(theme.accent_dim())
-                        .add_modifier(Modifier::ITALIC),
-                ));
-                sub_spans.push(Span::styled(
-                    format!(" — {desc}"),
-                    Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
-                ));
+                let sub_spans: Vec<Span<'static>> = vec![
+                    Span::raw("   · "),
+                    Span::styled(
+                        name.to_string(),
+                        Style::default()
+                            .fg(theme.accent_dim())
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                    Span::styled(
+                        [" — ", desc].concat(),
+                        Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
+                    ),
+                ];
                 lines.push(Line::from(sub_spans));
             }
             if item.subcommands.len() > max_subs {

@@ -7,7 +7,7 @@ fn eprint_server_not_found(name: &str) {
     eprintln!("  {}", "Use /mcp servers to see connected servers".dim());
 }
 
-/// Retention: REPL fallback handler for `/mcp` — called from slash_router.rs.
+/// Retention: fallback handler for `/mcp` — called from slash_router.rs.
 /// In TUI mode this is shadowed by TuiHandler::Selector (McpView).
 /// Kept for headless / non-interactive execution paths.
 #[allow(dead_code)]
@@ -1277,14 +1277,18 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("github");
-        assert!(!config["mcpServers"]
-            .as_object()
-            .unwrap()
-            .contains_key("github"));
-        assert!(config["mcpServers"]
-            .as_object()
-            .unwrap()
-            .contains_key("other"));
+        assert!(
+            !config["mcpServers"]
+                .as_object()
+                .unwrap()
+                .contains_key("github")
+        );
+        assert!(
+            config["mcpServers"]
+                .as_object()
+                .unwrap()
+                .contains_key("other")
+        );
     }
 
     #[test]

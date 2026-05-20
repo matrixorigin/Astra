@@ -23,8 +23,8 @@ expression: "build_panels_cheat_sheet_lines().join(\"\\n\")"
       ↑↓ navigate · q / Esc close
 
   /config [edit|show|paths|sources|diff|export]
-      interactive panel — search, pick, edit, diff, and export config
-      ↑↓ navigate · Enter edit/set · type to search · Esc save/close
+      edit opens the panel; show/paths/sources/diff/export stay text-first
+      panel: ↑↓ navigate · Enter edit/set · type to search · Esc save/close
 
   /model
       fuzzy-search model picker; switch or inspect current model

@@ -3,8 +3,8 @@ use super::*;
 
 // ═══════════════════════════════════════════════════════ Stats ════════════
 
-/// Retention: REPL fallback handler for `/stats` — called from slash_router.rs.
-/// In TUI mode this is shadowed by TuiHandler::Panel (InfoView).
+/// Retention: fallback handler for `/stats` — called from slash_router.rs.
+/// In TUI mode this is shadowed by the native stats views.
 /// Kept for headless / non-interactive execution paths.
 #[allow(dead_code)]
 pub(super) async fn handle_stats_command(arg: &str, state: &SessionState) {

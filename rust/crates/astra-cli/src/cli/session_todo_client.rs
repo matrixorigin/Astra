@@ -416,7 +416,7 @@ mod wiring_e2e {
         let (store, notify_tx) = HttpTaskStore::new(server.uri(), None);
         let store_dyn: Arc<dyn TaskStore> = store.clone();
         // Observer constructed BEFORE the server allocates a SID — same
-        // shape as `run_tui_repl` building it from `state.session_id =
+        // shape as `run_tui_session` building it from `state.session_id =
         // None.unwrap_or_default() = ""`.
         let observer = TaskBoardObserver::new(store_dyn, "");
 

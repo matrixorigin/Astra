@@ -68,7 +68,7 @@ mod worktrees;
 mod wrapping;
 
 pub(crate) use draw::{ActiveView, do_draw};
-pub(crate) use event_loop::{can_run_tui, run_tui_repl as run_tui};
+pub(crate) use event_loop::{can_run_tui, run_tui_session as run_tui};
 
 /// Walk the chat widget's committed history and emit role/text
 /// pairs for the `/context dump` JSON file.

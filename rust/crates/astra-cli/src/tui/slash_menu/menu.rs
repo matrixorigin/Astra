@@ -14,8 +14,8 @@
 
 use crate::command_registry::TuiHandler;
 use nucleo_matcher::{
-    pattern::{Atom, AtomKind, CaseMatching, Normalization},
     Config, Matcher, Utf32Str,
+    pattern::{Atom, AtomKind, CaseMatching, Normalization},
 };
 
 /// A single slash command exposed to the menu.

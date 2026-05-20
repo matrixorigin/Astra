@@ -2,7 +2,7 @@
 
 #![cfg(test)]
 
-use super::{is_open_for, SlashItem, SlashMenu};
+use super::{SlashItem, SlashMenu, is_open_for};
 
 fn items() -> Vec<SlashItem> {
     vec![
