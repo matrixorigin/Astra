@@ -422,6 +422,74 @@ pub(super) async fn handle_memory_domain_command(
                         }
                     }
                 }
+                // ─── Edit a session memory section ───────────────
+                "edit" => {
+                    let valid_sections = [
+                        "Active Goals",
+                        "Pending Todos",
+                        "Completed",
+                        "L0 Critical",
+                        "L1 Important",
+                        "L2 Contextual",
+                        "Learnings",
+                    ];
+                    if sub_arg.is_empty() || !valid_sections.contains(&sub_arg) {
+                        eprintln!("  {} /memory edit <section>", "Usage:".dim());
+                        eprintln!("  Sections: {}", valid_sections.join(" | "));
+                        return Ok(());
+                    }
+                    let section = sub_arg;
+                    // 1. Retrieve current session memory
+                    let current_body = match api
+                        .post_memory_retrieve_json(tok, &serde_json::json!({}))
+                        .await
+                    {
+                        Ok(r) if r.status().is_success() => {
+                            let text = r.text().await.unwrap_or_default();
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                                val.get("content")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(&text)
+                                    .to_string()
+                            } else {
+                                text
+                            }
+                        }
+                        _ => String::new(),
+                    };
+                    // 2. Open $EDITOR with current section content
+                    let current_section =
+                        extract_md_section(&current_body, section).unwrap_or_default();
+                    let tmp = std::env::temp_dir().join(format!(
+                        "astra_memory_edit_{}.md",
+                        section.replace(' ', "_").to_lowercase()
+                    ));
+                    std::fs::write(&tmp, current_section.trim_start_matches('\n'))
+                        .unwrap_or_default();
+                    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+                    match std::process::Command::new(&editor).arg(&tmp).status() {
+                        Ok(s) if s.success() => {}
+                        _ => {
+                            eprintln!("  {} Editor exited with error", theme::icon_err());
+                            return Ok(());
+                        }
+                    }
+                    // 3. Read edited content and store back
+                    let new_content = std::fs::read_to_string(&tmp).unwrap_or_default();
+                    let _ = std::fs::remove_file(&tmp);
+                    let updated = replace_md_section(&current_body, section, &new_content);
+                    match api
+                        .post_memory_store_json(tok, &serde_json::json!({ "content": updated }))
+                        .await
+                    {
+                        Ok(r) if r.status().is_success() => {
+                            eprintln!("  {} Section {section:?} updated.", theme::icon_ok())
+                        }
+                        Ok(r) => eprintln!("  {} Store failed ({})", theme::icon_err(), r.status()),
+                        Err(e) => eprintln!("  {} Memoria unreachable: {e}", theme::icon_err()),
+                    }
+                }
+
                 _ => {
                     eprintln!("  {} /memory <subcommand>", "Usage:".dim());
                     eprintln!("  {}", "  list                    List all memories".dim());
@@ -525,6 +593,29 @@ fn extract_md_section(md: &str, section_name: &str) -> Option<String> {
     // Find start of next ## header (the newline before it)
     let end = rest.find("\n## ").map(|i| i + 1).unwrap_or(rest.len());
     Some(rest[..end].to_string())
+}
+
+/// Replace (or append) a `## SectionName` block in a markdown string.
+/// If the section exists its content is replaced; otherwise the section is appended.
+/// Pure function — no I/O.
+pub(crate) fn replace_md_section(md: &str, section_name: &str, new_content: &str) -> String {
+    let needle = format!("## {section_name}");
+    if let Some(start) = md.find(&needle) {
+        let after_header = start + needle.len();
+        let rest = &md[after_header..];
+        let end = rest.find("\n## ").map(|i| i + 1).unwrap_or(rest.len());
+        let before = &md[..after_header];
+        let after = &rest[end..];
+        format!("{}\n{}{}", before, new_content, after)
+    } else {
+        // Section absent — append at end
+        let sep = if md.is_empty() || md.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        format!("{}{}\n## {section_name}\n{}", md, sep, new_content)
+    }
 }
 
 #[cfg(test)]
@@ -644,5 +735,97 @@ mod tests {
         let parsed = parse_memory_forget_args("mem-1 --reason duplicate stale memory").unwrap();
         assert_eq!(parsed.0, "mem-1");
         assert_eq!(parsed.1, "duplicate stale memory");
+    }
+
+    // ── /memory edit — replace_md_section ───────────────────────────────
+
+    #[test]
+    fn replace_md_section_replaces_existing_section() {
+        let body = "## Active Goals\n- old goal\n\n## Pending Todos\n- do stuff\n";
+        let result = replace_md_section(body, "Active Goals", "- new goal\n");
+        assert!(
+            result.contains("- new goal"),
+            "new content missing, got: {result:?}"
+        );
+        assert!(
+            !result.contains("- old goal"),
+            "old content still present, got: {result:?}"
+        );
+        // Other sections must be preserved
+        assert!(
+            result.contains("## Pending Todos"),
+            "other section lost, got: {result:?}"
+        );
+        assert!(
+            result.contains("- do stuff"),
+            "other section content lost, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn replace_md_section_adds_section_if_missing() {
+        let body = "## L0 Critical\n- keep this\n";
+        let result = replace_md_section(body, "Active Goals", "- brand new goal\n");
+        assert!(
+            result.contains("## Active Goals"),
+            "section not added, got: {result:?}"
+        );
+        assert!(
+            result.contains("- brand new goal"),
+            "content not added, got: {result:?}"
+        );
+        assert!(
+            result.contains("## L0 Critical"),
+            "existing section lost, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn replace_md_section_preserves_all_other_sections() {
+        let body = "## Active Goals\n- goal\n\n## Pending Todos\n- todo\n\n## Completed\n- done\n\n## L0 Critical\n- critical\n";
+        let result = replace_md_section(body, "Pending Todos", "- new todo\n");
+        assert!(result.contains("## Active Goals"), "Active Goals lost");
+        assert!(result.contains("- goal"), "Active Goals content lost");
+        assert!(result.contains("## Completed"), "Completed lost");
+        assert!(result.contains("- done"), "Completed content lost");
+        assert!(result.contains("## L0 Critical"), "L0 Critical lost");
+        assert!(result.contains("- critical"), "L0 Critical content lost");
+        assert!(result.contains("- new todo"), "new content missing");
+        assert!(
+            !result.contains("- todo\n"),
+            "old todo content still present"
+        );
+    }
+
+    #[test]
+    fn replace_md_section_valid_section_names() {
+        // All recognised section names must work without error
+        for name in &[
+            "Active Goals",
+            "Pending Todos",
+            "Completed",
+            "L0 Critical",
+            "L1 Important",
+            "L2 Contextual",
+            "Learnings",
+        ] {
+            let body = format!("## {name}\n- content\n");
+            let result = replace_md_section(&body, name, "- replaced\n");
+            assert!(
+                result.contains("- replaced"),
+                "replace failed for section {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_edit_subcommand_exists_in_router() {
+        let src = include_str!("slash_memory.rs");
+        let test_start = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..test_start];
+        assert!(
+            prod.contains("\"edit\""),
+            "/memory edit subcommand missing from match block"
+        );
     }
 }
