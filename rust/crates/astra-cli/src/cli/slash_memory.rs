@@ -441,9 +441,71 @@ pub(super) async fn handle_memory_domain_command(
     Ok(())
 }
 
+/// Format the session memory markdown body for human-readable terminal display.
+/// Pure function — no I/O, no API calls. Testable in isolation.
+pub(crate) fn format_session_memory_display(body: &str) -> String {
+    // stub — implemented in Task 1.2
+    let _ = body;
+    String::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── /memory session display ──────────────────────────────────────────
+
+    #[test]
+    fn format_session_memory_display_empty_is_graceful() {
+        let result = format_session_memory_display("");
+        assert!(
+            result.contains("No session memory") || result.contains("not yet extracted"),
+            "empty body should show a helpful message, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn format_session_memory_display_shows_l0_content() {
+        let body = "## L0 Critical\n- Goal: fix auth module\n";
+        let result = format_session_memory_display(body);
+        assert!(
+            result.contains("fix auth module"),
+            "should show L0 content, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn format_session_memory_display_shows_goals_todos_completed() {
+        let body = "## Active Goals\n- Refactor memory\n\n## Pending Todos\n- Write tests\n\n## Completed\n- Scaffold done\n";
+        let result = format_session_memory_display(body);
+        assert!(
+            result.contains("Refactor memory"),
+            "missing goals, got: {result:?}"
+        );
+        assert!(
+            result.contains("Write tests"),
+            "missing todos, got: {result:?}"
+        );
+        assert!(
+            result.contains("Scaffold done"),
+            "missing completed, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn format_session_memory_display_omits_missing_sections() {
+        let body = "## L0 Critical\n- only this section\n";
+        let result = format_session_memory_display(body);
+        // Missing sections must not produce empty labelled blocks
+        assert!(
+            !result.contains("L1 Important:\n\n"),
+            "spurious L1 block, got: {result:?}"
+        );
+        assert!(
+            !result.contains("L2 Contextual:\n\n"),
+            "spurious L2 block, got: {result:?}"
+        );
+    }
 
     // ── /memory subcommand contracts ──
 
@@ -466,6 +528,7 @@ mod tests {
             "search",
             "dismiss",
             "list",
+            "session",
         ] {
             assert!(
                 prod.contains(&format!("\"{cmd}\"")),
