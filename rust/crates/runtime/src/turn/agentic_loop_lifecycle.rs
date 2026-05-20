@@ -1263,20 +1263,22 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             // Cascade detected: skip clearing this turn to break the loop.
             astra_turn_core::microcompact::CompactStats::default()
         } else if !state.session_facts.active_files.is_empty() {
-            astra_turn_core::microcompact::compact_tool_results_state_aware_with_persistence(
+            astra_turn_core::microcompact::compact_tool_results_state_aware_with_persistence_protected_prefix(
                 &mut state.messages,
                 pressure,
                 &state.session_facts,
                 5,
                 strategy,
                 session_dir.as_deref(),
+                state.last_request_message_count,
             )
         } else {
-            astra_turn_core::microcompact::compact_tool_results_adaptive_with_persistence(
+            astra_turn_core::microcompact::compact_tool_results_adaptive_with_persistence_protected_prefix(
                 &mut state.messages,
                 pressure,
                 strategy,
                 session_dir.as_deref(),
+                state.last_request_message_count,
             )
         };
         if mc.results_compacted > 0 {

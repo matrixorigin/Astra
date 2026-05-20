@@ -625,6 +625,7 @@ pub(crate) async fn stream_chat_sse(
         agentic_turn_budget: task_profile.agentic_turn_budget,
         current_round_index: 0,
         llm_rounds_completed: 0,
+        last_request_message_count: None,
         turn_guard,
         restricted_tools: initial_restricted,
         boosted_tools: HashSet::new(),

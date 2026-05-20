@@ -855,6 +855,10 @@ pub struct AgenticLoopState {
     /// Actual number of LLM calls completed in this turn (not inflated by
     /// progressive penalty).  Used for round budget guidance injection.
     pub llm_rounds_completed: u32,
+    /// Number of history messages that were visible to the most recent LLM
+    /// request. Microcompact uses this to avoid rewriting older, already-sent
+    /// tool results while still allowing compaction of newly appended results.
+    pub last_request_message_count: Option<usize>,
     pub turn_guard: TurnGuard,
     pub restricted_tools: HashSet<String>,
     /// Positive allowlist bias populated by pipeline `add_tools` strategy.
@@ -1803,6 +1807,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
         current_round_index: 0,
         llm_rounds_completed: 0,
+        last_request_message_count: None,
         turn_guard: TurnGuard::new(),
         restricted_tools: HashSet::new(),
         boosted_tools: HashSet::new(),
@@ -2159,6 +2164,7 @@ pub(crate) mod tests {
             agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
             current_round_index: 0,
             llm_rounds_completed: 0,
+            last_request_message_count: None,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),

@@ -758,6 +758,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // calls for guidance-threshold purposes, not just successful ones).
     let turn_result = host.execute_turn(state).await;
     state.llm_rounds_completed += 1;
+    if turn_result.is_ok() {
+        state.last_request_message_count = Some(pre_llm_messages.len());
+    }
     if let Ok(result) = &turn_result
         && let Some(trace) = result.accum.context_manifest_trace.clone()
     {

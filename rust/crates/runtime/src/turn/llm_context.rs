@@ -950,11 +950,10 @@ pub(crate) fn apply_message_cache_metadata(
 ///
 /// The bridge currently compacts and mutates its message vector inline. This
 /// helper centralizes the cache-sensitive tail rule shared with
-/// [`assemble_wire_messages`]: volatile runtime text must be prepended to the
-/// final user message so the stable prefix remains byte-identical for prefix
-/// caches.
+/// [`assemble_wire_messages`]: volatile runtime text must live on the true
+/// tail, not be spliced into historical user turns.
 pub(crate) fn finalize_bridge_wire_messages(
-    llm_messages: &mut [Value],
+    llm_messages: &mut Vec<Value>,
     volatile_text: Option<String>,
     provider: &str,
     model_name: &str,
@@ -962,18 +961,24 @@ pub(crate) fn finalize_bridge_wire_messages(
     astra_turn_core::edge_ledger::strip_stale_reasoning(llm_messages, provider, model_name);
     if let Some(text) = volatile_text
         && !text.is_empty()
-        && let Some(last_user) = llm_messages
-            .iter_mut()
-            .rev()
-            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
     {
-        let existing = last_user
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        last_user["content"] = Value::String(format!(
-            "<system-reminder>\n{text}</system-reminder>\n\n{existing}"
-        ));
+        let wrapped = format!("<system-reminder>\n{text}</system-reminder>");
+        let tail_is_user = llm_messages
+            .last()
+            .and_then(|m| m.get("role").and_then(Value::as_str))
+            == Some("user");
+        if tail_is_user {
+            let last_user = llm_messages
+                .last_mut()
+                .expect("tail_is_user implies a last message exists");
+            let existing = last_user
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            last_user["content"] = Value::String(format!("{wrapped}\n\n{existing}"));
+        } else {
+            llm_messages.push(serde_json::json!({"role": "user", "content": wrapped}));
+        }
     }
 }
 
@@ -1093,5 +1098,46 @@ mod context_cache_contract_tests {
         assert_eq!(trace["wire"]["message_cache_control_count"], 1);
         assert_eq!(trace["wire"]["tool_cache_control_count"], 1);
         assert_eq!(trace["wire"]["total_cache_control_count"], 2);
+    }
+
+    #[test]
+    fn finalize_bridge_wire_messages_keeps_historical_user_stable_when_tail_is_tool() {
+        let mut messages = vec![
+            json!({"role": "user", "content": "original user"}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": "tool output", "tool_call_id": "c1"}),
+        ];
+
+        finalize_bridge_wire_messages(
+            &mut messages,
+            Some("volatile".to_string()),
+            "openai",
+            "gpt-4",
+        );
+
+        assert_eq!(messages[0]["content"], "original user");
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(
+            messages[3]["content"],
+            "<system-reminder>\nvolatile</system-reminder>"
+        );
+    }
+
+    #[test]
+    fn finalize_bridge_wire_messages_prepends_to_tail_user_when_available() {
+        let mut messages = vec![json!({"role": "user", "content": "original user"})];
+
+        finalize_bridge_wire_messages(
+            &mut messages,
+            Some("volatile".to_string()),
+            "openai",
+            "gpt-4",
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0]["content"],
+            "<system-reminder>\nvolatile</system-reminder>\n\noriginal user"
+        );
     }
 }
