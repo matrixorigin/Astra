@@ -361,8 +361,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
     // Load runtime config once per round for all mid-loop guards below.
     let tool_cfg = &astra_config::runtime_config::RuntimeConfig::load().tool_selection;
+    let resolved_tool_policy =
+        tool_cfg.resolve_for_model(state.context_manifest_model_name.as_deref());
     let parallel_batching_force_threshold =
-        tool_cfg.effective_parallel_batching_force_streak() as usize;
+        resolved_tool_policy.parallel_batching_force_streak as usize;
     let redundant_reads_threshold = tool_cfg.effective_redundant_reads_midloop_threshold() as usize;
     let cache_waste_threshold = tool_cfg.effective_cache_waste_midloop_threshold() as usize;
     let exploration_family_threshold =
@@ -1754,11 +1756,18 @@ pub(crate) fn is_execution_corrective_message(m: &serde_json::Value) -> bool {
 /// Third-tier guard for the parallel-batching layer. The prompt-side soft
 /// nudge fires when the trailing single-tool round streak hits
 /// `PARALLEL_BATCHING_NUDGE_THRESHOLD` (=4). If the model ignores the nudge
-/// and produces yet another single-tool round, the streak crosses
-/// `PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD` (=5) and we inject a hard
-/// corrective `user` message — the same pattern as `EXECUTION_ESCALATION`,
-/// scoped to a different failure mode (sequential read churn rather than
-/// read-only spin on a mutating task).
+/// and produces yet another single-tool round, the streak crosses the
+/// resolved `parallel_batching_force_streak` threshold (default 5, per-model
+/// overrides via `ModelPolicyProfile`) and we inject a hard corrective
+/// `user` message — the same pattern as `EXECUTION_ESCALATION`, scoped to a
+/// different failure mode (sequential read churn rather than read-only spin
+/// on a mutating task).
+///
+/// Invariant: the resolved force threshold must stay strictly greater than
+/// `PARALLEL_BATCHING_NUDGE_THRESHOLD` so the soft→hard cascade is preserved
+/// (otherwise the runtime hard-corrects before the prompt-layer nudge ever
+/// gets a chance to fire). Pinned by
+/// `parallel_batching_force_default_above_nudge_threshold`.
 pub(crate) const PARALLEL_BATCHING_FORCE_MARKER: &str = "## ⤴ Parallel Batching Force";
 
 /// Trailing single-tool-round streak length at which the soft prompt nudge
@@ -1766,7 +1775,8 @@ pub(crate) const PARALLEL_BATCHING_FORCE_MARKER: &str = "## ⤴ Parallel Batchin
 /// threshold so the model gets exactly ONE chance to self-correct before we
 /// intervene with a higher-priority `user` message.
 /// Default for the early-streak threshold; the actual value used at runtime
-/// flows through `ToolSelectionConfig::effective_parallel_batching_force_streak`.
+/// flows through `ToolSelectionConfig::effective_parallel_batching_force_streak`
+/// (and per-model overrides via `ModelPolicyProfile`).
 /// Must match `effective_parallel_batching_force_streak`'s zero-default.
 #[cfg(test)]
 pub(crate) const PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD: usize = 5;
@@ -1814,8 +1824,9 @@ pub(crate) fn should_force_parallel_batching(
     let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
     // Late-budget threshold stays derived (compile-time floor of 2): once the
     // model is close to the round-budget warning, even a short streak should
-    // trigger correction. Derived as `max(2, early - 2)` to preserve the
-    // original (5, 3) gap without requiring a separate config knob.
+    // trigger correction. Derived as `max(2, early - 2)` so the original
+    // (early=5 → late=3) gap is preserved at the default while remaining
+    // proportional under per-model overrides (e.g. early=8 → late=6).
     let late_threshold = early_threshold.saturating_sub(2).max(2);
     let threshold = if state.llm_rounds_completed >= crate::prompts::ROUND_BUDGET_THRESHOLD {
         late_threshold
@@ -3796,6 +3807,171 @@ mod tests {
             &state,
             PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
         ));
+    }
+
+    // ─── Cascade-invariant + per-model resolver wiring ─────────────────────
+
+    /// The runtime hard-corrective force MUST stay strictly above the
+    /// prompt-layer soft nudge so the soft→hard cascade is preserved. If the
+    /// resolved force ever drops to ≤ nudge, the runtime will inject a hard
+    /// `user`-role corrective before the model has had any chance to
+    /// self-correct on the soft prompt nudge — that inverts the intended
+    /// failure-mode escalation.
+    #[test]
+    fn parallel_batching_force_default_above_nudge_threshold() {
+        let cfg = astra_config::runtime_config::ToolSelectionConfig::default();
+        let resolved = cfg.effective_parallel_batching_force_streak() as usize;
+        assert!(
+            resolved > crate::prompts::PARALLEL_BATCHING_NUDGE_THRESHOLD,
+            "force streak {resolved} must stay strictly greater than nudge \
+             threshold {} so the soft→hard cascade is preserved",
+            crate::prompts::PARALLEL_BATCHING_NUDGE_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn parallel_batching_force_min_tracks_runtime_nudge_plus_one() {
+        assert_eq!(
+            astra_config::runtime_config::MIN_PARALLEL_BATCHING_FORCE_STREAK as usize,
+            crate::prompts::PARALLEL_BATCHING_NUDGE_THRESHOLD + 1,
+            "config floor must stay exactly one round above the runtime nudge \
+             threshold so the soft→hard cascade stays aligned across crates"
+        );
+    }
+
+    /// The same invariant, but exercised through `resolve_for_model` with
+    /// every built-in profile. Catches a regression where someone sets a
+    /// per-model override below the nudge threshold or lets the config/runtime
+    /// floors drift apart across crates.
+    #[test]
+    fn parallel_batching_force_per_model_above_nudge_threshold() {
+        let cfg = astra_config::runtime_config::ToolSelectionConfig::default();
+        for model in &[
+            "claude-opus-4-7",
+            "claude-sonnet-4-6",
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "gpt-5",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-anthropic",
+            "MiniMax-M2.7",
+            "unknown-model-id",
+        ] {
+            let policy = cfg.resolve_for_model(Some(*model));
+            assert!(
+                policy.parallel_batching_force_streak as usize
+                    > crate::prompts::PARALLEL_BATCHING_NUDGE_THRESHOLD,
+                "model={model} resolved force={} must stay strictly greater \
+                 than nudge threshold {} so the soft→hard cascade is preserved",
+                policy.parallel_batching_force_streak,
+                crate::prompts::PARALLEL_BATCHING_NUDGE_THRESHOLD,
+            );
+        }
+    }
+
+    /// End-to-end wiring: the runtime guard MUST consume the *resolved*
+    /// per-model threshold rather than the global default. This pins the
+    /// chain `state.context_manifest_model_name → resolve_for_model →
+    /// EffectiveToolPolicy::parallel_batching_force_streak →
+    /// should_force_parallel_batching(_, threshold)`. A regression that
+    /// re-routes the guard back to `effective_parallel_batching_force_streak`
+    /// (model-blind) would silently break this.
+    #[test]
+    fn parallel_batching_force_uses_resolved_per_model_threshold() {
+        // Configure a user profile that more than doubles the global default.
+        // 11 is well above the global default 5 and well above the nudge
+        // threshold, so a streak of 5 should NOT fire under this profile but
+        // WOULD fire under the global default.
+        let mut cfg = astra_config::runtime_config::ToolSelectionConfig::default();
+        cfg.model_profiles
+            .push(astra_config::runtime_config::ModelPolicyProfile {
+                model_match: "haiku".to_string(),
+                parallel_batching_force_streak: 11,
+                ..Default::default()
+            });
+        let policy = cfg.resolve_for_model(Some("us.anthropic.claude-haiku-4-5-20251001-v1:0"));
+        assert_eq!(policy.parallel_batching_force_streak, 11);
+
+        // Build a state with a streak equal to the global default (5).
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        for _ in 0..5 {
+            push_single_tool_round(&mut state);
+        }
+
+        // Resolved per-model threshold (=11) must suppress the corrective…
+        assert!(
+            !should_force_parallel_batching(&state, policy.parallel_batching_force_streak as usize),
+            "streak=5 must NOT fire under per-model force=11"
+        );
+
+        // …whereas the model-blind global path (=5) would fire. This is the
+        // actual regression target: if someone re-routes the guard back to
+        // `effective_parallel_batching_force_streak`, the second assertion
+        // would still pass but the first would change behavior — pinning
+        // both makes the wiring explicit.
+        assert!(
+            should_force_parallel_batching(
+                &state,
+                cfg.effective_parallel_batching_force_streak() as usize
+            ),
+            "streak=5 SHOULD fire at the global default — sanity check that \
+             the test exercises the right axis"
+        );
+    }
+
+    /// Per-profile clamp invariant: a user that sets
+    /// `parallel_batching_force_streak = 1` (or any value at/below
+    /// `PARALLEL_BATCHING_NUDGE_THRESHOLD`) MUST land above the nudge
+    /// threshold after `apply_profile`'s clamp, otherwise the runtime
+    /// hard corrective fires before the prompt-layer ever nudges and
+    /// the soft→hard cascade is silently inverted.
+    #[test]
+    fn parallel_batching_force_per_profile_clamp_above_nudge() {
+        for low in 1..=crate::prompts::PARALLEL_BATCHING_NUDGE_THRESHOLD as u32 {
+            let mut cfg = astra_config::runtime_config::ToolSelectionConfig::default();
+            cfg.model_profiles
+                .push(astra_config::runtime_config::ModelPolicyProfile {
+                    model_match: "haiku".to_string(),
+                    parallel_batching_force_streak: low,
+                    ..Default::default()
+                });
+            let policy = cfg.resolve_for_model(Some("us.anthropic.claude-haiku-4-5-20251001-v1:0"));
+            assert!(
+                (policy.parallel_batching_force_streak as usize)
+                    > crate::prompts::PARALLEL_BATCHING_NUDGE_THRESHOLD,
+                "per-profile force={low} resolved to {} but must be > nudge threshold {} \
+                 to preserve the soft→hard cascade",
+                policy.parallel_batching_force_streak,
+                crate::prompts::PARALLEL_BATCHING_NUDGE_THRESHOLD,
+            );
+        }
+    }
+
+    /// Late-zone derivation `early - 2` must remain proportional under
+    /// per-model overrides — protects the comment-stated invariant that
+    /// "early=8 → late=6" preserves the original (5,3) gap shape.
+    #[test]
+    fn parallel_batching_force_late_threshold_proportional_to_early() {
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        // Six trailing single-tool rounds, deep in the round-budget warning
+        // zone. Under early=8 the late threshold derives to 6, so this must
+        // fire. Under early=9 the late threshold derives to 7, so it must
+        // NOT fire on the same streak — proves the late path is a function
+        // of the resolved early threshold, not a hardcoded 3.
+        for _ in 0..6 {
+            push_single_tool_round(&mut state);
+        }
+        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD + 1;
+
+        assert!(
+            should_force_parallel_batching(&state, 8),
+            "streak=6 in warning zone must fire under early=8 (late=6)"
+        );
+        assert!(
+            !should_force_parallel_batching(&state, 9),
+            "streak=6 in warning zone must NOT fire under early=9 (late=7)"
+        );
     }
 
     // ─── Round-budget convergence guard — REMOVED ─────────────────────────

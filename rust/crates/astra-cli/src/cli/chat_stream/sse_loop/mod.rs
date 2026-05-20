@@ -606,7 +606,7 @@ pub(crate) async fn stream_chat_sse(
         current_run_id: Some(parent_turn_run_id.clone()),
         context_manifest_pool: None,
         context_manifest_user_id: None,
-        context_manifest_model_name: None,
+        context_manifest_model_name: model_id_for_policy.map(str::to_string),
         recursion_depth: 0,
         final_text: String::new(),
         final_text_streamed: false,

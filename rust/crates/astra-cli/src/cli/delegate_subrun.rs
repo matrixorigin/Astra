@@ -266,7 +266,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         let mut host = SubRunHost {
             api: self.api.clone(),
             token: self.token.clone(),
-            model: effective_model,
+            model: effective_model.clone(),
             project_root: effective_root.clone(),
             executor: std::sync::Arc::new(executor),
             all_schemas,
@@ -361,7 +361,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             current_run_id: Some(config.run_id.clone()),
             context_manifest_pool: None,
             context_manifest_user_id: None,
-            context_manifest_model_name: None,
+            context_manifest_model_name: effective_model.clone(),
             recursion_depth: config.recursion_depth,
             final_text: String::new(),
             final_text_streamed: false,

@@ -279,7 +279,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             String::new(), // sub-runs don't need user_id for LLM calls
             subrun_session_id.clone(),
         )
-        .with_model(effective_model)
+        .with_model(effective_model.clone())
         .with_llm_token_service(self.llm_token_service.clone())
         .with_edge_tools(self.edge_tools.clone())
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
@@ -362,7 +362,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             current_run_id: None,
             context_manifest_pool: None,
             context_manifest_user_id: None,
-            context_manifest_model_name: None,
+            context_manifest_model_name: effective_model.clone(),
             recursion_depth: child_recursion_depth,
             final_text: String::new(),
             final_text_streamed: false,
