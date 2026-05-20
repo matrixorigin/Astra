@@ -85,7 +85,13 @@ pub async fn prefetch_memories(
     // will be filtered downstream by `is_memory_worthy`.
     let merged: Vec<String> = merged_records
         .iter()
-        .map(|m| compact_view_of(&m.content))
+        .map(|m| {
+            let compact = compact_view_of(&m.content);
+            match source_label(&m.memory_type, m.session_id.as_deref()) {
+                Some(label) => format!("{label} {compact}"),
+                None => compact,
+            }
+        })
         .collect();
     let fetch_ms = started.elapsed().as_millis() as i64;
     let preview = merged.iter().take(3).map(|l| l.to_string()).collect();
@@ -834,6 +840,19 @@ fn parse_rankable(value: serde_json::Value) -> Option<RankableMemory> {
     })
 }
 
+/// Returns a human-readable source label for a prefetched memory entry.
+/// `"procedural"` memories originated from the agent's own learnings;
+/// all other typed memories are cross-session knowledge.
+/// Returns `None` when there is no session_id to attribute.
+pub(crate) fn source_label(memory_type: &str, session_id: Option<&str>) -> Option<String> {
+    let sid = session_id.filter(|s| !s.is_empty())?;
+    match memory_type {
+        "procedural" => Some(format!("[learnings from session {sid}]")),
+        t if !t.is_empty() => Some("[cross-session memory]".to_string()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1354,11 +1373,9 @@ mod tests {
         ];
         let entries = build_memory_entries(&lines);
         assert_eq!(entries.len(), 1);
-        assert!(
-            entries[0]
-                .content
-                .contains("parallel tool execution for speed")
-        );
+        assert!(entries[0]
+            .content
+            .contains("parallel tool execution for speed"));
     }
 
     #[test]
@@ -1821,5 +1838,34 @@ mod tests {
             elapsed < std::time::Duration::from_secs(30),
             "should time out well before 30s, took {elapsed:?}"
         );
+    }
+
+    // ── Task 4: prefetch source labels ───────────────────────────────────
+
+    #[test]
+    fn source_label_procedural_with_session_id_is_learnings() {
+        let label = source_label("procedural", Some("abc123"));
+        assert_eq!(label, Some("[learnings from session abc123]".to_string()));
+    }
+
+    #[test]
+    fn source_label_semantic_with_session_id_is_cross_session() {
+        let label = source_label("semantic", Some("abc"));
+        assert_eq!(label, Some("[cross-session memory]".to_string()));
+    }
+
+    #[test]
+    fn source_label_no_session_id_returns_none() {
+        assert!(source_label("semantic", None).is_none());
+    }
+
+    #[test]
+    fn source_label_empty_memory_type_returns_none() {
+        assert!(source_label("", None).is_none());
+    }
+
+    #[test]
+    fn source_label_empty_session_id_returns_none() {
+        assert!(source_label("procedural", Some("")).is_none());
     }
 }
