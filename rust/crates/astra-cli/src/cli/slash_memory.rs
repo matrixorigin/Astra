@@ -395,6 +395,33 @@ pub(super) async fn handle_memory_domain_command(
                     Ok(body) => print_json_or_raw(&body),
                     Err(e) => eprintln!("  {} {e}", theme::icon_err()),
                 },
+                // ─── Current session memory ───────────────────────
+                "session" => {
+                    let payload = serde_json::json!({});
+                    match api.post_memory_retrieve_json(tok, &payload).await {
+                        Ok(r) if r.status().is_success() => {
+                            let text = r.text().await.unwrap_or_default();
+                            // Response may be JSON {"content":"..."} or plain markdown
+                            let body =
+                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                                    val.get("content")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or(&text)
+                                        .to_string()
+                                } else {
+                                    text
+                                };
+                            eprintln!("{}", format_session_memory_display(&body));
+                        }
+                        Ok(r) => eprintln!(
+                            "{}",
+                            format!("  ✗ Memory retrieve failed ({})", r.status()).red()
+                        ),
+                        Err(e) => {
+                            eprintln!("{}", format!("  ✗ Memoria unreachable: {e}").red())
+                        }
+                    }
+                }
                 _ => {
                     eprintln!("  {} /memory <subcommand>", "Usage:".dim());
                     eprintln!("  {}", "  list                    List all memories".dim());
@@ -444,9 +471,60 @@ pub(super) async fn handle_memory_domain_command(
 /// Format the session memory markdown body for human-readable terminal display.
 /// Pure function — no I/O, no API calls. Testable in isolation.
 pub(crate) fn format_session_memory_display(body: &str) -> String {
-    // stub — implemented in Task 1.2
-    let _ = body;
-    String::new()
+    if body.trim().is_empty() {
+        return format!(
+            "  {}\n  {}\n",
+            "No session memory extracted yet.".dim(),
+            "Tip: /save triggers early extraction.".dim()
+        );
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "\n  {}\n",
+        "── Session Memory ──────────────────────────────────────".dim()
+    ));
+
+    // Priority-ordered sections: actionable state first, then background
+    let sections: &[(&str, &str)] = &[
+        ("Active Goals", "🎯 Active Goals"),
+        ("Pending Todos", "📌 Pending Todos"),
+        ("Completed", "✅ Completed"),
+        ("L0 Critical", "🔒 Critical (L0)"),
+        ("L1 Important", "📝 Important (L1)"),
+        ("Learnings", "💡 Learnings"),
+        ("L2 Contextual", "📋 Context (L2)"),
+    ];
+
+    for (section_name, label) in sections {
+        if let Some(content) = extract_md_section(body, section_name) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                out.push_str(&format!("\n  {}\n", label.bold()));
+                for line in trimmed.lines().take(15) {
+                    out.push_str(&format!("    {line}\n"));
+                }
+            }
+        }
+    }
+
+    out.push_str(&format!(
+        "\n  {}\n",
+        "───────────────────────────────────────────────────────".dim()
+    ));
+    out
+}
+
+/// Extract a `## SectionName` block from a markdown string.
+/// Returns content between the header and the next `##` header (exclusive).
+fn extract_md_section(md: &str, section_name: &str) -> Option<String> {
+    let needle = format!("## {section_name}");
+    let start = md.find(&needle)?;
+    let after_header = start + needle.len();
+    let rest = &md[after_header..];
+    // Find start of next ## header (the newline before it)
+    let end = rest.find("\n## ").map(|i| i + 1).unwrap_or(rest.len());
+    Some(rest[..end].to_string())
 }
 
 #[cfg(test)]

@@ -737,6 +737,21 @@ impl ThinClient {
             .send()
             .await?)
     }
+
+    pub async fn post_memory_retrieve_json(
+        &self,
+        token: &str,
+        body: &Value,
+    ) -> Result<Response, ThinClientError> {
+        let url = self.url(paths::MEMORY_RETRIEVE)?;
+        Ok(self
+            .http
+            .post(url)
+            .headers(Self::bearer_headers(token)?)
+            .json(body)
+            .send()
+            .await?)
+    }
     // ── Tasks (§5.5 state CRUD — `router_builder`) ───────────────────────────
 
     pub async fn get_tasks_query_text(
