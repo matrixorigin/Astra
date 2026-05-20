@@ -700,6 +700,28 @@ impl ChatWidget {
         out
     }
 
+    /// Drain committed cells for terminal scrollback, but keep trailing
+    /// user-only cells pending until a response/status cell follows.
+    ///
+    /// Terminal insertion is stateful and later large batches can disturb
+    /// earlier tiny batches on some terminals. Pairing a user prompt with
+    /// the first following assistant/tool/system/summary cell keeps turn
+    /// boundaries atomic in the native scrollback while transcript
+    /// persistence remains immediate.
+    pub fn drain_new_committed_for_scrollback(&mut self) -> Vec<Arc<dyn HistoryCell>> {
+        let start = self.committed_watermark;
+        let mut end = self.history.len();
+        while end > start && cell_kind(self.history[end - 1].as_ref()) == CellKind::User {
+            end -= 1;
+        }
+        if end == start {
+            return Vec::new();
+        }
+        let out = self.history[start..end].to_vec();
+        self.committed_watermark = end;
+        out
+    }
+
     /// Reset the commit watermark to the current history length.
     /// Used on resume so replayed cells don't get reflushed.
     pub fn mark_all_flushed(&mut self) {
@@ -2557,6 +2579,37 @@ mod tests {
         w.handle_event(AppEvent::User(UserEvent::Submit("c".into())));
         let third = w.drain_new_committed();
         assert_eq!(third.len(), 1);
+    }
+
+    #[test]
+    fn scrollback_drain_holds_trailing_user_until_response_cell() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::User(UserEvent::Submit("question".into())));
+
+        let first = w.drain_new_committed_for_scrollback();
+        assert!(
+            first.is_empty(),
+            "a lone user prompt should wait for the response batch"
+        );
+
+        w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta("answer".into())));
+        w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
+
+        let second = w.drain_new_committed_for_scrollback();
+        assert_eq!(second.len(), 3, "user + assistant + summary drain together");
+        assert_eq!(cell_kind(second[0].as_ref()), CellKind::User);
+        assert_eq!(cell_kind(second[1].as_ref()), CellKind::Assistant);
+        assert_eq!(cell_kind(second[2].as_ref()), CellKind::TurnSummary);
+    }
+
+    #[test]
+    fn normal_drain_still_replays_trailing_user_cells() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::User(UserEvent::Submit("/session".into())));
+
+        let out = w.drain_new_committed();
+        assert_eq!(out.len(), 1);
+        assert_eq!(cell_kind(out[0].as_ref()), CellKind::User);
     }
 
     #[test]

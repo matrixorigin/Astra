@@ -70,7 +70,24 @@ fn flush_chat_widget(
     chat_widget: &mut chat_widget::ChatWidget,
     width: u16,
 ) {
+    let new_cells = chat_widget.drain_new_committed_for_scrollback();
+    flush_chat_cells(guard, new_cells, width);
+}
+
+fn flush_chat_widget_all(
+    guard: &mut TerminalGuard,
+    chat_widget: &mut chat_widget::ChatWidget,
+    width: u16,
+) {
     let new_cells = chat_widget.drain_new_committed();
+    flush_chat_cells(guard, new_cells, width);
+}
+
+fn flush_chat_cells(
+    guard: &mut TerminalGuard,
+    new_cells: Vec<Arc<dyn history_cell::HistoryCell>>,
+    width: u16,
+) {
     if new_cells.is_empty() {
         return;
     }
@@ -422,7 +439,7 @@ fn replay_session_into_widget(
     // Paint the restored cells exactly once via the same rendering
     // path that streaming flushes use, so the visual match is
     // lossless.
-    flush_chat_widget(guard, &mut widget, width);
+    flush_chat_widget_all(guard, &mut widget, width);
     // Belt-and-suspenders: if flush_chat_widget's implementation
     // ever changes to not advance the watermark, this keeps us
     // safe.

@@ -18,7 +18,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
 use super::Timeline;
@@ -36,13 +36,21 @@ pub(crate) fn desired_height(tl: &Timeline) -> u16 {
 }
 
 pub(crate) fn render(tl: &Timeline, area: Rect, buf: &mut Buffer) {
+    render_with_drill_scroll(tl, area, buf, 0);
+}
+
+pub(crate) fn render_with_drill_scroll(
+    tl: &Timeline,
+    area: Rect,
+    buf: &mut Buffer,
+    drill_scroll: u16,
+) -> u16 {
     if area.width == 0 || area.height == 0 {
-        return;
+        return 0;
     }
 
     if tl.is_drilled() {
-        render_drill(tl, area, buf);
-        return;
+        return render_drill(tl, area, buf, drill_scroll);
     }
 
     let outer = Block::default()
@@ -58,18 +66,19 @@ pub(crate) fn render(tl: &Timeline, area: Rect, buf: &mut Buffer) {
             Style::default().add_modifier(Modifier::DIM),
         )))
         .render(inner, buf);
-        return;
+        return 0;
     }
 
     if inner.width < MIN_SPLIT_WIDTH {
         render_list(tl, inner, buf);
-        return;
+        return 0;
     }
 
     let chunks =
         Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(inner);
     render_list(tl, chunks[0], buf);
     render_detail(tl, chunks[1], buf);
+    0
 }
 
 fn title_line(tl: &Timeline) -> Line<'static> {
@@ -270,8 +279,10 @@ fn fmt_tokens_u64(n: u64) -> String {
 
 // ─── Drill view (full turn trace) ──────────────────────────────────────
 
-fn render_drill(tl: &Timeline, area: Rect, buf: &mut Buffer) {
-    let Some(t) = tl.selected_turn() else { return };
+fn render_drill(tl: &Timeline, area: Rect, buf: &mut Buffer, scroll: u16) -> u16 {
+    let Some(t) = tl.selected_turn() else {
+        return 0;
+    };
     let dim = Style::default().fg(Color::DarkGray);
     let label = Style::default().fg(crate::tui::theme::current().accent);
     let bold = Style::default().add_modifier(Modifier::BOLD);
@@ -510,31 +521,31 @@ fn render_drill(tl: &Timeline, area: Rect, buf: &mut Buffer) {
 
     // User input / assistant output
     if let Some(ref input) = t.user_input {
-        let preview: String = input.chars().take(200).collect();
         lines.push(Line::default());
         lines.push(Line::from(Span::styled("  User", label)));
-        for line in preview.lines().take(4) {
+        for line in input.lines() {
             lines.push(Line::from(Span::styled(format!("    {line}"), dim)));
-        }
-        if input.lines().count() > 4 {
-            lines.push(Line::from(Span::styled("    …", dim)));
         }
     }
     if let Some(ref output) = t.assistant_output {
-        let preview: String = output.chars().take(300).collect();
         lines.push(Line::default());
         lines.push(Line::from(Span::styled("  Assistant", label)));
-        for line in preview.lines().take(6) {
+        for line in output.lines() {
             lines.push(Line::from(Span::styled(format!("    {line}"), dim)));
-        }
-        if output.lines().count() > 6 {
-            lines.push(Line::from(Span::styled("    …", dim)));
         }
     }
 
-    Paragraph::new(lines)
+    let text = Text::from(lines);
+    let paragraph = Paragraph::new(text.clone()).wrap(Wrap { trim: false });
+    let line_count = paragraph.line_count(inner.width) as u16;
+    let max_scroll = line_count.saturating_sub(inner.height);
+    let scroll = scroll.min(max_scroll);
+
+    Paragraph::new(text)
         .wrap(Wrap { trim: false })
+        .scroll((scroll, 0))
         .render(inner, buf);
+    max_scroll
 }
 
 /// Truncate an RFC3339 ISO timestamp to `HH:MM:SS`.
@@ -550,7 +561,7 @@ fn short_time(iso: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::model::{StaticTurnSource, TimelineTurn};
+    use super::super::model::{StaticTurnSource, TimelineTurn, ToolCallDetail};
     use super::*;
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
 
@@ -597,8 +608,20 @@ mod tests {
         }
     }
 
+    struct ScrolledWidget<'a>(&'a Timeline, u16);
+    impl ratatui::widgets::Widget for ScrolledWidget<'_> {
+        fn render(self, area: Rect, buf: &mut Buffer) {
+            render_with_drill_scroll(self.0, area, buf, self.1);
+        }
+    }
+
     fn render_tl(tl: &Timeline, w: u16, h: u16) -> String {
         let buf = draw_widget(Widget(tl), w, h);
+        buffer_to_string(&buf)
+    }
+
+    fn render_tl_scrolled(tl: &Timeline, w: u16, h: u16, scroll: u16) -> String {
+        let buf = draw_widget(ScrolledWidget(tl, scroll), w, h);
         buffer_to_string(&buf)
     }
 
@@ -637,6 +660,62 @@ mod tests {
         let mut tl = Timeline::new(src, "sess_err");
         tl.move_down();
         insta::assert_snapshot!("timeline_error_turn_100x10", render_tl(&tl, 100, 10));
+    }
+
+    #[test]
+    fn drill_view_applies_scroll_offset() {
+        let mut turn = mk(1, 500, 200, 12, "long trace", None);
+        turn.duration_ms = Some(12_000);
+        turn.total_llm_ms = Some(2_000);
+        turn.tool_calls = (0..12)
+            .map(|idx| ToolCallDetail {
+                name: format!("tool_{idx:02}"),
+                ok: true,
+                ms: 200 + idx as u64,
+                error: None,
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: None,
+                start_offset_ms: None,
+                parallel: None,
+                round: None,
+            })
+            .collect();
+        let src = StaticTurnSource::new(vec![turn]);
+        let mut tl = Timeline::new(src, "sess_trace");
+        tl.enter_drill();
+
+        let top = render_tl_scrolled(&tl, 80, 8, 0);
+        let scrolled = render_tl_scrolled(&tl, 80, 8, 8);
+
+        assert_ne!(top, scrolled);
+        assert!(top.contains("Total"));
+        assert!(!scrolled.contains("Total"));
+    }
+
+    #[test]
+    fn drill_view_renders_full_user_and_assistant_content() {
+        let mut turn = mk(1, 500, 200, 0, "full text", None);
+        turn.user_input = Some(
+            (0..8)
+                .map(|idx| format!("user line {idx:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        turn.assistant_output = Some(
+            (0..12)
+                .map(|idx| format!("assistant line {idx:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let src = StaticTurnSource::new(vec![turn]);
+        let mut tl = Timeline::new(src, "sess_full_text");
+        tl.enter_drill();
+
+        let bottom = render_tl_scrolled(&tl, 80, 8, u16::MAX);
+
+        assert!(bottom.contains("assistant line 11"));
+        assert!(!bottom.contains("…"));
     }
 
     // ─── Helpers ──────────────────────────────────────────────────
