@@ -1597,7 +1597,7 @@ impl ToolExecutor {
             .map(str::trim)
             .filter(|plan| !plan.is_empty())
             .map(str::to_string);
-        let explicit_approved = args.get("approved").and_then(Value::as_bool);
+        let explicit_approved = Some(args.get("approved").and_then(Value::as_bool).unwrap_or(true));
 
         let cloud_plan_id = self.lookup_active_planning_plan_id().await;
         match cloud_plan_id {

@@ -1051,7 +1051,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "approved": {
                             "type": "boolean",
-                            "description": "True (default) to commit the plan and unlock writes. False to keep planning."
+                            "default": true,
+                            "description": "True to commit the plan and unlock writes. False to keep planning."
                         }
                     },
                     "required": ["plan"]

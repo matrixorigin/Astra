@@ -45,7 +45,7 @@ mod circuit_breaker_integration {
 }
 
 mod stall_detection {
-    use astra_turn_core::stall::{SERVER_STALL_WINDOW, detect_server_stall};
+    use astra_turn_core::stall::{detect_server_stall, SERVER_STALL_WINDOW};
     use std::collections::BTreeSet;
 
     /// Proves stall detector catches repetitive tool calls
@@ -298,7 +298,7 @@ mod multi_file_edit_regression {
     use astra_runtime::tool_registry::SelectionReport;
     use astra_turn_core::tool_schema_prune::pin_invoked_tool_schemas;
     use astra_turn_core::turn_guard::{TurnGuard, VerdictSeverity};
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     fn tool_schema(name: &str) -> Value {
         json!({"type": "function", "function": {"name": name, "description": "d", "parameters": {}}})
@@ -591,7 +591,7 @@ mod input_guards {
 // ── Result Quality Integration ──────────────────────────────────────────────
 
 mod result_quality_integration {
-    use astra_runtime::turn::result_quality::{ResultQuality, classify_result};
+    use astra_runtime::turn::result_quality::{classify_result, ResultQuality};
 
     #[test]
     fn real_world_github_error() {
@@ -1047,8 +1047,8 @@ mod chat_stream_turnguard_e2e {
         let fb = guard.result_feedback("grep", ResultQuality::Empty);
         assert!(fb.is_some(), "empty result should produce feedback");
         assert!(
-            fb.unwrap().contains("empty"),
-            "feedback should mention empty"
+            fb.unwrap().contains("no finished result"),
+            "feedback should indicate non-finished result"
         );
 
         // Success
