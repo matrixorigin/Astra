@@ -37,21 +37,46 @@ pub const DEFAULT_SIMILARITY_THRESHOLD: f64 = 0.75;
 /// - Git refs: default to "HEAD" when omitted
 pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
     match tool_name {
-        // File-based tools: key on normalized path
+        // File-based tools: key on normalized path + output-critical params
         "read_file" => {
             let path = arg_str(args, "path")?;
-            Some(format!("read_file:{}", normalize_path(path)))
+            let start = arg_u64(args, "start_line").map(|v| v.to_string()).unwrap_or_default();
+            let end = arg_u64(args, "end_line").map(|v| v.to_string()).unwrap_or_default();
+            let outline = arg_bool(args, "outline").unwrap_or(false);
+            Some(format!(
+                "read_file:{}:{}:{}:outline={}",
+                normalize_path(path),
+                start,
+                end,
+                outline,
+            ))
         }
         "glob" => {
             let pattern = arg_str(args, "pattern").unwrap_or("*");
             let path = arg_str(args, "path").unwrap_or(".");
-            Some(format!("glob:{}:{}", normalize_path(path), pattern))
+            let offset = arg_u64(args, "offset").map(|v| v.to_string()).unwrap_or_default();
+            let head_limit = arg_u64(args, "head_limit").map(|v| v.to_string()).unwrap_or_default();
+            Some(format!(
+                "glob:{}:{}:offset={}:limit={}",
+                normalize_path(path),
+                pattern,
+                offset,
+                head_limit,
+            ))
         }
-        // Grep: key on path + pattern — both dimensions matter for dedup
+        // Grep: key on path + pattern + output_mode + include — all affect output
         "grep" => {
             let path = arg_str(args, "path").unwrap_or(".");
             let pattern = arg_str(args, "pattern").unwrap_or(".*");
-            Some(format!("grep:{}:{}", normalize_path(path), pattern))
+            let output_mode = arg_str(args, "output_mode").unwrap_or("content");
+            let include = arg_str(args, "include").unwrap_or("");
+            Some(format!(
+                "grep:{}:{}:mode={}:include={}",
+                normalize_path(path),
+                pattern,
+                output_mode,
+                include,
+            ))
         }
         // GitHub repo tools: case-insensitive repo
         "github_list_prs" | "github_list_issues" | "github_ci_status" | "github_repo_stats" => {
@@ -194,6 +219,14 @@ pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
+}
+
+fn arg_u64(args: &Value, key: &str) -> Option<u64> {
+    args.get(key).and_then(Value::as_u64)
+}
+
+fn arg_bool(args: &Value, key: &str) -> Option<bool> {
+    args.get(key).and_then(Value::as_bool)
 }
 
 fn normalize_path(path: &str) -> String {
@@ -605,9 +638,10 @@ impl SemanticDedup {
     }
 
     /// Check if we've already read a specific file (for pre-call planning).
+    /// Uses prefix match so line-range-specific keys still register the file as "read".
     pub fn has_file(&self, path: &str) -> bool {
-        let key = format!("read_file:{}", normalize_path(path));
-        self.param_cache.contains_key(&key)
+        let prefix = format!("read_file:{}:", normalize_path(path));
+        self.param_cache.keys().any(|k| k.starts_with(&prefix))
     }
 
     /// Check if we've already done a grep scoped to this path (any pattern).
@@ -645,6 +679,20 @@ mod tests {
     }
 
     #[test]
+    fn read_file_different_line_ranges_differ() {
+        let k1 = semantic_call_key("read_file", &json!({"path": "foo.rs", "start_line": 1, "end_line": 120}));
+        let k2 = semantic_call_key("read_file", &json!({"path": "foo.rs", "start_line": 200, "end_line": 350}));
+        assert_ne!(k1, k2, "different line ranges must produce distinct keys — otherwise agent can't read different regions of the same file");
+    }
+
+    #[test]
+    fn read_file_outline_vs_full_differ() {
+        let k1 = semantic_call_key("read_file", &json!({"path": "foo.rs", "outline": true}));
+        let k2 = semantic_call_key("read_file", &json!({"path": "foo.rs"}));
+        assert_ne!(k1, k2, "outline vs full read must differ — outline only returns signatures");
+    }
+
+    #[test]
     fn grep_same_file_different_pattern_differs() {
         let k1 = semantic_call_key("grep", &json!({"pattern": "foo", "path": "src/main.rs"}));
         let k2 = semantic_call_key("grep", &json!({"pattern": "bar", "path": "src/main.rs"}));
@@ -655,10 +703,31 @@ mod tests {
     }
 
     #[test]
-    fn grep_different_file() {
-        let k1 = semantic_call_key("grep", &json!({"pattern": "foo", "path": "src/a.rs"}));
-        let k2 = semantic_call_key("grep", &json!({"pattern": "foo", "path": "src/b.rs"}));
-        assert_ne!(k1, k2, "different files should produce different keys");
+    fn grep_different_output_mode_differs() {
+        let k1 = semantic_call_key("grep", &json!({"pattern": "foo", "path": "src/a.rs", "output_mode": "content"}));
+        let k2 = semantic_call_key("grep", &json!({"pattern": "foo", "path": "src/a.rs", "output_mode": "files_with_matches"}));
+        assert_ne!(k1, k2, "different output_mode must not share same key — results differ");
+    }
+
+    #[test]
+    fn grep_include_filter_differs() {
+        let k1 = semantic_call_key("grep", &json!({"pattern": "foo", "path": "src", "include": "*.rs"}));
+        let k2 = semantic_call_key("grep", &json!({"pattern": "foo", "path": "src", "include": "*.toml"}));
+        assert_ne!(k1, k2, "different include file filters must differ");
+    }
+
+    #[test]
+    fn glob_offset_differs() {
+        let k1 = semantic_call_key("glob", &json!({"pattern": "**/*.rs", "offset": 0}));
+        let k2 = semantic_call_key("glob", &json!({"pattern": "**/*.rs", "offset": 50}));
+        assert_ne!(k1, k2, "different pagination offsets must differ");
+    }
+
+    #[test]
+    fn glob_head_limit_differs() {
+        let k1 = semantic_call_key("glob", &json!({"pattern": "**/*.rs", "head_limit": 10}));
+        let k2 = semantic_call_key("glob", &json!({"pattern": "**/*.rs", "head_limit": 100}));
+        assert_ne!(k1, k2, "different head_limit values must differ — output size changes");
     }
 
     #[test]
