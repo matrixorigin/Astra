@@ -44,16 +44,29 @@ pub fn classify_result(result_str: &str) -> ResultQuality {
         {
             return ResultQuality::Error;
         }
-        // Non-terminal status without payload: any non-empty status that is
-        // not a well-known terminal status, with no result/output/data.
-        if let Some(status) = value.get("status").and_then(|s| s.as_str())
-            && !status.is_empty()
-            && !matches!(status, "ok" | "done" | "success" | "complete" | "finished")
-            && value.get("result").is_none()
-            && value.get("output").is_none()
-            && value.get("data").is_none()
-        {
-            return ResultQuality::Empty;
+        if let Some(status) = value.get("status").and_then(|s| s.as_str()) {
+            let status = status.trim().to_ascii_lowercase();
+            if matches!(
+                status.as_str(),
+                "failed" | "error" | "cancelled" | "canceled" | "aborted" | "timeout" | "timed_out"
+            ) {
+                return ResultQuality::Error;
+            }
+            if matches!(
+                status.as_str(),
+                "pending"
+                    | "queued"
+                    | "in_progress"
+                    | "running"
+                    | "still_running"
+                    | "processing"
+                    | "starting"
+            ) && value.get("result").is_none()
+                && value.get("output").is_none()
+                && value.get("data").is_none()
+            {
+                return ResultQuality::Empty;
+            }
         }
         // Empty JSON structures
         if value.is_null() {
@@ -167,6 +180,30 @@ mod tests {
         assert_eq!(
             classify_result(r#"{"status":"still_running","agent_id":"agent-123"}"#),
             ResultQuality::Empty
+        );
+    }
+
+    #[test]
+    fn json_failed_status_is_error() {
+        assert_eq!(
+            classify_result(r#"{"status":"failed","agent_id":"agent-123"}"#),
+            ResultQuality::Error
+        );
+    }
+
+    #[test]
+    fn json_cancelled_status_is_error() {
+        assert_eq!(
+            classify_result(r#"{"status":"cancelled","agent_id":"agent-123"}"#),
+            ResultQuality::Error
+        );
+    }
+
+    #[test]
+    fn json_completed_status_without_payload_is_success() {
+        assert_eq!(
+            classify_result(r#"{"status":"completed","agent_id":"agent-123"}"#),
+            ResultQuality::Success
         );
     }
 
