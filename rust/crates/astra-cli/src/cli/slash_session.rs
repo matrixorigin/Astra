@@ -727,14 +727,12 @@ pub(super) fn resolve_journal_target_session(
     }
 }
 
-
-
 pub(super) async fn handle_session_command(
     arg: &str,
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
+    _api: &astra_thin_client::ThinClient,
+    _profile: Option<&str>,
     state: &mut SessionState,
-    token: Option<&str>,
+    _token: Option<&str>,
 ) {
     let (sub_cmd, sub_arg) = match arg.find(char::is_whitespace) {
         Some(pos) => (arg[..pos].trim(), arg[pos..].trim()),
@@ -5388,7 +5386,7 @@ pub(super) async fn handle_resume_command(
 mod resume_tests {
     use super::*;
     use astra_services::session_journal::{self, JournalDirGuard};
-    use wiremock::matchers::{body_json, header_exists, method, path};
+    use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {

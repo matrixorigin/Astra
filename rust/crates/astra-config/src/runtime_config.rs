@@ -101,7 +101,7 @@ pub struct RuntimeConfig {
 /// (which itself defaults to 150/0). Setting a positive value here
 /// overrides the env-driven default for the CLI without requiring a
 /// process restart with new `ASTRA_*` exports.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RuntimeLimitsConfig {
     /// Max tool calls per user message (regular chat turn).
     /// 0 = inherit from `RuntimeLimits::max_turns` (env / built-in 150).
@@ -111,15 +111,6 @@ pub struct RuntimeLimitsConfig {
     /// Max tool calls per plan subtask. 0 = fall back to `max_turns`.
     #[serde(default)]
     pub plan_subtask_max_turns: u32,
-}
-
-impl Default for RuntimeLimitsConfig {
-    fn default() -> Self {
-        Self {
-            max_turns: 0,
-            plan_subtask_max_turns: 0,
-        }
-    }
 }
 
 // ─── Fork-Prefix Configuration ───────────────────────────────────────────────
