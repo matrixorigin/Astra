@@ -292,7 +292,7 @@ impl PipelineSession {
             );
         }
 
-        self.stats.record(model_id, query_source, &feedback);
+        self.stats.record(model_id, query_source, feedback);
         self.recovery.process_feedback(feedback.was_truncated);
 
         if feedback.was_truncated

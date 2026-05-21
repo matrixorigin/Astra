@@ -1416,17 +1416,27 @@ mod tests {
     #[test]
     fn call_llm_stream_has_total_budget_guard() {
         let source = include_str!("bridge_llm_stream.rs");
-        let fn_start = source
+        let wrapper_start = source
             .find("pub(crate) async fn call_llm_stream(")
             .expect("call_llm_stream must exist");
-        // Find the next function after call_llm_stream
-        let rest = &source[fn_start + 50..];
-        let fn_end = rest
+        let wrapper_rest = &source[wrapper_start..];
+        let wrapper_end = wrapper_rest
             .find("\npub")
-            .or_else(|| rest.find("\nfn "))
-            .or_else(|| rest.find("\n#[cfg(test)]"))
-            .unwrap_or(rest.len());
-        let body = &rest[..fn_end];
+            .or_else(|| wrapper_rest.find("\nfn "))
+            .or_else(|| wrapper_rest.find("\n#[cfg(test)]"))
+            .unwrap_or(wrapper_rest.len());
+        let wrapper_body = &wrapper_rest[..wrapper_end];
+        assert!(
+            wrapper_body.contains("call_llm_stream_with_request_overrides"),
+            "call_llm_stream must delegate to the shared retry/guard implementation"
+        );
+
+        let impl_start = source
+            .find("pub(crate) async fn call_llm_stream_with_request_overrides(")
+            .expect("call_llm_stream_with_request_overrides must exist");
+        let impl_rest = &source[impl_start..];
+        let impl_end = impl_rest.find("\n#[cfg(test)]").unwrap_or(impl_rest.len());
+        let body = &impl_rest[..impl_end];
         assert!(
             body.contains("total_budget") || body.contains("budget"),
             "call_llm_stream must check total budget to prevent unbounded blocking"

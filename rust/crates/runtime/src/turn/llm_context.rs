@@ -970,19 +970,24 @@ pub(crate) fn finalize_bridge_wire_messages(
         && !text.is_empty()
     {
         let wrapped = format!("<system-reminder>\n{text}</system-reminder>");
-        let tail_is_user = llm_messages
+        let tail_role = llm_messages
             .last()
-            .and_then(|m| m.get("role").and_then(Value::as_str))
-            == Some("user");
-        if tail_is_user {
+            .and_then(|m| m.get("role").and_then(Value::as_str));
+        if tail_role == Some("user") {
             let last_user = llm_messages
                 .last_mut()
-                .expect("tail_is_user implies a last message exists");
+                .expect("tail_role=user implies a last message exists");
             let existing = last_user
                 .get("content")
                 .and_then(Value::as_str)
                 .unwrap_or("");
             last_user["content"] = Value::String(format!("{wrapped}\n\n{existing}"));
+        } else if tail_role == Some("tool") {
+            llm_messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": "Understood.",
+            }));
+            llm_messages.push(serde_json::json!({"role": "user", "content": wrapped}));
         } else {
             llm_messages.push(serde_json::json!({"role": "user", "content": wrapped}));
         }
@@ -1123,9 +1128,10 @@ mod context_cache_contract_tests {
         );
 
         assert_eq!(messages[0]["content"], "original user");
-        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["role"], "assistant");
+        assert_eq!(messages[3]["content"], "Understood.");
         assert_eq!(
-            messages[3]["content"],
+            messages[4]["content"],
             "<system-reminder>\nvolatile</system-reminder>"
         );
     }

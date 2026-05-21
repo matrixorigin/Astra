@@ -140,6 +140,8 @@ fn shipped_cases_reference_only_known_criterion_variants() {
         "turn_rounds_between",
         "cache_rate_above",
         "prompt_cache_tokens",
+        "pipeline_alert_count",
+        "pipeline_avg_cache_hit_ratio",
         "any_of",
         "all_of",
     ];

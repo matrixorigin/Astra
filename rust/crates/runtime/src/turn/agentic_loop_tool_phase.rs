@@ -1796,6 +1796,20 @@ mod tests {
             .collect()
     }
 
+    fn read_boundary_events(session_id: &str) -> Vec<JournalEvent> {
+        read_journal_events(session_id)
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type,
+                    JournalEventType::ExecutionBoundaryOpened
+                        | JournalEventType::ExecutionBoundaryCommitted
+                        | JournalEventType::ExecutionBoundaryAborted
+                )
+            })
+            .collect()
+    }
+
     fn cleanup_journal(session_id: &str) {
         let writer = JournalWriter::new(session_id).unwrap();
         std::fs::remove_file(writer.path()).ok();
@@ -1941,7 +1955,7 @@ esac
         )
         .await;
 
-        let events = read_journal_events(&session_id);
+        let events = read_boundary_events(&session_id);
         assert_eq!(events.len(), 2);
         assert_eq!(
             events[0].event_type,
@@ -2008,7 +2022,7 @@ esac
         )
         .await;
 
-        let events = read_journal_events(&session_id);
+        let events = read_boundary_events(&session_id);
         assert_eq!(events.len(), 2);
         assert_eq!(
             events[0].event_type,
@@ -2080,7 +2094,7 @@ esac
         )
         .await;
 
-        let events = read_journal_events(&session_id);
+        let events = read_boundary_events(&session_id);
         assert_eq!(events.len(), 2);
         assert_eq!(
             events[0].event_type,
@@ -2174,7 +2188,7 @@ esac
         )
         .await;
 
-        let events = read_journal_events(&session_id);
+        let events = read_boundary_events(&session_id);
         let boundary_events: Vec<_> = events
             .iter()
             .filter(|event| {
@@ -2308,7 +2322,7 @@ esac
         )
         .await;
 
-        let events = read_journal_events(&session_id);
+        let events = read_boundary_events(&session_id);
         assert_eq!(events.len(), 2, "expected open + committed, got {events:?}");
         assert_eq!(
             events[0].event_type,
@@ -2374,7 +2388,7 @@ esac
         )
         .await;
 
-        let events = read_journal_events(&session_id);
+        let events = read_boundary_events(&session_id);
         assert_eq!(events.len(), 2);
         assert_eq!(
             events[1].event_type,

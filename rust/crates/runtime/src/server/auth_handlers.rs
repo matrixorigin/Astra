@@ -117,32 +117,12 @@ async fn memory_proxy_call(
     headers: &HeaderMap,
     method: reqwest::Method,
     endpoint: &str,
-    mut body: serde_json::Value,
+    body: serde_json::Value,
     inject_identity: bool,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(headers).await?;
     let user_id = user.user_id.clone();
-
-    if inject_identity && let Some(obj) = body.as_object_mut() {
-        // Force-overwrite user identity to prevent clients from impersonating
-        // other users. Preserve a caller-supplied session_id so legitimate
-        // session-scoped memory flows keep their actual session boundary.
-        obj.entry("session_id".to_string())
-            .or_insert_with(|| serde_json::Value::String(user_id.clone()));
-        obj.insert(
-            "user_id".to_string(),
-            serde_json::Value::String(user_id.clone()),
-        );
-    }
-
-    // Memoria PurgeRequest only accepts: memory_ids, topic, reason.
-    // Strip injected fields that would cause a 422 Unprocessable Entity.
-    if endpoint.ends_with("/purge") {
-        if let Some(obj) = body.as_object_mut() {
-            obj.remove("session_id");
-            obj.remove("user_id");
-        }
-    }
+    let body = apply_memory_proxy_identity(body, &user_id, inject_identity, endpoint);
 
     state
         .memoria_forwarder
@@ -162,6 +142,37 @@ async fn memory_proxy_call(
                 internal_error(&error)
             }
         })
+}
+
+fn apply_memory_proxy_identity(
+    mut body: serde_json::Value,
+    user_id: &str,
+    inject_identity: bool,
+    endpoint: &str,
+) -> serde_json::Value {
+    if inject_identity && let Some(obj) = body.as_object_mut() {
+        // Force-overwrite both ownership fields so clients cannot spoof either
+        // another user's identity or a foreign session scope inside Memoria.
+        obj.insert(
+            "session_id".to_string(),
+            serde_json::Value::String(user_id.to_string()),
+        );
+        obj.insert(
+            "user_id".to_string(),
+            serde_json::Value::String(user_id.to_string()),
+        );
+    }
+
+    // Memoria PurgeRequest only accepts: memory_ids, topic, reason.
+    // Strip injected fields that would cause a 422 Unprocessable Entity.
+    if endpoint.ends_with("/purge")
+        && let Some(obj) = body.as_object_mut()
+    {
+        obj.remove("session_id");
+        obj.remove("user_id");
+    }
+
+    body
 }
 
 pub(super) async fn memory_proxy_store_handler(
@@ -552,4 +563,40 @@ pub(super) async fn memoria_proxy_consolidate_handler(
         Some(body),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_memory_proxy_identity;
+    use serde_json::json;
+
+    #[test]
+    fn apply_memory_proxy_identity_overwrites_spoofed_user_and_session() {
+        let body = json!({
+            "content": "probe",
+            "memory_type": "semantic",
+            "user_id": "spoofed-user",
+            "session_id": "spoofed-session"
+        });
+
+        let out = apply_memory_proxy_identity(body, "real-user", true, "/v1/memories");
+
+        assert_eq!(out["user_id"].as_str(), Some("real-user"));
+        assert_eq!(out["session_id"].as_str(), Some("real-user"));
+    }
+
+    #[test]
+    fn apply_memory_proxy_identity_strips_injected_fields_for_purge() {
+        let body = json!({
+            "memory_ids": ["m1"],
+            "user_id": "spoofed-user",
+            "session_id": "spoofed-session"
+        });
+
+        let out = apply_memory_proxy_identity(body, "real-user", true, "/v1/memories/purge");
+
+        assert!(out.get("user_id").is_none());
+        assert!(out.get("session_id").is_none());
+        assert_eq!(out["memory_ids"], json!(["m1"]));
+    }
 }

@@ -297,9 +297,11 @@ fn is_completion_signal(content: &str) -> bool {
 /// 1. `system_messages` (from the context pipeline).
 /// 2. `compacted_messages` (conversation history from Memoria).
 /// 3. `volatile_preamble` content is attached at the true tail:
-///    if the last message is already `role=user`, prepend there; otherwise
-///    append one synthetic tail `role=user` reminder. This avoids rewriting a
-///    historical user message when `assistant/tool` messages trail it.
+///    if the last message is already `role=user`, prepend there; if the tail is
+///    `role=tool`, append `assistant("Understood.")` + `user(reminder)` so the
+///    wire alternation stays protocol-valid; otherwise append one synthetic tail
+///    `role=user` reminder. This avoids rewriting a historical user message
+///    when `assistant/tool` messages trail it.
 /// 4. `strip_stale_reasoning` is applied in place.
 /// 5. Invoked-skill attachments (server path only).
 /// 6. Recent-file attachments (server path only).
@@ -359,19 +361,28 @@ pub(crate) fn assemble_llm_messages(
             .collect::<Vec<_>>()
             .join("\n");
         if !volatile_text.is_empty() {
-            let tail_is_user = llm_messages
+            let tail_role = llm_messages
                 .last()
-                .and_then(|m| m.get("role").and_then(Value::as_str))
-                == Some("user");
-            if tail_is_user {
+                .and_then(|m| m.get("role").and_then(Value::as_str));
+            if tail_role == Some("user") {
                 let last_user = llm_messages
                     .last_mut()
-                    .expect("tail_is_user implies a last message exists");
+                    .expect("tail_role=user implies a last message exists");
                 let existing = last_user
                     .get("content")
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 last_user["content"] = Value::String(format!("{volatile_text}\n\n{existing}"));
+            } else if tail_role == Some("tool") {
+                llm_messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": "Understood.",
+                }));
+                llm_messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": volatile_text,
+                }));
+                synthetic_tail_end = Some(llm_messages.len());
             } else {
                 // No tail user available — append one synthetic tail reminder
                 // instead of rewriting a historical user message.
@@ -1060,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn volatile_preamble_appended_as_tail_user_when_last_user_is_mid_history() {
+    fn volatile_preamble_appends_protocol_valid_tail_after_tool() {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let preamble = vec![
             json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
@@ -1088,8 +1099,10 @@ mod tests {
         );
         assert_eq!(msgs[2]["role"], "assistant");
         assert_eq!(msgs[3]["role"], "tool");
-        assert_eq!(msgs[4]["role"], "user");
-        let tail_user = msgs[4]["content"].as_str().unwrap();
+        assert_eq!(msgs[4]["role"], "assistant");
+        assert_eq!(msgs[4]["content"], "Understood.");
+        assert_eq!(msgs[5]["role"], "user");
+        let tail_user = msgs[5]["content"].as_str().unwrap();
         assert!(
             tail_user.starts_with("<system-reminder>volatile</system-reminder>"),
             "volatile reminder should be appended as the true tail user"

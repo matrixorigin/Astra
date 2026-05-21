@@ -1624,6 +1624,10 @@ async fn execute_repl_bridge_command(
     if let Ok(name) = std::env::var("ASTRA_CLI_SESSION_NAME") {
         state.session_name = Some(name);
     }
+    if slash_cmd == "/messaging" {
+        handle_messaging_command(arg, &state);
+        return Ok(ExitCode::Success);
+    }
     let task_service = session_runtime::resolve_task_service(profile).await;
     session_runtime::install_task_service(&mut state, task_service);
     let (task_store, task_notify_tx) =

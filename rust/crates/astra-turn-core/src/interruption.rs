@@ -305,10 +305,10 @@ pub fn build_resume_guidance_with_context(
 
     let mut guidance = String::new();
     guidance.push_str("[RESUME CONTEXT] This session was previously interrupted.\n");
-    write!(guidance, "  Reason: {kind}\n").ok();
-    write!(
+    writeln!(guidance, "  Reason: {kind}").ok();
+    writeln!(
         guidance,
-        "  Progress: {turns} turn(s), {tool_calls} tool call(s) completed\n"
+        "  Progress: {turns} turn(s), {tool_calls} tool call(s) completed"
     )
     .ok();
     if has_checkpoint {
@@ -335,12 +335,12 @@ pub fn build_resume_guidance_with_context(
             if let Some(sig) = stall_signal {
                 if sig.starts_with("single_tool_streak=") {
                     let streak = sig.trim_start_matches("single_tool_streak=");
-                    write!(
+                    writeln!(
                         guidance,
                         "  Cause: the previous run used exactly ONE tool per round for {streak} \
                          consecutive rounds, which exhausted the per-turn round budget. On \
                          resume, batch independent calls (different files / greps / reads) \
-                         into a single parallel round instead.\n"
+                         into a single parallel round instead."
                     )
                     .ok();
                 } else if sig.starts_with("exploration_family=") {
@@ -380,7 +380,7 @@ pub fn build_resume_guidance_with_context(
                 .and_then(|v| v.as_str())
                 .filter(|detail| detail.contains("Likely cause:"))
             {
-                write!(guidance, "  Runtime detail: {detail}\n").ok();
+                writeln!(guidance, "  Runtime detail: {detail}").ok();
             }
         }
         "rate_limited" | "cooldown_rejected" | "server_overload" => {
@@ -437,7 +437,7 @@ pub fn build_resume_guidance_with_context(
         }
         _ => {
             if !user_msg.is_empty() {
-                write!(guidance, "  Detail: {user_msg}\n").ok();
+                writeln!(guidance, "  Detail: {user_msg}").ok();
             }
         }
     }

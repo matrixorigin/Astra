@@ -280,47 +280,6 @@ fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::resolve_workspace_astra_bin;
-    use std::fs;
-    use std::time::Duration;
-
-    #[test]
-    fn workspace_bin_prefers_only_available_debug_binary() {
-        let dir = tempfile::tempdir().unwrap();
-        let debug = dir.path().join("rust/target/debug");
-        fs::create_dir_all(&debug).unwrap();
-        let debug_bin = debug.join("astra");
-        fs::write(&debug_bin, b"debug").unwrap();
-
-        assert_eq!(resolve_workspace_astra_bin(dir.path()), Some(debug_bin));
-    }
-
-    #[test]
-    fn workspace_bin_prefers_newer_profile_binary() {
-        let dir = tempfile::tempdir().unwrap();
-        let release = dir.path().join("rust/target/release");
-        let debug = dir.path().join("rust/target/debug");
-        fs::create_dir_all(&release).unwrap();
-        fs::create_dir_all(&debug).unwrap();
-        let release_bin = release.join("astra");
-        let debug_bin = debug.join("astra");
-
-        fs::write(&release_bin, b"release").unwrap();
-        std::thread::sleep(Duration::from_millis(20));
-        fs::write(&debug_bin, b"debug").unwrap();
-        assert_eq!(
-            resolve_workspace_astra_bin(dir.path()),
-            Some(debug_bin.clone())
-        );
-
-        std::thread::sleep(Duration::from_millis(20));
-        fs::write(&release_bin, b"release-newer").unwrap();
-        assert_eq!(resolve_workspace_astra_bin(dir.path()), Some(release_bin));
-    }
-}
-
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -585,4 +544,45 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_workspace_astra_bin;
+    use std::fs;
+    use std::time::Duration;
+
+    #[test]
+    fn workspace_bin_prefers_only_available_debug_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let debug = dir.path().join("rust/target/debug");
+        fs::create_dir_all(&debug).unwrap();
+        let debug_bin = debug.join("astra");
+        fs::write(&debug_bin, b"debug").unwrap();
+
+        assert_eq!(resolve_workspace_astra_bin(dir.path()), Some(debug_bin));
+    }
+
+    #[test]
+    fn workspace_bin_prefers_newer_profile_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("rust/target/release");
+        let debug = dir.path().join("rust/target/debug");
+        fs::create_dir_all(&release).unwrap();
+        fs::create_dir_all(&debug).unwrap();
+        let release_bin = release.join("astra");
+        let debug_bin = debug.join("astra");
+
+        fs::write(&release_bin, b"release").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&debug_bin, b"debug").unwrap();
+        assert_eq!(
+            resolve_workspace_astra_bin(dir.path()),
+            Some(debug_bin.clone())
+        );
+
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&release_bin, b"release-newer").unwrap();
+        assert_eq!(resolve_workspace_astra_bin(dir.path()), Some(release_bin));
+    }
 }
