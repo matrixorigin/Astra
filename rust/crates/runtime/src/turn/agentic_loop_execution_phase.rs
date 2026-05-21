@@ -6,8 +6,8 @@ use super::agentic_loop_host::{
     finalize_turn_trace, try_write_heavy_checkpoint,
 };
 use super::agentic_loop_lifecycle::{
-    TurnIterationPrep, current_agentic_step, interruption_state_summary, session_turn_number,
-    tool_record_is_workspace_mutation,
+    TurnIterationPrep, current_agentic_step, interruption_diagnosis_summary,
+    interruption_state_summary, session_turn_number, tool_record_is_workspace_mutation,
 };
 use astra_services::{ContextManifestWrite, DatabaseContextManifestStore};
 use astra_turn_core::agentic_turn_ingest::{
@@ -481,12 +481,17 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             }
             astra_turn_core::loop_circuit_breaker::BreakerAction::Abort => {
                 state.stall.forced_round_budget_phase2 = true;
-                let abort_msg = format!(
+                let mut abort_msg = format!(
                     "[Circuit breaker abort at round {}. The agent did not recover \
                      after correction — stall or regression persists. Any progress \
                      and tool results from earlier rounds are preserved above.]",
                     state.llm_rounds_completed,
                 );
+                if let Some(diagnosis) = interruption_diagnosis_summary(state) {
+                    abort_msg.push_str(&format!(
+                        "\nLikely cause: {diagnosis}. Resume by reusing existing evidence and only fetching one genuinely new fact if still needed."
+                    ));
+                }
                 if state.final_text.trim().is_empty() {
                     state.final_text = abort_msg.clone();
                 } else {
@@ -1069,6 +1074,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                                     state.consecutive_context_window_errors,
                                 )
                                 .with_agentic_step(Some(current_agentic_step(state)));
+                            let _ = astra_services::session_journal::ensure_session_start_event(
+                                sid,
+                                state.context_manifest_model_name.as_deref(),
+                            );
                             if let Ok(writer) =
                                 astra_services::session_journal::JournalWriter::new(sid)
                             {
@@ -1236,12 +1245,17 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // model ignored it → abort.
     if state.stall.forced_round_budget_phase1 && !state.stall.forced_round_budget_phase2 {
         state.stall.forced_round_budget_phase2 = true;
-        let abort_msg = format!(
+        let mut abort_msg = format!(
             "[Circuit breaker abort at round {}. The runtime injected a \
              finalization corrective but the model continued to call tools. \
              Any progress from earlier rounds is preserved above.]",
             state.llm_rounds_completed,
         );
+        if let Some(diagnosis) = interruption_diagnosis_summary(state) {
+            abort_msg.push_str(&format!(
+                "\nLikely cause: {diagnosis}. Resume by synthesizing the evidence already gathered before attempting more tools."
+            ));
+        }
         if state.final_text.trim().is_empty() {
             state.final_text = abort_msg.clone();
         } else {

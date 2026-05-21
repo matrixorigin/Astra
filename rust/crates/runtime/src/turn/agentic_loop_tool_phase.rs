@@ -291,6 +291,7 @@ fn append_session_journal_event(
     session_id: &str,
     event: astra_services::session_journal::JournalEvent,
 ) {
+    let _ = astra_services::session_journal::ensure_session_start_event(session_id, None);
     match astra_services::session_journal::JournalWriter::new(session_id) {
         Ok(journal) => {
             if let Err(err) = journal.append(&event) {

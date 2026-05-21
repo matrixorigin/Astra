@@ -1280,6 +1280,36 @@ pub fn read_journal(session_id: &str) -> std::io::Result<Vec<JournalEvent>> {
     Ok(parse_journal_text(&content).0)
 }
 
+pub fn journal_needs_session_start(session_id: &str) -> std::io::Result<bool> {
+    let events = read_journal(session_id)?;
+    let last_type = events.last().map(|e| &e.event_type);
+    Ok(match last_type {
+        None | Some(JournalEventType::SessionEnd) => true,
+        _ => {
+            let last_start = events
+                .iter()
+                .rposition(|e| e.event_type == JournalEventType::SessionStart);
+            let last_end = events
+                .iter()
+                .rposition(|e| e.event_type == JournalEventType::SessionEnd);
+            let has_unmatched_start = match (last_start, last_end) {
+                (Some(s), Some(e)) => s > e,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            !has_unmatched_start
+        }
+    })
+}
+
+pub fn ensure_session_start_event(session_id: &str, model: Option<&str>) -> std::io::Result<()> {
+    if journal_needs_session_start(session_id)? {
+        let writer = JournalWriter::new(session_id)?;
+        writer.append(&JournalEvent::session_start(Some(session_id), model))?;
+    }
+    Ok(())
+}
+
 fn approval_metadata_str(metadata: &serde_json::Value, field: &str) -> Option<String> {
     metadata
         .get("approval")
@@ -6936,68 +6966,78 @@ mod turn_event_buffer_tests {
     }
 
     /// Verify the needs_start_event logic for resumed sessions.
-    /// This mirrors the rposition-based check in repl_turn::initialize_journal.
     #[test]
     fn needs_start_event_scenarios() {
         let tmp = tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
-
-        // Helper: same logic as repl_turn::initialize_journal
-        fn needs_start(events: &[JournalEvent]) -> bool {
-            let last_type = events.last().map(|e| &e.event_type);
-            match last_type {
-                None | Some(JournalEventType::SessionEnd) => true,
-                _ => {
-                    let last_start = events
-                        .iter()
-                        .rposition(|e| e.event_type == JournalEventType::SessionStart);
-                    let last_end = events
-                        .iter()
-                        .rposition(|e| e.event_type == JournalEventType::SessionEnd);
-                    let has_unmatched_start = match (last_start, last_end) {
-                        (Some(s), Some(e)) => s > e,
-                        (Some(_), None) => true,
-                        _ => false,
-                    };
-                    !has_unmatched_start
-                }
-            }
-        }
+        let sid = "needs-start-sid";
 
         // Empty journal → needs start
-        assert!(needs_start(&[]));
+        assert!(journal_needs_session_start(sid).unwrap());
 
         // Clean end → needs start
-        let events = vec![
+        let events = [
             JournalEvent::session_start(Some("s"), Some("m")),
             JournalEvent::base_public(JournalEventType::Turn, Some("s")),
             JournalEvent::session_end(Some("s"), 1),
         ];
-        assert!(needs_start(&events));
+        let writer = JournalWriter::new(sid).unwrap();
+        writer.append_bulk(&events).unwrap();
+        assert!(journal_needs_session_start(sid).unwrap());
 
         // Interrupted (start, turn, no end) → already has open start, skip
-        let events = vec![
+        let sid = "needs-start-open";
+        let events = [
             JournalEvent::session_start(Some("s"), Some("m")),
             JournalEvent::base_public(JournalEventType::Turn, Some("s")),
         ];
-        assert!(!needs_start(&events));
+        let writer = JournalWriter::new(sid).unwrap();
+        writer.append_bulk(&events).unwrap();
+        assert!(!journal_needs_session_start(sid).unwrap());
 
         // start → end → start → turn (interrupted) → already has open start, skip
-        let events = vec![
+        let sid = "needs-start-nested";
+        let events = [
             JournalEvent::session_start(Some("s"), Some("m")),
             JournalEvent::session_end(Some("s"), 1),
             JournalEvent::session_start(Some("s"), Some("m")),
             JournalEvent::base_public(JournalEventType::Turn, Some("s")),
         ];
-        assert!(!needs_start(&events));
+        let writer = JournalWriter::new(sid).unwrap();
+        writer.append_bulk(&events).unwrap();
+        assert!(!journal_needs_session_start(sid).unwrap());
 
         // start → end → turn (orphan turn after clean end) → needs start
-        let events = vec![
+        let sid = "needs-start-orphan";
+        let events = [
             JournalEvent::session_start(Some("s"), Some("m")),
             JournalEvent::session_end(Some("s"), 1),
             JournalEvent::base_public(JournalEventType::Turn, Some("s")),
         ];
-        assert!(needs_start(&events));
+        let writer = JournalWriter::new(sid).unwrap();
+        writer.append_bulk(&events).unwrap();
+        assert!(journal_needs_session_start(sid).unwrap());
+    }
+
+    #[test]
+    fn ensure_session_start_event_prepends_runtime_first_write() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "ensure-start-runtime-first-write";
+
+        ensure_session_start_event(sid, Some("gpt-5")).unwrap();
+        let writer = JournalWriter::new(sid).unwrap();
+        writer
+            .append(&JournalEvent::interruption_recorded(
+                Some(sid),
+                1,
+                serde_json::json!({"kind":"budget_exhausted","resumable":true}),
+            ))
+            .unwrap();
+
+        let events = read_journal(sid).unwrap();
+        assert_eq!(events[0].event_type, JournalEventType::SessionStart);
+        assert_eq!(events[1].event_type, JournalEventType::InterruptionRecorded);
     }
 }
 

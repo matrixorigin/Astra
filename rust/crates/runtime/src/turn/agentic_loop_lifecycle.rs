@@ -669,15 +669,7 @@ pub(crate) fn interruption_state_summary(
     state: &AgenticLoopState,
     error_detail: Option<String>,
 ) -> InterruptionStateSummary {
-    // Compute a stall-signal breadcrumb from the single-tool streak at
-    // interruption time. Lets the resumed session see *why* it was cut
-    // (e.g. `"single_tool_streak=18"`) without re-scanning history.
-    let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
-    let stall_signal = if streak >= 3 {
-        Some(format!("single_tool_streak={streak}"))
-    } else {
-        None
-    };
+    let stall_signal = interruption_stall_signal(state);
     InterruptionStateSummary {
         has_checkpoint: state.stall.last_heavy_checkpoint.is_some(),
         tool_calls_completed: completed_tool_calls(state),
@@ -686,6 +678,57 @@ pub(crate) fn interruption_state_summary(
         error_detail,
         stall_signal,
     }
+}
+
+pub(crate) fn interruption_diagnosis_summary(state: &AgenticLoopState) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some((family, streak)) =
+        astra_turn_core::evaluation::exploration_family_round_streak(&state.stall.tool_call_records)
+        && streak >= astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD
+    {
+        parts.push(match family {
+            "read" => format!("{streak} consecutive read-dominant exploratory rounds"),
+            "search" => format!("{streak} consecutive search-dominant exploratory rounds"),
+            "diff" => format!("{streak} consecutive diff-dominant exploratory rounds"),
+            _ => format!("{streak} consecutive {family}-dominant exploratory rounds"),
+        });
+    }
+    let redundant_reads = astra_turn_core::evaluation::count_redundant_overlapping_reads(
+        &state.stall.tool_call_records,
+    );
+    if redundant_reads >= astra_turn_core::evaluation::REDUNDANT_OVERLAPPING_READS_THRESHOLD {
+        parts.push(format!(
+            "{redundant_reads} redundant overlapping reads on unchanged files"
+        ));
+    }
+    let single_tool_streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
+    if single_tool_streak >= 3 && parts.is_empty() {
+        parts.push(format!(
+            "a single-tool streak of {single_tool_streak} consecutive rounds"
+        ));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
+}
+
+fn interruption_stall_signal(state: &AgenticLoopState) -> Option<String> {
+    if let Some((family, streak)) =
+        astra_turn_core::evaluation::exploration_family_round_streak(&state.stall.tool_call_records)
+        && streak >= astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD
+    {
+        return Some(format!("exploration_family={family};streak={streak}"));
+    }
+    let redundant_reads = astra_turn_core::evaluation::count_redundant_overlapping_reads(
+        &state.stall.tool_call_records,
+    );
+    if redundant_reads >= astra_turn_core::evaluation::REDUNDANT_OVERLAPPING_READS_THRESHOLD {
+        return Some(format!("redundant_reads={redundant_reads}"));
+    }
+    let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
+    (streak >= 3).then(|| format!("single_tool_streak={streak}"))
 }
 
 pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
@@ -1435,6 +1478,23 @@ mod tests {
         }
     }
 
+    fn read_record(round: u32, start_line: u32, end_line: u32) -> ToolCallRecord {
+        ToolCallRecord {
+            name: "read_file".into(),
+            ok: true,
+            args_full: Some(
+                json!({
+                    "path": "/tmp/sample.rs",
+                    "start_line": start_line,
+                    "end_line": end_line
+                })
+                .to_string(),
+            ),
+            round: Some(round),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn open_ended_file_exploration_detection_requires_file_and_loop_signal() {
         assert!(is_open_ended_file_exploration(
@@ -1493,6 +1553,29 @@ mod tests {
             budget_entries, 1,
             "budget injection must be idempotent (singleton dedup); pending={:?}",
             state.volatile_pending,
+        );
+    }
+
+    #[test]
+    fn interruption_state_summary_prefers_exploration_family_stall_signal() {
+        let mut state = make_state();
+        state.stall.tool_call_records = (0..5)
+            .flat_map(|round| [read_record(round, 10, 40), read_record(round, 50, 80)])
+            .collect();
+
+        let summary = interruption_state_summary(&state, None);
+        assert_eq!(
+            summary.stall_signal.as_deref(),
+            Some("exploration_family=read;streak=5")
+        );
+        let diagnosis = interruption_diagnosis_summary(&state).expect("diagnosis");
+        assert!(
+            diagnosis.contains("5 consecutive read-dominant exploratory rounds"),
+            "expected read-family diagnosis, got {diagnosis}"
+        );
+        assert!(
+            diagnosis.contains("redundant overlapping reads"),
+            "expected redundant-read detail, got {diagnosis}"
         );
     }
 

@@ -3156,32 +3156,8 @@ fn initialize_journal(state: &mut SessionState, session_id: &str) {
         };
     }
 
-    let needs_start_event = match session_journal::read_journal(session_id) {
-        Ok(events) => {
-            // Write session_start if: journal is empty, last event is session_end
-            // (clean restart), or we're resuming an interrupted session (no open
-            // session_start). Use rposition to find the LAST start/end pair.
-            let last_type = events.last().map(|e| &e.event_type);
-            match last_type {
-                None | Some(session_journal::JournalEventType::SessionEnd) => true,
-                _ => {
-                    let last_start = events.iter().rposition(|e| {
-                        e.event_type == session_journal::JournalEventType::SessionStart
-                    });
-                    let last_end = events.iter().rposition(|e| {
-                        e.event_type == session_journal::JournalEventType::SessionEnd
-                    });
-                    let has_unmatched_start = match (last_start, last_end) {
-                        (Some(s), Some(e)) => s > e,
-                        (Some(_), None) => true,
-                        _ => false,
-                    };
-                    !has_unmatched_start
-                }
-            }
-        }
-        Err(_) => true,
-    };
+    let needs_start_event =
+        session_journal::journal_needs_session_start(session_id).unwrap_or(true);
 
     if !already_attached && needs_start_event {
         let Some(journal) = state.journal.as_ref() else {

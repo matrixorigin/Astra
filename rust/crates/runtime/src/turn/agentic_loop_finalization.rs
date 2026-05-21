@@ -491,6 +491,10 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     // Emit structured interruption to journal if one was recorded.
     if let Some(ref interruption) = state.interruption {
         if let Some(ref sid) = state.current_session_id {
+            let _ = astra_services::session_journal::ensure_session_start_event(
+                sid,
+                state.context_manifest_model_name.as_deref(),
+            );
             // Best-effort flush of turn observability events on interruption.
             if let Some(buf) = state.turn_event_buffer.as_mut() {
                 if !buf.is_empty() {
@@ -956,6 +960,43 @@ mod tests {
             "interrupted tool-only turns must not persist an empty or success-shaped final answer"
         );
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+    }
+
+    #[tokio::test]
+    async fn run_loop_writes_session_start_before_interruption_on_fresh_journal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        let sid = "11111111-2222-3333-4444-555555555555";
+        state.current_session_id = Some(sid.to_string());
+        state.context_manifest_model_name = Some("gpt-5".to_string());
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+            astra_turn_core::interruption::InterruptionStateSummary {
+                has_checkpoint: false,
+                tool_calls_completed: 2,
+                turns_completed: 3,
+                remaining_turns: 0,
+                error_detail: Some("forced for test".to_string()),
+                stall_signal: None,
+            },
+        ));
+
+        let result = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(result.is_err(), "mock loop should error once turn results are exhausted");
+
+        let events = astra_services::session_journal::read_journal(sid).unwrap();
+        assert_eq!(
+            events.first().map(|event| event.event_type.clone()),
+            Some(astra_services::session_journal::JournalEventType::SessionStart)
+        );
+        assert_eq!(
+            events.get(1).map(|event| event.event_type.clone()),
+            Some(astra_services::session_journal::JournalEventType::InterruptionRecorded)
+        );
     }
 
     #[tokio::test]
