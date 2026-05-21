@@ -45,6 +45,8 @@ use serde::{Deserialize, Serialize};
 mod agent_loader;
 #[path = "cli/agent_runtime.rs"]
 mod agent_runtime;
+#[path = "cli/app_server.rs"]
+mod app_server;
 #[path = "cli/auth_flow.rs"]
 mod auth_flow;
 #[path = "cli/chat_stream/mod.rs"]

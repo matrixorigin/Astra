@@ -378,6 +378,7 @@ fn cli_serve_defaults() {
     let cli = Cli::try_parse_from(["astra", "serve"]).unwrap();
     match cli.command {
         Some(Command::Serve(ref args)) => {
+            assert!(args.mode.is_none());
             assert_eq!(args.host, "127.0.0.1");
             assert_eq!(args.port, 8000);
         }
@@ -390,7 +391,34 @@ fn cli_serve_custom_port() {
     let cli = Cli::try_parse_from(["astra", "serve", "--port", "3000"]).unwrap();
     match cli.command {
         Some(Command::Serve(ref args)) => {
+            assert!(args.mode.is_none());
             assert_eq!(args.port, 3000);
+        }
+        _ => panic!("expected Serve command"),
+    }
+}
+
+#[test]
+fn cli_serve_http_subcommand() {
+    let cli = Cli::try_parse_from(["astra", "serve", "http", "--port", "3000"]).unwrap();
+    match cli.command {
+        Some(Command::Serve(ref args)) => match args.mode {
+            Some(ServeMode::Http(ref http)) => {
+                assert_eq!(http.host, "127.0.0.1");
+                assert_eq!(http.port, 3000);
+            }
+            _ => panic!("expected serve http mode"),
+        },
+        _ => panic!("expected Serve command"),
+    }
+}
+
+#[test]
+fn cli_serve_stdio_subcommand() {
+    let cli = Cli::try_parse_from(["astra", "serve", "stdio"]).unwrap();
+    match cli.command {
+        Some(Command::Serve(ref args)) => {
+            assert!(matches!(args.mode, Some(ServeMode::Stdio)));
         }
         _ => panic!("expected Serve command"),
     }

@@ -19,6 +19,21 @@ pub(super) enum ExitCode {
     ApiError = 3,
 }
 
+async fn start_http_server(host: &str, port: u16) -> Result<(), String> {
+    let addr: std::net::SocketAddr = format!("{host}:{port}")
+        .parse()
+        .map_err(|e| format!("Invalid listen address: {e}"))?;
+    eprintln!(
+        "  {} {} on {}",
+        "▸".bold().magenta(),
+        "Starting API server".bold(),
+        addr.to_string().magenta()
+    );
+    astra_runtime::serve(addr)
+        .await
+        .map_err(|e| format!("API server failed to start: {e}"))
+}
+
 impl From<ExitCode> for i32 {
     fn from(code: ExitCode) -> i32 {
         code as i32
@@ -1834,20 +1849,26 @@ pub(super) async fn execute_cli_command(
             Ok(ExitCode::Success)
         }
 
-        // Start embedded HTTP API server
         Some(Command::Serve(args)) => {
-            let addr: std::net::SocketAddr = format!("{}:{}", args.host, args.port)
-                .parse()
-                .map_err(|e| format!("Invalid listen address: {e}"))?;
-            eprintln!(
-                "  {} {} on {}",
-                "▸".bold().magenta(),
-                "Starting API server".bold(),
-                addr.to_string().magenta()
-            );
-            astra_runtime::serve(addr)
-                .await
-                .map_err(|e| format!("API server failed to start: {e}"))?;
+            match args.mode {
+                None => {
+                    start_http_server(&args.host, args.port).await?;
+                }
+                Some(crate::cli_args::ServeMode::Http(http_args)) => {
+                    start_http_server(&http_args.host, http_args.port).await?;
+                }
+                Some(crate::cli_args::ServeMode::Stdio) => {
+                    crate::app_server::run_stdio_app_server(
+                        "stdio://",
+                        api,
+                        profile.as_deref(),
+                        global_model.as_deref(),
+                        system_prompt.as_deref(),
+                        auto_approve,
+                    )
+                    .await?;
+                }
+            }
             Ok(ExitCode::Success)
         }
 
