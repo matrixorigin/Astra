@@ -102,6 +102,26 @@ pub(super) async fn finalize_session(state: &mut SessionState) {
     //    generous — the worker's internal LLM_TIMEOUT is 30s but real
     //    selector calls return in well under 5s.
     if let Some(svc) = state.session_memory_extractor.as_ref() {
+        if let Some(session_id) = state.session_id.as_deref().filter(|sid| !sid.is_empty()) {
+            let _ = svc.maybe_spawn_shutdown_flush(astra_runtime::session_memory::ExtractionRequest {
+                session_id: session_id.to_string(),
+                messages: super::chat_turn::history_as_messages(&state.history),
+                current_tokens: state
+                    .total_prompt_tokens
+                    .saturating_add(state.total_cache_read_tokens)
+                    .saturating_add(state.total_cache_creation_tokens) as usize,
+                current_tool_calls: 0,
+                had_error: state
+                    .last_turn_event
+                    .as_ref()
+                    .and_then(|event| event.error.as_ref())
+                    .is_some(),
+                turn_number: state.turn,
+                config:
+                    astra_turn_core::cloud_session_memory_extract::SessionMemoryExtractConfig::default(
+                    ),
+            });
+        }
         let leftover = svc
             .wait_for_pending(std::time::Duration::from_secs(10))
             .await;

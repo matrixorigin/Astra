@@ -133,9 +133,23 @@ async fn post_loop_memory_cleanup(
     session_id: &str,
     session_facts: &astra_turn_types::session_facts::SessionFacts,
     extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
+    final_extract_request: Option<crate::session_memory::ExtractionRequest>,
 ) {
     if session_id.is_empty() {
         return;
+    }
+    if let (Some(svc), Some(req)) = (extraction_service, final_extract_request) {
+        let _ = svc.maybe_spawn_shutdown_flush(req);
+    }
+    if let Some(svc) = extraction_service {
+        let leftover = svc.wait_for_pending(std::time::Duration::from_secs(10)).await;
+        if leftover > 0 {
+            tracing::warn!(
+                session_id = %session_id,
+                leftover,
+                "session-memory extraction still in flight after post-loop drain timeout"
+            );
+        }
     }
     // ── Governance, debounced ──
     //
@@ -3784,6 +3798,30 @@ impl AgenticRunLifecycleService {
     }
 }
 
+/// Build an [`ExtractionRequest`] from the current loop state for shutdown-time
+/// memory extraction. Returns `None` when no session id is set.
+fn build_shutdown_extraction_request(
+    state: &AgenticLoopState,
+) -> Option<crate::session_memory::ExtractionRequest> {
+    state.current_session_id.as_ref().map(|session_id| {
+        crate::session_memory::ExtractionRequest {
+            session_id: session_id.clone(),
+            messages: state.messages.clone(),
+            current_tokens: state
+                .total_prompt
+                .saturating_add(state.total_cache_read)
+                .saturating_add(state.total_cache_creation)
+                as usize,
+            current_tool_calls: state.total_tool_calls as usize,
+            had_error: state.error_recovery.consecutive_same_error > 0,
+            turn_number: state.max_turns.saturating_sub(state.remaining_turns) as u32,
+            config:
+                astra_turn_core::cloud_session_memory_extract::SessionMemoryExtractConfig::default(
+                ),
+        }
+    })
+}
+
 #[async_trait]
 impl RunLifecycleService for AgenticRunLifecycleService {
     /// Create a run (background mode): spawns the agentic loop in a task, returns immediately.
@@ -4228,6 +4266,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 loop_state.current_session_id.as_deref().unwrap_or(""),
                 &loop_state.session_facts,
                 loop_state.memory_extraction_service.as_ref(),
+                build_shutdown_extraction_request(&loop_state),
             )
             .await;
         });
@@ -4653,6 +4692,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 state.current_session_id.as_deref().unwrap_or(""),
                 &state.session_facts,
                 state.memory_extraction_service.as_ref(),
+                build_shutdown_extraction_request(&state),
             )
             .await;
         });

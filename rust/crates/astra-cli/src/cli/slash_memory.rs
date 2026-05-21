@@ -592,6 +592,19 @@ async fn load_current_session_memory(
     Ok(select_session_memory_record(&payload, session_id))
 }
 
+pub(super) async fn load_current_session_memory_body_with_profile(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    session_id: &str,
+) -> Option<String> {
+    let token = session_runtime::fresh_access_token(api, profile).await?;
+    load_current_session_memory(api, &token, session_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|record| record.body)
+}
+
 async fn store_current_session_memory(
     api: &astra_thin_client::ThinClient,
     token: &str,

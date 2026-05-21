@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use serde_json::Value;
 
 use astra_services::event_ingestion::{IngestionEvent, IngestionSender};
 use astra_services::session_journal::{
@@ -42,14 +43,14 @@ use crate::memory_relevance::LlmConnParams;
 use crate::turn::cloud::memoria_compact::MemoriaClient;
 
 use super::activity::{BackgroundActivity, BackgroundActivityBroker};
-use super::gate::{GateDecision, evaluate};
+use super::gate::{evaluate, GateDecision};
 use super::health::{MemoriaAdmit, MemoriaHealth, SelectorHealth};
 use super::observatory::{
-    ExtractionOutcome as ObsExtractionOutcome, ExtractionRecord as ObsExtractionRecord,
-    ExtractionTrigger, SessionMemoryObservatory, clip_preview,
+    clip_preview, ExtractionOutcome as ObsExtractionOutcome,
+    ExtractionRecord as ObsExtractionRecord, ExtractionTrigger, SessionMemoryObservatory,
 };
 use super::request::{ExtractionRequest, SpawnDecision};
-use super::runner::{ExtractionArtifacts, run_extraction};
+use super::runner::{run_extraction, ExtractionArtifacts};
 
 type LocalJournalEventSink = dyn Fn(&JournalEvent) + Send + Sync + 'static;
 
@@ -61,6 +62,51 @@ pub const LLM_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`SessionMemoryExtractConfig`] (~12K) already bounds the document;
 /// this keeps per-call cost predictable on pricier selectors.
 pub const EXTRACTION_MAX_OUTPUT_TOKENS: usize = 4096;
+
+fn should_force_shutdown_refresh(messages: &[Value], current_tokens: usize) -> bool {
+    let mut conversational_messages = 0usize;
+    let mut total_chars = 0usize;
+    let mut has_error_signal = false;
+
+    for message in messages {
+        let Some(role) = message.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let Some(text) = message
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::trim)
+        else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+        conversational_messages += 1;
+        total_chars += text.chars().count();
+        let lower = text.to_ascii_lowercase();
+        if lower.contains("error")
+            || lower.contains("fail")
+            || lower.contains("panic")
+            || text.contains("错误")
+            || text.contains("失败")
+        {
+            has_error_signal = true;
+        }
+    }
+
+    if conversational_messages < 2 {
+        return false;
+    }
+
+    has_error_signal
+        || current_tokens >= 1_024
+        || total_chars >= 120
+        || conversational_messages >= 4
+}
 
 // ───────────────────────────────────────────────────────────────────────
 // Selector-params resolution (async trait so tests can swap in a const)
@@ -262,6 +308,45 @@ impl MemoryExtractionService {
 
     pub fn broker(&self) -> Arc<BackgroundActivityBroker> {
         Arc::clone(&self.broker)
+    }
+
+    /// Best-effort final flush for short or lightly-active sessions.
+    ///
+    /// Normal turn-end extraction is still the primary path. This helper
+    /// exists for session shutdown: if a session never crossed the normal
+    /// init/growth gates but still accumulated meaningful state, enqueue one
+    /// last extraction before callers block in [`Self::wait_for_pending`].
+    ///
+    /// Skips silently when the session is trivial (for example "hi" / "hello")
+    /// or when the latest persisted snapshot is already fresh enough.
+    pub fn maybe_spawn_shutdown_flush(
+        self: &Arc<Self>,
+        mut req: ExtractionRequest,
+    ) -> SpawnDecision {
+        if req.session_id.is_empty()
+            || !should_force_shutdown_refresh(&req.messages, req.current_tokens)
+        {
+            return SpawnDecision::Skipped;
+        }
+
+        let already_fresh = self
+            .session_states
+            .lock()
+            .ok()
+            .and_then(|states| states.get(&req.session_id).cloned())
+            .is_some_and(|state| {
+                !req.had_error
+                    && state.initialized
+                    && req.current_tokens <= state.tokens_at_last_extraction
+            });
+        if already_fresh {
+            return SpawnDecision::Skipped;
+        }
+
+        req.config.min_tokens_to_init = 0;
+        req.config.min_tokens_between_updates = 0;
+        req.config.min_tool_calls_between_updates = 0;
+        self.maybe_spawn(req)
     }
 
     /// Synchronous entry point. Evaluates the gate against the service's
@@ -1116,6 +1201,21 @@ mod tests {
         }
     }
 
+    fn meaningful_shutdown_req(session_id: &str, tokens: usize) -> ExtractionRequest {
+        ExtractionRequest {
+            session_id: session_id.to_string(),
+            messages: vec![
+                json!({"role": "user", "content": "Need a cache-safe session memory design that still captures shutdown summaries for short sessions and resumed work."}),
+                json!({"role": "assistant", "content": "I removed the legacy extractor, fixed the model poisoning bug, and am wiring a final shutdown flush plus resume recap next."}),
+            ],
+            current_tokens: tokens,
+            current_tool_calls: 0,
+            had_error: false,
+            turn_number: 1,
+            config: SessionMemoryExtractConfig::default(),
+        }
+    }
+
     fn collect_extraction_events(
         rx: &mut tokio::sync::mpsc::Receiver<IngestionEvent>,
     ) -> Vec<IngestionEvent> {
@@ -1147,6 +1247,42 @@ mod tests {
         let m = events[0].metadata.as_ref().unwrap();
         assert_eq!(m["outcome"], "skipped");
         assert_eq!(m["reason"], "below_init_gate");
+        assert!(ctx.memoria.stored.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_flush_spawns_for_short_meaningful_session() {
+        let ctx = build_ctx(None);
+        let sid = format!("shutdown-flush-{}", nanos());
+        let req = meaningful_shutdown_req(&sid, 600);
+        assert_eq!(
+            ctx.svc.maybe_spawn_shutdown_flush(req),
+            SpawnDecision::Spawned
+        );
+        let leftover = ctx.svc.wait_for_pending(Duration::from_secs(2)).await;
+        assert_eq!(leftover, 0);
+        assert_eq!(ctx.memoria.stored.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_flush_skips_trivial_session() {
+        let ctx = build_ctx(None);
+        let req = ExtractionRequest {
+            session_id: format!("shutdown-trivial-{}", nanos()),
+            messages: vec![
+                json!({"role": "user", "content": "hi"}),
+                json!({"role": "assistant", "content": "hello"}),
+            ],
+            current_tokens: 12,
+            current_tool_calls: 0,
+            had_error: false,
+            turn_number: 1,
+            config: SessionMemoryExtractConfig::default(),
+        };
+        assert_eq!(
+            ctx.svc.maybe_spawn_shutdown_flush(req),
+            SpawnDecision::Skipped
+        );
         assert!(ctx.memoria.stored.lock().unwrap().is_empty());
     }
 

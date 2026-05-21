@@ -936,6 +936,75 @@ fn active_task_anchor_section(active_tasks: &[SessionTask]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+fn extract_session_memory_section(md: &str, section_name: &str) -> Option<String> {
+    let header = format!("## {section_name}");
+    let start = md.find(&header)?;
+    let content_start = md[start..].find('\n').map(|i| start + i + 1)?;
+    let rest = &md[content_start..];
+    let next_section = rest.find("\n## ").map(|i| content_start + i).unwrap_or(md.len());
+    Some(md[content_start..next_section].to_string())
+}
+
+fn session_memory_recap(memory_md: &str) -> Option<String> {
+    const SECTIONS: &[(&str, &str, usize)] = &[
+        ("Active Goals", "Session goals", 2),
+        ("Pending Todos", "Session pending", 3),
+        ("Current State", "Session state", 2),
+        ("Errors & Corrections", "Session corrections", 2),
+        ("Completed", "Session completed", 2),
+    ];
+    let mut blocks = Vec::new();
+    let mut total_chars = 0usize;
+    for (section, label, max_lines) in SECTIONS {
+        let Some(content) = extract_session_memory_section(memory_md, section) else {
+            continue;
+        };
+        let lines: Vec<String> = content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("<!--"))
+            .map(|line| line.trim_start_matches("- ").to_string())
+            .take(*max_lines)
+            .collect();
+        if lines.is_empty() {
+            continue;
+        }
+        let block = format!("{label}:\n- {}", lines.join("\n- "));
+        total_chars += block.len();
+        if total_chars > 700 {
+            break;
+        }
+        blocks.push(block);
+    }
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(blocks.join("\n"))
+    }
+}
+
+pub(super) fn merge_continuation_anchor_with_session_memory(
+    anchor: Option<String>,
+    session_memory_markdown: Option<&str>,
+) -> Option<String> {
+    let Some(recap) = session_memory_markdown.and_then(session_memory_recap) else {
+        return anchor;
+    };
+    if anchor
+        .as_deref()
+        .is_some_and(|existing| existing.contains("[Session memory recap]"))
+    {
+        return anchor;
+    }
+    let merged = match anchor {
+        Some(anchor) if !anchor.trim().is_empty() => {
+            format!("{anchor}\n\n[Session memory recap]\n{recap}")
+        }
+        _ => format!("[Session memory recap]\n{recap}"),
+    };
+    Some(truncate_str(&merged, 900))
+}
+
 async fn load_active_tasks_for_anchor(state: &SessionState) -> Vec<SessionTask> {
     let session_id = state.task_manager.session_id();
     let tasks = state
@@ -5891,6 +5960,36 @@ mod tests {
         assert!(anchor.contains("Active task board:"), "{anchor}");
         assert!(anchor.contains("Finish slash command repair"), "{anchor}");
         assert!(anchor.contains("[in_progress]"), "{anchor}");
+    }
+
+    #[test]
+    fn merge_continuation_anchor_with_session_memory_adds_recap() {
+        let memory = "# Session Memory
+
+## Active Goals
+- Improve prompt cache
+
+## Pending Todos
+- Add shutdown flush
+
+## Current State
+- Investigating resume behavior
+
+## Errors & Corrections
+- Fixed model override poisoning
+
+## Completed
+- Removed legacy extractor
+";
+        let merged = merge_continuation_anchor_with_session_memory(
+            Some("Latest user task: tighten session memory".to_string()),
+            Some(memory),
+        )
+        .expect("merged anchor");
+        assert!(merged.contains("Latest user task: tighten session memory"));
+        assert!(merged.contains("[Session memory recap]"));
+        assert!(merged.contains("Session pending"));
+        assert!(merged.contains("Add shutdown flush"));
     }
 
     /// Simulates a multi-turn error recovery scenario:
