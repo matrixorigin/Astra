@@ -27,19 +27,8 @@ fn default_context_window() -> i64 {
 fn default_retrieval_turns() -> i32 {
     5
 }
-fn default_recall_limit() -> i32 {
-    10
-}
 fn default_raw_token_budget() -> i32 {
     2000
-}
-fn default_task_hint() -> String {
-    "default".into()
-}
-
-#[derive(Deserialize)]
-pub struct MemoryIntrospectionQuery {
-    pub session_id: String,
 }
 
 #[derive(Deserialize)]
@@ -68,16 +57,6 @@ pub struct RetrievalQualityQuery {
     pub session_id: String,
     #[serde(default = "default_retrieval_turns")]
     pub turns: i32,
-}
-
-#[derive(Deserialize)]
-pub struct MemoryRecallQuery {
-    pub session_id: String,
-    pub query: String,
-    #[serde(default = "default_task_hint")]
-    pub task_hint: String,
-    #[serde(default = "default_recall_limit")]
-    pub limit: i32,
 }
 
 // ── P2.1: LLM-facing introspection (decision trace / tool history / drift) ──
@@ -109,19 +88,6 @@ pub struct DriftCheckQuery {
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
-
-pub async fn get_memory_introspection_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<MemoryIntrospectionQuery>,
-) -> Result<Json<MemoryIntrospectionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let resp = state
-        .introspection_service
-        .get_memory_introspection(&user.user_id, &params.session_id)
-        .await?;
-    Ok(Json(resp))
-}
 
 pub async fn get_skills_introspection_handler(
     State(state): State<AppState>,
@@ -186,25 +152,6 @@ pub async fn get_retrieval_quality_handler(
     Ok(Json(resp))
 }
 
-pub async fn get_memory_recall_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<MemoryRecallQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let resp = state
-        .introspection_service
-        .get_memory_recall(
-            &user.user_id,
-            &params.session_id,
-            &params.query,
-            &params.task_hint,
-            params.limit,
-        )
-        .await?;
-    Ok(Json(resp))
-}
-
 pub async fn get_decision_trace_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -253,9 +200,7 @@ mod tests {
         assert_eq!(default_turns(), 10);
         assert_eq!(default_context_window(), 128000);
         assert_eq!(default_retrieval_turns(), 5);
-        assert_eq!(default_recall_limit(), 10);
         assert_eq!(default_raw_token_budget(), 2000);
-        assert_eq!(default_task_hint(), "default");
     }
 
     #[test]
@@ -282,14 +227,6 @@ mod tests {
         let json = r#"{"session_id": "s1"}"#;
         let q: RetrievalQualityQuery = serde_json::from_str(json).unwrap();
         assert_eq!(q.turns, 5);
-    }
-
-    #[test]
-    fn memory_recall_query_defaults() {
-        let json = r#"{"session_id": "s1", "query": "test"}"#;
-        let q: MemoryRecallQuery = serde_json::from_str(json).unwrap();
-        assert_eq!(q.task_hint, "default");
-        assert_eq!(q.limit, 10);
     }
 
     #[test]

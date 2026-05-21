@@ -31,7 +31,7 @@ use astra_runtime::{
     },
 };
 use astra_services::introspection::{
-    IntrospectionService, MemoryIntrospectionResponse, ServiceResult, SkillsIntrospectionResponse,
+    IntrospectionService, ServiceResult, SkillsIntrospectionResponse,
 };
 
 // ─── Stubs ──────────────────────────────────────────────────────────────────
@@ -100,13 +100,6 @@ struct StubIntrospection;
 
 #[async_trait]
 impl IntrospectionService for StubIntrospection {
-    async fn get_memory_introspection(
-        &self,
-        _: &str,
-        _: &str,
-    ) -> ServiceResult<MemoryIntrospectionResponse> {
-        unreachable!("not called by this test")
-    }
     async fn get_skills_introspection(
         &self,
         _: &str,
@@ -128,16 +121,6 @@ impl IntrospectionService for StubIntrospection {
         unreachable!("not called by this test")
     }
     async fn get_retrieval_quality(&self, _: &str, _: &str, _: i32) -> ServiceResult<Value> {
-        unreachable!("not called by this test")
-    }
-    async fn get_memory_recall(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: i32,
-    ) -> ServiceResult<Value> {
         unreachable!("not called by this test")
     }
 
