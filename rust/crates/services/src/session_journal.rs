@@ -1280,6 +1280,48 @@ pub fn read_journal(session_id: &str) -> std::io::Result<Vec<JournalEvent>> {
     Ok(parse_journal_text(&content).0)
 }
 
+/// Read the last `limit` events from a session journal file.
+///
+/// This avoids loading the entire journal into memory for long-running sessions
+/// where only recent events are relevant (e.g. cache-hit diagnostics).
+pub fn read_journal_tail(session_id: &str, limit: usize) -> std::io::Result<Vec<JournalEvent>> {
+    use std::collections::VecDeque;
+    use std::io::BufRead;
+
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let path = journal_dir().join(format!("{session_id}.jsonl"));
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let file = std::fs::File::open(&path)?;
+    let reader = std::io::BufReader::new(file);
+    let mut tail_lines = VecDeque::with_capacity(limit);
+    for line in reader.lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if tail_lines.len() == limit {
+            tail_lines.pop_front();
+        }
+        tail_lines.push_back(line.to_string());
+    }
+
+    let mut events = Vec::with_capacity(tail_lines.len());
+    for line in tail_lines {
+        if let Ok(event) = serde_json::from_str::<JournalEvent>(&line) {
+            events.push(event);
+        }
+    }
+    Ok(events)
+}
+
 pub fn journal_needs_session_start(session_id: &str) -> std::io::Result<bool> {
     let events = read_journal(session_id)?;
     let last_type = events.last().map(|e| &e.event_type);
@@ -4387,6 +4429,33 @@ mod tests {
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.event_type, JournalEventType::SessionFork);
         assert!(parsed.session_lineage.is_some());
+    }
+
+    #[test]
+    fn read_journal_tail_returns_only_the_last_n_events() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "00000000-0000-0000-0000-000000000190";
+        let writer = JournalWriter::new(sid).expect("journal writer");
+        for turn in 1..=5 {
+            writer
+                .append(&JournalEvent::turn(
+                    Some(sid),
+                    turn,
+                    Some("test-model"),
+                    "user",
+                    "assistant",
+                    0,
+                    0,
+                    0,
+                    0,
+                ))
+                .expect("append turn");
+        }
+
+        let tail = read_journal_tail(sid, 2).expect("read tail");
+        let turns: Vec<u32> = tail.iter().filter_map(|event| event.turn).collect();
+        assert_eq!(turns, vec![4, 5]);
     }
 
     #[test]

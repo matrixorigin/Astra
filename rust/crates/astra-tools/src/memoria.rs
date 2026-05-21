@@ -95,8 +95,22 @@ pub fn parse_memory_search_hits(raw: &str) -> Vec<BoostSearchHit> {
 /// Return true when text appears to contain credentials or similarly
 /// sensitive material that must never become durable memory.
 pub fn contains_sensitive_memory_content(text: &str) -> bool {
+    // Fast path: case-sensitive patterns (no allocation needed).
+    let raw = text.trim();
+    if raw.contains("ghp_")
+        || raw.contains("github_pat_")
+        || raw.contains("sk-live-")
+        || raw.contains("sk_test_")
+        || raw.contains("xoxb-")
+        || raw.contains("xoxp-")
+        || raw.contains("AKIA")
+    {
+        return true;
+    }
+
+    // Slow path: case-insensitive search.
     let lower = text.to_ascii_lowercase();
-    let compact: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+    let has_whitespace = lower.chars().any(char::is_whitespace);
     const NEEDLES: &[&str] = &[
         "password:",
         "password=",
@@ -119,20 +133,16 @@ pub fn contains_sensitive_memory_content(text: &str) -> bool {
         "beginrsaprivatekey",
         "beginopensshprivatekey",
     ];
-    if NEEDLES.iter().any(|needle| compact.contains(needle)) {
+    if NEEDLES.iter().any(|needle| lower.contains(needle)) {
         return true;
     }
-    if lower.contains("bearer ") {
-        return true;
+    if has_whitespace {
+        let compact: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+        if NEEDLES.iter().any(|needle| compact.contains(needle)) {
+            return true;
+        }
     }
-    let raw = text.trim();
-    raw.contains("ghp_")
-        || raw.contains("github_pat_")
-        || raw.contains("sk-live-")
-        || raw.contains("sk_test_")
-        || raw.contains("xoxb-")
-        || raw.contains("xoxp-")
-        || raw.contains("AKIA")
+    lower.contains("bearer ")
 }
 
 const MEMORY_COMPACT_VIEW_MAX_CHARS: usize = 96;
@@ -154,11 +164,25 @@ fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
         return trimmed.to_string();
     }
     let mut out: String = trimmed.chars().take(max_chars).collect();
+    // Back up past any trailing combining marks to avoid splitting a grapheme cluster.
+    while out.chars().last().is_some_and(is_combining_mark) {
+        out.pop();
+    }
     while out.chars().last().is_some_and(char::is_whitespace) {
         out.pop();
     }
     out.push('…');
     out
+}
+
+/// Check whether a Unicode code point is a combining mark.
+fn is_combining_mark(c: char) -> bool {
+    matches!(c as u32,
+        0x0300..=0x036F |      // Combining Diacritical Marks
+        0x1DC0..=0x1DFF |      // Combining Diacritical Marks Supplement
+        0x20D0..=0x20FF |      // Combining Diacritical Marks for Symbols
+        0xFE20..=0xFE2F        // Combining Half Marks
+    )
 }
 
 fn collapse_inline_whitespace(text: &str) -> String {
@@ -2985,6 +3009,17 @@ mod memoria_http_client_tests {
         let enriched = MemoriaClient::purge_result_to_agent_response(&raw, "session:abc");
         assert_eq!(enriched["deleted_count"], 0);
         assert!(enriched["message"].as_str().unwrap().contains("0 deleted"));
+    }
+
+    #[test]
+    fn sensitive_memory_detection_preserves_whitespace_insensitive_needles() {
+        use super::*;
+        assert!(contains_sensitive_memory_content(
+            "Please remember p a s s w o r d : hunter2 for later"
+        ));
+        assert!(contains_sensitive_memory_content(
+            "api_key = secret-value\nkeep this handy"
+        ));
     }
 
     // ── P6: decorate_recall_response (freshness + surface-once) ────────

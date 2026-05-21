@@ -707,6 +707,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn volatile_context_empty_outside_git() {
         let tmp = tempdir().unwrap();
         unsafe {
@@ -903,6 +904,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn git_diff_summary_returns_none_outside_repo() {
         let tmp = tempdir().unwrap();
         unsafe {
@@ -926,6 +928,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn git_recent_commits_returns_none_outside_repo() {
         let tmp = tempdir().unwrap();
         unsafe {

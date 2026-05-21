@@ -349,6 +349,18 @@ pub struct CacheBreakDetectorState {
     pub diff_seq: u32,
 }
 
+/// In-memory cache-break detector for prompt caching systems.
+///
+/// Compares sequential [`PromptStateSnapshot`]s across turns to detect when
+/// provider-side prompt caches become invalid and need to be rebuilt.
+///
+/// # Concurrency
+///
+/// `CacheBreakDetector` is deliberately **not** `Send + Sync`. It owns an
+/// internal `HashMap` and is designed to be used from a single task (thread
+/// or async future). In async contexts, Rust's borrow checker prevents any
+/// `&mut self` method from being called while another borrow is held across
+/// an `.await` point, so exclusive access is guaranteed without locks.
 #[derive(Debug, Default)]
 pub struct CacheBreakDetector {
     /// Previous snapshot per source. LRU-evicted at [`MAX_TRACKED_SOURCES`]

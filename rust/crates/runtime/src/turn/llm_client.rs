@@ -1669,11 +1669,14 @@ fn apply_request_body_overrides(
     let Some(overrides) = request_body_overrides else {
         return;
     };
+    let keys: Vec<&String> = overrides.keys().collect();
+    tracing::debug!(?keys, "applying request body overrides");
     merge_json_object(body, overrides);
 }
 
 fn merge_json_object(target: &mut Value, overrides: &Map<String, Value>) {
     let Some(target_obj) = target.as_object_mut() else {
+        tracing::warn!("merge_json_object called with non-object target; skipping");
         return;
     };
     for (key, override_value) in overrides {

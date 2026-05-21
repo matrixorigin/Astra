@@ -8,6 +8,7 @@
 //! API continuation, observability) a machine-readable interruption contract.
 
 use serde::{Deserialize, Serialize};
+use std::fmt::Write;
 
 /// Classification of why the agentic loop was interrupted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -304,10 +305,12 @@ pub fn build_resume_guidance_with_context(
 
     let mut guidance = String::new();
     guidance.push_str("[RESUME CONTEXT] This session was previously interrupted.\n");
-    guidance.push_str(&format!("  Reason: {kind}\n"));
-    guidance.push_str(&format!(
+    write!(guidance, "  Reason: {kind}\n").ok();
+    write!(
+        guidance,
         "  Progress: {turns} turn(s), {tool_calls} tool call(s) completed\n"
-    ));
+    )
+    .ok();
     if has_checkpoint {
         guidance.push_str("  Checkpoint: saved — prior tool results are preserved in context\n");
     }
@@ -332,12 +335,14 @@ pub fn build_resume_guidance_with_context(
             if let Some(sig) = stall_signal {
                 if sig.starts_with("single_tool_streak=") {
                     let streak = sig.trim_start_matches("single_tool_streak=");
-                    guidance.push_str(&format!(
+                    write!(
+                        guidance,
                         "  Cause: the previous run used exactly ONE tool per round for {streak} \
                          consecutive rounds, which exhausted the per-turn round budget. On \
                          resume, batch independent calls (different files / greps / reads) \
                          into a single parallel round instead.\n"
-                    ));
+                    )
+                    .ok();
                 } else if sig.starts_with("exploration_family=") {
                     let kv = parse_kv_stall_signal(sig);
                     if let (Some(family), Some(streak)) =
@@ -375,7 +380,7 @@ pub fn build_resume_guidance_with_context(
                 .and_then(|v| v.as_str())
                 .filter(|detail| detail.contains("Likely cause:"))
             {
-                guidance.push_str(&format!("  Runtime detail: {detail}\n"));
+                write!(guidance, "  Runtime detail: {detail}\n").ok();
             }
         }
         "rate_limited" | "cooldown_rejected" | "server_overload" => {
@@ -392,10 +397,12 @@ pub fn build_resume_guidance_with_context(
             // Enrich with compaction effectiveness context if available.
             if let Some(ctx) = compaction_context {
                 if ctx.compaction_attempts > 0 {
-                    guidance.push_str(&format!(
+                    write!(
+                        guidance,
                         "  Compaction: {} attempt(s), ~{} tokens freed total",
                         ctx.compaction_attempts, ctx.total_tokens_freed
-                    ));
+                    )
+                    .ok();
                     if ctx.last_was_insufficient {
                         guidance.push_str(
                             " (last compaction was insufficient — context may still be tight)",
@@ -430,7 +437,7 @@ pub fn build_resume_guidance_with_context(
         }
         _ => {
             if !user_msg.is_empty() {
-                guidance.push_str(&format!("  Detail: {user_msg}\n"));
+                write!(guidance, "  Detail: {user_msg}\n").ok();
             }
         }
     }

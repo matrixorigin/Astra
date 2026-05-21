@@ -238,7 +238,7 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
             ..Default::default()
         };
     }
-    let Ok(events) = astra_services::session_journal::read_journal(session_id) else {
+    let Ok(events) = astra_services::session_journal::read_journal_tail(session_id, 500) else {
         return BridgePipelineBaseline {
             next_turn: 1,
             ..Default::default()
@@ -248,10 +248,12 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
     let mut feedback_ratios = Vec::new();
     let mut raw_ratios = Vec::new();
     let mut response_count = 0u32;
+    let mut max_turn = 0u32;
     let mut pending_request_snapshot = None;
     let mut cache_detector = astra_turn_core::cache_diagnostics::CacheBreakDetector::new();
 
     for event in events {
+        max_turn = max_turn.max(event.turn.unwrap_or(0));
         match event.event_type {
             astra_services::session_journal::JournalEventType::PipelineFeedback => {
                 if let Some(ratio) = event
@@ -302,7 +304,7 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
     };
 
     BridgePipelineBaseline {
-        next_turn: response_count.saturating_add(1),
+        next_turn: max_turn.max(response_count).saturating_add(1),
         stats: astra_turn_core::pipeline_stats::PipelineStats {
             turns_executed: ratios.len() as u32,
             avg_cache_hit_ratio,
@@ -6148,6 +6150,50 @@ mod tests {
                 .record_turn_for_source("bridge_inprocess", current, Some(500))
                 .is_none(),
             "reconstructed detector state should treat the next stable turn as a hit"
+        );
+    }
+
+    #[test]
+    fn load_bridge_pipeline_baseline_preserves_absolute_turn_when_tail_truncated() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "00000000-0000-0000-0000-000000000189";
+        let writer = astra_services::session_journal::JournalWriter::new(session_id)
+            .expect("journal writer");
+
+        let response_metadata = |cached_input_tokens: u64| {
+            json!({
+                "provider": "openai",
+                "response": {
+                    "response": {
+                        "usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": cached_input_tokens,
+                            "cache_creation_tokens": 0,
+                            "output_tokens": 12
+                        }
+                    }
+                }
+            })
+        };
+
+        for turn in 1..=520 {
+            writer
+                .append(
+                    &astra_services::session_journal::JournalEvent::llm_response_full(
+                        Some(session_id),
+                        turn,
+                        0,
+                        response_metadata(0),
+                    ),
+                )
+                .unwrap();
+        }
+
+        let baseline = load_bridge_pipeline_baseline(session_id);
+        assert_eq!(
+            baseline.next_turn, 521,
+            "tail-based reconstruction must preserve the absolute turn number"
         );
     }
 
