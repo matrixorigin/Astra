@@ -48,7 +48,7 @@ use rmcp::{
         UnsubscribeRequestParams,
     },
     serve_client,
-    service::{NotificationContext, RequestContext, ServiceError},
+    service::{NotificationContext, RequestContext, RunningService, ServiceError},
     transport::TokioChildProcess,
 };
 use tokio::sync::RwLock;
@@ -734,6 +734,9 @@ pub struct McpConnection {
     /// Stored so that task panics or unexpected exits are detectable instead of
     /// silently degrading the connection.
     ws_bridge_handles: Option<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)>,
+    /// Keep the transport alive. Dropping this cancels the internal
+    /// CancellationToken, killing the background I/O task.
+    _running: Option<RunningService<RoleClient, ChangeHandler>>,
 }
 
 impl McpConnection {
@@ -1550,6 +1553,7 @@ async fn connect_stdio(
         prompts_changed,
         resources_changed,
         ws_bridge_handles: None,
+        _running: Some(running),
     })
 }
 
@@ -1616,6 +1620,7 @@ async fn connect_sse(
         prompts_changed,
         resources_changed,
         ws_bridge_handles: None,
+        _running: Some(running),
     })
 }
 
@@ -1756,6 +1761,7 @@ async fn connect_ws(
         prompts_changed,
         resources_changed,
         ws_bridge_handles: Some((ws_read_handle, ws_write_handle)),
+        _running: Some(running),
     })
 }
 

@@ -104,3 +104,6 @@ rust/.cargo/*
 # insta-rs runtime artifacts (only the canonical .snap is tracked)
 *.snap.new
 .insta/
+
+investigation/
+tools/
