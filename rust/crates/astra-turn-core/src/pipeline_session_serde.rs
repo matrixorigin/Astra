@@ -151,6 +151,7 @@ mod tests {
                 recovery,
                 emergent: Default::default(),
                 working_memory: Default::default(),
+                cache_detector_state: Default::default(),
             },
         );
         let value = serde_json::to_value(session.snapshot_full_state()).unwrap();
@@ -233,6 +234,7 @@ mod tests {
                 recovery: RecoveryState::default(),
                 emergent: Default::default(),
                 working_memory: Default::default(),
+                cache_detector_state: Default::default(),
             },
         );
         original

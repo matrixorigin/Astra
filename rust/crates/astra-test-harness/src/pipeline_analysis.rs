@@ -21,6 +21,8 @@ pub struct PipelineHealthReport {
     pub total_tokens_freed: u64,
     /// Alerts that fired (turn, rule, severity).
     pub alerts: Vec<PipelineAlertEntry>,
+    /// Number of explicit prompt-cache break alerts.
+    pub prompt_cache_breaks: u32,
     /// Whether a compaction cascade was detected.
     pub cascade_detected: bool,
     /// Number of turns with pipeline feedback.
@@ -75,6 +77,9 @@ pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport
 
                     if rule == "compaction_cascade" {
                         report.cascade_detected = true;
+                    }
+                    if rule == "prompt_cache_break" {
+                        report.prompt_cache_breaks += 1;
                     }
 
                     report.alerts.push(PipelineAlertEntry {
@@ -142,6 +147,12 @@ pub fn render_pipeline_health(report: &PipelineHealthReport) -> String {
 
     if report.cascade_detected {
         out.push_str("  ⚠ Compaction cascade detected\n");
+    }
+    if report.prompt_cache_breaks > 0 {
+        out.push_str(&format!(
+            "  ⚠ Prompt cache breaks: {}\n",
+            report.prompt_cache_breaks
+        ));
     }
 
     if !report.alerts.is_empty() {

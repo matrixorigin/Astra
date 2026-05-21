@@ -38,6 +38,7 @@ fn build_sources() -> (
             session_id: "contract-session".into(),
             run_id: "contract-run".into(),
             model_id: "claude-sonnet-4-6".into(),
+            provider_name: "anthropic".into(),
             model_limit: 100_000,
             provider_policy: ProviderCachePolicy::anthropic(),
             provider_strategy: ProviderCacheStrategy::default(),

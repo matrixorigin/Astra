@@ -45,9 +45,10 @@ fn matches_model(r: &CacheBreakReason) -> bool {
 fn identical_turns_produce_no_break() {
     let mut det = CacheBreakDetector::new();
     let tools = vec![tool("bash", "run shell")];
-    let s = snap("SYSTEM", &tools, "claude-sonnet-4");
+    let mut s = snap("SYSTEM", &tools, "claude-sonnet-4");
+    s.cache_eligible_tokens = 512;
     assert!(det.record_turn(s.clone(), Some(900)).is_none());
-    let e = det.record_turn(s, Some(950));
+    let e = det.record_turn(s, Some(900));
     assert!(e.is_none(), "stable turn must not break (got {e:?})");
 }
 
@@ -141,9 +142,11 @@ fn simultaneous_system_tool_and_model_changes_classify_multiple() {
 fn stats_accumulate_hits_and_misses_correctly() {
     let mut det = CacheBreakDetector::new();
     let tools = vec![tool("bash", "A")];
-    det.record_turn(snap("SYS", &tools, "m"), None);
-    det.record_turn(snap("SYS", &tools, "m"), Some(800)); // hit
-    det.record_turn(snap("SYS", &tools, "m"), Some(800)); // hit
+    let mut snapshot = snap("SYS", &tools, "m");
+    snapshot.cache_eligible_tokens = 512;
+    det.record_turn(snapshot.clone(), None);
+    det.record_turn(snapshot.clone(), Some(900)); // hit
+    det.record_turn(snapshot, Some(900)); // hit
     det.record_turn(snap("SYS v2", &tools, "m"), Some(0)); // miss
     assert_eq!(det.stats.total_turns, 4);
     assert!(det.stats.cache_misses >= 2, "first + break = 2 misses");
@@ -210,15 +213,19 @@ fn no_ttl_break_when_cache_read_tokens_are_healthy() {
 }
 
 #[test]
-fn no_ttl_break_when_gap_is_below_five_minutes() {
+fn short_gap_without_structural_change_becomes_unknown_cold_start() {
     let mut det = CacheBreakDetector::new();
     let tools = vec![tool("bash", "A")];
     det.record_turn(snap_at("SYS", &tools, "m", 1_000), None);
-    // 4-minute gap is below the 5-min TTL inference threshold.
+    // 4-minute gap is below the 5-min TTL inference threshold, so the detector
+    // should surface an unexplained cold start instead of mislabeling it as TTL.
+    let evt = det
+        .record_turn(snap_at("SYS", &tools, "m", 1_000 + 240), Some(0))
+        .expect("unexpected cold start should still produce an explicit event");
     assert!(
-        det.record_turn(snap_at("SYS", &tools, "m", 1_000 + 240), Some(0))
-            .is_none(),
-        "short gap must not be classified as TTL expiry"
+        matches!(evt.reason, CacheBreakReason::UnknownColdStart),
+        "short gap should classify as UnknownColdStart, got {:?}",
+        evt.reason
     );
 }
 

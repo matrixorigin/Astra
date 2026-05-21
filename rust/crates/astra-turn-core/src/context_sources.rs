@@ -132,6 +132,7 @@ pub struct SessionContext {
     pub session_id: String,
     pub run_id: String,
     pub model_id: String,
+    pub provider_name: String,
     pub model_limit: u32,
     pub provider_policy: ProviderCachePolicy,
     pub provider_strategy: ProviderCacheStrategy,

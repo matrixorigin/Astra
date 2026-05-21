@@ -1,0 +1,28 @@
+name: cache_provider_matrix_regression
+description: |
+  **What**: Provider-agnostic live prompt-cache regression case for OpenAI-compatible,
+  Anthropic-compatible, and Bedrock Claude models.
+  **Tests**: The stable system/session prefix should warm once, then keep reusing cache
+  across short ACK turns without firing explicit `prompt_cache_break` alerts.
+  **Why**: This is the lightweight matrix case to run with `astra-test --models ...`
+  across MiniMax, Anthropic/DeepSeek, and Bedrock Claude/Haiku once the model is loaded.
+  **Pass means**: average pipeline cache-hit ratio stays healthy after warmup and no
+  unexpected prompt-cache-break alert is emitted.
+prompt: |
+  Reply READY. Do not call tools.
+capability: custom:cache
+difficulty: 1
+weight: 1.0
+timeout_seconds: 180
+steps:
+  - prompt: 'Reply ACK. Do not call any tools.'
+  - prompt: 'Reply ACK. Do not call any tools.'
+  - prompt: 'Reply ACK. Do not call any tools.'
+criteria:
+  - type: exit_code
+    code: 0
+  - type: pipeline_alert_count
+    rule: prompt_cache_break
+    max: 0
+  - type: pipeline_avg_cache_hit_ratio
+    min: 0.25

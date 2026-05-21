@@ -38,8 +38,22 @@ pub fn evaluate_alerts(
 ) -> Vec<TraceAlert> {
     let mut alerts = Vec::new();
 
-    // Rule 1: Cache cold start — no cache reads on turn > 1
-    if turn > 1 && feedback.cache_hit_ratio == 0.0 && feedback.tokens.cache_creation > 0 {
+    // Rule 1: Explicit prompt cache break attribution
+    if let Some(reason) = feedback.cache_break_detected.as_ref() {
+        alerts.push(TraceAlert {
+            severity: AlertSeverity::Warning,
+            rule: "prompt_cache_break".into(),
+            message: format!("Prompt cache break on turn {turn}: {reason}."),
+            turn,
+        });
+    }
+
+    // Rule 2: Cache cold start — no cache reads on turn > 1 without attribution
+    if turn > 1
+        && feedback.cache_break_detected.is_none()
+        && feedback.cache_hit_ratio == 0.0
+        && feedback.tokens.cache_creation > 0
+    {
         alerts.push(TraceAlert {
             severity: AlertSeverity::Warning,
             rule: "cache_cold_start".into(),
@@ -51,7 +65,7 @@ pub fn evaluate_alerts(
         });
     }
 
-    // Rule 2: Cache regression — session avg drops > 10% over 3 turns
+    // Rule 3: Cache regression — session avg drops > 10% over 3 turns
     if turn >= 4 && stats.avg_cache_hit_ratio > 0.0 {
         let recent_ratio = feedback.cache_hit_ratio;
         let session_avg = stats.avg_cache_hit_ratio;
@@ -68,7 +82,7 @@ pub fn evaluate_alerts(
         }
     }
 
-    // Rule 3: Compaction cascade — 2+ events in 3 turns
+    // Rule 4: Compaction cascade — 2+ events in 3 turns
     if stats.has_compaction_cascade() {
         alerts.push(TraceAlert {
             severity: AlertSeverity::Warning,
@@ -78,7 +92,7 @@ pub fn evaluate_alerts(
         });
     }
 
-    // Rule 4: Recovery loop — PTL errors >= 2
+    // Rule 5: Recovery loop — PTL errors >= 2
     if recovery.consecutive_ptl_errors >= 2 {
         alerts.push(TraceAlert {
             severity: AlertSeverity::Error,
@@ -91,7 +105,7 @@ pub fn evaluate_alerts(
         });
     }
 
-    // Rule 5: Predictive miss — > 20% error between estimated and actual
+    // Rule 6: Predictive miss — > 20% error between estimated and actual
     if stats.turns_executed >= 2 {
         let estimated_input = feedback.tokens.total_input();
         // If there's a big gap between what we expected and what we got,
@@ -138,6 +152,15 @@ mod tests {
         let recovery = RecoveryState::default();
         let alerts = evaluate_alerts(2, &f, &stats, &recovery);
         assert!(alerts.iter().any(|a| a.rule == "cache_cold_start"));
+    }
+
+    #[test]
+    fn explicit_cache_break_emits_prompt_cache_break_alert() {
+        let mut f = make_feedback(0, 5000);
+        f.cache_break_detected = Some(CacheBreakReason::CacheControlChanged);
+        let alerts = evaluate_alerts(3, &f, &PipelineStats::default(), &RecoveryState::default());
+        assert!(alerts.iter().any(|a| a.rule == "prompt_cache_break"));
+        assert!(!alerts.iter().any(|a| a.rule == "cache_cold_start"));
     }
 
     #[test]

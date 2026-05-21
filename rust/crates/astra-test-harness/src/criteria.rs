@@ -14,6 +14,7 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::pipeline_analysis::analyze_pipeline_health;
 use crate::runner::RunOutcome;
 use crate::session_capture::SessionCapture;
 
@@ -179,6 +180,23 @@ pub enum Criterion {
         max_creation: Option<u64>,
     },
 
+    /// Passes when the session's pipeline alerts matching `rule`
+    /// occur at most `max` times.
+    PipelineAlertCount {
+        rule: String,
+        max: u32,
+        #[serde(default)]
+        optional: bool,
+    },
+
+    /// Passes when the average per-turn prompt cache hit ratio reported
+    /// by pipeline feedback is at least `min`.
+    PipelineAvgCacheHitRatio {
+        min: f64,
+        #[serde(default)]
+        optional: bool,
+    },
+
     /// Passes when any nested deterministic criterion passes.
     ///
     /// Use for cases with multiple acceptable high-quality behaviors, such
@@ -266,7 +284,9 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
 
         Criterion::Judger { .. }
         | Criterion::SessionEventCount { .. }
-        | Criterion::JournalToolCalled { .. } => CriterionSeverity::Quality,
+        | Criterion::JournalToolCalled { .. }
+        | Criterion::PipelineAlertCount { .. }
+        | Criterion::PipelineAvgCacheHitRatio { .. } => CriterionSeverity::Quality,
     }
 }
 
@@ -300,6 +320,24 @@ pub fn evaluate_deterministic_with_session(
         .iter()
         .map(|c| evaluate_one(c, outcome, session))
         .collect()
+}
+
+/// Whether any criterion in the tree requires a loaded session capture.
+pub fn requires_session_capture(criteria: &[Criterion]) -> bool {
+    criteria.iter().any(criterion_requires_session_capture)
+}
+
+fn criterion_requires_session_capture(c: &Criterion) -> bool {
+    match c {
+        Criterion::SessionEventCount { .. }
+        | Criterion::JournalToolCalled { .. }
+        | Criterion::PipelineAlertCount { .. }
+        | Criterion::PipelineAvgCacheHitRatio { .. } => true,
+        Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
+            requires_session_capture(criteria)
+        }
+        _ => false,
+    }
 }
 
 fn evaluate_one(
@@ -750,6 +788,78 @@ fn evaluate_one(
                 score: None,
             }
         }
+        Criterion::PipelineAlertCount {
+            rule,
+            max,
+            optional,
+        } => match session {
+            None if *optional => CriterionResult {
+                criterion: c.clone(),
+                severity: criterion_severity(c),
+                passed: true,
+                detail: "session unavailable — skipped pipeline alert check".into(),
+                full_detail: None,
+                score: None,
+            },
+            None => CriterionResult {
+                criterion: c.clone(),
+                severity: criterion_severity(c),
+                passed: false,
+                detail: "session unavailable — cannot inspect pipeline alerts".into(),
+                full_detail: None,
+                score: None,
+            },
+            Some(capture) => {
+                let report = analyze_pipeline_health(capture);
+                let count = report
+                    .alerts
+                    .iter()
+                    .filter(|alert| alert.rule == *rule)
+                    .count() as u32;
+                CriterionResult {
+                    criterion: c.clone(),
+                    severity: criterion_severity(c),
+                    passed: count <= *max,
+                    detail: format!("pipeline_alert[{rule}]={count}, expected <= {max}"),
+                    full_detail: None,
+                    score: None,
+                }
+            }
+        },
+        Criterion::PipelineAvgCacheHitRatio { min, optional } => match session {
+            None if *optional => CriterionResult {
+                criterion: c.clone(),
+                severity: criterion_severity(c),
+                passed: true,
+                detail: "session unavailable — skipped pipeline cache ratio check".into(),
+                full_detail: None,
+                score: None,
+            },
+            None => CriterionResult {
+                criterion: c.clone(),
+                severity: criterion_severity(c),
+                passed: false,
+                detail: "session unavailable — cannot inspect pipeline cache ratio".into(),
+                full_detail: None,
+                score: None,
+            },
+            Some(capture) => {
+                let report = analyze_pipeline_health(capture);
+                let passed = report.turns_with_feedback > 0 && report.avg_cache_hit_ratio >= *min;
+                CriterionResult {
+                    criterion: c.clone(),
+                    severity: criterion_severity(c),
+                    passed,
+                    detail: format!(
+                        "pipeline_avg_cache_hit_ratio={:.1}%, expected >= {:.1}%",
+                        report.avg_cache_hit_ratio * 100.0,
+                        min * 100.0
+                    ),
+                    full_detail: None,
+                    score: None,
+                }
+            }
+        },
     }
 }
 
@@ -820,6 +930,14 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             }
             Ok(())
         }
+        Criterion::PipelineAvgCacheHitRatio { min, .. } => {
+            if !min.is_finite() || *min < 0.0 || *min > 1.0 {
+                return Err(format!(
+                    "PipelineAvgCacheHitRatio.min must be finite in [0.0, 1.0]; got {min}"
+                ));
+            }
+            Ok(())
+        }
         Criterion::SessionEventCount {
             min, event_type, ..
         } => {
@@ -850,6 +968,12 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
         Criterion::ToolCalled { name } | Criterion::JournalToolCalled { name, .. } => {
             if name.trim().is_empty() {
                 return Err("tool name must not be empty".into());
+            }
+            Ok(())
+        }
+        Criterion::PipelineAlertCount { rule, .. } => {
+            if rule.trim().is_empty() {
+                return Err("PipelineAlertCount.rule must not be empty".into());
             }
             Ok(())
         }

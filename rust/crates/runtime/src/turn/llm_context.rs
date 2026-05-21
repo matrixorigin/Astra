@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 
+use astra_services::SessionArtifactStore;
 use serde_json::{Map, Value, json};
 
 use super::agentic_loop_host::AgenticLoopState;
@@ -733,6 +734,12 @@ pub(crate) fn assemble_context_pipeline(
             .pipeline_session
             .as_mut()
             .expect("pipeline_session must be initialized for all production paths");
+        if let Some(session_id) = state.current_session_id.as_deref()
+            && let Ok(session_dir) =
+                astra_services::local_session_artifact_store().session_dir(session_id)
+        {
+            pipeline_sess.set_prompt_cache_diff_dir(session_dir.join("prompt-cache-diffs"));
+        }
         pipeline_sess.run_turn_adaptive(adaptive)
     };
 

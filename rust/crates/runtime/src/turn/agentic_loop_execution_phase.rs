@@ -855,7 +855,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     let ingest_is_fatal = matches!(ingest_outcome, AgenticTurnIngestOutcome::Fatal(_));
     if !ingest_is_fatal {
         if let Some(ref mut pipeline_sess) = state.pipeline_session {
-            let feedback = astra_turn_core::context_feedback::ContextFeedback::from_usage(
+            let mut feedback = astra_turn_core::context_feedback::ContextFeedback::from_usage(
                 turn_result.accum.prompt_tokens,
                 turn_result.accum.cache_read_tokens,
                 turn_result.accum.cache_creation_tokens,
@@ -863,7 +863,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 false,
             );
             let model_id = state.skills.model_override.as_deref().unwrap_or("default");
-            pipeline_sess.record_feedback(model_id, "agentic_loop", feedback.clone(), None);
+            pipeline_sess.record_feedback(model_id, "agentic_loop", &mut feedback, None);
 
             // Emit pipeline journal events for observability and cloud sync
             if let Some(ref mut buf) = state.turn_event_buffer {
@@ -894,7 +894,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     }
                 }
 
-                // Evaluate trace alerts and emit Error-severity ones
+                // Evaluate trace alerts and emit them to the journal.
                 let alerts = astra_turn_core::trace_alert::evaluate_alerts(
                     turn,
                     &feedback,
@@ -917,18 +917,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 }
 
                 for alert in &alerts {
-                    if alert.severity >= astra_turn_core::trace_alert::AlertSeverity::Error {
-                        let alert_evt =
-                            astra_turn_core::pipeline_journal::PipelineJournalEvent::from_alert(
-                                alert,
-                            );
-                        if let Ok(payload) = serde_json::to_value(&alert_evt) {
-                            buf.record(
-                                astra_services::session_journal::JournalEvent::pipeline_alert(
-                                    session_id, turn, payload,
-                                ),
-                            );
-                        }
+                    let alert_evt =
+                        astra_turn_core::pipeline_journal::PipelineJournalEvent::from_alert(alert);
+                    if let Ok(payload) = serde_json::to_value(&alert_evt) {
+                        buf.record(
+                            astra_services::session_journal::JournalEvent::pipeline_alert(
+                                session_id, turn, payload,
+                            ),
+                        );
                     }
                 }
             }

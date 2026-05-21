@@ -37,3 +37,8 @@ criteria:
         # important invariant is the *stable prefix doesn't break* — a
         # non-zero but bounded creation is fine.
         max_creation: 45000
+      - type: pipeline_alert_count
+        rule: prompt_cache_break
+        max: 0
+      - type: pipeline_avg_cache_hit_ratio
+        min: 0.35

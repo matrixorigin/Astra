@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use astra_test_harness::case::{Case, matches_filter};
+use astra_test_harness::criteria::requires_session_capture;
 use astra_test_harness::digest::AstraCliDigestCollector;
 use astra_test_harness::exec::AstraCliExecutor;
 use astra_test_harness::judger::{
@@ -398,7 +399,10 @@ async fn main() -> Result<()> {
     }
 
     let session_loader = DiskSessionLoader;
-    let session_mode = if args.capture_session || args.verbose {
+    let needs_session_capture = cases
+        .iter()
+        .any(|case| requires_session_capture(&case.criteria));
+    let session_mode = if args.capture_session || args.verbose || needs_session_capture {
         SessionCaptureMode::Always
     } else {
         SessionCaptureMode::OnDebugLog

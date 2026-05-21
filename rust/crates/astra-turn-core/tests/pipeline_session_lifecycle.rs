@@ -27,6 +27,7 @@ fn make_session_context() -> SessionContext {
         session_id: "integration-test-session".into(),
         run_id: "run-1".into(),
         model_id: "claude-sonnet-4-6".into(),
+        provider_name: "anthropic".into(),
         model_limit: 200_000,
         provider_policy: ProviderCachePolicy::anthropic(),
         provider_strategy: ProviderCacheStrategy::default(),
@@ -112,9 +113,9 @@ fn ten_turn_session_lifecycle() {
         let cache_read = 800 + (turn_idx as u64 * 10);
         let cache_creation = 200u64.saturating_sub(turn_idx as u64 * 15);
         let completion = 300 + (turn_idx as u64 * 50);
-        let feedback =
+        let mut feedback =
             ContextFeedback::from_usage(0, cache_read, cache_creation, completion, false);
-        sess.record_feedback("claude-sonnet-4-6", "repl", feedback, None);
+        sess.record_feedback("claude-sonnet-4-6", "repl", &mut feedback, None);
     }
 
     assert_eq!(sess.turns_completed(), 10);
@@ -134,8 +135,8 @@ fn warm_start_from_serialized_stats() {
 
     let mut first_session = PipelineSession::new(config.clone());
     for _ in 1..=5 {
-        let feedback = ContextFeedback::from_usage(0, 900, 100, 400, false);
-        first_session.record_feedback("claude-sonnet-4-6", "repl", feedback, None);
+        let mut feedback = ContextFeedback::from_usage(0, 900, 100, 400, false);
+        first_session.record_feedback("claude-sonnet-4-6", "repl", &mut feedback, None);
     }
 
     let bytes = serialize_stats(&first_session.stats).expect("serialization should succeed");
@@ -191,7 +192,7 @@ fn shadow_mode_produces_deterministic_output() {
     let config = PipelineConfig {
         provider_policy: ProviderCachePolicy::anthropic(),
     };
-    let sess = PipelineSession::new(config);
+    let mut sess = PipelineSession::new(config);
     let statics = StaticSections::test_default();
     let agent = AgentContext::default();
     let session = make_session_context();
@@ -245,8 +246,8 @@ fn response_token_estimator_improves_over_turns() {
     assert_eq!(initial_reserve.output_tokens, 500);
 
     for i in 1..=20 {
-        let feedback = ContextFeedback::from_usage(0, 0, 0, 1000 + i * 100, false);
-        sess.record_feedback("model", "repl", feedback, None);
+        let mut feedback = ContextFeedback::from_usage(0, 0, 0, 1000 + i * 100, false);
+        sess.record_feedback("model", "repl", &mut feedback, None);
     }
 
     let learned_reserve =
@@ -311,8 +312,8 @@ fn full_lifecycle_with_emergent_and_latches() {
     sess.push_emergent_skill("debug", "error detected in tool output", 1);
     sess.push_emergent_memory("Related: user debugged similar issue last week", 0.85, 1);
 
-    let feedback1 = ContextFeedback::from_usage(0, 900, 100, 400, false);
-    sess.record_feedback("claude-sonnet-4-6", "repl", feedback1, Some(&output1));
+    let mut feedback1 = ContextFeedback::from_usage(0, 900, 100, 400, false);
+    sess.record_feedback("claude-sonnet-4-6", "repl", &mut feedback1, Some(&output1));
 
     // Turn 2: emergent context should be available (not empty)
     assert!(
@@ -335,8 +336,8 @@ fn full_lifecycle_with_emergent_and_latches() {
         .expect("turn 2 should succeed");
     assert_eq!(output2.metrics.turn_index, 2);
 
-    let feedback2 = ContextFeedback::from_usage(0, 950, 50, 350, false);
-    sess.record_feedback("claude-sonnet-4-6", "repl", feedback2, Some(&output2));
+    let mut feedback2 = ContextFeedback::from_usage(0, 950, 50, 350, false);
+    sess.record_feedback("claude-sonnet-4-6", "repl", &mut feedback2, Some(&output2));
 
     // Turn 3: latch a beta header
     sess.latch_header("anthropic-beta", "prompt-caching-2024-07-31", 3);
@@ -356,8 +357,8 @@ fn full_lifecycle_with_emergent_and_latches() {
         .run_turn_adaptive(input3)
         .expect("turn 3 should succeed");
 
-    let feedback3 = ContextFeedback::from_usage(0, 980, 20, 300, false);
-    sess.record_feedback("claude-sonnet-4-6", "repl", feedback3, Some(&output3));
+    let mut feedback3 = ContextFeedback::from_usage(0, 980, 20, 300, false);
+    sess.record_feedback("claude-sonnet-4-6", "repl", &mut feedback3, Some(&output3));
 
     // Verify accumulated state
     assert_eq!(sess.turns_completed(), 3);

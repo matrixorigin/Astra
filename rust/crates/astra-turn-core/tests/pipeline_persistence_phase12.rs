@@ -132,8 +132,8 @@ fn full_session_snapshot_includes_all_state() {
 
     // Simulate 3 turns
     for i in 1..=3 {
-        let feedback = ContextFeedback::from_usage(0, 800, 200, 300 + i * 50, false);
-        sess.record_feedback("model", "repl", feedback, None);
+        let mut feedback = ContextFeedback::from_usage(0, 800, 200, 300 + i * 50, false);
+        sess.record_feedback("model", "repl", &mut feedback, None);
     }
     sess.push_emergent_skill("test-skill", "trigger", 3);
     sess.latch_cache_scope(CacheScope::Global, 1);
