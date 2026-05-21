@@ -232,6 +232,22 @@ pub(super) async fn finalize_session(state: &mut SessionState) {
     })
     .await;
     if let Some(sid) = state.session_id.as_deref() {
+        let report = super::chat_turn::close_pending_memory_feedback_at_turn_end(
+            Some(sid),
+            Some(crate::command_router::resolve_api_url(None)),
+            super::session_runtime::current_access_token(None),
+            "cli-session-end",
+        )
+        .await;
+        if report.attempted > 0 {
+            tracing::debug!(
+                session_id = %sid,
+                attempted = report.attempted,
+                succeeded = report.succeeded,
+                failed = report.failed,
+                "closed pending recall feedback during session cleanup"
+            );
+        }
         astra_tools::memoria::MemoriaClient::reset_session_process_state(sid);
     }
     // 5. Clear panic guard

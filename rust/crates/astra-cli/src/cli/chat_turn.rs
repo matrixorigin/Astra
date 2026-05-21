@@ -2176,6 +2176,29 @@ fn apply_turn_success(
     check_skill_improvement_inner(state);
 }
 
+fn should_close_pending_memory_feedback_at_turn_end(tools_used: &[String]) -> bool {
+    tools_used.iter().all(|name| name == "memory")
+}
+
+pub(super) async fn close_pending_memory_feedback_at_turn_end(
+    session_id: Option<&str>,
+    cloud_base: Option<String>,
+    cloud_token: Option<String>,
+    context_prefix: &str,
+) -> astra_tools::memoria::FeedbackDrainReport {
+    let Some(session_id) = session_id.filter(|sid| !sid.trim().is_empty()) else {
+        return astra_tools::memoria::FeedbackDrainReport::default();
+    };
+    crate::edge_tools::memoria::close_pending_recall_feedback_with_proxy(
+        session_id,
+        "useful",
+        context_prefix,
+        cloud_base,
+        cloud_token,
+    )
+    .await
+}
+
 async fn apply_turn_success_async(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
@@ -2188,6 +2211,29 @@ async fn apply_turn_success_async(
     let final_messages = std::mem::take(&mut result.final_messages);
     let csl_checkpoint_fields = extract_csl_fields_from_result(&result);
     apply_turn_success_sync(state, profile, line, result, turn_start);
+    if should_close_pending_memory_feedback_at_turn_end(&state.recent_tools) {
+        let session_id = state.session_id.clone();
+        let cloud_base = Some(crate::command_router::resolve_api_url(None));
+        let cloud_token = super::session_runtime::current_access_token(profile);
+        tokio::spawn(async move {
+            let report = close_pending_memory_feedback_at_turn_end(
+                session_id.as_deref(),
+                cloud_base,
+                cloud_token,
+                "cli-turn-end",
+            )
+            .await;
+            if report.attempted > 0 {
+                tracing::debug!(
+                    session_id = ?session_id,
+                    attempted = report.attempted,
+                    succeeded = report.succeeded,
+                    failed = report.failed,
+                    "closed pending recall feedback at turn end"
+                );
+            }
+        });
+    }
     rebuild_continuation_anchor_from_live_state(state).await;
 
     // Persist CSL via CslManager.
@@ -5205,6 +5251,44 @@ mod tests {
                 .as_ref()
                 .map(|suggestion| suggestion.text.as_str()),
             Some("run the tests")
+        );
+    }
+
+    #[test]
+    fn turn_end_feedback_only_runs_when_no_non_memory_tool_succeeded() {
+        assert!(should_close_pending_memory_feedback_at_turn_end(&[]));
+        assert!(should_close_pending_memory_feedback_at_turn_end(&[
+            "memory".to_string()
+        ]));
+        assert!(!should_close_pending_memory_feedback_at_turn_end(&[
+            "memory".to_string(),
+            "bash".to_string()
+        ]));
+        assert!(!should_close_pending_memory_feedback_at_turn_end(&[
+            "bash".to_string()
+        ]));
+    }
+
+    #[tokio::test]
+    async fn close_pending_memory_feedback_at_turn_end_drains_recall_queue() {
+        let session_id = "chat-turn-close-feedback";
+        astra_tools::memoria::MemoriaClient::reset_recall_ledger(session_id);
+        astra_tools::memoria::MemoriaClient::record_recall(session_id, 4, vec!["m1".into()]);
+
+        let report = close_pending_memory_feedback_at_turn_end(
+            Some(session_id),
+            Some("http://127.0.0.1:9".to_string()),
+            Some("token".to_string()),
+            "unit-test",
+        )
+        .await;
+
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.succeeded, 0);
+        assert_eq!(
+            astra_tools::memoria::MemoriaClient::pending_recall_count(session_id),
+            0
         );
     }
 

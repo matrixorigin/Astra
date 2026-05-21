@@ -215,11 +215,13 @@ pub async fn memoria_retrieve(body: &Value, timeout: Duration) -> Result<String,
 }
 
 pub async fn memoria_store(body: &Value, timeout: Duration) -> Result<String, String> {
+    let mut enriched = body.clone();
+    astra_tools::memoria::enrich_store_payload_with_views(&mut enriched);
     memoria_proxy_request(
         astra_tools::memoria::HttpMethod::Post,
         "/memory/store",
         timeout,
-        Some(body),
+        Some(&enriched),
     )
     .await
 }
@@ -256,6 +258,26 @@ pub async fn memoria_consolidate_fire_and_forget() {
         Some(&json!({ "force": false })),
     )
     .await;
+}
+
+pub async fn close_pending_recall_feedback_with_proxy(
+    session_id: &str,
+    signal: &str,
+    context_prefix: &str,
+    cloud_base: Option<String>,
+    cloud_token: Option<String>,
+) -> astra_tools::memoria::FeedbackDrainReport {
+    let session_id = session_id.trim();
+    if session_id.is_empty() || signal.trim().is_empty() {
+        return astra_tools::memoria::FeedbackDrainReport::default();
+    }
+    let (Some(cloud_base), Some(cloud_token)) = (cloud_base, cloud_token) else {
+        return astra_tools::memoria::FeedbackDrainReport::default();
+    };
+    let client = astra_tools::memoria::MemoriaClient::new(Some(cloud_base), Some(cloud_token));
+    client
+        .feedback_pending_recalls(session_id, signal, context_prefix)
+        .await
 }
 
 impl ToolExecutor {

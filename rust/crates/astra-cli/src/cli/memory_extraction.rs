@@ -154,6 +154,24 @@ fn extraction_write_accounting(
     }
 }
 
+fn extraction_store_payload(
+    memory: &ExtractedMemory,
+    session_id: Option<&str>,
+) -> serde_json::Value {
+    let encoded = astra_prompts::memory_types::encode(memory.category, &memory.content);
+    let mut payload = serde_json::json!({
+        "content": encoded,
+        "memory_type": memory.category.memoria_type(),
+        "trust_tier": memory.category.trust_tier(),
+        "source": {"agent": "extraction"},
+    });
+    if let Some(session_id) = session_id.filter(|sid| !sid.is_empty()) {
+        payload["session_id"] = serde_json::json!(session_id);
+    }
+    astra_tools::memoria::enrich_store_payload_with_views(&mut payload);
+    payload
+}
+
 /// Check if the main model already **wrote** to memory this turn.
 ///
 /// Write actions (`remember`, `forget`, `update`, `focus`, `reflect`,
@@ -773,14 +791,9 @@ async fn run_extraction(
             }
             astra_tools::memoria::WriteDecision::Store => {
                 writes += 1;
+                let payload = extraction_store_payload(m, session_id);
                 crate::edge_tools::memoria::memoria_store(
-                    &serde_json::json!({
-                        "content": encoded,
-                        "memory_type": m.category.memoria_type(),
-                        "trust_tier": m.category.trust_tier(),
-                        "session_id": session_id,
-                        "source": {"agent": "extraction"},
-                    }),
+                    &payload,
                     std::time::Duration::from_secs(5),
                 )
                 .await
@@ -1663,6 +1676,36 @@ mod tests {
         assert!(
             src.contains(r#""source": {"agent": "extraction"}"#),
             "batch write must include extraction source metadata"
+        );
+    }
+
+    #[test]
+    fn extraction_store_payload_attaches_views_and_session_scope() {
+        let payload = extraction_store_payload(
+            &ExtractedMemory {
+                category: MemoryCategory::Feedback,
+                content: "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online IT suites for DB changes.".into(),
+            },
+            Some("sess-123"),
+        );
+
+        assert_eq!(payload["session_id"], "sess-123");
+        assert_eq!(payload["source"]["agent"], "extraction");
+        assert_eq!(
+            payload["source"]["astra_views"]["full"],
+            "[feedback] Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online IT suites for DB changes."
+        );
+        assert!(
+            payload["source"]["astra_views"]["compact"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Integration tests must hit a real database")
+        );
+        assert!(
+            payload["source"]["astra_views"]["overview"]
+                .as_str()
+                .unwrap_or("")
+                .contains("mock drift hid a migration bug")
         );
     }
 

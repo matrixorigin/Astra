@@ -135,6 +135,138 @@ pub fn contains_sensitive_memory_content(text: &str) -> bool {
         || raw.contains("AKIA")
 }
 
+const MEMORY_COMPACT_VIEW_MAX_CHARS: usize = 96;
+const MEMORY_OVERVIEW_VIEW_MAX_CHARS: usize = 280;
+const ASTRA_VIEWS_KEY: &str = "astra_views";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryContentViews {
+    pub compact: String,
+    pub overview: String,
+    pub full: String,
+}
+
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    let char_count = trimmed.chars().count();
+    if char_count <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed.chars().take(max_chars).collect();
+    while out.chars().last().is_some_and(char::is_whitespace) {
+        out.pop();
+    }
+    out.push('…');
+    out
+}
+
+fn collapse_inline_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn first_sentenceish(text: &str) -> Option<String> {
+    let first_line = text.lines().find(|line| !line.trim().is_empty())?.trim();
+    if first_line.is_empty() {
+        return None;
+    }
+    for delimiter in ['.', '!', '?', ';', '—'] {
+        if let Some((head, _)) = first_line.split_once(delimiter) {
+            let candidate = head.trim();
+            if !candidate.is_empty() {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    Some(first_line.to_string())
+}
+
+pub fn derive_memory_content_views(content: &str) -> MemoryContentViews {
+    let full = content.trim().to_string();
+    let compact_seed = first_sentenceish(&full).unwrap_or_else(|| full.clone());
+    let compact = truncate_with_ellipsis(
+        &collapse_inline_whitespace(&compact_seed),
+        MEMORY_COMPACT_VIEW_MAX_CHARS,
+    );
+    let overview = truncate_with_ellipsis(&full, MEMORY_OVERVIEW_VIEW_MAX_CHARS);
+    MemoryContentViews {
+        compact,
+        overview,
+        full,
+    }
+}
+
+fn extract_stored_views(item: &Value, content: &str) -> Option<MemoryContentViews> {
+    let views = item
+        .get("source")
+        .and_then(|source| source.get(ASTRA_VIEWS_KEY))?;
+    let compact = views.get("compact")?.as_str()?.trim();
+    let overview = views.get("overview")?.as_str()?.trim();
+    let full = views.get("full")?.as_str()?.trim();
+    if compact.is_empty() || overview.is_empty() || full.is_empty() || full != content.trim() {
+        return None;
+    }
+    Some(MemoryContentViews {
+        compact: compact.to_string(),
+        overview: overview.to_string(),
+        full: full.to_string(),
+    })
+}
+
+fn views_for_memory_item(item: &Value) -> Option<MemoryContentViews> {
+    let content = item.get("content").and_then(Value::as_str)?.trim();
+    if content.is_empty() {
+        return None;
+    }
+    extract_stored_views(item, content).or_else(|| Some(derive_memory_content_views(content)))
+}
+
+fn view_content_for_recall(item: &Value, requested_view: Option<&str>) -> Option<String> {
+    let views = views_for_memory_item(item)?;
+    Some(match requested_view.unwrap_or("full") {
+        "compact" => views.compact,
+        "overview" => views.overview,
+        _ => views.full,
+    })
+}
+
+fn content_for_expand_level(item: &Value, requested_level: Option<&str>) -> Option<String> {
+    let views = views_for_memory_item(item)?;
+    Some(match requested_level.unwrap_or("detail") {
+        "abstract" => views.compact,
+        "overview" => views.overview,
+        _ => views.full,
+    })
+}
+
+pub fn enrich_store_payload_with_views(payload: &mut Value) {
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+    let Some(content) = obj
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|content| !content.is_empty())
+    else {
+        return;
+    };
+    let views = derive_memory_content_views(content);
+    let source = obj.entry("source".to_string()).or_insert_with(|| json!({}));
+    if !source.is_object() {
+        *source = json!({});
+    }
+    if let Some(source_obj) = source.as_object_mut() {
+        source_obj.insert(
+            ASTRA_VIEWS_KEY.to_string(),
+            json!({
+                "compact": views.compact,
+                "overview": views.overview,
+                "full": views.full,
+            }),
+        );
+    }
+}
+
 /// A single `focus` hint: a session-scoped attention boost with TTL.
 ///
 /// Stored in-process by [`MemoriaClient`]. On each `recall` call the
@@ -705,6 +837,15 @@ impl MemoriaClient {
         seen: &std::collections::HashSet<String>,
         newly_surfaced: &mut Vec<String>,
     ) -> String {
+        Self::decorate_recall_response_with_view(raw_text, seen, newly_surfaced, None)
+    }
+
+    pub fn decorate_recall_response_with_view(
+        raw_text: &str,
+        seen: &std::collections::HashSet<String>,
+        newly_surfaced: &mut Vec<String>,
+        requested_view: Option<&str>,
+    ) -> String {
         let Ok(mut parsed) = serde_json::from_str::<Value>(raw_text) else {
             return raw_text.to_string();
         };
@@ -732,6 +873,11 @@ impl MemoriaClient {
                 .get("trust_tier")
                 .and_then(Value::as_str)
                 .map(String::from);
+            if let Some(content) = view_content_for_recall(item, requested_view)
+                && let Some(slot) = item.get_mut("content")
+            {
+                *slot = Value::String(content);
+            }
             if let Some(days) = days {
                 let suffix = astra_turn_types::freshness_suffix_for(days, trust_tier.as_deref());
                 if !suffix.is_empty()
@@ -746,6 +892,26 @@ impl MemoriaClient {
             {
                 newly_surfaced.push(id);
             }
+        }
+        serde_json::to_string(&parsed).unwrap_or_else(|_| raw_text.to_string())
+    }
+
+    pub fn decorate_expand_response(raw_text: &str, requested_level: Option<&str>) -> String {
+        let Ok(mut parsed) = serde_json::from_str::<Value>(raw_text) else {
+            return raw_text.to_string();
+        };
+        let Some(obj) = parsed.as_object_mut() else {
+            return raw_text.to_string();
+        };
+        let item = Value::Object(obj.clone());
+        if let Some(content) = content_for_expand_level(&item, requested_level) {
+            obj.insert("content".to_string(), Value::String(content));
+        }
+        if let Some(level) = requested_level {
+            obj.insert(
+                "resolved_level".to_string(),
+                Value::String(level.to_string()),
+            );
         }
         serde_json::to_string(&parsed).unwrap_or_else(|_| raw_text.to_string())
     }
@@ -1001,15 +1167,20 @@ impl MemoriaClient {
             Err(e) => json!({"error": format!("build client: {e}")}).to_string(),
         };
 
-        // Post-process recall responses with freshness suffixes + surface-
-        // once dedup so LLM-driven recalls carry the same signals as the
-        // bridge-side prefetch path. Other verbs pass through verbatim.
+        // Post-process recall responses with requested view shaping,
+        // freshness suffixes, and surface-once dedup so LLM-driven recalls
+        // carry the same signals as the bridge-side prefetch path.
         if op == "recall" {
             let session_id = args.get("session_id").and_then(Value::as_str).unwrap_or("");
             let turn = args.get("turn").and_then(Value::as_u64).unwrap_or(0) as u32;
             let seen = Self::seen_snapshot(session_id);
             let mut newly_surfaced = Vec::new();
-            let decorated = Self::decorate_recall_response(&raw_text, &seen, &mut newly_surfaced);
+            let decorated = Self::decorate_recall_response_with_view(
+                &raw_text,
+                &seen,
+                &mut newly_surfaced,
+                args.get("view").and_then(Value::as_str),
+            );
             if !newly_surfaced.is_empty() {
                 // (a) dedup store: don't re-show same id this session
                 Self::record_seen(session_id, newly_surfaced.clone());
@@ -1020,6 +1191,12 @@ impl MemoriaClient {
                 Self::record_recall(session_id, turn, newly_surfaced);
             }
             return decorated;
+        }
+        if op == "expand" {
+            return Self::decorate_expand_response(
+                &raw_text,
+                args.get("level").and_then(Value::as_str),
+            );
         }
         raw_text
     }
@@ -1416,6 +1593,7 @@ impl MemoriaClient {
                     );
                 }
 
+                enrich_store_payload_with_views(&mut payload);
                 (format!("{base}/v1/memories"), payload, HttpMethod::Post)
             }
             // ── recall → v1 retrieve (`POST /v1/memories/retrieve`) ──────
@@ -2156,6 +2334,31 @@ mod tests {
     }
 
     #[test]
+    fn remember_payload_attaches_astra_views() {
+        let args = json!({
+            "content": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites.",
+            "memory_type": "feedback",
+        });
+        let (_, payload, _) = MemoriaClient::build_direct_request("http://mem", "remember", &args);
+        assert_eq!(
+            payload["source"]["astra_views"]["full"],
+            "[feedback] Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites."
+        );
+        assert!(
+            payload["source"]["astra_views"]["compact"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Integration tests must hit a real database")
+        );
+        assert!(
+            payload["source"]["astra_views"]["overview"]
+                .as_str()
+                .unwrap_or("")
+                .contains("mock drift hid a migration bug")
+        );
+    }
+
+    #[test]
     fn build_direct_request_propagates_session_and_user_id() {
         let args = json!({
             "query": "rust patterns",
@@ -2845,6 +3048,64 @@ mod memoria_http_client_tests {
         assert_eq!(arr.len(), 1, "seen id must be filtered");
         assert_eq!(arr[0]["memory_id"].as_str(), Some("m-new"));
         assert_eq!(newly, vec!["m-new"], "only surviving ids recorded");
+    }
+
+    #[test]
+    fn decorate_recall_honors_compact_view() {
+        use super::*;
+        let raw = serde_json::json!([
+            {
+                "memory_id": "m1",
+                "content": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites.",
+                "source": {
+                    "astra_views": {
+                        "compact": "Integration tests must hit a real database",
+                        "overview": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.",
+                        "full": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites."
+                    }
+                }
+            }
+        ])
+        .to_string();
+        let seen = std::collections::HashSet::new();
+        let mut newly = Vec::new();
+        let out = MemoriaClient::decorate_recall_response_with_view(
+            &raw,
+            &seen,
+            &mut newly,
+            Some("compact"),
+        );
+        let arr: Vec<Value> = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            arr[0]["content"].as_str(),
+            Some("Integration tests must hit a real database")
+        );
+    }
+
+    #[test]
+    fn decorate_expand_honors_requested_level() {
+        use super::*;
+        let raw = serde_json::json!({
+            "memory_id": "m1",
+            "content": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites.",
+            "source": {
+                "astra_views": {
+                    "compact": "Integration tests must hit a real database",
+                    "overview": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.",
+                    "full": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites."
+                }
+            }
+        })
+        .to_string();
+        let overview = MemoriaClient::decorate_expand_response(&raw, Some("overview"));
+        let parsed: Value = serde_json::from_str(&overview).unwrap();
+        assert_eq!(
+            parsed["content"].as_str(),
+            Some(
+                "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug."
+            )
+        );
+        assert_eq!(parsed["resolved_level"].as_str(), Some("overview"));
     }
 
     #[test]
