@@ -1398,6 +1398,347 @@ fn build_history_text(full_text: &str, records: &[session_journal::ToolCallRecor
     format!("{full_text}{summary}")
 }
 
+#[derive(Clone)]
+struct JournalPromptTurn {
+    snapshot: astra_turn_core::cache_diagnostics::PromptStateSnapshot,
+    usage: astra_runtime::turn::token_usage::TokenUsage,
+}
+
+fn build_bridge_pipeline_journal_events(
+    session_id: Option<&str>,
+    turn: u32,
+    model_id: &str,
+    current_turn_events: &[session_journal::JournalEvent],
+) -> Vec<session_journal::JournalEvent> {
+    let Some(session_id) = session_id.filter(|sid| !sid.is_empty()) else {
+        return Vec::new();
+    };
+    let Ok(mut events) = session_journal::read_journal(session_id) else {
+        return Vec::new();
+    };
+    events.extend_from_slice(current_turn_events);
+    if events.iter().any(|event| {
+        event.turn == Some(turn)
+            && matches!(
+                event.event_type,
+                session_journal::JournalEventType::PipelineFeedback
+                    | session_journal::JournalEventType::PipelineAlert
+            )
+    }) {
+        return Vec::new();
+    }
+
+    let turns = journal_prompt_turns(&events);
+    let Some(current) = turns.last() else {
+        return Vec::new();
+    };
+
+    let mut feedback = astra_turn_core::context_feedback::ContextFeedback::from_usage(
+        current.usage.input_tokens,
+        current.usage.cached_input_tokens,
+        current.usage.cache_creation_tokens,
+        current.usage.output_tokens,
+        false,
+    );
+
+    if let Some(previous) = turns.iter().rev().nth(1) {
+        let mut detector = astra_turn_core::cache_diagnostics::CacheBreakDetector::new();
+        let _ = detector.record_turn_for_source(
+            "bridge_inprocess",
+            previous.snapshot.clone(),
+            Some(previous.usage.cached_input_tokens),
+        );
+        if let Some(event) = detector.record_turn_for_source(
+            "bridge_inprocess",
+            current.snapshot.clone(),
+            Some(current.usage.cached_input_tokens),
+        ) {
+            feedback.attribute_cache_break(event.reason);
+        }
+    }
+
+    let prior_feedback_ratios: Vec<f64> = events
+        .iter()
+        .filter(|event| {
+            event.turn.unwrap_or(0) < turn
+                && event.event_type == session_journal::JournalEventType::PipelineFeedback
+        })
+        .filter_map(|event| {
+            event
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get("cache_hit_ratio"))
+                .and_then(serde_json::Value::as_f64)
+        })
+        .collect();
+    let prior_ratios = if prior_feedback_ratios.is_empty() {
+        turns
+            .iter()
+            .take(turns.len().saturating_sub(1))
+            .filter_map(|turn| {
+                let total_input = turn
+                    .usage
+                    .input_tokens
+                    .saturating_add(turn.usage.cached_input_tokens)
+                    .saturating_add(turn.usage.cache_creation_tokens);
+                (total_input > 0)
+                    .then_some(turn.usage.cached_input_tokens as f64 / total_input as f64)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        prior_feedback_ratios
+    };
+    let avg_cache_hit_ratio = if prior_ratios.is_empty() {
+        0.0
+    } else {
+        prior_ratios.iter().sum::<f64>() / prior_ratios.len() as f64
+    };
+    let stats = astra_turn_core::pipeline_stats::PipelineStats {
+        turns_executed: prior_ratios.len() as u32,
+        avg_cache_hit_ratio,
+        ..Default::default()
+    };
+
+    let feedback_evt = astra_turn_core::pipeline_journal::PipelineJournalEvent::from_feedback(
+        turn, model_id, &feedback,
+    );
+    let mut journal_events = Vec::new();
+    if let Ok(payload) = serde_json::to_value(&feedback_evt) {
+        journal_events.push(session_journal::JournalEvent::pipeline_feedback(
+            Some(session_id),
+            turn,
+            payload,
+        ));
+    }
+
+    for alert in astra_turn_core::trace_alert::evaluate_alerts(
+        turn,
+        &feedback,
+        &stats,
+        &astra_turn_core::recovery_state::RecoveryState::default(),
+    ) {
+        let alert_evt = astra_turn_core::pipeline_journal::PipelineJournalEvent::from_alert(&alert);
+        if let Ok(payload) = serde_json::to_value(&alert_evt) {
+            journal_events.push(session_journal::JournalEvent::pipeline_alert(
+                Some(session_id),
+                turn,
+                payload,
+            ));
+        }
+    }
+    journal_events
+}
+
+pub(crate) fn append_one_shot_journal_events(
+    session_id: Option<&str>,
+    model_id: Option<&str>,
+    line: &str,
+    result: &StreamResult,
+    turn_start: Instant,
+) {
+    let Some(session_id) = session_id.filter(|sid| !sid.is_empty()) else {
+        return;
+    };
+    let Ok(writer) = session_journal::JournalWriter::new(session_id) else {
+        return;
+    };
+    let Ok(existing_events) = session_journal::read_journal(session_id) else {
+        return;
+    };
+
+    let mut prompt_events = existing_events.clone();
+    prompt_events.extend_from_slice(&result.turn_observability_events);
+    let turn = journal_prompt_turns(&prompt_events).len() as u32;
+    if turn == 0 {
+        return;
+    }
+    if existing_events.iter().any(|event| {
+        event.turn == Some(turn) && event.event_type == session_journal::JournalEventType::Turn
+    }) {
+        return;
+    }
+
+    let mut append_events = build_bridge_pipeline_journal_events(
+        Some(session_id),
+        turn,
+        model_id.unwrap_or("unknown"),
+        &result.turn_observability_events,
+    );
+    append_events.push(
+        session_journal::JournalEvent::turn(
+            Some(session_id),
+            turn,
+            model_id,
+            line,
+            &result.full_text,
+            result.tool_calls_count,
+            result.prompt_tokens,
+            result.completion_tokens,
+            turn_start.elapsed().as_millis() as u64,
+        )
+        .with_tool_selection(
+            result.tools_selected.clone(),
+            result.selected_skills.clone(),
+            result.tools_used.clone(),
+            result.budget_used,
+        )
+        .with_run_id(result.run_id.as_deref())
+        .with_budget_pressure(result.budget_pressure)
+        .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens),
+    );
+    if let Err(e) = writer.append_bulk(&append_events) {
+        astra_core::agent_warn!("journal", "failed to append one-shot journal events: {e}");
+    }
+}
+
+fn journal_prompt_turns(events: &[session_journal::JournalEvent]) -> Vec<JournalPromptTurn> {
+    let mut pending_request: Option<(
+        String,
+        Vec<serde_json::Value>,
+        Vec<serde_json::Value>,
+        String,
+    )> = None;
+    let mut turns = Vec::new();
+
+    for event in events {
+        match event.event_type {
+            session_journal::JournalEventType::LlmRequestFull => {
+                let Some(metadata) = event.metadata.as_ref() else {
+                    continue;
+                };
+                let Some(request) = metadata
+                    .get("request")
+                    .and_then(serde_json::Value::as_object)
+                else {
+                    continue;
+                };
+                let messages = request
+                    .get("messages")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let tools = request
+                    .get("tools")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let model = metadata
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let provider = metadata
+                    .get("provider")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                pending_request = Some((model, messages, tools, provider));
+            }
+            session_journal::JournalEventType::LlmResponseFull => {
+                let Some((model, messages, tools, provider)) = pending_request.take() else {
+                    continue;
+                };
+                let Some(usage) = journal_usage_from_response_event(event) else {
+                    continue;
+                };
+                let total_input = usage
+                    .input_tokens
+                    .saturating_add(usage.cached_input_tokens)
+                    .saturating_add(usage.cache_creation_tokens);
+                let Some(mut snapshot) = journal_prompt_snapshot_from_messages(
+                    &messages,
+                    &tools,
+                    &model,
+                    &provider,
+                    total_input,
+                ) else {
+                    continue;
+                };
+                snapshot.provider = provider;
+                turns.push(JournalPromptTurn { snapshot, usage });
+            }
+            _ => {}
+        }
+    }
+    turns
+}
+
+fn journal_usage_from_response_event(
+    event: &session_journal::JournalEvent,
+) -> Option<astra_runtime::turn::token_usage::TokenUsage> {
+    let usage = event
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("response"))
+        .and_then(|response| response.get("response"))
+        .and_then(|response| response.get("usage"))
+        .and_then(serde_json::Value::as_object)?;
+    let canonical = astra_runtime::turn::token_usage::TokenUsage::from_json_map(usage);
+    if !canonical.is_empty() {
+        return Some(canonical);
+    }
+    let provider = event
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("provider"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("openai");
+    astra_runtime::turn::token_usage::extract_usage(
+        astra_runtime::turn::token_usage::UsageDialect::for_provider(provider),
+        usage,
+    )
+}
+
+fn journal_prompt_snapshot_from_messages(
+    messages: &[serde_json::Value],
+    tools: &[serde_json::Value],
+    model: &str,
+    provider: &str,
+    cache_eligible_tokens: u64,
+) -> Option<astra_turn_core::cache_diagnostics::PromptStateSnapshot> {
+    let system_prompt_text = messages
+        .iter()
+        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+        .or_else(|| messages.first())
+        .map(journal_message_content_text)
+        .unwrap_or_default();
+    let mut snapshot = astra_turn_core::cache_diagnostics::PromptStateSnapshot::capture(
+        &system_prompt_text,
+        tools,
+        model,
+        cache_eligible_tokens as usize,
+    );
+    snapshot.provider = provider.to_string();
+    Some(snapshot)
+}
+
+fn journal_message_content_text(message: &serde_json::Value) -> String {
+    journal_content_value_text(message.get("content").unwrap_or(&serde_json::Value::Null))
+}
+
+fn journal_content_value_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                item.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| item.as_str().map(str::to_string))
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        serde_json::Value::Object(map) => map
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default()),
+        _ => value.to_string(),
+    }
+}
+
 /// After `state.turn` has been incremented: journal turn row, workspace + checkpoints,
 /// stall/verdict/step sidecars. Shared by normal chat and plan-only LLM turns.
 fn commit_turn_journal_workspace_and_sidecars(
@@ -1412,8 +1753,16 @@ fn commit_turn_journal_workspace_and_sidecars(
 
     if let Some(journal) = state.journal.as_ref() {
         // Flush turn observability events (llm_round, tool timing) before the turn summary.
-        if !result.turn_observability_events.is_empty() {
-            if let Err(e) = journal.append_bulk(&result.turn_observability_events) {
+        let mut turn_observability_events = result.turn_observability_events.clone();
+        let bridge_pipeline_events = build_bridge_pipeline_journal_events(
+            state.session_id.as_deref(),
+            state.turn,
+            state.model.as_deref().unwrap_or("unknown"),
+            &turn_observability_events,
+        );
+        turn_observability_events.extend(bridge_pipeline_events);
+        if !turn_observability_events.is_empty() {
+            if let Err(e) = journal.append_bulk(&turn_observability_events) {
                 astra_core::agent_warn!("journal", "failed to write observability events: {e}");
             }
         }

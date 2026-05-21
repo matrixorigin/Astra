@@ -224,6 +224,197 @@ fn count_inprocess_persisted_events(
         }
 }
 
+#[derive(Debug, Default)]
+struct BridgePipelineBaseline {
+    next_turn: u32,
+    stats: astra_turn_core::pipeline_stats::PipelineStats,
+    previous_prompt_snapshot: Option<astra_turn_core::cache_diagnostics::PromptStateSnapshot>,
+    previous_cache_read_tokens: Option<u64>,
+}
+
+fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
+    if session_id.is_empty() {
+        return BridgePipelineBaseline {
+            next_turn: 1,
+            ..Default::default()
+        };
+    }
+    let Ok(events) = astra_services::session_journal::read_journal(session_id) else {
+        return BridgePipelineBaseline {
+            next_turn: 1,
+            ..Default::default()
+        };
+    };
+
+    let mut feedback_ratios = Vec::new();
+    let mut raw_ratios = Vec::new();
+    let mut response_count = 0u32;
+    let mut pending_request_snapshot = None;
+    let mut previous_prompt_snapshot = None;
+    let mut previous_cache_read_tokens = None;
+
+    for event in events {
+        match event.event_type {
+            astra_services::session_journal::JournalEventType::PipelineFeedback => {
+                if let Some(ratio) = event
+                    .metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get("cache_hit_ratio"))
+                    .and_then(Value::as_f64)
+                {
+                    feedback_ratios.push(ratio);
+                }
+            }
+            astra_services::session_journal::JournalEventType::LlmRequestFull => {
+                pending_request_snapshot = bridge_prompt_snapshot_from_journal_event(&event);
+            }
+            astra_services::session_journal::JournalEventType::LlmResponseFull => {
+                response_count = response_count.saturating_add(1);
+                if let Some(usage) = bridge_usage_from_response_event(&event) {
+                    let total_input = usage
+                        .input_tokens
+                        .saturating_add(usage.cached_input_tokens)
+                        .saturating_add(usage.cache_creation_tokens);
+                    if total_input > 0 {
+                        raw_ratios.push(usage.cached_input_tokens as f64 / total_input as f64);
+                    }
+                    previous_cache_read_tokens = Some(usage.cached_input_tokens);
+                }
+                if let Some(snapshot) = pending_request_snapshot.take() {
+                    previous_prompt_snapshot = Some(snapshot);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let ratios = if feedback_ratios.is_empty() {
+        raw_ratios
+    } else {
+        feedback_ratios
+    };
+    let avg_cache_hit_ratio = if ratios.is_empty() {
+        0.0
+    } else {
+        ratios.iter().sum::<f64>() / ratios.len() as f64
+    };
+
+    BridgePipelineBaseline {
+        next_turn: response_count.saturating_add(1),
+        stats: astra_turn_core::pipeline_stats::PipelineStats {
+            turns_executed: ratios.len() as u32,
+            avg_cache_hit_ratio,
+            ..Default::default()
+        },
+        previous_prompt_snapshot,
+        previous_cache_read_tokens,
+    }
+}
+
+fn bridge_usage_from_response_event(
+    event: &astra_services::session_journal::JournalEvent,
+) -> Option<crate::turn::token_usage::TokenUsage> {
+    let usage = event
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("response"))
+        .and_then(|response| response.get("response"))
+        .and_then(|response| response.get("usage"))
+        .and_then(Value::as_object)?;
+    let canonical = crate::turn::token_usage::TokenUsage::from_json_map(usage);
+    if !canonical.is_empty() {
+        return Some(canonical);
+    }
+    let provider = event
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("provider"))
+        .and_then(Value::as_str)
+        .unwrap_or("openai");
+    crate::turn::token_usage::extract_usage(
+        crate::turn::token_usage::UsageDialect::for_provider(provider),
+        usage,
+    )
+}
+
+fn bridge_prompt_snapshot_from_journal_event(
+    event: &astra_services::session_journal::JournalEvent,
+) -> Option<astra_turn_core::cache_diagnostics::PromptStateSnapshot> {
+    let metadata = event.metadata.as_ref()?;
+    let request = metadata.get("request")?.as_object()?;
+    let tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let model = metadata
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let provider = metadata
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    bridge_prompt_snapshot_from_messages(&messages, &tools, model, provider)
+}
+
+fn bridge_prompt_snapshot_from_messages(
+    messages: &[Value],
+    tools: &[Value],
+    model: &str,
+    provider: &str,
+) -> Option<astra_turn_core::cache_diagnostics::PromptStateSnapshot> {
+    let system_prompt_text = messages
+        .iter()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+        .or_else(|| messages.first())
+        .map(bridge_message_content_text)
+        .unwrap_or_default();
+    let tools_json = serde_json::to_string(tools).ok()?;
+    let cache_eligible_tokens = prompts::estimate_str_tokens(&system_prompt_text)
+        + prompts::estimate_str_tokens(&tools_json);
+    let mut snapshot = astra_turn_core::cache_diagnostics::PromptStateSnapshot::capture(
+        &system_prompt_text,
+        tools,
+        model,
+        cache_eligible_tokens,
+    );
+    snapshot.provider = provider.to_string();
+    Some(snapshot)
+}
+
+fn bridge_message_content_text(message: &Value) -> String {
+    bridge_content_value_text(message.get("content").unwrap_or(&Value::Null))
+}
+
+fn bridge_content_value_text(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| item.as_str().map(str::to_string))
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        Value::Object(map) => map
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default()),
+        _ => value.to_string(),
+    }
+}
+
 // ── SSE helpers — delegated to turn::bridge_sse_helpers ───────────────────────
 use super::bridge_sse_helpers::{
     extend_forward_from_validated_sse_block, flush_tail_buf_into_llm_forward,
@@ -2002,7 +2193,7 @@ impl InProcessChatTurnBridge {
             let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
             let mut last_measured_prompt: Option<u64> = None;
-            let mut cache_detector = astra_turn_core::cloud_cache_diagnostics::CacheBreakDetector::new();
+            let bridge_pipeline_baseline = load_bridge_pipeline_baseline(&session_id);
 
 
             // Single LLM call per HTTP request (no multi-round tool loop).
@@ -2020,8 +2211,6 @@ impl InProcessChatTurnBridge {
                 // output is already the authoritative set.
                 let round_edge_tools =
                     filter_round_edge_tools(&edge_tools, &HashSet::new());
-                let round_tools_fingerprint_str =
-                    serde_json::to_string(&round_edge_tools).unwrap_or_default();
                 // `pipeline_tier` is the authoritative tier; the per-round
                 // tier refinement (based on `last_measured_prompt`) used to
                 // live here but produced tier drift between planner and
@@ -3327,26 +3516,77 @@ impl InProcessChatTurnBridge {
                     });
                 }
 
-                // ── Cache break detection ──
-                {
-                    let sys_content = llm_messages.first()
-                        .and_then(|m| m.get("content"));
-                    let sys_prompt_str = match sys_content {
-                        Some(Value::String(s)) => s.clone(),
-                        Some(v) => serde_json::to_string(v).unwrap_or_default(),
-                        None => String::new(),
-                    };
-                    let fp = astra_turn_core::cloud_cache_diagnostics::CacheFingerprint::new(
-                        &sys_prompt_str,
-                        &round_tools_fingerprint_str,
-                        &model_name,
-                        &provider,
+                // ── Formal pipeline feedback / alerts ──
+                if let Some(buf) = turn_event_buffer.as_mut() {
+                    let current_turn = bridge_pipeline_baseline.next_turn.max(1);
+                    let mut feedback = astra_turn_core::context_feedback::ContextFeedback::from_usage(
+                        usage_snapshot.input_tokens,
+                        usage_snapshot.cached_input_tokens,
+                        usage_snapshot.cache_creation_tokens,
+                        usage_snapshot.output_tokens,
+                        false,
                     );
-                    let cache_read = usage_snapshot.cached_input_tokens;
-                    if let Some(event) = cache_detector.detect_break(&fp, cache_read) {
-                        let causes: Vec<String> = event.causes.iter().map(|c| c.to_string()).collect();
-                        eprintln!("[cache_diagnostics] cache break: {} | {}",
-                            causes.join(", "), cache_detector.stats_summary());
+                    if let Some(current_snapshot) = bridge_prompt_snapshot_from_messages(
+                        &llm_messages,
+                        &pruned_tools,
+                        capture_model,
+                        &provider,
+                    ) {
+                        if let Some(previous_snapshot) =
+                            bridge_pipeline_baseline.previous_prompt_snapshot.clone()
+                        {
+                            let mut detector =
+                                astra_turn_core::cache_diagnostics::CacheBreakDetector::new();
+                            let _ = detector.record_turn_for_source(
+                                "bridge_inprocess",
+                                previous_snapshot,
+                                bridge_pipeline_baseline.previous_cache_read_tokens,
+                            );
+                            if let Some(event) = detector.record_turn_for_source(
+                                "bridge_inprocess",
+                                current_snapshot,
+                                Some(usage_snapshot.cached_input_tokens),
+                            ) {
+                                feedback.attribute_cache_break(event.reason);
+                            }
+                        }
+                    }
+
+                    let feedback_evt =
+                        astra_turn_core::pipeline_journal::PipelineJournalEvent::from_feedback(
+                            current_turn,
+                            capture_model,
+                            &feedback,
+                        );
+                    if let Ok(payload) = serde_json::to_value(&feedback_evt) {
+                        buf.record(
+                            astra_services::session_journal::JournalEvent::pipeline_feedback(
+                                (!session_id.is_empty()).then_some(session_id.as_str()),
+                                current_turn,
+                                payload,
+                            ),
+                        );
+                    }
+
+                    for alert in astra_turn_core::trace_alert::evaluate_alerts(
+                        current_turn,
+                        &feedback,
+                        &bridge_pipeline_baseline.stats,
+                        &astra_turn_core::recovery_state::RecoveryState::default(),
+                    ) {
+                        let alert_evt =
+                            astra_turn_core::pipeline_journal::PipelineJournalEvent::from_alert(
+                                &alert,
+                            );
+                        if let Ok(payload) = serde_json::to_value(&alert_evt) {
+                            buf.record(
+                                astra_services::session_journal::JournalEvent::pipeline_alert(
+                                    (!session_id.is_empty()).then_some(session_id.as_str()),
+                                    current_turn,
+                                    payload,
+                                ),
+                            );
+                        }
                     }
                 }
 

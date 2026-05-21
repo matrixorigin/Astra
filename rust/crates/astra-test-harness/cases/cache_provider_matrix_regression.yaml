@@ -19,10 +19,12 @@ steps:
   - prompt: 'Reply ACK. Do not call any tools.'
   - prompt: 'Reply ACK. Do not call any tools.'
 criteria:
-  - type: exit_code
-    code: 0
-  - type: pipeline_alert_count
-    rule: prompt_cache_break
-    max: 0
-  - type: pipeline_avg_cache_hit_ratio
-    min: 0.25
+  - type: all_of
+    criteria:
+      - type: exit_code
+        code: 0
+      - type: pipeline_alert_count
+        rule: prompt_cache_break
+        max: 0
+      - type: pipeline_avg_cache_hit_ratio
+        min: 0.25

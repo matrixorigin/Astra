@@ -5,8 +5,11 @@
 //! frequency, pressure evolution, and alert timeline.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::session_capture::SessionCapture;
+
+const RAW_CACHE_BREAK_MIN_RATIO: f64 = 0.25;
 
 /// Aggregate pipeline health metrics for a session.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -39,7 +42,8 @@ pub struct PipelineAlertEntry {
 /// Analyze a session capture for pipeline health.
 pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport {
     let mut report = PipelineHealthReport::default();
-    let mut ratios = Vec::new();
+    let mut feedback_ratios = Vec::new();
+    let mut raw_usage_ratios = Vec::new();
 
     for event in &capture.events {
         let metadata = event.raw.get("metadata");
@@ -49,8 +53,12 @@ pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport
                 if let Some(meta) = metadata
                     && let Some(ratio) = meta.get("cache_hit_ratio").and_then(|v| v.as_f64())
                 {
-                    ratios.push(ratio);
-                    report.turns_with_feedback += 1;
+                    feedback_ratios.push(ratio);
+                }
+            }
+            "llm_response_full" => {
+                if let Some(ratio) = raw_llm_response_cache_hit_ratio(event) {
+                    raw_usage_ratios.push(ratio);
                 }
             }
             "PipelineCompactionAudit" => {
@@ -93,12 +101,173 @@ pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport
         }
     }
 
-    report.cache_hit_ratios = ratios.clone();
-    if !ratios.is_empty() {
-        report.avg_cache_hit_ratio = ratios.iter().sum::<f64>() / ratios.len() as f64;
+    if report.prompt_cache_breaks == 0 {
+        let raw_breaks = detect_raw_prompt_cache_breaks(capture);
+        report.prompt_cache_breaks = raw_breaks.len() as u32;
+        report.alerts.extend(raw_breaks);
+    }
+
+    report.cache_hit_ratios = if feedback_ratios.is_empty() {
+        raw_usage_ratios
+    } else {
+        feedback_ratios
+    };
+    report.turns_with_feedback = report.cache_hit_ratios.len() as u32;
+    if !report.cache_hit_ratios.is_empty() {
+        report.avg_cache_hit_ratio =
+            report.cache_hit_ratios.iter().sum::<f64>() / report.cache_hit_ratios.len() as f64;
     }
 
     report
+}
+
+fn raw_llm_response_cache_hit_ratio(event: &crate::session_capture::JournalEvent) -> Option<f64> {
+    let usage = event
+        .raw
+        .get("metadata")
+        .and_then(|meta| meta.get("response"))
+        .and_then(|response| response.get("response"))
+        .and_then(|response| response.get("usage"))?;
+
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_read_tokens = usage
+        .get("cached_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_creation_tokens = usage
+        .get("cache_creation_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let total_input = input_tokens
+        .saturating_add(cache_read_tokens)
+        .saturating_add(cache_creation_tokens);
+    if total_input == 0 {
+        return None;
+    }
+    Some(cache_read_tokens as f64 / total_input as f64)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawPromptFingerprint {
+    provider: String,
+    model: String,
+    system_prompt: String,
+    tools_json: String,
+}
+
+#[derive(Debug, Clone)]
+struct RawPromptTurn {
+    turn: u32,
+    fingerprint: RawPromptFingerprint,
+    cache_hit_ratio: f64,
+}
+
+fn detect_raw_prompt_cache_breaks(capture: &SessionCapture) -> Vec<PipelineAlertEntry> {
+    let mut turns = Vec::new();
+    let mut pending_request: Option<RawPromptFingerprint> = None;
+    let mut response_turn = 0u32;
+
+    for event in &capture.events {
+        match event.event_type.as_str() {
+            "llm_request_full" => {
+                pending_request = raw_prompt_fingerprint(event);
+            }
+            "llm_response_full" => {
+                response_turn = response_turn.saturating_add(1);
+                let Some(fingerprint) = pending_request.take() else {
+                    continue;
+                };
+                let Some(cache_hit_ratio) = raw_llm_response_cache_hit_ratio(event) else {
+                    continue;
+                };
+                turns.push(RawPromptTurn {
+                    turn: response_turn,
+                    fingerprint,
+                    cache_hit_ratio,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let mut alerts = Vec::new();
+    for pair in turns.windows(2) {
+        let previous = &pair[0];
+        let current = &pair[1];
+        let fingerprint_changed = previous.fingerprint != current.fingerprint;
+        let crossed_below_floor = previous.cache_hit_ratio >= RAW_CACHE_BREAK_MIN_RATIO
+            && current.cache_hit_ratio < RAW_CACHE_BREAK_MIN_RATIO;
+        if (fingerprint_changed || crossed_below_floor)
+            && current.cache_hit_ratio < RAW_CACHE_BREAK_MIN_RATIO
+        {
+            alerts.push(PipelineAlertEntry {
+                turn: current.turn,
+                rule: "prompt_cache_break".into(),
+                severity: "warning".into(),
+            });
+        }
+    }
+    alerts
+}
+
+fn raw_prompt_fingerprint(
+    event: &crate::session_capture::JournalEvent,
+) -> Option<RawPromptFingerprint> {
+    let metadata = event.raw.get("metadata")?;
+    let request = metadata.get("request")?;
+    let messages = request.get("messages")?.as_array()?;
+    let system_prompt = messages
+        .iter()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+        .or_else(|| messages.first())
+        .map(message_content_text)
+        .unwrap_or_default();
+    let tools_json =
+        serde_json::to_string(request.get("tools").unwrap_or(&Value::Array(vec![]))).ok()?;
+    Some(RawPromptFingerprint {
+        provider: metadata
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        model: metadata
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        system_prompt,
+        tools_json,
+    })
+}
+
+fn message_content_text(message: &Value) -> String {
+    content_value_text(message.get("content").unwrap_or(&Value::Null))
+}
+
+fn content_value_text(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| item.as_str().map(str::to_string))
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        Value::Object(map) => map
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default()),
+        _ => value.to_string(),
+    }
 }
 
 /// Render a human-readable pipeline health summary.
@@ -230,6 +399,61 @@ mod tests {
         }
     }
 
+    fn make_llm_request_event(
+        model: &str,
+        provider: &str,
+        system_prompt: Value,
+        tools: Value,
+    ) -> JournalEvent {
+        JournalEvent {
+            event_type: "llm_request_full".into(),
+            raw: serde_json::json!({
+                "type": "llm_request_full",
+                "metadata": {
+                    "model": model,
+                    "provider": provider,
+                    "request": {
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": system_prompt,
+                            },
+                            {
+                                "role": "user",
+                                "content": "Reply ACK.",
+                            }
+                        ],
+                        "tools": tools,
+                    }
+                }
+            }),
+        }
+    }
+
+    fn make_llm_response_event(
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        cache_creation_tokens: u64,
+    ) -> JournalEvent {
+        JournalEvent {
+            event_type: "llm_response_full".into(),
+            raw: serde_json::json!({
+                "type": "llm_response_full",
+                "metadata": {
+                    "response": {
+                        "response": {
+                            "usage": {
+                                "input_tokens": input_tokens,
+                                "cached_input_tokens": cached_input_tokens,
+                                "cache_creation_tokens": cache_creation_tokens,
+                            }
+                        }
+                    }
+                }
+            }),
+        }
+    }
+
     #[test]
     fn empty_session_produces_empty_report() {
         let capture = make_capture(vec![]);
@@ -250,6 +474,100 @@ mod tests {
         assert_eq!(report.turns_with_feedback, 4);
         assert_eq!(report.cache_hit_ratios.len(), 4);
         assert!(report.avg_cache_hit_ratio > 0.5);
+    }
+
+    #[test]
+    fn llm_response_usage_fallback_produces_cache_trend() {
+        let capture = make_capture(vec![
+            make_llm_response_event(9_984, 5, 0),
+            make_llm_response_event(162, 10_112, 0),
+            make_llm_response_event(172, 10_112, 0),
+        ]);
+        let report = analyze_pipeline_health(&capture);
+        assert_eq!(report.turns_with_feedback, 3);
+        assert_eq!(report.cache_hit_ratios.len(), 3);
+        assert!(report.cache_hit_ratios[0] < 0.01);
+        assert!(report.cache_hit_ratios[1] > 0.9);
+        assert!(report.avg_cache_hit_ratio > 0.6);
+    }
+
+    #[test]
+    fn pipeline_feedback_takes_precedence_over_raw_usage_fallback() {
+        let capture = make_capture(vec![
+            make_llm_response_event(100, 9_900, 0),
+            make_feedback_event(1, 0.2),
+        ]);
+        let report = analyze_pipeline_health(&capture);
+        assert_eq!(report.turns_with_feedback, 1);
+        assert_eq!(report.cache_hit_ratios, vec![0.2]);
+    }
+
+    #[test]
+    fn raw_prompt_break_detection_flags_cache_drop_without_pipeline_alerts() {
+        let capture = make_capture(vec![
+            make_llm_request_event(
+                "m",
+                "openai",
+                Value::String("system".into()),
+                serde_json::json!([]),
+            ),
+            make_llm_response_event(100, 900, 0),
+            make_llm_request_event(
+                "m",
+                "openai",
+                Value::String("system".into()),
+                serde_json::json!([]),
+            ),
+            make_llm_response_event(100, 900, 0),
+            make_llm_request_event(
+                "m",
+                "openai",
+                Value::String("system".into()),
+                serde_json::json!([]),
+            ),
+            make_llm_response_event(1_000, 0, 0),
+        ]);
+        let report = analyze_pipeline_health(&capture);
+        assert_eq!(report.prompt_cache_breaks, 1);
+        assert_eq!(
+            report
+                .alerts
+                .iter()
+                .filter(|alert| alert.rule == "prompt_cache_break")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn explicit_prompt_cache_break_alerts_suppress_raw_duplicates() {
+        let capture = make_capture(vec![
+            make_alert_event(3, "prompt_cache_break", "warning"),
+            make_llm_request_event(
+                "m",
+                "openai",
+                Value::String("system".into()),
+                serde_json::json!([]),
+            ),
+            make_llm_response_event(100, 900, 0),
+            make_llm_request_event(
+                "m",
+                "openai",
+                Value::String("system".into()),
+                serde_json::json!([]),
+            ),
+            make_llm_response_event(1_000, 0, 0),
+        ]);
+        let report = analyze_pipeline_health(&capture);
+        assert_eq!(report.prompt_cache_breaks, 1);
+        assert_eq!(
+            report
+                .alerts
+                .iter()
+                .filter(|alert| alert.rule == "prompt_cache_break")
+                .count(),
+            1
+        );
     }
 
     #[test]

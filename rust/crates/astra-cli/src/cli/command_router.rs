@@ -2455,6 +2455,7 @@ pub(super) async fn execute_cli_command(
             );
             params.pre_loaded_messages = continuation_messages.take();
             params.append_system_prompt = args.append_system_prompt.clone();
+            let turn_start = std::time::Instant::now();
             let mut sr = match stream_chat_sse(params).await {
                 Ok(sr) => sr,
                 Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
@@ -2476,6 +2477,13 @@ pub(super) async fn execute_cli_command(
             if let Some(sid) = &sr.session_id {
                 persist_profile_last_session(profile.as_deref(), sid)?;
             }
+            super::chat_turn::append_one_shot_journal_events(
+                sr.session_id.as_deref(),
+                args.model.as_deref().or(global_model.as_deref()),
+                &message,
+                &sr,
+                turn_start,
+            );
 
             // Drain any background-spawned child agents before
             // returning. Without this, background tasks (the
