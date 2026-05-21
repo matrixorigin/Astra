@@ -225,14 +225,14 @@ pub async fn run_chat_run_pause_resume_http() {
             "model": mock_model,
             "context": {
                 "test_llm_rounds": [
-                    {
-                        "full_text": "matrix e2e pause/resume completed"
-                    }
+                    {"full_text": "turn 1"},
+                    {"full_text": "turn 2"},
+                    {"full_text": "turn 3"}
                 ]
             },
             "execution_budget": {
                 "initial_turns": 1,
-                "hard_turn_limit": 1
+                "hard_turn_limit": 3
             }
         }),
     )
