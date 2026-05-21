@@ -902,43 +902,19 @@ impl MemoriaClient {
         // `build_direct_request` for the `remember` branch. No
         // pre-normalization needed here.
 
-        let (endpoint, mut payload, auth_header, method) = if let (Some(cloud_base), Some(token)) =
-            (&self.cloud_base, &self.cloud_token)
-        {
-            // Cloud proxy: route v2 verbs via a dedicated `/memory/v2/:op`
-            // namespace so the server-side executor can translate to v1
-            // using its own credentials. If the cloud doesn't implement
-            // v2 yet, the fall-through direct path still works via the
-            // agent's own MEMORIA_MASTER_KEY.
-            (
-                format!("{cloud_base}/memory/v2/{op}"),
-                args.clone(),
-                format!("Bearer {token}"),
-                HttpMethod::Post,
-            )
-        } else {
-            let mem = astra_core::MemoriaSettings::from_env();
-            let key = match mem.master_key {
-                Some(k) => k,
-                None => {
-                    return json!({
-                            "error": "Memory unavailable: not connected to cloud and MEMORIA_MASTER_KEY not set",
-                            "hint": "Login with /login to enable cloud-backed memory with user isolation"
-                        })
-                        .to_string();
-                }
-            };
-            let (ep, pl, m) = Self::build_direct_request(&mem.base_url, op, args);
-            if ep.is_empty() {
-                // Validation errors (and anything else the mapper decides
-                // to short-circuit) return the payload verbatim. Must
-                // happen BEFORE the auto-snapshot below so rejected
-                // calls don't produce orphan `pre_<op>_*` snapshots.
-                return pl.to_string();
-            }
-            (ep, pl, format!("Bearer {key}"), m)
+        let (endpoint, mut payload, auth_header, method) = match Self::build_request_transport(
+            self.cloud_base.as_deref(),
+            self.cloud_token.as_deref(),
+            op,
+            args,
+        ) {
+            Ok(request) => request,
+            Err(response) => return response,
         };
 
+        // `build_request_transport` preserves the old `if ep.is_empty()`
+        // short-circuit before we reach this point, so rejected destructive
+        // calls still bypass auto-snapshot creation.
         // Auto-snapshot before destructive ops so `memory_rollback` is a
         // real recovery path. Happens AFTER validation (endpoint is
         // non-empty, required args were verified) so rejected
@@ -989,16 +965,33 @@ impl MemoriaClient {
                     .send()
                     .await
                 {
-                    Ok(resp) => match resp.text().await {
-                        Ok(text) => {
-                            self.fail_count.store(0, Ordering::Relaxed);
-                            text
+                    Ok(resp) => {
+                        let status = resp.status();
+                        match resp.text().await {
+                            Ok(text) => {
+                                if !status.is_success() {
+                                    self.fail_count.fetch_add(1, Ordering::Relaxed);
+                                    json!({
+                                        "error": format!(
+                                            "memoria request failed: status={status}, body={}",
+                                            text.trim()
+                                        )
+                                    })
+                                    .to_string()
+                                } else if text.trim().is_empty() {
+                                    self.fail_count.store(0, Ordering::Relaxed);
+                                    Self::empty_success_response(op, args).to_string()
+                                } else {
+                                    self.fail_count.store(0, Ordering::Relaxed);
+                                    text
+                                }
+                            }
+                            Err(e) => {
+                                self.fail_count.fetch_add(1, Ordering::Relaxed);
+                                json!({"error": format!("read response: {e}")}).to_string()
+                            }
                         }
-                        Err(e) => {
-                            self.fail_count.fetch_add(1, Ordering::Relaxed);
-                            json!({"error": format!("read response: {e}")}).to_string()
-                        }
-                    },
+                    }
                     Err(e) => {
                         self.fail_count.fetch_add(1, Ordering::Relaxed);
                         json!({"error": format!("memoria request failed: {e}")}).to_string()
@@ -1029,6 +1022,84 @@ impl MemoriaClient {
             return decorated;
         }
         raw_text
+    }
+
+    fn build_request_transport(
+        cloud_base: Option<&str>,
+        cloud_token: Option<&str>,
+        op: &str,
+        args: &Value,
+    ) -> Result<(String, Value, String, HttpMethod), String> {
+        if let (Some(cloud_base), Some(token)) = (cloud_base, cloud_token)
+            && let Some((endpoint, payload, method)) =
+                Self::build_cloud_proxy_request(cloud_base, op, args)
+        {
+            if endpoint.is_empty() {
+                return Err(payload.to_string());
+            }
+            return Ok((endpoint, payload, format!("Bearer {token}"), method));
+        }
+
+        let mem = astra_core::MemoriaSettings::from_env();
+        let key = match mem.master_key {
+            Some(k) => k,
+            None => {
+                return Err(
+                    json!({
+                        "error": "Memory unavailable: not connected to cloud and MEMORIA_MASTER_KEY not set",
+                        "hint": "Login with /login to enable cloud-backed memory with user isolation"
+                    })
+                    .to_string(),
+                );
+            }
+        };
+        let (ep, pl, m) = Self::build_direct_request(&mem.base_url, op, args);
+        if ep.is_empty() {
+            return Err(pl.to_string());
+        }
+        Ok((ep, pl, format!("Bearer {key}"), m))
+    }
+
+    fn build_cloud_proxy_request(
+        cloud_base: &str,
+        op: &str,
+        args: &Value,
+    ) -> Option<(String, Value, HttpMethod)> {
+        let (direct_endpoint, payload, method) = Self::build_direct_request("", op, args);
+        if direct_endpoint.is_empty() {
+            return Some((String::new(), payload, method));
+        }
+        let endpoint = match direct_endpoint.as_str() {
+            "/v1/memories" => format!("{cloud_base}/memory/store"),
+            "/v1/memories/retrieve" => format!("{cloud_base}/memory/retrieve"),
+            "/v1/memories/purge" => format!("{cloud_base}/memory/purge"),
+            _ => return None,
+        };
+        Some((endpoint, payload, method))
+    }
+
+    fn empty_success_response(op: &str, args: &Value) -> Value {
+        match op {
+            "recall" => json!([]),
+            "remember" => json!({
+                "status": "ok",
+                "message": "memory stored",
+                "content": args.get("content").and_then(Value::as_str).unwrap_or(""),
+            }),
+            "forget" => json!({
+                "status": "ok",
+                "message": "memory purge completed",
+            }),
+            "update" => json!({
+                "status": "ok",
+                "message": "memory updated",
+            }),
+            "feedback" => json!({
+                "status": "ok",
+                "message": "memory feedback recorded",
+            }),
+            _ => json!({"status": "ok"}),
+        }
     }
 
     /// Boost search: best-effort memory lookup on the critical path.
@@ -2115,6 +2186,54 @@ mod tests {
         let args = json!({"query": "q", "min_confidence": 0.7});
         let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "recall", &args);
         assert_eq!(pl["min_confidence"], json!(0.7));
+    }
+
+    #[test]
+    fn build_cloud_proxy_request_maps_remember_to_store_route() {
+        let args = json!({
+            "content": "prefers smoke tests",
+            "memory_type": "profile",
+            "session_id": "sess-1",
+            "user_id": "user-1"
+        });
+        let (endpoint, payload, method) =
+            MemoriaClient::build_cloud_proxy_request("https://cloud.example", "remember", &args)
+                .expect("cloud remember route");
+        assert_eq!(endpoint, "https://cloud.example/memory/store");
+        assert!(matches!(method, HttpMethod::Post));
+        assert_eq!(payload["content"], "prefers smoke tests");
+    }
+
+    #[test]
+    fn build_cloud_proxy_request_maps_recall_to_retrieve_route() {
+        let args = json!({
+            "query": "smoke tests",
+            "session_id": "sess-1",
+            "user_id": "user-1"
+        });
+        let (endpoint, payload, method) =
+            MemoriaClient::build_cloud_proxy_request("https://cloud.example", "recall", &args)
+                .expect("cloud recall route");
+        assert_eq!(endpoint, "https://cloud.example/memory/retrieve");
+        assert!(matches!(method, HttpMethod::Post));
+        assert_eq!(payload["query"], "smoke tests");
+    }
+
+    #[test]
+    fn empty_success_response_recall_returns_empty_array() {
+        let value = MemoriaClient::empty_success_response("recall", &json!({"query": "q"}));
+        assert_eq!(value, json!([]));
+    }
+
+    #[test]
+    fn empty_success_response_remember_returns_ack() {
+        let value = MemoriaClient::empty_success_response(
+            "remember",
+            &json!({"content": "prefers smoke tests"}),
+        );
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["message"], "memory stored");
+        assert_eq!(value["content"], "prefers smoke tests");
     }
 
     // ── Session isolation via v2 `scope` → v1 `session_scope` ──
