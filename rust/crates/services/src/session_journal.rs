@@ -837,9 +837,8 @@ pub enum JournalEventType {
     /// Full LLM response payload for a single attempt within a round.
     LlmResponseFull,
     /// Background session-memory (session-memory.md) extraction completed.
-    /// Distinct from legacy Memoria memory extraction: this event
-    /// describes a single atomic rewrite of the session-memory L1
-    /// artifact, not a Memoria store.
+    /// Describes a single atomic rewrite of the session-memory L1
+    /// artifact.
     SessionMemoryExtraction,
     /// Context pipeline per-turn feedback (cache ratio, tokens, tier).
     PipelineFeedback,
@@ -3439,7 +3438,6 @@ impl JournalEvent {
 
     /// Session-memory (session-memory.md) extraction outcome event.
     ///
-    /// Distinct from the legacy Memoria memory-extraction event.
     /// Metadata is a flat, self-describing object driven by the
     /// [`SessionMemoryExtractionOutcome`] enum.
     pub fn session_memory_extraction(

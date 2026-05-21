@@ -1,13 +1,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use astra_services::session_journal::{
     SessionMemoryExtractionErrorReason, SessionMemoryExtractionSource,
 };
 use astra_turn_core::cloud_session_memory_extract::{
-    SESSION_MEMORY_TEMPLATE, build_extraction_prompt,
+    build_extraction_prompt, SESSION_MEMORY_TEMPLATE,
 };
 
 use crate::memory_relevance::LlmConnParams;
@@ -17,7 +17,7 @@ use crate::turn::llm_client::{
     parse_nonstream_response_for_provider,
 };
 
-pub(crate) const SESSION_MEMORY_PREFIX: &str = "[@session/memory]";
+pub const SESSION_MEMORY_PREFIX: &str = "[@session/memory]";
 
 /// What the worker produced.
 pub enum ExtractionArtifacts {
@@ -101,14 +101,14 @@ pub async fn run_extraction(
     }
 }
 
-pub(crate) fn encode_session_memory_entry(session_id: &str, content: &str) -> String {
+pub fn encode_session_memory_entry(session_id: &str, content: &str) -> String {
     format!(
         "{SESSION_MEMORY_PREFIX}\nsession_id={session_id}\n\n{}",
         content.trim()
     )
 }
 
-pub(crate) fn decode_session_memory_entry(raw: &str, session_id: &str) -> Option<String> {
+pub fn decode_session_memory_entry(raw: &str, session_id: &str) -> Option<String> {
     let trimmed = raw.trim();
     if !trimmed.starts_with(SESSION_MEMORY_PREFIX) {
         return None;

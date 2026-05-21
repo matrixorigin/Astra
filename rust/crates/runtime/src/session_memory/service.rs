@@ -51,6 +51,8 @@ use super::observatory::{
 use super::request::{ExtractionRequest, SpawnDecision};
 use super::runner::{ExtractionArtifacts, run_extraction};
 
+type LocalJournalEventSink = dyn Fn(&JournalEvent) + Send + Sync + 'static;
+
 /// Hard upper bound on one LLM call. Memory extraction is background
 /// work; a hung call must never linger past this.
 pub const LLM_TIMEOUT: Duration = Duration::from_secs(30);
@@ -133,6 +135,7 @@ pub struct MemoryExtractionService {
     /// — including skips — when this is `Some`. No effect on LLM
     /// payloads or cache hashes by construction.
     observatory: Option<Arc<SessionMemoryObservatory>>,
+    local_event_sink: Option<Arc<LocalJournalEventSink>>,
 }
 
 impl std::fmt::Debug for MemoryExtractionService {
@@ -169,6 +172,7 @@ impl MemoryExtractionService {
             pending_done: Arc::new(tokio::sync::Notify::new()),
             session_states: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             observatory: None,
+            local_event_sink: None,
         }
     }
 
@@ -177,6 +181,16 @@ impl MemoryExtractionService {
     /// site so both surfaces populate a single ring set for introspect.
     pub fn with_observatory(mut self, observatory: Arc<SessionMemoryObservatory>) -> Self {
         self.observatory = Some(observatory);
+        self
+    }
+
+    /// Mirror emitted journal events into a caller-owned local sink.
+    ///
+    /// CLI uses this to append session-memory extraction events to the
+    /// local `~/.astra/sessions/*.jsonl` journal even though cloud
+    /// ingestion remains server-owned.
+    pub fn with_local_event_sink(mut self, sink: Arc<LocalJournalEventSink>) -> Self {
+        self.local_event_sink = Some(sink);
         self
     }
 
@@ -874,6 +888,9 @@ impl MemoryExtractionService {
     // ── event emission helpers ────────────────────────────────────────
 
     fn enqueue(&self, event: JournalEvent) {
+        if let Some(sink) = self.local_event_sink.as_ref() {
+            sink(&event);
+        }
         let ingestion_event = IngestionEvent::from_journal_event(&event, &self.user_id);
         self.ingestion.enqueue(ingestion_event);
     }

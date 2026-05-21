@@ -1302,8 +1302,6 @@ pub(super) async fn handle_info_command(
             state.total_prompt_tokens += sr.prompt_tokens;
             state.total_completion_tokens += sr.completion_tokens;
             state.recent_tools = sr.tools_used.clone();
-            state.recent_memory_actions =
-                super::memory_extraction::extract_memory_actions(&sr.tool_call_records);
 
             // Write turn event to journal (same as normal chat turns).
             if let Some(journal) = state.journal.as_ref() {

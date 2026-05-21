@@ -202,24 +202,6 @@ pub(super) async fn finalize_session(state: &mut SessionState) {
             });
         }
     }
-    // 3f. Drain any in-flight memory extraction (bounded 5s).
-    //
-    // Use the centralized journal_event_for_outcome builder so that
-    // variant-specific metadata (prior_turn for SkippedBusy, error string
-    // for Error) reaches the session-end journal — previously the manual
-    // constructor here dropped those fields and operators investigating
-    // a session end saw only `tag=skipped_busy` with no blocker context.
-    if let Some(outcome) = state.memory_extractor.drain(Duration::from_secs(5)).await {
-        if let Some(ref j) = state.journal {
-            let evt = super::memory_extraction::journal_event_for_outcome(
-                state.session_id.as_deref(),
-                state.turn,
-                &outcome,
-            );
-            let _ = j.append(&evt);
-            enqueue_ingestion_pub(state, &evt);
-        }
-    }
     // 3e. End observability only after session-derived lessons/outcomes have
     // been persisted so the lifecycle boundary matches the data flow.
     if let (Some(hub), Some(session_id)) = (&state.observability_hub, &state.session_id) {

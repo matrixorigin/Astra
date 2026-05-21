@@ -1370,11 +1370,11 @@ pub(crate) fn handle_view_result(
         return;
     }
 
-    // Model name → apply
-    state.model = Some(name.to_string());
-    crate::slash_config::set_active_model_for_display(Some(name.to_string()));
-    bottom_pane.footer.model = Some(name.to_string());
-    chat_widget.commit_system(SystemCell::response(format!("Set model to {name}")));
+    // Unknown picker results must stay inert here. Model picks are
+    // routed asynchronously by the outer event loop via
+    // `MODEL_PICK_SENTINEL`; treating arbitrary selection text as a
+    // model lets unrelated pickers (notably `/memory` results) poison
+    // `state.model`.
 }
 
 fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane) {
@@ -2968,27 +2968,26 @@ mod view_result_tests {
     }
 
     #[test]
-    fn model_selection_updates_footer_and_commits_feedback() {
+    fn arbitrary_selection_does_not_mutate_model() {
         let mut state = SessionState::default();
+        state.model = Some("deepseek-v4-pro".to_string());
         let mut bottom_pane = BottomPane::new();
+        bottom_pane.footer.model = Some("deepseek-v4-pro".to_string());
         let mut chat_widget = ChatWidget::new("");
 
         handle_view_result(
-            "claude-sonnet-4.6",
+            "[working] [@session/memory] foo",
             &mut state,
             &mut bottom_pane,
             &mut chat_widget,
         );
 
-        assert_eq!(state.model.as_deref(), Some("claude-sonnet-4.6"));
+        assert_eq!(state.model.as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(
             bottom_pane.footer.model.as_deref(),
-            Some("claude-sonnet-4.6")
+            Some("deepseek-v4-pro")
         );
-        assert_eq!(
-            last_system_message(&chat_widget).as_deref(),
-            Some("Set model to claude-sonnet-4.6")
-        );
+        assert!(chat_widget.history().is_empty());
     }
 }
 

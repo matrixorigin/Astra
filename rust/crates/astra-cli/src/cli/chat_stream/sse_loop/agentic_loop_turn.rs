@@ -341,7 +341,8 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     touch_prep_ui_phase(&ctx.prep_ui_phase, "Starting…");
 
     let git_branch = read_git_branch_abbrev();
-    let (resolved_model, thinking_config) = match ctx.model {
+    let requested_model = astra_core::model_override::normalize_model_override(ctx.model);
+    let (resolved_model, thinking_config) = match requested_model {
         Some(m) => {
             let (name, cfg) = astra_turn_core::thinking_config::resolve_model_thinking(m);
             // Per-turn dampener: the model suffix encodes the user's CEILING
@@ -411,7 +412,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     let budget_pressure = {
         let schema_tokens = ctx.registry.total_pinned_token_cost();
-        budget_pressure_for_chat_turn(ctx.messages, ctx.model, schema_tokens as usize)
+        budget_pressure_for_chat_turn(ctx.messages, requested_model, schema_tokens as usize)
     };
 
     let semantic_query = semantic_query_from_message(ctx.message);
@@ -592,8 +593,8 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     let tool_surface =
         tool_registry::surface::ToolSurface::from_runtime_config(ctx.registry.all_tool_schemas());
-    if let Some(deferred_tools_text) = tool_surface.deferred_block_text(ctx.model) {
-        let deferred_tools_context_window = prompts::budget_for_model(ctx.model).model_limit;
+    if let Some(deferred_tools_text) = tool_surface.deferred_block_text(requested_model) {
+        let deferred_tools_context_window = prompts::budget_for_model(requested_model).model_limit;
         merge_edge_profile_extensions(
             &mut payload,
             &json!({
@@ -789,7 +790,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     // ─── Record token budget estimate to trace collector (M1 observability) ───
     if let Some(collector) = ctx.telem.trace_collector {
         let schema_tokens = selected_tool_tokens_total;
-        let budget = prompts::budget_for_model(ctx.model);
+        let budget = prompts::budget_for_model(requested_model);
         let max_tokens = budget.model_limit as u32;
         let history_messages = retained_history_messages(ctx.messages);
 

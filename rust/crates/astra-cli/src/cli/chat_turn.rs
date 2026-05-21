@@ -1123,7 +1123,7 @@ async fn run_chat_turn(
             auth_profile: ctx.profile,
             message,
             session_id,
-            model: state.model.as_deref(),
+            model: astra_core::model_override::normalize_model_override(state.model.as_deref()),
             provider: None,
             explain: state.explain,
             render_md: true,
@@ -1723,7 +1723,8 @@ fn commit_turn_journal_workspace_and_sidecars(
         let bridge_pipeline_events = build_bridge_pipeline_journal_events(
             state.session_id.as_deref(),
             state.turn,
-            state.model.as_deref().unwrap_or("unknown"),
+            astra_core::model_override::normalize_model_override(state.model.as_deref())
+                .unwrap_or("unknown"),
             &turn_observability_events,
         );
         turn_observability_events.extend(bridge_pipeline_events);
@@ -1736,7 +1737,7 @@ fn commit_turn_journal_workspace_and_sidecars(
         let mut turn_event = session_journal::JournalEvent::turn(
             state.session_id.as_deref(),
             state.turn,
-            state.model.as_deref(),
+            astra_core::model_override::normalize_model_override(state.model.as_deref()),
             line,
             &result.full_text,
             result.tool_calls_count,
@@ -2220,64 +2221,6 @@ async fn apply_turn_success_async(
     }
     check_skill_improvement_async(state).await;
 
-    // Background memory extraction: analyze this turn for durable memories.
-    let tools_used: Vec<String> = state.recent_tools.to_vec();
-    let recent_memory_actions: Vec<String> = state.recent_memory_actions.to_vec();
-    let extraction_turn = state.turn;
-
-    // Resolve fork prefix for extraction cache sharing: look up the
-    // current run's captured prefix from the spawner's store.
-    let fork_prefix = state
-        .agent_spawner
-        .as_ref()
-        .and_then(|s| s.prefix_store())
-        .and_then(|store| {
-            state
-                .run_id
-                .as_deref()
-                .and_then(|rid| store.get_prefix(rid))
-        });
-
-    state
-        .memory_extractor
-        .set_enabled(state.auto_memory_enabled);
-    let outcome =
-        state
-            .memory_extractor
-            .maybe_extract(super::memory_extraction::ExtractionContext {
-                turn: extraction_turn,
-                memory_model_params: state.memory_model_params.as_ref(),
-                user_message: line,
-                assistant_response: state.last_response.as_deref().unwrap_or(""),
-                tools_used: &tools_used,
-                recent_memory_actions: &recent_memory_actions,
-                session_id: state.session_id.as_deref(),
-                existing_manifest: "",
-                fork_prefix,
-            });
-    // Journal: record extraction skip reasons for audit trail.
-    // Started outcomes are journaled when drain() completes (session end).
-    match &outcome {
-        super::memory_extraction::ExtractionOutcome::SkippedMainWrote
-        | super::memory_extraction::ExtractionOutcome::SkippedNoModel
-        | super::memory_extraction::ExtractionOutcome::SkippedBusy { .. }
-        | super::memory_extraction::ExtractionOutcome::Error(_) => {
-            // Use the centralized builder so variant-specific fields
-            // (prior_turn, error) reach the journal metadata instead of
-            // being silently dropped during manual construction.
-            let evt = super::memory_extraction::journal_event_for_outcome(
-                state.session_id.as_deref(),
-                extraction_turn,
-                &outcome,
-            );
-            enqueue_ingestion(state, &evt);
-            if let Some(ref j) = state.journal {
-                let _ = j.append(&evt);
-            }
-        }
-        _ => {}
-    }
-
     // ── Desktop notification (fire-and-forget) ──────────────────────────
     let elapsed = turn_start.elapsed();
     let notif_config = super::notifications::NotificationConfig {
@@ -2374,8 +2317,6 @@ fn apply_turn_success_sync(
         build_history_text(&result.full_text, &result.tool_call_records),
     ));
     state.recent_tools = result.tools_used.clone();
-    state.recent_memory_actions =
-        super::memory_extraction::extract_memory_actions(&result.tool_call_records);
 
     // Persist tool health for cross-session error budgets
     if !result.tool_health_export.is_empty() {
@@ -3119,7 +3060,10 @@ fn initialize_journal(state: &mut SessionState, session_id: &str) {
             return;
         };
         let start_event =
-            session_journal::JournalEvent::session_start(Some(session_id), state.model.as_deref());
+            session_journal::JournalEvent::session_start(
+                Some(session_id),
+                astra_core::model_override::normalize_model_override(state.model.as_deref()),
+            );
         let _ = journal.append(&start_event);
         // enqueue_ingestion is server-owned and remains a local no-op.
         enqueue_ingestion(state, &start_event);
@@ -3159,7 +3103,8 @@ fn initialize_journal(state: &mut SessionState, session_id: &str) {
             Err(_) => (
                 astra_services::session_workspace::WorkspaceMetadata::new(
                     session_id,
-                    state.model.as_deref().unwrap_or("default"),
+                    astra_core::model_override::normalize_model_override(state.model.as_deref())
+                        .unwrap_or("default"),
                 ),
                 true,
                 false,
@@ -3438,7 +3383,7 @@ fn report_turn_failure(
         let mut err_event = session_journal::JournalEvent::turn_error(
             state.session_id.as_deref(),
             state.turn + 1,
-            state.model.as_deref(),
+            astra_core::model_override::normalize_model_override(state.model.as_deref()),
             line,
             &failure.error,
             turn_start.elapsed().as_millis() as u64,

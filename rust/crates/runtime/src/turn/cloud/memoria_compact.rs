@@ -976,11 +976,19 @@ fn build_memory_context(memories: &[MemoriaMemory], max_tokens: usize) -> String
     let mut total_tokens = 0;
 
     for mem in memories {
-        let mem_tokens = crate::prompts::estimate_str_tokens(&mem.content);
+        let rendered = mem
+            .session_id
+            .as_deref()
+            .and_then(|session_id| {
+                crate::session_memory::runner::decode_session_memory_entry(&mem.content, session_id)
+            })
+            .map(|body| format!("Session memory summary:\n{body}"))
+            .unwrap_or_else(|| mem.content.clone());
+        let mem_tokens = crate::prompts::estimate_str_tokens(&rendered);
         if total_tokens + mem_tokens > max_tokens {
             break;
         }
-        parts.push(format!("• {}", mem.content));
+        parts.push(format!("• {}", rendered.replace('\n', "\n  ")));
         total_tokens += mem_tokens;
     }
 
@@ -1742,6 +1750,24 @@ mod tests {
         let ctx = build_memory_context(&memories, 1000);
         assert!(ctx.contains("User prefers Rust"));
         assert!(ctx.contains("[Session Context from Memory]"));
+    }
+
+    #[test]
+    fn build_memory_context_decodes_session_memory_entries() {
+        let memories = vec![MemoriaMemory {
+            memory_id: "m1".to_string(),
+            content: crate::session_memory::runner::encode_session_memory_entry(
+                "sess-1",
+                "## Active Goals\n- Fix memory\n",
+            ),
+            memory_type: "working".to_string(),
+            session_id: Some("sess-1".to_string()),
+            ..Default::default()
+        }];
+        let ctx = build_memory_context(&memories, 1000);
+        assert!(ctx.contains("Session memory summary"));
+        assert!(ctx.contains("Fix memory"));
+        assert!(!ctx.contains(crate::session_memory::runner::SESSION_MEMORY_PREFIX));
     }
 
     #[test]

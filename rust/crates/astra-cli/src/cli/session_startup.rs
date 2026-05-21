@@ -97,20 +97,22 @@ impl CliSessionMemoryMemoriaClient {
             .collect()
     }
 
-    fn decode_session_memory_entry(raw: &str, session_id: &str) -> Option<String> {
-        let prefix = "[@session/memory]";
-        let trimmed = raw.trim();
-        if !trimmed.starts_with(prefix) {
-            return None;
+    fn track_working_id_from_memories(
+        &self,
+        session_id: &str,
+        memories: &[astra_runtime::turn::cloud::memoria_compact::MemoriaMemory],
+    ) {
+        if let Some(memory) = memories.iter().find(|memory| {
+            astra_runtime::session_memory::runner::decode_session_memory_entry(
+                &memory.content,
+                session_id,
+            )
+            .is_some()
+        }) {
+            if let Ok(mut guard) = self.working_ids.lock() {
+                guard.insert(session_id.to_string(), memory.memory_id.clone());
+            }
         }
-        let rest = trimmed[prefix.len()..].trim_start();
-        let sid_line = rest.lines().next()?.trim();
-        let encoded_sid = sid_line.strip_prefix("session_id=")?.trim();
-        if encoded_sid != session_id {
-            return None;
-        }
-        let content = rest[sid_line.len()..].trim();
-        (!content.is_empty()).then(|| content.to_string())
     }
 }
 
@@ -148,13 +150,8 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaClient for CliSessionMe
             return Err(format!("memory retrieve HTTP {status}"));
         }
         let memories = Self::parse_memories(&payload);
-        if let Some(session_id) = session_id
-            && let Some(memory) = memories.iter().find(|memory| {
-                Self::decode_session_memory_entry(&memory.content, session_id).is_some()
-            })
-            && let Ok(mut guard) = self.working_ids.lock()
-        {
-            guard.insert(session_id.to_string(), memory.memory_id.clone());
+        if let Some(session_id) = session_id {
+            self.track_working_id_from_memories(session_id, &memories);
         }
         Ok(memories)
     }
@@ -238,6 +235,35 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaClient for CliSessionMe
     }
 }
 
+fn build_cli_session_memory_event_sink(
+) -> std::sync::Arc<dyn Fn(&session_journal::JournalEvent) + Send + Sync> {
+    std::sync::Arc::new(|event: &session_journal::JournalEvent| {
+        let Some(session_id) = event.session_id.as_deref().filter(|sid| !sid.is_empty()) else {
+            return;
+        };
+        let writer = match session_journal::JournalWriter::new(session_id) {
+            Ok(writer) => writer,
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    event_type = ?event.event_type,
+                    ?error,
+                    "failed to open local journal for session-memory event"
+                );
+                return;
+            }
+        };
+        if let Err(error) = writer.append(event) {
+            tracing::warn!(
+                session_id,
+                event_type = ?event.event_type,
+                ?error,
+                "failed to append session-memory event to local journal"
+            );
+        }
+    })
+}
+
 async fn build_cli_session_memory_extractor(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
@@ -259,11 +285,11 @@ async fn build_cli_session_memory_extractor(
     let ingestion = astra_services::event_ingestion::IngestionSender::disconnected();
     let broker =
         std::sync::Arc::new(astra_runtime::session_memory::BackgroundActivityBroker::new());
-    Some(std::sync::Arc::new(
-        astra_runtime::session_memory::MemoryExtractionService::new(
-            selector, memoria, ingestion, me.user_id, broker,
-        ),
-    ))
+    let service = astra_runtime::session_memory::MemoryExtractionService::new(
+        selector, memoria, ingestion, me.user_id, broker,
+    )
+    .with_local_event_sink(build_cli_session_memory_event_sink());
+    Some(std::sync::Arc::new(service))
 }
 
 pub(crate) async fn complete_session_startup(
