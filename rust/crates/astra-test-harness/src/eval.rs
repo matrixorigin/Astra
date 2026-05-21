@@ -316,6 +316,7 @@ fn assess_runtime_health(report: &SuiteReport, models: &[String]) -> RuntimeHeal
                 r.failure_class,
                 Some(
                     FailureClass::InfraTimeout
+                        | FailureClass::InfraModelInactive
                         | FailureClass::InfraProviderError { .. }
                         | FailureClass::InfraRateLimit
                 )

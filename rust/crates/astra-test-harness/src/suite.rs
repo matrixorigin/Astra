@@ -282,6 +282,7 @@ impl<'a> SuiteRunner<'a> {
                 class,
                 FailureClass::InfraAuth
                     | FailureClass::InfraTimeout
+                    | FailureClass::InfraModelInactive
                     | FailureClass::InfraProviderError { .. }
                     | FailureClass::InfraRateLimit
             );

@@ -16,6 +16,7 @@ use crate::runner::RunOutcome;
 pub enum FailureClass {
     InfraAuth,
     InfraTimeout,
+    InfraModelInactive,
     InfraProviderError { provider: String },
     InfraRateLimit,
     PlatformSetupFailed,
@@ -32,6 +33,7 @@ impl fmt::Display for FailureClass {
         match self {
             Self::InfraAuth => write!(f, "InfraAuth"),
             Self::InfraTimeout => write!(f, "InfraTimeout"),
+            Self::InfraModelInactive => write!(f, "InfraModelInactive"),
             Self::InfraProviderError { provider } => write!(f, "InfraProviderError({provider})"),
             Self::InfraRateLimit => write!(f, "InfraRateLimit"),
             Self::PlatformSetupFailed => write!(f, "PlatformSetupFailed"),
@@ -58,6 +60,10 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
         return FailureClass::InfraAuth;
     }
 
+    if stderr.contains("is inactive (connectivity failed or disabled)") {
+        return FailureClass::InfraModelInactive;
+    }
+
     if stderr.contains("429")
         || stderr.contains("rate limit")
         || stderr.contains("Too many requests")
@@ -75,7 +81,10 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
     }
 
     // astra exits 3 on auth failure with empty response.
-    if outcome.exit_code == 3 && outcome.text.is_empty() {
+    if outcome.exit_code == 3
+        && outcome.text.is_empty()
+        && !stderr.contains("is inactive (connectivity failed or disabled)")
+    {
         return FailureClass::InfraAuth;
     }
 
@@ -159,6 +168,9 @@ pub fn suggested_action(class: &FailureClass) -> &'static str {
     match class {
         FailureClass::InfraAuth => "Check credentials: run `astra-admin login` or verify API keys",
         FailureClass::InfraTimeout => "Increase timeout or check network connectivity to provider",
+        FailureClass::InfraModelInactive => {
+            "Model is inactive on the server; run `astra-admin model check <model>` or load an active model"
+        }
         FailureClass::InfraProviderError { .. } => {
             "Provider returned an error; check provider status page or retry later"
         }
@@ -302,6 +314,14 @@ mod tests {
     fn exit_3_empty_text_is_auth() {
         let outcome = make_outcome().with_exit_code(3);
         assert_eq!(classify(&outcome, &[]), FailureClass::InfraAuth);
+    }
+
+    #[test]
+    fn model_inactive_is_not_misclassified_as_auth() {
+        let outcome = make_outcome()
+            .with_exit_code(3)
+            .with_stderr("Error: Model 'foo' is inactive (connectivity failed or disabled)");
+        assert_eq!(classify(&outcome, &[]), FailureClass::InfraModelInactive);
     }
 
     #[test]

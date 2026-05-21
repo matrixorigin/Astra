@@ -25,6 +25,17 @@ pub enum PreflightError {
     ModelUnavailable { model: String, detail: String },
 }
 
+fn stderr_indicates_cli_auth_failure(stderr: &str) -> bool {
+    stderr.contains("Could not validate credentials")
+        || stderr.contains("Session expired")
+        || stderr.contains("try /login")
+}
+
+fn stderr_indicates_model_inactive(stderr: &str, model: &str) -> bool {
+    stderr.contains(&format!("Model '{model}' is inactive"))
+        || stderr.contains("is inactive (connectivity failed or disabled)")
+}
+
 /// Run all pre-flight checks in order. Validates binary, server, and
 /// every model in the matrix (not just the first).
 pub async fn run_preflight(astra_bin: &Path, models: &[String]) -> Result<(), PreflightError> {
@@ -110,7 +121,14 @@ async fn check_model(astra_bin: &Path, model: &str) -> Result<(), PreflightError
     };
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("Could not validate credentials") || output.status.code() == Some(3) {
+    if stderr_indicates_model_inactive(&stderr, model) {
+        return Err(PreflightError::ModelUnavailable {
+            model: model.to_string(),
+            detail: stderr.trim().to_string(),
+        });
+    }
+
+    if stderr_indicates_cli_auth_failure(&stderr) {
         // Try auto-login: register a harness user and retry.
         eprintln!("[astra-test] preflight: auth failed, attempting auto-register...");
         if try_auto_register(astra_bin).await {
@@ -276,6 +294,31 @@ mod tests {
         assert!(matches!(
             result,
             Err(PreflightError::ModelUnavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn detects_cli_auth_failure_from_stderr() {
+        assert!(stderr_indicates_cli_auth_failure(
+            "Error: Could not validate credentials"
+        ));
+        assert!(stderr_indicates_cli_auth_failure(
+            "API Error (401): Could not validate credentials\n  Hint: Session expired — try /login"
+        ));
+        assert!(!stderr_indicates_cli_auth_failure(
+            "Model 'foo' is inactive (connectivity failed or disabled)"
+        ));
+    }
+
+    #[test]
+    fn detects_model_inactive_from_stderr() {
+        assert!(stderr_indicates_model_inactive(
+            "Error: Model 'foo' is inactive (connectivity failed or disabled)",
+            "foo"
+        ));
+        assert!(!stderr_indicates_model_inactive(
+            "Error: Could not validate credentials",
+            "foo"
         ));
     }
 
