@@ -1029,6 +1029,15 @@ impl ServerToolExecutor {
         }
     }
 
+    pub async fn close_pending_memory_feedback_at_turn_end(
+        &self,
+        context_prefix: &str,
+    ) -> astra_tools::memoria::FeedbackDrainReport {
+        self.memoria_client
+            .feedback_pending_recalls(&self.session_id, "useful", context_prefix)
+            .await
+    }
+
     pub fn with_capabilities(
         mut self,
         capabilities: astra_turn_core::capability::CapabilitySet,

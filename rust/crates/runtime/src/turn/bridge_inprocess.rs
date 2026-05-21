@@ -370,50 +370,18 @@ fn bridge_prompt_snapshot_from_messages(
     model: &str,
     provider: &str,
 ) -> Option<astra_turn_core::cache_diagnostics::PromptStateSnapshot> {
-    let system_prompt_text = messages
-        .iter()
-        .find(|message| message.get("role").and_then(Value::as_str) == Some("system"))
-        .or_else(|| messages.first())
-        .map(bridge_message_content_text)
-        .unwrap_or_default();
+    let system_prompt_text =
+        astra_turn_core::cache_diagnostics::prompt_snapshot_system_text_from_messages(messages);
     let tools_json = serde_json::to_string(tools).ok()?;
     let cache_eligible_tokens = prompts::estimate_str_tokens(&system_prompt_text)
         + prompts::estimate_str_tokens(&tools_json);
-    let mut snapshot = astra_turn_core::cache_diagnostics::PromptStateSnapshot::capture(
-        &system_prompt_text,
+    astra_turn_core::cache_diagnostics::prompt_snapshot_from_messages(
+        messages,
         tools,
+        provider,
         model,
         cache_eligible_tokens,
-    );
-    snapshot.provider = provider.to_string();
-    Some(snapshot)
-}
-
-fn bridge_message_content_text(message: &Value) -> String {
-    bridge_content_value_text(message.get("content").unwrap_or(&Value::Null))
-}
-
-fn bridge_content_value_text(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::String(text) => text.clone(),
-        Value::Array(items) => items
-            .iter()
-            .filter_map(|item| {
-                item.get("text")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .or_else(|| item.as_str().map(str::to_string))
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-        Value::Object(map) => map
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default()),
-        _ => value.to_string(),
-    }
+    )
 }
 
 // ── SSE helpers — delegated to turn::bridge_sse_helpers ───────────────────────

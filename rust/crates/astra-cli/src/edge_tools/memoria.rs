@@ -620,9 +620,10 @@ pub async fn memoria_retrieve_lessons(
         .collect()
 }
 
-/// Store extracted lessons in Memoria as L3 durable memory using the
-/// batch endpoint (Session Memory Protocol §6.2). Single HTTP call for
-/// up to 100 lessons. Best-effort, fire-and-forget.
+/// Store extracted lessons in Memoria as L3 durable memory.
+///
+/// Best-effort and loss-tolerant: lessons are sent one-by-one through the
+/// server proxy, but a failure on one lesson must not drop the rest.
 pub async fn memoria_store_lessons_fire_and_forget(
     lessons: Vec<astra_runtime::lesson_synthesizer::ExtractedLesson>,
     session_id: Option<String>,
@@ -630,6 +631,8 @@ pub async fn memoria_store_lessons_fire_and_forget(
     if lessons.is_empty() {
         return;
     }
+    let mut stored = 0usize;
+    let mut failed = 0usize;
     for lesson in lessons {
         let mut body = json!({
             "content": lesson.content,
@@ -640,14 +643,108 @@ pub async fn memoria_store_lessons_fire_and_forget(
         if let Some(ref sid) = session_id {
             body["session_id"] = json!(sid);
         }
-        if let Err(e) = memoria_store(&body, Duration::from_secs(5)).await {
-            tracing::debug!(
-                target: "memoria",
-                error = %e,
-                "session-end lesson store failed",
-            );
-            break;
+        match memoria_store(&body, Duration::from_secs(5)).await {
+            Ok(_) => stored += 1,
+            Err(e) => {
+                failed += 1;
+                tracing::debug!(
+                    target: "memoria",
+                    error = %e,
+                    "session-end lesson store failed",
+                );
+            }
         }
+    }
+    if failed > 0 {
+        tracing::warn!(
+            target: "memoria",
+            stored,
+            failed,
+            "session-end lesson store completed with partial failures"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.as_ref() {
+                unsafe { std::env::set_var(self.key, previous) };
+            } else {
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn session_end_lesson_store_continues_after_first_failure() {
+        let server = MockServer::start().await;
+        let _api = EnvGuard::set("ASTRA_API_URL", &server.uri());
+        let _token = EnvGuard::set("ASTRA_ACCESS_TOKEN", "test-token");
+
+        Mock::given(method("POST"))
+            .and(path("/memory/store"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/memory/store"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        memoria_store_lessons_fire_and_forget(
+            vec![
+                astra_runtime::lesson_synthesizer::ExtractedLesson {
+                    memory_type: "working",
+                    content: "lesson one".into(),
+                    trust_tier: "T4",
+                },
+                astra_runtime::lesson_synthesizer::ExtractedLesson {
+                    memory_type: "working",
+                    content: "lesson two".into(),
+                    trust_tier: "T4",
+                },
+                astra_runtime::lesson_synthesizer::ExtractedLesson {
+                    memory_type: "working",
+                    content: "lesson three".into(),
+                    trust_tier: "T4",
+                },
+            ],
+            Some("sess-1".into()),
+        )
+        .await;
+
+        let requests = server.received_requests().await.expect("captured requests");
+        assert_eq!(
+            requests.len(),
+            3,
+            "must continue storing after first failure"
+        );
     }
 }
 

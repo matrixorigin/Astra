@@ -138,6 +138,7 @@ pub fn contains_sensitive_memory_content(text: &str) -> bool {
 const MEMORY_COMPACT_VIEW_MAX_CHARS: usize = 96;
 const MEMORY_OVERVIEW_VIEW_MAX_CHARS: usize = 280;
 const ASTRA_VIEWS_KEY: &str = "astra_views";
+const ASTRA_VIEWS_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryContentViews {
@@ -199,6 +200,9 @@ fn extract_stored_views(item: &Value, content: &str) -> Option<MemoryContentView
     let views = item
         .get("source")
         .and_then(|source| source.get(ASTRA_VIEWS_KEY))?;
+    if views.get("version").and_then(Value::as_u64) != Some(ASTRA_VIEWS_VERSION) {
+        return None;
+    }
     let compact = views.get("compact")?.as_str()?.trim();
     let overview = views.get("overview")?.as_str()?.trim();
     let full = views.get("full")?.as_str()?.trim();
@@ -245,20 +249,36 @@ pub fn enrich_store_payload_with_views(payload: &mut Value) {
     let Some(content) = obj
         .get("content")
         .and_then(Value::as_str)
-        .map(str::trim)
+        .map(|content| content.trim().to_string())
         .filter(|content| !content.is_empty())
     else {
         return;
     };
-    let views = derive_memory_content_views(content);
+    let views = derive_memory_content_views(&content);
+    let existing_views = obj
+        .get("source")
+        .and_then(Value::as_object)
+        .and_then(|source| source.get(ASTRA_VIEWS_KEY))
+        .cloned();
     let source = obj.entry("source".to_string()).or_insert_with(|| json!({}));
     if !source.is_object() {
         *source = json!({});
     }
     if let Some(source_obj) = source.as_object_mut() {
+        if let Some(existing_views) = existing_views {
+            let mut source_wrapper = serde_json::Map::new();
+            source_wrapper.insert(ASTRA_VIEWS_KEY.to_string(), existing_views);
+            let mut current_item = serde_json::Map::new();
+            current_item.insert("content".to_string(), Value::String(content.clone()));
+            current_item.insert("source".to_string(), Value::Object(source_wrapper));
+            if extract_stored_views(&Value::Object(current_item), &content).is_some() {
+                return;
+            }
+        }
         source_obj.insert(
             ASTRA_VIEWS_KEY.to_string(),
             json!({
+                "version": ASTRA_VIEWS_VERSION,
                 "compact": views.compact,
                 "overview": views.overview,
                 "full": views.full,
@@ -2356,6 +2376,10 @@ mod tests {
                 .unwrap_or("")
                 .contains("mock drift hid a migration bug")
         );
+        assert_eq!(
+            payload["source"]["astra_views"]["version"],
+            ASTRA_VIEWS_VERSION
+        );
     }
 
     #[test]
@@ -3090,6 +3114,7 @@ mod memoria_http_client_tests {
             "content": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites.",
             "source": {
                 "astra_views": {
+                    "version": ASTRA_VIEWS_VERSION,
                     "compact": "Integration tests must hit a real database",
                     "overview": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.",
                     "full": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites."
@@ -3106,6 +3131,76 @@ mod memoria_http_client_tests {
             )
         );
         assert_eq!(parsed["resolved_level"].as_str(), Some("overview"));
+    }
+
+    #[test]
+    fn views_fall_back_when_stored_version_is_stale() {
+        use super::*;
+        let item = json!({
+            "content": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites.",
+            "source": {
+                "astra_views": {
+                    "version": 0,
+                    "compact": "stale compact",
+                    "overview": "stale overview",
+                    "full": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites."
+                }
+            }
+        });
+        let views = views_for_memory_item(&item).expect("fallback views");
+        assert_ne!(views.compact, "stale compact");
+        assert!(
+            views
+                .compact
+                .contains("Integration tests must hit a real database")
+        );
+    }
+
+    #[test]
+    fn views_fall_back_when_stored_fields_are_malformed() {
+        use super::*;
+        let item = json!({
+            "content": "Use rg for repo-wide code search because it respects ignore files.",
+            "source": {
+                "astra_views": {
+                    "version": ASTRA_VIEWS_VERSION,
+                    "compact": serde_json::Value::Null,
+                    "overview": "",
+                    "full": "Use rg for repo-wide code search because it respects ignore files."
+                }
+            }
+        });
+        let views = views_for_memory_item(&item).expect("fallback views");
+        assert_eq!(
+            views.full,
+            "Use rg for repo-wide code search because it respects ignore files."
+        );
+        assert!(views.compact.contains("Use rg for repo-wide code search"));
+    }
+
+    #[test]
+    fn enrich_store_payload_is_idempotent_for_current_views() {
+        use super::*;
+        let mut payload = json!({
+            "content": "[feedback] Prefer Rust integration tests over mocks.",
+            "source": {
+                "astra_views": {
+                    "version": ASTRA_VIEWS_VERSION,
+                    "compact": "Prefer Rust integration tests over mocks",
+                    "overview": "[feedback] Prefer Rust integration tests over mocks.",
+                    "full": "[feedback] Prefer Rust integration tests over mocks."
+                }
+            }
+        });
+        enrich_store_payload_with_views(&mut payload);
+        assert_eq!(
+            payload["source"]["astra_views"]["compact"],
+            "Prefer Rust integration tests over mocks"
+        );
+        assert_eq!(
+            payload["source"]["astra_views"]["version"],
+            ASTRA_VIEWS_VERSION
+        );
     }
 
     #[test]

@@ -247,6 +247,70 @@ impl PromptStateSnapshot {
     }
 }
 
+/// Extract the canonical system-prompt text from a provider request message list.
+///
+/// Uses the first `role=system` message when present, otherwise falls back to the
+/// first message. Structured content arrays/objects are flattened into text using
+/// the same rules across CLI and runtime journal reconstruction.
+#[must_use]
+pub fn prompt_snapshot_system_text_from_messages(messages: &[serde_json::Value]) -> String {
+    messages
+        .iter()
+        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+        .or_else(|| messages.first())
+        .map(prompt_snapshot_message_content_text)
+        .unwrap_or_default()
+}
+
+/// Build a [`PromptStateSnapshot`] from a raw provider message list plus tool schemas.
+///
+/// This is the shared bridge/CLI journal reconstruction path so prompt-cache
+/// diagnostics cannot drift between the two execution surfaces.
+pub fn prompt_snapshot_from_messages(
+    messages: &[serde_json::Value],
+    tool_schemas: &[serde_json::Value],
+    provider: &str,
+    model: &str,
+    cache_eligible_tokens: usize,
+) -> Option<PromptStateSnapshot> {
+    let system_prompt_text = prompt_snapshot_system_text_from_messages(messages);
+    let mut snapshot = PromptStateSnapshot::capture(
+        &system_prompt_text,
+        tool_schemas,
+        model,
+        cache_eligible_tokens,
+    );
+    snapshot.provider = provider.to_string();
+    Some(snapshot)
+}
+
+fn prompt_snapshot_message_content_text(message: &serde_json::Value) -> String {
+    prompt_snapshot_content_value_text(message.get("content").unwrap_or(&serde_json::Value::Null))
+}
+
+fn prompt_snapshot_content_value_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                item.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| item.as_str().map(str::to_string))
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        serde_json::Value::Object(map) => map
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default()),
+        _ => value.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Detector: compares consecutive snapshots
 // ---------------------------------------------------------------------------
@@ -966,6 +1030,37 @@ mod tests {
         let mut s = PromptStateSnapshot::capture(prompt, tools, model, 15_000);
         s.timestamp_secs = 1000; // fixed for testing
         s
+    }
+
+    #[test]
+    fn prompt_snapshot_from_messages_prefers_system_role_and_flattens_structured_content() {
+        let messages = vec![
+            json!({"role": "user", "content": "ignored"}),
+            json!({
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "System rules"},
+                    {"type": "text", "text": "Second paragraph"},
+                    "tail"
+                ]
+            }),
+        ];
+        assert_eq!(
+            prompt_snapshot_system_text_from_messages(&messages),
+            "System rules\n\nSecond paragraph\n\ntail"
+        );
+    }
+
+    #[test]
+    fn prompt_snapshot_from_messages_preserves_provider_and_model() {
+        let messages = vec![json!({"role": "system", "content": {"text": "Prompt"}})];
+        let tools = make_tools(&["bash"]);
+        let snapshot = prompt_snapshot_from_messages(&messages, &tools, "anthropic", "claude", 42)
+            .expect("snapshot");
+        assert_eq!(snapshot.provider, "anthropic");
+        assert_eq!(snapshot.model, "claude");
+        assert_eq!(snapshot.cache_eligible_tokens, 42);
+        assert_eq!(snapshot.system_prompt_hash, hash_str("Prompt"));
     }
 
     #[test]

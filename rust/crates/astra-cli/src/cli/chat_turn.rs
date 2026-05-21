@@ -1696,47 +1696,13 @@ fn journal_prompt_snapshot_from_messages(
     provider: &str,
     cache_eligible_tokens: u64,
 ) -> Option<astra_turn_core::cache_diagnostics::PromptStateSnapshot> {
-    let system_prompt_text = messages
-        .iter()
-        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
-        .or_else(|| messages.first())
-        .map(journal_message_content_text)
-        .unwrap_or_default();
-    let mut snapshot = astra_turn_core::cache_diagnostics::PromptStateSnapshot::capture(
-        &system_prompt_text,
+    astra_turn_core::cache_diagnostics::prompt_snapshot_from_messages(
+        messages,
         tools,
+        provider,
         model,
         cache_eligible_tokens as usize,
-    );
-    snapshot.provider = provider.to_string();
-    Some(snapshot)
-}
-
-fn journal_message_content_text(message: &serde_json::Value) -> String {
-    journal_content_value_text(message.get("content").unwrap_or(&serde_json::Value::Null))
-}
-
-fn journal_content_value_text(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Null => String::new(),
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Array(items) => items
-            .iter()
-            .filter_map(|item| {
-                item.get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-                    .or_else(|| item.as_str().map(str::to_string))
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-        serde_json::Value::Object(map) => map
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default()),
-        _ => value.to_string(),
-    }
+    )
 }
 
 /// After `state.turn` has been incremented: journal turn row, workspace + checkpoints,
@@ -2176,10 +2142,6 @@ fn apply_turn_success(
     check_skill_improvement_inner(state);
 }
 
-fn should_close_pending_memory_feedback_at_turn_end(tools_used: &[String]) -> bool {
-    tools_used.iter().all(|name| name == "memory")
-}
-
 pub(super) async fn close_pending_memory_feedback_at_turn_end(
     session_id: Option<&str>,
     cloud_base: Option<String>,
@@ -2211,28 +2173,21 @@ async fn apply_turn_success_async(
     let final_messages = std::mem::take(&mut result.final_messages);
     let csl_checkpoint_fields = extract_csl_fields_from_result(&result);
     apply_turn_success_sync(state, profile, line, result, turn_start);
-    if should_close_pending_memory_feedback_at_turn_end(&state.recent_tools) {
-        let session_id = state.session_id.clone();
-        let cloud_base = Some(crate::command_router::resolve_api_url(None));
-        let cloud_token = super::session_runtime::current_access_token(profile);
-        tokio::spawn(async move {
-            let report = close_pending_memory_feedback_at_turn_end(
-                session_id.as_deref(),
-                cloud_base,
-                cloud_token,
-                "cli-turn-end",
-            )
-            .await;
-            if report.attempted > 0 {
-                tracing::debug!(
-                    session_id = ?session_id,
-                    attempted = report.attempted,
-                    succeeded = report.succeeded,
-                    failed = report.failed,
-                    "closed pending recall feedback at turn end"
-                );
-            }
-        });
+    let report = close_pending_memory_feedback_at_turn_end(
+        state.session_id.as_deref(),
+        Some(crate::command_router::resolve_api_url(None)),
+        super::session_runtime::current_access_token(profile),
+        "cli-turn-end",
+    )
+    .await;
+    if report.attempted > 0 {
+        tracing::debug!(
+            session_id = ?state.session_id,
+            attempted = report.attempted,
+            succeeded = report.succeeded,
+            failed = report.failed,
+            "closed pending recall feedback at turn end"
+        );
     }
     rebuild_continuation_anchor_from_live_state(state).await;
 
@@ -5230,21 +5185,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn turn_end_feedback_only_runs_when_no_non_memory_tool_succeeded() {
-        assert!(should_close_pending_memory_feedback_at_turn_end(&[]));
-        assert!(should_close_pending_memory_feedback_at_turn_end(&[
-            "memory".to_string()
-        ]));
-        assert!(!should_close_pending_memory_feedback_at_turn_end(&[
-            "memory".to_string(),
-            "bash".to_string()
-        ]));
-        assert!(!should_close_pending_memory_feedback_at_turn_end(&[
-            "bash".to_string()
-        ]));
-    }
-
     #[tokio::test]
     async fn close_pending_memory_feedback_at_turn_end_drains_recall_queue() {
         let session_id = "chat-turn-close-feedback";
@@ -5265,6 +5205,49 @@ mod tests {
         assert_eq!(
             astra_tools::memoria::MemoriaClient::pending_recall_count(session_id),
             0
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn apply_turn_success_async_drains_pending_recall_feedback_before_returning() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let server = MockServer::start().await;
+        let _api_url = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
+        let _token = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "token");
+        Mock::given(method("POST"))
+            .and(path("/memory/feedback/m1"))
+            .and(header("authorization", "Bearer token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = SessionState::default();
+        let session_id = "sess-memory-drain";
+        astra_tools::memoria::MemoriaClient::reset_recall_ledger(session_id);
+        astra_tools::memoria::MemoriaClient::record_recall(session_id, 1, vec!["m1".into()]);
+        let mut result = stub_stream_result("Used the recalled memory.");
+        result.session_id = Some(session_id.to_string());
+        result.tools_used = vec!["memory".to_string()];
+        let mut ui = CollectingUi::default();
+
+        apply_turn_success_async(
+            &mut state,
+            &api,
+            None,
+            "remember that",
+            result,
+            Instant::now(),
+            &mut ui,
+        )
+        .await;
+
+        assert_eq!(
+            astra_tools::memoria::MemoriaClient::pending_recall_count(session_id),
+            0,
+            "turn completion must synchronously drain recall feedback so cleanup cannot race it"
         );
     }
 
