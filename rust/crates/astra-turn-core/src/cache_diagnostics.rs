@@ -407,7 +407,7 @@ impl CacheBreakDetector {
     ) -> Option<CacheBreakEvent> {
         self.stats.total_turns += 1;
 
-        let previous_for_source = self.per_source.get(source).cloned();
+        let previous_for_source = self.per_source.get(source);
 
         let event = if let Some(prev) = previous_for_source.as_ref() {
             self.detect_break(prev, &current, actual_cache_read_tokens)
@@ -426,13 +426,8 @@ impl CacheBreakDetector {
             }
             if let Some(dir) = self.diff_dir.clone() {
                 self.diff_seq = self.diff_seq.wrapping_add(1);
-                let _ = write_diff_artifact(
-                    &dir,
-                    self.diff_seq,
-                    previous_for_source.as_ref(),
-                    &current,
-                    evt,
-                );
+                let _ =
+                    write_diff_artifact(&dir, self.diff_seq, previous_for_source, &current, evt);
             }
         } else if previous_for_source.is_some() {
             self.stats.cache_hits += 1;

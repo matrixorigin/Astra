@@ -88,8 +88,8 @@ pub struct PipelineSession {
     pending_audits: Vec<crate::pipeline_journal::PipelineJournalEvent>,
 }
 
-#[derive(Debug, Clone)]
-struct PendingPromptSnapshot {
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PendingPromptSnapshot {
     query_source: String,
     snapshot: PromptStateSnapshot,
 }
@@ -512,6 +512,8 @@ impl PipelineSession {
             emergent: self.emergent.clone(),
             working_memory: self.working_memory.clone(),
             cache_detector_state: self.cache_detector.snapshot_state(),
+            pending_prompt_snapshot: self.pending_prompt_snapshot.clone(),
+            turns_completed: self.turns_completed,
         }
     }
 
@@ -532,8 +534,8 @@ impl PipelineSession {
             recovery,
             working_memory: snapshot.working_memory,
             cache_detector: CacheBreakDetector::from_state(snapshot.cache_detector_state),
-            pending_prompt_snapshot: None,
-            turns_completed: 0,
+            pending_prompt_snapshot: snapshot.pending_prompt_snapshot,
+            turns_completed: snapshot.turns_completed,
             pending_audits: Vec::new(),
         }
     }
@@ -550,6 +552,10 @@ pub struct PipelineSessionSnapshot {
     pub working_memory: WorkingMemoryState,
     #[serde(default)]
     pub cache_detector_state: CacheBreakDetectorState,
+    #[serde(default)]
+    pub(crate) pending_prompt_snapshot: Option<PendingPromptSnapshot>,
+    #[serde(default)]
+    pub turns_completed: u32,
 }
 
 /// Summary metrics extracted from pipeline state for cloud_session_facts.
@@ -946,6 +952,58 @@ mod tests {
         assert!(
             !history.is_empty(),
             "section usage should be recorded from turn output"
+        );
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_pending_prompt_snapshot_and_turn_count() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        let statics = test_statics();
+        let agent = AgentContext::default();
+        let session = test_session_context();
+        let external = test_external();
+        let limits = OptimizeLimits::default();
+
+        let first_turn = test_turn_state(1);
+        let first_output = sess
+            .run_turn(TurnInput {
+                statics: &statics,
+                agent: &agent,
+                session: &session,
+                turn: &first_turn,
+                external: &external,
+                optimize_limits: &limits,
+                model_id: "model",
+                query_source: "repl",
+            })
+            .unwrap();
+        let mut first_feedback = ContextFeedback::from_usage(0, 800, 200, 500, false);
+        sess.record_feedback("model", "repl", &mut first_feedback, Some(&first_output));
+
+        let second_turn = test_turn_state(2);
+        let _second_output = sess
+            .run_turn(TurnInput {
+                statics: &statics,
+                agent: &agent,
+                session: &session,
+                turn: &second_turn,
+                external: &external,
+                optimize_limits: &limits,
+                model_id: "model",
+                query_source: "repl",
+            })
+            .unwrap();
+
+        assert_eq!(sess.turns_completed(), 1);
+        assert!(sess.pending_prompt_snapshot.is_some());
+
+        let restored =
+            PipelineSession::from_snapshot(PipelineConfig::default(), sess.snapshot_full_state());
+
+        assert_eq!(restored.turns_completed(), 1);
+        assert!(
+            restored.pending_prompt_snapshot.is_some(),
+            "mid-turn pending prompt snapshot must survive restore for exact cache-break attribution"
         );
     }
 

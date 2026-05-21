@@ -228,8 +228,7 @@ fn count_inprocess_persisted_events(
 struct BridgePipelineBaseline {
     next_turn: u32,
     stats: astra_turn_core::pipeline_stats::PipelineStats,
-    previous_prompt_snapshot: Option<astra_turn_core::cache_diagnostics::PromptStateSnapshot>,
-    previous_cache_read_tokens: Option<u64>,
+    cache_detector: astra_turn_core::cache_diagnostics::CacheBreakDetector,
 }
 
 fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
@@ -250,8 +249,7 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
     let mut raw_ratios = Vec::new();
     let mut response_count = 0u32;
     let mut pending_request_snapshot = None;
-    let mut previous_prompt_snapshot = None;
-    let mut previous_cache_read_tokens = None;
+    let mut cache_detector = astra_turn_core::cache_diagnostics::CacheBreakDetector::new();
 
     for event in events {
         match event.event_type {
@@ -270,7 +268,8 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
             }
             astra_services::session_journal::JournalEventType::LlmResponseFull => {
                 response_count = response_count.saturating_add(1);
-                if let Some(usage) = bridge_usage_from_response_event(&event) {
+                let usage = bridge_usage_from_response_event(&event);
+                if let Some(usage) = usage.as_ref() {
                     let total_input = usage
                         .input_tokens
                         .saturating_add(usage.cached_input_tokens)
@@ -278,10 +277,13 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
                     if total_input > 0 {
                         raw_ratios.push(usage.cached_input_tokens as f64 / total_input as f64);
                     }
-                    previous_cache_read_tokens = Some(usage.cached_input_tokens);
                 }
                 if let Some(snapshot) = pending_request_snapshot.take() {
-                    previous_prompt_snapshot = Some(snapshot);
+                    let _ = cache_detector.record_turn_for_source(
+                        "bridge_inprocess",
+                        snapshot,
+                        usage.as_ref().map(|u| u.cached_input_tokens),
+                    );
                 }
             }
             _ => {}
@@ -306,8 +308,7 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
             avg_cache_hit_ratio,
             ..Default::default()
         },
-        previous_prompt_snapshot,
-        previous_cache_read_tokens,
+        cache_detector,
     }
 }
 
@@ -2193,7 +2194,7 @@ impl InProcessChatTurnBridge {
             let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
             let mut last_measured_prompt: Option<u64> = None;
-            let bridge_pipeline_baseline = load_bridge_pipeline_baseline(&session_id);
+            let mut bridge_pipeline_baseline = load_bridge_pipeline_baseline(&session_id);
 
 
             // Single LLM call per HTTP request (no multi-round tool loop).
@@ -3532,23 +3533,15 @@ impl InProcessChatTurnBridge {
                         capture_model,
                         &provider,
                     ) {
-                        if let Some(previous_snapshot) =
-                            bridge_pipeline_baseline.previous_prompt_snapshot.clone()
-                        {
-                            let mut detector =
-                                astra_turn_core::cache_diagnostics::CacheBreakDetector::new();
-                            let _ = detector.record_turn_for_source(
-                                "bridge_inprocess",
-                                previous_snapshot,
-                                bridge_pipeline_baseline.previous_cache_read_tokens,
-                            );
-                            if let Some(event) = detector.record_turn_for_source(
+                        if let Some(event) = bridge_pipeline_baseline
+                            .cache_detector
+                            .record_turn_for_source(
                                 "bridge_inprocess",
                                 current_snapshot,
                                 Some(usage_snapshot.cached_input_tokens),
-                            ) {
-                                feedback.attribute_cache_break(event.reason);
-                            }
+                            )
+                        {
+                            feedback.attribute_cache_break(event.reason);
                         }
                     }
 
@@ -6076,6 +6069,113 @@ mod tests {
         let m = u.to_json_map();
         let estimated_tokens = m.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as usize;
         assert_eq!(estimated_tokens, 45000);
+    }
+
+    #[test]
+    fn load_bridge_pipeline_baseline_reconstructs_detector_state_from_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "00000000-0000-0000-0000-000000000188";
+        let writer = astra_services::session_journal::JournalWriter::new(session_id)
+            .expect("journal writer");
+
+        let request_metadata = |system_text: &str| {
+            json!({
+                "model": "test-model",
+                "provider": "openai",
+                "request": {
+                    "messages": [
+                        {"role": "system", "content": system_text},
+                        {"role": "user", "content": "ping"}
+                    ],
+                    "tools": []
+                }
+            })
+        };
+        let response_metadata = |cached_input_tokens: u64| {
+            json!({
+                "provider": "openai",
+                "response": {
+                    "response": {
+                        "usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": cached_input_tokens,
+                            "cache_creation_tokens": 0,
+                            "output_tokens": 12
+                        }
+                    }
+                }
+            })
+        };
+
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::llm_request_full(
+                    Some(session_id),
+                    1,
+                    0,
+                    request_metadata("stable prompt"),
+                ),
+            )
+            .unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::llm_response_full(
+                    Some(session_id),
+                    1,
+                    0,
+                    response_metadata(0),
+                ),
+            )
+            .unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::llm_request_full(
+                    Some(session_id),
+                    2,
+                    0,
+                    request_metadata("stable prompt"),
+                ),
+            )
+            .unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::llm_response_full(
+                    Some(session_id),
+                    2,
+                    0,
+                    response_metadata(500),
+                ),
+            )
+            .unwrap();
+
+        let mut baseline = load_bridge_pipeline_baseline(session_id);
+        assert_eq!(baseline.next_turn, 3);
+        assert!(
+            baseline
+                .cache_detector
+                .snapshot_for_source("bridge_inprocess")
+                .is_some(),
+            "baseline should warm the bridge cache detector from prior request/response pairs"
+        );
+
+        let current = bridge_prompt_snapshot_from_messages(
+            &[
+                json!({"role": "system", "content": "stable prompt"}),
+                json!({"role": "user", "content": "continue"}),
+            ],
+            &[],
+            "test-model",
+            "openai",
+        )
+        .expect("current prompt snapshot");
+        assert!(
+            baseline
+                .cache_detector
+                .record_turn_for_source("bridge_inprocess", current, Some(500))
+                .is_none(),
+            "reconstructed detector state should treat the next stable turn as a hit"
+        );
     }
 
     #[cfg(feature = "bridge-e2e-hooks")]
