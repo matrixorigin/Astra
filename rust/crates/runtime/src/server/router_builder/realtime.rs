@@ -1,3 +1,5 @@
+use axum::routing::put;
+
 use super::*;
 
 pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
@@ -25,6 +27,72 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/memory/purge",
             post(auth_handlers::memory_proxy_purge_handler),
+        )
+        .route(
+            "/memory/expand/{memory_id}",
+            get(auth_handlers::memory_proxy_expand_handler),
+        )
+        .route(
+            "/memory/correct",
+            post(auth_handlers::memory_proxy_correct_handler),
+        )
+        .route(
+            "/memory/correct/{memory_id}",
+            put(auth_handlers::memory_proxy_correct_by_id_handler),
+        )
+        .route(
+            "/memory/feedback/{memory_id}",
+            post(auth_handlers::memory_proxy_feedback_handler),
+        )
+        .route(
+            "/memory/profile",
+            get(auth_handlers::memory_proxy_profile_handler),
+        )
+        .route(
+            "/memory/reflect",
+            post(auth_handlers::memory_proxy_reflect_handler),
+        )
+        .route(
+            "/memory/snapshots",
+            get(auth_handlers::memoria_proxy_snapshots_list_handler)
+                .post(auth_handlers::memoria_proxy_snapshot_create_handler),
+        )
+        .route(
+            "/memory/snapshots/{name}/rollback",
+            post(auth_handlers::memoria_proxy_snapshot_rollback_handler),
+        )
+        .route(
+            "/memory/snapshots/{name}/diff",
+            get(auth_handlers::memoria_proxy_snapshot_diff_handler),
+        )
+        .route(
+            "/memory/branches",
+            get(auth_handlers::memoria_proxy_branches_list_handler)
+                .post(auth_handlers::memoria_proxy_branch_create_handler),
+        )
+        .route(
+            "/memory/branches/{name}/checkout",
+            post(auth_handlers::memoria_proxy_branch_checkout_handler),
+        )
+        .route(
+            "/memory/branches/{name}/merge",
+            post(auth_handlers::memoria_proxy_branch_merge_handler),
+        )
+        .route(
+            "/memory/branches/{name}/diff",
+            get(auth_handlers::memoria_proxy_branch_diff_handler),
+        )
+        .route(
+            "/memory/health",
+            get(auth_handlers::memoria_proxy_health_handler),
+        )
+        .route(
+            "/memory/governance",
+            post(auth_handlers::memoria_proxy_governance_handler),
+        )
+        .route(
+            "/memory/consolidate",
+            post(auth_handlers::memoria_proxy_consolidate_handler),
         )
         .route("/chat", post(chat_handlers::chat_handler))
         .route("/chat/stream", post(chat_handlers::chat_stream_handler))

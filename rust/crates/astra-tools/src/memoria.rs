@@ -827,15 +827,15 @@ impl MemoriaClient {
         // write path must stay fast when there are no conflicts.
         let mem = astra_core::MemoriaSettings::from_env();
         let key = mem.master_key?;
+        let mut body = json!({"query": new_content, "top_k": 3});
+        if let Some(sid) = session_id {
+            body["session_id"] = json!(sid);
+        }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .no_proxy()
             .build()
             .ok()?;
-        let mut body = json!({"query": new_content, "top_k": 3});
-        if let Some(sid) = session_id {
-            body["session_id"] = json!(sid);
-        }
         let resp = client
             .post(format!("{}/v1/memories/retrieve", mem.base_url))
             .header("Authorization", format!("Bearer {key}"))
@@ -930,7 +930,7 @@ impl MemoriaClient {
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
             let name = pre_op_snapshot_name(op, ts);
-            if let Err(e) = memoria_snapshot_create(&name).await {
+            if let Err(e) = self.proxy_snapshot_create(&name).await {
                 tracing::warn!(
                     target: "astra::memory::auto_snapshot",
                     op = %op,
@@ -1069,13 +1069,66 @@ impl MemoriaClient {
         if direct_endpoint.is_empty() {
             return Some((String::new(), payload, method));
         }
-        let endpoint = match direct_endpoint.as_str() {
-            "/v1/memories" => format!("{cloud_base}/memory/store"),
-            "/v1/memories/retrieve" => format!("{cloud_base}/memory/retrieve"),
-            "/v1/memories/purge" => format!("{cloud_base}/memory/purge"),
-            _ => return None,
+        let endpoint = if direct_endpoint == "/v1/memories" {
+            format!("{cloud_base}/memory/store")
+        } else if direct_endpoint == "/v1/memories/retrieve" {
+            format!("{cloud_base}/memory/retrieve")
+        } else if direct_endpoint == "/v1/memories/search" {
+            format!("{cloud_base}/memory/search")
+        } else if direct_endpoint == "/v1/memories/purge" {
+            format!("{cloud_base}/memory/purge")
+        } else if direct_endpoint == "/v1/memories/correct" {
+            format!("{cloud_base}/memory/correct")
+        } else if direct_endpoint == "/v1/profiles/me" {
+            format!("{cloud_base}/memory/profile")
+        } else if direct_endpoint == "/v1/reflect" {
+            format!("{cloud_base}/memory/reflect")
+        } else if let Some(memory_id) = direct_endpoint
+            .strip_prefix("/v1/memories/")
+            .and_then(|tail| tail.strip_suffix("/correct"))
+        {
+            format!("{cloud_base}/memory/correct/{memory_id}")
+        } else if let Some(memory_id) = direct_endpoint
+            .strip_prefix("/v1/memories/")
+            .and_then(|tail| tail.strip_suffix("/feedback"))
+        {
+            format!("{cloud_base}/memory/feedback/{memory_id}")
+        } else if let Some(memory_id) = direct_endpoint.strip_prefix("/v1/memories/") {
+            format!("{cloud_base}/memory/expand/{memory_id}")
+        } else {
+            return None;
         };
         Some((endpoint, payload, method))
+    }
+
+    async fn proxy_snapshot_create(&self, name: &str) -> Result<(), String> {
+        let Some(cloud_base) = self.cloud_base.as_deref() else {
+            return memoria_snapshot_create(name).await.map(|_| ());
+        };
+        let Some(token) = self.cloud_token.as_deref() else {
+            return memoria_snapshot_create(name).await.map(|_| ());
+        };
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .no_proxy()
+            .build()
+            .map_err(|e| format!("build client: {e}"))?;
+        let resp = client
+            .post(format!("{cloud_base}/memory/snapshots"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&json!({ "name": name }))
+            .send()
+            .await
+            .map_err(|e| format!("memoria snapshot request failed: {e}"))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            Err(format!(
+                "memoria snapshot request failed: status={status}, body={body}"
+            ))
+        }
     }
 
     fn empty_success_response(op: &str, args: &Value) -> Value {
@@ -1107,9 +1160,12 @@ impl MemoriaClient {
         if query.trim().is_empty() || self.is_circuit_open() {
             return vec![];
         }
-        let mem = astra_core::MemoriaSettings::from_env();
-        let token = match mem.bearer_token() {
-            Some(t) => t,
+        let cloud_base = match self.cloud_base.as_deref() {
+            Some(base) => base,
+            None => return vec![],
+        };
+        let token = match self.cloud_token.as_deref() {
+            Some(token) => token,
             None => return vec![],
         };
         let client = match reqwest::Client::builder()
@@ -1121,8 +1177,8 @@ impl MemoriaClient {
             Err(_) => return vec![],
         };
         match client
-            .post(format!("{}/v1/memories/retrieve", mem.base_url))
-            .header("Authorization", token)
+            .post(format!("{cloud_base}/memory/retrieve"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&json!({
                 "query": query,
                 "top_k": top_k,
@@ -2220,6 +2276,54 @@ mod tests {
     }
 
     #[test]
+    fn build_cloud_proxy_request_maps_update_by_id_route() {
+        let args = json!({
+            "memory_id": "mem-1",
+            "content": "updated text",
+            "reason": "correction"
+        });
+        let (endpoint, payload, method) =
+            MemoriaClient::build_cloud_proxy_request("https://cloud.example", "update", &args)
+                .expect("cloud update route");
+        assert_eq!(endpoint, "https://cloud.example/memory/correct/mem-1");
+        assert!(matches!(method, HttpMethod::Put));
+        assert_eq!(payload["new_content"], "updated text");
+    }
+
+    #[test]
+    fn build_cloud_proxy_request_maps_feedback_route() {
+        let args = json!({
+            "memory_id": "mem-2",
+            "signal": "useful"
+        });
+        let (endpoint, payload, method) =
+            MemoriaClient::build_cloud_proxy_request("https://cloud.example", "feedback", &args)
+                .expect("cloud feedback route");
+        assert_eq!(endpoint, "https://cloud.example/memory/feedback/mem-2");
+        assert!(matches!(method, HttpMethod::Post));
+        assert_eq!(payload["signal"], "useful");
+    }
+
+    #[test]
+    fn build_request_transport_requires_server_proxy_auth() {
+        let result = MemoriaClient::build_request_transport(
+            None,
+            None,
+            "remember",
+            &json!({
+                "content": "prefers smoke tests"
+            }),
+        );
+        match astra_core::MemoriaSettings::from_env().master_key {
+            Some(_) => assert!(result.is_ok(), "direct server path must remain available"),
+            None => {
+                let error = result.expect_err("without direct config this should stay an error");
+                assert!(error.contains("MEMORIA_MASTER_KEY"));
+            }
+        }
+    }
+
+    #[test]
     fn empty_success_response_recall_returns_empty_array() {
         let value = MemoriaClient::empty_success_response("recall", &json!({"query": "q"}));
         assert_eq!(value, json!([]));
@@ -2493,7 +2597,7 @@ mod tests {
     /// validates args. A rejected `forget` (missing reason, missing
     /// memory_id/topic, etc.) must not produce an orphan `pre_forget_*`
     /// snapshot. Verified by source ordering: in `call_with_timeout`
-    /// the `memoria_snapshot_create` call must appear after the early-
+    /// the snapshot-create call must appear after the early-
     /// return `ep.is_empty()` guard.
     #[test]
     fn auto_snapshot_is_ordered_after_validation() {
@@ -2509,7 +2613,7 @@ mod tests {
         let body = &src[fn_start..fn_end];
 
         let snapshot_at = body
-            .find("memoria_snapshot_create")
+            .find("proxy_snapshot_create")
             .expect("auto-snapshot call must exist in call_with_timeout");
         let validation_short_circuit_at = body
             .find("if ep.is_empty()")

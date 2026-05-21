@@ -9,23 +9,254 @@ use serde_json::{Value, json};
 
 use super::ToolExecutor;
 
-pub use astra_tools::memoria::{
-    BoostSearchHit,
-    memoria_branch_checkout,
-    memoria_branch_create,
-    memoria_branch_diff,
-    memoria_branch_merge,
-    memoria_branches_list,
-    memoria_health,
-    memoria_oneshot_client,
-    memoria_reflect,
-    // Cloud helpers — single source of truth in astra-tools
-    memoria_snapshot_create,
-    memoria_snapshot_diff,
-    memoria_snapshot_rollback,
-    memoria_snapshots_list,
-    parse_memory_search_hits,
-};
+pub use astra_tools::memoria::{BoostSearchHit, parse_memory_search_hits};
+
+fn current_memoria_proxy_target() -> Result<(String, String), String> {
+    let base = crate::command_router::resolve_api_url(None);
+    let token = crate::session_runtime::current_access_token(None).ok_or_else(|| {
+        "not logged in; memory operations must go through the Astra server".to_string()
+    })?;
+    Ok((base, token))
+}
+
+async fn memoria_proxy_request(
+    method: astra_tools::memoria::HttpMethod,
+    path: &str,
+    timeout: Duration,
+    body: Option<&Value>,
+) -> Result<String, String> {
+    let (base, token) = current_memoria_proxy_target()?;
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .no_proxy()
+        .build()
+        .map_err(|e| format!("build client: {e}"))?;
+    let url = format!("{}{}", base.trim_end_matches('/'), path);
+    let req = match method {
+        astra_tools::memoria::HttpMethod::Get => client.get(&url),
+        astra_tools::memoria::HttpMethod::Put => client.put(&url),
+        astra_tools::memoria::HttpMethod::Post => client.post(&url),
+    }
+    .header("Authorization", format!("Bearer {token}"));
+    let req = if let Some(body) = body {
+        req.json(body)
+    } else {
+        req
+    };
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        Ok(text)
+    } else {
+        Err(format!("({status}) {text}"))
+    }
+}
+
+pub async fn memoria_snapshot_create(name: &str) -> Result<String, String> {
+    memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Post,
+        "/memory/snapshots",
+        Duration::from_secs(5),
+        Some(&json!({ "name": name })),
+    )
+    .await
+}
+
+pub async fn memoria_snapshot_rollback(name: &str) -> Result<String, String> {
+    memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Post,
+        &format!("/memory/snapshots/{name}/rollback"),
+        Duration::from_secs(10),
+        None,
+    )
+    .await
+}
+
+pub async fn memoria_snapshot_diff(name: &str) -> Result<String, String> {
+    memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Get,
+        &format!("/memory/snapshots/{name}/diff"),
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+}
+
+pub async fn memoria_snapshots_list() -> Result<String, String> {
+    memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Get,
+        "/memory/snapshots",
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+}
+
+pub async fn memoria_branch_create(name: &str) -> Result<String, String> {
+    memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Post,
+        "/memory/branches",
+        Duration::from_secs(5),
+        Some(&json!({ "name": name })),
+    )
+    .await
+}
+
+pub async fn memoria_branch_checkout(name: &str) -> Result<String, String> {
+    memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Post,
+        &format!("/memory/branches/{name}/checkout"),
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+}
+
+pub async fn memoria_branch_merge(name: &str) -> Result<String, String> {
+    memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Post,
+        &format!("/memory/branches/{name}/merge"),
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+}
+
+pub async fn memoria_branch_diff(name: &str) -> Result<String, String> {
+    memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Get,
+        &format!("/memory/branches/{name}/diff"),
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+}
+
+pub async fn memoria_branches_list() -> Result<String, String> {
+    memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Get,
+        "/memory/branches",
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+}
+
+pub async fn memoria_reflect() -> Result<String, String> {
+    memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Post,
+        "/memory/reflect",
+        Duration::from_secs(15),
+        Some(&json!({ "mode": "auto" })),
+    )
+    .await
+}
+
+pub async fn memoria_health() -> Result<String, String> {
+    memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Get,
+        "/memory/health",
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+}
+
+pub async fn memoria_feedback(
+    memory_id: &str,
+    signal: &str,
+    context: Option<&str>,
+) -> Result<String, String> {
+    let mut body = json!({ "signal": signal });
+    if let Some(context) = context {
+        body["context"] = json!(context);
+    }
+    memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Post,
+        &format!("/memory/feedback/{memory_id}"),
+        Duration::from_secs(5),
+        Some(&body),
+    )
+    .await
+}
+
+pub async fn memoria_show(memory_id: &str) -> Result<String, String> {
+    memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Get,
+        &format!("/memory/expand/{memory_id}"),
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+}
+
+pub async fn memoria_purge(body: &Value) -> Result<String, String> {
+    memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Post,
+        "/memory/purge",
+        Duration::from_secs(5),
+        Some(body),
+    )
+    .await
+}
+
+pub async fn memoria_retrieve(body: &Value, timeout: Duration) -> Result<String, String> {
+    memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Post,
+        "/memory/retrieve",
+        timeout,
+        Some(body),
+    )
+    .await
+}
+
+pub async fn memoria_store(body: &Value, timeout: Duration) -> Result<String, String> {
+    memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Post,
+        "/memory/store",
+        timeout,
+        Some(body),
+    )
+    .await
+}
+
+pub async fn memoria_correct(
+    memory_id: &str,
+    body: &Value,
+    timeout: Duration,
+) -> Result<String, String> {
+    memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Put,
+        &format!("/memory/correct/{memory_id}"),
+        timeout,
+        Some(body),
+    )
+    .await
+}
+
+pub async fn memoria_governance_fire_and_forget() {
+    let _ = memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Post,
+        "/memory/governance",
+        Duration::from_secs(10),
+        Some(&json!({ "force": false })),
+    )
+    .await;
+}
+
+pub async fn memoria_consolidate_fire_and_forget() {
+    let _ = memoria_proxy_request(
+        astra_tools::memoria::HttpMethod::Post,
+        "/memory/consolidate",
+        Duration::from_secs(15),
+        Some(&json!({ "force": false })),
+    )
+    .await;
+}
 
 impl ToolExecutor {
     pub(super) async fn memoria_call(&self, op: &str, args: &Value) -> String {
@@ -62,6 +293,13 @@ impl ToolExecutor {
         // Delegate to the shared MemoriaClient (single source of truth for
         // build_direct_request, type normalization, and HTTP method routing).
         let cloud_token = self.cloud_token();
+        if cloud_token.is_none() {
+            return json!({
+                "error": "Memory unavailable: login required because CLI memory calls must go through the Astra server",
+                "hint": "Run `astra login` so the memory tool can use the authenticated server proxy"
+            })
+            .to_string();
+        }
         let client = astra_tools::memoria::MemoriaClient::new(self.cloud_base.clone(), cloud_token);
         let result = client.call_with_timeout(op, args, timeout).await;
 
@@ -89,9 +327,6 @@ impl ToolExecutor {
         if query.trim().is_empty() {
             return vec![];
         }
-        // Direct Memoria call (skip cloud proxy — server has no /memory/* route).
-        // This is best-effort on the critical path; circuit breaker prevents
-        // repeated timeouts if Memoria is down.
         if self
             .memoria_fail_count
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -99,9 +334,12 @@ impl ToolExecutor {
         {
             return vec![];
         }
-        let mem = astra_core::MemoriaSettings::from_env();
-        let token = match mem.bearer_token() {
-            Some(t) => t,
+        let cloud_base = match self.cloud_base.as_deref() {
+            Some(base) => base,
+            None => return vec![],
+        };
+        let token = match self.cloud_token() {
+            Some(token) => token,
             None => return vec![],
         };
         let client = match reqwest::Client::builder()
@@ -113,8 +351,8 @@ impl ToolExecutor {
             Err(_) => return vec![],
         };
         match client
-            .post(format!("{}/v1/memories/retrieve", mem.base_url))
-            .header("Authorization", token)
+            .post(format!("{cloud_base}/memory/retrieve"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&json!({
                 "query": query,
                 "top_k": top_k,
@@ -152,9 +390,11 @@ impl ToolExecutor {
         {
             return;
         }
-        let mem = astra_core::MemoriaSettings::from_env();
-        let token = match mem.bearer_token() {
-            Some(t) => t,
+        let Some(cloud_base) = self.cloud_base.clone() else {
+            return;
+        };
+        let token = match self.cloud_token() {
+            Some(token) => token,
             None => return,
         };
         tokio::spawn(async move {
@@ -167,10 +407,10 @@ impl ToolExecutor {
                 Err(_) => return,
             };
             for mid in memory_ids {
-                let url = format!("{}/v1/memories/{mid}/feedback", mem.base_url);
+                let url = format!("{cloud_base}/memory/feedback/{mid}");
                 if let Err(e) = client
                     .post(&url)
-                    .header("Authorization", &token)
+                    .header("Authorization", format!("Bearer {token}"))
                     .json(&json!({
                         "signal": "useful",
                         "context": "boost_search retrieval"
@@ -318,11 +558,6 @@ mod build_direct_request_tests {
     }
 }
 
-/// Public accessor for session_cleanup's working-memory purge.
-pub fn memoria_oneshot_client_pub(timeout_secs: u64) -> Option<(reqwest::Client, String, String)> {
-    astra_tools::memoria::memoria_oneshot_client(timeout_secs)
-}
-
 /// Retrieve procedural/semantic lessons from Memoria for session bootstrap.
 /// `context_query` should be derived from the user's first message — this
 /// produces much better semantic retrieval than keyword stuffing.
@@ -332,27 +567,14 @@ pub async fn memoria_retrieve_lessons(
     top_k: u64,
     context_query: Option<&str>,
 ) -> Vec<astra_runtime::self_model::LessonHint> {
-    let Some((client, base, key)) = memoria_oneshot_client(3) else {
-        return Vec::new();
-    };
     let query = context_query.unwrap_or("reusable lessons and corrections from prior sessions");
     let payload = json!({
         "query": query,
         "top_k": top_k,
         "min_confidence": 0.3,
     });
-    let resp = match client
-        .post(format!("{base}/v1/memories/retrieve"))
-        .header("Authorization", format!("Bearer {key}"))
-        .json(&payload)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-    let text = match resp.text().await {
-        Ok(t) => t,
+    let text = match memoria_retrieve(&payload, Duration::from_secs(3)).await {
+        Ok(text) => text,
         Err(_) => return Vec::new(),
     };
     let value: serde_json::Value = match serde_json::from_str(&text) {
@@ -376,10 +598,6 @@ pub async fn memoria_retrieve_lessons(
         .collect()
 }
 
-pub use astra_tools::memoria::{
-    memoria_consolidate_fire_and_forget, memoria_governance_fire_and_forget,
-};
-
 /// Store extracted lessons in Memoria as L3 durable memory using the
 /// batch endpoint (Session Memory Protocol §6.2). Single HTTP call for
 /// up to 100 lessons. Best-effort, fire-and-forget.
@@ -390,38 +608,24 @@ pub async fn memoria_store_lessons_fire_and_forget(
     if lessons.is_empty() {
         return;
     }
-    let Some((client, base, key)) = memoria_oneshot_client(5) else {
-        return;
-    };
-    let memories: Vec<serde_json::Value> = lessons
-        .iter()
-        .map(|l| {
-            let mut m = json!({
-                "content": l.content,
-                "memory_type": l.memory_type,
-                "trust_tier": l.trust_tier,
-                "source": {"agent": "session_end"},
-            });
-            if let Some(ref sid) = session_id {
-                m["session_id"] = json!(sid);
-            }
-            m
-        })
-        .collect();
-
-    if let Err(e) = client
-        .post(format!("{base}/v1/memories/batch"))
-        .header("Authorization", format!("Bearer {key}"))
-        .json(&json!({ "memories": memories }))
-        .send()
-        .await
-    {
-        tracing::debug!(
-            target: "memoria",
-            count = lessons.len(),
-            error = %e,
-            "batch lesson store failed",
-        );
+    for lesson in lessons {
+        let mut body = json!({
+            "content": lesson.content,
+            "memory_type": lesson.memory_type,
+            "trust_tier": lesson.trust_tier,
+            "source": {"agent": "session_end"},
+        });
+        if let Some(ref sid) = session_id {
+            body["session_id"] = json!(sid);
+        }
+        if let Err(e) = memoria_store(&body, Duration::from_secs(5)).await {
+            tracing::debug!(
+                target: "memoria",
+                error = %e,
+                "session-end lesson store failed",
+            );
+            break;
+        }
     }
 }
 

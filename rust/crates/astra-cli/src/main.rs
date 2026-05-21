@@ -396,21 +396,6 @@ async fn main() {
         }
     };
 
-    // Set MEMORIA_MASTER_KEY from credentials if not already set
-    if std::env::var("MEMORIA_MASTER_KEY").is_err() {
-        let creds = load_credentials();
-        let name = profile_name(cli.profile.as_deref(), &creds);
-        if let Some(key) = creds
-            .profiles
-            .get(&name)
-            .and_then(|p| p.memoria_api_key.as_deref())
-        {
-            unsafe {
-                std::env::set_var("MEMORIA_MASTER_KEY", key);
-            }
-        }
-    }
-
     let Cli {
         api_url: _,
         profile,

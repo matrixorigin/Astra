@@ -712,20 +712,6 @@ async fn run_extraction(
         .map(|m| format!("{:?}", m.category).to_lowercase())
         .collect();
 
-    let mem = astra_core::MemoriaSettings::from_env();
-    let key = match mem.master_key {
-        Some(k) => k,
-        None => {
-            return ExtractionOutcome::Extracted {
-                count: quality_filtered.len(),
-                categories,
-                duration_ms: start.elapsed().as_millis() as u64,
-                prefix_reused,
-                usage: usage.clone(),
-            };
-        }
-    };
-
     // Per-candidate conflict pre-check: route near-duplicates to
     // `/correct` instead of batch-inserting a new row. The prior path
     // POSTed every extracted item to `/v1/memories/batch`, creating
@@ -734,8 +720,6 @@ async fn run_extraction(
     // to a single recall RTT; each candidate then independently POSTs
     // either `/v1/memories` (new) or `/v1/memories/{id}/correct`
     // (refinement).
-    let auth = format!("Bearer {key}");
-    let base = mem.base_url.clone();
     let mut writes = 0usize;
     let mut updates = 0usize;
     let mut skipped = 0usize;
@@ -745,31 +729,26 @@ async fn run_extraction(
         let encoded = astra_prompts::memory_types::encode(m.category, &m.content);
         // Step 1: top-3 recall with a 2-second timeout (same budget as
         // the tool-side conflict pre-check).
-        let probe = client
-            .post(format!("{base}/v1/memories/retrieve"))
-            .header("Authorization", &auth)
-            .timeout(std::time::Duration::from_secs(2))
-            .json(&serde_json::json!({
+        let probe = crate::edge_tools::memoria::memoria_retrieve(
+            &serde_json::json!({
                 "query": encoded,
                 "top_k": 3,
                 "session_id": session_id,
-            }))
-            .send()
-            .await;
+            }),
+            std::time::Duration::from_secs(2),
+        )
+        .await;
         let decision = match probe {
-            Ok(resp) if resp.status().is_success() => match resp.text().await {
-                Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
-                    Ok(parsed) => {
-                        let arr = parsed
-                            .get("memories")
-                            .and_then(serde_json::Value::as_array)
-                            .cloned()
-                            .or_else(|| parsed.as_array().cloned())
-                            .unwrap_or_default();
-                        astra_tools::memoria::classify_write(&arr)
-                    }
-                    Err(_) => write_decision_for_failed_conflict_probe(),
-                },
+            Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(parsed) => {
+                    let arr = parsed
+                        .get("memories")
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .or_else(|| parsed.as_array().cloned())
+                        .unwrap_or_default();
+                    astra_tools::memoria::classify_write(&arr)
+                }
                 Err(_) => write_decision_for_failed_conflict_probe(),
             },
             // Fail closed on probe/network failure. Writing a fresh row
@@ -782,30 +761,29 @@ async fn run_extraction(
         let write_result = match &decision {
             astra_tools::memoria::WriteDecision::Update { memory_id, .. } => {
                 updates += 1;
-                client
-                    .put(format!("{base}/v1/memories/{memory_id}/correct"))
-                    .header("Authorization", &auth)
-                    .json(&serde_json::json!({
+                crate::edge_tools::memoria::memoria_correct(
+                    memory_id,
+                    &serde_json::json!({
                         "new_content": encoded,
                         "reason": "session-end extraction refinement",
-                    }))
-                    .send()
-                    .await
+                    }),
+                    std::time::Duration::from_secs(5),
+                )
+                .await
             }
             astra_tools::memoria::WriteDecision::Store => {
                 writes += 1;
-                client
-                    .post(format!("{base}/v1/memories"))
-                    .header("Authorization", &auth)
-                    .json(&serde_json::json!({
+                crate::edge_tools::memoria::memoria_store(
+                    &serde_json::json!({
                         "content": encoded,
                         "memory_type": m.category.memoria_type(),
                         "trust_tier": m.category.trust_tier(),
                         "session_id": session_id,
                         "source": {"agent": "extraction"},
-                    }))
-                    .send()
-                    .await
+                    }),
+                    std::time::Duration::from_secs(5),
+                )
+                .await
             }
             astra_tools::memoria::WriteDecision::Skip { reason } => {
                 skipped += 1;
@@ -814,10 +792,7 @@ async fn run_extraction(
             }
         };
         match write_result {
-            Ok(resp) if !resp.status().is_success() => {
-                errors.push(format!("{:?} HTTP {}", decision, resp.status()));
-            }
-            Err(e) => errors.push(format!("{decision:?} network: {e}")),
+            Err(e) => errors.push(format!("{decision:?}: {e}")),
             _ => {}
         }
     }

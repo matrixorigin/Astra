@@ -183,38 +183,22 @@ pub(super) async fn finalize_session(state: &mut SessionState) {
                 .await;
                 // Only purge AFTER store completes.
                 if let Some(sid) = sid_for_purge {
-                    if let Some((client, base, key)) =
-                        edge_tools::memoria::memoria_oneshot_client_pub(5)
-                    {
-                        let _ = client
-                            .post(format!("{base}/v1/memories/purge"))
-                            .header("Authorization", format!("Bearer {key}"))
-                            .json(&serde_json::json!({
-                                "topic": format!("LESSON session:{sid}"),
-                                "reason": "session-end promotion to semantic T3",
-                            }))
-                            .send()
-                            .await;
-                    }
+                    let _ = edge_tools::memoria::memoria_purge(&serde_json::json!({
+                        "topic": format!("LESSON session:{sid}"),
+                        "reason": "session-end promotion to semantic T3",
+                    }))
+                    .await;
                 }
             });
         } else if let Some(ref sid) = state.session_id {
             // No new lessons but still purge stale T4 working copies.
             let sid = sid.clone();
             tokio::spawn(async move {
-                if let Some((client, base, key)) =
-                    edge_tools::memoria::memoria_oneshot_client_pub(5)
-                {
-                    let _ = client
-                        .post(format!("{base}/v1/memories/purge"))
-                        .header("Authorization", format!("Bearer {key}"))
-                        .json(&serde_json::json!({
-                            "topic": format!("LESSON session:{sid}"),
-                            "reason": "session-end cleanup (no new lessons)",
-                        }))
-                        .send()
-                        .await;
-                }
+                let _ = edge_tools::memoria::memoria_purge(&serde_json::json!({
+                    "topic": format!("LESSON session:{sid}"),
+                    "reason": "session-end cleanup (no new lessons)",
+                }))
+                .await;
             });
         }
     }

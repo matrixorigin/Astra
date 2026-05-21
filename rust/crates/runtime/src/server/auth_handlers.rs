@@ -117,16 +117,17 @@ async fn memory_proxy_call(
     headers: &HeaderMap,
     endpoint: &str,
     mut body: serde_json::Value,
+    inject_identity: bool,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(headers).await?;
     let user_id = user.user_id.clone();
 
-    if let Some(obj) = body.as_object_mut() {
-        // Force-overwrite to prevent clients from impersonating other users
-        obj.insert(
-            "session_id".to_string(),
-            serde_json::Value::String(user_id.clone()),
-        );
+    if inject_identity && let Some(obj) = body.as_object_mut() {
+        // Force-overwrite user identity to prevent clients from impersonating
+        // other users. Preserve a caller-supplied session_id so legitimate
+        // session-scoped memory flows keep their actual session boundary.
+        obj.entry("session_id".to_string())
+            .or_insert_with(|| serde_json::Value::String(user_id.clone()));
         obj.insert(
             "user_id".to_string(),
             serde_json::Value::String(user_id.clone()),
@@ -167,7 +168,7 @@ pub(super) async fn memory_proxy_store_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memory_proxy_call(&state, &headers, "/v1/memories", body).await
+    memory_proxy_call(&state, &headers, "/v1/memories", body, true).await
 }
 
 pub(super) async fn memory_proxy_retrieve_handler(
@@ -175,7 +176,7 @@ pub(super) async fn memory_proxy_retrieve_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memory_proxy_call(&state, &headers, "/v1/memories/retrieve", body).await
+    memory_proxy_call(&state, &headers, "/v1/memories/retrieve", body, true).await
 }
 
 pub(super) async fn memory_proxy_search_handler(
@@ -183,7 +184,7 @@ pub(super) async fn memory_proxy_search_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memory_proxy_call(&state, &headers, "/v1/memories/search", body).await
+    memory_proxy_call(&state, &headers, "/v1/memories/search", body, true).await
 }
 
 pub(super) async fn memory_proxy_purge_handler(
@@ -202,7 +203,7 @@ pub(super) async fn memory_proxy_purge_handler(
         .unwrap_or("unknown")
         .to_string();
 
-    let result = memory_proxy_call(&state, &headers, "/v1/memories/purge", body).await?;
+    let result = memory_proxy_call(&state, &headers, "/v1/memories/purge", body, true).await?;
     let deleted = result
         .get("deleted_count")
         .and_then(|v| v.as_u64())
@@ -218,4 +219,226 @@ pub(super) async fn memory_proxy_purge_handler(
         "message": message,
     });
     Ok(Json(enriched))
+}
+
+pub(super) async fn memory_proxy_expand_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(memory_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    memory_proxy_call(
+        &state,
+        &headers,
+        &format!("/v1/memories/{memory_id}"),
+        serde_json::json!({}),
+        false,
+    )
+    .await
+}
+
+pub(super) async fn memory_proxy_correct_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    memory_proxy_call(&state, &headers, "/v1/memories/correct", body, true).await
+}
+
+pub(super) async fn memory_proxy_correct_by_id_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(memory_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    memory_proxy_call(
+        &state,
+        &headers,
+        &format!("/v1/memories/{memory_id}/correct"),
+        body,
+        true,
+    )
+    .await
+}
+
+pub(super) async fn memory_proxy_feedback_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(memory_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    memory_proxy_call(
+        &state,
+        &headers,
+        &format!("/v1/memories/{memory_id}/feedback"),
+        body,
+        false,
+    )
+    .await
+}
+
+pub(super) async fn memory_proxy_profile_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    memory_proxy_call(
+        &state,
+        &headers,
+        "/v1/profiles/me",
+        serde_json::json!({}),
+        true,
+    )
+    .await
+}
+
+pub(super) async fn memory_proxy_reflect_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    memory_proxy_call(&state, &headers, "/v1/reflect", body, true).await
+}
+
+async fn memoria_management_proxy_call(
+    state: &AppState,
+    headers: &HeaderMap,
+    endpoint: &str,
+    body: Option<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state.auth_service.current_user(headers).await?;
+    state
+        .memoria_forwarder
+        .forward(endpoint, body.unwrap_or_else(|| serde_json::json!({})))
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(
+                target: "astra_runtime::auth",
+                endpoint = endpoint,
+                error = %error,
+                "memoria management proxy forward failed"
+            );
+            if error.contains("not configured") {
+                error_response(StatusCode::SERVICE_UNAVAILABLE, &error)
+            } else {
+                internal_error(&error)
+            }
+        })
+}
+
+pub(super) async fn memoria_proxy_snapshot_create_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    memoria_management_proxy_call(&state, &headers, "/v1/snapshots", Some(body)).await
+}
+
+pub(super) async fn memoria_proxy_snapshots_list_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    memoria_management_proxy_call(&state, &headers, "/v1/snapshots", None).await
+}
+
+pub(super) async fn memoria_proxy_snapshot_rollback_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    memoria_management_proxy_call(
+        &state,
+        &headers,
+        &format!("/v1/snapshots/{name}/rollback"),
+        None,
+    )
+    .await
+}
+
+pub(super) async fn memoria_proxy_snapshot_diff_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    memoria_management_proxy_call(
+        &state,
+        &headers,
+        &format!("/v1/snapshots/{name}/diff"),
+        None,
+    )
+    .await
+}
+
+pub(super) async fn memoria_proxy_branch_create_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    memoria_management_proxy_call(&state, &headers, "/v1/branches", Some(body)).await
+}
+
+pub(super) async fn memoria_proxy_branches_list_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    memoria_management_proxy_call(&state, &headers, "/v1/branches", None).await
+}
+
+pub(super) async fn memoria_proxy_branch_checkout_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    memoria_management_proxy_call(
+        &state,
+        &headers,
+        &format!("/v1/branches/{name}/checkout"),
+        None,
+    )
+    .await
+}
+
+pub(super) async fn memoria_proxy_branch_merge_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    memoria_management_proxy_call(
+        &state,
+        &headers,
+        &format!("/v1/branches/{name}/merge"),
+        None,
+    )
+    .await
+}
+
+pub(super) async fn memoria_proxy_branch_diff_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    memoria_management_proxy_call(&state, &headers, &format!("/v1/branches/{name}/diff"), None)
+        .await
+}
+
+pub(super) async fn memoria_proxy_health_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    memoria_management_proxy_call(&state, &headers, "/v1/health/analyze", None).await
+}
+
+pub(super) async fn memoria_proxy_governance_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    memoria_management_proxy_call(&state, &headers, "/v1/governance", Some(body)).await
+}
+
+pub(super) async fn memoria_proxy_consolidate_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    memoria_management_proxy_call(&state, &headers, "/v1/consolidate", Some(body)).await
 }
