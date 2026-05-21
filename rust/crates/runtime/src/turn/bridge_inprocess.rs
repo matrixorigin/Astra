@@ -831,7 +831,7 @@ use super::bridge_observability::{
 };
 
 // ── LLM streaming — delegated to turn::bridge_llm_stream ─────────────────────
-use super::bridge_llm_stream::call_llm_stream;
+use super::bridge_llm_stream::call_llm_stream_with_request_overrides;
 use super::bridge_llm_stream::rate_limit_cooldown;
 use astra_turn_core::bridge_rate_limit_cooldown::{
     FallbackOutcome, RateLimitAction, try_resolve_fallback,
@@ -1299,13 +1299,14 @@ impl InProcessChatTurnBridge {
             // Resolve LLM model (skipped when `test_llm_rounds` drives the turn — feature `bridge-e2e-hooks`).
             // Also capture fallback_chain for rate-limit-triggered fallback.
             let pool_ref = shared_pool.as_ref().map(SharedPool::get);
-            let (mut model_name, mut wire_model_name, mut api_key, mut base_url, mut provider, fallback_chain) = if use_e2e_llm {
+            let (mut model_name, mut wire_model_name, mut api_key, mut base_url, mut provider, mut request_body_overrides, fallback_chain) = if use_e2e_llm {
                 (
                     "bridge-e2e-mock".to_string(),
                     None::<String>,
                     "unused".to_string(),
                     "http://127.0.0.1:1".to_string(),
                     "openai".to_string(),
+                    None,
                     Vec::<String>::new(),
                 )
             } else {
@@ -1323,6 +1324,7 @@ impl InProcessChatTurnBridge {
                         m.api_key,
                         m.base_url,
                         m.provider,
+                        m.request_body_overrides,
                         m.fallback_chain,
                     ),
                     Err(e) => {
@@ -1388,6 +1390,7 @@ impl InProcessChatTurnBridge {
                             api_key = fb.api_key;
                             base_url = fb.base_url;
                             provider = fb.provider;
+                            request_body_overrides = fb.request_body_overrides;
                         }
                         FallbackOutcome::NoFallbackConfigured => {
                             astra_core::agent_warn!(
@@ -2589,7 +2592,7 @@ impl InProcessChatTurnBridge {
                     {
                         futures_util::stream::iter(blocks.into_iter().map(Bytes::from)).boxed()
                     } else {
-                        match call_llm_stream(
+                        match call_llm_stream_with_request_overrides(
                             &llm_messages,
                             &pruned_tools,
                             &model_name,
@@ -2601,6 +2604,7 @@ impl InProcessChatTurnBridge {
                             has_fallback,
                             cc.clone(),
                             &thinking_config,
+                            request_body_overrides.as_ref(),
                         )
                         .await
                         {
@@ -2765,7 +2769,7 @@ impl InProcessChatTurnBridge {
                             }
 
                             // Retry LLM call
-                            match call_llm_stream(
+                            match call_llm_stream_with_request_overrides(
                                 &llm_messages,
                                 &pruned_tools,
                                 &model_name,
@@ -2777,6 +2781,7 @@ impl InProcessChatTurnBridge {
                                 has_fallback,
                                 cc.clone(),
                                 &thinking_config,
+                                request_body_overrides.as_ref(),
                             )
                             .await
                             {

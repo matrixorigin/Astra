@@ -117,7 +117,7 @@ pub(super) async fn completions_handler(
     let mut messages = request.messages;
     crate::turn::llm_client::strip_empty_assistant_tool_calls(&mut messages);
     let upstream_name = resolved.upstream_model_name();
-    let body = crate::turn::llm_client::build_provider_request_body(
+    let body = crate::turn::llm_client::build_provider_request_body_with_overrides(
         &messages,
         &[],
         upstream_name,
@@ -126,6 +126,7 @@ pub(super) async fn completions_handler(
         Some(request.temperature),
         false,
         &astra_turn_core::thinking_config::ThinkingConfig::Off,
+        resolved.request_body_overrides.as_ref(),
     );
 
     let url = crate::turn::llm_client::llm_request_url_for_provider(

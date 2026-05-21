@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::turn::bridge_sse_helpers::render_sse;
 use crate::turn::llm_client::{
-    LLM_MAX_RETRIES, LlmCancel, apply_provider_auth, build_provider_request_body,
+    LLM_MAX_RETRIES, LlmCancel, apply_provider_auth, build_provider_request_body_with_overrides,
     consolidate_system_messages, llm_request_url_for_provider, llm_retry_base_ms,
     parse_openai_sse_json_stream, provider_uses_anthropic_messages, provider_uses_bedrock_converse,
     sleep_ms_or_llm_cancel,
@@ -241,12 +241,13 @@ async fn bedrock_stream_with_retry(
     has_fallback: bool,
     client_cancel: Option<Arc<CancellationToken>>,
     thinking: &astra_turn_core::thinking_config::ThinkingConfig,
+    request_body_overrides: Option<&Map<String, Value>>,
 ) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
     let cooldown = rate_limit_cooldown();
     let model_key = model_name;
     let upstream_name = wire_model_name.unwrap_or(model_name);
 
-    let body = build_provider_request_body(
+    let body = build_provider_request_body_with_overrides(
         messages,
         tools,
         upstream_name,
@@ -255,6 +256,7 @@ async fn bedrock_stream_with_retry(
         None,
         true,
         thinking,
+        request_body_overrides,
     );
     let url = llm_request_url_for_provider(base_url, provider, upstream_name, true);
 
@@ -391,12 +393,13 @@ async fn anthropic_stream_with_retry(
     has_fallback: bool,
     client_cancel: Option<Arc<CancellationToken>>,
     thinking: &astra_turn_core::thinking_config::ThinkingConfig,
+    request_body_overrides: Option<&Map<String, Value>>,
 ) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
     let cooldown = rate_limit_cooldown();
     let model_key = model_name;
     let upstream_name = wire_model_name.unwrap_or(model_name);
 
-    let body = build_provider_request_body(
+    let body = build_provider_request_body_with_overrides(
         messages,
         tools,
         upstream_name,
@@ -405,6 +408,7 @@ async fn anthropic_stream_with_retry(
         None,
         true,
         thinking,
+        request_body_overrides,
     );
     let url = llm_request_url_for_provider(base_url, provider, upstream_name, true);
 
@@ -754,6 +758,7 @@ fn apply_anthropic_event(
 /// resolution BEFORE calling this function. This function only handles retries for
 /// transient errors within a single model.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn call_llm_stream(
     messages: &[Value],
     tools: &[Value],
@@ -766,6 +771,38 @@ pub(crate) async fn call_llm_stream(
     has_fallback: bool,
     client_cancel: Option<Arc<CancellationToken>>,
     thinking: &astra_turn_core::thinking_config::ThinkingConfig,
+) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
+    call_llm_stream_with_request_overrides(
+        messages,
+        tools,
+        model_name,
+        wire_model_name,
+        api_key,
+        base_url,
+        provider,
+        max_output_tokens,
+        has_fallback,
+        client_cancel,
+        thinking,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_llm_stream_with_request_overrides(
+    messages: &[Value],
+    tools: &[Value],
+    model_name: &str,
+    wire_model_name: Option<&str>,
+    api_key: &str,
+    base_url: &str,
+    provider: &str,
+    max_output_tokens: Option<usize>,
+    has_fallback: bool,
+    client_cancel: Option<Arc<CancellationToken>>,
+    thinking: &astra_turn_core::thinking_config::ThinkingConfig,
+    request_body_overrides: Option<&Map<String, Value>>,
 ) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
     let cooldown = rate_limit_cooldown();
     // `model_key` addresses the per-local-row rate-limit state. Two local
@@ -799,6 +836,7 @@ pub(crate) async fn call_llm_stream(
             has_fallback,
             client_cancel,
             thinking,
+            request_body_overrides,
         )
         .await;
     }
@@ -816,11 +854,12 @@ pub(crate) async fn call_llm_stream(
             has_fallback,
             client_cancel,
             thinking,
+            request_body_overrides,
         )
         .await;
     }
 
-    let body = build_provider_request_body(
+    let body = build_provider_request_body_with_overrides(
         &messages,
         tools,
         upstream_name,
@@ -829,6 +868,7 @@ pub(crate) async fn call_llm_stream(
         None,
         true,
         thinking,
+        request_body_overrides,
     );
 
     let url = llm_request_url_for_provider(base_url, provider, upstream_name, true);

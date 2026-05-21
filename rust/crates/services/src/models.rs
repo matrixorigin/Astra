@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use sqlx::{Row, query};
 use uuid::Uuid;
 
@@ -59,6 +60,10 @@ pub struct QuirksData {
     /// column — so adding it required no DB migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_model_name: Option<String>,
+    /// Additional top-level request body fields to merge into outbound
+    /// provider payloads for this model row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body_overrides: Option<Map<String, Value>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -211,6 +216,7 @@ pub struct ResolvedActiveLlmModel {
     pub provider: String,
     pub fallback_chain: Vec<String>,
     pub tags: Vec<String>,
+    pub request_body_overrides: Option<Map<String, Value>>,
     /// Probe-determined thinking capability. NULL if unprobed.
     pub thinking_capability: Option<ThinkingCapability>,
 }
@@ -275,6 +281,7 @@ fn build_resolved_active_llm_from_row(
 
     let fallback_chain = quirks.fallback_chain;
     let wire_model_name = quirks.wire_model_name;
+    let request_body_overrides = quirks.request_body_overrides;
 
     Ok(ResolvedActiveLlmModel {
         model_name,
@@ -284,6 +291,7 @@ fn build_resolved_active_llm_from_row(
         provider,
         fallback_chain,
         tags,
+        request_body_overrides,
         thinking_capability,
     })
 }
@@ -2559,6 +2567,7 @@ mod tests {
             provider: "anthropic".into(),
             fallback_chain: vec![],
             tags: vec![],
+            request_body_overrides: None,
             thinking_capability: None,
         };
         assert_eq!(r.upstream_model_name(), "deepseek-v4-pro");
@@ -2576,6 +2585,7 @@ mod tests {
             provider: "anthropic".into(),
             fallback_chain: vec![],
             tags: vec![],
+            request_body_overrides: None,
             thinking_capability: None,
         };
         assert_eq!(r.upstream_model_name(), "claude-sonnet-4-6");
@@ -2591,6 +2601,30 @@ mod tests {
         assert!(json.contains("wire_model_name"));
         let back: QuirksData = serde_json::from_str(&json).unwrap();
         assert_eq!(back.wire_model_name.as_deref(), Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn quirks_request_body_overrides_round_trip_through_json() {
+        let q = QuirksData {
+            request_body_overrides: Some(Map::from_iter([(
+                "context_management".into(),
+                serde_json::json!({
+                    "edits": [{"type": "clear_tool_uses_20250919", "trigger": {"type": "input_tokens", "value": 180_000}}],
+                }),
+            )])),
+            ..QuirksData::default()
+        };
+        let json = serde_json::to_string(&q).unwrap();
+        assert!(json.contains("request_body_overrides"));
+        let back: QuirksData = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.request_body_overrides
+                .as_ref()
+                .and_then(|m| m.get("context_management")),
+            q.request_body_overrides
+                .as_ref()
+                .and_then(|m| m.get("context_management"))
+        );
     }
 
     #[test]
@@ -2617,6 +2651,7 @@ mod tests {
         assert!(!q.no_system_message);
         assert!(!q.system_as_user_prefix);
         assert!(q.fixed_temperature.is_none());
+        assert!(q.request_body_overrides.is_none());
     }
 
     #[test]
@@ -2657,6 +2692,10 @@ mod tests {
             system_as_user_prefix: true,
             fallback_chain: vec!["claude-haiku".into(), "gpt-4o-mini".into()],
             wire_model_name: Some("deepseek-v4-pro".into()),
+            request_body_overrides: Some(Map::from_iter([(
+                "context_management".into(),
+                serde_json::json!({"edits": [{"type": "clear_tool_uses_20250919"}]}),
+            )])),
         };
         let json = serde_json::to_string(&q).unwrap();
         let restored: QuirksData = serde_json::from_str(&json).unwrap();
