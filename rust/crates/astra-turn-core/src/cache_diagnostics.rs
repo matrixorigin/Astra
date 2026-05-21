@@ -201,8 +201,25 @@ impl PromptStateSnapshot {
         model: &str,
         cache_eligible_tokens: usize,
     ) -> Self {
+        Self::capture_with_fingerprints(
+            system_prompt_text,
+            fingerprint_system_blocks(system_blocks),
+            tool_schemas,
+            provider,
+            model,
+            cache_eligible_tokens,
+        )
+    }
+
+    fn capture_with_fingerprints(
+        system_prompt_text: &str,
+        system_blocks: Vec<SystemBlockFingerprint>,
+        tool_schemas: &[serde_json::Value],
+        provider: &str,
+        model: &str,
+        cache_eligible_tokens: usize,
+    ) -> Self {
         let system_prompt_hash = hash_str(system_prompt_text);
-        let system_blocks = fingerprint_system_blocks(system_blocks);
         let cache_control_hash = hash_cache_control_state(&system_blocks);
 
         let per_tool_hashes: Vec<(String, u64)> = tool_schemas
@@ -249,17 +266,17 @@ impl PromptStateSnapshot {
 
 /// Extract the canonical system-prompt text from a provider request message list.
 ///
-/// Uses the first `role=system` message when present, otherwise falls back to the
+/// Uses all `role=system` messages when present, otherwise falls back to the
 /// first message. Structured content arrays/objects are flattened into text using
 /// the same rules across CLI and runtime journal reconstruction.
 #[must_use]
 pub fn prompt_snapshot_system_text_from_messages(messages: &[serde_json::Value]) -> String {
-    messages
-        .iter()
-        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
-        .or_else(|| messages.first())
-        .map(prompt_snapshot_message_content_text)
-        .unwrap_or_default()
+    prompt_snapshot_selected_message_contents(messages)
+        .into_iter()
+        .map(prompt_snapshot_content_value_text)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Build a [`PromptStateSnapshot`] from a raw provider message list plus tool schemas.
@@ -274,34 +291,60 @@ pub fn prompt_snapshot_from_messages(
     cache_eligible_tokens: usize,
 ) -> Option<PromptStateSnapshot> {
     let system_prompt_text = prompt_snapshot_system_text_from_messages(messages);
-    let mut snapshot = PromptStateSnapshot::capture(
+    let snapshot = PromptStateSnapshot::capture_with_fingerprints(
         &system_prompt_text,
+        prompt_snapshot_fingerprint_system_blocks(messages),
         tool_schemas,
+        provider,
         model,
         cache_eligible_tokens,
     );
-    snapshot.provider = provider.to_string();
     Some(snapshot)
 }
 
-fn prompt_snapshot_message_content_text(message: &serde_json::Value) -> String {
-    prompt_snapshot_content_value_text(message.get("content").unwrap_or(&serde_json::Value::Null))
+fn prompt_snapshot_selected_message_contents(
+    messages: &[serde_json::Value],
+) -> Vec<&serde_json::Value> {
+    let system_contents: Vec<&serde_json::Value> = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+        .filter_map(|message| message.get("content"))
+        .collect();
+    if system_contents.is_empty() {
+        messages
+            .first()
+            .and_then(|message| message.get("content"))
+            .into_iter()
+            .collect()
+    } else {
+        system_contents
+    }
 }
 
 fn prompt_snapshot_content_value_text(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Null => String::new(),
         serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Array(items) => items
-            .iter()
-            .filter_map(|item| {
-                item.get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-                    .or_else(|| item.as_str().map(str::to_string))
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n"),
+        serde_json::Value::Array(items) => {
+            let mut out = String::new();
+            for item in items {
+                let text = prompt_snapshot_content_block_text(item);
+                if text.is_empty() {
+                    continue;
+                }
+                if prompt_snapshot_is_separator_block(item) {
+                    if !out.ends_with("\n\n") {
+                        out.push_str("\n\n");
+                    }
+                    continue;
+                }
+                if !out.is_empty() && !out.ends_with("\n\n") {
+                    out.push_str("\n\n");
+                }
+                out.push_str(&text);
+            }
+            out
+        }
         serde_json::Value::Object(map) => map
             .get("text")
             .and_then(serde_json::Value::as_str)
@@ -309,6 +352,80 @@ fn prompt_snapshot_content_value_text(value: &serde_json::Value) -> String {
             .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default()),
         _ => value.to_string(),
     }
+}
+
+fn prompt_snapshot_fingerprint_system_blocks(
+    messages: &[serde_json::Value],
+) -> Vec<SystemBlockFingerprint> {
+    prompt_snapshot_selected_message_contents(messages)
+        .into_iter()
+        .flat_map(prompt_snapshot_content_value_blocks)
+        .collect()
+}
+
+fn prompt_snapshot_content_value_blocks(value: &serde_json::Value) -> Vec<SystemBlockFingerprint> {
+    match value {
+        serde_json::Value::Null => Vec::new(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(prompt_snapshot_content_block_fingerprint)
+            .collect(),
+        _ => prompt_snapshot_content_block_fingerprint(value)
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn prompt_snapshot_content_block_fingerprint(
+    value: &serde_json::Value,
+) -> Option<SystemBlockFingerprint> {
+    if prompt_snapshot_is_separator_block(value) {
+        return None;
+    }
+    let text = prompt_snapshot_content_block_text(value);
+    let cache_control_hash = value
+        .get("cache_control")
+        .map_or(0, |cache_control| hash_str(&cache_control.to_string()));
+    if text.is_empty() && cache_control_hash == 0 {
+        return None;
+    }
+    Some(SystemBlockFingerprint {
+        kind: value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| match value {
+                serde_json::Value::String(_) => "text",
+                serde_json::Value::Object(_) => "object",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::Null => "null",
+            })
+            .to_string(),
+        scope: "provider_visible".to_string(),
+        text_hash: hash_str(&text),
+        cache_control_hash,
+    })
+}
+
+fn prompt_snapshot_content_block_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Object(map) => map
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default()),
+        serde_json::Value::Array(_) => prompt_snapshot_content_value_text(value),
+        _ => value.to_string(),
+    }
+}
+
+fn prompt_snapshot_is_separator_block(value: &serde_json::Value) -> bool {
+    value.get("cache_control").is_none()
+        && value.get("type").and_then(serde_json::Value::as_str) == Some("text")
+        && value.get("text").and_then(serde_json::Value::as_str) == Some("\n\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +918,20 @@ impl CacheBreakDetector {
         message_count: usize,
         system_message_count: usize,
     ) -> CacheAwareCompressionHint {
+        self.compression_hint_for_source(DEFAULT_SOURCE, message_count, system_message_count)
+    }
+
+    /// Generate a compression hint for a specific query source.
+    ///
+    /// If the requested source has not been written yet, fall back to the most
+    /// recently refreshed source so replay-only streams do not silently lose the
+    /// protected-token estimate.
+    pub fn compression_hint_for_source(
+        &self,
+        source: &str,
+        message_count: usize,
+        system_message_count: usize,
+    ) -> CacheAwareCompressionHint {
         let stats = &self.stats;
         let hit_rate = stats.hit_rate_percent();
 
@@ -826,19 +957,18 @@ impl CacheBreakDetector {
             0
         };
 
-        // Compression hints are a whole-session property, not per-source.
-        // We use the DEFAULT_SOURCE (main stream) as the representative
-        // snapshot: the protected prefix tokens are whatever the main
-        // conversation last saw. Subagent streams don't influence what
-        // the main compression pipeline treats as cache-valid prefix.
-        //
-        // NOTE: if the main turn loop is ever wired to record under a
-        // different source key (e.g. `"repl_main_thread"`), this lookup
-        // must be updated in lockstep or the protected-token estimate
-        // will silently fall to 0.
+        // Compression hints are a whole-session property, but the token estimate
+        // still needs a representative snapshot. Prefer the caller's stream, and
+        // fall back to the most recently refreshed tracked stream so bridge-only
+        // replay state remains usable.
         let protected_token_estimate = self
             .per_source
-            .get(DEFAULT_SOURCE)
+            .get(source)
+            .or_else(|| {
+                self.source_order
+                    .last()
+                    .and_then(|latest| self.per_source.get(latest))
+            })
             .map(|s| s.cache_eligible_tokens)
             .unwrap_or(0);
 
@@ -895,8 +1025,6 @@ fn fingerprint_system_blocks(
 fn hash_cache_control_state(system_blocks: &[SystemBlockFingerprint]) -> u64 {
     let mut h = DefaultHasher::new();
     for block in system_blocks {
-        block.kind.hash(&mut h);
-        block.scope.hash(&mut h);
         block.cache_control_hash.hash(&mut h);
     }
     h.finish()
@@ -1073,6 +1201,60 @@ mod tests {
         assert_eq!(snapshot.model, "claude");
         assert_eq!(snapshot.cache_eligible_tokens, 42);
         assert_eq!(snapshot.system_prompt_hash, hash_str("Prompt"));
+    }
+
+    #[test]
+    fn prompt_snapshot_from_messages_matches_serialized_cache_control_fingerprint() {
+        use crate::section_types::{CacheScope, SectionKind};
+
+        let serialized = [SerializedSystemBlock {
+            kind: SectionKind::Identity,
+            scope: CacheScope::Session,
+            text: "Prompt".into(),
+            cache_control: Some(json!({"type": "ephemeral", "ttl": "1h"})),
+        }];
+        let messages = vec![json!({
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "Prompt", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ]
+        })];
+
+        let from_serialized =
+            PromptStateSnapshot::capture_serialized(&serialized, &[], "anthropic", "claude", 42);
+        let from_messages =
+            prompt_snapshot_from_messages(&messages, &[], "anthropic", "claude", 42)
+                .expect("snapshot");
+
+        assert_eq!(
+            from_messages.system_prompt_hash,
+            from_serialized.system_prompt_hash
+        );
+        assert_eq!(
+            from_messages.cache_control_hash,
+            from_serialized.cache_control_hash
+        );
+    }
+
+    #[test]
+    fn prompt_snapshot_from_messages_handles_explicit_separator_blocks() {
+        let messages = vec![json!({
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "A"},
+                {"type": "text", "text": "\n\n"},
+                {"type": "text", "text": "B", "cache_control": {"type": "ephemeral"}}
+            ]
+        })];
+
+        let snapshot = prompt_snapshot_from_messages(&messages, &[], "anthropic", "claude", 42)
+            .expect("snapshot");
+
+        assert_eq!(
+            prompt_snapshot_system_text_from_messages(&messages),
+            "A\n\nB"
+        );
+        assert_eq!(snapshot.system_blocks.len(), 2);
     }
 
     #[test]
@@ -1279,6 +1461,42 @@ mod tests {
                 .all(|reason| !matches!(reason, CacheBreakReason::CacheControlChanged)),
             "text-only changes must not be misattributed as cache-control churn"
         );
+    }
+
+    #[test]
+    fn detect_cache_control_change() {
+        use crate::section_types::{CacheScope, SectionKind};
+
+        let block_v1 = SerializedSystemBlock {
+            kind: SectionKind::Identity,
+            scope: CacheScope::Session,
+            text: "stable".into(),
+            cache_control: Some(json!({"type": "ephemeral"})),
+        };
+        let block_v2 = SerializedSystemBlock {
+            cache_control: Some(json!({"type": "ephemeral", "ttl": "1h"})),
+            ..block_v1.clone()
+        };
+
+        let mut det = CacheBreakDetector::new();
+        det.record_turn(
+            PromptStateSnapshot::capture_serialized(&[block_v1], &[], "anthropic", "claude", 8_000),
+            None,
+        );
+        let event = det
+            .record_turn(
+                PromptStateSnapshot::capture_serialized(
+                    &[block_v2],
+                    &[],
+                    "anthropic",
+                    "claude",
+                    8_000,
+                ),
+                Some(0),
+            )
+            .expect("cache-control change should be detected");
+
+        assert_eq!(event.reason, CacheBreakReason::CacheControlChanged);
     }
 
     #[test]
@@ -1588,6 +1806,39 @@ mod tests {
         assert!(!hint.cache_healthy);
         assert_eq!(hint.strategy, CompressionStrategy::CompressFreely);
         assert_eq!(hint.protected_prefix_len, 0);
+    }
+
+    #[test]
+    fn compression_hint_falls_back_to_latest_tracked_source() {
+        let tools = make_tools(&["bash"]);
+        let mut det = CacheBreakDetector::new();
+
+        for _ in 0..5 {
+            det.record_turn_for_source("bridge_inprocess", snap("prompt", &tools, "claude"), None);
+        }
+
+        let hint = det.compression_hint(20, 2);
+        assert!(hint.cache_healthy);
+        assert_eq!(hint.protected_token_estimate, 15_000);
+    }
+
+    #[test]
+    fn compression_hint_for_source_prefers_requested_snapshot() {
+        let tools = make_tools(&["bash"]);
+        let mut det = CacheBreakDetector::new();
+
+        let mut main = snap("main", &tools, "claude");
+        main.cache_eligible_tokens = 7_000;
+        let mut bridge = snap("bridge", &tools, "claude");
+        bridge.cache_eligible_tokens = 11_000;
+
+        det.record_turn_for_source(DEFAULT_SOURCE, main.clone(), None);
+        det.record_turn_for_source(DEFAULT_SOURCE, main, None);
+        det.record_turn_for_source("bridge_inprocess", bridge.clone(), None);
+        det.record_turn_for_source("bridge_inprocess", bridge, None);
+
+        let hint = det.compression_hint_for_source(DEFAULT_SOURCE, 20, 2);
+        assert_eq!(hint.protected_token_estimate, 7_000);
     }
 
     #[test]

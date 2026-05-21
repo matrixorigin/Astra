@@ -850,8 +850,25 @@ fn summarize_persisted_content(content: &str) -> (Vec<String>, String) {
 }
 
 impl MemoryExtractionService {
-    async fn load_current_memory(&self, _session_id: &str) -> String {
-        String::new()
+    async fn load_current_memory(&self, session_id: &str) -> String {
+        let query = format!(
+            "{} {} session memory",
+            super::runner::SESSION_MEMORY_PREFIX,
+            session_id
+        );
+        let Ok(memories) = self
+            .memoria_client
+            .retrieve_ext(&query, Some(session_id), 5, true)
+            .await
+        else {
+            return String::new();
+        };
+        memories
+            .iter()
+            .find_map(|memory| {
+                super::runner::decode_session_memory_entry(&memory.content, session_id)
+            })
+            .unwrap_or_default()
     }
 
     // ── event emission helpers ────────────────────────────────────────

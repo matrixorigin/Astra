@@ -231,6 +231,18 @@ struct BridgePipelineBaseline {
     cache_detector: astra_turn_core::cache_diagnostics::CacheBreakDetector,
 }
 
+const BRIDGE_CACHE_SOURCE: &str = "bridge_inprocess";
+
+fn event_source(event: &astra_services::session_journal::JournalEvent) -> Option<&str> {
+    event.metadata.as_ref()?.get("source")?.as_str()
+}
+
+fn event_matches_bridge_cache_source(
+    event: &astra_services::session_journal::JournalEvent,
+) -> bool {
+    event_source(event).is_none_or(|source| source == BRIDGE_CACHE_SOURCE)
+}
+
 fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
     if session_id.is_empty() {
         return BridgePipelineBaseline {
@@ -266,9 +278,14 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
                 }
             }
             astra_services::session_journal::JournalEventType::LlmRequestFull => {
-                pending_request_snapshot = bridge_prompt_snapshot_from_journal_event(&event);
+                if event_matches_bridge_cache_source(&event) {
+                    pending_request_snapshot = bridge_prompt_snapshot_from_journal_event(&event);
+                }
             }
             astra_services::session_journal::JournalEventType::LlmResponseFull => {
+                if !event_matches_bridge_cache_source(&event) {
+                    continue;
+                }
                 response_count = response_count.saturating_add(1);
                 let usage = bridge_usage_from_response_event(&event);
                 if let Some(usage) = usage.as_ref() {
@@ -282,7 +299,7 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
                 }
                 if let Some(snapshot) = pending_request_snapshot.take() {
                     let _ = cache_detector.record_turn_for_source(
-                        "bridge_inprocess",
+                        BRIDGE_CACHE_SOURCE,
                         snapshot,
                         usage.as_ref().map(|u| u.cached_input_tokens),
                     );
@@ -3511,7 +3528,7 @@ impl InProcessChatTurnBridge {
                         if let Some(event) = bridge_pipeline_baseline
                             .cache_detector
                             .record_turn_for_source(
-                                "bridge_inprocess",
+                                BRIDGE_CACHE_SOURCE,
                                 current_snapshot,
                                 Some(usage_snapshot.cached_input_tokens),
                             )
@@ -6129,7 +6146,7 @@ mod tests {
         assert!(
             baseline
                 .cache_detector
-                .snapshot_for_source("bridge_inprocess")
+                .snapshot_for_source(BRIDGE_CACHE_SOURCE)
                 .is_some(),
             "baseline should warm the bridge cache detector from prior request/response pairs"
         );
@@ -6147,7 +6164,7 @@ mod tests {
         assert!(
             baseline
                 .cache_detector
-                .record_turn_for_source("bridge_inprocess", current, Some(500))
+                .record_turn_for_source(BRIDGE_CACHE_SOURCE, current, Some(500))
                 .is_none(),
             "reconstructed detector state should treat the next stable turn as a hit"
         );
