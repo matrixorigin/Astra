@@ -20,6 +20,7 @@ pub trait HealthChecker: Send + Sync {
 pub trait MemoriaForwarder: Send + Sync {
     async fn forward(
         &self,
+        method: reqwest::Method,
         endpoint: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String>;
@@ -755,13 +756,14 @@ impl ReqwestMemoriaForwarder {
 impl MemoriaForwarder for ReqwestMemoriaForwarder {
     async fn forward(
         &self,
+        method: reqwest::Method,
         endpoint: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let url = format!("{}{}", self.base_url, endpoint);
         let resp = self
             .client
-            .post(&url)
+            .request(method, &url)
             .header("Authorization", format!("Bearer {}", self.master_key))
             .json(&body)
             .send()
@@ -785,6 +787,7 @@ pub struct NoopMemoriaForwarder;
 impl MemoriaForwarder for NoopMemoriaForwarder {
     async fn forward(
         &self,
+        _method: reqwest::Method,
         _endpoint: &str,
         _body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
@@ -896,6 +899,7 @@ mod tests {
         let start = std::time::Instant::now();
         let result = forwarder
             .forward(
+                reqwest::Method::POST,
                 "/v1/memories/retrieve",
                 serde_json::json!({"query": "test"}),
             )
@@ -930,6 +934,57 @@ mod tests {
             impl_body.contains("self.client") || impl_body.contains("self\n            .client"),
             "forward() must use the shared self.client"
         );
+        assert!(
+            impl_body.contains(".request(method, &url)"),
+            "forward() must honor the caller-provided HTTP method"
+        );
+    }
+
+    #[tokio::test]
+    async fn memoria_forwarder_honors_http_method() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let method = req
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().next())
+                        .unwrap_or("UNKNOWN");
+                    let body = format!(r#"{{"method":"{method}"}}"#);
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+                break;
+            }
+        });
+
+        let forwarder = ReqwestMemoriaForwarder::new_with_timeouts(
+            format!("http://{addr}"),
+            "test-key".to_string(),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+        let result = forwarder
+            .forward(
+                reqwest::Method::PUT,
+                "/v1/memories/test-id/correct",
+                serde_json::json!({"new_content": "x", "reason": "y"}),
+            )
+            .await
+            .expect("forward success");
+        assert_eq!(result["method"], "PUT");
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -964,6 +1019,7 @@ mod tests {
         let err = state
             .memoria_forwarder
             .forward(
+                reqwest::Method::POST,
                 "/v1/memories/retrieve",
                 serde_json::json!({ "query": "test" }),
             )

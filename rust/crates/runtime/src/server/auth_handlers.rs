@@ -115,6 +115,7 @@ pub(super) async fn auth_me_handler(
 async fn memory_proxy_call(
     state: &AppState,
     headers: &HeaderMap,
+    method: reqwest::Method,
     endpoint: &str,
     mut body: serde_json::Value,
     inject_identity: bool,
@@ -145,7 +146,7 @@ async fn memory_proxy_call(
 
     state
         .memoria_forwarder
-        .forward(endpoint, body)
+        .forward(method, endpoint, body)
         .await
         .map(Json)
         .map_err(|error| {
@@ -168,7 +169,15 @@ pub(super) async fn memory_proxy_store_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memory_proxy_call(&state, &headers, "/v1/memories", body, true).await
+    memory_proxy_call(
+        &state,
+        &headers,
+        reqwest::Method::POST,
+        "/v1/memories",
+        body,
+        true,
+    )
+    .await
 }
 
 pub(super) async fn memory_proxy_retrieve_handler(
@@ -176,7 +185,15 @@ pub(super) async fn memory_proxy_retrieve_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memory_proxy_call(&state, &headers, "/v1/memories/retrieve", body, true).await
+    memory_proxy_call(
+        &state,
+        &headers,
+        reqwest::Method::POST,
+        "/v1/memories/retrieve",
+        body,
+        true,
+    )
+    .await
 }
 
 pub(super) async fn memory_proxy_search_handler(
@@ -184,7 +201,15 @@ pub(super) async fn memory_proxy_search_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memory_proxy_call(&state, &headers, "/v1/memories/search", body, true).await
+    memory_proxy_call(
+        &state,
+        &headers,
+        reqwest::Method::POST,
+        "/v1/memories/search",
+        body,
+        true,
+    )
+    .await
 }
 
 pub(super) async fn memory_proxy_purge_handler(
@@ -203,7 +228,15 @@ pub(super) async fn memory_proxy_purge_handler(
         .unwrap_or("unknown")
         .to_string();
 
-    let result = memory_proxy_call(&state, &headers, "/v1/memories/purge", body, true).await?;
+    let result = memory_proxy_call(
+        &state,
+        &headers,
+        reqwest::Method::POST,
+        "/v1/memories/purge",
+        body,
+        true,
+    )
+    .await?;
     let deleted = result
         .get("deleted_count")
         .and_then(|v| v.as_u64())
@@ -229,6 +262,7 @@ pub(super) async fn memory_proxy_expand_handler(
     memory_proxy_call(
         &state,
         &headers,
+        reqwest::Method::GET,
         &format!("/v1/memories/{memory_id}"),
         serde_json::json!({}),
         false,
@@ -241,7 +275,15 @@ pub(super) async fn memory_proxy_correct_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memory_proxy_call(&state, &headers, "/v1/memories/correct", body, true).await
+    memory_proxy_call(
+        &state,
+        &headers,
+        reqwest::Method::POST,
+        "/v1/memories/correct",
+        body,
+        true,
+    )
+    .await
 }
 
 pub(super) async fn memory_proxy_correct_by_id_handler(
@@ -253,6 +295,7 @@ pub(super) async fn memory_proxy_correct_by_id_handler(
     memory_proxy_call(
         &state,
         &headers,
+        reqwest::Method::PUT,
         &format!("/v1/memories/{memory_id}/correct"),
         body,
         true,
@@ -269,6 +312,7 @@ pub(super) async fn memory_proxy_feedback_handler(
     memory_proxy_call(
         &state,
         &headers,
+        reqwest::Method::POST,
         &format!("/v1/memories/{memory_id}/feedback"),
         body,
         false,
@@ -283,6 +327,7 @@ pub(super) async fn memory_proxy_profile_handler(
     memory_proxy_call(
         &state,
         &headers,
+        reqwest::Method::GET,
         "/v1/profiles/me",
         serde_json::json!({}),
         true,
@@ -295,19 +340,32 @@ pub(super) async fn memory_proxy_reflect_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memory_proxy_call(&state, &headers, "/v1/reflect", body, true).await
+    memory_proxy_call(
+        &state,
+        &headers,
+        reqwest::Method::POST,
+        "/v1/reflect",
+        body,
+        true,
+    )
+    .await
 }
 
 async fn memoria_management_proxy_call(
     state: &AppState,
     headers: &HeaderMap,
+    method: reqwest::Method,
     endpoint: &str,
     body: Option<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     state.auth_service.current_user(headers).await?;
     state
         .memoria_forwarder
-        .forward(endpoint, body.unwrap_or_else(|| serde_json::json!({})))
+        .forward(
+            method,
+            endpoint,
+            body.unwrap_or_else(|| serde_json::json!({})),
+        )
         .await
         .map(Json)
         .map_err(|error| {
@@ -330,14 +388,28 @@ pub(super) async fn memoria_proxy_snapshot_create_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memoria_management_proxy_call(&state, &headers, "/v1/snapshots", Some(body)).await
+    memoria_management_proxy_call(
+        &state,
+        &headers,
+        reqwest::Method::POST,
+        "/v1/snapshots",
+        Some(body),
+    )
+    .await
 }
 
 pub(super) async fn memoria_proxy_snapshots_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memoria_management_proxy_call(&state, &headers, "/v1/snapshots", None).await
+    memoria_management_proxy_call(
+        &state,
+        &headers,
+        reqwest::Method::GET,
+        "/v1/snapshots",
+        None,
+    )
+    .await
 }
 
 pub(super) async fn memoria_proxy_snapshot_rollback_handler(
@@ -348,6 +420,7 @@ pub(super) async fn memoria_proxy_snapshot_rollback_handler(
     memoria_management_proxy_call(
         &state,
         &headers,
+        reqwest::Method::POST,
         &format!("/v1/snapshots/{name}/rollback"),
         None,
     )
@@ -362,6 +435,7 @@ pub(super) async fn memoria_proxy_snapshot_diff_handler(
     memoria_management_proxy_call(
         &state,
         &headers,
+        reqwest::Method::GET,
         &format!("/v1/snapshots/{name}/diff"),
         None,
     )
@@ -373,14 +447,22 @@ pub(super) async fn memoria_proxy_branch_create_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memoria_management_proxy_call(&state, &headers, "/v1/branches", Some(body)).await
+    memoria_management_proxy_call(
+        &state,
+        &headers,
+        reqwest::Method::POST,
+        "/v1/branches",
+        Some(body),
+    )
+    .await
 }
 
 pub(super) async fn memoria_proxy_branches_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memoria_management_proxy_call(&state, &headers, "/v1/branches", None).await
+    memoria_management_proxy_call(&state, &headers, reqwest::Method::GET, "/v1/branches", None)
+        .await
 }
 
 pub(super) async fn memoria_proxy_branch_checkout_handler(
@@ -391,6 +473,7 @@ pub(super) async fn memoria_proxy_branch_checkout_handler(
     memoria_management_proxy_call(
         &state,
         &headers,
+        reqwest::Method::POST,
         &format!("/v1/branches/{name}/checkout"),
         None,
     )
@@ -405,6 +488,7 @@ pub(super) async fn memoria_proxy_branch_merge_handler(
     memoria_management_proxy_call(
         &state,
         &headers,
+        reqwest::Method::POST,
         &format!("/v1/branches/{name}/merge"),
         None,
     )
@@ -416,15 +500,28 @@ pub(super) async fn memoria_proxy_branch_diff_handler(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memoria_management_proxy_call(&state, &headers, &format!("/v1/branches/{name}/diff"), None)
-        .await
+    memoria_management_proxy_call(
+        &state,
+        &headers,
+        reqwest::Method::GET,
+        &format!("/v1/branches/{name}/diff"),
+        None,
+    )
+    .await
 }
 
 pub(super) async fn memoria_proxy_health_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memoria_management_proxy_call(&state, &headers, "/v1/health/analyze", None).await
+    memoria_management_proxy_call(
+        &state,
+        &headers,
+        reqwest::Method::GET,
+        "/v1/health/analyze",
+        None,
+    )
+    .await
 }
 
 pub(super) async fn memoria_proxy_governance_handler(
@@ -432,7 +529,14 @@ pub(super) async fn memoria_proxy_governance_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memoria_management_proxy_call(&state, &headers, "/v1/governance", Some(body)).await
+    memoria_management_proxy_call(
+        &state,
+        &headers,
+        reqwest::Method::POST,
+        "/v1/governance",
+        Some(body),
+    )
+    .await
 }
 
 pub(super) async fn memoria_proxy_consolidate_handler(
@@ -440,5 +544,12 @@ pub(super) async fn memoria_proxy_consolidate_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memoria_management_proxy_call(&state, &headers, "/v1/consolidate", Some(body)).await
+    memoria_management_proxy_call(
+        &state,
+        &headers,
+        reqwest::Method::POST,
+        "/v1/consolidate",
+        Some(body),
+    )
+    .await
 }
