@@ -228,7 +228,10 @@ mod tests {
         assert_eq!(p.max_execution_secs, 30.0);
         assert!(p.network_allowed);
         assert!(p.allowed_paths.contains(&PathBuf::from("/tmp")));
-        assert!(p.allowed_paths.contains(&normalize_path(&std::env::temp_dir())));
+        assert!(
+            p.allowed_paths
+                .contains(&normalize_path(&std::env::temp_dir()))
+        );
         assert!(p.is_path_allowed(std::path::Path::new("/home/user/project/src")));
         assert!(p.is_path_allowed(std::path::Path::new("/tmp/build")));
         assert!(!p.is_path_allowed(std::path::Path::new("/etc/passwd")));
@@ -247,7 +250,10 @@ mod tests {
         assert_eq!(p.mode, SandboxMode::Strict);
         assert!(!p.network_allowed);
         assert!(p.allowed_paths.contains(&PathBuf::from("/tmp")));
-        assert!(p.allowed_paths.contains(&normalize_path(&std::env::temp_dir())));
+        assert!(
+            p.allowed_paths
+                .contains(&normalize_path(&std::env::temp_dir()))
+        );
         assert!(p.is_path_allowed(std::path::Path::new("/tmp/x")));
         assert!(!p.is_path_allowed(std::path::Path::new("/var/tmp/x")));
     }
