@@ -13,6 +13,18 @@ fn unique_path_variants(path: &Path) -> Vec<PathBuf> {
     variants
 }
 
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn default_temp_allowed_paths() -> Vec<PathBuf> {
+    let mut paths = vec![PathBuf::from("/tmp")];
+    push_unique_path(&mut paths, normalize_path(&std::env::temp_dir()));
+    paths
+}
+
 /// Security enforcement level (ordered from least to most restrictive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SandboxMode {
@@ -103,14 +115,13 @@ impl SandboxPolicy {
     /// Create a policy for a project directory with Standard mode defaults.
     pub fn for_project(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
+        let mut allowed_paths = default_temp_allowed_paths();
+        push_unique_path(&mut allowed_paths, PathBuf::from("/var/tmp"));
+        push_unique_path(&mut allowed_paths, PathBuf::from("/dev/null"));
         Self {
             mode: SandboxMode::Standard,
             project_root: root,
-            allowed_paths: vec![
-                PathBuf::from("/tmp"),
-                PathBuf::from("/var/tmp"),
-                PathBuf::from("/dev/null"),
-            ],
+            allowed_paths,
             env_allowlist: None,
             max_execution_secs: 30.0,
             max_output_bytes: 20_000,
@@ -134,10 +145,12 @@ impl SandboxPolicy {
     /// Create a strict policy (full isolation).
     pub fn strict(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
+        let mut allowed_paths = default_temp_allowed_paths();
+        push_unique_path(&mut allowed_paths, PathBuf::from("/dev/null"));
         Self {
             mode: SandboxMode::Strict,
             project_root: root,
-            allowed_paths: vec![PathBuf::from("/tmp"), PathBuf::from("/dev/null")],
+            allowed_paths,
             env_allowlist: Some(Vec::new()), // Only baseline vars
             max_execution_secs: 15.0,
             max_output_bytes: 10_000,
@@ -214,6 +227,8 @@ mod tests {
         assert_eq!(p.mode, SandboxMode::Standard);
         assert_eq!(p.max_execution_secs, 30.0);
         assert!(p.network_allowed);
+        assert!(p.allowed_paths.contains(&PathBuf::from("/tmp")));
+        assert!(p.allowed_paths.contains(&normalize_path(&std::env::temp_dir())));
         assert!(p.is_path_allowed(std::path::Path::new("/home/user/project/src")));
         assert!(p.is_path_allowed(std::path::Path::new("/tmp/build")));
         assert!(!p.is_path_allowed(std::path::Path::new("/etc/passwd")));
@@ -231,6 +246,8 @@ mod tests {
         let p = SandboxPolicy::strict("/home/user/project");
         assert_eq!(p.mode, SandboxMode::Strict);
         assert!(!p.network_allowed);
+        assert!(p.allowed_paths.contains(&PathBuf::from("/tmp")));
+        assert!(p.allowed_paths.contains(&normalize_path(&std::env::temp_dir())));
         assert!(p.is_path_allowed(std::path::Path::new("/tmp/x")));
         assert!(!p.is_path_allowed(std::path::Path::new("/var/tmp/x")));
     }

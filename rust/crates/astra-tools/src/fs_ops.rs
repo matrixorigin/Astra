@@ -94,16 +94,23 @@ pub(crate) fn relative_to_workspace_root(workspace_root: &Path, path: &Path) -> 
 }
 
 /// Default allowed paths that ALL sandbox modes include.
-/// Both `SandboxConfig::standard` and `SandboxConfig::strict` allow `/tmp`.
-static DEFAULT_ALLOWED: &[&str] = &["/tmp"];
+/// Both `SandboxConfig::standard` and `SandboxConfig::strict` allow `/tmp`
+/// and the platform's resolved temp directory (e.g. macOS `/var/folders/.../T`).
+fn default_allowed_paths() -> Vec<PathBuf> {
+    let mut allowed = vec![PathBuf::from("/tmp")];
+    let temp_dir = std::env::temp_dir();
+    if !allowed.iter().any(|existing| existing == &temp_dir) {
+        allowed.push(temp_dir);
+    }
+    allowed
+}
 
 /// Resolve a relative path against workspace_root with normalization.
 ///
 /// Allows workspace root AND default allowed paths (`/tmp`).
 /// For custom allowed paths, use [`resolve_path_sandboxed`].
 pub fn resolve_path(workspace_root: &Path, relative: &str) -> Result<PathBuf, String> {
-    let allowed: Vec<PathBuf> = DEFAULT_ALLOWED.iter().map(PathBuf::from).collect();
-    resolve_path_sandboxed(workspace_root, relative, &allowed)
+    resolve_path_sandboxed(workspace_root, relative, &default_allowed_paths())
 }
 
 /// Resolve a path with full sandbox awareness: allows workspace root
@@ -3061,6 +3068,18 @@ mod tests {
         assert!(
             result.is_ok(),
             "resolve_path must allow /tmp (default allowed path): {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn resolve_path_allows_platform_temp_dir_by_default() {
+        let workspace = tempfile::tempdir().unwrap();
+        let temp_file = std::env::temp_dir().join("astra-default-allowed-temp.txt");
+        let result = resolve_path(workspace.path(), &temp_file.to_string_lossy());
+        assert!(
+            result.is_ok(),
+            "resolve_path must allow the platform temp dir by default: {:?}",
             result
         );
     }

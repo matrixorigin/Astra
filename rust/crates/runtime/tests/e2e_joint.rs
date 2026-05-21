@@ -2,7 +2,7 @@ mod test_support;
 
 use std::{collections::BTreeSet, net::SocketAddr, sync::Arc, time::Duration};
 
-use astra_core::SharedPool;
+use astra_core::{MatrixOneSettings, SharedPool};
 use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo,
@@ -32,6 +32,9 @@ use uuid::Uuid;
 
 const HTTP_TOKEN: &str = "Bearer e2e-joint-token";
 
+static SHARED_BOOTSTRAP: tokio::sync::OnceCell<MatrixOneSettings> =
+    tokio::sync::OnceCell::const_new();
+
 fn require_db_it_env() -> astra_core::MatrixOneSettings {
     let enabled = std::env::var("ASTRA_TEST_DB_IT").unwrap_or_default();
     assert!(
@@ -42,13 +45,18 @@ fn require_db_it_env() -> astra_core::MatrixOneSettings {
 }
 
 async fn setup_pool() -> SharedPool {
-    let settings = require_db_it_env();
-    let catalog =
-        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".to_string());
-    astra_services::ensure_core_schema(&settings, &catalog)
-        .await
-        .expect("ensure_core_schema must pass before joint E2E");
-    SharedPool::new(&settings)
+    let settings = SHARED_BOOTSTRAP
+        .get_or_init(|| async {
+            let settings = require_db_it_env();
+            let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+                .unwrap_or_else(|_| "mysql".to_string());
+            astra_services::ensure_core_schema(&settings, &catalog)
+                .await
+                .expect("ensure_core_schema must pass before joint E2E");
+            settings
+        })
+        .await;
+    SharedPool::new(settings)
         .await
         .expect("SharedPool::new must connect to MatrixOne")
 }

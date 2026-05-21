@@ -792,6 +792,7 @@ async fn end_to_end_thin_client_posts_step_run_pair_and_persists_row() {
 
     let base = format!("http://{}", addr);
     let client = astra_thin_client::ThinClient::new(&base, None).expect("thin client");
+    let token = auth_bearer();
 
     let start_body = json!({
         "subtask_id": "s1",
@@ -800,7 +801,7 @@ async fn end_to_end_thin_client_posts_step_run_pair_and_persists_row() {
         "attempt": 2
     });
     let resp = client
-        .post_plan_step_run_start("test-token", &plan_id, &start_body)
+        .post_plan_step_run_start(token, &plan_id, &start_body)
         .await
         .expect("start POST");
     let resp_json: Value = serde_json::from_str(&resp).expect("start body is JSON");
@@ -830,7 +831,7 @@ async fn end_to_end_thin_client_posts_step_run_pair_and_persists_row() {
     // Finish it.
     let finish_body = json!({ "status": "completed" });
     let _ = client
-        .post_plan_step_run_finish("test-token", &plan_id, &run_id, &finish_body)
+        .post_plan_step_run_finish(token, &plan_id, &run_id, &finish_body)
         .await
         .expect("finish POST");
 
@@ -849,7 +850,7 @@ async fn end_to_end_thin_client_posts_step_run_pair_and_persists_row() {
 
     // List the runs via the client too, to prove the full CLI round-trip.
     let listing = client
-        .get_plan_step_runs_text("test-token", &plan_id, Some("s1"), Some(10))
+        .get_plan_step_runs_text(token, &plan_id, Some("s1"), Some(10))
         .await
         .expect("runs list");
     let listing_json: Value = serde_json::from_str(&listing).unwrap();
@@ -1097,7 +1098,7 @@ async fn list_plans_active_session_only_requires_session_id() {
     let (status, body) = request_json(app, "GET", "/plans?active_session_only=true", None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(
-        body["error"].as_str(),
+        body["detail"].as_str(),
         Some("active_session_only requires session_id")
     );
 }

@@ -164,18 +164,32 @@ pub struct SandboxConfig {
     pub network_allowed: bool,
 }
 
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn default_temp_allowed_paths() -> Vec<PathBuf> {
+    let mut paths = vec![PathBuf::from("/tmp")];
+    push_unique_path(&mut paths, std::env::temp_dir());
+    paths
+}
+
 impl SandboxConfig {
     /// Create a standard sandbox config for a project directory.
     pub fn standard(project_root: impl Into<PathBuf>) -> Self {
         let root = project_root.into();
+        let mut allowed_paths = default_temp_allowed_paths();
+        push_unique_path(
+            &mut allowed_paths,
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/root"))
+                .join(".config"),
+        );
         Self {
             project_root: root,
-            allowed_paths: vec![
-                PathBuf::from("/tmp"),
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("/root"))
-                    .join(".config"),
-            ],
+            allowed_paths,
             mode: SandboxMode::Standard,
             max_output_bytes: 200_000,
             command_timeout: Duration::from_secs(120),
@@ -188,7 +202,7 @@ impl SandboxConfig {
         let root = project_root.into();
         Self {
             project_root: root,
-            allowed_paths: vec![PathBuf::from("/tmp")],
+            allowed_paths: default_temp_allowed_paths(),
             mode: SandboxMode::Strict,
             max_output_bytes: 200_000,
             command_timeout: Duration::from_secs(120),
@@ -704,6 +718,7 @@ mod tests {
         assert_eq!(cfg.max_output_bytes, 200_000);
         assert_eq!(cfg.command_timeout, Duration::from_secs(120));
         assert!(cfg.allowed_paths.contains(&PathBuf::from("/tmp")));
+        assert!(cfg.allowed_paths.contains(&std::env::temp_dir()));
     }
 
     #[test]
@@ -711,7 +726,8 @@ mod tests {
         let cfg = SandboxConfig::strict("/srv/workspace");
         assert_eq!(cfg.mode, SandboxMode::Strict);
         assert!(!cfg.network_allowed);
-        assert_eq!(cfg.allowed_paths, vec![PathBuf::from("/tmp")]);
+        assert!(cfg.allowed_paths.contains(&PathBuf::from("/tmp")));
+        assert!(cfg.allowed_paths.contains(&std::env::temp_dir()));
     }
 
     #[test]
