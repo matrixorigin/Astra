@@ -41,6 +41,7 @@ use astra_core::SharedPool;
 use astra_services::session_journal::{
     JournalWriter, LlmRoundRecord, ToolCallRecord, TurnEventBuffer,
 };
+use astra_services::SessionArtifactStore;
 use async_stream::stream;
 use axum::body::Body;
 use axum::body::Bytes;
@@ -250,9 +251,15 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
             ..Default::default()
         };
     }
+    let mut cache_detector = astra_turn_core::cache_diagnostics::CacheBreakDetector::new();
+    if let Ok(session_dir) = astra_services::local_session_artifact_store().session_dir(session_id)
+    {
+        cache_detector.set_diff_dir(session_dir.join("prompt-cache-diffs"));
+    }
     let Ok(events) = astra_services::session_journal::read_journal_tail(session_id, 500) else {
         return BridgePipelineBaseline {
             next_turn: 1,
+            cache_detector,
             ..Default::default()
         };
     };
@@ -262,7 +269,6 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
     let mut response_count = 0u32;
     let mut max_turn = 0u32;
     let mut pending_request_snapshot = None;
-    let mut cache_detector = astra_turn_core::cache_diagnostics::CacheBreakDetector::new();
 
     for event in events {
         max_turn = max_turn.max(event.turn.unwrap_or(0));
@@ -3536,6 +3542,11 @@ impl InProcessChatTurnBridge {
                             feedback.attribute_cache_break(event.reason);
                         }
                     }
+                    bridge_pipeline_baseline.stats.record(
+                        capture_model,
+                        BRIDGE_CACHE_SOURCE,
+                        &feedback,
+                    );
 
                     let feedback_evt =
                         astra_turn_core::pipeline_journal::PipelineJournalEvent::from_feedback(
@@ -4287,6 +4298,7 @@ mod tests {
     use astra_services::{
         SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact,
     };
+    use astra_services::SessionArtifactStore;
     use astra_turn_core::turn_guard::TurnGuard;
     use async_trait::async_trait;
     use http_body_util::BodyExt;
@@ -6167,6 +6179,98 @@ mod tests {
                 .record_turn_for_source(BRIDGE_CACHE_SOURCE, current, Some(500))
                 .is_none(),
             "reconstructed detector state should treat the next stable turn as a hit"
+        );
+    }
+
+    #[test]
+    fn load_bridge_pipeline_baseline_enables_prompt_cache_diff_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "00000000-0000-0000-0000-000000000190";
+        let writer = astra_services::session_journal::JournalWriter::new(session_id)
+            .expect("journal writer");
+
+        let request_metadata = |system_prompt: &str| {
+            json!({
+                "provider": "openai",
+                "model": "test-model",
+                "request": {
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": "continue"}
+                    ],
+                    "tools": []
+                }
+            })
+        };
+        let response_metadata = |cached_input_tokens: u64| {
+            json!({
+                "provider": "openai",
+                "response": {
+                    "response": {
+                        "usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": cached_input_tokens,
+                            "cache_creation_tokens": 0,
+                            "output_tokens": 12
+                        }
+                    }
+                }
+            })
+        };
+
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::llm_request_full(
+                    Some(session_id),
+                    1,
+                    0,
+                    request_metadata("stable prompt"),
+                ),
+            )
+            .unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::llm_response_full(
+                    Some(session_id),
+                    1,
+                    0,
+                    response_metadata(50),
+                ),
+            )
+            .unwrap();
+
+        let mut baseline = load_bridge_pipeline_baseline(session_id);
+        let changed = bridge_prompt_snapshot_from_messages(
+            &[
+                json!({"role": "system", "content": "changed prompt"}),
+                json!({"role": "user", "content": "continue"}),
+            ],
+            &[],
+            "test-model",
+            "openai",
+        )
+        .expect("changed prompt snapshot");
+        let event = baseline.cache_detector.record_turn_for_source(
+            BRIDGE_CACHE_SOURCE,
+            changed,
+            Some(0),
+        );
+        assert!(
+            event.is_some(),
+            "changed prompt should trip the bridge cache detector"
+        );
+
+        let diff_dir = astra_services::local_session_artifact_store()
+            .session_dir(session_id)
+            .expect("session dir")
+            .join("prompt-cache-diffs");
+        let entries = std::fs::read_dir(&diff_dir)
+            .expect("prompt-cache diff dir")
+            .count();
+        assert!(
+            entries > 0,
+            "bridge baseline should emit prompt-cache diff artifacts into the session dir"
         );
     }
 
