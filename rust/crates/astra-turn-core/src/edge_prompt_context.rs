@@ -460,7 +460,59 @@ pub fn make_args_preview(tool_name: &str, args: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::process::Command;
     use tempfile::tempdir;
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: stdout={} stderr={}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_recent_commits_repo(dirty: bool) -> tempfile::TempDir {
+        let tmp = tempdir().unwrap();
+        run_git(tmp.path(), &["init", "-q"]);
+        run_git(tmp.path(), &["config", "user.name", "Astra Test"]);
+        run_git(
+            tmp.path(),
+            &["config", "user.email", "astra-test@example.com"],
+        );
+
+        let tracked = tmp.path().join("tracked.txt");
+        for i in 1..=4 {
+            std::fs::write(&tracked, format!("version {i}\n")).unwrap();
+            run_git(tmp.path(), &["add", "tracked.txt"]);
+            let msg = format!("commit-{i}");
+            run_git(tmp.path(), &["commit", "-q", "-m", &msg]);
+        }
+
+        if dirty {
+            std::fs::write(&tracked, "dirty working tree\n").unwrap();
+        }
+
+        tmp
+    }
+
+    fn count_recent_commit_lines(ctx: &str) -> usize {
+        let Some(start) = ctx.find("- Recent commits:") else {
+            return 0;
+        };
+        ctx[start..]
+            .lines()
+            .skip(1)
+            .take_while(|line| line.chars().take(7).all(|c| c.is_ascii_hexdigit()))
+            .count()
+    }
 
     #[test]
     fn make_args_preview_file_tool_uses_path() {
@@ -823,27 +875,22 @@ mod tests {
     /// silently waste tokens on every dirty render.
     #[test]
     fn build_volatile_environment_context_caps_recent_commits_lower_when_dirty() {
-        let cwd = std::env::current_dir().unwrap();
-        let ctx = build_volatile_environment_context(&cwd);
-        // Heuristic: count the number of plain `<sha> <subject>` lines under
-        // the "Recent commits:" block. Lines start with a 7-12 char hex SHA
-        // followed by a space.
-        let Some(start) = ctx.find("- Recent commits:") else {
-            // No recent-commits block (e.g. running outside a git repo) —
-            // skip the assertion. Other tests already cover the empty path.
-            return;
-        };
-        let block = &ctx[start..];
-        let commit_lines = block
-            .lines()
-            .skip(1) // skip the header line itself
-            .take_while(|line| line.chars().take(7).all(|c| c.is_ascii_hexdigit()))
-            .count();
-        let dirty = ctx.contains("(dirty)");
-        let expected = if dirty { 1 } else { 3 };
+        let clean_repo = init_recent_commits_repo(false);
+        let dirty_repo = init_recent_commits_repo(true);
+
+        let clean_ctx = build_volatile_environment_context(clean_repo.path());
+        let dirty_ctx = build_volatile_environment_context(dirty_repo.path());
+
+        let clean_commits = count_recent_commit_lines(&clean_ctx);
+        let dirty_commits = count_recent_commit_lines(&dirty_ctx);
+
         assert!(
-            commit_lines <= expected,
-            "dirty={dirty}: recent-commits cap should be {expected}, got {commit_lines}\n{ctx}"
+            clean_commits <= 3,
+            "clean repo should cap recent commits at 3, got {clean_commits}\n{clean_ctx}"
+        );
+        assert!(
+            dirty_commits <= 1,
+            "dirty repo should cap recent commits at 1, got {dirty_commits}\n{dirty_ctx}"
         );
     }
 
