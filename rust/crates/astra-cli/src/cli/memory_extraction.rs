@@ -1690,19 +1690,25 @@ mod tests {
         );
 
         assert_eq!(payload["session_id"], "sess-123");
-        assert_eq!(payload["source"]["agent"], "extraction");
+        let source: serde_json::Value = serde_json::from_str(
+            payload["source"]
+                .as_str()
+                .expect("Memoria v1 payload keeps source as a string"),
+        )
+        .expect("source json");
+        assert_eq!(source["agent"], "extraction");
         assert_eq!(
-            payload["source"]["astra_views"]["full"],
+            source["astra_views"]["full"],
             "[feedback] Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online IT suites for DB changes."
         );
         assert!(
-            payload["source"]["astra_views"]["compact"]
+            source["astra_views"]["compact"]
                 .as_str()
                 .unwrap_or("")
                 .contains("Integration tests must hit a real database")
         );
         assert!(
-            payload["source"]["astra_views"]["overview"]
+            source["astra_views"]["overview"]
                 .as_str()
                 .unwrap_or("")
                 .contains("mock drift hid a migration bug")
