@@ -1125,11 +1125,31 @@ fn spawn_diff_artifact_write(
     curr: PromptStateSnapshot,
     event: CacheBreakEvent,
 ) {
-    let _ = std::thread::Builder::new()
+    let dir_for_thread = dir.clone();
+    if let Err(error) = std::thread::Builder::new()
         .name("cache-diff-artifact".into())
         .spawn(move || {
-            let _ = write_diff_artifact(&dir, seq, prev.as_ref(), &curr, &event);
-        });
+            if let Err(error) =
+                write_diff_artifact(&dir_for_thread, seq, prev.as_ref(), &curr, &event)
+            {
+                tracing::warn!(
+                    target: "astra::cache",
+                    ?error,
+                    path = %dir_for_thread.display(),
+                    seq,
+                    "failed to write cache diff artifact"
+                );
+            }
+        })
+    {
+        tracing::warn!(
+            target: "astra::cache",
+            ?error,
+            path = %dir.display(),
+            seq,
+            "failed to spawn cache diff artifact writer"
+        );
+    }
 }
 
 fn render_unified_snapshot_patch(

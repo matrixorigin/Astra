@@ -417,7 +417,7 @@ pub(crate) fn assemble_llm_messages(
     // (no real attachment landed after it). When attachments extend the
     // message list past the synthetic tail, the real tail can be annotated.
     let last_is_synthetic_tail = synthetic_tail_end.is_some_and(|end| end == llm_messages.len());
-    if !last_is_synthetic_tail {
+    if cache_cfg.should_annotate() && !last_is_synthetic_tail {
         apply_anthropic_cache_metadata(&mut llm_messages, cache_cfg, session_id);
     }
     llm_messages
@@ -981,6 +981,27 @@ mod tests {
         // structure.
         assert!(bridge_out.last().unwrap().get("role").is_some());
         assert!(server_out.last().unwrap().get("role").is_some());
+    }
+
+    #[test]
+    fn prefix_only_providers_skip_anthropic_cache_annotations() {
+        let msgs = assemble_llm_messages(
+            vec![json!({"role": "system", "content": "sys"})],
+            Vec::new(),
+            Vec::new(),
+            vec![json!({"role": "user", "content": "hi"})],
+            &PostCompactAttachments::default(),
+            "sid",
+            "openai",
+            "gpt-4o",
+            &PromptCacheConfig::latch("openai", "gpt-4o"),
+        );
+
+        assert!(
+            msgs.iter()
+                .all(|message| message.get("cache_control").is_none()),
+            "prefix-only providers must never receive anthropic cache_control markers"
+        );
     }
 
     /// Regression lock: for prefix-only providers, volatile content MUST NOT

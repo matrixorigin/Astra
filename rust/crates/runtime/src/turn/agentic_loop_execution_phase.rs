@@ -758,14 +758,15 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     let pre_llm_messages = state.messages.clone();
     let llm_attempt_index = state.llm_rounds_completed;
     state.last_llm_context_manifest_trace = None;
+    // Protect the exact request prefix we are about to send even if the LLM
+    // call fails; the next retry/compaction pass must not clear tool results
+    // that were already part of this attempted request.
+    state.last_request_message_count = Some(pre_llm_messages.len());
     // Increment the LLM-round counter regardless of outcome so retry/error
     // paths don't see a stale count (the counter tracks *attempted* LLM
     // calls for guidance-threshold purposes, not just successful ones).
     let turn_result = host.execute_turn(state).await;
     state.llm_rounds_completed += 1;
-    if turn_result.is_ok() {
-        state.last_request_message_count = Some(pre_llm_messages.len());
-    }
     if let Ok(result) = &turn_result
         && let Some(trace) = result.accum.context_manifest_trace.clone()
     {
@@ -4534,6 +4535,40 @@ mod tests {
 
         let result = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_turn_still_preserves_last_request_message_count() {
+        let mut state = make_state();
+        state
+            .messages
+            .push(serde_json::json!({"role": "user", "content": "retry me"}));
+
+        let mut host = MockHost::new(vec![HostTurnResult {
+            accum: ChatTurnSseAccum {
+                error_message: Some("rate limit exceeded".to_string()),
+                has_usage: true,
+                prompt_tokens: 12,
+                completion_tokens: 0,
+                ..ChatTurnSseAccum::default()
+            },
+            ttft_ms: None,
+            edge_tool_round: Vec::new(),
+            error_kind: None,
+        }]);
+        let prep = TurnIterationPrep {
+            quiet: true,
+            turn_start_time: Instant::now(),
+        };
+
+        let result = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep).await;
+        assert!(result.is_err());
+        assert_eq!(state.llm_rounds_completed, 1);
+        assert_eq!(
+            state.last_request_message_count,
+            Some(1),
+            "failed LLM attempts must still protect the exact request prefix for retry-time compaction"
+        );
     }
 }
 
