@@ -1051,19 +1051,6 @@ pub async fn ensure_core_schema(
     .await?;
 
     query(
-        "CREATE TABLE IF NOT EXISTS prompt_chunks (
-            chunk_id VARCHAR(80) PRIMARY KEY,
-            chunk_hash VARCHAR(64) NOT NULL,
-            chunk_kind VARCHAR(32) NOT NULL,
-            payload_json LONGTEXT NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_prompt_chunk_hash (chunk_hash)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    query(
         "CREATE TABLE IF NOT EXISTS prompt_deltas (
             delta_id VARCHAR(64) PRIMARY KEY,
             request_id VARCHAR(64) NOT NULL,
@@ -1082,6 +1069,7 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
+    drop_column_if_exists(&pool, &settings.database, "prompt_deltas", "payload_json").await?;
 
     query(
         "CREATE TABLE IF NOT EXISTS session_state_revisions (
@@ -1669,23 +1657,6 @@ pub async fn ensure_core_schema(
     .await?;
 
     query(
-        "CREATE TABLE IF NOT EXISTS harness_sources (
-            source_id VARCHAR(128) PRIMARY KEY,
-            harness_run_id VARCHAR(128) NOT NULL,
-            source_type VARCHAR(64) NOT NULL,
-            source_ref VARCHAR(255) NOT NULL,
-            snapshot_ref VARCHAR(255) NULL,
-            content_hash VARCHAR(128) NULL,
-            metadata_json LONGTEXT NOT NULL,
-            status VARCHAR(64) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_harness_sources_run (harness_run_id, source_type, status)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    query(
         "CREATE TABLE IF NOT EXISTS harness_items (
             item_id VARCHAR(128) PRIMARY KEY,
             harness_run_id VARCHAR(128) NOT NULL,
@@ -1695,6 +1666,7 @@ pub async fn ensure_core_schema(
             input_json LONGTEXT NOT NULL,
             proposed_output_json LONGTEXT NOT NULL,
             final_output_json LONGTEXT NOT NULL,
+            decision_history_json LONGTEXT NULL,
             status VARCHAR(64) NOT NULL,
             confidence DOUBLE NULL,
             assigned_to VARCHAR(128) NULL,
@@ -1717,6 +1689,7 @@ pub async fn ensure_core_schema(
             publish_visibility VARCHAR(32) NOT NULL,
             content_markdown LONGTEXT NOT NULL,
             source_summary_json LONGTEXT NOT NULL,
+            decision_history_json LONGTEXT NULL,
             status VARCHAR(64) NOT NULL,
             confidence DOUBLE NULL,
             created_by_node_id VARCHAR(128) NULL,
@@ -1739,6 +1712,7 @@ pub async fn ensure_core_schema(
             rule_type VARCHAR(64) NOT NULL,
             statement TEXT NOT NULL,
             rationale TEXT NOT NULL,
+            decision_history_json LONGTEXT NULL,
             status VARCHAR(64) NOT NULL,
             confidence DOUBLE NULL,
             source_count BIGINT NOT NULL DEFAULT 0,
@@ -1761,6 +1735,9 @@ pub async fn ensure_core_schema(
             skill_rule_id VARCHAR(128) NULL,
             source_id VARCHAR(128) NULL,
             source_locator_json LONGTEXT NOT NULL,
+            source_snapshot_ref VARCHAR(128) NULL,
+            source_content_hash VARCHAR(128) NULL,
+            source_metadata_json LONGTEXT NULL,
             artifact_id VARCHAR(128) NULL,
             quote_hash VARCHAR(128) NULL,
             evidence_text_preview TEXT NULL,
@@ -1775,32 +1752,22 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    query(
-        "CREATE TABLE IF NOT EXISTS harness_decisions (
-            decision_id VARCHAR(128) PRIMARY KEY,
-            harness_run_id VARCHAR(128) NOT NULL,
-            target_type VARCHAR(64) NULL,
-            item_id VARCHAR(128) NOT NULL,
-            skill_draft_id VARCHAR(128) NULL,
-            skill_rule_id VARCHAR(128) NULL,
-            reviewer_user_id VARCHAR(128) NOT NULL,
-            decision VARCHAR(64) NOT NULL,
-            before_json LONGTEXT NOT NULL,
-            after_json LONGTEXT NOT NULL,
-            reason TEXT NULL,
-            idempotency_key VARCHAR(255) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_harness_decision_idempotency (harness_run_id, idempotency_key),
-            INDEX idx_harness_decisions_item (item_id, created_at),
-            INDEX idx_harness_decisions_skill_draft (skill_draft_id, created_at),
-            INDEX idx_harness_decisions_skill_rule (skill_rule_id, created_at),
-            INDEX idx_harness_decisions_reviewer (reviewer_user_id, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     for (table, column, ddl) in [
+        (
+            "harness_items",
+            "decision_history_json",
+            "ALTER TABLE harness_items ADD COLUMN decision_history_json LONGTEXT NULL",
+        ),
+        (
+            "harness_skill_drafts",
+            "decision_history_json",
+            "ALTER TABLE harness_skill_drafts ADD COLUMN decision_history_json LONGTEXT NULL",
+        ),
+        (
+            "harness_skill_rules",
+            "decision_history_json",
+            "ALTER TABLE harness_skill_rules ADD COLUMN decision_history_json LONGTEXT NULL",
+        ),
         (
             "harness_citations",
             "skill_draft_id",
@@ -1812,40 +1779,28 @@ pub async fn ensure_core_schema(
             "ALTER TABLE harness_citations ADD COLUMN skill_rule_id VARCHAR(128) NULL",
         ),
         (
-            "harness_decisions",
-            "target_type",
-            "ALTER TABLE harness_decisions ADD COLUMN target_type VARCHAR(64) NULL",
+            "harness_citations",
+            "source_snapshot_ref",
+            "ALTER TABLE harness_citations ADD COLUMN source_snapshot_ref VARCHAR(128) NULL",
         ),
         (
-            "harness_decisions",
-            "skill_draft_id",
-            "ALTER TABLE harness_decisions ADD COLUMN skill_draft_id VARCHAR(128) NULL",
+            "harness_citations",
+            "source_content_hash",
+            "ALTER TABLE harness_citations ADD COLUMN source_content_hash VARCHAR(128) NULL",
         ),
         (
-            "harness_decisions",
-            "skill_rule_id",
-            "ALTER TABLE harness_decisions ADD COLUMN skill_rule_id VARCHAR(128) NULL",
+            "harness_citations",
+            "source_metadata_json",
+            "ALTER TABLE harness_citations ADD COLUMN source_metadata_json LONGTEXT NULL",
         ),
     ] {
         add_column_if_missing(&pool, &settings.database, table, column, ddl).await?;
     }
-    for (table, index, ddl) in [
-        (
-            "harness_citations",
-            "idx_harness_citations_skill_rule",
-            "ALTER TABLE harness_citations ADD INDEX idx_harness_citations_skill_rule (skill_rule_id, created_at)",
-        ),
-        (
-            "harness_decisions",
-            "idx_harness_decisions_skill_draft",
-            "ALTER TABLE harness_decisions ADD INDEX idx_harness_decisions_skill_draft (skill_draft_id, created_at)",
-        ),
-        (
-            "harness_decisions",
-            "idx_harness_decisions_skill_rule",
-            "ALTER TABLE harness_decisions ADD INDEX idx_harness_decisions_skill_rule (skill_rule_id, created_at)",
-        ),
-    ] {
+    for (table, index, ddl) in [(
+        "harness_citations",
+        "idx_harness_citations_skill_rule",
+        "ALTER TABLE harness_citations ADD INDEX idx_harness_citations_skill_rule (skill_rule_id, created_at)",
+    )] {
         add_index_if_missing(&pool, &settings.database, table, index, ddl).await?;
     }
 
@@ -2075,37 +2030,59 @@ pub async fn ensure_core_schema(
     drop_column_if_exists(&pool, &settings.database, "skills_registry", "triggers").await?;
 
     query(
-        "CREATE TABLE IF NOT EXISTS skill_marketplace_stats (
-            skill_name          VARCHAR(255) PRIMARY KEY,
-            publisher_id        VARCHAR(255),
-            total_installs      BIGINT DEFAULT 0,
-            active_users_7d     INT DEFAULT 0,
-            avg_quality         FLOAT DEFAULT 0.0,
-            avg_rating          FLOAT DEFAULT 0.0,
-            report_count        INT DEFAULT 0,
-            compatibility_score FLOAT DEFAULT 0.0,
-            trust_tier          VARCHAR(32),
-            last_updated        TIMESTAMP,
-            INDEX idx_ranking (avg_quality, active_users_7d)
+        "CREATE TABLE IF NOT EXISTS skill_metrics (
+            metric_id            VARCHAR(255) PRIMARY KEY,
+            skill_name           VARCHAR(255) NOT NULL,
+            metric_type          VARCHAR(32) NOT NULL,
+            metric_slot          VARCHAR(255) NOT NULL,
+            skill_version        VARCHAR(50) NULL,
+            runtime_version      VARCHAR(50) NULL,
+            publisher_id         VARCHAR(255) NULL,
+            total_installs       BIGINT NOT NULL DEFAULT 0,
+            active_users_7d      INT NOT NULL DEFAULT 0,
+            avg_quality          FLOAT NOT NULL DEFAULT 0.0,
+            avg_rating           FLOAT NOT NULL DEFAULT 0.0,
+            report_count         INT NOT NULL DEFAULT 0,
+            compatibility_score  FLOAT NOT NULL DEFAULT 0.0,
+            trust_tier           VARCHAR(32) NULL,
+            success_rate         FLOAT NULL,
+            avg_tokens           FLOAT NULL,
+            invocation_count     INT NULL,
+            created_at           DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at           DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_skill_metrics_slot (skill_name, metric_type, metric_slot),
+            INDEX idx_skill_metrics_lookup (skill_name, metric_type, created_at),
+            INDEX idx_skill_metrics_ranking (metric_type, avg_quality, active_users_7d),
+            INDEX idx_skill_metrics_tier (metric_type, trust_tier, updated_at)
         )",
     )
     .execute(&pool)
     .await?;
-
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "skill_metrics",
+        "metric_slot",
+        "ALTER TABLE skill_metrics ADD COLUMN metric_slot VARCHAR(255) NOT NULL DEFAULT 'legacy'",
+    )
+    .await?;
     query(
-        "CREATE TABLE IF NOT EXISTS skill_quality_reports (
-            id                  BIGINT AUTO_INCREMENT PRIMARY KEY,
-            skill_name          VARCHAR(255) NOT NULL,
-            skill_version       VARCHAR(50) NOT NULL,
-            runtime_version     VARCHAR(50) NOT NULL,
-            success_rate        FLOAT,
-            avg_tokens          FLOAT,
-            invocation_count    INT,
-            reported_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            INDEX idx_skill (skill_name, skill_version)
-        )",
+        "UPDATE skill_metrics
+         SET metric_slot = CASE
+             WHEN metric_type = 'aggregate' THEN 'aggregate'
+             ELSE metric_id
+         END
+         WHERE metric_slot = 'legacy' OR metric_slot IS NULL OR metric_slot = ''",
     )
     .execute(&pool)
+    .await?;
+    add_index_if_missing(
+        &pool,
+        &settings.database,
+        "skill_metrics",
+        "uq_skill_metrics_slot",
+        "ALTER TABLE skill_metrics ADD UNIQUE INDEX uq_skill_metrics_slot (skill_name, metric_type, metric_slot)",
+    )
     .await?;
 
     // ── Long-task orchestration (Phase H) ──
@@ -2315,81 +2292,6 @@ pub async fn ensure_core_schema(
 
     for (table, column, ddl) in [
         (
-            "session_artifacts",
-            "project_id",
-            "ALTER TABLE session_artifacts ADD COLUMN project_id VARCHAR(128) NULL",
-        ),
-        (
-            "session_artifacts",
-            "owner_run_id",
-            "ALTER TABLE session_artifacts ADD COLUMN owner_run_id VARCHAR(128) NULL",
-        ),
-        (
-            "session_artifacts",
-            "owner_delegation_id",
-            "ALTER TABLE session_artifacts ADD COLUMN owner_delegation_id VARCHAR(128) NULL",
-        ),
-        (
-            "session_artifacts",
-            "root_run_id",
-            "ALTER TABLE session_artifacts ADD COLUMN root_run_id VARCHAR(128) NULL",
-        ),
-        (
-            "session_artifacts",
-            "access_scope",
-            "ALTER TABLE session_artifacts ADD COLUMN access_scope VARCHAR(32) NOT NULL DEFAULT 'delegation'",
-        ),
-        (
-            "session_artifacts",
-            "retention_policy",
-            "ALTER TABLE session_artifacts ADD COLUMN retention_policy VARCHAR(32) NOT NULL DEFAULT 'default'",
-        ),
-        (
-            "session_artifacts",
-            "retention_until",
-            "ALTER TABLE session_artifacts ADD COLUMN retention_until DATETIME(6) NULL",
-        ),
-        (
-            "session_artifacts",
-            "status",
-            "ALTER TABLE session_artifacts ADD COLUMN status VARCHAR(32) NOT NULL DEFAULT 'active'",
-        ),
-        (
-            "session_artifacts",
-            "normalize_version",
-            "ALTER TABLE session_artifacts ADD COLUMN normalize_version VARCHAR(16) NULL",
-        ),
-        (
-            "session_artifacts",
-            "cold_storage_ref",
-            "ALTER TABLE session_artifacts ADD COLUMN cold_storage_ref VARCHAR(255) NULL",
-        ),
-        (
-            "session_artifacts",
-            "derived_from_artifact_id",
-            "ALTER TABLE session_artifacts ADD COLUMN derived_from_artifact_id VARCHAR(128) NULL",
-        ),
-        (
-            "session_artifacts",
-            "referenced_by_manifest_count",
-            "ALTER TABLE session_artifacts ADD COLUMN referenced_by_manifest_count INT NOT NULL DEFAULT 0",
-        ),
-        (
-            "session_artifacts",
-            "referenced_by_state_items_count",
-            "ALTER TABLE session_artifacts ADD COLUMN referenced_by_state_items_count INT NOT NULL DEFAULT 0",
-        ),
-        (
-            "session_artifacts",
-            "referenced_by_citation_count",
-            "ALTER TABLE session_artifacts ADD COLUMN referenced_by_citation_count INT NOT NULL DEFAULT 0",
-        ),
-        (
-            "session_artifacts",
-            "updated_at",
-            "ALTER TABLE session_artifacts ADD COLUMN updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
-        ),
-        (
             "agent_sessions",
             "project_id",
             "ALTER TABLE agent_sessions ADD COLUMN project_id VARCHAR(128) NULL",
@@ -2405,38 +2307,11 @@ pub async fn ensure_core_schema(
         }
     }
 
-    for (table, index, ddl) in [
-        (
-            "session_artifacts",
-            "idx_artifacts_root_scope",
-            "ALTER TABLE session_artifacts ADD INDEX idx_artifacts_root_scope (root_run_id, access_scope, status, updated_at)",
-        ),
-        (
-            "session_artifacts",
-            "idx_artifacts_owner_run",
-            "ALTER TABLE session_artifacts ADD INDEX idx_artifacts_owner_run (owner_run_id, status, updated_at)",
-        ),
-        (
-            "session_artifacts",
-            "idx_artifacts_retention",
-            "ALTER TABLE session_artifacts ADD INDEX idx_artifacts_retention (status, retention_until, retention_policy)",
-        ),
-        (
-            "session_artifacts",
-            "idx_artifacts_project",
-            "ALTER TABLE session_artifacts ADD INDEX idx_artifacts_project (project_id, status, retention_until)",
-        ),
-        (
-            "session_artifacts",
-            "idx_artifacts_derived",
-            "ALTER TABLE session_artifacts ADD INDEX idx_artifacts_derived (derived_from_artifact_id)",
-        ),
-        (
-            "agent_sessions",
-            "idx_sessions_project",
-            "ALTER TABLE agent_sessions ADD INDEX idx_sessions_project (user_id, project_id, updated_at)",
-        ),
-    ] {
+    for (table, index, ddl) in [(
+        "agent_sessions",
+        "idx_sessions_project",
+        "ALTER TABLE agent_sessions ADD INDEX idx_sessions_project (user_id, project_id, updated_at)",
+    )] {
         if let Err(e) = add_index_if_missing(&pool, &settings.database, table, index, ddl).await {
             tracing::debug!("phase4 additive index migration skipped: {table}.{index}: {e}");
         }
@@ -2773,45 +2648,6 @@ pub async fn ensure_core_schema(
             created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
             UNIQUE INDEX idx_suc_user_skill_cred (user_id, skill_name, credential_name)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // ─── Workflow tables ─────────────────────────────────────────────────────────
-
-    query(
-        "CREATE TABLE IF NOT EXISTS wf_definitions (
-            workflow_id  VARCHAR(36) PRIMARY KEY,
-            name         VARCHAR(128) NOT NULL,
-            version      VARCHAR(32) NOT NULL DEFAULT '1.0.0',
-            description  TEXT,
-            definition   LONGTEXT NOT NULL,
-            is_active    SMALLINT NOT NULL DEFAULT 1,
-            created_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            INDEX idx_wfd_name (name),
-            INDEX idx_wfd_active (is_active)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    query(
-        "CREATE TABLE IF NOT EXISTS wf_runs (
-            run_id           VARCHAR(36) PRIMARY KEY,
-            workflow_id      VARCHAR(36) NOT NULL,
-            agent_run_id     VARCHAR(36),
-            status           VARCHAR(32) NOT NULL DEFAULT 'pending',
-            waiting_for      VARCHAR(128),
-            current_step_idx INT NOT NULL DEFAULT 0,
-            step_results     LONGTEXT,
-            error            TEXT,
-            created_at       DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at       DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            INDEX idx_wfr_workflow (workflow_id),
-            INDEX idx_wfr_status (status),
-            INDEX idx_wfr_agent_run (agent_run_id)
         )",
     )
     .execute(&pool)
@@ -3323,6 +3159,13 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
             "DROP TABLE IF EXISTS harness_agent_roles",
             "DROP TABLE IF EXISTS harness_subagent_runs",
             "DROP TABLE IF EXISTS harness_blackboard_entries",
+            "DROP TABLE IF EXISTS prompt_chunks",
+            "DROP TABLE IF EXISTS harness_sources",
+            "DROP TABLE IF EXISTS harness_decisions",
+            "DROP TABLE IF EXISTS wf_definitions",
+            "DROP TABLE IF EXISTS wf_runs",
+            "DROP TABLE IF EXISTS skill_marketplace_stats",
+            "DROP TABLE IF EXISTS skill_quality_reports",
             "DROP TABLE IF EXISTS step_idempotency_cache",
             "DROP TABLE IF EXISTS mem_memories",
             "DROP TABLE IF EXISTS sk_knowledge_entries",

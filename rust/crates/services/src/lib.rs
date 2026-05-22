@@ -264,6 +264,6 @@ pub use triggers::{
     DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService,
 };
 pub use workflows::{
-    DatabaseWorkflowService, UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem,
-    WorkflowRunRecord, WorkflowService,
+    UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem, WorkflowRunRecord,
+    WorkflowService,
 };

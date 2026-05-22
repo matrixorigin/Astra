@@ -66,19 +66,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             "/triggers/{trigger_id}/fire",
             post(triggers::fire_webhook_handler),
         )
-        .route("/workflows", get(workflows::list_workflows_handler))
-        .route(
-            "/workflows/{workflow_id}",
-            get(workflows::get_workflow_handler),
-        )
-        .route(
-            "/workflows/runs/{run_id}",
-            get(workflows::get_workflow_run_handler),
-        )
-        .route(
-            "/workflows/runs/{run_id}/resolve",
-            post(workflows::resolve_workflow_wait_handler),
-        )
         .route(
             "/sandbox",
             post(sandbox::create_sandbox_handler).get(sandbox::list_sandboxes_handler),

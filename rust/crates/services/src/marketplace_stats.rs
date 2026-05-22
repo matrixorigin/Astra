@@ -82,6 +82,9 @@ pub struct SkillSearchResponse {
 
 const MAX_SEARCH_RESULTS: u32 = 100;
 const DEFAULT_SEARCH_LIMIT: u32 = 20;
+const SKILL_METRIC_TYPE_AGGREGATE: &str = "aggregate";
+const SKILL_METRIC_TYPE_QUALITY_REPORT: &str = "quality_report";
+const SKILL_METRIC_SLOT_AGGREGATE: &str = "aggregate";
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
@@ -142,6 +145,10 @@ impl DatabaseMarketplaceStatsService {
     }
 }
 
+fn aggregate_metric_id(skill_name: &str) -> String {
+    format!("skill-metric-aggregate-{skill_name}")
+}
+
 #[async_trait]
 impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
     async fn submit_quality_report(
@@ -149,13 +156,17 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
         report: QualityReportData,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+        let metric_id = uuid::Uuid::now_v7().to_string();
 
         query(
-            "INSERT INTO skill_quality_reports \
-             (skill_name, skill_version, runtime_version, success_rate, avg_tokens, invocation_count) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO skill_metrics \
+             (metric_id, skill_name, metric_type, metric_slot, skill_version, runtime_version, success_rate, avg_tokens, invocation_count, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
         )
+        .bind(&metric_id)
         .bind(&report.skill_name)
+        .bind(SKILL_METRIC_TYPE_QUALITY_REPORT)
+        .bind(&metric_id)
         .bind(&report.skill_version)
         .bind(&report.runtime_version)
         .bind(report.success_rate)
@@ -180,10 +191,11 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
         let row = query(
             "SELECT skill_name, publisher_id, total_installs, active_users_7d, \
              avg_quality, avg_rating, report_count, compatibility_score, \
-             trust_tier, last_updated \
-             FROM skill_marketplace_stats WHERE skill_name = ?",
+             trust_tier, CAST(updated_at AS CHAR) AS last_updated \
+             FROM skill_metrics WHERE skill_name = ? AND metric_type = ? LIMIT 1",
         )
         .bind(&skill_name)
+        .bind(SKILL_METRIC_TYPE_AGGREGATE)
         .fetch_optional(&pool)
         .await
         .map_err(internal_error)?;
@@ -276,7 +288,8 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
              COALESCE(ms.total_installs, 0) AS total_installs, \
              COALESCE(ms.active_users_7d, 0) AS active_users_7d \
              FROM skills_registry sr \
-             LEFT JOIN skill_marketplace_stats ms ON sr.skill_name = ms.skill_name \
+             LEFT JOIN skill_metrics ms \
+               ON sr.skill_name = ms.skill_name AND ms.metric_type = '{SKILL_METRIC_TYPE_AGGREGATE}' \
              {where_clause} \
              ORDER BY ranking_score DESC \
              LIMIT ? OFFSET ?"
@@ -285,7 +298,8 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
         // Count total
         let count_sql = format!(
             "SELECT COUNT(*) AS cnt FROM skills_registry sr \
-             LEFT JOIN skill_marketplace_stats ms ON sr.skill_name = ms.skill_name \
+             LEFT JOIN skill_metrics ms \
+               ON sr.skill_name = ms.skill_name AND ms.metric_type = '{SKILL_METRIC_TYPE_AGGREGATE}' \
              {where_clause}"
         );
 
@@ -342,9 +356,10 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
              AVG(success_rate) AS avg_quality, \
              COUNT(*) AS report_count, \
              AVG(avg_tokens) AS avg_tokens \
-             FROM skill_quality_reports WHERE skill_name = ?",
+             FROM skill_metrics WHERE skill_name = ? AND metric_type = ?",
         )
         .bind(&skill_name)
+        .bind(SKILL_METRIC_TYPE_QUALITY_REPORT)
         .fetch_one(&pool)
         .await
         .map_err(internal_error)?;
@@ -352,19 +367,23 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
         let avg_quality: f64 = agg_row.try_get("avg_quality").unwrap_or(0.0);
         let report_count: i64 = agg_row.try_get("report_count").unwrap_or(0);
 
-        // Upsert into marketplace_stats
-        // MatrixOne supports INSERT ... ON DUPLICATE KEY UPDATE
         query(
-            "INSERT INTO skill_marketplace_stats (skill_name, avg_quality, report_count, last_updated) \
-             VALUES (?, ?, ?, NOW()) \
+            "INSERT INTO skill_metrics \
+             (metric_id, skill_name, metric_type, metric_slot, avg_quality, report_count, avg_tokens, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, NOW(6)) \
              ON DUPLICATE KEY UPDATE \
-             avg_quality = VALUES(avg_quality), \
-             report_count = VALUES(report_count), \
-             last_updated = NOW()",
+               avg_quality = VALUES(avg_quality), \
+               report_count = VALUES(report_count), \
+               avg_tokens = VALUES(avg_tokens), \
+               updated_at = NOW(6)",
         )
+        .bind(aggregate_metric_id(&skill_name))
         .bind(&skill_name)
+        .bind(SKILL_METRIC_TYPE_AGGREGATE)
+        .bind(SKILL_METRIC_SLOT_AGGREGATE)
         .bind(avg_quality)
         .bind(report_count as i32)
+        .bind(agg_row.try_get::<Option<f64>, _>("avg_tokens").unwrap_or(None))
         .execute(&pool)
         .await
         .map_err(internal_error)?;
@@ -475,6 +494,14 @@ mod tests {
         assert_eq!(
             clamp_marketplace_search_offset(u32::MAX),
             MAX_MARKETPLACE_SEARCH_OFFSET
+        );
+    }
+
+    #[test]
+    fn aggregate_metric_id_is_stable() {
+        assert_eq!(
+            aggregate_metric_id("review_changes"),
+            "skill-metric-aggregate-review_changes"
         );
     }
 }

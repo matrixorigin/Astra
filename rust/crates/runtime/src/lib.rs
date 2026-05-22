@@ -52,7 +52,6 @@ pub mod sandbox;
 pub mod skill_config;
 pub mod skills;
 pub mod triggers;
-pub(crate) mod workflows;
 
 // ── Internal modules: runtime storage helpers ────────────────────────────────
 
@@ -209,8 +208,8 @@ pub use astra_services::{
     },
     triggers::{DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService},
     workflows::{
-        DatabaseWorkflowService, UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem,
-        WorkflowRunRecord, WorkflowService,
+        UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem, WorkflowRunRecord,
+        WorkflowService,
     },
 };
 

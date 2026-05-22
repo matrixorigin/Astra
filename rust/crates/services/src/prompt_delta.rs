@@ -30,7 +30,6 @@ struct PromptChunkPlan {
     position: i32,
     chunk_id: String,
     chunk_hash: String,
-    payload_json: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,22 +169,6 @@ pub async fn persist_prompt_request(
     } else {
         Vec::new()
     };
-
-    for chunk in &plan.chunks {
-        sqlx::query(
-            "INSERT INTO prompt_chunks
-             (chunk_id, chunk_hash, chunk_kind, payload_json, created_at)
-             VALUES (?, ?, ?, ?, NOW(6))
-             ON DUPLICATE KEY UPDATE chunk_hash = VALUES(chunk_hash)",
-        )
-        .bind(&chunk.chunk_id)
-        .bind(&chunk.chunk_hash)
-        .bind(&chunk.chunk_kind)
-        .bind(&chunk.payload_json)
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| error.to_string())?;
-    }
 
     let mut previous_map = std::collections::HashMap::new();
     for chunk in previous_chunks {
@@ -506,7 +489,6 @@ fn build_chunk_plan(
         position,
         chunk_id: format!("pchunk-{chunk_hash}"),
         chunk_hash,
-        payload_json,
     })
 }
 
