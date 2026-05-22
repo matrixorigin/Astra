@@ -191,6 +191,17 @@ impl CacheCapability {
         }
     }
 
+    /// Resolve capability from explicit model metadata when available,
+    /// otherwise fall back to provider/model heuristics.
+    #[must_use]
+    pub fn from_explicit_or_provider_model(
+        explicit: Option<Self>,
+        provider: &str,
+        model: &str,
+    ) -> Self {
+        explicit.unwrap_or_else(|| Self::for_provider_and_model(provider, model))
+    }
+
     /// Shortcut used by call sites that only care whether volatile
     /// content should be injected on the current LLM round.
     ///
@@ -232,6 +243,27 @@ mod tests {
             CacheCapability::for_provider_and_model("bedrock", "us.anthropic.claude-sonnet-4-6");
         assert_eq!(c.protocol, CacheProtocol::BedrockCachePoint);
         assert_eq!(c.volatile_placement, VolatilePlacement::MarkerIsolated);
+    }
+
+    #[test]
+    fn explicit_capability_overrides_provider_model_fallback() {
+        let explicit = CacheCapability {
+            protocol: CacheProtocol::StrictHistoryMatch,
+            volatile_placement: VolatilePlacement::CurrentUserOnly,
+        };
+
+        let c =
+            CacheCapability::from_explicit_or_provider_model(Some(explicit), "openai", "gpt-4o");
+
+        assert_eq!(c, explicit);
+    }
+
+    #[test]
+    fn missing_explicit_capability_preserves_openai_default() {
+        let c = CacheCapability::from_explicit_or_provider_model(None, "openai", "gpt-4o");
+
+        assert_eq!(c.protocol, CacheProtocol::OpenAiAutoPrefix);
+        assert_eq!(c.volatile_placement, VolatilePlacement::TailSuffix);
     }
 
     #[test]

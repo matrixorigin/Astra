@@ -1286,13 +1286,14 @@ impl InProcessChatTurnBridge {
             // Resolve LLM model (skipped when `test_llm_rounds` drives the turn — feature `bridge-e2e-hooks`).
             // Also capture fallback_chain for rate-limit-triggered fallback.
             let pool_ref = shared_pool.as_ref().map(SharedPool::get);
-            let (mut model_name, mut wire_model_name, mut api_key, mut base_url, mut provider, mut request_body_overrides, fallback_chain) = if use_e2e_llm {
+            let (mut model_name, mut wire_model_name, mut api_key, mut base_url, mut provider, mut request_body_overrides, mut cache_capability, fallback_chain) = if use_e2e_llm {
                 (
                     "bridge-e2e-mock".to_string(),
                     None::<String>,
                     "unused".to_string(),
                     "http://127.0.0.1:1".to_string(),
                     "openai".to_string(),
+                    None,
                     None,
                     Vec::<String>::new(),
                 )
@@ -1312,6 +1313,9 @@ impl InProcessChatTurnBridge {
                         m.base_url,
                         m.provider,
                         m.request_body_overrides,
+                        crate::turn::llm_context::cache_capability_from_model_metadata(
+                            m.prompt_cache_capability,
+                        ),
                         m.fallback_chain,
                     ),
                     Err(e) => {
@@ -1378,6 +1382,10 @@ impl InProcessChatTurnBridge {
                             base_url = fb.base_url;
                             provider = fb.provider;
                             request_body_overrides = fb.request_body_overrides;
+                            cache_capability =
+                                crate::turn::llm_context::cache_capability_from_model_metadata(
+                                    fb.prompt_cache_capability,
+                                );
                         }
                         FallbackOutcome::NoFallbackConfigured => {
                             astra_core::agent_warn!(
@@ -1929,6 +1937,23 @@ impl InProcessChatTurnBridge {
                 // once when skill catalog changes, then stabilizes.
                 stable_sections.push(section);
             }
+            if let Some(texts) = edge_profile
+                .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS)
+                .and_then(Value::as_array)
+            {
+                let runtime_volatile = texts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                if !runtime_volatile.is_empty() {
+                    dynamic_sections.push(prompts::PromptSection::dynamic(
+                        runtime_volatile,
+                        prompts::PromptTokenBucket::Environment,
+                    ));
+                }
+            }
             if !tool_round_guidance.is_empty() {
                 dynamic_sections.push(
                     prompts::PromptSection::dynamic(
@@ -1964,10 +1989,12 @@ impl InProcessChatTurnBridge {
             // Provider-aware volatile gating — see
             // `effective_volatile_sections_for_round` for the full rationale.
             // CurrentUserOnly (MiniMax) drops ALL rounds, not just >0.
-            let cache_cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
-                &provider,
-                &model_name,
-            );
+            let cache_cap =
+                astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider_model(
+                    cache_capability,
+                    &provider,
+                    &model_name,
+                );
             let effective_dynamic_sections = effective_volatile_sections_for_round(
                 cache_cap,
                 round_index,
@@ -2160,6 +2187,7 @@ impl InProcessChatTurnBridge {
                 bridge_volatile_text.take(),
                 &provider,
                 &model_name,
+                cache_capability,
             );
 
             // Cloud loop: every tool round waits on §5.5 ledger (`POST /tools/result`) then continues LLM.
@@ -4716,6 +4744,7 @@ mod tests {
             Some("volatile".to_string()),
             "anthropic",
             "claude-sonnet-4",
+            None,
         );
         if !bridge_tail_is_synthetic {
             crate::turn::llm_context::apply_message_cache_metadata(

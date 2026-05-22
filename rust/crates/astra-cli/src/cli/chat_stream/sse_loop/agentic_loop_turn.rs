@@ -257,6 +257,7 @@ pub(crate) struct PrepareTurnTelemetry<'a> {
 
 struct PrepareChatTurnRequest<'a> {
     messages: &'a [Value],
+    runtime_volatile_texts: &'a [String],
     ephemeral_prefix: Option<&'a Value>,
     current_session_id: Option<&'a str>,
     model: Option<&'a str>,
@@ -370,6 +371,18 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         git_branch,
         thinking: thinking_config,
     });
+
+    if !ctx.runtime_volatile_texts.is_empty()
+        && let Some(root) = payload.as_object_mut()
+        && let Some(ep) = root.get_mut("edge_profile")
+        && let Some(ep_obj) = ep.as_object_mut()
+    {
+        ep_obj.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS
+                .to_string(),
+            json!(ctx.runtime_volatile_texts),
+        );
+    }
 
     // Route skill listing through edge_profile → bridge volatile lane, so
     // it lands in RuntimeVolatile (post-cache-marker) rather than becoming a
@@ -934,6 +947,10 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub executor: Arc<ToolExecutor>,
     pub registry: &'a ToolRegistry,
     pub messages: &'a [Value],
+    /// CLI runtime nudges drained from the structured volatile lane. Sent as
+    /// edge metadata so the runtime can apply model-resolved cache capability
+    /// before deciding whether to inject or drop them.
+    pub runtime_volatile_texts: &'a [String],
     /// Ephemeral system message prepended to messages for this turn only
     /// (e.g., skill listing). Not stored in conversation history.
     pub ephemeral_prefix: Option<&'a Value>,
@@ -1088,6 +1105,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         executor,
         registry,
         messages,
+        runtime_volatile_texts,
         ephemeral_prefix,
         current_session_id,
         tool_results,
@@ -1135,6 +1153,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         &ui,
         PrepareChatTurnRequest {
             messages,
+            runtime_volatile_texts,
             ephemeral_prefix,
             current_session_id,
             model,
@@ -1578,6 +1597,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
 
         let payload = super::prepare_chat_turn_payload(super::PrepareChatTurnRequest {
             messages: &messages,
+            runtime_volatile_texts: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
             model: None,
@@ -1695,6 +1715,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
 
         let payload = super::prepare_chat_turn_payload(super::PrepareChatTurnRequest {
             messages: &messages,
+            runtime_volatile_texts: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
             model: None,

@@ -5729,6 +5729,7 @@ mod tests {
             fallback_chain: vec![],
             tags: vec![],
             request_body_overrides: None,
+            prompt_cache_capability: None,
             thinking_capability: None,
         };
         let config = CloudLlmConfig::from_resolved(resolved);

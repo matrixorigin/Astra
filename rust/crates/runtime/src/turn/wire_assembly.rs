@@ -306,6 +306,7 @@ fn is_completion_signal(content: &str) -> bool {
 /// 5. Invoked-skill attachments (server path only).
 /// 6. Recent-file attachments (server path only).
 /// 7. `apply_anthropic_cache_metadata` (Anthropic path only).
+#[cfg(test)]
 pub(crate) fn assemble_llm_messages(
     system_messages: Vec<Value>,
     volatile_preamble: Vec<Value>,
@@ -317,9 +318,38 @@ pub(crate) fn assemble_llm_messages(
     model_name: &str,
     cache_cfg: &PromptCacheConfig,
 ) -> Vec<Value> {
-    let cache_cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
-        provider, model_name,
-    );
+    assemble_llm_messages_with_cache_capability(
+        system_messages,
+        volatile_preamble,
+        drained_volatile,
+        compacted_messages,
+        attachments,
+        session_id,
+        provider,
+        model_name,
+        None,
+        cache_cfg,
+    )
+}
+
+pub(crate) fn assemble_llm_messages_with_cache_capability(
+    system_messages: Vec<Value>,
+    volatile_preamble: Vec<Value>,
+    drained_volatile: Vec<crate::turn::agentic_loop_host::VolatileInjection>,
+    compacted_messages: Vec<Value>,
+    attachments: &PostCompactAttachments<'_>,
+    session_id: &str,
+    provider: &str,
+    model_name: &str,
+    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+    cache_cfg: &PromptCacheConfig,
+) -> Vec<Value> {
+    let cache_cap =
+        astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider_model(
+            cache_capability,
+            provider,
+            model_name,
+        );
     let suppress_volatile = matches!(
         cache_cap.volatile_placement,
         astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly

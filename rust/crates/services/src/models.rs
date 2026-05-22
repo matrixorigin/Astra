@@ -60,10 +60,52 @@ pub struct QuirksData {
     /// column — so adding it required no DB migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_model_name: Option<String>,
+    /// Explicit prompt-cache behavior for this concrete model deployment.
+    ///
+    /// OpenAI-compatible transport does not imply OpenAI-compatible cache
+    /// semantics. Storing this in `quirks_json` lets operators classify a
+    /// deployment once (provider + endpoint + upstream model) without baking
+    /// model-name guesses into runtime hot paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_capability: Option<PromptCacheCapabilityData>,
     /// Additional top-level request body fields to merge into outbound
     /// provider payloads for this model row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_body_overrides: Option<Map<String, Value>>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheProtocolData {
+    #[serde(alias = "MarkerExplicit")]
+    MarkerExplicit,
+    #[serde(alias = "BedrockCachePoint")]
+    BedrockCachePoint,
+    #[serde(alias = "OpenAiAutoPrefix")]
+    OpenAiAutoPrefix,
+    #[serde(alias = "StrictHistoryMatch")]
+    StrictHistoryMatch,
+    #[serde(alias = "None")]
+    None,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheVolatilePlacementData {
+    #[serde(alias = "MarkerIsolated")]
+    MarkerIsolated,
+    #[serde(alias = "TailSuffix")]
+    TailSuffix,
+    #[serde(alias = "CurrentUserOnly")]
+    CurrentUserOnly,
+    #[serde(alias = "Free")]
+    Free,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptCacheCapabilityData {
+    pub protocol: PromptCacheProtocolData,
+    pub volatile_placement: PromptCacheVolatilePlacementData,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -217,6 +259,7 @@ pub struct ResolvedActiveLlmModel {
     pub fallback_chain: Vec<String>,
     pub tags: Vec<String>,
     pub request_body_overrides: Option<Map<String, Value>>,
+    pub prompt_cache_capability: Option<PromptCacheCapabilityData>,
     /// Probe-determined thinking capability. NULL if unprobed.
     pub thinking_capability: Option<ThinkingCapability>,
 }
@@ -281,6 +324,7 @@ fn build_resolved_active_llm_from_row(
 
     let fallback_chain = quirks.fallback_chain;
     let wire_model_name = quirks.wire_model_name;
+    let prompt_cache_capability = quirks.prompt_cache_capability;
     let request_body_overrides = quirks.request_body_overrides;
 
     Ok(ResolvedActiveLlmModel {
@@ -292,6 +336,7 @@ fn build_resolved_active_llm_from_row(
         fallback_chain,
         tags,
         request_body_overrides,
+        prompt_cache_capability,
         thinking_capability,
     })
 }
@@ -2568,6 +2613,7 @@ mod tests {
             fallback_chain: vec![],
             tags: vec![],
             request_body_overrides: None,
+            prompt_cache_capability: None,
             thinking_capability: None,
         };
         assert_eq!(r.upstream_model_name(), "deepseek-v4-pro");
@@ -2586,6 +2632,7 @@ mod tests {
             fallback_chain: vec![],
             tags: vec![],
             request_body_overrides: None,
+            prompt_cache_capability: None,
             thinking_capability: None,
         };
         assert_eq!(r.upstream_model_name(), "claude-sonnet-4-6");
@@ -2624,6 +2671,46 @@ mod tests {
             q.request_body_overrides
                 .as_ref()
                 .and_then(|m| m.get("context_management"))
+        );
+    }
+
+    #[test]
+    fn quirks_prompt_cache_capability_round_trips_through_json() {
+        let q = QuirksData {
+            prompt_cache_capability: Some(PromptCacheCapabilityData {
+                protocol: PromptCacheProtocolData::StrictHistoryMatch,
+                volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
+            }),
+            ..QuirksData::default()
+        };
+
+        let json = serde_json::to_string(&q).unwrap();
+        assert!(json.contains("prompt_cache_capability"));
+        assert!(json.contains("strict_history_match"));
+        assert!(json.contains("current_user_only"));
+        let restored: QuirksData = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.prompt_cache_capability, q.prompt_cache_capability);
+    }
+
+    #[test]
+    fn quirks_prompt_cache_capability_accepts_legacy_variant_names() {
+        let q: QuirksData = serde_json::from_str(
+            r#"{
+                "prompt_cache_capability": {
+                    "protocol": "StrictHistoryMatch",
+                    "volatile_placement": "CurrentUserOnly"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            q.prompt_cache_capability,
+            Some(PromptCacheCapabilityData {
+                protocol: PromptCacheProtocolData::StrictHistoryMatch,
+                volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
+            })
         );
     }
 
@@ -2692,6 +2779,10 @@ mod tests {
             system_as_user_prefix: true,
             fallback_chain: vec!["claude-haiku".into(), "gpt-4o-mini".into()],
             wire_model_name: Some("deepseek-v4-pro".into()),
+            prompt_cache_capability: Some(PromptCacheCapabilityData {
+                protocol: PromptCacheProtocolData::StrictHistoryMatch,
+                volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
+            }),
             request_body_overrides: Some(Map::from_iter([(
                 "context_management".into(),
                 serde_json::json!({"edits": [{"type": "clear_tool_uses_20250919"}]}),

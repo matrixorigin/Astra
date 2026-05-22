@@ -172,9 +172,9 @@ pub use marketplace_stats::{
 };
 pub use models::{
     DatabaseModelService, ModelCreateRequestData, ModelListItem, ModelRecord, ModelService,
-    ModelUpdateRequestData, PricingData, QuirksData, ResolvedActiveLlmModel,
-    UnconfiguredModelService, resolve_active_llm_model, resolve_memory_model,
-    resolve_reasoning_model,
+    ModelUpdateRequestData, PricingData, PromptCacheCapabilityData, PromptCacheProtocolData,
+    PromptCacheVolatilePlacementData, QuirksData, ResolvedActiveLlmModel, UnconfiguredModelService,
+    resolve_active_llm_model, resolve_memory_model, resolve_reasoning_model,
 };
 pub use multi_agent::{
     DatabaseEdgeRegistryService, DatabaseTaskLeaseService, EdgeAgentRecord, EdgeRegistryService,

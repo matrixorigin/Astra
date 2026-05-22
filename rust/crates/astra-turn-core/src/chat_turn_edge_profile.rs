@@ -8,6 +8,12 @@ use serde_json::{Value, json};
 /// typo on either side is a compile error rather than a silent regression.
 pub const EDGE_PROFILE_KEY_SKILL_LISTING_TEXT: &str = "skill_listing_text";
 
+/// Protocol key for CLI-side runtime volatile nudges routed as structured
+/// edge metadata instead of being inlined into `messages[]`. The runtime
+/// resolves model cache capability before deciding whether to inject or drop
+/// this lane.
+pub const EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS: &str = "runtime_volatile_texts";
+
 /// Protocol key for the session-stable deferred-tool manifest routed through
 /// `edge_profile` from the CLI to the runtime bridge.
 pub const EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT: &str = "deferred_tools_text";

@@ -270,6 +270,7 @@ struct ResolvedTurnLlmConfig {
     api_key: String,
     base_url: String,
     provider: String,
+    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     fallback_chain: Vec<String>,
     header_overrides: HashMap<String, String>,
     request_body_overrides: Option<Map<String, Value>>,
@@ -356,6 +357,7 @@ async fn resolve_llm_model_for_turn(
             api_key: String::new(),
             base_url: "https://api.openai.com/v1".to_string(),
             provider: "openai".to_string(),
+            cache_capability: None,
             fallback_chain: Vec::new(),
             header_overrides: forward_headers.clone(),
             request_body_overrides: None,
@@ -372,6 +374,9 @@ async fn resolve_llm_model_for_turn(
         api_key: resolved.api_key,
         base_url: resolved.base_url,
         provider: resolved.provider,
+        cache_capability: crate::turn::llm_context::cache_capability_from_model_metadata(
+            resolved.prompt_cache_capability,
+        ),
         fallback_chain: resolved.fallback_chain,
         header_overrides: HashMap::new(),
         request_body_overrides: resolved.request_body_overrides,
@@ -1420,6 +1425,7 @@ impl ServerAgenticLoopHost {
             api_key: String::new(),
             base_url: String::new(),
             fallback_chain: Vec::new(),
+            cache_capability: None,
             header_overrides: HashMap::new(),
             request_body_overrides: None,
             completions_url_override: None,
@@ -2061,6 +2067,25 @@ impl ServerAgenticLoopHost {
         model_name: &str,
         user_content: &str,
     ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
+        self.run_turn_pipeline_with_cache_capability(
+            state,
+            visible_tools,
+            provider,
+            model_name,
+            None,
+            user_content,
+        )
+    }
+
+    fn run_turn_pipeline_with_cache_capability(
+        &mut self,
+        state: &mut AgenticLoopState,
+        visible_tools: &[Value],
+        provider: &str,
+        model_name: &str,
+        cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+        user_content: &str,
+    ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
         let plan_hint = self.read_plan_resume_hint();
         let lifecycle_summary = if let Some(existing) = &self.turn_start_lifecycle_summary {
             if self.turn_start_plan_resume_hint.as_deref() != plan_hint.as_deref() {
@@ -2106,6 +2131,7 @@ impl ServerAgenticLoopHost {
                 cache_cfg: &cache_cfg,
                 provider,
                 model_name,
+                cache_capability,
                 user_content,
                 query_source: "agentic_loop",
             },
@@ -2191,6 +2217,7 @@ impl ServerAgenticLoopHost {
                 session_id: &self.session_id,
                 provider: &llm_cfg.provider,
                 model_name: &llm_cfg.model_name,
+                cache_capability: llm_cfg.cache_capability,
                 cache_cfg,
             },
         )
@@ -2442,11 +2469,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         //   * compaction tier selection
         //   * tier-pruned tool schemas
         // Runtime no longer re-derives any of these.
-        let turn_pipeline = self.run_turn_pipeline(
+        let turn_pipeline = self.run_turn_pipeline_with_cache_capability(
             state,
             &visible_tools,
             &llm_cfg.provider,
             &llm_cfg.model_name,
+            llm_cfg.cache_capability,
             &user_content,
         )?;
         let PipelineTurnOutcome {
@@ -3976,6 +4004,7 @@ mod tests {
             base_url: String::new(),
             provider: "openai".into(),
             fallback_chain: Vec::new(),
+            cache_capability: None,
             header_overrides: HashMap::new(),
             request_body_overrides: None,
             completions_url_override: None,

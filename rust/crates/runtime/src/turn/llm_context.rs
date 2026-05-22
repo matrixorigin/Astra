@@ -14,6 +14,47 @@ use serde_json::{Map, Value, json};
 use super::agentic_loop_host::AgenticLoopState;
 use super::prompt_cache::PromptCacheConfig;
 
+pub(crate) fn cache_capability_from_model_metadata(
+    value: Option<astra_services::PromptCacheCapabilityData>,
+) -> Option<astra_turn_core::cache_placement::CacheCapability> {
+    let value = value?;
+    let protocol = match value.protocol {
+        astra_services::PromptCacheProtocolData::MarkerExplicit => {
+            astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit
+        }
+        astra_services::PromptCacheProtocolData::BedrockCachePoint => {
+            astra_turn_core::cache_placement::CacheProtocol::BedrockCachePoint
+        }
+        astra_services::PromptCacheProtocolData::OpenAiAutoPrefix => {
+            astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix
+        }
+        astra_services::PromptCacheProtocolData::StrictHistoryMatch => {
+            astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch
+        }
+        astra_services::PromptCacheProtocolData::None => {
+            astra_turn_core::cache_placement::CacheProtocol::None
+        }
+    };
+    let volatile_placement = match value.volatile_placement {
+        astra_services::PromptCacheVolatilePlacementData::MarkerIsolated => {
+            astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated
+        }
+        astra_services::PromptCacheVolatilePlacementData::TailSuffix => {
+            astra_turn_core::cache_placement::VolatilePlacement::TailSuffix
+        }
+        astra_services::PromptCacheVolatilePlacementData::CurrentUserOnly => {
+            astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
+        }
+        astra_services::PromptCacheVolatilePlacementData::Free => {
+            astra_turn_core::cache_placement::VolatilePlacement::Free
+        }
+    };
+    Some(astra_turn_core::cache_placement::CacheCapability {
+        protocol,
+        volatile_placement,
+    })
+}
+
 fn estimate_json_tokens(value: &Value) -> u32 {
     (value.to_string().len() as u32 / 4).saturating_add(1)
 }
@@ -31,6 +72,7 @@ pub(crate) struct LlmContextAssemblyInput<'a> {
     pub cache_cfg: &'a PromptCacheConfig,
     pub provider: &'a str,
     pub model_name: &'a str,
+    pub cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     pub user_content: &'a str,
     pub query_source: &'a str,
 }
@@ -348,6 +390,7 @@ pub(crate) struct LlmWireAssemblyInput<'a> {
     pub session_id: &'a str,
     pub provider: &'a str,
     pub model_name: &'a str,
+    pub cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     pub cache_cfg: &'a PromptCacheConfig,
 }
 
@@ -714,7 +757,11 @@ pub(crate) fn assemble_context_pipeline(
         ..Default::default()
     };
 
-    let cache_cap = CacheCapability::for_provider_and_model(input.provider, input.model_name);
+    let cache_cap = CacheCapability::from_explicit_or_provider_model(
+        input.cache_capability,
+        input.provider,
+        input.model_name,
+    );
     let round_within_turn = state.current_round_index;
     let inject_volatile = cache_cap.should_inject_volatile_on_round(round_within_turn);
 
@@ -877,7 +924,7 @@ pub(crate) fn assemble_wire_messages(input: LlmWireAssemblyInput<'_>) -> Vec<Val
         cwd: input.edge_profile.get("cwd").and_then(Value::as_str),
     };
 
-    crate::turn::wire_assembly::assemble_llm_messages(
+    crate::turn::wire_assembly::assemble_llm_messages_with_cache_capability(
         input.system_messages,
         input.volatile_preamble,
         drained,
@@ -886,6 +933,7 @@ pub(crate) fn assemble_wire_messages(input: LlmWireAssemblyInput<'_>) -> Vec<Val
         input.session_id,
         input.provider,
         input.model_name,
+        input.cache_capability,
         input.cache_cfg,
     )
 }
@@ -919,11 +967,15 @@ pub(crate) fn finalize_bridge_wire_messages(
     volatile_text: Option<String>,
     provider: &str,
     model_name: &str,
+    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
 ) -> bool {
     astra_turn_core::edge_ledger::strip_stale_reasoning(llm_messages, provider, model_name);
-    let cache_cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
-        provider, model_name,
-    );
+    let cache_cap =
+        astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider_model(
+            cache_capability,
+            provider,
+            model_name,
+        );
     let mut appended_synthetic_tail = false;
     if let Some(text) = volatile_text
         && !text.is_empty()
@@ -1093,6 +1145,7 @@ mod context_cache_contract_tests {
             Some("volatile".to_string()),
             "openai",
             "gpt-4",
+            None,
         );
 
         assert_eq!(messages[0]["content"], "original user");
@@ -1113,6 +1166,7 @@ mod context_cache_contract_tests {
             Some("volatile".to_string()),
             "openai",
             "gpt-4",
+            None,
         );
 
         assert_eq!(messages.len(), 1);
@@ -1131,10 +1185,32 @@ mod context_cache_contract_tests {
             Some("volatile".to_string()),
             "openai",
             "deepseek-v4-flash",
+            None,
         );
 
         assert!(!appended);
         assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"], "original user");
+    }
+
+    #[test]
+    fn finalize_bridge_wire_messages_uses_explicit_cache_capability() {
+        let mut messages = vec![json!({"role": "user", "content": "original user"})];
+        let explicit = astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+            volatile_placement:
+                astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+        };
+
+        let appended = finalize_bridge_wire_messages(
+            &mut messages,
+            Some("volatile".to_string()),
+            "openai",
+            "gpt-4o",
+            Some(explicit),
+        );
+
+        assert!(!appended);
         assert_eq!(messages[0]["content"], "original user");
     }
 }
