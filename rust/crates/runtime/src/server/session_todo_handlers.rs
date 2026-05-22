@@ -8,7 +8,8 @@
 //!
 //! Endpoints:
 //! - `POST /sessions/{session_id}/todos:execute` — run a TaskManager
-//!   action (create/update/list/get/stop) and return its string output.
+//!   action (create/update/list/get/stop/archive) and return its string
+//!   output.
 //! - `GET /sessions/{session_id}/todos` — load the full task list.
 //!
 //! User isolation: every request resolves the user via the auth header
@@ -23,7 +24,7 @@ use std::sync::Arc;
 
 #[derive(Deserialize)]
 pub(super) struct ExecuteTodoRequest {
-    /// `task` tool action: `create | update | list | get | stop`.
+    /// `task` tool action: `create | update | list | get | stop | archive`.
     pub action: String,
     /// Action arguments — same shape the LLM emits to the `task` tool.
     /// Unknown fields are ignored by TaskManager.
@@ -114,7 +115,7 @@ pub(super) async fn execute_todo_handler(
         "get" => manager.get(&req.args).await,
         "stop" => manager.stop(&req.args).await,
         "adopt" => adopt_task_into_session(&state, &user.user_id, &session_id, &req.args).await,
-        "archive" => archive_completed_tasks(&state, &user.user_id, &req.args).await,
+        "archive" => manager.archive(&req.args).await,
         other => format!(
             "Error: unknown todo action '{other}'. Valid: create, update, list, get, stop, adopt, archive"
         ),
@@ -293,74 +294,6 @@ async fn adopt_task_into_session(
     }
 
     create_output
-}
-
-/// `archive`: two modes.
-///
-/// - With `task_id`: archive that single row regardless of age,
-///   scoped to the authed user (U-13). Skips the time threshold
-///   since the user / model is explicitly asking for it.
-/// - Without `task_id`: bulk-mark every completed-and-old task
-///   as archived. Default threshold is 30 days; configurable via
-///   `older_than_days`.
-///
-/// Returns a summary string with the affected row count.
-async fn archive_completed_tasks(
-    state: &AppState,
-    user_id: &str,
-    args: &serde_json::Value,
-) -> String {
-    let Some(pool) = state.shared_pool.as_ref() else {
-        return "Error: session_todos store not configured on this server".to_string();
-    };
-
-    // U-13 single-task archive path: explicit task_id, no age check.
-    // Still scoped by user_id to prevent cross-user archival.
-    if let Some(task_id) = args.get("task_id").and_then(|v| v.as_str()) {
-        let result = sqlx::query(
-            "UPDATE session_todos \
-             SET status = 'archived', archived_at = NOW(6), updated_at = NOW(6) \
-             WHERE user_id = ? AND todo_id = ? \
-               AND status NOT IN ('archived', 'deleted', 'migrated')",
-        )
-        .bind(user_id)
-        .bind(task_id)
-        .execute(pool.get())
-        .await;
-        return match result {
-            Ok(rows) if rows.rows_affected() == 0 => format!(
-                "Refused: task {task_id} not found, not owned by you, or already archived/deleted"
-            ),
-            Ok(rows) => format!(
-                "Archived task {task_id} ({} row affected)",
-                rows.rows_affected()
-            ),
-            Err(e) => format!("Error: archive failed: {e}"),
-        };
-    }
-
-    // Bulk archive path (default).
-    let days = args
-        .get("older_than_days")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(30);
-    let result = sqlx::query(
-        "UPDATE session_todos \
-         SET status = 'archived', archived_at = NOW(6), updated_at = NOW(6) \
-         WHERE user_id = ? AND status = 'completed' \
-           AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
-    )
-    .bind(user_id)
-    .bind(days as i64)
-    .execute(pool.get())
-    .await;
-    match result {
-        Ok(rows) => format!(
-            "Archived {} completed task(s) older than {days} days for user {user_id}",
-            rows.rows_affected()
-        ),
-        Err(e) => format!("Error: archive failed: {e}"),
-    }
 }
 
 /// `GET /sessions/{session_id}/todos` — load the full task list.

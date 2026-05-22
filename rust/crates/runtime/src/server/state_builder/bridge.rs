@@ -26,10 +26,11 @@ pub(super) fn attach_chat_turn_bridge(
 pub(super) fn spawn_runtime_sweepers(shared_pool: SharedPool) {
     super::super::device_lease_sweeper::spawn_device_lease_expiry_sweeper(shared_pool.clone());
     super::super::artifact_retention_sweeper::spawn_artifact_retention_sweeper(shared_pool.clone());
-    // U-16/U-17: lifecycle sweepers for `session_todos`.
-    // Stale `in_progress` rows auto-paused after 24h; `archived`
-    // rows GC'd after 90 days. Both are idle when the table has
-    // no qualifying rows, so cost stays near-zero.
+    // U-16/U-17/U-18: lifecycle sweepers for `session_todos`.
+    // Stale `in_progress` rows auto-pause after 24h; stale
+    // `completed` rows auto-archive weekly; long-retained
+    // `archived` rows GC after 90 days. All three are idle when
+    // the table has no qualifying rows, so cost stays near-zero.
     super::super::session_todo_sweeper::spawn_session_todo_stale_sweeper(shared_pool.clone());
-    super::super::session_todo_sweeper::spawn_session_todo_archive_gc(shared_pool);
+    super::super::session_todo_sweeper::spawn_session_todo_archive_sweeper(shared_pool);
 }

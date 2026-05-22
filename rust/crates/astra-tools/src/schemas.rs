@@ -788,21 +788,20 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task",
-                "description": "Durable task list. Use this tool proactively for multi-step work and progress.\n\
+                "description": "Durable task list. Use this tool proactively for multi-step work.\n\
         \n\
-        Actions: create, update, list, get, stop, list_user, adopt, archive. Checklist only — use `agent_job` for background shell/sub-agent work.\n\
+        Actions: create, update, list, get, stop, list_user, adopt, archive. Checklist only; use `agent_job` for background work.\n\
         \n\
         ## When to Use\n\
-        - 3 or more distinct outcomes, files, phases, or deliverables.\n\
-        - Approved plan execution or delegated/background work.\n\
+        - 3 or more distinct outcomes, files, or phases.\n\
+        - Approved plans or delegated/background work.\n\
         - Scope expands mid-flight.\n\
         \n\
-        When tracking is useful:\n\
         1. Create one task per concrete outcome or phase — NOT one umbrella task for the whole request.\n\
-        2. For broad work, split into 3-7 leaf tasks sized to one artifact, API surface, or validation step.\n\
+        2. For broad work, split into 3-7 leaf tasks sized to one artifact or validation step.\n\
         3. Mark the first actionable task as `in_progress` BEFORE beginning work.\n\
         4. Keep exactly ONE task as `in_progress` at a time.\n\
-        5. Mark tasks completed immediately; on failure set `failed` with `error_message`.\n\
+        5. Finish tasks immediately: `completed` on success, `failed` + `error_message` on failure, use `archive` when old history should leave the board.\n\
         \n\
         ## When NOT to Use\n\
         - Single edit / single command / answer.\n\
@@ -812,15 +811,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
         ## Field Conventions\n\
         - `title`: specific outcome.\n\
         - `active_form`: spinner text while in_progress.\n\
-        - `description`: what done looks like.\n\
+        - `description`: definition of done.\n\
         - `subtasks`: optional nested steps; use `depends_on` for order.\n\
         - `metadata`: free-form state; on update, `{key: null}` deletes that key.\n\
         \n\
-        - `list_user` shows cross-session tasks; `adopt` copies one into the current session.\n\
-        \n\
         <example>\n\
         User: Build an employee reimbursement system.\n\
-        Assistant: Create separate tasks like `scaffold backend`, `implement expense API`, `build frontend flows`, `verify startup`; do NOT create one umbrella task `build reimbursement system`. Mark the first task `in_progress` BEFORE beginning work.\n\
+        Assistant: Create tasks like `scaffold backend`, `expense API`, `frontend flows`, `verify startup`; do NOT create one umbrella task `build reimbursement system`. Mark the first task `in_progress` BEFORE beginning work.\n\
         </example>",
                 "parameters": {
                     "type": "object",
@@ -828,13 +825,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "action": {"type": "string", "enum": ["create","update","list","get","stop","list_user","adopt","archive"], "description": "Operation to perform"},
                         "source_session_id": {"type": "string", "description": "(adopt) Source session id."},
                         "older_than_days": {"type": "integer", "description": "(archive bulk) Archive completed tasks older than N days. Default 30."},
-                        "user_status": {"type": "string", "enum": ["active","completed","failed","all"], "description": "(list_user) Cross-session filter. Default active."},
+                        "user_status": {"type": "string", "enum": ["active","completed","failed","archived","all"], "description": "(list_user) Cross-session filter. Default active."},
                         "title": {"type": "string", "description": "(create/update) Imperative title."},
                         "description": {"type": "string", "description": "(create/update) Definition of done."},
-                        "task_id": {"type": "string", "description": "(update/get/stop/adopt/archive) Task id."},
+                        "task_id": {"type": "string", "description": "(update/get/stop/adopt/archive) Task id. Single-task archive stays in the current session."},
                         "new_status": {"type": "string", "enum": ["pending","in_progress","completed","failed","cancelled","deleted"], "description": "(update) New status. `deleted` permanently removes the task."},
                         "status": {"type": "string", "enum": ["pending","in_progress","completed","failed","cancelled","deleted"], "description": "(update) Legacy alias for new_status."},
-                        "status_filter": {"type": "string", "enum": ["pending","in_progress","completed","failed","all","active"], "description": "(list) Result filter. `active` = pending + in_progress."},
+                        "status_filter": {"type": "string", "enum": ["pending","in_progress","completed","failed","archived","all","active"], "description": "(list) Result filter. `active` = pending + in_progress."},
                         "subtask_id": {"type": "string", "description": "(update) Specific subtask id."},
                         "active_form": {"type": "string", "description": "(create/update) Spinner text while in_progress."},
                         "owner": {"type": "string", "description": "(create/update) Task owner."},
@@ -1305,6 +1302,7 @@ mod tests {
     fn task_schema_exposes_lifecycle_progress_and_dependencies() {
         let schemas = all_tool_schemas_with_env(|_| None);
         let task = find_schema(&schemas, "task").expect("task schema must exist");
+        let desc = task["function"]["description"].as_str().unwrap();
         let properties = &task["function"]["parameters"]["properties"];
 
         for field in ["active_form", "add_blocks", "add_blocked_by"] {
@@ -1319,6 +1317,19 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Spinner text"),
             "active_form should stay product-facing spinner guidance"
+        );
+        assert!(
+            desc.contains("use `archive`")
+                || desc.contains("archive` (single task now")
+                || desc.contains("archive old completed"),
+            "task schema should explicitly teach when to archive finished work: {desc}"
+        );
+        assert!(
+            properties["status_filter"]
+                .as_object()
+                .and_then(|_| properties["status_filter"]["enum"].as_array())
+                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("archived"))),
+            "task schema should let the model query archived tasks explicitly"
         );
     }
 

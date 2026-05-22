@@ -1941,10 +1941,10 @@ impl ToolExecutor {
         }
     }
 
-    /// `task(action='archive', older_than_days?)` — mark completed
-    /// tasks older than N days as archived (hidden from default list).
-    /// Server-side bulk update by user_id + status='completed' +
-    /// updated_at older than threshold.
+    /// `task(action='archive', task_id?)` — either archive one
+    /// current-session task immediately, or bulk-archive stale
+    /// completed history (cloud-backed stores may widen bulk scope
+    /// to the current user's sessions).
     async fn task_archive(&self, args: &Value) -> String {
         if self.cloud_base.is_none() {
             return "Error: task(action='archive') requires a cloud connection.".to_string();
