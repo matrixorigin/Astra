@@ -818,6 +818,7 @@ mod tests {
             prompt_cache_capability:
               protocol: strict_history_match
               volatile_placement: current_user_only
+              reuse_scope: conversation_turns
             "#,
         );
 
@@ -829,6 +830,7 @@ mod tests {
             serde_json::json!({
                 "protocol": "strict_history_match",
                 "volatile_placement": "current_user_only",
+                "reuse_scope": "conversation_turns",
             })
         );
     }

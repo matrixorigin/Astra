@@ -32,7 +32,7 @@ pub struct ModelPromptCacheProfile {
 struct ModelEntry {
     name: String,
     #[serde(default)]
-    prompt_cache_capability: Option<PromptCacheCapabilityYaml>,
+    prompt_cache_capability: Option<astra_services::PromptCacheCapabilityData>,
     #[serde(default)]
     quirks: Option<ModelQuirksYaml>,
 }
@@ -40,13 +40,7 @@ struct ModelEntry {
 #[derive(Debug, Deserialize, Default)]
 struct ModelQuirksYaml {
     #[serde(default)]
-    prompt_cache_capability: Option<PromptCacheCapabilityYaml>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct PromptCacheCapabilityYaml {
-    #[serde(default)]
-    reuse_scope: Option<PromptCacheReuseScope>,
+    prompt_cache_capability: Option<astra_services::PromptCacheCapabilityData>,
 }
 
 fn models_yaml_path(working_dir: Option<&Path>) -> Option<PathBuf> {

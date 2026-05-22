@@ -1,26 +1,12 @@
 use std::collections::BTreeMap;
 
-use astra_services::session_journal::{self, JournalEvent, JournalEventType};
+use astra_services::{
+    PromptCacheCapabilityData, PromptCacheReuseScopeData, prompt_cache_capability_from_models_yaml,
+    session_journal::{self, JournalEvent, JournalEventType},
+};
 use astra_turn_core::introspect::cache_diagnosis::{self, RoundSnapshot};
 
 use super::*;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ObservedReuseScope {
-    None,
-    IntraTurnRounds,
-    ConversationTurns,
-}
-
-impl ObservedReuseScope {
-    fn label(self) -> &'static str {
-        match self {
-            Self::None => "none observed",
-            Self::IntraTurnRounds => "intra_turn_rounds",
-            Self::ConversationTurns => "conversation_turns",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct CacheTurnSummary {
@@ -56,7 +42,13 @@ pub(super) fn handle_cache_command(arg: &str, state: &SessionState) {
     let turns = summarize_cache_turns(&events);
     eprintln!(
         "{}",
-        render_cache_summary(session_id, state.model.as_deref(), &turns, &rounds)
+        render_cache_summary(
+            session_id,
+            state.model.as_deref(),
+            declared_cache_capability(state.model.as_deref()),
+            &turns,
+            &rounds,
+        )
     );
 }
 
@@ -126,25 +118,31 @@ fn summarize_cache_turns(events: &[JournalEvent]) -> Vec<CacheTurnSummary> {
     by_turn.into_values().collect()
 }
 
-fn observed_reuse_scope(rounds: &[RoundSnapshot]) -> ObservedReuseScope {
+fn declared_cache_capability(model: Option<&str>) -> Option<PromptCacheCapabilityData> {
+    let model = model?;
+    prompt_cache_capability_from_models_yaml(model, None)
+}
+
+fn observed_reuse_scope(rounds: &[RoundSnapshot]) -> Option<PromptCacheReuseScopeData> {
     if rounds
         .iter()
         .any(|round| round.turn > 1 && round.round == 0 && round.cache_read_tokens > 0)
     {
-        ObservedReuseScope::ConversationTurns
+        Some(PromptCacheReuseScopeData::ConversationTurns)
     } else if rounds
         .iter()
         .any(|round| round.round > 0 && round.cache_read_tokens > 0)
     {
-        ObservedReuseScope::IntraTurnRounds
+        Some(PromptCacheReuseScopeData::IntraTurnRounds)
     } else {
-        ObservedReuseScope::None
+        None
     }
 }
 
 fn render_cache_summary(
     session_id: &str,
     active_model: Option<&str>,
+    declared_capability: Option<PromptCacheCapabilityData>,
     turns: &[CacheTurnSummary],
     rounds: &[RoundSnapshot],
 ) -> String {
@@ -159,6 +157,7 @@ fn render_cache_summary(
     } else {
         0.0
     };
+    let declared_reuse = declared_capability.and_then(|cap| cap.reuse_scope);
     let scope = observed_reuse_scope(rounds);
     let later_turn_round0_total = rounds
         .iter()
@@ -179,6 +178,9 @@ fn render_cache_summary(
     if let Some(model) = active_model {
         out.push_str(&format!("  model:              {model}\n"));
     }
+    if let Some(scope) = declared_reuse {
+        out.push_str(&format!("  declared reuse:     {}\n", scope.as_str()));
+    }
     out.push_str(&format!(
         "  totals:             fresh={} read={} write={} out={}\n",
         total_fresh, total_cache_read, total_cache_creation, total_completion
@@ -189,7 +191,8 @@ fn render_cache_summary(
     ));
     out.push_str(&format!(
         "  observed reuse:     {}{}\n",
-        scope.label(),
+        scope.map(PromptCacheReuseScopeData::as_str)
+            .unwrap_or("none observed"),
         if later_turn_round0_total > 0 || intra_turn_hits > 0 {
             format!(
                 "  (later-turn r0 hits {later_turn_round0_hits}/{later_turn_round0_total}, intra-turn hits {intra_turn_hits})"
@@ -198,6 +201,16 @@ fn render_cache_summary(
             String::new()
         }
     ));
+    if let Some(declared_scope) = declared_reuse
+        && let Some(observed_scope) = scope
+        && !observed_scope.supports(declared_scope)
+    {
+        out.push_str(&format!(
+            "  mismatch:           observed {} < declared {}\n",
+            observed_scope.as_str(),
+            declared_scope.as_str()
+        ));
+    }
     out.push_str(&format!(
         "  captures/findings:  {}/{}\n",
         rounds.len(),
@@ -272,13 +285,13 @@ mod tests {
     fn observed_scope_distinguishes_conversation_from_intra_turn() {
         assert_eq!(
             observed_reuse_scope(&[round(1, 1, 5000)]),
-            ObservedReuseScope::IntraTurnRounds
+            Some(PromptCacheReuseScopeData::IntraTurnRounds)
         );
         assert_eq!(
             observed_reuse_scope(&[round(2, 0, 5000)]),
-            ObservedReuseScope::ConversationTurns
+            Some(PromptCacheReuseScopeData::ConversationTurns)
         );
-        assert_eq!(observed_reuse_scope(&[]), ObservedReuseScope::None);
+        assert_eq!(observed_reuse_scope(&[]), None);
     }
 
     #[test]
@@ -345,12 +358,38 @@ mod tests {
         let text = render_cache_summary(
             "sess-1",
             Some("kimi-k2.6"),
+            Some(PromptCacheCapabilityData {
+                protocol: astra_services::PromptCacheProtocolData::OpenAiAutoPrefix,
+                volatile_placement: astra_services::PromptCacheVolatilePlacementData::TailSuffix,
+                reuse_scope: Some(PromptCacheReuseScopeData::ConversationTurns),
+            }),
             &turns,
             &[round(2, 0, 3000), round(2, 1, 4000)],
         );
+        assert!(text.contains("declared reuse:     conversation_turns"));
         assert!(text.contains("observed reuse:     conversation_turns"));
         assert!(text.contains("/inspect cache"));
         assert!(text.contains("fresh=1000"));
         assert!(text.contains("read=3000"));
+    }
+
+    #[test]
+    fn render_cache_summary_surfaces_declared_vs_observed_mismatch() {
+        let text = render_cache_summary(
+            "sess-2",
+            Some("kimi-k2.6"),
+            Some(PromptCacheCapabilityData {
+                protocol: astra_services::PromptCacheProtocolData::OpenAiAutoPrefix,
+                volatile_placement: astra_services::PromptCacheVolatilePlacementData::TailSuffix,
+                reuse_scope: Some(PromptCacheReuseScopeData::ConversationTurns),
+            }),
+            &[],
+            &[round(1, 1, 5000)],
+        );
+        assert!(text.contains("declared reuse:     conversation_turns"));
+        assert!(text.contains("observed reuse:     intra_turn_rounds"));
+        assert!(text.contains(
+            "mismatch:           observed intra_turn_rounds < declared conversation_turns"
+        ));
     }
 }

@@ -138,12 +138,7 @@ pub enum Capability {
     Custom(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PromptCacheReuseScope {
-    ConversationTurns,
-    IntraTurnRounds,
-}
+pub type PromptCacheReuseScope = astra_services::PromptCacheReuseScopeData;
 
 impl<'de> serde::Deserialize<'de> for Capability {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
