@@ -1909,7 +1909,12 @@ fn commit_turn_journal_workspace_and_sidecars(
         if let Some(sid) = state.session_id.as_deref()
             && let Ok(mut ws) = astra_services::session_workspace::read_workspace(sid)
         {
-            ws.record_turn(result.prompt_tokens, result.completion_tokens);
+            ws.record_turn(
+                result.prompt_tokens,
+                result.completion_tokens,
+                result.cache_read_tokens,
+                result.cache_creation_tokens,
+            );
 
             // Persist plan state to workspace for session resume
             sync_plan_fields_to_workspace(state, &mut ws);

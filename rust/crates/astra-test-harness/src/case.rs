@@ -65,6 +65,13 @@ pub struct Case {
     #[serde(default)]
     pub capability: Option<Capability>,
 
+    /// Optional prompt-cache reuse scope this case requires from the
+    /// target model. Cases that require cross-turn cache reuse can be
+    /// skip-passed for models that only support intra-turn tool-loop
+    /// reuse.
+    #[serde(default)]
+    pub required_cache_scope: Option<PromptCacheReuseScope>,
+
     /// Difficulty level 1–5. Higher = harder. Used for weighted scoring.
     #[serde(default)]
     pub difficulty: Option<u8>,
@@ -129,6 +136,13 @@ pub enum Capability {
     Planning,
     /// Custom capability — YAML must use `"custom:my_name"` syntax.
     Custom(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheReuseScope {
+    ConversationTurns,
+    IntraTurnRounds,
 }
 
 impl<'de> serde::Deserialize<'de> for Capability {

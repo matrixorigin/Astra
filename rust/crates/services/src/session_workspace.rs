@@ -23,6 +23,10 @@ fn is_zero(v: &usize) -> bool {
     *v == 0
 }
 
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextTraceToolSelection {
     #[serde(default)]
@@ -238,6 +242,12 @@ pub struct WorkspaceMetadata {
     pub total_tokens_in: u64,
     /// Cumulative completion tokens.
     pub total_tokens_out: u64,
+    /// Cumulative prompt-cache read tokens.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub total_cache_read_tokens: u64,
+    /// Cumulative prompt-cache creation tokens.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub total_cache_creation_tokens: u64,
     /// Session status: "active", "completed", "error".
     pub status: String,
     /// Brief summary (updated on checkpoints or session end).
@@ -402,6 +412,8 @@ impl WorkspaceMetadata {
             turn_count: 0,
             total_tokens_in: 0,
             total_tokens_out: 0,
+            total_cache_read_tokens: 0,
+            total_cache_creation_tokens: 0,
             status: "active".to_string(),
             summary: None,
             checkpoints: Vec::new(),
@@ -449,6 +461,8 @@ impl WorkspaceMetadata {
             turn_count: 0,
             total_tokens_in: 0,
             total_tokens_out: 0,
+            total_cache_read_tokens: 0,
+            total_cache_creation_tokens: 0,
             status: "active".to_string(),
             summary: None,
             checkpoints: Vec::new(),
@@ -478,10 +492,18 @@ impl WorkspaceMetadata {
     }
 
     /// Update after a turn completes.
-    pub fn record_turn(&mut self, tokens_in: u64, tokens_out: u64) {
+    pub fn record_turn(
+        &mut self,
+        tokens_in: u64,
+        tokens_out: u64,
+        cache_read_tokens: u64,
+        cache_creation_tokens: u64,
+    ) {
         self.turn_count += 1;
         self.total_tokens_in += tokens_in;
         self.total_tokens_out += tokens_out;
+        self.total_cache_read_tokens += cache_read_tokens;
+        self.total_cache_creation_tokens += cache_creation_tokens;
         self.updated_at = chrono::Utc::now().to_rfc3339();
     }
 
@@ -811,28 +833,32 @@ mod tests {
     #[test]
     fn record_turn_increments_counters() {
         let mut ws = WorkspaceMetadata::with_context("s", "m", "/tmp", None);
-        ws.record_turn(100, 50);
+        ws.record_turn(100, 50, 20, 5);
         assert_eq!(ws.turn_count, 1);
         assert_eq!(ws.total_tokens_in, 100);
         assert_eq!(ws.total_tokens_out, 50);
+        assert_eq!(ws.total_cache_read_tokens, 20);
+        assert_eq!(ws.total_cache_creation_tokens, 5);
 
-        ws.record_turn(200, 100);
+        ws.record_turn(200, 100, 30, 7);
         assert_eq!(ws.turn_count, 2);
         assert_eq!(ws.total_tokens_in, 300);
         assert_eq!(ws.total_tokens_out, 150);
+        assert_eq!(ws.total_cache_read_tokens, 50);
+        assert_eq!(ws.total_cache_creation_tokens, 12);
     }
 
     #[test]
     fn record_checkpoint_appends_turn_number() {
         let mut ws = WorkspaceMetadata::with_context("s", "m", "/tmp", None);
-        ws.record_turn(10, 5);
-        ws.record_turn(10, 5);
-        ws.record_turn(10, 5);
+        ws.record_turn(10, 5, 0, 0);
+        ws.record_turn(10, 5, 0, 0);
+        ws.record_turn(10, 5, 0, 0);
         ws.record_checkpoint();
         assert_eq!(ws.checkpoints, vec![3]);
 
-        ws.record_turn(10, 5);
-        ws.record_turn(10, 5);
+        ws.record_turn(10, 5, 0, 0);
+        ws.record_turn(10, 5, 0, 0);
         ws.record_checkpoint();
         assert_eq!(ws.checkpoints, vec![3, 5]);
     }
@@ -881,7 +907,7 @@ mod tests {
     #[test]
     fn workspace_yaml_round_trip() {
         let mut ws = WorkspaceMetadata::with_context("sess-1", "gpt-4", "/home/user", Some("main"));
-        ws.record_turn(100, 50);
+        ws.record_turn(100, 50, 25, 4);
         ws.record_checkpoint();
         ws.mark_completed(Some("Done"));
         ws.pinned_tools = vec!["bash".into()];
@@ -894,6 +920,8 @@ mod tests {
         assert_eq!(parsed.checkpoints, vec![1]);
         assert_eq!(parsed.status, "completed");
         assert_eq!(parsed.summary, Some("Done".to_string()));
+        assert_eq!(parsed.total_cache_read_tokens, 25);
+        assert_eq!(parsed.total_cache_creation_tokens, 4);
         assert_eq!(parsed.pinned_tools, vec!["bash".to_string()]);
         assert_eq!(parsed.deprioritized_tools, vec!["web_fetch".to_string()]);
     }
@@ -901,7 +929,7 @@ mod tests {
     #[test]
     fn workspace_remote_artifact_record_uses_workspace_kind() {
         let mut ws = WorkspaceMetadata::with_context("sess-1", "gpt-4", "/home/user", Some("main"));
-        ws.record_turn(100, 50);
+        ws.record_turn(100, 50, 0, 0);
         let record = to_remote_artifact_record(&ws, "user-1").unwrap();
         assert_eq!(record.session_id, "sess-1");
         assert_eq!(record.user_id, "user-1");
@@ -915,7 +943,7 @@ mod tests {
     #[tokio::test]
     async fn persist_remote_workspace_uses_workspace_record() {
         let mut ws = WorkspaceMetadata::with_context("sess-1", "gpt-4", "/home/user", Some("main"));
-        ws.record_turn(100, 50);
+        ws.record_turn(100, 50, 0, 0);
         let store = RecordingArtifactStore::default();
 
         let stored = persist_remote_workspace(&ws, "user-1", &store)
@@ -1032,7 +1060,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut ws = WorkspaceMetadata::with_context(session_id, "claude", "/tmp", None);
-        ws.record_turn(200, 100);
+        ws.record_turn(200, 100, 40, 8);
 
         // Write to the temp dir
         let path = dir.join("workspace.yaml");
@@ -1045,6 +1073,8 @@ mod tests {
         assert_eq!(parsed.session_id, session_id);
         assert_eq!(parsed.turn_count, 1);
         assert_eq!(parsed.total_tokens_in, 200);
+        assert_eq!(parsed.total_cache_read_tokens, 40);
+        assert_eq!(parsed.total_cache_creation_tokens, 8);
     }
 
     #[test]

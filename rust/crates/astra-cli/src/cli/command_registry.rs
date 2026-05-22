@@ -573,11 +573,18 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
+        "/cache",
+        "Prompt-cache summary and diagnosis for the active session",
+        CommandGroup::Observability,
+    )
+    .with_arg_hint("[diagnosis|diag|detail]")
+    .with_tui_handler(TuiHandler::Fallback),
+    CommandMeta::new(
         "/inspect",
         "Harness snapshots and exports: budget, tools, context, diff, trace, …",
         CommandGroup::Observability,
     )
-    .with_arg_hint("[budget|tools|context|json|diff|history N|trace|forensics|export path]"),
+    .with_arg_hint("[budget|tools|context|cache|json|diff|history N|trace|forensics|export path]"),
     CommandMeta::new(
         "/stats",
         "Session analytics: overview, history, tools, cost, health, learning",

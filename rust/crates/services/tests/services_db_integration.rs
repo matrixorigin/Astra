@@ -1915,7 +1915,7 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
         "/srv/remote-agent",
         Some("feature/remote-workspace"),
     );
-    workspace.record_turn(120, 45);
+    workspace.record_turn(120, 45, 0, 0);
     workspace.plan_goal = Some("prove remote workspace restore".into());
     workspace.plan_execution_rounds = 3;
     workspace.last_context_trace = Some(ContextTraceSignal {

@@ -706,7 +706,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // Forward to stream event channel (even in suppress mode)
         if let Some(tx) = &self.stream_event_tx {
             if let Some((tool, reason)) =
-                astra_turn_core::permission::types::parse_auto_approved_permission(&line)
+                astra_turn_core::permission_notice::parse_auto_approved_permission(&line)
             {
                 let _ = tx.send(super::super::StreamEvent::PermissionAutoApproved { tool, reason });
             } else {

@@ -18,6 +18,7 @@ prompt: |
   Read the file Cargo.toml and summarize what workspace members it has.
   Then read Makefile and tell me what the default target is.
 capability: custom:cache
+required_cache_scope: intra_turn_rounds
 difficulty: 3
 weight: 1.0
 timeout_seconds: 240

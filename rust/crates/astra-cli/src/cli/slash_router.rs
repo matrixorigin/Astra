@@ -325,6 +325,10 @@ pub(crate) async fn handle_slash_command(
 
         "/debug" => handle_debug_command(arg, state),
 
+        "/cache" => {
+            slash_cache::handle_cache_command(arg, state);
+        }
+
         "/inspect" => {
             slash_inspect::handle_inspect_command(arg, state);
         }

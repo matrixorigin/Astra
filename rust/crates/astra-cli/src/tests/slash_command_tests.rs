@@ -139,3 +139,23 @@ async fn slash_health_detail_mode() {
         .unwrap();
     assert!(!exit);
 }
+
+#[tokio::test]
+async fn slash_cache_does_not_crash_without_active_session() {
+    let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
+    let mut state = SessionState::default();
+    let exit = handle_slash_command("/cache", &api, None, &mut state, None)
+        .await
+        .unwrap();
+    assert!(!exit);
+}
+
+#[tokio::test]
+async fn slash_inspect_cache_does_not_crash_without_active_session() {
+    let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
+    let mut state = SessionState::default();
+    let exit = handle_slash_command("/inspect cache", &api, None, &mut state, None)
+        .await
+        .unwrap();
+    assert!(!exit);
+}

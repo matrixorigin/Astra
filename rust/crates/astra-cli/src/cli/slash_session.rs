@@ -662,6 +662,8 @@ fn handle_session_switch(sub_arg: &str, state: &mut SessionState) {
     state.turn = st.turn;
     state.total_prompt_tokens = st.total_prompt_tokens;
     state.total_completion_tokens = st.total_completion_tokens;
+    state.total_cache_read_tokens = st.total_cache_read_tokens;
+    state.total_cache_creation_tokens = st.total_cache_creation_tokens;
     state.recent_tools = st.recent_tools;
     state.last_turn_event = None;
     state.run_id = None;
@@ -867,6 +869,8 @@ pub(super) async fn handle_session_command(
                     state.turn = st.turn;
                     state.total_prompt_tokens = st.total_prompt_tokens;
                     state.total_completion_tokens = st.total_completion_tokens;
+                    state.total_cache_read_tokens = st.total_cache_read_tokens;
+                    state.total_cache_creation_tokens = st.total_cache_creation_tokens;
                     state.last_turn_event = None;
                     state.run_id = None;
 
@@ -4740,10 +4744,17 @@ async fn apply_restored_session(
 
     reset_state_for_session_restore(state);
 
+    let local_state = session_runtime::session_state_from_journal(&restored.session_id);
     state.set_session_id(restored.session_id.clone());
     state.turn = restored.turn_count;
     state.total_prompt_tokens = restored.total_tokens_in;
     state.total_completion_tokens = restored.total_tokens_out;
+    state.total_cache_read_tokens = restored
+        .total_cache_read_tokens
+        .max(local_state.total_cache_read_tokens);
+    state.total_cache_creation_tokens = restored
+        .total_cache_creation_tokens
+        .max(local_state.total_cache_creation_tokens);
     state.recent_tools = restored.recent_tools.clone();
 
     apply_restored_workspace_state(state, &restored.session_id);
@@ -4898,6 +4909,8 @@ async fn apply_restored_session(
         ws.turn_count = restored.turn_count;
         ws.total_tokens_in = restored.total_tokens_in;
         ws.total_tokens_out = restored.total_tokens_out;
+        ws.total_cache_read_tokens = state.total_cache_read_tokens;
+        ws.total_cache_creation_tokens = state.total_cache_creation_tokens;
         ws.status = restored.last_status.clone();
         if let Some(ref branch) = restored.git_branch {
             ws.git_branch = Some(branch.clone());
@@ -5453,6 +5466,8 @@ mod resume_tests {
         ws.turn_count = turn_count;
         ws.total_tokens_in = 15;
         ws.total_tokens_out = 7;
+        ws.total_cache_read_tokens = 9;
+        ws.total_cache_creation_tokens = 3;
         ws.status = "active".to_string();
         session_workspace::write_workspace(&ws).unwrap();
     }
@@ -5889,6 +5904,38 @@ mod resume_tests {
         assert_eq!(state.turn, 2);
         assert_eq!(state.total_prompt_tokens, 15);
         assert_eq!(state.total_completion_tokens, 7);
+        assert_eq!(state.total_cache_read_tokens, 9);
+        assert_eq!(state.total_cache_creation_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn apply_restored_session_uses_remote_cache_totals_without_local_journal() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState::default();
+        let session_id = format!("resume-remote-cache-{}", uuid::Uuid::new_v4());
+
+        let restored = astra_services::session_restore::RestoredSession {
+            session_id: session_id.clone(),
+            turn_count: 4,
+            total_tokens_in: 120,
+            total_tokens_out: 30,
+            total_cache_read_tokens: 44,
+            total_cache_creation_tokens: 11,
+            last_status: "active".to_string(),
+            restored_from_cloud: true,
+            ..Default::default()
+        };
+
+        apply_restored_session(None, &api, &mut state, restored)
+            .await
+            .expect("remote restore should succeed without local journal");
+
+        assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(state.total_prompt_tokens, 120);
+        assert_eq!(state.total_completion_tokens, 30);
+        assert_eq!(state.total_cache_read_tokens, 44);
+        assert_eq!(state.total_cache_creation_tokens, 11);
     }
 
     #[tokio::test]

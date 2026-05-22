@@ -198,6 +198,7 @@ pub fn ingest_agentic_turn_stream(
         if let Some(replacement) = guard.replacement {
             agent_warn!("response_guard", "Guard triggered, replacing LLM output");
             *st.final_text = replacement;
+            persist_final_assistant_message(st.messages, st.final_text.as_str());
             return AgenticTurnIngestOutcome::Break;
         }
         if guard.quality.has_fabrication_markers {
@@ -308,6 +309,9 @@ pub fn ingest_agentic_turn_stream(
             record_prompt_calibration_success(snap, &mut st);
             return AgenticTurnIngestOutcome::Continue;
         }
+        if !snap.full_text.is_empty() {
+            persist_final_assistant_message(st.messages, st.final_text.as_str());
+        }
         record_prompt_calibration_success(snap, &mut st);
         return AgenticTurnIngestOutcome::Break;
     }
@@ -329,6 +333,16 @@ fn record_prompt_calibration_success(
     if snap.has_usage && billable_input > 0 {
         *st.last_measured_prompt_tokens = Some(billable_input);
     }
+}
+
+fn persist_final_assistant_message(messages: &mut Vec<Value>, final_text: &str) {
+    if final_text.is_empty() {
+        return;
+    }
+    messages.push(serde_json::json!({
+        "role": "assistant",
+        "content": final_text,
+    }));
 }
 
 #[cfg(test)]
@@ -591,6 +605,9 @@ mod tests {
         assert!(pack.has_any_usage);
         assert_eq!(pack.last_measured_prompt_tokens, Some(1));
         assert_eq!(pack.consecutive_context_window_errors, 0);
+        assert_eq!(pack.messages.len(), 1, "final assistant should persist");
+        assert_eq!(pack.messages[0]["role"], "assistant");
+        assert_eq!(pack.messages[0]["content"], "ok");
     }
 
     #[test]
@@ -802,7 +819,9 @@ mod tests {
         );
         // Should break, not retry again
         assert_eq!(out, AgenticTurnIngestOutcome::Break);
-        assert!(pack.messages.is_empty(), "no nudge on second attempt");
+        assert_eq!(pack.messages.len(), 1, "final assistant should persist");
+        assert_eq!(pack.messages[0]["role"], "assistant");
+        assert_eq!(pack.messages[0]["content"], "fabricated answer");
     }
 
     #[test]
@@ -835,7 +854,9 @@ mod tests {
         );
         assert_eq!(out, AgenticTurnIngestOutcome::Break);
         assert!(!pack.forced_factual_retry);
-        assert!(pack.messages.is_empty());
+        assert_eq!(pack.messages.len(), 1);
+        assert_eq!(pack.messages[0]["role"], "assistant");
+        assert_eq!(pack.messages[0]["content"], "Based on the PR data...");
     }
 
     #[test]
@@ -899,7 +920,12 @@ mod tests {
         // General knowledge question — no retry
         assert_eq!(out, AgenticTurnIngestOutcome::Break);
         assert!(!pack.forced_factual_retry);
-        assert!(pack.messages.is_empty());
+        assert_eq!(pack.messages.len(), 1);
+        assert_eq!(pack.messages[0]["role"], "assistant");
+        assert_eq!(
+            pack.messages[0]["content"],
+            "Rust is a systems programming language..."
+        );
     }
 
     #[test]

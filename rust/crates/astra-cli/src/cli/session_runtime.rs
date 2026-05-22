@@ -698,6 +698,8 @@ pub struct RestoredSessionState {
     pub recent_tools: Vec<String>,
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub total_cache_creation_tokens: u64,
 }
 
 /// Rebuild `(user_msg, assistant_msg)` history from the session journal.
@@ -736,6 +738,8 @@ fn restore_session_state_from_journal(session_id: &str) -> RestoredSessionState 
             .max(event.turn.unwrap_or(restored.turn.saturating_add(1)));
         restored.total_prompt_tokens += event.tokens_in.unwrap_or(0);
         restored.total_completion_tokens += event.tokens_out.unwrap_or(0);
+        restored.total_cache_read_tokens += event.cache_read_tokens.unwrap_or(0);
+        restored.total_cache_creation_tokens += event.cache_creation_tokens.unwrap_or(0);
         if let Some(tools_used) = event.tools_used {
             restored.recent_tools = tools_used;
         }
@@ -1277,6 +1281,7 @@ mod tests {
                     20,
                     90,
                 )
+                .with_cache_tokens(80, 10)
                 .with_tool_selection(
                     vec!["github_list_prs".into()],
                     vec![],
@@ -1293,6 +1298,8 @@ mod tests {
         );
         assert_eq!(restored.total_prompt_tokens, 200);
         assert_eq!(restored.total_completion_tokens, 50);
+        assert_eq!(restored.total_cache_read_tokens, 80);
+        assert_eq!(restored.total_cache_creation_tokens, 10);
         assert_eq!(restored.recent_tools, vec!["github_list_prs".to_string()]);
         assert_eq!(restored.history.len(), 2);
     }

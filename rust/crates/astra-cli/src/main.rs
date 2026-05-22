@@ -150,6 +150,8 @@ mod slash_account;
 mod slash_agent;
 #[path = "cli/slash_bug.rs"]
 mod slash_bug;
+#[path = "cli/slash_cache.rs"]
+mod slash_cache;
 #[path = "cli/slash_config.rs"]
 mod slash_config;
 #[path = "cli/slash_debug.rs"]

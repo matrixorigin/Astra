@@ -398,6 +398,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         //   `/inspect budget`         → token budget breakdown
         //   `/inspect tools`          → tool call dashboard
         //   `/inspect context`        → context window snapshot
+        //   `/inspect cache`          → per-round cache diagnosis
         //   `/inspect json`           → raw snapshot as JSON
         //   `/inspect diff`           → state diff vs start-of-session
         //   `/inspect history [N]`    → recent turn history
@@ -1747,8 +1748,8 @@ fn inspect_command_supported(args: &str) -> Result<(), String> {
     let sub = args.trim();
     match sub {
         "" => Ok(()),
-        "budget" | "tools" | "context" | "json" | "diff" | "history" | "trace" | "forensics"
-        | "export" => Ok(()),
+        "budget" | "tools" | "context" | "cache" | "json" | "diff" | "history" | "trace"
+        | "forensics" | "export" => Ok(()),
         _ => Err(format!("Unknown `/inspect` subcommand: `{sub}`.")),
     }
 }
@@ -2745,7 +2746,7 @@ mod routing_tests {
     #[test]
     fn inspect_route_accepts_known_subcommands_and_rejects_unknown_ones() {
         for form in [
-            "", "budget", "tools", "context", "json", "diff", "history", "trace",
+            "", "budget", "tools", "context", "cache", "json", "diff", "history", "trace",
         ] {
             assert!(
                 inspect_command_supported(form).is_ok(),

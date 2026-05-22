@@ -28,6 +28,10 @@ use crate::{
 const STEP_CHECKPOINT_NUMBER_OFFSET: u32 = 1_000_000_000;
 pub const COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND: &str = "composite_snapshot_index";
 
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
 // ─── Restored Session State ─────────────────────────────────────────────────
 
 /// The reconstructed state needed to resume a session.
@@ -41,6 +45,12 @@ pub struct RestoredSession {
     pub total_tokens_in: u64,
     /// Total output tokens consumed so far.
     pub total_tokens_out: u64,
+    /// Total prompt-cache read tokens consumed so far.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub total_cache_read_tokens: u64,
+    /// Total prompt-cache creation tokens consumed so far.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub total_cache_creation_tokens: u64,
     /// Recently used tools (for context carry-forward).
     pub recent_tools: Vec<String>,
     /// Number of checkpoints available.
@@ -799,6 +809,8 @@ struct LocalJournalSummary {
     turn_count: u32,
     total_tokens_in: u64,
     total_tokens_out: u64,
+    total_cache_read_tokens: u64,
+    total_cache_creation_tokens: u64,
     recent_tools: Vec<String>,
     model: Option<String>,
     last_status: String,
@@ -827,6 +839,8 @@ fn summarize_local_journal(session_id: &str) -> Option<LocalJournalSummary> {
                 summary.turn_count += 1;
                 summary.total_tokens_in += event.tokens_in.unwrap_or(0);
                 summary.total_tokens_out += event.tokens_out.unwrap_or(0);
+                summary.total_cache_read_tokens += event.cache_read_tokens.unwrap_or(0);
+                summary.total_cache_creation_tokens += event.cache_creation_tokens.unwrap_or(0);
                 if event.model.is_some() {
                     summary.model = event.model.clone();
                 }
@@ -880,12 +894,26 @@ fn restored_session_from_workspace(
     let total_tokens_out = local_journal
         .map(|summary| ws.total_tokens_out.max(summary.total_tokens_out))
         .unwrap_or(ws.total_tokens_out);
+    let total_cache_read_tokens = local_journal
+        .map(|summary| {
+            ws.total_cache_read_tokens
+                .max(summary.total_cache_read_tokens)
+        })
+        .unwrap_or(ws.total_cache_read_tokens);
+    let total_cache_creation_tokens = local_journal
+        .map(|summary| {
+            ws.total_cache_creation_tokens
+                .max(summary.total_cache_creation_tokens)
+        })
+        .unwrap_or(ws.total_cache_creation_tokens);
 
     RestoredSession {
         session_id: ws.session_id.clone(),
         turn_count,
         total_tokens_in,
         total_tokens_out,
+        total_cache_read_tokens,
+        total_cache_creation_tokens,
         recent_tools,
         checkpoint_count,
         last_status: ws.status,
@@ -1041,6 +1069,8 @@ impl SessionRestoreService for HybridRestoreService {
                 turn_count: summary.turn_count,
                 total_tokens_in: summary.total_tokens_in,
                 total_tokens_out: summary.total_tokens_out,
+                total_cache_read_tokens: summary.total_cache_read_tokens,
+                total_cache_creation_tokens: summary.total_cache_creation_tokens,
                 recent_tools: summary.recent_tools,
                 checkpoint_count: ckpt_count,
                 last_status: summary.last_status,

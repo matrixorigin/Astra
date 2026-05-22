@@ -1301,6 +1301,8 @@ pub(super) async fn handle_info_command(
             state.turn += 1;
             state.total_prompt_tokens += sr.prompt_tokens;
             state.total_completion_tokens += sr.completion_tokens;
+            state.total_cache_read_tokens += sr.cache_read_tokens;
+            state.total_cache_creation_tokens += sr.cache_creation_tokens;
             state.recent_tools = sr.tools_used.clone();
 
             // Write turn event to journal (same as normal chat turns).
@@ -1324,6 +1326,7 @@ pub(super) async fn handle_info_command(
                 )
                 .with_tool_calls(sr.tool_call_records)
                 .with_budget_pressure(sr.budget_pressure)
+                .with_cache_tokens(sr.cache_read_tokens, sr.cache_creation_tokens)
                 .with_tool_selection(
                     sr.tools_selected,
                     sr.selected_skills,

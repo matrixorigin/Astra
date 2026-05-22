@@ -126,6 +126,16 @@ fn context_trace_count(state: &crate::SessionState) -> usize {
         .unwrap_or(0)
 }
 
+fn total_input_tokens(
+    fresh_prompt_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+) -> u64 {
+    fresh_prompt_tokens
+        .saturating_add(cache_read_tokens)
+        .saturating_add(cache_creation_tokens)
+}
+
 fn latest_context_trace_since(
     state: &crate::SessionState,
     baseline_cached_turn_id: Option<&str>,
@@ -2311,11 +2321,13 @@ pub(crate) async fn run_tui_session(
                                     let turn_completion = state.total_completion_tokens - pre_completion_tokens;
                                     let turn_cache_read = state.total_cache_read_tokens - pre_cache_read;
                                     let turn_cache_creation = state.total_cache_creation_tokens - pre_cache_creation;
-                                    // turn_prompt already includes cache_read and
-                                    // cache_creation tokens — no need to add them
-                                    // again.
+                                    let turn_input = total_input_tokens(
+                                        turn_prompt,
+                                        turn_cache_read,
+                                        turn_cache_creation,
+                                    );
                                     bottom_pane.footer.token_budget =
-                                        Some((turn_prompt, 200_000));
+                                        Some((turn_input, 200_000));
 
                                     // Turn summary: dispatch to ChatWidget,
                                     // which builds the TurnSummaryCell and
@@ -2329,7 +2341,7 @@ pub(crate) async fn run_tui_session(
                                         let ctx = chat_widget::TurnContext {
                                             elapsed_ms: Some(elapsed.as_millis() as u64),
                                             ttft_ms,
-                                            tokens_in: Some(turn_prompt + turn_cache_read + turn_cache_creation),
+                                            tokens_in: Some(turn_input),
                                             tokens_out: Some(turn_completion),
                                             // Drive the `💾 N%` segment:
                                             // hit rate = cache_read / total_input.
@@ -3608,6 +3620,12 @@ mod tests {
     fn ambient_flush_waits_while_deferred_slash_pair_is_pending() {
         assert!(!should_flush_ambient_commits(true));
         assert!(should_flush_ambient_commits(false));
+    }
+
+    #[test]
+    fn total_input_tokens_includes_cache_buckets_exactly_once() {
+        assert_eq!(total_input_tokens(1200, 800, 100), 2100);
+        assert_eq!(total_input_tokens(0, 5000, 0), 5000);
     }
 
     #[test]

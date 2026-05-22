@@ -61,6 +61,7 @@ models:
   - deepseek-v4-pro-anthropic
   - MiniMax-M2.7
 capability: custom:cache
+required_cache_scope: conversation_turns
 difficulty: 3
 weight: 1.0
 timeout_seconds: 180
