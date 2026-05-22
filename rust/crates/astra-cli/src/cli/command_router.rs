@@ -2880,7 +2880,7 @@ pub(super) async fn execute_cli_command(
 
         // ── MCP server management (offline, no server needed) ──────────
         Some(Command::Mcp(mcp_cmd)) => {
-            execute_mcp_command(mcp_cmd)?;
+            execute_mcp_command(mcp_cmd).await?;
             Ok(ExitCode::Success)
         }
 
@@ -3515,13 +3515,15 @@ fn write_mcp_config(path: &std::path::Path, config: &serde_json::Value) -> Resul
     })
 }
 
-fn execute_mcp_command(cmd: McpCmd) -> Result<(), String> {
+async fn execute_mcp_command(cmd: McpCmd) -> Result<(), String> {
     match cmd {
         McpCmd::List(args) => mcp_list(&args.scope),
         McpCmd::Add(args) => mcp_add(&args.name, &args.command, &args.args, &args.scope),
         McpCmd::AddJson(args) => mcp_add_json(&args.name, &args.json, &args.scope),
         McpCmd::Remove(args) => mcp_remove(&args.name, &args.scope),
         McpCmd::Get(args) => mcp_get(&args.name),
+        McpCmd::Test(args) => mcp_test(&args.name, &args.scope).await,
+        McpCmd::Ping(args) => mcp_ping(&args.name, &args.scope).await,
     }
 }
 
@@ -3753,7 +3755,216 @@ fn mcp_get(name: &str) -> Result<(), String> {
     Err(format!("No MCP server found with name: {name}"))
 }
 
-// ═══════════════════════════════════════════════════════ Config ═══════════
+/// Find a server entry by name in a JSON config. Searches both scopes.
+fn find_server_entry<'a>(
+    config: &'a serde_json::Value,
+    name: &str,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    config
+        .get("mcpServers")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get(name))
+        .and_then(|v| v.as_object())
+}
+
+/// Convert a JSON server entry to an `McpServerConfig`.
+fn json_entry_to_mcp_config(
+    name: &str,
+    entry: &serde_json::Map<String, serde_json::Value>,
+) -> Result<astra_mcp::McpServerConfig, String> {
+    let server_type = entry
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("stdio");
+
+    let transport = match server_type {
+        "sse" | "http" => {
+            let url = entry
+                .get("url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("SSE server '{name}' missing `url`"))?;
+            astra_mcp::Transport::Sse {
+                url: url.to_string(),
+                auth_token: entry
+                    .get("auth_token")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                headers: entry
+                    .get("headers")
+                    .and_then(|v| v.as_object())
+                    .map(|h| {
+                        h.iter()
+                            .map(|(k, v)| {
+                                (k.clone(), v.as_str().unwrap_or("").to_string())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }
+        }
+        "ws" | "websocket" => {
+            let url = entry
+                .get("url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("WS server '{name}' missing `url`"))?;
+            astra_mcp::Transport::Ws {
+                url: url.to_string(),
+                auth_token: entry
+                    .get("auth_token")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                headers: entry
+                    .get("headers")
+                    .and_then(|v| v.as_object())
+                    .map(|h| {
+                        h.iter()
+                            .map(|(k, v)| {
+                                (k.clone(), v.as_str().unwrap_or("").to_string())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }
+        }
+        _ => {
+            let command = entry
+                .get("command")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("Stdio server '{name}' missing `command`"))?;
+            let mut cmd = vec![command.to_string()];
+            if let Some(args) = entry.get("args").and_then(|v| v.as_array()) {
+                cmd.extend(args.iter().filter_map(|v| v.as_str()).map(String::from));
+            }
+            astra_mcp::Transport::Stdio {
+                command: cmd,
+                args: Vec::new(),
+                env: entry
+                    .get("env")
+                    .and_then(|v| v.as_object())
+                    .map(|h| {
+                        h.iter()
+                            .map(|(k, v)| {
+                                (k.clone(), v.as_str().unwrap_or("").to_string())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }
+        }
+    };
+
+    Ok(astra_mcp::McpServerConfig {
+        name: name.to_string(),
+        transport,
+        description: String::new(),
+        enabled: true,
+        retry: Default::default(),
+    })
+}
+
+async fn mcp_test(name: &str, scope: &str) -> Result<(), String> {
+    let path = mcp_json_path_for_scope(scope)?;
+    let config = read_mcp_config(&path)?;
+    let entry =
+        find_server_entry(&config, name).ok_or_else(|| {
+            format!("Server '{name}' not found in {}", path.display())
+        })?;
+    let mcp_config = json_entry_to_mcp_config(name, entry)?;
+
+    eprintln!(
+        "  {} Connecting to {}...",
+        theme::icon_ok(),
+        name.magenta()
+    );
+
+    let mut manager = astra_mcp::McpClientManager::new();
+    let tool_count = manager.connect(mcp_config).await.map_err(|e| {
+        format!("Failed to connect to '{name}': {e}")
+    })?;
+
+    let conn = manager.get(name).ok_or_else(|| {
+        format!("Connected but cannot find '{name}'")
+    })?;
+
+    eprintln!(
+        "  {} Connected successfully ({} tools, uptime {}s)",
+        theme::icon_ok(),
+        tool_count.to_string().magenta(),
+        conn.uptime()
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    );
+
+    // List tools
+    let tools = conn.tools();
+    if !tools.is_empty() {
+        eprintln!("\n  {}:", "Tools".bold());
+        for tool in tools {
+            let desc = tool
+                .description
+                .as_deref()
+                .unwrap_or("");
+            let short_desc = if desc.len() > 80 {
+                format!("{}…", &desc[..desc.floor_char_boundary(80)])
+            } else {
+                desc.to_string()
+            };
+            eprintln!("    {} {}", tool.name.magenta(), short_desc.dim());
+        }
+    }
+
+    // List resources
+    match conn.list_resources().await {
+        Ok(resources) if !resources.is_empty() => {
+            eprintln!("\n  {}:", "Resources".bold());
+            for r in &resources {
+                eprintln!("    {} → {}", r.raw.name.clone().magenta(), r.raw.uri.clone().dim());
+            }
+        }
+        _ => {}
+    }
+
+    manager.disconnect(name);
+    eprintln!("\n  {} Disconnected.", theme::icon_ok());
+    Ok(())
+}
+
+async fn mcp_ping(name: &str, scope: &str) -> Result<(), String> {
+    let path = mcp_json_path_for_scope(scope)?;
+    let config = read_mcp_config(&path)?;
+    let entry =
+        find_server_entry(&config, name).ok_or_else(|| {
+            format!("Server '{name}' not found in {}", path.display())
+        })?;
+    let mcp_config = json_entry_to_mcp_config(name, entry)?;
+
+    let mut manager = astra_mcp::McpClientManager::new();
+    manager.connect(mcp_config).await.map_err(|e| {
+        format!("Failed to connect to '{name}': {e}")
+    })?;
+
+    match manager.ping(name).await {
+        Ok(latency) => {
+            eprintln!(
+                "  {} {} — {}",
+                theme::icon_ok(),
+                name.magenta(),
+                format!("{}ms", latency.as_millis()).dim()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} {} — {}",
+                theme::icon_warn(),
+                name.magenta(),
+                format!("ping failed: {e}").yellow()
+            );
+        }
+    }
+
+    manager.disconnect(name);
+    Ok(())
+}
 
 /// Path to `~/.astra/settings.json`.
 fn settings_path(override_path: Option<&std::path::PathBuf>) -> Result<std::path::PathBuf, String> {

@@ -49,6 +49,7 @@ mod router_builder;
 pub mod run_engine;
 mod run_handlers;
 pub mod run_lifecycle;
+pub(crate) mod runtime_mcp;
 pub mod server_loop_host;
 pub mod server_skill_subrun;
 pub mod server_tool_executor;

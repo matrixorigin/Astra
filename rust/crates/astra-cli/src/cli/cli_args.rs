@@ -1164,6 +1164,10 @@ pub(crate) enum McpCmd {
     Remove(McpRemoveArgs),
     /// Show details of a configured MCP server
     Get(McpGetArgs),
+    /// Test connection to an MCP server and list its tools
+    Test(McpTestArgs),
+    /// Ping an MCP server to check connectivity
+    Ping(McpPingArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1211,6 +1215,24 @@ pub(crate) struct McpRemoveArgs {
 pub(crate) struct McpGetArgs {
     /// Server name to inspect
     pub name: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct McpTestArgs {
+    /// Server name to test
+    pub name: String,
+    /// Config scope: project or user
+    #[arg(short = 's', long, default_value = "project")]
+    pub scope: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct McpPingArgs {
+    /// Server name to ping
+    pub name: String,
+    /// Config scope: project or user
+    #[arg(short = 's', long, default_value = "project")]
+    pub scope: String,
 }
 
 #[derive(Args, Debug)]

@@ -4275,6 +4275,28 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let edge_tools = Self::extract_edge_tools(&request);
         let edge_profile = Self::extract_edge_profile(&request);
 
+        // ── MCP: parse context.mcp_servers and connect ────────────────
+        let mcp_servers: Vec<super::runtime_mcp::ContextMcpServer> = request
+            .context
+            .as_ref()
+            .and_then(|c| c.get("mcp_servers"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        let mcp_required = !mcp_servers.is_empty();
+        let mcp_manager = if mcp_required {
+            Some(
+                super::runtime_mcp::RuntimeMcpManager::connect_all(
+                    &mcp_servers,
+                    &request.forward_headers,
+                )
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, Json(e)))?,
+            )
+        } else {
+            None
+        };
+
         // Provision workspace early for web-agent mode (no edge tools) so
         // build_initial_state loads stop hooks from the provisioned directory.
         let server_workspace = if edge_tools.is_empty() {
@@ -4371,6 +4393,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         host.set_event_tx(event_tx.clone());
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
 
+        // ── MCP: inject schemas into host tool surface ────────────────
+        let mcp_schemas = if let Some(ref mcp) = mcp_manager {
+            let schemas = mcp.tool_schemas().await;
+            host.install_runtime_tool_schemas(schemas.clone());
+            Some(schemas)
+        } else {
+            None
+        };
+
         // Guard: reject if this session already has a blocking run.
         // Hold write lock across check+insert to prevent TOCTOU race.
         {
@@ -4432,6 +4463,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             ))
             .with_cancel_token(state.cancellation.token.clone())
             .with_task_store(task_store);
+
+            // ── MCP: inject manager + plugin schemas into executor ────
+            if let Some(ref mcp) = mcp_manager {
+                executor.set_mcp_manager(mcp.inner().clone());
+                if let Some(ref schemas) = mcp_schemas {
+                    executor.set_plugin_schemas(schemas.clone());
+                }
+            }
+
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }
