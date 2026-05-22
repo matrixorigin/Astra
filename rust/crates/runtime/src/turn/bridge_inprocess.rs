@@ -4561,6 +4561,23 @@ mod tests {
     }
 
     #[test]
+    fn effective_volatile_deepseek_v4_flash_is_empty_on_every_round() {
+        let cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+            "openai",
+            "deepseek-v4-flash",
+        );
+        let dyn_sections = sample_volatile_sections();
+        for round in [0u32, 1, 2, 6, 12] {
+            let out = effective_volatile_sections_for_round(cap, round, &dyn_sections);
+            assert!(
+                out.is_empty(),
+                "DeepSeek v4 flash must suppress volatile on round {round}; got {} sections",
+                out.len(),
+            );
+        }
+    }
+
+    #[test]
     fn effective_volatile_openai_keeps_sections_on_every_round() {
         // OpenAI auto-prefix (TailSuffix): safe to inject every round
         // since volatile lives at the tail of the last user message.

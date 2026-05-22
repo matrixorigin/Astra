@@ -169,6 +169,23 @@ fn derive_turn_interaction_mode(
     }
 }
 
+fn should_inline_volatile_messages_for_model(model: Option<&str>) -> bool {
+    let Some(model) = astra_core::model_override::normalize_model_override(model) else {
+        return true;
+    };
+    // CLI-side volatile draining happens before the server resolves the full
+    // model row, so we only have the selected model id here. The known
+    // CurrentUserOnly cases are OpenAI-compatible strict-history models
+    // identified by model id (`deepseek-v4-*`, `minimax*`), so the
+    // openai/provider hint is sufficient for this preflight gate.
+    let cache_cap =
+        astra_turn_core::cache_placement::CacheCapability::for_provider_and_model("openai", model);
+    !matches!(
+        cache_cap.volatile_placement,
+        astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
+    )
+}
+
 impl CliAgenticLoopHost<'_> {
     /// Internal accessor. The trait impl delegates here; this method
     /// exists separately so other CLI-only call sites can use it
@@ -364,11 +381,20 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // role=user pairs (Bedrock HTTP 400). See
         // `take_volatile_pending_as_message` / `take_volatile_pending_appended_to`
         // docs for the full context.
-        let augmented_messages_owned: Option<Vec<serde_json::Value>> =
-            state.take_volatile_pending_appended_to(state.messages.clone());
-
         // If a skill activation overrode the model, use that; otherwise fall back to host default.
-        let effective_model = state.skills.model_override.as_deref().or(self.model);
+        let effective_model_owned = state
+            .skills
+            .model_override
+            .clone()
+            .or_else(|| self.model.map(str::to_owned));
+        let effective_model = effective_model_owned.as_deref();
+        let augmented_messages_owned: Option<Vec<serde_json::Value>> =
+            if should_inline_volatile_messages_for_model(effective_model) {
+                state.take_volatile_pending_appended_to(state.messages.clone())
+            } else {
+                let _ = state.take_volatile_pending();
+                None
+            };
 
         // Skill allowed_tools is additive — it ensures skill-referenced tools
         // are visible to the model via schema injection, but never restricts
@@ -711,7 +737,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // Forward to stream event channel (even in suppress mode)
         if let Some(tx) = &self.stream_event_tx {
             if let Some((tool, reason)) =
-                astra_turn_core::permission_notice::parse_auto_approved_permission(&line)
+                astra_turn_core::permission::types::parse_auto_approved_permission(&line)
             {
                 let _ = tx.send(super::super::StreamEvent::PermissionAutoApproved { tool, reason });
             } else {
@@ -1180,6 +1206,18 @@ mod tests {
             derive_turn_interaction_mode(PermissionMode::Plan, false, false, false, true, true),
             TurnInteractionMode::NonInteractive
         );
+    }
+
+    #[test]
+    fn inline_volatile_allowed_for_standard_openai_models() {
+        assert!(should_inline_volatile_messages_for_model(Some("gpt-4o")));
+    }
+
+    #[test]
+    fn inline_volatile_disabled_for_deepseek_v4_flash() {
+        assert!(!should_inline_volatile_messages_for_model(Some(
+            "deepseek-v4-flash"
+        )));
     }
 
     // ── Session c47c2dca regression guard ─────────────────────────────

@@ -156,10 +156,29 @@ impl CacheCapability {
             // substring so e.g. `MiniMax-M2.7` or future `MiniMax-M3`
             // variants served under provider=openai still get the right
             // placement.
-            "openai" if model_lower.contains("minimax") => Self {
-                protocol: CacheProtocol::StrictHistoryMatch,
-                volatile_placement: VolatilePlacement::CurrentUserOnly,
-            },
+            //
+            // DeepSeek v4 on the OpenAI-compatible MOI gateway showed the
+            // same operational symptom under harness/live sessions
+            // (`cache_provider_matrix_regression`, session
+            // eeea6ec6-cb33-46b5-9932-b2d34a081b0a): once the volatile tail
+            // expanded to the "long" reminder shape, the next round's
+            // `cached_input_tokens` collapsed from ~10k to 0 even though the
+            // stable prefix before the tail was unchanged. Treating those
+            // models as `TailSuffix` reintroduces avoidable cache misses; the
+            // safer contract is the same total volatile suppression we use for
+            // other strict-history providers.
+            "openai"
+                if model_lower.contains("minimax")
+                    || matches!(
+                        model_lower.as_str(),
+                        "deepseek-v4-flash" | "deepseek-v4-pro"
+                    ) =>
+            {
+                Self {
+                    protocol: CacheProtocol::StrictHistoryMatch,
+                    volatile_placement: VolatilePlacement::CurrentUserOnly,
+                }
+            }
             "openai" => Self {
                 protocol: CacheProtocol::OpenAiAutoPrefix,
                 volatile_placement: VolatilePlacement::TailSuffix,
@@ -234,6 +253,20 @@ mod tests {
     #[test]
     fn minimax_detected_case_insensitively() {
         let c = CacheCapability::for_provider_and_model("openai", "minimax-m3-preview");
+        assert_eq!(c.volatile_placement, VolatilePlacement::CurrentUserOnly);
+    }
+
+    #[test]
+    fn deepseek_v4_flash_openai_routes_to_current_user_only() {
+        let c = CacheCapability::for_provider_and_model("openai", "deepseek-v4-flash");
+        assert_eq!(c.protocol, CacheProtocol::StrictHistoryMatch);
+        assert_eq!(c.volatile_placement, VolatilePlacement::CurrentUserOnly);
+    }
+
+    #[test]
+    fn deepseek_v4_pro_openai_routes_to_current_user_only() {
+        let c = CacheCapability::for_provider_and_model("openai", "DEEPSEEK-V4-PRO");
+        assert_eq!(c.protocol, CacheProtocol::StrictHistoryMatch);
         assert_eq!(c.volatile_placement, VolatilePlacement::CurrentUserOnly);
     }
 

@@ -4298,6 +4298,45 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn run_turn_pipeline_deepseek_v4_flash_skips_volatile_on_tool_loop_round() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-deepseek".to_string(),
+            "s-deepseek".to_string(),
+        )
+        .with_edge_tools(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Shell.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })])
+        .build();
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-deepseek".into());
+        state.max_turn_input_tokens = 200_000;
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        let tools = host.edge_tools.clone();
+
+        for round in [0u32, 1, 5] {
+            state.current_round_index = round;
+            let out = host
+                .run_turn_pipeline(&mut state, &tools, "openai", "deepseek-v4-flash", "hi")
+                .expect("pipeline should succeed");
+            assert!(
+                out.volatile_preamble.is_empty(),
+                "DeepSeek v4 flash must suppress volatile preamble on every round. \
+                 round={round} preamble={:?}",
+                out.volatile_preamble,
+            );
+        }
+    }
+
     /// OpenAI auto-prefix cache can tolerate volatile-in-tail every
     /// round, so preamble emission stays unchanged across rounds.
     #[tokio::test]

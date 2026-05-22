@@ -317,6 +317,13 @@ pub(crate) fn assemble_llm_messages(
     model_name: &str,
     cache_cfg: &PromptCacheConfig,
 ) -> Vec<Value> {
+    let cache_cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+        provider, model_name,
+    );
+    let suppress_volatile = matches!(
+        cache_cap.volatile_placement,
+        astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
+    );
     let mut llm_messages = system_messages;
     llm_messages.extend(compacted_messages);
 
@@ -326,9 +333,13 @@ pub(crate) fn assemble_llm_messages(
     // `state.messages[]` for volatile content, so `messages[]` stays byte-
     // stable across rounds — the property Anthropic / DeepSeek prompt
     // caches rely on.
-    let mut volatile_preamble = volatile_preamble;
+    let mut volatile_preamble = if suppress_volatile {
+        Vec::new()
+    } else {
+        volatile_preamble
+    };
     let drained_text = render_drained_volatile(&drained_volatile);
-    if !drained_text.is_empty() {
+    if !suppress_volatile && !drained_text.is_empty() {
         volatile_preamble.push(serde_json::json!({
             "role": "user",
             "content": drained_text,
@@ -342,7 +353,7 @@ pub(crate) fn assemble_llm_messages(
     // Once zero producers call `state.messages.push(...)` with runtime
     // content, this pass becomes a no-op and can be removed.
     let harvested = consolidate_mid_history_volatile_injections(&mut llm_messages);
-    if !harvested.is_empty() {
+    if !suppress_volatile && !harvested.is_empty() {
         volatile_preamble.push(serde_json::json!({
             "role": "user",
             "content": harvested,
@@ -1127,6 +1138,63 @@ mod tests {
         assert!(
             tail_user.starts_with("<system-reminder>volatile</system-reminder>"),
             "volatile reminder should be appended as the true tail user"
+        );
+    }
+
+    #[test]
+    fn current_user_only_models_drop_volatile_entirely() {
+        let system = vec![json!({"role": "system", "content": "sys"})];
+        let preamble = vec![
+            json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
+            json!({"role": "assistant", "content": "Understood."}),
+        ];
+        let drained = vec![crate::turn::agentic_loop_host::VolatileInjection {
+            kind: crate::turn::agentic_loop_host::VolatileKind::AlreadyFetched,
+            content: "## Already Fetched (do NOT re-read/re-grep these)\nFiles: foo.rs".into(),
+            round_index: 1,
+        }];
+        let compacted = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": "tool output", "tool_call_id": "c1"}),
+            json!({"role": "system", "content": "✓ 2 tools executed in parallel — excellent. Keep batching independent operations."}),
+        ];
+        let msgs = assemble_llm_messages(
+            system,
+            preamble,
+            drained,
+            compacted,
+            &PostCompactAttachments::default(),
+            "sid",
+            "openai",
+            "deepseek-v4-flash",
+            &cache_cfg(),
+        );
+        assert_eq!(msgs.len(), 4, "no synthetic volatile tail should remain");
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "hi");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[3]["role"], "tool");
+        assert!(
+            msgs.iter().all(|message| {
+                !message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .contains("Already Fetched")
+                    && !message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .contains("tools executed in parallel")
+                    && !message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .contains("<system-reminder>")
+            }),
+            "CurrentUserOnly providers must drop all volatile wire content"
         );
     }
 

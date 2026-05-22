@@ -921,10 +921,19 @@ pub(crate) fn finalize_bridge_wire_messages(
     model_name: &str,
 ) -> bool {
     astra_turn_core::edge_ledger::strip_stale_reasoning(llm_messages, provider, model_name);
+    let cache_cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+        provider, model_name,
+    );
     let mut appended_synthetic_tail = false;
     if let Some(text) = volatile_text
         && !text.is_empty()
     {
+        if matches!(
+            cache_cap.volatile_placement,
+            astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
+        ) {
+            return false;
+        }
         let wrapped = format!("<system-reminder>\n{text}</system-reminder>");
         let tail_role = llm_messages
             .last()
@@ -1111,5 +1120,21 @@ mod context_cache_contract_tests {
             messages[0]["content"],
             "<system-reminder>\nvolatile</system-reminder>\n\noriginal user"
         );
+    }
+
+    #[test]
+    fn finalize_bridge_wire_messages_skips_current_user_only_models() {
+        let mut messages = vec![json!({"role": "user", "content": "original user"})];
+
+        let appended = finalize_bridge_wire_messages(
+            &mut messages,
+            Some("volatile".to_string()),
+            "openai",
+            "deepseek-v4-flash",
+        );
+
+        assert!(!appended);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"], "original user");
     }
 }
