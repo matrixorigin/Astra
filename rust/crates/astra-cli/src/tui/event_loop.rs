@@ -491,7 +491,7 @@ fn refresh_footer_from_state(
         .session_id
         .as_ref()
         .map(|sid| sid[..8.min(sid.len())].to_string());
-    bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
+    bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
 }
 
 /// Replay a session's JSONL transcript into a fresh `ChatWidget`,
@@ -629,13 +629,18 @@ pub(crate) async fn run_tui_session(
     if let Some(ref sid) = state.session_id {
         bottom_pane.footer.session_id = Some(sid[..8.min(sid.len())].to_string());
     }
-    bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
+    bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
     // Lock-free observer of `perm_manager.mode()` so the inner-tick
     // path can refresh the status-line chip while the agentic loop
     // holds `&mut state`. Without this, mid-turn pivots
     // (`exit_plan_mode` flipping Plan → Auto on the next-turn
     // boundary) only land on screen when the outer select wakes up.
     let perm_mode_mirror = state.perm_manager.mode_mirror_handle();
+    // Wire the same mirror into the footer so every frame render
+    // reads the live mode from the atomic mirror rather than the
+    // cached `permission_mode` field. This eliminates the ~50 ms
+    // staleness window that the tick-based self-healing had.
+    bottom_pane.footer.set_mode_mirror(perm_mode_mirror.clone());
 
     // Load skill items for $ mention popup
     {
@@ -1699,7 +1704,7 @@ pub(crate) async fn run_tui_session(
                                                                 // catches up.
                                                                 perm_mode_mirror.stage(next_mode);
                                                                 bottom_pane.footer.permission_mode =
-                                                                    Some(format!("{}", next_mode));
+                                                                    Some(next_mode);
                                                                 // Reflect the staged mode in the approval queue
                                                                 // immediately so the chip and pending count
                                                                 // agree. perm_manager.mode() will catch up at
@@ -2130,6 +2135,15 @@ pub(crate) async fn run_tui_session(
                                 }
                                                  }
                                                 Some(req) = ask_user_rx.recv() => {
+                                                    // Draft transition: show a brief
+                                                    // indicator before the ask-user form
+                                                    // opens so the user isn't surprised by
+                                                    // a sudden modal.
+                                                    chat_widget.commit_system(
+                                                        crate::tui::history_cell::system::SystemCell::response(
+                                                            "🤔 The agent needs your input — opening question…",
+                                                        ),
+                                                    );
                                                     bottom_pane.enqueue_ask_user(req.prompt, req.response_tx);
                                                     frame_requester.schedule_frame();
                                                     {
@@ -2170,9 +2184,9 @@ pub(crate) async fn run_tui_session(
                                                     // here would clash. Catches turn-boundary
                                                     // pivots (e.g. exit_plan_mode → Auto) within
                                                     // one inner tick.
-                                                    let live_mode = format!("{}", perm_mode_mirror.current());
-                                                    if bottom_pane.footer.permission_mode.as_deref()
-                                                        != Some(live_mode.as_str())
+                                                    let live_mode = perm_mode_mirror.current();
+                                                    if bottom_pane.footer.permission_mode
+                                                        != Some(live_mode)
                                                     {
                                                         bottom_pane.footer.permission_mode = Some(live_mode);
                                                     }
@@ -2284,7 +2298,7 @@ pub(crate) async fn run_tui_session(
                                     if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.clone()); }
                                     if let Some(ref s) = state.session_id { bottom_pane.footer.session_id = Some(s[..8.min(s.len())].to_string()); }
                                     bottom_pane.footer.token_usage = Some(format!("{}↑ {}↓", state.total_prompt_tokens, state.total_completion_tokens));
-                                    bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
+                                    bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
                                     // Footer "N% (Mk)" chip shows the CONTEXT WINDOW for
                                     // the most recent turn — i.e. how many input tokens
                                     // the model saw this turn, not cumulative session
@@ -2762,7 +2776,7 @@ pub(crate) async fn run_tui_session(
                                     bottom_pane.sync_popups();
                                     // Update footer after view actions (model/permission may change)
                                     if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.clone()); }
-                                    bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
+                                    bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
                                     // Clear the deferred-flush flag for any
                                     // ViewCompleted-with-name path that fell
                                     // through to here without an explicit
@@ -2900,9 +2914,8 @@ pub(crate) async fn run_tui_session(
                 // happens to call `refresh_footer_from_state`. Cheap:
                 // a string format and an Option<u64> compare per 50ms.
                 let live_mode_enum = state.perm_manager.mode();
-                let live_mode = format!("{live_mode_enum}");
-                if bottom_pane.footer.permission_mode.as_deref() != Some(live_mode.as_str()) {
-                    bottom_pane.footer.permission_mode = Some(live_mode);
+                if bottom_pane.footer.permission_mode != Some(live_mode_enum) {
+                    bottom_pane.footer.permission_mode = Some(live_mode_enum);
                     // Mode just shifted (driven by host-side
                     // pull_mode_from_mirror after exit_plan_mode
                     // overlay or mid-turn Shift+Tab). Re-evaluate

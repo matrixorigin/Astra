@@ -37,6 +37,32 @@ pub enum PermissionMode {
     Deny,
 }
 
+impl PermissionMode {
+    /// Human label for the status-line mode chip.
+    pub fn chip_text(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Plan => "plan",
+            Self::AcceptEdits => "edit",
+            Self::Prompt => "default",
+            Self::Deny => "deny",
+        }
+    }
+
+    /// Color hint for the status-line mode chip.
+    /// Returns `(red, green, blue)` for a ratatui-style `Color::Rgb`.
+    pub fn chip_color_rgb(self) -> (u8, u8, u8) {
+        // Blue for plan, cyan for edit, yellow for auto, red for deny, white for default.
+        match self {
+            Self::Auto => (255, 255, 0),
+            Self::Plan => (100, 149, 237),
+            Self::AcceptEdits => (0, 255, 255),
+            Self::Prompt => (255, 255, 255),
+            Self::Deny => (255, 0, 0),
+        }
+    }
+}
+
 impl std::fmt::Display for PermissionMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use ratatui::{buffer::Buffer, layout::Rect};
 
-use crate::tui::status_line::{PermissionMode, StatusContext, StatusLine};
+use crate::permission_manager::{PermissionMode, PermissionModeMirror};
+use crate::tui::status_line::{StatusContext, StatusLine};
 
 pub(crate) struct Footer {
     pub model: Option<String>,
@@ -16,7 +17,7 @@ pub(crate) struct Footer {
     pub token_usage: Option<String>,
     pub cwd: Option<String>,
     pub is_turn_active: bool,
-    pub permission_mode: Option<String>,
+    pub permission_mode: Option<PermissionMode>,
     pub git_branch: Option<String>,
     pub token_budget: Option<(u64, u64)>,
     pub current_objective: Option<String>,
@@ -28,6 +29,13 @@ pub(crate) struct Footer {
     /// Updated by the TUI event-loop tick; rendered as the `BG: …`
     /// chip on the status line. `None` keeps the chip hidden.
     pub bg_task_counts: Option<(usize, usize)>,
+    /// Lock-free mirror of the current permission mode. When set,
+    /// `to_context()` reads the live mode from this mirror on every
+    /// render instead of relying on the cached `permission_mode`
+    /// field. Eliminates the ~50 ms staleness window between a mode
+    /// change (e.g. `/plan`, `/auto`, exit_plan_mode) and the next
+    /// event-loop tick that calls `refresh_footer_from_state`.
+    mode_mirror: Option<PermissionModeMirror>,
 }
 
 impl Footer {
@@ -47,6 +55,7 @@ impl Footer {
             task_counts: None,
             task_board_expanded: false,
             bg_task_counts: None,
+            mode_mirror: None,
         }
     }
 
@@ -58,14 +67,21 @@ impl Footer {
         self.git_branch = detect_git_branch();
     }
 
-    fn permission_mode_enum(&self) -> PermissionMode {
-        match self.permission_mode.as_deref() {
-            Some("auto") => PermissionMode::Auto,
-            Some("plan") => PermissionMode::Plan,
-            Some("accept_edits") => PermissionMode::AcceptEdits,
-            Some("deny") => PermissionMode::Deny,
-            _ => PermissionMode::Ask,
-        }
+    /// Install a lock-free mirror so every frame reads the *current*
+    /// permission mode directly from the atomic state rather than a
+    /// cached copy that may be up to one event-loop tick stale.
+    pub fn set_mode_mirror(&mut self, mirror: PermissionModeMirror) {
+        self.mode_mirror = Some(mirror);
+    }
+
+    /// Resolve the live permission mode: prefer the lock-free mirror
+    /// when available; otherwise fall back to the cached field (for
+    /// tests and early-init renders before the mirror is wired).
+    fn live_mode(&self) -> PermissionMode {
+        self.mode_mirror
+            .as_ref()
+            .map(|m| m.current())
+            .unwrap_or(self.permission_mode.unwrap_or_default())
     }
 
     fn to_context(&self) -> StatusContext {
@@ -75,7 +91,7 @@ impl Footer {
             token_budget: self.token_budget,
             current_objective: self.current_objective.clone(),
             turn_elapsed: self.turn_elapsed,
-            permission_mode: self.permission_mode_enum(),
+            permission_mode: self.live_mode(),
             turn_active: self.is_turn_active,
             session_id: self.session_id.clone(),
             cost_usd: None,

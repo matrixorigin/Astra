@@ -447,6 +447,15 @@ impl PermissionModeMirror {
             std::sync::atomic::Ordering::Release,
         );
     }
+
+    /// Test-only constructor: build a mirror from a pre-encoded u8.
+    /// Use `encode_mode_for_mirror` to get the correct encoding.
+    #[cfg(test)]
+    pub(crate) fn from_encoded(encoded: u8) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(encoded)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

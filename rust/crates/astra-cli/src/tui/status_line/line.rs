@@ -11,33 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthStr;
 
-/// Permission mode expressed as an enum rather than a string so the
-/// status line can't silently render typo'd values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum PermissionMode {
-    #[default]
-    Ask,
-    Auto,
-    Plan,
-    AcceptEdits,
-    Deny,
-}
-
-impl PermissionMode {
-    pub fn chip_text(self) -> &'static str {
-        // Plain words — emojis varied wildly across themes and got
-        // flagged as visually noisy ("🔍" and "✎" never landed). The
-        // chip's colour already carries the urgency signal: blue for
-        // plan, cyan for edit, yellow for auto, red for deny.
-        match self {
-            Self::Ask => "default",
-            Self::Auto => "auto",
-            Self::Plan => "plan",
-            Self::AcceptEdits => "edit",
-            Self::Deny => "deny",
-        }
-    }
-}
+pub(crate) use crate::permission_manager::PermissionMode;
 
 /// Inputs that feed the status line. Owned so the struct is `Clone`
 /// and easy to fixture.
@@ -165,9 +139,9 @@ impl StatusLine {
         }
 
         match ctx.permission_mode {
-            PermissionMode::Ask => {
+            PermissionMode::Prompt => {
                 out.left.push(Segment::styled(
-                    PermissionMode::Ask.chip_text(),
+                    ctx.permission_mode.chip_text(),
                     Style::default()
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
@@ -175,7 +149,7 @@ impl StatusLine {
             }
             PermissionMode::Auto => {
                 out.left.push(Segment::styled(
-                    PermissionMode::Auto.chip_text(),
+                    ctx.permission_mode.chip_text(),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -183,7 +157,7 @@ impl StatusLine {
             }
             PermissionMode::Plan => {
                 out.left.push(Segment::styled(
-                    PermissionMode::Plan.chip_text(),
+                    ctx.permission_mode.chip_text(),
                     Style::default()
                         .fg(Color::Blue)
                         .add_modifier(Modifier::BOLD),
@@ -191,7 +165,7 @@ impl StatusLine {
             }
             PermissionMode::AcceptEdits => {
                 out.left.push(Segment::styled(
-                    PermissionMode::AcceptEdits.chip_text(),
+                    ctx.permission_mode.chip_text(),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -199,7 +173,7 @@ impl StatusLine {
             }
             PermissionMode::Deny => {
                 out.left.push(Segment::styled(
-                    PermissionMode::Deny.chip_text(),
+                    ctx.permission_mode.chip_text(),
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ));
             }

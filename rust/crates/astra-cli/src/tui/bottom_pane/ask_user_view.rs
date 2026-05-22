@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
@@ -409,7 +409,11 @@ impl AskUserView {
             let focused = state.cursor_row == idx;
             let selected = state.selected.contains(&idx);
             let selector = if question.multi_select {
-                if selected { "[x]" } else { "[ ]" }
+                if selected {
+                    "[x]"
+                } else {
+                    "[ ]"
+                }
             } else if selected {
                 "(*)"
             } else {
@@ -457,12 +461,19 @@ impl AskUserView {
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
+                Style::default().fg(Color::Cyan)
             };
             Widget::render(
                 Line::from(vec![
                     Span::styled(if focused { "  › " } else { "    " }, style),
-                    Span::styled("Other", style),
+                    Span::styled(
+                        if focused {
+                            "Other"
+                        } else {
+                            "✎ Other (free-text)"
+                        },
+                        style,
+                    ),
                 ]),
                 Rect::new(chunks[1].x, y, chunks[1].width, 1),
                 buf,
@@ -970,7 +981,30 @@ impl BottomPaneView for AskUserView {
         let other_focused = Self::is_other_row(&question, state);
 
         match key.code {
-            KeyCode::Esc => self.send(AskUserResponse::Cancelled),
+            KeyCode::Esc => {
+                // In multi-select mode, Esc first clears all selections.
+                // Only when nothing is selected does it cancel the
+                // form — matching Claude Code's two-stage Esc for
+                // multi-select safety.
+                if question.multi_select && !state.selected.is_empty() {
+                    let state = self.current_state_mut().expect("state for active question");
+                    state.selected.clear();
+                    self.validation = None;
+                } else {
+                    self.send(AskUserResponse::Cancelled);
+                }
+            }
+            KeyCode::Char('a')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && question.multi_select =>
+            {
+                // Ctrl+A: select all options in multi-select mode.
+                let state = self.current_state_mut().expect("state for active question");
+                state.selected.clear();
+                for i in 0..question.options.len() {
+                    state.selected.insert(i);
+                }
+                self.validation = None;
+            }
             KeyCode::Left | KeyCode::BackTab => self.prev_tab(),
             KeyCode::Right | KeyCode::Tab => self.next_tab(),
             KeyCode::Up => {
