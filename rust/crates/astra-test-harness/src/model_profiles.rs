@@ -44,19 +44,34 @@ struct ModelQuirksYaml {
 }
 
 fn models_yaml_path(working_dir: Option<&Path>) -> Option<PathBuf> {
+    // Walk ancestor directories so the harness finds the repo-root
+    // `.models.yaml` whether invoked from the repo root, `rust/`, or
+    // any nested working tree path. Mirrors
+    // `astra_services::prompt_cache_capability_from_models_yaml` —
+    // when the two disagreed, harness silently saw an empty profile
+    // map and `skip_for_unsupported_cache_scope` defaulted to
+    // `Unknown`, so cases requiring `conversation_turns` ran on
+    // `intra_turn_rounds`-only models and failed in confusing ways.
     let base = match working_dir {
         Some(path) => path.to_path_buf(),
         None => std::env::current_dir().ok()?,
     };
-    let path = base.join(".models.yaml");
-    path.exists().then_some(path)
+    let start = if base.is_dir() {
+        base
+    } else {
+        base.parent()?.to_path_buf()
+    };
+    start
+        .ancestors()
+        .map(|dir| dir.join(".models.yaml"))
+        .find(|path| path.is_file())
 }
 
 fn parse_profiles_str(yaml: &str) -> HashMap<String, ModelPromptCacheProfile> {
     let entries: Vec<ModelEntry> = serde_yaml_ng::from_str(yaml).unwrap_or_default();
     entries
         .into_iter()
-        .filter_map(|entry| {
+        .map(|entry| {
             let cap = entry
                 .prompt_cache_capability
                 .or_else(|| entry.quirks.and_then(|q| q.prompt_cache_capability));
@@ -67,7 +82,7 @@ fn parse_profiles_str(yaml: &str) -> HashMap<String, ModelPromptCacheProfile> {
                 Some(PromptCacheReuseScope::IntraTurnRounds) => ModelReuseSupport::IntraTurnRounds,
                 None => ModelReuseSupport::Unknown,
             };
-            Some((entry.name, ModelPromptCacheProfile { reuse_support }))
+            (entry.name, ModelPromptCacheProfile { reuse_support })
         })
         .collect()
 }
@@ -116,6 +131,42 @@ mod tests {
         );
         assert!(
             !ModelReuseSupport::IntraTurnRounds.supports(PromptCacheReuseScope::ConversationTurns)
+        );
+    }
+
+    #[test]
+    fn load_profiles_walks_ancestor_directories_for_models_yaml() {
+        // Regression: when astra-test is invoked from a nested working
+        // dir (e.g. `rust/`) — as Make targets and many CI scripts do —
+        // `models_yaml_path` MUST climb to find the repo-root file the
+        // way the runtime's `prompt_cache_capability_from_models_yaml`
+        // already does. Otherwise `skip_for_unsupported_cache_scope`
+        // saw an empty profile map and ran intra-turn-only models
+        // through cases requiring conversation-turn cache reuse.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let nested = repo.join("rust").join("crates").join("astra-cli");
+        std::fs::create_dir_all(&nested).expect("create nested dirs");
+        std::fs::write(
+            repo.join(".models.yaml"),
+            r#"
+- name: kimi-k2.6
+  provider: openai
+  prompt_cache_capability:
+    protocol: openai_auto_prefix
+    volatile_placement: tail_suffix
+    reuse_scope: intra_turn_rounds
+"#,
+        )
+        .expect("write models yaml");
+
+        let profiles = load_profiles(Some(&nested));
+        assert_eq!(
+            profiles
+                .get("kimi-k2.6")
+                .map(|profile| profile.reuse_support),
+            Some(ModelReuseSupport::IntraTurnRounds),
+            "load_profiles must locate ancestor `.models.yaml` (got profiles: {profiles:?})",
         );
     }
 }

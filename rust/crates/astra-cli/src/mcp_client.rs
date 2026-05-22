@@ -26,10 +26,10 @@
 // Connection helpers are staged for upcoming MCP wiring; keep the surface without warning spam.
 #![allow(dead_code)]
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::theme;
@@ -716,8 +716,8 @@ async fn do_elicitation(
 pub struct McpConnection {
     /// Server name.
     pub name: String,
-    /// Peer for sending requests.
-    peer: Peer<RoleClient>,
+    /// Backend transport for requests.
+    backend: McpConnectionBackend,
     /// Cached tools from this server.
     tools: Vec<Tool>,
     /// When the connection was established.
@@ -734,6 +734,95 @@ pub struct McpConnection {
     /// Stored so that task panics or unexpected exits are detectable instead of
     /// silently degrading the connection.
     ws_bridge_handles: Option<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)>,
+}
+
+enum McpConnectionBackend {
+    Stateful(Peer<RoleClient>),
+    StatelessHttp(StatelessHttpMcpClient),
+}
+
+struct StatelessHttpMcpClient {
+    client: reqwest::Client,
+    url: String,
+    auth_token: Option<String>,
+    headers: HashMap<String, String>,
+    next_id: AtomicU64,
+}
+
+#[derive(Serialize)]
+struct JsonRpcRequest<'a, T> {
+    jsonrpc: &'static str,
+    id: u64,
+    method: &'a str,
+    params: T,
+}
+
+#[derive(Deserialize)]
+struct JsonRpcResponse<T> {
+    #[allow(dead_code)]
+    jsonrpc: Option<String>,
+    #[allow(dead_code)]
+    id: Option<serde_json::Value>,
+    result: Option<T>,
+    error: Option<rmcp::model::ErrorData>,
+}
+
+impl StatelessHttpMcpClient {
+    fn new(
+        url: &str,
+        auth_token: Option<&str>,
+        headers: &HashMap<String, String>,
+    ) -> Result<Self, McpError> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(MCP_CONNECT_TIMEOUT_SECS))
+            .build()
+            .map_err(|e| McpError::Initialize(format!("build stateless HTTP MCP client: {e}")))?;
+        Ok(Self {
+            client,
+            url: url.to_string(),
+            auth_token: auth_token.map(ToOwned::to_owned),
+            headers: headers.clone(),
+            next_id: AtomicU64::new(1),
+        })
+    }
+
+    async fn request<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<T, ServiceError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let payload = JsonRpcRequest {
+            jsonrpc: "2.0",
+            id,
+            method,
+            params,
+        };
+        let mut req = self
+            .client
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream");
+        if let Some(token) = &self.auth_token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        for (k, v) in &self.headers {
+            req = req.header(k, v);
+        }
+        let response = req
+            .json(&payload)
+            .send()
+            .await
+            .map_err(service_error_internal)?;
+        let body = response.text().await.map_err(service_error_internal)?;
+        let parsed: JsonRpcResponse<T> =
+            serde_json::from_str(&body).map_err(service_error_internal)?;
+        match (parsed.result, parsed.error) {
+            (Some(result), None) => Ok(result),
+            (_, Some(error)) => Err(ServiceError::McpError(error)),
+            _ => Err(ServiceError::UnexpectedResponse),
+        }
+    }
 }
 
 impl McpConnection {
@@ -756,7 +845,18 @@ impl McpConnection {
     /// Returns `true` if tools were refreshed, `false` if no change detected.
     pub async fn refresh_tools_if_changed(&mut self) -> Result<bool, ServiceError> {
         if self.tools_changed.swap(false, Ordering::AcqRel) {
-            self.tools = self.peer.list_all_tools().await?;
+            self.tools = match &self.backend {
+                McpConnectionBackend::Stateful(peer) => peer.list_all_tools().await?,
+                McpConnectionBackend::StatelessHttp(client) => {
+                    client
+                        .request::<rmcp::model::ListToolsResult>(
+                            "tools/list",
+                            serde_json::json!({}),
+                        )
+                        .await?
+                        .tools
+                }
+            };
             Ok(true)
         } else {
             Ok(false)
@@ -796,23 +896,36 @@ impl McpConnection {
         } else {
             CallToolRequestParams::new(name.to_string())
         };
-        tokio::time::timeout(
-            std::time::Duration::from_secs(MCP_TOOL_CALL_TIMEOUT_SECS),
-            self.peer.call_tool(params),
-        )
-        .await
-        .map_err(|_| {
-            eprintln!(
-                "  {} MCP tool '{}' on server '{}' timed out after {}s",
-                "✗".red(),
-                name.magenta(),
-                self.name.as_str().magenta(),
-                MCP_TOOL_CALL_TIMEOUT_SECS
-            );
-            ServiceError::Timeout {
-                timeout: std::time::Duration::from_secs(MCP_TOOL_CALL_TIMEOUT_SECS),
+        match &self.backend {
+            McpConnectionBackend::Stateful(peer) => tokio::time::timeout(
+                std::time::Duration::from_secs(MCP_TOOL_CALL_TIMEOUT_SECS),
+                peer.call_tool(params),
+            )
+            .await
+            .map_err(|_| {
+                eprintln!(
+                    "  {} MCP tool '{}' on server '{}' timed out after {}s",
+                    "✗".red(),
+                    name.magenta(),
+                    self.name.as_str().magenta(),
+                    MCP_TOOL_CALL_TIMEOUT_SECS
+                );
+                ServiceError::Timeout {
+                    timeout: std::time::Duration::from_secs(MCP_TOOL_CALL_TIMEOUT_SECS),
+                }
+            })?,
+            McpConnectionBackend::StatelessHttp(client) => {
+                client
+                    .request(
+                        "tools/call",
+                        serde_json::json!({
+                            "name": params.name,
+                            "arguments": params.arguments,
+                        }),
+                    )
+                    .await
             }
-        })?
+        }
     }
 
     /// Check if this server has a specific tool.
@@ -821,17 +934,22 @@ impl McpConnection {
     }
     /// List all resources from this server.
     pub async fn list_resources(&self) -> Result<Vec<Resource>, ServiceError> {
-        self.peer.list_all_resources().await
+        match &self.backend {
+            McpConnectionBackend::Stateful(peer) => peer.list_all_resources().await,
+            McpConnectionBackend::StatelessHttp(client) => client
+                .request::<rmcp::model::ListResourcesResult>(
+                    "resources/list",
+                    serde_json::json!({}),
+                )
+                .await
+                .map(|r| r.resources),
+        }
     }
 
     /// Read a resource by URI, extracting text content.
     pub async fn read_resource(&self, uri: &str) -> Result<String, McpError> {
         let params = ReadResourceRequestParams::new(uri.to_string());
-        let result = self
-            .peer
-            .read_resource(params)
-            .await
-            .map_err(McpError::Service)?;
+        let result = self.read_resource_inner(params).await?;
         let text = result
             .contents
             .into_iter()
@@ -846,19 +964,39 @@ impl McpConnection {
 
     /// Subscribe to updates for a specific resource URI.
     pub async fn subscribe_resource(&self, uri: &str) -> Result<(), ServiceError> {
-        self.peer.subscribe(SubscribeRequestParams::new(uri)).await
+        match &self.backend {
+            McpConnectionBackend::Stateful(peer) => {
+                peer.subscribe(SubscribeRequestParams::new(uri)).await
+            }
+            McpConnectionBackend::StatelessHttp(_) => {
+                Err(unsupported_stateless_method("resources/subscribe"))
+            }
+        }
     }
 
     /// Unsubscribe from updates for a specific resource URI.
     pub async fn unsubscribe_resource(&self, uri: &str) -> Result<(), ServiceError> {
-        self.peer
-            .unsubscribe(UnsubscribeRequestParams::new(uri))
-            .await
+        match &self.backend {
+            McpConnectionBackend::Stateful(peer) => {
+                peer.unsubscribe(UnsubscribeRequestParams::new(uri)).await
+            }
+            McpConnectionBackend::StatelessHttp(_) => {
+                Err(unsupported_stateless_method("resources/unsubscribe"))
+            }
+        }
     }
 
     /// Set the logging level for this server.
     pub async fn set_log_level(&self, level: LoggingLevel) -> Result<(), ServiceError> {
-        self.peer.set_level(SetLevelRequestParams::new(level)).await
+        match &self.backend {
+            McpConnectionBackend::Stateful(peer) => {
+                peer.set_level(SetLevelRequestParams::new(level)).await
+            }
+            McpConnectionBackend::StatelessHttp(_) => {
+                let _ = level;
+                Err(unsupported_stateless_method("logging/setLevel"))
+            }
+        }
     }
 
     /// Discover `skill://` resources and return (name, skill_md_content) pairs.
@@ -883,7 +1021,13 @@ impl McpConnection {
 
     /// List all prompts available from this server.
     pub async fn list_prompts(&self) -> Result<Vec<Prompt>, ServiceError> {
-        self.peer.list_all_prompts().await
+        match &self.backend {
+            McpConnectionBackend::Stateful(peer) => peer.list_all_prompts().await,
+            McpConnectionBackend::StatelessHttp(client) => client
+                .request::<rmcp::model::ListPromptsResult>("prompts/list", serde_json::json!({}))
+                .await
+                .map(|r| r.prompts),
+        }
     }
 
     /// Get a specific prompt by name, optionally with arguments.
@@ -896,7 +1040,20 @@ impl McpConnection {
         if let Some(args) = arguments {
             params.arguments = Some(args);
         }
-        self.peer.get_prompt(params).await
+        match &self.backend {
+            McpConnectionBackend::Stateful(peer) => peer.get_prompt(params).await,
+            McpConnectionBackend::StatelessHttp(client) => {
+                client
+                    .request(
+                        "prompts/get",
+                        serde_json::json!({
+                            "name": name,
+                            "arguments": params.arguments,
+                        }),
+                    )
+                    .await
+            }
+        }
     }
 
     /// Request argument completions from the server.
@@ -913,19 +1070,69 @@ impl McpConnection {
                 value: argument_value.to_string(),
             },
         );
-        self.peer.complete(params).await
+        match &self.backend {
+            McpConnectionBackend::Stateful(peer) => peer.complete(params).await,
+            McpConnectionBackend::StatelessHttp(client) => {
+                let ref_value =
+                    serde_json::to_value(&params.r#ref).map_err(service_error_internal)?;
+                client
+                    .request(
+                        "completion/complete",
+                        serde_json::json!({
+                            "ref": ref_value,
+                            "argument": {
+                                "name": params.argument.name,
+                                "value": params.argument.value,
+                            }
+                        }),
+                    )
+                    .await
+            }
+        }
     }
 
     /// Ping the server to check connectivity.
     pub async fn ping(&self) -> Result<(), ServiceError> {
-        let ping = PingRequest {
-            method: Default::default(),
-            extensions: Default::default(),
-        };
-        self.peer
-            .send_request(ClientRequest::PingRequest(ping))
-            .await?;
-        Ok(())
+        match &self.backend {
+            McpConnectionBackend::Stateful(peer) => {
+                let ping = PingRequest {
+                    method: Default::default(),
+                    extensions: Default::default(),
+                };
+                match peer.send_request(ClientRequest::PingRequest(ping)).await {
+                    Ok(_) => Ok(()),
+                    Err(ServiceError::McpError(err)) if mcp_error_is_ping_unsupported(&err) => {
+                        peer.list_all_tools().await.map(|_| ())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            McpConnectionBackend::StatelessHttp(client) => {
+                let _: rmcp::model::ListToolsResult =
+                    client.request("tools/list", serde_json::json!({})).await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn read_resource_inner(
+        &self,
+        params: ReadResourceRequestParams,
+    ) -> Result<rmcp::model::ReadResourceResult, McpError> {
+        match &self.backend {
+            McpConnectionBackend::Stateful(peer) => {
+                peer.read_resource(params).await.map_err(McpError::Service)
+            }
+            McpConnectionBackend::StatelessHttp(client) => client
+                .request(
+                    "resources/read",
+                    serde_json::json!({
+                        "uri": params.uri,
+                    }),
+                )
+                .await
+                .map_err(McpError::Service),
+        }
     }
 }
 
@@ -1248,26 +1455,38 @@ impl McpClientManager {
     }
 
     /// Ping a specific server to check connectivity.
-    pub async fn ping(&self, server: &str) -> Result<std::time::Duration, McpError> {
+    ///
+    /// Streamable HTTP MCP servers may legitimately close an idle transport after
+    /// initialization/tool discovery. Treat that as a recoverable disconnect:
+    /// reconnect once and retry the ping before surfacing an error.
+    pub async fn ping(&mut self, server: &str) -> Result<std::time::Duration, McpError> {
         let conn = self
             .connections
             .get(server)
             .ok_or_else(|| McpError::ServerNotConnected(server.to_string()))?;
         let start = Instant::now();
-        conn.ping().await.map_err(McpError::Service)?;
-        Ok(start.elapsed())
+        match conn.ping().await {
+            Ok(()) => Ok(start.elapsed()),
+            Err(e) if service_error_requires_reconnect(&e) => {
+                self.reconnect(server).await?;
+                let conn = self
+                    .connections
+                    .get(server)
+                    .ok_or_else(|| McpError::ServerNotConnected(server.to_string()))?;
+                let retry_start = Instant::now();
+                conn.ping().await.map_err(McpError::Service)?;
+                Ok(retry_start.elapsed())
+            }
+            Err(e) => Err(McpError::Service(e)),
+        }
     }
 
     /// Ping all connected servers, returning (name, latency_or_error) pairs.
-    pub async fn ping_all(&self) -> Vec<(String, Result<std::time::Duration, McpError>)> {
+    pub async fn ping_all(&mut self) -> Vec<(String, Result<std::time::Duration, McpError>)> {
         let mut results = Vec::new();
-        for (name, conn) in &self.connections {
-            let start = Instant::now();
-            let result = conn.ping().await;
-            results.push((
-                name.clone(),
-                result.map(|_| start.elapsed()).map_err(McpError::Service),
-            ));
+        let names: Vec<String> = self.connections.keys().cloned().collect();
+        for name in names {
+            results.push((name.clone(), self.ping(&name).await));
         }
         results
     }
@@ -1380,6 +1599,48 @@ impl McpClientManager {
         }
         changed
     }
+}
+
+fn service_error_requires_reconnect(error: &ServiceError) -> bool {
+    match error {
+        ServiceError::TransportClosed | ServiceError::TransportSend(_) => true,
+        _ => {
+            let text = error.to_string().to_ascii_lowercase();
+            text.contains("transport closed")
+                || text.contains("connection closed")
+                || text.contains("broken pipe")
+        }
+    }
+}
+
+fn mcp_error_is_ping_unsupported(error: &rmcp::model::ErrorData) -> bool {
+    error.code == rmcp::model::ErrorCode::METHOD_NOT_FOUND
+        || error
+            .message
+            .to_ascii_lowercase()
+            .contains("method not found: ping")
+}
+
+fn mcp_error_supports_stateless_fallback(error: &McpError) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("transport closed")
+        || text.contains("transport channel closed")
+        || text.contains("connection closed")
+}
+
+fn service_error_internal<E: std::fmt::Display>(error: E) -> ServiceError {
+    ServiceError::McpError(rmcp::model::ErrorData::internal_error(
+        error.to_string(),
+        None,
+    ))
+}
+
+fn unsupported_stateless_method(method: &str) -> ServiceError {
+    ServiceError::McpError(rmcp::model::ErrorData::new(
+        rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+        format!("stateless HTTP MCP transport does not support {method}"),
+        None,
+    ))
 }
 
 /// Connect to an MCP server with exponential backoff retry.
@@ -1542,7 +1803,7 @@ async fn connect_stdio(
 
     Ok(McpConnection {
         name: name.to_string(),
-        peer,
+        backend: McpConnectionBackend::Stateful(peer),
         tools,
         connected_at: Some(Instant::now()),
         config,
@@ -1569,6 +1830,12 @@ async fn connect_sse(
 
     if url.is_empty() {
         return Err(McpError::InvalidConfig("url cannot be empty".to_string()));
+    }
+
+    if let Some(connection) =
+        probe_stateless_http_connection(name, url, auth_token, headers, config.clone()).await?
+    {
+        return Ok(connection);
     }
 
     // Build transport config
@@ -1598,17 +1865,73 @@ async fn connect_sse(
     // Connect as MCP client with change notification handler
     let (handler, tools_changed, prompts_changed, resources_changed) =
         ChangeHandler::new(sampling, roots);
-    let running = serve_client(handler, transport)
+    match serve_client(handler, transport).await {
+        Ok(running) => {
+            let peer = running.peer().clone();
+            let tools = match fetch_tools_with_timeout(&peer, name).await {
+                Ok(tools) => tools,
+                Err(err) if mcp_error_supports_stateless_fallback(&err) => {
+                    return connect_stateless_http(name, url, auth_token, headers, config).await;
+                }
+                Err(err) => return Err(err),
+            };
+            Ok(McpConnection {
+                name: name.to_string(),
+                backend: McpConnectionBackend::Stateful(peer),
+                tools,
+                connected_at: Some(Instant::now()),
+                config,
+                tools_changed,
+                prompts_changed,
+                resources_changed,
+                ws_bridge_handles: None,
+            })
+        }
+        Err(e) => {
+            let init_error = McpError::Initialize(format!("SSE connect to {url}: {e}"));
+            if !mcp_error_supports_stateless_fallback(&init_error) {
+                return Err(init_error);
+            }
+            connect_stateless_http(name, url, auth_token, headers, config).await
+        }
+    }
+}
+
+async fn connect_stateless_http(
+    name: &str,
+    url: &str,
+    auth_token: Option<&str>,
+    headers: &HashMap<String, String>,
+    config: McpServerConfig,
+) -> Result<McpConnection, McpError> {
+    let client = StatelessHttpMcpClient::new(url, auth_token, headers)?;
+    let _: serde_json::Value = client
+        .request(
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "astra",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
+            }),
+        )
         .await
-        .map_err(|e| McpError::Initialize(format!("SSE connect to {url}: {e}")))?;
-
-    let peer = running.peer().clone();
-
-    let tools = fetch_tools_with_timeout(&peer, name).await?;
-
+        .map_err(|e| McpError::Initialize(format!("stateless HTTP initialize {url}: {e}")))?;
+    let _: serde_json::Value = client
+        .request("notifications/initialized", serde_json::json!({}))
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    let tools = client
+        .request::<rmcp::model::ListToolsResult>("tools/list", serde_json::json!({}))
+        .await
+        .map_err(|e| McpError::Initialize(format!("stateless HTTP tools/list {url}: {e}")))?
+        .tools;
+    let (tools_changed, prompts_changed, resources_changed) = fresh_change_flags();
     Ok(McpConnection {
         name: name.to_string(),
-        peer,
+        backend: McpConnectionBackend::StatelessHttp(client),
         tools,
         connected_at: Some(Instant::now()),
         config,
@@ -1617,6 +1940,88 @@ async fn connect_sse(
         resources_changed,
         ws_bridge_handles: None,
     })
+}
+
+async fn probe_stateless_http_connection(
+    name: &str,
+    url: &str,
+    auth_token: Option<&str>,
+    headers: &HashMap<String, String>,
+    config: McpServerConfig,
+) -> Result<Option<McpConnection>, McpError> {
+    let client = StatelessHttpMcpClient::new(url, auth_token, headers)?;
+    let init_payload = JsonRpcRequest {
+        jsonrpc: "2.0",
+        id: 0,
+        method: "initialize",
+        params: serde_json::json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "astra",
+                "version": env!("CARGO_PKG_VERSION"),
+            }
+        }),
+    };
+    let mut req = client
+        .client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream");
+    if let Some(token) = &client.auth_token {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    for (k, v) in &client.headers {
+        req = req.header(k, v);
+    }
+    let response =
+        req.json(&init_payload).send().await.map_err(|e| {
+            McpError::Initialize(format!("probe stateless HTTP initialize {url}: {e}"))
+        })?;
+    if response.headers().get("mcp-session-id").is_some() {
+        return Ok(None);
+    }
+    let body = response.text().await.map_err(|e| {
+        McpError::Initialize(format!("probe stateless HTTP initialize body {url}: {e}"))
+    })?;
+    let parsed: JsonRpcResponse<serde_json::Value> = serde_json::from_str(&body).map_err(|e| {
+        McpError::Initialize(format!("probe stateless HTTP initialize parse {url}: {e}"))
+    })?;
+    if let Some(error) = parsed.error {
+        return Err(McpError::Initialize(format!(
+            "probe stateless HTTP initialize {url}: {}",
+            error.message
+        )));
+    }
+    let _: serde_json::Value = client
+        .request("notifications/initialized", serde_json::json!({}))
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    let tools = client
+        .request::<rmcp::model::ListToolsResult>("tools/list", serde_json::json!({}))
+        .await
+        .map_err(|e| McpError::Initialize(format!("probe stateless HTTP tools/list {url}: {e}")))?
+        .tools;
+    let (tools_changed, prompts_changed, resources_changed) = fresh_change_flags();
+    Ok(Some(McpConnection {
+        name: name.to_string(),
+        backend: McpConnectionBackend::StatelessHttp(client),
+        tools,
+        connected_at: Some(Instant::now()),
+        config,
+        tools_changed,
+        prompts_changed,
+        resources_changed,
+        ws_bridge_handles: None,
+    }))
+}
+
+fn fresh_change_flags() -> (Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>) {
+    (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    )
 }
 
 /// Connect via WebSocket transport.
@@ -1748,7 +2153,7 @@ async fn connect_ws(
 
     Ok(McpConnection {
         name: name.to_string(),
-        peer,
+        backend: McpConnectionBackend::Stateful(peer),
         tools,
         connected_at: Some(Instant::now()),
         config,
@@ -3321,7 +3726,7 @@ mcp_servers:
 
     #[tokio::test]
     async fn manager_ping_nonexistent_server() {
-        let mgr = McpClientManager::new();
+        let mut mgr = McpClientManager::new();
         let result = mgr.ping("nonexistent").await;
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -3330,7 +3735,7 @@ mcp_servers:
 
     #[tokio::test]
     async fn manager_ping_all_empty() {
-        let mgr = McpClientManager::new();
+        let mut mgr = McpClientManager::new();
         let results = mgr.ping_all().await;
         assert!(results.is_empty());
     }
@@ -3431,6 +3836,38 @@ mcp_servers:
         let e = McpError::ReconnectionFailed("srv".into(), 3);
         assert!(e.to_string().contains("srv"));
         assert!(e.to_string().contains("3"));
+    }
+
+    #[test]
+    fn service_error_requires_reconnect_detects_closed_transport() {
+        let err = ServiceError::TransportClosed;
+        assert!(service_error_requires_reconnect(&err));
+    }
+
+    #[test]
+    fn service_error_requires_reconnect_ignores_unrelated_errors() {
+        let err = ServiceError::UnexpectedResponse;
+        assert!(!service_error_requires_reconnect(&err));
+    }
+
+    #[test]
+    fn mcp_error_is_ping_unsupported_detects_method_not_found() {
+        let err = rmcp::model::ErrorData::new(
+            rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+            "Method not found: ping",
+            None,
+        );
+        assert!(mcp_error_is_ping_unsupported(&err));
+    }
+
+    #[test]
+    fn mcp_error_is_ping_unsupported_ignores_other_rpc_errors() {
+        let err = rmcp::model::ErrorData::new(
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "invalid params",
+            None,
+        );
+        assert!(!mcp_error_is_ping_unsupported(&err));
     }
 
     // --- Argument normalization tests (call_tool logic) ---

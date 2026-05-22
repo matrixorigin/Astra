@@ -158,9 +158,30 @@ impl CacheCapability {
                 volatile_placement: VolatilePlacement::MarkerIsolated,
                 reuse_scope: None,
             },
+            // Bedrock multiplexes Anthropic Claude (cachePoint marker
+            // semantics) and non-Claude families (Nova, Titan, Cohere)
+            // that do NOT support Anthropic-style cache_control. Mirror
+            // the runtime's authoritative classification in
+            // `runtime::turn::prompt_cache::provider_cache_policy_for`
+            // and the substring detection used by
+            // `microcompact::ProviderCacheStrategy::from_provider_hint`
+            // (`claude` / `anthropic`) — when those checks miss, fall
+            // back to `None` so the volatile placement pipeline emits
+            // the simple stable-text system block both classifiers
+            // agree on. Without this guard, Nova traffic was getting an
+            // Anthropic-shaped multi-block system message (no
+            // cache_control to back it up) instead of the prefix-cache-
+            // friendly text shape `microcompact` expects.
+            "bedrock" if model_lower.contains("claude") || model_lower.contains("anthropic") => {
+                Self {
+                    protocol: CacheProtocol::BedrockCachePoint,
+                    volatile_placement: VolatilePlacement::MarkerIsolated,
+                    reuse_scope: None,
+                }
+            }
             "bedrock" => Self {
-                protocol: CacheProtocol::BedrockCachePoint,
-                volatile_placement: VolatilePlacement::MarkerIsolated,
+                protocol: CacheProtocol::None,
+                volatile_placement: VolatilePlacement::Free,
                 reuse_scope: None,
             },
             // Vendor-specific: MiniMax is a known strict-history provider
@@ -263,6 +284,33 @@ mod tests {
             CacheCapability::for_provider_and_model("bedrock", "us.anthropic.claude-sonnet-4-6");
         assert_eq!(c.protocol, CacheProtocol::BedrockCachePoint);
         assert_eq!(c.volatile_placement, VolatilePlacement::MarkerIsolated);
+    }
+
+    #[test]
+    fn bedrock_non_claude_models_skip_marker_protocol() {
+        // Non-Claude Bedrock models (Nova, Titan, Cohere) do NOT support
+        // Anthropic-style cache_control markers — see
+        // `bridge_provider_policy_keeps_non_claude_bedrock_prefix_only`
+        // in `runtime::turn::prompt_cache::tests`. Routing them through
+        // `BedrockCachePoint` here disagrees with
+        // `microcompact::ProviderCacheStrategy::from_provider_and_model`,
+        // which correctly falls back to `Prefix`. The two classifiers
+        // are consumed by the same volatile placement / system layout
+        // logic, so the disagreement leaks Anthropic-shaped multi-block
+        // system content into Nova traffic. Conservative: treat
+        // non-Claude Bedrock as Free placement so the runtime emits the
+        // simpler stable-text system block both classifiers agree on.
+        let nova = CacheCapability::for_provider_and_model("bedrock", "us.amazon.nova-micro-v1:0");
+        assert_eq!(nova.protocol, CacheProtocol::None);
+        assert_eq!(nova.volatile_placement, VolatilePlacement::Free);
+
+        let titan = CacheCapability::for_provider_and_model("bedrock", "amazon.titan-text-v1");
+        assert_eq!(titan.protocol, CacheProtocol::None);
+        assert_eq!(titan.volatile_placement, VolatilePlacement::Free);
+
+        let cohere = CacheCapability::for_provider_and_model("bedrock", "cohere.command-r-plus");
+        assert_eq!(cohere.protocol, CacheProtocol::None);
+        assert_eq!(cohere.volatile_placement, VolatilePlacement::Free);
     }
 
     #[test]

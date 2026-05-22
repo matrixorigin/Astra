@@ -1012,7 +1012,7 @@ async fn handle_mcp_complete(arg: &str, state: &SessionState) {
 
 /// Handle `/mcp ping [server]` — ping one server or all.
 async fn handle_mcp_ping(server: Option<&str>, state: &SessionState) {
-    let manager = state.mcp_manager.read().await;
+    let mut manager = state.mcp_manager.write().await;
 
     if manager.connection_count() == 0 {
         eprintln!("{}", "  No MCP servers connected.".dim());

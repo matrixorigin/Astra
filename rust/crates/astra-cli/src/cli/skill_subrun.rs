@@ -712,6 +712,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
             pinned_tool_schema_tokens: 0,
+            sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
             budget_wrapup_ignored_rounds: 0,
