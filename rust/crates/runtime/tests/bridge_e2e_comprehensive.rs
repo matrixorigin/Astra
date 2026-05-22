@@ -6705,7 +6705,6 @@ async fn deep_hook_plan_session_metadata() {
     // Hook plan has optional fields — verify at least one is populated
     let has_any_data = hook.decision_audit.is_some()
         || hook.skill_selection.is_some()
-        || hook.implicit_feedback.is_some()
         || hook.reflection_mark.is_some()
         || hook.reflection_lesson.is_some();
     // The hook writer is called even if all fields are None (the bridge always builds one)

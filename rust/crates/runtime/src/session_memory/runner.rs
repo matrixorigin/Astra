@@ -1,13 +1,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use astra_services::session_journal::{
     SessionMemoryExtractionErrorReason, SessionMemoryExtractionSource,
 };
 use astra_turn_core::cloud_session_memory_extract::{
-    build_extraction_prompt, SESSION_MEMORY_TEMPLATE,
+    SESSION_MEMORY_TEMPLATE, build_extraction_prompt,
 };
 
 use crate::memory_relevance::LlmConnParams;

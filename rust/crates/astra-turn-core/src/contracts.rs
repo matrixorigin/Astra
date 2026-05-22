@@ -90,17 +90,6 @@ pub struct TurnSkillSelectionRecord {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct TurnImplicitFeedbackRecord {
-    pub feedback_id: String,
-    pub prompt_template_id: String,
-    pub prompt_version: String,
-    pub llm_request_id: String,
-    pub rating: i64,
-    pub comment: Option<String>,
-    pub metadata: Option<serde_json::Value>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct TurnReflectionMark {
     pub session_id: String,
     pub reflect_output: String,
@@ -133,7 +122,6 @@ pub struct TurnReflectionLessonRequest {
 pub struct TurnHookDbPersistPlan {
     pub decision_audit: Option<TurnDecisionAuditRecord>,
     pub skill_selection: Option<TurnSkillSelectionRecord>,
-    pub implicit_feedback: Option<TurnImplicitFeedbackRecord>,
     pub reflection_mark: Option<TurnReflectionMark>,
     pub reflection_lesson: Option<TurnReflectionLessonRecord>,
 }
@@ -204,7 +192,6 @@ mod tests {
         let plan = TurnHookDbPersistPlan::default();
         assert!(plan.decision_audit.is_none());
         assert!(plan.skill_selection.is_none());
-        assert!(plan.implicit_feedback.is_none());
         assert!(plan.reflection_mark.is_none());
         assert!(plan.reflection_lesson.is_none());
     }

@@ -75,10 +75,6 @@ fn build_hook_db_persist_from_payload(
     let user_id = optional_object_str(hook_payload, "user_id")?.to_string();
     let parent_event_id = optional_object_str(hook_payload, "parent_event_id")?.to_string();
     let messages = object_array(hook_payload, "messages");
-    let run_implicit_feedback = hook_payload
-        .get("run_implicit_feedback")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
     let tool_calls = object_array_maps(hook_payload, "tool_calls");
     let selected_skills = crate::turn::skill_tool::selected_skill_names_from_tool_calls(
         &tool_calls
@@ -287,38 +283,10 @@ fn build_hook_db_persist_from_payload(
                 execution_time_ms: None,
             })
     };
-    let implicit_feedback = if !run_implicit_feedback {
-        first_user_content(&messages).and_then(|user_content| {
-            let signal =
-                detect_implicit_feedback_signal(user_content, latest_assistant_content(&messages));
-            if signal.signal_type == "neutral" {
-                None
-            } else {
-                Some(TurnImplicitFeedbackRecord {
-                    feedback_id: Uuid::now_v7().to_string(),
-                    prompt_template_id: "chat_turn".to_string(),
-                    prompt_version: "auto".to_string(),
-                    llm_request_id: parent_event_id.clone(),
-                    rating: implicit_feedback_rating(&signal.signal_type),
-                    comment: Some(format!(
-                        "[implicit:{}] {}",
-                        signal.signal_type, signal.evidence
-                    )),
-                    metadata: Some(serde_json::json!({
-                        "source": "implicit_heuristic",
-                        "confidence": signal.confidence.to_string(),
-                    })),
-                })
-            }
-        })
-    } else {
-        None
-    };
     Some((
         TurnHookDbPersistPlan {
             decision_audit,
             skill_selection,
-            implicit_feedback,
             reflection_mark: None,
             reflection_lesson: None,
         },
@@ -513,19 +481,6 @@ fn first_user_content(messages: &[serde_json::Value]) -> Option<&str> {
     })
 }
 
-fn latest_assistant_content(messages: &[serde_json::Value]) -> Option<&str> {
-    messages.iter().rev().find_map(|message| {
-        if message.get("role").and_then(|v| v.as_str()) == Some("assistant") {
-            message
-                .get("content")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-        } else {
-            None
-        }
-    })
-}
-
 fn optional_object_str<'a>(
     object: &'a serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -674,7 +629,6 @@ mod inprocess_hook_contract_tests {
             false,
             true,
             true,
-            true,
         ))
     }
 
@@ -703,7 +657,6 @@ mod inprocess_hook_contract_tests {
             5,
             None,
             false,
-            true,
             true,
             true,
         );
@@ -771,7 +724,6 @@ mod inprocess_hook_contract_tests {
             false,
             true,
             true,
-            true,
         );
         payload.insert(
             "skill_selector_shortlist".to_string(),
@@ -824,7 +776,6 @@ mod inprocess_hook_contract_tests {
             false,
             true,
             true,
-            true,
         ))
     }
 
@@ -860,7 +811,6 @@ mod inprocess_hook_contract_tests {
             false,
             true,
             true,
-            true,
         ))
     }
 
@@ -890,7 +840,6 @@ mod inprocess_hook_contract_tests {
             turn,
             None,
             false,
-            true,
             true,
             true,
         ))
@@ -1079,7 +1028,6 @@ mod inprocess_hook_contract_tests {
             None,
             false,
             true,
-            true,
             false,
         ));
 
@@ -1124,7 +1072,7 @@ mod inprocess_hook_contract_tests {
     }
 
     #[tokio::test]
-    async fn hook_persists_implicit_feedback_on_negative_signal() {
+    async fn hook_records_response_audit_without_skill_selection_on_retry_signal() {
         let hook_writer = RecordingHookDbWriter::default();
         let reflection_store = RecordingReflectionStateStore::default();
         let lesson_writer = RecordingReflectionLessonWriter::default();
@@ -1149,7 +1097,6 @@ mod inprocess_hook_contract_tests {
             None,
             false,
             true,
-            false,
             true,
         ));
 
@@ -1165,10 +1112,7 @@ mod inprocess_hook_contract_tests {
 
         let plans = hook_writer.plans.lock().await;
         assert_eq!(plans.len(), 1);
-        let feedback = plans[0].implicit_feedback.as_ref();
-        if let Some(fb) = feedback {
-            assert!(fb.rating < 3, "negative signal should produce low rating");
-            assert!(fb.comment.as_deref().unwrap_or("").contains("implicit:"));
-        }
+        assert!(plans[0].decision_audit.is_some());
+        assert!(plans[0].skill_selection.is_none());
     }
 }

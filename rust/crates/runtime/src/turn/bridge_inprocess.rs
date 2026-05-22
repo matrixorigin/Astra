@@ -38,10 +38,10 @@ use std::{
 };
 
 use astra_core::SharedPool;
+use astra_services::SessionArtifactStore;
 use astra_services::session_journal::{
     JournalWriter, LlmRoundRecord, ToolCallRecord, TurnEventBuffer,
 };
-use astra_services::SessionArtifactStore;
 use async_stream::stream;
 use axum::body::Body;
 use axum::body::Bytes;
@@ -3846,7 +3846,7 @@ impl InProcessChatTurnBridge {
                 });
             }
 
-            // Hook side effects: decision audit, skill selection, implicit feedback, reflection
+            // Hook side effects: decision audit, skill selection, reflection
             {
                 let mut hook_payload = astra_turn_core::tail_persist::build_turn_hook_args(
                     &user_id,
@@ -3863,7 +3863,6 @@ impl InProcessChatTurnBridge {
                     None, // session_start
                     false, // run_hook_db_writes = false → triggers persist
                     false, // run_observer = false → triggers observer
-                    false, // run_implicit_feedback = false → triggers feedback
                     false, // run_reflection_learning = false → triggers reflection
                 );
                 if is_correction_turn {
@@ -4295,10 +4294,10 @@ pub mod bridge_inprocess_test_helpers {
 mod tests {
     use super::*;
     use crate::turn::bridge_sse_helpers::apply_forward_llm_sse_event;
+    use astra_services::SessionArtifactStore;
     use astra_services::{
         SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact,
     };
-    use astra_services::SessionArtifactStore;
     use astra_turn_core::turn_guard::TurnGuard;
     use async_trait::async_trait;
     use http_body_util::BodyExt;
@@ -6251,11 +6250,10 @@ mod tests {
             "openai",
         )
         .expect("changed prompt snapshot");
-        let event = baseline.cache_detector.record_turn_for_source(
-            BRIDGE_CACHE_SOURCE,
-            changed,
-            Some(0),
-        );
+        let event =
+            baseline
+                .cache_detector
+                .record_turn_for_source(BRIDGE_CACHE_SOURCE, changed, Some(0));
         assert!(
             event.is_some(),
             "changed prompt should trip the bridge cache detector"

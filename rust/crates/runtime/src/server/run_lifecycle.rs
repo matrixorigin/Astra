@@ -142,7 +142,9 @@ async fn post_loop_memory_cleanup(
         let _ = svc.maybe_spawn_shutdown_flush(req);
     }
     if let Some(svc) = extraction_service {
-        let leftover = svc.wait_for_pending(std::time::Duration::from_secs(10)).await;
+        let leftover = svc
+            .wait_for_pending(std::time::Duration::from_secs(10))
+            .await;
         if leftover > 0 {
             tracing::warn!(
                 session_id = %session_id,
@@ -2070,7 +2072,6 @@ async fn persist_server_loop_hook_events(
     let plan = TurnHookDbPersistPlan {
         decision_audit,
         skill_selection,
-        implicit_feedback: None,
         reflection_mark: None,
         reflection_lesson: None,
     };

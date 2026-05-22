@@ -1858,6 +1858,8 @@ pub async fn ensure_core_schema(
         "mem_memories",
         "sk_knowledge_entries",
         "governance_runs",
+        "eval_llm_feedback",
+        "user_preference_history",
     ] {
         query(&format!("DROP TABLE IF EXISTS {table}"))
             .execute(&pool)
@@ -1924,23 +1926,6 @@ pub async fn ensure_core_schema(
             INDEX idx_skill_selection_session_created (session_id, created_at),
             INDEX idx_skill_selection_user_created (user_id, created_at),
             INDEX idx_skill_selection_skill_created (skill_name, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    query(
-        "CREATE TABLE IF NOT EXISTS eval_llm_feedback (
-            feedback_id VARCHAR(64) PRIMARY KEY,
-            prompt_template_id VARCHAR(255) NULL,
-            prompt_version VARCHAR(64) NULL,
-            llm_request_id VARCHAR(64) NULL,
-            rating BIGINT NULL,
-            comment TEXT NULL,
-            metadata JSON NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_eval_feedback_llm_request_id (llm_request_id),
-            INDEX idx_eval_feedback_created_at (created_at)
         )",
     )
     .execute(&pool)
@@ -2025,24 +2010,6 @@ pub async fn ensure_core_schema(
             version INT NOT NULL DEFAULT 1,
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             UNIQUE KEY idx_prefs_user_key (user_id, pref_key)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // Preference change history for audit trail and rollback
-    query(
-        "CREATE TABLE IF NOT EXISTS user_preference_history (
-            history_id VARCHAR(64) PRIMARY KEY,
-            user_id VARCHAR(64) NOT NULL,
-            pref_key VARCHAR(100) NOT NULL,
-            old_value LONGTEXT NULL,
-            new_value LONGTEXT NOT NULL,
-            old_version INT NULL,
-            new_version INT NOT NULL,
-            source VARCHAR(50) NOT NULL DEFAULT 'edge',
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_pref_history_user_key (user_id, pref_key, created_at)
         )",
     )
     .execute(&pool)

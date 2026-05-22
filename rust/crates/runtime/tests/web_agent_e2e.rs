@@ -3865,8 +3865,6 @@ async fn hook_db_decision_audit_text_only() {
 
     // No skill selection for text-only.
     assert!(plan.skill_selection.is_none());
-    // No implicit feedback (server loop doesn't have next-turn signal).
-    assert!(plan.implicit_feedback.is_none());
 
     // Observer should have been called with messages.
     let requests = observer_worker.requests.lock().await;

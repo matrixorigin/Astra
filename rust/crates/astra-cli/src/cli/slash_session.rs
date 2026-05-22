@@ -5913,8 +5913,10 @@ mod resume_tests {
 ## Completed
 - Removed legacy memory extraction
 ";
-        let encoded =
-            astra_runtime::session_memory::runner::encode_session_memory_entry(&session_id, memory_body);
+        let encoded = astra_runtime::session_memory::runner::encode_session_memory_entry(
+            &session_id,
+            memory_body,
+        );
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))

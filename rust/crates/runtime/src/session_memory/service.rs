@@ -43,14 +43,14 @@ use crate::memory_relevance::LlmConnParams;
 use crate::turn::cloud::memoria_compact::MemoriaClient;
 
 use super::activity::{BackgroundActivity, BackgroundActivityBroker};
-use super::gate::{evaluate, GateDecision};
+use super::gate::{GateDecision, evaluate};
 use super::health::{MemoriaAdmit, MemoriaHealth, SelectorHealth};
 use super::observatory::{
-    clip_preview, ExtractionOutcome as ObsExtractionOutcome,
-    ExtractionRecord as ObsExtractionRecord, ExtractionTrigger, SessionMemoryObservatory,
+    ExtractionOutcome as ObsExtractionOutcome, ExtractionRecord as ObsExtractionRecord,
+    ExtractionTrigger, SessionMemoryObservatory, clip_preview,
 };
 use super::request::{ExtractionRequest, SpawnDecision};
-use super::runner::{run_extraction, ExtractionArtifacts};
+use super::runner::{ExtractionArtifacts, run_extraction};
 
 type LocalJournalEventSink = dyn Fn(&JournalEvent) + Send + Sync + 'static;
 

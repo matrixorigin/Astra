@@ -2671,7 +2671,10 @@ impl ToolExecutor {
 
         let ext = obs.extractions_snapshot();
         let inj = obs.injections_snapshot();
-        if ext.is_empty() && inj.is_empty() && let Some(fallback) = journal_fallback {
+        if ext.is_empty()
+            && inj.is_empty()
+            && let Some(fallback) = journal_fallback
+        {
             return fallback;
         }
         let mut out = String::from("# session-memory observatory\n\n");
@@ -2789,7 +2792,8 @@ impl ToolExecutor {
         let extractions: Vec<_> = events
             .iter()
             .filter(|event| {
-                event.event_type == astra_services::session_journal::JournalEventType::SessionMemoryExtraction
+                event.event_type
+                    == astra_services::session_journal::JournalEventType::SessionMemoryExtraction
             })
             .collect();
         let session_end = events.iter().any(|event| {
@@ -2824,21 +2828,33 @@ impl ToolExecutor {
             let extracted = extractions
                 .iter()
                 .filter(|event| {
-                    event.metadata.as_ref().and_then(|m| m.get("outcome")).and_then(serde_json::Value::as_str)
+                    event
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("outcome"))
+                        .and_then(serde_json::Value::as_str)
                         == Some("extracted")
                 })
                 .count();
             let skipped = extractions
                 .iter()
                 .filter(|event| {
-                    event.metadata.as_ref().and_then(|m| m.get("outcome")).and_then(serde_json::Value::as_str)
+                    event
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("outcome"))
+                        .and_then(serde_json::Value::as_str)
                         == Some("skipped")
                 })
                 .count();
             let errored = extractions
                 .iter()
                 .filter(|event| {
-                    event.metadata.as_ref().and_then(|m| m.get("outcome")).and_then(serde_json::Value::as_str)
+                    event
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("outcome"))
+                        .and_then(serde_json::Value::as_str)
                         == Some("errored")
                 })
                 .count();
@@ -2852,7 +2868,14 @@ impl ToolExecutor {
             )
             .ok();
             out.push_str("\n## extraction journal (newest last)\n");
-            for event in extractions.iter().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
+            for event in extractions
+                .iter()
+                .rev()
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
                 let meta = event.metadata.as_ref();
                 let outcome = meta
                     .and_then(|m| m.get("outcome"))
@@ -5315,7 +5338,10 @@ mod tests {
         assert!(out.contains("source: local_journal"), "{out}");
         assert!(out.contains("session_end: missing"), "{out}");
         assert!(out.contains("errored reason=llm_error"), "{out}");
-        assert!(out.contains("last_turn_error: t2 [cancelled] user_interrupted"), "{out}");
+        assert!(
+            out.contains("last_turn_error: t2 [cancelled] user_interrupted"),
+            "{out}"
+        );
     }
 
     #[test]

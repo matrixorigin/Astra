@@ -598,34 +598,6 @@ impl StateSyncService for MatrixOneSyncService {
             Err(e) => Err(e),
         };
 
-        // Write audit trail (best-effort, don't fail the push)
-        if result.is_ok() {
-            let history_id = uuid::Uuid::new_v4().to_string();
-            if let Err(e) = sqlx::query(
-                "INSERT INTO user_preference_history \
-                 (history_id, user_id, pref_key, old_value, new_value, old_version, new_version, source) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, 'edge')",
-            )
-            .bind(&history_id)
-            .bind(user_id)
-            .bind(key)
-            .bind(&old_value)
-            .bind(value)
-            .bind(old_version)
-            .bind(new_version)
-            .execute(&self.pool)
-            .await
-            {
-                tracing::warn!(
-                    target: "astra_services::state_sync",
-                    user_id = %user_id,
-                    pref_key = %key,
-                    error = %e,
-                    "failed to write preference history audit trail"
-                );
-            }
-        }
-
         match result {
             Ok(_) => SyncResult::ok(SyncDirection::Push, "preference", 1),
             Err(e) => SyncResult::err(SyncDirection::Push, "preference", format!("push_pref: {e}")),

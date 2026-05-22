@@ -235,8 +235,8 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaClient for CliSessionMe
     }
 }
 
-fn build_cli_session_memory_event_sink(
-) -> std::sync::Arc<dyn Fn(&session_journal::JournalEvent) + Send + Sync> {
+fn build_cli_session_memory_event_sink()
+-> std::sync::Arc<dyn Fn(&session_journal::JournalEvent) + Send + Sync> {
     std::sync::Arc::new(|event: &session_journal::JournalEvent| {
         let Some(session_id) = event.session_id.as_deref().filter(|sid| !sid.is_empty()) else {
             return;

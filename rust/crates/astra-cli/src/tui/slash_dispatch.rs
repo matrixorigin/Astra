@@ -2983,10 +2983,7 @@ mod view_result_tests {
         );
 
         assert_eq!(state.model.as_deref(), Some("deepseek-v4-pro"));
-        assert_eq!(
-            bottom_pane.footer.model.as_deref(),
-            Some("deepseek-v4-pro")
-        );
+        assert_eq!(bottom_pane.footer.model.as_deref(), Some("deepseek-v4-pro"));
         assert!(chat_widget.history().is_empty());
     }
 }

@@ -16,7 +16,6 @@ pub fn build_turn_hook_args(
     session_start: Option<Value>,
     run_hook_db_writes: bool,
     run_observer: bool,
-    run_implicit_feedback: bool,
     run_reflection_learning: bool,
 ) -> Map<String, Value> {
     Map::from_iter([
@@ -62,10 +61,6 @@ pub fn build_turn_hook_args(
         ),
         ("run_observer".to_string(), Value::Bool(run_observer)),
         (
-            "run_implicit_feedback".to_string(),
-            Value::Bool(run_implicit_feedback),
-        ),
-        (
             "run_reflection_learning".to_string(),
             Value::Bool(run_reflection_learning),
         ),
@@ -96,7 +91,6 @@ mod tests {
             false,
             false,
             false,
-            false,
         );
         assert_eq!(args["user_id"].as_str().unwrap(), "u1");
         assert!(args["context_capture_id"].is_null());
@@ -119,7 +113,6 @@ mod tests {
             Some("evt1"),
             5,
             Some(json!("2025-01-01")),
-            true,
             true,
             true,
             true,

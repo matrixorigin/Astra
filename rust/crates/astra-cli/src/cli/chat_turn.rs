@@ -941,7 +941,10 @@ fn extract_session_memory_section(md: &str, section_name: &str) -> Option<String
     let start = md.find(&header)?;
     let content_start = md[start..].find('\n').map(|i| start + i + 1)?;
     let rest = &md[content_start..];
-    let next_section = rest.find("\n## ").map(|i| content_start + i).unwrap_or(md.len());
+    let next_section = rest
+        .find("\n## ")
+        .map(|i| content_start + i)
+        .unwrap_or(md.len());
     Some(md[content_start..next_section].to_string())
 }
 
@@ -3128,11 +3131,10 @@ fn initialize_journal(state: &mut SessionState, session_id: &str) {
         let Some(journal) = state.journal.as_ref() else {
             return;
         };
-        let start_event =
-            session_journal::JournalEvent::session_start(
-                Some(session_id),
-                astra_core::model_override::normalize_model_override(state.model.as_deref()),
-            );
+        let start_event = session_journal::JournalEvent::session_start(
+            Some(session_id),
+            astra_core::model_override::normalize_model_override(state.model.as_deref()),
+        );
         let _ = journal.append(&start_event);
         // enqueue_ingestion is server-owned and remains a local no-op.
         enqueue_ingestion(state, &start_event);

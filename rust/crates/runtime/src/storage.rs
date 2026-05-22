@@ -6,8 +6,7 @@ use serde_json::Value;
 use sqlx::{MySql, query};
 
 use astra_turn_core::contracts::{
-    TurnCoreEventRecord, TurnDecisionAuditRecord, TurnImplicitFeedbackRecord,
-    TurnSkillSelectionRecord, TurnToolEventRecord,
+    TurnCoreEventRecord, TurnDecisionAuditRecord, TurnSkillSelectionRecord, TurnToolEventRecord,
 };
 use astra_turn_core::hook_plans::SnapshotLinkPlan;
 use astra_turn_core::trace_event::TraceEvent;
@@ -237,27 +236,6 @@ pub(crate) async fn insert_turn_skill_selection(
     .bind(&record.selection_method)
     .bind(record.execution_success)
     .bind(record.execution_time_ms)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-pub(crate) async fn insert_turn_implicit_feedback(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    record: &TurnImplicitFeedbackRecord,
-) -> Result<(), sqlx::Error> {
-    query(
-        "INSERT INTO eval_llm_feedback \
-         (feedback_id, prompt_template_id, prompt_version, llm_request_id, rating, comment, `metadata`, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, NOW())",
-    )
-    .bind(&record.feedback_id)
-    .bind(&record.prompt_template_id)
-    .bind(&record.prompt_version)
-    .bind(&record.llm_request_id)
-    .bind(record.rating)
-    .bind(&record.comment)
-    .bind(record.metadata.as_ref().map(serde_json::Value::to_string))
     .execute(&mut **tx)
     .await?;
     Ok(())

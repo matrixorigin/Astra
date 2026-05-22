@@ -369,14 +369,14 @@ pub(super) async fn handle_memory_domain_command(
                         return Ok(());
                     };
                     // 1. Retrieve current session memory
-                    let current_record = match load_current_session_memory(api, tok, session_id).await
-                    {
-                        Ok(record) => record,
-                        Err(e) => {
-                            eprintln!("  {} {e}", theme::icon_err());
-                            return Ok(());
-                        }
-                    };
+                    let current_record =
+                        match load_current_session_memory(api, tok, session_id).await {
+                            Ok(record) => record,
+                            Err(e) => {
+                                eprintln!("  {} {e}", theme::icon_err());
+                                return Ok(());
+                            }
+                        };
                     let (current_memory_id, current_body) = current_record
                         .map(|record| (Some(record.memory_id), record.body))
                         .unwrap_or((None, String::new()));
@@ -620,8 +620,7 @@ async fn store_current_session_memory(
             "new_content": encoded,
             "reason": "manual /memory edit",
         });
-        api
-            .put_bearer_path_json_text(token, &path, &payload)
+        api.put_bearer_path_json_text(token, &path, &payload)
             .await
             .map_err(|error| format!("memory update failed: {error}"))?;
         return Ok(());

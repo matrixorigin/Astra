@@ -60,8 +60,8 @@ pub(crate) mod storage;
 
 pub(crate) use storage::{
     ensure_core_schema, insert_core_turn_event, insert_tool_turn_event, insert_turn_decision_audit,
-    insert_turn_implicit_feedback, insert_turn_skill_selection, resolve_active_skill_versions,
-    update_snapshot_llm_ids, update_turn_skill_selection_version,
+    insert_turn_skill_selection, resolve_active_skill_versions, update_snapshot_llm_ids,
+    update_turn_skill_selection_version,
 };
 
 // ── Public modules: runtime core ─────────────────────────────────────────────
@@ -260,10 +260,10 @@ pub(crate) use astra_turn_core::contracts::TurnReflectionLessonRequest;
 pub use astra_turn_core::contracts::{
     TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnCoreEventRecord, TurnCoreEventWriter,
     TurnCorePersistOutcome, TurnCorePersistPlan, TurnDecisionAuditRecord, TurnHookDbPersistPlan,
-    TurnHookDbWriter, TurnImplicitFeedbackRecord, TurnObserverRequest, TurnObserverWorker,
-    TurnReflectionLessonRecord, TurnReflectionLessonWriter, TurnReflectionMark,
-    TurnReflectionStateStore, TurnSessionActivityWriter, TurnSkillSelectionRecord,
-    TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
+    TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker, TurnReflectionLessonRecord,
+    TurnReflectionLessonWriter, TurnReflectionMark, TurnReflectionStateStore,
+    TurnSessionActivityWriter, TurnSkillSelectionRecord, TurnToolEventPersistPlan,
+    TurnToolEventRecord, TurnToolEventWriter,
 };
 
 pub use turn::services::{
