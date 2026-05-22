@@ -27,6 +27,16 @@ make dev-api-start    # API server (auto-creates database schema)
 
 Open `http://localhost:8000/health` to verify.
 
+You can also start the runtime directly from the CLI:
+
+```bash
+astra serve                         # HTTP API server, defaults to 127.0.0.1:8000
+astra serve http --port 8000        # explicit HTTP mode
+astra serve stdio                   # stdio JSON-RPC app-server mode
+```
+
+`serve http` exposes the Axum HTTP API. `serve stdio` starts a long-lived app-server transport: a parent process writes newline-delimited JSON-RPC requests to stdin, reads responses and notifications from stdout, and may keep the child alive across multiple turns so session and turn state stay warm. It is not an interactive terminal mode. In stdio mode, stdout is reserved for protocol messages; diagnostics should go to stderr or `ASTRA_LOG_FILE`.
+
 ### Logging (API server and CLI diagnostics)
 
 - **`RUST_LOG`**: standard `tracing` filter (e.g. `RUST_LOG=info`, or per-target `astra_runtime=debug`).

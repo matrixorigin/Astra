@@ -88,8 +88,7 @@ impl TerminalGuard {
         stdout().sync_update(|_| {
             let terminal = &mut self.terminal;
 
-            let mut needs_full_repaint =
-                Self::update_inline_viewport(terminal, height, self.is_zellij)?;
+            let mut needs_full_repaint = Self::update_inline_viewport(terminal, height)?;
 
             needs_full_repaint |=
                 Self::flush_pending_history(terminal, &mut self.pending_history, self.is_zellij)?;
@@ -110,14 +109,12 @@ impl TerminalGuard {
         self.terminal.clear()
     }
 
-    /// Matches Codex tui.rs::update_inline_viewport():
-    /// If viewport would extend past screen bottom, scroll content above it up.
+    /// If viewport would extend past screen bottom, add only the missing rows
+    /// at the bottom so displaced content enters native terminal scrollback.
+    /// Once enough space exists below a shrunken viewport, later growth reuses
+    /// that space instead of printing more blank lines.
     /// If viewport area changed, clear old area and set new one.
-    fn update_inline_viewport(
-        terminal: &mut CustomTerminal,
-        height: u16,
-        is_zellij: bool,
-    ) -> io::Result<bool> {
+    fn update_inline_viewport(terminal: &mut CustomTerminal, height: u16) -> io::Result<bool> {
         let size = terminal.size()?;
         let mut area = terminal.viewport_area;
         area.height = height.min(size.height);
@@ -126,27 +123,14 @@ impl TerminalGuard {
 
         if area.bottom() > size.height {
             let scroll_by = area.bottom() - size.height;
-            if is_zellij {
-                queue!(
-                    terminal.backend_mut(),
-                    cursor::MoveTo(0, size.height.saturating_sub(1))
-                )?;
-                for _ in 0..scroll_by {
-                    queue!(terminal.backend_mut(), Print("\n"))?;
-                }
-                needs_full_repaint = true;
-            } else {
-                let region_bottom = area.top();
-                if region_bottom > 0 {
-                    queue!(
-                        terminal.backend_mut(),
-                        Print(format!("\x1b[1;{}r", region_bottom)),
-                        cursor::MoveTo(0, 0),
-                        Print(format!("\x1b[{}S", scroll_by)),
-                        Print("\x1b[r"),
-                    )?;
-                }
+            queue!(
+                terminal.backend_mut(),
+                cursor::MoveTo(0, size.height.saturating_sub(1))
+            )?;
+            for _ in 0..scroll_by {
+                queue!(terminal.backend_mut(), Print("\n"))?;
             }
+            needs_full_repaint = true;
             area.y = size.height - area.height;
         }
 
