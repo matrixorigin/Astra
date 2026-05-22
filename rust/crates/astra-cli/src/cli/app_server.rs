@@ -405,6 +405,7 @@ async fn run_turn(
         pm.mode(),
         skill_search.clone(),
         Some(thread_id.clone()),
+        model.clone(),
     )
     .await;
     let spawner_for_drain = agent_spawner.clone();
