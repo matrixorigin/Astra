@@ -66,6 +66,21 @@ impl Default for ProviderCacheStrategy {
 }
 
 impl ProviderCacheStrategy {
+    #[must_use]
+    pub fn from_cache_capability(capability: crate::cache_placement::CacheCapability) -> Self {
+        match capability.protocol {
+            crate::cache_placement::CacheProtocol::MarkerExplicit
+            | crate::cache_placement::CacheProtocol::BedrockCachePoint => Self {
+                prompt_cache_protocol: PromptCacheProtocol::AnthropicCacheControl,
+                compact_strategy: CompactStrategy::Minimal,
+                supports_cache_control: true,
+            },
+            crate::cache_placement::CacheProtocol::OpenAiAutoPrefix
+            | crate::cache_placement::CacheProtocol::StrictHistoryMatch
+            | crate::cache_placement::CacheProtocol::None => Self::default(),
+        }
+    }
+
     /// Derive provider cache capabilities from a provider or model hint.
     ///
     /// This is intentionally capability-shaped rather than placeholder-shaped:
@@ -117,6 +132,17 @@ impl ProviderCacheStrategy {
         }
         model.map(Self::from_provider_hint).unwrap_or_default()
     }
+
+    #[must_use]
+    pub fn from_explicit_or_provider_model(
+        explicit: Option<crate::cache_placement::CacheCapability>,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Self {
+        explicit
+            .map(Self::from_cache_capability)
+            .unwrap_or_else(|| Self::from_provider_and_model(provider, model))
+    }
 }
 
 impl CompactStrategy {
@@ -129,6 +155,16 @@ impl CompactStrategy {
     /// Derive strategy from explicit provider plus model fallback.
     pub fn from_provider_and_model(provider: Option<&str>, model: Option<&str>) -> Self {
         ProviderCacheStrategy::from_provider_and_model(provider, model).compact_strategy
+    }
+
+    #[must_use]
+    pub fn from_explicit_or_provider_model(
+        explicit: Option<crate::cache_placement::CacheCapability>,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Self {
+        ProviderCacheStrategy::from_explicit_or_provider_model(explicit, provider, model)
+            .compact_strategy
     }
 }
 
@@ -854,6 +890,25 @@ mod tests {
         assert_eq!(estimate_tokens(""), 0);
         // Short content rounds down
         assert_eq!(estimate_tokens("abc"), 0);
+    }
+
+    #[test]
+    fn explicit_cache_capability_overrides_provider_model_strategy() {
+        let strategy = ProviderCacheStrategy::from_explicit_or_provider_model(
+            Some(crate::cache_placement::CacheCapability {
+                protocol: crate::cache_placement::CacheProtocol::MarkerExplicit,
+                volatile_placement: crate::cache_placement::VolatilePlacement::MarkerIsolated,
+                reuse_scope: Some(crate::cache_placement::CacheReuseScope::ConversationTurns),
+            }),
+            Some("openai"),
+            Some("proxy-claude"),
+        );
+        assert_eq!(
+            strategy.prompt_cache_protocol,
+            PromptCacheProtocol::AnthropicCacheControl
+        );
+        assert_eq!(strategy.compact_strategy, CompactStrategy::Minimal);
+        assert!(strategy.supports_cache_control);
     }
 
     // ── Count-based compaction ───────────────────────────────────────────

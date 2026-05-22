@@ -2112,7 +2112,8 @@ impl ServerAgenticLoopHost {
             "visible_tool_count": visible_tools.len(),
             "restricted_tool_count": restricted_snapshot.len(),
         }));
-        let cache_cfg = PromptCacheConfig::latch(provider, model_name);
+        let cache_cfg =
+            PromptCacheConfig::from_cache_capability(cache_capability, provider, model_name);
         crate::turn::llm_context::assemble_context_pipeline(
             crate::turn::llm_context::LlmContextAssemblyInput {
                 state,
@@ -2453,7 +2454,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
         // Latch prompt cache config from provider info (once per turn is fine;
         // provider doesn't change within a turn).
-        let cache_cfg = PromptCacheConfig::latch(&llm_cfg.provider, &llm_cfg.model_name);
+        let cache_cfg = PromptCacheConfig::from_cache_capability(
+            llm_cfg.cache_capability,
+            &llm_cfg.provider,
+            &llm_cfg.model_name,
+        );
         self.resolved_model_name = Some(llm_cfg.model_name.clone());
         self.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
             model_name: llm_cfg.model_name.clone(),
@@ -2525,7 +2530,20 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let budget = crate::prompts::budget_for_model(Some(&llm_cfg.model_name));
         let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
-        let mut final_tools = pipeline_tool_schemas;
+        let cache_cap =
+            astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider_model(
+                llm_cfg.cache_capability,
+                &llm_cfg.provider,
+                &llm_cfg.model_name,
+            );
+        let mut final_tools = crate::turn::llm_context::stabilize_tool_schemas_for_cache(
+            &pipeline_tool_schemas,
+            &state.sticky_tool_schemas,
+            &visible_tools,
+            cache_cap,
+            state.llm_rounds_completed,
+        );
+        state.sticky_tool_schemas = final_tools.clone();
         // Annotate tool schemas with cache_control for Anthropic.
         crate::turn::llm_context::annotate_tool_schemas_for_cache(&mut final_tools, &cache_cfg);
         if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
@@ -4886,6 +4904,7 @@ mod tests {
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
             pinned_tool_schema_tokens: 0,
+            sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
             budget_wrapup_ignored_rounds: 0,

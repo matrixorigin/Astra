@@ -125,11 +125,21 @@ pub enum VolatilePlacement {
     Free,
 }
 
+/// How far prompt-cache reuse survives for this provider/model path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CacheReuseScope {
+    /// Cache can survive across later user turns when the stable prefix matches.
+    ConversationTurns,
+    /// Cache reuse is only reliable across additional LLM rounds within the same turn.
+    IntraTurnRounds,
+}
+
 /// The combined classification the runtime consumes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CacheCapability {
     pub protocol: CacheProtocol,
     pub volatile_placement: VolatilePlacement,
+    pub reuse_scope: Option<CacheReuseScope>,
 }
 
 impl CacheCapability {
@@ -146,10 +156,12 @@ impl CacheCapability {
             "anthropic" => Self {
                 protocol: CacheProtocol::MarkerExplicit,
                 volatile_placement: VolatilePlacement::MarkerIsolated,
+                reuse_scope: None,
             },
             "bedrock" => Self {
                 protocol: CacheProtocol::BedrockCachePoint,
                 volatile_placement: VolatilePlacement::MarkerIsolated,
+                reuse_scope: None,
             },
             // Vendor-specific: MiniMax is a known strict-history provider
             // (see session 986a553e regression). Detect via model-id
@@ -177,16 +189,19 @@ impl CacheCapability {
                 Self {
                     protocol: CacheProtocol::StrictHistoryMatch,
                     volatile_placement: VolatilePlacement::CurrentUserOnly,
+                    reuse_scope: None,
                 }
             }
             "openai" => Self {
                 protocol: CacheProtocol::OpenAiAutoPrefix,
                 volatile_placement: VolatilePlacement::TailSuffix,
+                reuse_scope: None,
             },
             // Unknown providers: conservative — no cache assumed.
             _ => Self {
                 protocol: CacheProtocol::None,
                 volatile_placement: VolatilePlacement::Free,
+                reuse_scope: None,
             },
         }
     }
@@ -200,6 +215,11 @@ impl CacheCapability {
         model: &str,
     ) -> Self {
         explicit.unwrap_or_else(|| Self::for_provider_and_model(provider, model))
+    }
+
+    #[must_use]
+    pub fn prefers_intra_turn_batching(&self) -> bool {
+        matches!(self.reuse_scope, Some(CacheReuseScope::IntraTurnRounds))
     }
 
     /// Shortcut used by call sites that only care whether volatile
@@ -250,6 +270,7 @@ mod tests {
         let explicit = CacheCapability {
             protocol: CacheProtocol::StrictHistoryMatch,
             volatile_placement: VolatilePlacement::CurrentUserOnly,
+            reuse_scope: Some(CacheReuseScope::ConversationTurns),
         };
 
         let c =
@@ -321,6 +342,7 @@ mod tests {
         let minimax = CacheCapability {
             protocol: CacheProtocol::StrictHistoryMatch,
             volatile_placement: VolatilePlacement::CurrentUserOnly,
+            reuse_scope: None,
         };
         for round in 0..=10 {
             assert!(
@@ -335,6 +357,7 @@ mod tests {
         let anthropic = CacheCapability {
             protocol: CacheProtocol::MarkerExplicit,
             volatile_placement: VolatilePlacement::MarkerIsolated,
+            reuse_scope: None,
         };
         // Marker providers are safe every round — the marker isolates
         // volatile content from cache.
@@ -348,6 +371,7 @@ mod tests {
         let openai = CacheCapability {
             protocol: CacheProtocol::OpenAiAutoPrefix,
             volatile_placement: VolatilePlacement::TailSuffix,
+            reuse_scope: None,
         };
         // Tail-suffix providers can safely re-append volatile every
         // round since the churn lives at the end. OpenAI's auto-prefix
@@ -355,6 +379,16 @@ mod tests {
         for round in 0..=20 {
             assert!(openai.should_inject_volatile_on_round(round));
         }
+    }
+
+    #[test]
+    fn intra_turn_reuse_scope_prefers_batching() {
+        let capability = CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::TailSuffix,
+            reuse_scope: Some(CacheReuseScope::IntraTurnRounds),
+        };
+        assert!(capability.prefers_intra_turn_batching());
     }
 
     #[test]

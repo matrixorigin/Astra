@@ -49,9 +49,18 @@ pub(crate) fn cache_capability_from_model_metadata(
             astra_turn_core::cache_placement::VolatilePlacement::Free
         }
     };
+    let reuse_scope = value.reuse_scope.map(|scope| match scope {
+        astra_services::PromptCacheReuseScopeData::ConversationTurns => {
+            astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns
+        }
+        astra_services::PromptCacheReuseScopeData::IntraTurnRounds => {
+            astra_turn_core::cache_placement::CacheReuseScope::IntraTurnRounds
+        }
+    });
     Some(astra_turn_core::cache_placement::CacheCapability {
         protocol,
         volatile_placement,
+        reuse_scope,
     })
 }
 
@@ -672,6 +681,11 @@ pub(crate) fn assemble_context_pipeline(
         })
         .collect();
     let tool_names: Vec<&str> = tool_names_owned.iter().map(String::as_str).collect();
+    let cache_cap = CacheCapability::from_explicit_or_provider_model(
+        input.cache_capability,
+        input.provider,
+        input.model_name,
+    );
 
     let mut external = build_external_sources(
         input.runtime_signals.edge_profile,
@@ -680,6 +694,7 @@ pub(crate) fn assemble_context_pipeline(
         &tool_names,
         input.runtime_signals.selection_confidence,
         input.runtime_signals.plan_resume_hint.as_deref(),
+        Some(cache_cap),
     );
     external
         .extra_stable_sections
@@ -707,6 +722,7 @@ pub(crate) fn assemble_context_pipeline(
         input.runtime_signals.edge_profile,
         input.provider,
         state.project_context.as_deref(),
+        Some(cache_cap),
     );
     if !input.tool_surface.deferred_tools_block.is_empty() {
         session_ctx.deferred_tools_block = input.tool_surface.deferred_tools_block.to_string();
@@ -757,11 +773,6 @@ pub(crate) fn assemble_context_pipeline(
         ..Default::default()
     };
 
-    let cache_cap = CacheCapability::from_explicit_or_provider_model(
-        input.cache_capability,
-        input.provider,
-        input.model_name,
-    );
     let round_within_turn = state.current_round_index;
     let inject_volatile = cache_cap.should_inject_volatile_on_round(round_within_turn);
 
@@ -946,6 +957,46 @@ pub(crate) fn annotate_tool_schemas_for_cache(
     crate::turn::prompt_cache::annotate_tool_schemas_for_caching(tool_schemas, cache_cfg);
 }
 
+pub(crate) fn stabilize_tool_schemas_for_cache(
+    current_tool_schemas: &[Value],
+    previous_tool_schemas: &[Value],
+    visible_tool_schemas: &[Value],
+    cache_capability: astra_turn_core::cache_placement::CacheCapability,
+    round_in_turn: u32,
+) -> Vec<Value> {
+    if round_in_turn == 0
+        || previous_tool_schemas.is_empty()
+        || matches!(
+            cache_capability.protocol,
+            astra_turn_core::cache_placement::CacheProtocol::None
+        )
+    {
+        return current_tool_schemas.to_vec();
+    }
+
+    let visible_names: HashSet<&str> = visible_tool_schemas.iter().filter_map(tool_name).collect();
+    let mut stabilized = Vec::new();
+    let mut seen = HashSet::new();
+
+    for schema in previous_tool_schemas {
+        let Some(name) = tool_name(schema) else {
+            continue;
+        };
+        if visible_names.contains(name) {
+            push_unique_tool(&mut stabilized, &mut seen, schema);
+        }
+    }
+    for schema in current_tool_schemas {
+        push_unique_tool(&mut stabilized, &mut seen, schema);
+    }
+
+    if stabilized.is_empty() {
+        current_tool_schemas.to_vec()
+    } else {
+        stabilized
+    }
+}
+
 /// Apply provider-specific message cache metadata.
 pub(crate) fn apply_message_cache_metadata(
     messages: &mut [Value],
@@ -1086,6 +1137,78 @@ mod context_cache_contract_tests {
     }
 
     #[test]
+    fn stabilize_tool_schemas_keeps_prior_tools_visible_mid_turn() {
+        let visible = vec![tool("bash"), tool("read_file"), tool("git")];
+        let previous = vec![tool("bash"), tool("read_file"), tool("git")];
+        let current = vec![tool("bash"), tool("read_file")];
+
+        let stabilized = stabilize_tool_schemas_for_cache(
+            &current,
+            &previous,
+            &visible,
+            astra_turn_core::cache_placement::CacheCapability {
+                protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+                volatile_placement:
+                    astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+                reuse_scope: Some(
+                    astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
+                ),
+            },
+            1,
+        );
+
+        assert_eq!(tool_names(&stabilized), vec!["bash", "read_file", "git"]);
+    }
+
+    #[test]
+    fn stabilize_tool_schemas_resets_on_first_round() {
+        let visible = vec![tool("bash"), tool("read_file"), tool("git")];
+        let previous = vec![tool("bash"), tool("read_file"), tool("git")];
+        let current = vec![tool("bash"), tool("read_file")];
+
+        let stabilized = stabilize_tool_schemas_for_cache(
+            &current,
+            &previous,
+            &visible,
+            astra_turn_core::cache_placement::CacheCapability {
+                protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+                volatile_placement:
+                    astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+                reuse_scope: Some(
+                    astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
+                ),
+            },
+            0,
+        );
+
+        assert_eq!(tool_names(&stabilized), vec!["bash", "read_file"]);
+    }
+
+    #[test]
+    fn stabilize_tool_schemas_drops_no_longer_visible_tools() {
+        let visible = vec![tool("bash"), tool("read_file")];
+        let previous = vec![tool("bash"), tool("read_file"), tool("git")];
+        let current = vec![tool("bash"), tool("read_file")];
+
+        let stabilized = stabilize_tool_schemas_for_cache(
+            &current,
+            &previous,
+            &visible,
+            astra_turn_core::cache_placement::CacheCapability {
+                protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+                volatile_placement:
+                    astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+                reuse_scope: Some(
+                    astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
+                ),
+            },
+            1,
+        );
+
+        assert_eq!(tool_names(&stabilized), vec!["bash", "read_file"]);
+    }
+
+    #[test]
     fn context_meta_event_preserves_manifest_trace() {
         let breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown {
             total_tokens: 123,
@@ -1200,6 +1323,7 @@ mod context_cache_contract_tests {
             protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
             volatile_placement:
                 astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+            reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
         };
 
         let appended = finalize_bridge_wire_messages(

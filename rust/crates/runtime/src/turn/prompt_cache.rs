@@ -27,10 +27,19 @@ pub struct PromptCacheConfig {
 impl PromptCacheConfig {
     /// Latch config from environment and provider info. Call once at session start.
     pub fn latch(provider: &str, model_name: &str) -> Self {
+        Self::from_cache_capability(None, provider, model_name)
+    }
+
+    pub fn from_cache_capability(
+        cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+        provider: &str,
+        model_name: &str,
+    ) -> Self {
         let cache_enabled = !std::env::var("ASTRA_TEST_PROMPT_CACHE_DISABLED")
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         let provider_strategy =
-            astra_turn_core::microcompact::ProviderCacheStrategy::from_provider_and_model(
+            astra_turn_core::microcompact::ProviderCacheStrategy::from_explicit_or_provider_model(
+                cache_capability,
                 Some(provider),
                 Some(model_name),
             );
@@ -91,8 +100,16 @@ pub(crate) struct BridgePipelineOutcome {
 /// This matters for multiplexed providers like Bedrock: Claude models support
 /// Anthropic-style cache markers (translated to Bedrock cache points), while
 /// Nova/Titan models must remain prefix-only.
-pub(crate) fn provider_cache_policy_for(provider: &str, model_name: &str) -> ProviderCachePolicy {
-    let strategy = ProviderCacheStrategy::from_provider_and_model(Some(provider), Some(model_name));
+pub(crate) fn provider_cache_policy_for(
+    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+    provider: &str,
+    model_name: &str,
+) -> ProviderCachePolicy {
+    let strategy = ProviderCacheStrategy::from_explicit_or_provider_model(
+        cache_capability,
+        Some(provider),
+        Some(model_name),
+    );
     if strategy.prompt_cache_protocol == PromptCacheProtocol::AnthropicCacheControl {
         ProviderCachePolicy::anthropic()
     } else {
@@ -265,9 +282,20 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         extra_dynamic_sections: volatile,
     };
 
-    let provider_policy = provider_cache_policy_for(provider, model_id);
-    let provider_strategy =
-        ProviderCacheStrategy::from_provider_and_model(Some(provider), Some(model_id));
+    let provider_policy = if cache_cfg.is_anthropic {
+        ProviderCachePolicy::anthropic()
+    } else {
+        ProviderCachePolicy::openai_compatible()
+    };
+    let provider_strategy = if cache_cfg.is_anthropic {
+        ProviderCacheStrategy {
+            prompt_cache_protocol: PromptCacheProtocol::AnthropicCacheControl,
+            compact_strategy: astra_turn_core::microcompact::CompactStrategy::Minimal,
+            supports_cache_control: true,
+        }
+    } else {
+        ProviderCacheStrategy::default()
+    };
     let session_ctx = SessionContext {
         session_id: session_id.to_string(),
         run_id: String::new(),
@@ -655,6 +683,23 @@ mod tests {
 
         let anthropic_provider = PromptCacheConfig::latch("anthropic", "gpt-4o");
         assert!(anthropic_provider.is_anthropic);
+    }
+
+    #[test]
+    fn prompt_cache_config_prefers_explicit_marker_capability() {
+        let cfg = PromptCacheConfig::from_cache_capability(
+            Some(astra_turn_core::cache_placement::CacheCapability {
+                protocol: astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit,
+                volatile_placement:
+                    astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                reuse_scope: Some(
+                    astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
+                ),
+            }),
+            "openai",
+            "proxy-claude",
+        );
+        assert!(cfg.is_anthropic);
     }
 
     // ── pinned-tool audit: session d0640d3d tool order ───────────────────
@@ -1442,7 +1487,7 @@ mod tests {
 
     #[test]
     fn bridge_provider_policy_keeps_non_claude_bedrock_prefix_only() {
-        let policy = provider_cache_policy_for("bedrock", "us.amazon.nova-micro-v1:0");
+        let policy = provider_cache_policy_for(None, "bedrock", "us.amazon.nova-micro-v1:0");
 
         assert_eq!(
             policy.protocol,
@@ -1456,7 +1501,7 @@ mod tests {
     #[test]
     fn bridge_provider_policy_enables_anthropic_for_bedrock_claude() {
         let policy =
-            provider_cache_policy_for("bedrock", "anthropic.claude-sonnet-4-20250514-v1:0");
+            provider_cache_policy_for(None, "bedrock", "anthropic.claude-sonnet-4-20250514-v1:0");
 
         assert_eq!(
             policy.protocol,
@@ -1464,6 +1509,27 @@ mod tests {
         );
         assert!(policy.max_markers > 0);
         assert!(policy.supports_global_scope);
+    }
+
+    #[test]
+    fn provider_cache_policy_prefers_explicit_capability_over_provider_hint() {
+        let policy = provider_cache_policy_for(
+            Some(astra_turn_core::cache_placement::CacheCapability {
+                protocol: astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit,
+                volatile_placement:
+                    astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                reuse_scope: Some(
+                    astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
+                ),
+            }),
+            "openai",
+            "proxy-claude",
+        );
+        assert_eq!(
+            policy.protocol,
+            astra_turn_core::microcompact::PromptCacheProtocol::AnthropicCacheControl
+        );
+        assert!(policy.max_markers > 0);
     }
 
     /// Real Anthropic `/v1/messages` rejects speculative cache-protocol

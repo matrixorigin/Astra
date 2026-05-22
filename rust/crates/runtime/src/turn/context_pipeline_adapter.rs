@@ -29,6 +29,7 @@ pub(crate) fn build_external_sources(
     tool_names: &[&str],
     selection_confidence: f64,
     plan_resume_hint: Option<&str>,
+    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
 ) -> ExternalSources {
     // silence: the binder consumes `user_content` via TurnState.last_user_message;
     // here it's only used for future task-type detection if needed.
@@ -196,6 +197,9 @@ pub(crate) fn build_external_sources(
     if let Some(section) = skill_listing_extra {
         extra_stable_sections.push(section);
     }
+    if let Some(section) = cache_strategy_section(cache_capability) {
+        extra_stable_sections.push(section);
+    }
 
     ExternalSources {
         memory_entries,
@@ -213,6 +217,19 @@ pub(crate) fn build_external_sources(
         // to ride this lane too; moved to stable in Phase-9.
         extra_dynamic_sections,
     }
+}
+
+fn cache_strategy_section(
+    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+) -> Option<crate::prompts::PromptSection> {
+    let cache_capability = cache_capability?;
+    if !cache_capability.prefers_intra_turn_batching() {
+        return None;
+    }
+    Some(crate::prompts::PromptSection::stable(
+        "## Execution Strategy\nThis model's prompt cache is only reliable within the current turn. When the task does not require new user input, batch related tool work and complete it within the same turn instead of stopping early or spreading the work across multiple user turns.".to_string(),
+        crate::prompts::CacheScope::Session,
+    ))
 }
 
 fn build_memory_entries_from_edge_profile(
@@ -336,10 +353,15 @@ pub(crate) fn build_session_context(
     edge_profile: &serde_json::Map<String, Value>,
     provider: &str,
     project_context: Option<&str>,
+    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
 ) -> SessionContext {
-    let provider_policy = super::prompt_cache::provider_cache_policy_for(provider, model_name);
-    let provider_strategy =
-        ProviderCacheStrategy::from_provider_and_model(Some(provider), Some(model_name));
+    let provider_policy =
+        super::prompt_cache::provider_cache_policy_for(cache_capability, provider, model_name);
+    let provider_strategy = ProviderCacheStrategy::from_explicit_or_provider_model(
+        cache_capability,
+        Some(provider),
+        Some(model_name),
+    );
     SessionContext {
         session_id: session_id.to_string(),
         run_id: run_id.unwrap_or_default().to_string(),
@@ -422,6 +444,7 @@ mod tests {
             &ep,
             "anthropic",
             None,
+            None,
         );
         // anthropic policy supports cache_control markers (max_markers > 0).
         assert!(
@@ -441,6 +464,7 @@ mod tests {
             200_000,
             &ep,
             "bedrock",
+            None,
             None,
         );
         // Bedrock Claude translates cache_control → cachePoint downstream,
@@ -463,6 +487,7 @@ mod tests {
             &ep,
             "bedrock",
             None,
+            None,
         );
         assert_eq!(
             ctx.provider_policy.max_markers, 0,
@@ -474,14 +499,14 @@ mod tests {
     #[test]
     fn session_context_saturates_oversized_model_limit() {
         let ep = serde_json::Map::new();
-        let ctx = build_session_context("sid", None, "gpt-4o", u64::MAX, &ep, "openai", None);
+        let ctx = build_session_context("sid", None, "gpt-4o", u64::MAX, &ep, "openai", None, None);
         assert_eq!(ctx.model_limit, u32::MAX);
     }
 
     #[test]
     fn session_context_picks_openai_policy_for_openai_provider() {
         let ep = serde_json::Map::new();
-        let ctx = build_session_context("sid", None, "gpt-4o", 128_000, &ep, "openai", None);
+        let ctx = build_session_context("sid", None, "gpt-4o", 128_000, &ep, "openai", None, None);
         // OpenAI uses prefix-only caching — emitting cache_control is a no-op
         // at best and (for some proxies) a 400 Bad Request at worst.
         assert_eq!(
@@ -506,8 +531,36 @@ mod tests {
             &ep,
             "unknown",
             None,
+            None,
         );
         assert_eq!(ctx.provider_policy.max_markers, 0);
+    }
+
+    #[test]
+    fn session_context_prefers_explicit_marker_capability_over_provider_hint() {
+        let ep = serde_json::Map::new();
+        let ctx = build_session_context(
+            "sid",
+            None,
+            "proxy-claude",
+            100_000,
+            &ep,
+            "openai",
+            None,
+            Some(astra_turn_core::cache_placement::CacheCapability {
+                protocol: astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit,
+                volatile_placement:
+                    astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                reuse_scope: Some(
+                    astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
+                ),
+            }),
+        );
+        assert!(
+            ctx.provider_strategy.supports_cache_control,
+            "explicit metadata should enable marker-aware runtime policy even on openai-compatible proxies"
+        );
+        assert!(ctx.provider_policy.max_markers > 0);
     }
 
     #[test]
@@ -529,6 +582,7 @@ mod tests {
             Some(
                 "1. [active] (2026-05-06, 22 turns, branch: main)\n2. [active] (2026-05-05, 4 turns)",
             ),
+            None,
         );
         assert!(
             ctx.project_context.contains("22 turns"),
@@ -540,7 +594,7 @@ mod tests {
     #[test]
     fn session_context_defaults_project_context_to_empty_when_absent() {
         let ep = serde_json::Map::new();
-        let ctx = build_session_context("sid", None, "gpt-4o", 128_000, &ep, "openai", None);
+        let ctx = build_session_context("sid", None, "gpt-4o", 128_000, &ep, "openai", None, None);
         assert!(ctx.project_context.is_empty());
     }
 
@@ -552,7 +606,7 @@ mod tests {
             Value::String("## User Memories\n- prefers Rust\n- hates emojis".into()),
         );
         let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None);
+        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None, None);
         assert!(
             !sources.memory_entries.is_empty(),
             "edge_profile.memory_section must flow into ExternalSources.memory_entries"
@@ -586,7 +640,7 @@ mod tests {
             ]),
         );
         let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None);
+        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None, None);
 
         assert_eq!(sources.memory_entries.len(), 2);
         assert_eq!(sources.memory_entries[0].content, "fresh structured memory");
@@ -604,7 +658,7 @@ mod tests {
     fn low_confidence_warning_is_volatile_tool_guidance() {
         let ep = serde_json::Map::new();
         let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.1, None);
+        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.1, None, None);
 
         // tool_conditional field removed — volatile content routes to extra_dynamic_sections only
         assert!(
@@ -627,8 +681,36 @@ mod tests {
     fn external_sources_empty_memory_when_edge_profile_has_none() {
         let ep = serde_json::Map::new();
         let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None);
+        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None, None);
         assert!(sources.memory_entries.is_empty());
+    }
+
+    #[test]
+    fn intra_turn_reuse_scope_adds_stable_execution_strategy_hint() {
+        let ep = serde_json::Map::new();
+        let state = make_state();
+        let sources = build_external_sources(
+            &ep,
+            &state,
+            "hi",
+            &["bash"],
+            0.8,
+            None,
+            Some(astra_turn_core::cache_placement::CacheCapability {
+                protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
+                volatile_placement: astra_turn_core::cache_placement::VolatilePlacement::TailSuffix,
+                reuse_scope: Some(
+                    astra_turn_core::cache_placement::CacheReuseScope::IntraTurnRounds,
+                ),
+            }),
+        );
+
+        assert!(
+            sources.extra_stable_sections.iter().any(|section| section
+                .text
+                .contains("prompt cache is only reliable within the current turn")),
+            "intra-turn-only cache models should get a stable batching hint"
+        );
     }
 
     // ── Composite integration tests ─────────────────────────────────────
@@ -679,10 +761,18 @@ mod tests {
             edge_profile,
             provider,
             None,
+            None,
         );
         let turn = build_turn_state(state, user_content);
-        let external =
-            build_external_sources(edge_profile, state, user_content, &["bash"], 0.8, None);
+        let external = build_external_sources(
+            edge_profile,
+            state,
+            user_content,
+            &["bash"],
+            0.8,
+            None,
+            None,
+        );
         CompositeInputs {
             statics,
             agent,
