@@ -1367,7 +1367,6 @@ pub(crate) fn handle_view_result(
     // Slash command selected from help → insert into composer
     if name.starts_with('/') {
         bottom_pane.composer.set_text(&format!("{name} "));
-        return;
     }
 
     // Unknown picker results must stay inert here. Model picks are

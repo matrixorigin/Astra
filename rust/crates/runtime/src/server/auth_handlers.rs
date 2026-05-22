@@ -118,10 +118,10 @@ async fn memory_proxy_call(
     method: reqwest::Method,
     endpoint: &str,
     body: serde_json::Value,
-    inject_identity: bool,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(headers).await?;
     let user_id = user.user_id.clone();
+    let inject_identity = should_inject_memory_proxy_identity(endpoint);
     let body = apply_memory_proxy_identity(body, &user_id, inject_identity, endpoint);
 
     state
@@ -142,6 +142,10 @@ async fn memory_proxy_call(
                 internal_error(&error)
             }
         })
+}
+
+fn should_inject_memory_proxy_identity(endpoint: &str) -> bool {
+    !endpoint.ends_with("/purge")
 }
 
 fn apply_memory_proxy_identity(
@@ -175,6 +179,19 @@ fn apply_memory_proxy_identity(
     body
 }
 
+fn apply_memoria_management_identity(
+    mut body: serde_json::Value,
+    user_id: &str,
+) -> serde_json::Value {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "user_id".to_string(),
+            serde_json::Value::String(user_id.to_string()),
+        );
+    }
+    body
+}
+
 pub(super) async fn memory_proxy_store_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -186,7 +203,6 @@ pub(super) async fn memory_proxy_store_handler(
         reqwest::Method::POST,
         "/v1/memories",
         body,
-        true,
     )
     .await
 }
@@ -202,7 +218,6 @@ pub(super) async fn memory_proxy_retrieve_handler(
         reqwest::Method::POST,
         "/v1/memories/retrieve",
         body,
-        true,
     )
     .await
 }
@@ -218,7 +233,6 @@ pub(super) async fn memory_proxy_search_handler(
         reqwest::Method::POST,
         "/v1/memories/search",
         body,
-        true,
     )
     .await
 }
@@ -245,7 +259,6 @@ pub(super) async fn memory_proxy_purge_handler(
         reqwest::Method::POST,
         "/v1/memories/purge",
         body,
-        true,
     )
     .await?;
     let deleted = result
@@ -276,7 +289,6 @@ pub(super) async fn memory_proxy_expand_handler(
         reqwest::Method::GET,
         &format!("/v1/memories/{memory_id}"),
         serde_json::json!({}),
-        false,
     )
     .await
 }
@@ -292,7 +304,6 @@ pub(super) async fn memory_proxy_correct_handler(
         reqwest::Method::POST,
         "/v1/memories/correct",
         body,
-        true,
     )
     .await
 }
@@ -309,7 +320,6 @@ pub(super) async fn memory_proxy_correct_by_id_handler(
         reqwest::Method::PUT,
         &format!("/v1/memories/{memory_id}/correct"),
         body,
-        true,
     )
     .await
 }
@@ -326,7 +336,6 @@ pub(super) async fn memory_proxy_feedback_handler(
         reqwest::Method::POST,
         &format!("/v1/memories/{memory_id}/feedback"),
         body,
-        false,
     )
     .await
 }
@@ -341,7 +350,6 @@ pub(super) async fn memory_proxy_profile_handler(
         reqwest::Method::GET,
         "/v1/profiles/me",
         serde_json::json!({}),
-        true,
     )
     .await
 }
@@ -351,15 +359,7 @@ pub(super) async fn memory_proxy_reflect_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memory_proxy_call(
-        &state,
-        &headers,
-        reqwest::Method::POST,
-        "/v1/reflect",
-        body,
-        true,
-    )
-    .await
+    memory_proxy_call(&state, &headers, reqwest::Method::POST, "/v1/reflect", body).await
 }
 
 async fn memoria_management_proxy_call(
@@ -369,14 +369,14 @@ async fn memoria_management_proxy_call(
     endpoint: &str,
     body: Option<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    state.auth_service.current_user(headers).await?;
+    let user = state.auth_service.current_user(headers).await?;
+    let body = apply_memoria_management_identity(
+        body.unwrap_or_else(|| serde_json::json!({})),
+        &user.user_id,
+    );
     state
         .memoria_forwarder
-        .forward(
-            method,
-            endpoint,
-            body.unwrap_or_else(|| serde_json::json!({})),
-        )
+        .forward(method, endpoint, body)
         .await
         .map(Json)
         .map_err(|error| {
@@ -567,7 +567,10 @@ pub(super) async fn memoria_proxy_consolidate_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::apply_memory_proxy_identity;
+    use super::{
+        apply_memoria_management_identity, apply_memory_proxy_identity,
+        should_inject_memory_proxy_identity,
+    };
     use serde_json::json;
 
     #[test]
@@ -598,5 +601,24 @@ mod tests {
         assert!(out.get("user_id").is_none());
         assert!(out.get("session_id").is_none());
         assert_eq!(out["memory_ids"], json!(["m1"]));
+    }
+
+    #[test]
+    fn memory_proxy_identity_policy_only_skips_purge() {
+        assert!(should_inject_memory_proxy_identity("/v1/memories"));
+        assert!(should_inject_memory_proxy_identity(
+            "/v1/memories/m-1/feedback"
+        ));
+        assert!(should_inject_memory_proxy_identity("/v1/profiles/me"));
+        assert!(!should_inject_memory_proxy_identity("/v1/memories/purge"));
+    }
+
+    #[test]
+    fn memoria_management_identity_injects_user_only() {
+        let out = apply_memoria_management_identity(json!({"name": "snap-1"}), "real-user");
+
+        assert_eq!(out["user_id"].as_str(), Some("real-user"));
+        assert!(out.get("session_id").is_none());
+        assert_eq!(out["name"].as_str(), Some("snap-1"));
     }
 }

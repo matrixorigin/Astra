@@ -11,13 +11,18 @@
 
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use crate::SessionArtifactStore;
 
 thread_local! {
     static LOCAL_SESSIONS_DIR_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
+
+static SESSION_START_STATE_CACHE: LazyLock<Mutex<HashMap<PathBuf, bool>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Resolved local `sessions` directory (`~/.astra/sessions` or a per-thread override).
 ///
@@ -32,6 +37,45 @@ pub fn local_sessions_dir() -> PathBuf {
             .join(".astra")
             .join("sessions")
     })
+}
+
+fn cached_session_start_state(path: &Path) -> Option<bool> {
+    SESSION_START_STATE_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(path)
+        .copied()
+}
+
+fn set_cached_session_start_state(path: &Path, has_open_session_start: bool) {
+    SESSION_START_STATE_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf(), has_open_session_start);
+}
+
+fn update_cached_session_start_state_from_event(path: &Path, event_type: &JournalEventType) {
+    match event_type {
+        JournalEventType::SessionStart => set_cached_session_start_state(path, true),
+        JournalEventType::SessionEnd => set_cached_session_start_state(path, false),
+        _ => {}
+    }
+}
+
+fn update_cached_session_start_state_from_events(path: &Path, events: &[JournalEvent]) {
+    if let Some(last_type) = events
+        .iter()
+        .rev()
+        .map(|event| &event.event_type)
+        .find(|event_type| {
+            matches!(
+                event_type,
+                JournalEventType::SessionStart | JournalEventType::SessionEnd
+            )
+        })
+    {
+        update_cached_session_start_state_from_event(path, last_type);
+    }
 }
 
 /// Validate that a session ID is safe for use as a filesystem path component.
@@ -926,6 +970,9 @@ pub struct SessionMemoryExtractionBreadcrumbs {
     /// Final attempt count (1 = succeeded first try, 2 = recovered
     /// after one retry). Absent when no persist attempt occurred.
     pub attempt: Option<u32>,
+    /// When the LLM fails before the final persist error, keep that
+    /// upstream reason so the journal reflects the full failure chain.
+    pub llm_reason: Option<SessionMemoryExtractionErrorReason>,
 }
 
 impl SessionMemoryExtractionOutcome {
@@ -968,6 +1015,9 @@ impl SessionMemoryExtractionOutcome {
             }
             if let Some(a) = bc.attempt {
                 map.insert("attempt".into(), serde_json::json!(a));
+            }
+            if let Some(llm_reason) = bc.llm_reason {
+                map.insert("llm_reason".into(), serde_json::json!(llm_reason));
             }
         }
         obj
@@ -1028,6 +1078,7 @@ impl JournalWriter {
         }
         // Ensure durability: flush to disk so a crash doesn't lose the event.
         file.sync_data()?;
+        update_cached_session_start_state_from_event(&self.path, &event.event_type);
         Ok(())
     }
 
@@ -1071,6 +1122,7 @@ impl JournalWriter {
         if sync {
             file.sync_data()?;
         }
+        update_cached_session_start_state_from_events(&self.path, events);
         Ok(())
     }
 }
@@ -1322,9 +1374,24 @@ pub fn read_journal_tail(session_id: &str, limit: usize) -> std::io::Result<Vec<
 }
 
 pub fn journal_needs_session_start(session_id: &str) -> std::io::Result<bool> {
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let path = journal_dir().join(format!("{session_id}.jsonl"));
+    let is_missing_or_empty = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata.len() == 0,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(err) => return Err(err),
+    };
+    if is_missing_or_empty {
+        set_cached_session_start_state(&path, false);
+        return Ok(true);
+    }
+    if let Some(has_open_session_start) = cached_session_start_state(&path) {
+        return Ok(!has_open_session_start);
+    }
     let events = read_journal(session_id)?;
     let last_type = events.last().map(|e| &e.event_type);
-    Ok(match last_type {
+    let needs_session_start = match last_type {
         None | Some(JournalEventType::SessionEnd) => true,
         _ => {
             let last_start = events
@@ -1340,7 +1407,9 @@ pub fn journal_needs_session_start(session_id: &str) -> std::io::Result<bool> {
             };
             !has_unmatched_start
         }
-    })
+    };
+    set_cached_session_start_state(&path, !needs_session_start);
+    Ok(needs_session_start)
 }
 
 pub fn ensure_session_start_event(session_id: &str, model: Option<&str>) -> std::io::Result<()> {

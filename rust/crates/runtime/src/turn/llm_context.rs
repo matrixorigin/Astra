@@ -964,8 +964,9 @@ pub(crate) fn finalize_bridge_wire_messages(
     volatile_text: Option<String>,
     provider: &str,
     model_name: &str,
-) {
+) -> bool {
     astra_turn_core::edge_ledger::strip_stale_reasoning(llm_messages, provider, model_name);
+    let mut appended_synthetic_tail = false;
     if let Some(text) = volatile_text
         && !text.is_empty()
     {
@@ -988,10 +989,13 @@ pub(crate) fn finalize_bridge_wire_messages(
                 "content": "Understood.",
             }));
             llm_messages.push(serde_json::json!({"role": "user", "content": wrapped}));
+            appended_synthetic_tail = true;
         } else {
             llm_messages.push(serde_json::json!({"role": "user", "content": wrapped}));
+            appended_synthetic_tail = true;
         }
     }
+    appended_synthetic_tail
 }
 
 pub(crate) fn augment_manifest_trace_with_wire(

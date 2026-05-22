@@ -393,7 +393,7 @@ fn prompt_snapshot_content_block_fingerprint(
         kind: value
             .get("type")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or_else(|| match value {
+            .unwrap_or(match value {
                 serde_json::Value::String(_) => "text",
                 serde_json::Value::Object(_) => "object",
                 serde_json::Value::Array(_) => "array",

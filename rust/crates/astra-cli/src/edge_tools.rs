@@ -371,7 +371,13 @@ fn render_extraction_outcome_label(
         } => {
             format!("llm_failed_fallback({reason:?},bytes={bytes_written},attempt={store_attempt})")
         }
-        ExtractionOutcome::PersistFailed { reason } => format!("persist_failed({reason:?})"),
+        ExtractionOutcome::PersistFailed { reason, llm_reason } => {
+            if let Some(llm_reason) = llm_reason {
+                format!("persist_failed({reason:?},llm={llm_reason:?})")
+            } else {
+                format!("persist_failed({reason:?})")
+            }
+        }
         ExtractionOutcome::Skipped { reason } => format!("skipped({reason})"),
     }
 }
@@ -5311,6 +5317,7 @@ mod tests {
             messages_count: Some(13),
             selector_model: Some("haiku".to_string()),
             attempt: Some(1),
+            llm_reason: None,
         };
         writer
             .append(&astra_services::session_journal::JournalEvent::session_memory_extraction(

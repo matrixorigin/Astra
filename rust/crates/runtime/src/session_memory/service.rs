@@ -75,16 +75,38 @@ fn should_force_shutdown_refresh(messages: &[Value], current_tokens: usize) -> b
         if role != "user" && role != "assistant" {
             continue;
         }
-        let Some(text) = message
+        let content = message
             .get("content")
             .and_then(Value::as_str)
-            .map(str::trim)
+            .map(str::trim);
+        let tool_call_names = if role == "assistant" {
+            message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .map(|tool_calls| {
+                    tool_calls
+                        .iter()
+                        .filter_map(|tool_call| {
+                            tool_call
+                                .get("function")
+                                .and_then(|function| function.get("name"))
+                                .and_then(Value::as_str)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let synthesized = (!tool_call_names.is_empty())
+            .then(|| format!("[called: {}]", tool_call_names.join(", ")));
+        let Some(text) = content
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .or(synthesized)
         else {
             continue;
         };
-        if text.is_empty() {
-            continue;
-        }
         conversational_messages += 1;
         total_chars += text.chars().count();
         let lower = text.to_ascii_lowercase();
@@ -363,6 +385,7 @@ impl MemoryExtractionService {
             messages_count: Some(req.messages.len() as u32),
             selector_model: None,
             attempt: None,
+            llm_reason: None,
         };
 
         enum Admission {
@@ -642,6 +665,7 @@ impl MemoryExtractionService {
                 messages_count: Some(messages_count),
                 selector_model: model_name.clone(),
                 attempt: None,
+                llm_reason: None,
             };
             self.emit_skip_event(
                 Some(&session_id),
@@ -714,8 +738,17 @@ impl MemoryExtractionService {
                         "LlmFailedPersistedFallback{{err={error_reason:?}, bytes={bytes_written}, attempt={store_attempt}}}"
                     )
                 }
-                ExtractionArtifacts::PersistFailed { error_reason } => {
-                    format!("PersistFailed{{err={error_reason:?}}}")
+                ExtractionArtifacts::PersistFailed {
+                    error_reason,
+                    llm_error_reason,
+                } => {
+                    if let Some(llm_error_reason) = llm_error_reason {
+                        format!(
+                            "PersistFailed{{err={error_reason:?}, llm_err={llm_error_reason:?}}}"
+                        )
+                    } else {
+                        format!("PersistFailed{{err={error_reason:?}}}")
+                    }
                 }
             };
             eprintln!(
@@ -756,6 +789,7 @@ impl MemoryExtractionService {
                         SessionMemoryExtractionSource::RuleFallback => None,
                     },
                     attempt: Some(store_attempt),
+                    llm_reason: None,
                 };
                 self.emit_success_event(
                     Some(&session_id),
@@ -807,6 +841,7 @@ impl MemoryExtractionService {
                     messages_count: Some(messages_count),
                     selector_model: selector_model_used.clone(),
                     attempt: Some(store_attempt),
+                    llm_reason: None,
                 };
                 self.emit_error_event(Some(&session_id), turn, error_reason, duration_ms, &bc);
                 self.broker.emit(BackgroundActivity::Finished {
@@ -831,7 +866,15 @@ impl MemoryExtractionService {
                     latency,
                 );
             }
-            ExtractionArtifacts::PersistFailed { error_reason } => {
+            ExtractionArtifacts::PersistFailed {
+                error_reason,
+                llm_error_reason,
+            } => {
+                if llm_error_reason.is_some()
+                    && let Some(name) = params_for_health.as_deref()
+                {
+                    self.health.mark_failed(name);
+                }
                 // Memoria persist failed → breaker counts it. Enough
                 // consecutive failures trip the breaker and skip
                 // future `maybe_spawn` until the cooldown elapses.
@@ -846,6 +889,7 @@ impl MemoryExtractionService {
                     // counts when nothing landed; use None so the
                     // field is omitted rather than misleadingly 0.
                     attempt: None,
+                    llm_reason: llm_error_reason,
                 };
                 self.emit_error_event(Some(&session_id), turn, error_reason, duration_ms, &bc);
                 self.broker.emit(BackgroundActivity::Errored {
@@ -861,6 +905,7 @@ impl MemoryExtractionService {
                     selector_model_used.clone(),
                     ObsExtractionOutcome::PersistFailed {
                         reason: error_reason.into(),
+                        llm_reason: llm_error_reason.map(Into::into),
                     },
                     Vec::new(),
                     String::new(),
@@ -1234,6 +1279,33 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos()
+    }
+
+    #[test]
+    fn force_shutdown_refresh_counts_assistant_tool_calls_as_conversational() {
+        let messages = vec![
+            json!({"role": "user", "content": "open the homepage"}),
+            json!({
+                "role": "assistant",
+                "content": serde_json::Value::Null,
+                "tool_calls": [{"function": {"name": "web_fetch"}}]
+            }),
+            json!({
+                "role": "assistant",
+                "content": serde_json::Value::Null,
+                "tool_calls": [{"function": {"name": "read_file"}}]
+            }),
+            json!({
+                "role": "assistant",
+                "content": serde_json::Value::Null,
+                "tool_calls": [{"function": {"name": "bash"}}]
+            }),
+        ];
+
+        assert!(
+            should_force_shutdown_refresh(&messages, 100),
+            "tool-only web-agent rounds should still count toward shutdown refresh heuristics"
+        );
     }
 
     #[tokio::test]

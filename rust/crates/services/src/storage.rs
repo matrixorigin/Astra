@@ -1849,23 +1849,6 @@ pub async fn ensure_core_schema(
         add_index_if_missing(&pool, &settings.database, table, index, ddl).await?;
     }
 
-    for table in [
-        "harness_artifacts",
-        "harness_agent_roles",
-        "harness_subagent_runs",
-        "harness_blackboard_entries",
-        "step_idempotency_cache",
-        "mem_memories",
-        "sk_knowledge_entries",
-        "governance_runs",
-        "eval_llm_feedback",
-        "user_preference_history",
-    ] {
-        query(&format!("DROP TABLE IF EXISTS {table}"))
-            .execute(&pool)
-            .await?;
-    }
-
     // Context / decisions / evaluation essentials used by turn persistence
     query(
         "CREATE TABLE IF NOT EXISTS ctx_snapshots (
@@ -3111,6 +3094,50 @@ async fn run_migration(
         return Ok(());
     }
 
+    execute_idempotent_migration_sql(pool, sql).await?;
+
+    query("INSERT IGNORE INTO schema_migrations (version, description) VALUES (?, ?)")
+        .bind(version)
+        .bind(description)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
+async fn run_migration_batch(
+    pool: &sqlx::Pool<MySql>,
+    version: i32,
+    description: &str,
+    statements: &[&str],
+) -> Result<(), sqlx::Error> {
+    let already_applied: bool = query("SELECT 1 FROM schema_migrations WHERE version = ?")
+        .bind(version)
+        .fetch_optional(pool)
+        .await?
+        .is_some();
+
+    if already_applied {
+        return Ok(());
+    }
+
+    for statement in statements {
+        execute_idempotent_migration_sql(pool, statement).await?;
+    }
+
+    query("INSERT IGNORE INTO schema_migrations (version, description) VALUES (?, ?)")
+        .bind(version)
+        .bind(description)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
+async fn execute_idempotent_migration_sql(
+    pool: &sqlx::Pool<MySql>,
+    sql: &str,
+) -> Result<(), sqlx::Error> {
     // Idempotent migrations need tolerance for vendor-specific error codes
     // when the target is already in the desired state:
     //   * 1060 — ALTER ADD COLUMN on an existing column (fresh DB where
@@ -3139,13 +3166,6 @@ async fn run_migration(
         }
         Err(e) => return Err(e),
     }
-
-    query("INSERT IGNORE INTO schema_migrations (version, description) VALUES (?, ?)")
-        .bind(version)
-        .bind(description)
-        .execute(pool)
-        .await?;
-
     Ok(())
 }
 
@@ -3291,6 +3311,25 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
         14,
         "add DB traceability columns and indexes to agent_events",
         "SELECT 1",
+    )
+    .await?;
+
+    run_migration_batch(
+        pool,
+        15,
+        "drop obsolete harness and memory tables once",
+        &[
+            "DROP TABLE IF EXISTS harness_artifacts",
+            "DROP TABLE IF EXISTS harness_agent_roles",
+            "DROP TABLE IF EXISTS harness_subagent_runs",
+            "DROP TABLE IF EXISTS harness_blackboard_entries",
+            "DROP TABLE IF EXISTS step_idempotency_cache",
+            "DROP TABLE IF EXISTS mem_memories",
+            "DROP TABLE IF EXISTS sk_knowledge_entries",
+            "DROP TABLE IF EXISTS governance_runs",
+            "DROP TABLE IF EXISTS eval_llm_feedback",
+            "DROP TABLE IF EXISTS user_preference_history",
+        ],
     )
     .await?;
 

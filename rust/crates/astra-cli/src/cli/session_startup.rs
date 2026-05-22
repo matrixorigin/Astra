@@ -228,10 +228,40 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaClient for CliSessionMe
     }
 
     async fn purge_working(&self, session_id: &str) -> Result<u64, String> {
+        let Some(memory_id) = self
+            .working_ids
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(session_id).cloned())
+        else {
+            return Ok(0);
+        };
+
+        let token = self.fresh_token().await?;
+        let body = serde_json::json!({
+            "memory_ids": [memory_id],
+            "reason": "session memory purge",
+        });
+        let response = self
+            .api
+            .post_memory_purge_json(&token, &body)
+            .await
+            .map_err(|error| format!("memory purge failed: {error}"))?;
+        let status = response.status();
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| format!("memory purge parse failed: {error}"))?;
+        if !status.is_success() {
+            return Err(format!("memory purge HTTP {status}"));
+        }
         if let Ok(mut guard) = self.working_ids.lock() {
             guard.remove(session_id);
         }
-        Ok(0)
+        Ok(payload
+            .get("deleted_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0))
     }
 }
 

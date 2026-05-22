@@ -72,7 +72,10 @@ pub enum ExtractionOutcome {
         store_attempt: u32,
     },
     /// Persist step itself failed. Nothing landed.
-    PersistFailed { reason: ErrorReason },
+    PersistFailed {
+        reason: ErrorReason,
+        llm_reason: Option<ErrorReason>,
+    },
     /// Gate/request decided not to spawn. Recorded so "nothing happened"
     /// is still visible in introspect, rather than silently absent.
     Skipped { reason: String },
@@ -489,6 +492,7 @@ mod tests {
             },
             ExtractionOutcome::PersistFailed {
                 reason: ErrorReason::PurgeFailed,
+                llm_reason: Some(ErrorReason::LlmError),
             },
             ExtractionOutcome::Skipped {
                 reason: "breaker_open".into(),

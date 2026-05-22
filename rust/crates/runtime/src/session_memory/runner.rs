@@ -35,6 +35,7 @@ pub enum ExtractionArtifacts {
     },
     PersistFailed {
         error_reason: SessionMemoryExtractionErrorReason,
+        llm_error_reason: Option<SessionMemoryExtractionErrorReason>,
     },
 }
 
@@ -65,7 +66,10 @@ pub async fn run_extraction(
                 store_attempt,
                 content: fallback,
             },
-            Err(error_reason) => ExtractionArtifacts::PersistFailed { error_reason },
+            Err(error_reason) => ExtractionArtifacts::PersistFailed {
+                error_reason,
+                llm_error_reason: None,
+            },
         };
     };
 
@@ -85,7 +89,10 @@ pub async fn run_extraction(
                 store_attempt,
                 content: updated,
             },
-            Err(error_reason) => ExtractionArtifacts::PersistFailed { error_reason },
+            Err(error_reason) => ExtractionArtifacts::PersistFailed {
+                error_reason,
+                llm_error_reason: None,
+            },
         },
         Err(error_reason) => match store_session_memory(memoria, session_id, &fallback).await {
             Ok((bytes_written, store_attempt)) => ExtractionArtifacts::LlmFailedPersistedFallback {
@@ -96,6 +103,7 @@ pub async fn run_extraction(
             },
             Err(store_error) => ExtractionArtifacts::PersistFailed {
                 error_reason: store_error,
+                llm_error_reason: Some(error_reason),
             },
         },
     }
@@ -214,7 +222,8 @@ fn build_rule_fallback_memory(
     let recent = render_recent_messages(messages, 8, 240);
     let first_user = first_user_message(messages).unwrap_or("Current session");
     let last_user = last_user_message(messages).unwrap_or(first_user);
-    let last_assistant = last_assistant_message(messages).unwrap_or("No assistant summary yet.");
+    let last_assistant =
+        last_assistant_message(messages).unwrap_or_else(|| "No assistant summary yet.".to_string());
     let errors = collect_error_lines(messages);
     format!(
         "# Session Memory\n\n## Session Title\n{first_user}\n\n## Active Goals\n- {last_user}\n\n## Pending Todos\n- Continue the current session task.\n\n## Completed\n- Session memory updated through rule fallback.\n\n## Current State\n- Turn {turn_number}\n- Approximate context size: {current_tokens} tokens\n- Latest assistant state: {last_assistant}\n\n## Task Specification\n{first_user}\n\n## Files and Functions\n{files}\n\n## Workflow\n{workflow}\n\n## Errors & Corrections\n{errors}\n\n## Learnings\n- Keep session memory synchronized when the session grows.\n\n## Worklog\n{worklog}",
@@ -258,8 +267,8 @@ fn render_recent_messages(messages: &[Value], take: usize, max_len: usize) -> Ve
         .filter_map(|msg| {
             let role = msg.get("role").and_then(Value::as_str)?;
             match role {
-                "user" | "assistant" => {
-                    let text = message_text(msg)?;
+                "user" | "assistant" | "tool" => {
+                    let text = message_text_or_summary(msg)?;
                     Some(format!("{role}: {}", truncate(&text, max_len)))
                 }
                 _ => None,
@@ -288,10 +297,10 @@ fn last_user_message(messages: &[Value]) -> Option<&str> {
     })
 }
 
-fn last_assistant_message(messages: &[Value]) -> Option<&str> {
+fn last_assistant_message(messages: &[Value]) -> Option<String> {
     messages.iter().rev().find_map(|msg| {
         (msg.get("role").and_then(Value::as_str) == Some("assistant"))
-            .then(|| message_text(msg))
+            .then(|| message_text_or_summary(msg))
             .flatten()
     })
 }
@@ -300,19 +309,18 @@ fn collect_error_lines(messages: &[Value]) -> Vec<String> {
     messages
         .iter()
         .filter_map(|msg| {
-            let text = message_text(msg)?;
+            let text = message_text_or_summary(msg)?;
             let lower = text.to_ascii_lowercase();
             (lower.contains("error") || lower.contains("fail") || lower.contains("panic"))
-                .then(|| truncate(text, 200))
+                .then(|| truncate(&text, 200).to_string())
         })
-        .map(ToString::to_string)
         .collect()
 }
 
 fn detect_file_mentions(messages: &[Value]) -> String {
     let mut seen = std::collections::BTreeSet::new();
     for msg in messages {
-        let Some(text) = message_text(msg) else {
+        let Some(text) = message_text_or_summary(msg) else {
             continue;
         };
         for token in text.split_whitespace() {
@@ -344,6 +352,38 @@ fn message_text(msg: &Value) -> Option<&str> {
     msg.get("content").and_then(Value::as_str)
 }
 
+fn assistant_tool_call_summary(msg: &Value) -> Option<String> {
+    let tool_calls = msg.get("tool_calls").and_then(Value::as_array)?;
+    let names: Vec<&str> = tool_calls
+        .iter()
+        .filter_map(|tool_call| {
+            tool_call
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+        })
+        .collect();
+    if names.is_empty() {
+        None
+    } else {
+        Some(format!("[called: {}]", names.join(", ")))
+    }
+}
+
+fn message_text_or_summary(msg: &Value) -> Option<String> {
+    let role = msg.get("role").and_then(Value::as_str)?;
+    if let Some(text) = message_text(msg)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_string());
+    }
+    match role {
+        "assistant" => assistant_tool_call_summary(msg),
+        _ => None,
+    }
+}
+
 fn truncate(text: &str, max_chars: usize) -> &str {
     if text.chars().count() <= max_chars {
         return text;
@@ -371,6 +411,9 @@ mod tests {
         stored: Mutex<Vec<(String, String, Option<String>)>>,
     }
 
+    #[derive(Default)]
+    struct FailingMemoria;
+
     #[async_trait::async_trait]
     impl MemoriaClient for CapturingMemoria {
         async fn retrieve_ext(
@@ -396,6 +439,33 @@ mod tests {
                 session_id.map(str::to_string),
             ));
             Ok("mem-1".to_string())
+        }
+
+        async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
+            Ok(0)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MemoriaClient for FailingMemoria {
+        async fn retrieve_ext(
+            &self,
+            _query: &str,
+            _session_id: Option<&str>,
+            _top_k: usize,
+            _filter_session: bool,
+        ) -> Result<Vec<MemoriaMemory>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn store(
+            &self,
+            _content: &str,
+            _memory_type: &str,
+            _session_id: Option<&str>,
+            _trust_tier: Option<&str>,
+        ) -> Result<String, String> {
+            Err("write failed".to_string())
         }
 
         async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
@@ -602,11 +672,107 @@ mod tests {
         server_handle.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn run_extraction_preserves_llm_reason_when_fallback_store_also_fails() {
+        let (server_url, server_handle) = spawn_json_server(
+            Arc::new(|request: &str| {
+                assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+            }),
+            json!({
+                "choices": [{
+                    "message": {
+                        "content": ""
+                    }
+                }]
+            }),
+        )
+        .await;
+
+        let memoria = Arc::new(FailingMemoria) as Arc<dyn MemoriaClient>;
+        let params = LlmConnParams {
+            base_url: format!("{server_url}/v1"),
+            api_key: "test-key".to_string(),
+            model_name: "selector-openai".to_string(),
+            provider: "openai".to_string(),
+        };
+        let artifacts = run_extraction(
+            &memoria,
+            "sess-double-fail",
+            &sample_messages(),
+            1,
+            20_000,
+            "",
+            Some(&params),
+            Duration::from_secs(3),
+            512,
+        )
+        .await;
+
+        match artifacts {
+            ExtractionArtifacts::PersistFailed {
+                error_reason,
+                llm_error_reason,
+            } => {
+                assert_eq!(
+                    error_reason,
+                    SessionMemoryExtractionErrorReason::WriteFailed
+                );
+                assert_eq!(
+                    llm_error_reason,
+                    Some(SessionMemoryExtractionErrorReason::EmptyResponse)
+                );
+            }
+            _ => panic!("expected double-failure persist error"),
+        }
+        server_handle.await.unwrap();
+    }
+
     #[test]
     fn session_memory_entry_roundtrips() {
         let encoded = encode_session_memory_entry("sess-42", "# Session Memory\n\nhello");
         let decoded = decode_session_memory_entry(&encoded, "sess-42").unwrap();
         assert_eq!(decoded, "# Session Memory\n\nhello");
         assert!(decode_session_memory_entry(&encoded, "other").is_none());
+    }
+
+    #[test]
+    fn render_recent_messages_includes_tool_heavy_web_agent_rounds() {
+        let messages = vec![
+            json!({"role": "user", "content": "open the homepage"}),
+            json!({
+                "role": "assistant",
+                "content": serde_json::Value::Null,
+                "tool_calls": [{
+                    "function": {"name": "web_fetch"}
+                }]
+            }),
+            json!({"role": "tool", "content": "Fetched https://example.com", "tool_call_id": "c1"}),
+        ];
+
+        assert_eq!(
+            render_recent_messages(&messages, 8, 240),
+            vec![
+                "user: open the homepage".to_string(),
+                "assistant: [called: web_fetch]".to_string(),
+                "tool: Fetched https://example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn last_assistant_message_synthesizes_tool_call_summary() {
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": serde_json::Value::Null,
+            "tool_calls": [
+                {"function": {"name": "web_fetch"}},
+                {"function": {"name": "bash"}}
+            ]
+        })];
+
+        assert_eq!(
+            last_assistant_message(&messages).as_deref(),
+            Some("[called: web_fetch, bash]")
+        );
     }
 }

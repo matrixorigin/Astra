@@ -283,10 +283,10 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
                     feedback_ratios.push(ratio);
                 }
             }
-            astra_services::session_journal::JournalEventType::LlmRequestFull => {
-                if event_matches_bridge_cache_source(&event) {
-                    pending_request_snapshot = bridge_prompt_snapshot_from_journal_event(&event);
-                }
+            astra_services::session_journal::JournalEventType::LlmRequestFull
+                if event_matches_bridge_cache_source(&event) =>
+            {
+                pending_request_snapshot = bridge_prompt_snapshot_from_journal_event(&event);
             }
             astra_services::session_journal::JournalEventType::LlmResponseFull => {
                 if !event_matches_bridge_cache_source(&event) {
@@ -382,10 +382,7 @@ fn bridge_prompt_snapshot_from_journal_event(
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let provider = metadata
-        .get("provider")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
+    let provider = metadata.get("provider").and_then(Value::as_str)?;
     bridge_prompt_snapshot_from_messages(&messages, &tools, model, provider)
 }
 
@@ -2165,7 +2162,7 @@ impl InProcessChatTurnBridge {
                 }
             }
 
-            crate::turn::llm_context::finalize_bridge_wire_messages(
+            let bridge_tail_is_synthetic = crate::turn::llm_context::finalize_bridge_wire_messages(
                 &mut llm_messages,
                 bridge_volatile_text.take(),
                 &provider,
@@ -2334,11 +2331,13 @@ impl InProcessChatTurnBridge {
                     // even though the request shape sent to the real API
                     // would be post-mutation. Traces from E2E tests must be
                     // comparable to traces from real runs.
-                    crate::turn::llm_context::apply_message_cache_metadata(
-                        &mut llm_messages,
-                        &cache_cfg,
-                        &session_id,
-                    );
+                    if !bridge_tail_is_synthetic {
+                        crate::turn::llm_context::apply_message_cache_metadata(
+                            &mut llm_messages,
+                            &cache_cfg,
+                            &session_id,
+                        );
+                    }
                     crate::turn::llm_context::augment_manifest_trace_with_wire(
                         &mut bridge_manifest_trace_json,
                         &llm_messages,
@@ -2412,11 +2411,13 @@ impl InProcessChatTurnBridge {
                     }
                 } else {
                     // Add Anthropic protocol-level prompt-cache metadata on the request clone.
-                    crate::turn::llm_context::apply_message_cache_metadata(
-                        &mut llm_messages,
-                        &cache_cfg,
-                        &session_id,
-                    );
+                    if !bridge_tail_is_synthetic {
+                        crate::turn::llm_context::apply_message_cache_metadata(
+                            &mut llm_messages,
+                            &cache_cfg,
+                            &session_id,
+                        );
+                    }
                     crate::turn::llm_context::augment_manifest_trace_with_wire(
                         &mut bridge_manifest_trace_json,
                         &llm_messages,
@@ -4658,6 +4659,61 @@ mod tests {
                 "empty input must yield empty output for {prov}/{model}",
             );
         }
+    }
+
+    #[test]
+    fn bridge_snapshot_skips_legacy_journal_event_without_provider() {
+        let mut event = astra_services::session_journal::JournalEvent::base_public(
+            astra_services::session_journal::JournalEventType::LlmRound,
+            Some("sess"),
+        );
+        event.metadata = Some(json!({
+            "model": "gpt-4o",
+            "request": {
+                "messages": [
+                    {"role": "system", "content": "stable"},
+                    {"role": "user", "content": "hello"}
+                ],
+                "tools": []
+            }
+        }));
+
+        assert!(bridge_prompt_snapshot_from_journal_event(&event).is_none());
+    }
+
+    #[test]
+    fn bridge_skips_cache_metadata_when_synthetic_tail_is_still_last_message() {
+        let mut llm_messages = vec![
+            json!({"role": "system", "content": [{"type": "text", "text": "stable"}]}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": "tool output", "tool_call_id": "c1"}),
+        ];
+        let cache_cfg = crate::turn::prompt_cache::PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+
+        let bridge_tail_is_synthetic = crate::turn::llm_context::finalize_bridge_wire_messages(
+            &mut llm_messages,
+            Some("volatile".to_string()),
+            "anthropic",
+            "claude-sonnet-4",
+        );
+        if !bridge_tail_is_synthetic {
+            crate::turn::llm_context::apply_message_cache_metadata(
+                &mut llm_messages,
+                &cache_cfg,
+                "sess",
+            );
+        }
+
+        assert!(bridge_tail_is_synthetic);
+        assert!(
+            llm_messages
+                .iter()
+                .all(|message| message.get("cache_control").is_none()),
+            "synthetic tail should stay unannotated so bridge and server cache boundaries match",
+        );
     }
 
     #[test]
