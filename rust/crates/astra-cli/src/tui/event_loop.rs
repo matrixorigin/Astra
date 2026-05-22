@@ -18,8 +18,14 @@
 
 use std::{sync::Arc, time::Duration};
 
+#[cfg(test)]
+use astra_services::session_journal::ToolCallRecord;
+use astra_services::session_journal::{JournalEvent, JournalEventType};
+use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
+
+use crate::explain_dag::{ExplainTurnMeta, render_explain_dag};
 
 use super::app_event::TuiAppEvent;
 use super::bottom_pane::{BottomPane, BottomPaneAction};
@@ -107,6 +113,65 @@ fn surface_status_line_system_cell(event: &TuiAppEvent, chat_widget: &mut chat_w
                 .to_string(),
         ));
     };
+}
+
+fn context_trace_count(state: &crate::SessionState) -> usize {
+    state
+        .observability_session
+        .as_ref()
+        .map(|session| {
+            let guard = session.read().unwrap_or_else(|e| e.into_inner());
+            guard.context_traces.len()
+        })
+        .unwrap_or(0)
+}
+
+fn latest_context_trace_since(
+    state: &crate::SessionState,
+    baseline_cached_turn_id: Option<&str>,
+    baseline_count: usize,
+) -> Option<ContextAssemblyTrace> {
+    if let Some(trace) = state.latest_context_assembly_trace.as_ref()
+        && baseline_cached_turn_id != Some(trace.turn_id.as_str())
+    {
+        return Some(trace.clone());
+    }
+    let session = state.observability_session.as_ref()?;
+    let guard = session.read().unwrap_or_else(|e| e.into_inner());
+    (guard.context_traces.len() > baseline_count)
+        .then(|| guard.context_traces.last().cloned())
+        .flatten()
+}
+
+fn current_turn_event(state: &crate::SessionState) -> Option<&JournalEvent> {
+    state.last_turn_event.as_ref().filter(|event| {
+        event.event_type == JournalEventType::Turn && event.turn == Some(state.turn)
+    })
+}
+
+fn commit_explain_dag(
+    state: &crate::SessionState,
+    explain_items: &[serde_json::Value],
+    baseline_cached_turn_id: Option<&str>,
+    baseline_context_traces: usize,
+    chat_widget: &mut chat_widget::ChatWidget,
+) -> bool {
+    if state.explain == crate::ExplainMode::Off {
+        return false;
+    }
+    let trace = latest_context_trace_since(state, baseline_cached_turn_id, baseline_context_traces);
+    let turn_event = current_turn_event(state);
+    let meta = turn_event.map(ExplainTurnMeta::from_journal_event);
+    let Some(text) = render_explain_dag(
+        trace.as_ref(),
+        meta.as_ref(),
+        explain_items,
+        state.explain == crate::ExplainMode::Verbose,
+    ) else {
+        return false;
+    };
+    chat_widget.commit_system(history_cell::system::SystemCell::info(text));
+    true
 }
 
 fn reopen_agents_view(
@@ -1560,8 +1625,14 @@ pub(crate) async fn run_tui_session(
                                     let _pre_cost = state.total_session_cost;
                                     let pre_cache_read = state.total_cache_read_tokens;
                                     let pre_cache_creation = state.total_cache_creation_tokens;
+                                    let pre_cached_context_trace_turn_id = state
+                                        .latest_context_assembly_trace
+                                        .as_ref()
+                                        .map(|trace| trace.turn_id.clone());
+                                    let pre_context_trace_count = context_trace_count(&state);
                                     let mut turn_tool_count: u32 = 0;
                                     let mut turn_ttft: Option<std::time::Instant> = None;
+                                    let mut explain_items: Vec<serde_json::Value> = Vec::new();
                                     let mut ctrl_b_pressed = false;
                                     // Phase 3b.3c: prime the bash detach slot for this
                                     // turn. The bash runner takes the handle on entry;
@@ -1979,6 +2050,10 @@ pub(crate) async fn run_tui_session(
                                                         TuiAppEvent::ToolStarted { .. } => {
                                                             turn_tool_count += 1;
                                                         }
+                                                        TuiAppEvent::ExplainReport(items) if !items.is_empty() => {
+                                                            explain_items.extend(items.clone());
+                                                            continue;
+                                                        }
                                                         _ => {}
                                                     }
                                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
@@ -2135,6 +2210,10 @@ pub(crate) async fn run_tui_session(
                                                     TuiAppEvent::ToolStarted { .. } => {
                                                         turn_tool_count += 1;
                                                     }
+                                                    TuiAppEvent::ExplainReport(items) if !items.is_empty() => {
+                                                        explain_items.extend(items.clone());
+                                                        continue;
+                                                    }
                                                     _ => {}
                                                 }
                                                 if let Some(new_ev) = chat_widget::translate(
@@ -2152,6 +2231,18 @@ pub(crate) async fn run_tui_session(
                                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
                                             }
                                         }
+                                    }
+
+                                    if turn_result.is_ok()
+                                        && commit_explain_dag(
+                                            &state,
+                                            &explain_items,
+                                            pre_cached_context_trace_turn_id.as_deref(),
+                                            pre_context_trace_count,
+                                            &mut chat_widget,
+                                        )
+                                    {
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
                                     }
 
                                     // Turn end — ChatWidget handles any
@@ -3051,6 +3142,8 @@ fn handle_app_event(
         TuiAppEvent::AgentLive(_)
         | TuiAppEvent::AgentLiveBatch(_)
         | TuiAppEvent::StatusLine(_)
+        | TuiAppEvent::ExplainReport(_)
+        | TuiAppEvent::VerdictReport(_)
         | TuiAppEvent::PermissionAutoApproved { .. } => {}
         TuiAppEvent::TurnComplete | TuiAppEvent::TurnError(_) => {
             bottom_pane.set_task_status(TaskStatus::Idle);
@@ -3564,5 +3657,224 @@ mod tests {
             .collect();
         assert!(rendered[0].contains("/allow"));
         assert!(rendered[1].contains("Mode → auto"));
+    }
+
+    #[test]
+    fn render_explain_dag_formats_rounds_cache_and_batches() {
+        let mut trace = ContextAssemblyTrace {
+            turn_id: "turn-2".into(),
+            session_id: "sess-1".into(),
+            ..Default::default()
+        };
+        trace.system_prompt.total_tokens = 3943;
+        trace.token_budget.total_used = 7658;
+        trace.token_budget.max_tokens = 160_000;
+        trace.token_budget.history_tokens = 7;
+        trace.token_budget.tool_schema_tokens = 3708;
+        trace
+            .history
+            .turns_retained
+            .push(astra_turn_core::context_assembly_trace::TurnRetention {
+                turn_index: 0,
+                role: "assistant".into(),
+                tokens: 7,
+                has_tool_calls: false,
+            });
+        trace.memory.candidates_considered = 5;
+        trace.memory.retrieval_latency_ms = 51;
+        trace.tools.tools_available = 27;
+        trace.tools.selection_strategy = "registry".into();
+        trace
+            .tools
+            .tools_selected
+            .push(astra_turn_core::context_assembly_trace::ToolSelected {
+                tool_name: "bash".into(),
+                score: 1.0,
+                tokens: 243,
+                selection_factors: Vec::new(),
+            });
+        trace
+            .tools
+            .tools_selected
+            .push(astra_turn_core::context_assembly_trace::ToolSelected {
+                tool_name: "read_file".into(),
+                score: 0.9,
+                tokens: 128,
+                selection_factors: Vec::new(),
+            });
+        let mut turn_event = astra_services::session_journal::JournalEvent::turn(
+            Some("sess-1"),
+            2,
+            Some("gpt-5"),
+            "hi",
+            "done",
+            2,
+            10_023,
+            32,
+            2_930,
+        )
+        .with_cache_tokens(900, 200)
+        .with_tool_calls(vec![
+            ToolCallRecord {
+                tool_call_id: Some("call-1".into()),
+                name: "bash".into(),
+                ok: true,
+                ms: 3000,
+                batch_id: Some("parallel-1".into()),
+                parallel: Some(true),
+                round: Some(0),
+                start_offset_ms: Some(40),
+                args_preview: Some("{\"command\":\"git status\"}".into()),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                tool_call_id: Some("call-2".into()),
+                name: "read_file".into(),
+                ok: true,
+                ms: 48,
+                batch_id: Some("parallel-1".into()),
+                parallel: Some(true),
+                round: Some(0),
+                file_path: Some("README.md".into()),
+                ..Default::default()
+            },
+        ]);
+        turn_event.ttft_ms = Some(1900);
+        turn_event.context_ms = Some(88);
+        turn_event.memoria_ms = Some(51);
+        turn_event.total_llm_ms = Some(2930);
+        turn_event.total_tool_ms = Some(3048);
+        turn_event.llm_rounds = Some(1);
+        let explain_items = vec![serde_json::json!({
+            "total_ms": 2930,
+            "prompt_tokens": 10023,
+            "completion_tokens": 32,
+            "steps": [{
+                "step": "llm",
+                "duration_ms": 2930,
+                "in": 10023,
+                "cached_in": 900,
+                "cache_write": 200,
+                "out": 32,
+                "tool_calls": 2
+            }],
+            "routing": {
+                "intent": "default",
+                "confidence": 0.0,
+                "tier": 0,
+                "skipped": false,
+                "reason": ""
+            }
+        })];
+
+        let meta = ExplainTurnMeta::from_journal_event(&turn_event);
+        let text =
+            render_explain_dag(Some(&trace), Some(&meta), &explain_items, false).expect("text");
+        assert!(text.contains("Explain Analyze DAG — turn-2"));
+        assert!(text.contains("context_assembly ms=88ms budget=7658/160000 (4.8%)"));
+        assert!(text.contains(
+            "llm ms=2.9s fresh_in=10023 cache_read=900 cache_write=200 out=32 tool_calls=2"
+        ));
+        assert!(text.contains("batch[parallel-1] parallel tools=2"));
+        assert!(text.contains("bash ok ms=3.0s offset=40ms id=call-1"));
+        assert!(text.contains("read_file ok ms=48ms id=call-2 path=README.md"));
+    }
+
+    #[test]
+    fn commit_explain_dag_commits_trace_to_history() {
+        let mut state = crate::SessionState::default();
+        state.explain = crate::ExplainMode::On;
+        state.turn = 9;
+        state.latest_context_assembly_trace = Some(ContextAssemblyTrace {
+            turn_id: "turn-9".into(),
+            session_id: "sid-trace".into(),
+            token_budget: astra_turn_core::context_assembly_trace::TokenBudgetTrace {
+                total_used: 1024,
+                max_tokens: 4096,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        state.last_turn_event = Some(astra_services::session_journal::JournalEvent::turn(
+            Some("sid-trace"),
+            9,
+            Some("gpt-5"),
+            "hi",
+            "hello",
+            0,
+            12,
+            8,
+            1200,
+        ));
+        let mut widget = chat_widget::ChatWidget::new("");
+
+        assert!(commit_explain_dag(&state, &[], None, 0, &mut widget));
+
+        let sys = widget
+            .history()
+            .last()
+            .and_then(|cell| {
+                cell.as_any_ref()
+                    .downcast_ref::<history_cell::system::SystemCell>()
+            })
+            .expect("expected a committed system cell");
+        assert!(sys.message().contains("Explain Analyze DAG — turn-9"));
+    }
+
+    #[test]
+    fn commit_explain_dag_skips_unchanged_cached_trace() {
+        let mut state = crate::SessionState::default();
+        state.explain = crate::ExplainMode::On;
+        state.latest_context_assembly_trace = Some(ContextAssemblyTrace {
+            turn_id: "turn-9".into(),
+            session_id: "sid-trace".into(),
+            ..Default::default()
+        });
+        let mut widget = chat_widget::ChatWidget::new("");
+
+        assert!(!commit_explain_dag(
+            &state,
+            &[],
+            Some("turn-9"),
+            0,
+            &mut widget,
+        ));
+        assert!(widget.history().is_empty());
+    }
+
+    #[test]
+    fn commit_explain_dag_preserves_unknown_cache_write_marker() {
+        let mut state = crate::SessionState::default();
+        state.explain = crate::ExplainMode::On;
+        state.turn = 4;
+        state.last_turn_event = Some(astra_services::session_journal::JournalEvent::turn(
+            Some("sid-trace"),
+            4,
+            Some("gpt-5"),
+            "hi",
+            "hello",
+            0,
+            12,
+            8,
+            1200,
+        ));
+        state
+            .last_turn_event
+            .as_mut()
+            .expect("turn event")
+            .cache_read_tokens = Some(144);
+        let mut widget = chat_widget::ChatWidget::new("");
+
+        assert!(commit_explain_dag(&state, &[], None, 0, &mut widget));
+
+        let sys = widget
+            .history()
+            .last()
+            .and_then(|cell| {
+                cell.as_any_ref()
+                    .downcast_ref::<history_cell::system::SystemCell>()
+            })
+            .expect("expected a committed system cell");
+        assert!(sys.message().contains("cache_write=?"));
     }
 }

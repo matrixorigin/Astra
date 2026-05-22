@@ -1126,10 +1126,7 @@ impl InProcessChatTurnBridge {
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
-        let explain = payload
-            .get("explain")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let explain = explain_requested(&payload);
         let model_override = payload
             .get("model")
             .and_then(Value::as_str)
@@ -4142,6 +4139,14 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn explain_requested(payload: &Value) -> bool {
+    match payload.get("explain") {
+        Some(Value::Bool(enabled)) => *enabled,
+        Some(Value::String(mode)) => mode.eq_ignore_ascii_case("verbose"),
+        _ => false,
+    }
+}
+
 fn classify_llm_error(msg: &str) -> astra_core::ErrorKind {
     // Delegate to the canonical classifier in llm_client.
     crate::turn::llm_client::classify_llm_error(msg)
@@ -5613,6 +5618,14 @@ mod tests {
             header_str(&headers, "x-mo-user-id").as_deref(),
             Some("user-123")
         );
+    }
+
+    #[test]
+    fn explain_requested_accepts_verbose_string() {
+        assert!(explain_requested(&json!({ "explain": "verbose" })));
+        assert!(explain_requested(&json!({ "explain": true })));
+        assert!(!explain_requested(&json!({ "explain": false })));
+        assert!(!explain_requested(&json!({ "explain": "off" })));
     }
 
     #[test]

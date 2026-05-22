@@ -16,6 +16,7 @@ use astra_services::session_journal::ToolCallRecord;
 use crossterm::style::Stylize;
 use serde_json::Value;
 
+use crate::explain_dag::ExplainTurnMeta;
 use crate::{ExplainMode, StreamResult, VerdictEvent};
 
 use super::super::explain_reports::{print_explain_report, print_verdict_report};
@@ -27,6 +28,13 @@ pub(crate) struct StreamLoopSidecarEprint<'a> {
     pub(crate) start: Instant,
     pub(crate) model: Option<&'a str>,
     pub(crate) explain_turns: &'a [Value],
+    pub(crate) pending_context_assembly_trace: Option<&'a serde_json::Value>,
+    pub(crate) tool_call_records: &'a [ToolCallRecord],
+    pub(crate) assistant_output: &'a str,
+    pub(crate) ttft_ms: Option<u64>,
+    pub(crate) context_ms: Option<u64>,
+    pub(crate) memoria_ms: Option<u64>,
+    pub(crate) llm_rounds: Option<u32>,
     pub(crate) verdict_events: &'a [VerdictEvent],
     pub(crate) has_any_usage: bool,
     pub(crate) total_prompt: u64,
@@ -44,6 +52,13 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
         start,
         model,
         explain_turns,
+        pending_context_assembly_trace,
+        tool_call_records,
+        assistant_output,
+        ttft_ms,
+        context_ms,
+        memoria_ms,
+        llm_rounds,
         verdict_events,
         has_any_usage,
         total_prompt,
@@ -53,8 +68,42 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
         current_session_id,
     } = ctx;
 
-    if explain != ExplainMode::Off && !explain_turns.is_empty() && !quiet {
-        print_explain_report(explain_turns, explain == ExplainMode::Verbose);
+    if explain != ExplainMode::Off && !quiet {
+        let tool_count =
+            resolved_tool_metrics(0, std::iter::empty::<String>(), tool_call_records).0;
+        let meta = ExplainTurnMeta {
+            turn_label: None,
+            duration_ms: Some(start.elapsed().as_millis() as u64),
+            ttft_ms,
+            context_ms,
+            memoria_ms,
+            total_llm_ms: None,
+            total_tool_ms: Some(
+                tool_call_records
+                    .iter()
+                    .filter(|record| !record.is_synthetic_placeholder())
+                    .map(|record| record.ms)
+                    .sum(),
+            ),
+            prompt_tokens: Some(total_prompt),
+            completion_tokens: Some(total_completion),
+            cache_read_tokens: Some(total_cache_read),
+            cache_creation_tokens: Some(total_cache_creation),
+            tool_count: Some(tool_count),
+            llm_rounds,
+            routing_domain_hint: None,
+            assistant_output: Some(assistant_output),
+            tool_call_records,
+            selection_strategy: None,
+            selection_confidence: None,
+            selected_tools: Vec::new(),
+        };
+        print_explain_report(
+            explain_turns,
+            Some(&meta),
+            pending_context_assembly_trace,
+            explain == ExplainMode::Verbose,
+        );
     }
     if explain != ExplainMode::Off && !verdict_events.is_empty() && !quiet {
         print_verdict_report(verdict_events, explain == ExplainMode::Verbose);

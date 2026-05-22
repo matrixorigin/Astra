@@ -203,6 +203,9 @@ pub(crate) struct SessionState {
     pub last_turn_interrupted: bool,
     /// Last turn's journal event — for /turn command display.
     pub last_turn_event: Option<session_journal::JournalEvent>,
+    /// Full context-assembly trace from the last successfully committed turn.
+    pub latest_context_assembly_trace:
+        Option<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>,
     /// Unified skill registry (single source of truth for all skill resolution).
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// Session-scoped skill quality tracker for learning loop.
@@ -497,6 +500,7 @@ impl Default for SessionState {
             current_plan_subtask_id: None,
             last_turn_interrupted: false,
             last_turn_event: None,
+            latest_context_assembly_trace: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
             skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
             skill_search: astra_core::SkillSearchSettings::default(),

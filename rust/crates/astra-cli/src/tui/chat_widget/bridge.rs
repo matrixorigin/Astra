@@ -125,6 +125,8 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
             ctx.into_stats(),
         )))),
         TuiAppEvent::TurnError(msg) => Some(AppEvent::Wire(WireEvent::TurnError(msg))),
+        TuiAppEvent::ExplainReport(items) => Some(AppEvent::Wire(WireEvent::ExplainReport(items))),
+        TuiAppEvent::VerdictReport(items) => Some(AppEvent::Wire(WireEvent::VerdictReport(items))),
         // Bottom-pane-only events — ChatWidget doesn't care.
         TuiAppEvent::ThinkingStarted
         | TuiAppEvent::WaitingForModel

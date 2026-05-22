@@ -2367,11 +2367,7 @@ pub(super) async fn execute_cli_command(
                     )
                 }
             };
-            let explain_mode = if args.explain {
-                ExplainMode::On
-            } else {
-                ExplainMode::Off
-            };
+            let explain_mode = args.explain.unwrap_or(ExplainMode::Off);
 
             // --json implies --quiet
             let quiet = args.quiet || args.json;

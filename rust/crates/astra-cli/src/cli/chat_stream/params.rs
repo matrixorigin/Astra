@@ -135,6 +135,12 @@ pub enum StreamEvent {
     AgentLive(astra_turn_core::agent_live_event::AgentLiveEvent),
     /// Local policy approved a tool without showing an interactive prompt.
     PermissionAutoApproved { tool: String, reason: String },
+    /// Explain report from the turn (debug / introspection data).
+    ExplainReport(Vec<serde_json::Value>),
+    /// Final explain-analyze DAG text rendered for non-TUI consumers.
+    ExplainText(String),
+    /// Verdict audit events from the turn.
+    VerdictReport(Vec<crate::VerdictEvent>),
 }
 
 pub type StreamEventTx = mpsc::UnboundedSender<StreamEvent>;

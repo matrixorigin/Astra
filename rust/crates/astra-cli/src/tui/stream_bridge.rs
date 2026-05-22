@@ -28,8 +28,9 @@ pub(crate) fn create_per_turn_bridge(tui_tx: TuiAppEventTx) -> crate::chat_strea
 
     tokio::spawn(async move {
         while let Some(event) = stream_rx.recv().await {
-            let tui_event = map_stream_event(event);
-            if tui_tx.send(tui_event).is_err() {
+            if let Some(tui_event) = map_stream_event(event)
+                && tui_tx.send(tui_event).is_err()
+            {
                 break;
             }
         }
@@ -221,8 +222,8 @@ async fn recv_next_live_event(
     }
 }
 
-fn map_stream_event(event: StreamEvent) -> TuiAppEvent {
-    match event {
+fn map_stream_event(event: StreamEvent) -> Option<TuiAppEvent> {
+    Some(match event {
         StreamEvent::Token(text) => TuiAppEvent::Token(text),
         StreamEvent::Thinking(true) => TuiAppEvent::ThinkingStarted,
         StreamEvent::Thinking(false) => TuiAppEvent::ThinkingStopped,
@@ -312,7 +313,10 @@ fn map_stream_event(event: StreamEvent) -> TuiAppEvent {
         StreamEvent::PermissionAutoApproved { tool, reason } => {
             TuiAppEvent::PermissionAutoApproved { tool, reason }
         }
-    }
+        StreamEvent::ExplainReport(items) => TuiAppEvent::ExplainReport(items),
+        StreamEvent::VerdictReport(items) => TuiAppEvent::VerdictReport(items),
+        StreamEvent::ExplainText(_) => return None,
+    })
 }
 
 #[cfg(test)]

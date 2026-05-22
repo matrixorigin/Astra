@@ -283,7 +283,11 @@ fn stream_event_to_agent_live_kind(
         StreamEvent::ToolOutput { name, lines, bytes } => Some(AgentLiveEventKind::Status(
             format!("{name} streaming: {lines} lines, {bytes} bytes"),
         )),
-        StreamEvent::Thinking(_) | StreamEvent::AgentLive(_) => None,
+        StreamEvent::Thinking(_)
+        | StreamEvent::AgentLive(_)
+        | StreamEvent::ExplainReport(_)
+        | StreamEvent::ExplainText(_)
+        | StreamEvent::VerdictReport(_) => None,
     }
 }
 

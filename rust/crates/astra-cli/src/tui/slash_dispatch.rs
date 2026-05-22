@@ -5,6 +5,7 @@
 //! produce output render to scrollback. Unrecognized or complex commands
 //! fall back to `with_restored()` which temporarily exits the TUI.
 
+use crate::ExplainMode;
 use crate::command_registry;
 use crate::command_registry::TuiHandler;
 use crate::session_state::SessionState;
@@ -372,8 +373,22 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         }
 
         // ── State commands → with_restored (share full logic with non-TUI) ──
-        "/clear" | "/undo" | "/redo" | "/compact" | "/explain" | "/reflect" => {
-            SlashResult::Fallback
+        "/clear" | "/undo" | "/redo" | "/compact" | "/reflect" => SlashResult::Fallback,
+
+        // ── Explain ─────────────────────────────────────────────────
+        "/explain" => {
+            ctx.state.explain = match ctx.state.explain {
+                ExplainMode::Off => ExplainMode::On,
+                ExplainMode::On => ExplainMode::Verbose,
+                ExplainMode::Verbose => ExplainMode::Off,
+            };
+            let label = match ctx.state.explain {
+                ExplainMode::Off => "off",
+                ExplainMode::On => "on",
+                ExplainMode::Verbose => "verbose",
+            };
+            ctx.show_response(format!("Explain mode: {label}"));
+            SlashResult::Handled
         }
 
         // ── Inspect (TUI-native) ────────────────────────────────────

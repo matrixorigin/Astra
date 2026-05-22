@@ -1,8 +1,7 @@
 use std::time::Instant;
 
-use astra_services::session_workspace::ContextTraceSignal;
-#[cfg(test)]
-use astra_services::session_workspace::{ContextTraceBudgetSignal, ContextTraceToolSelection};
+use astra_services::session_workspace::ContextTraceBudgetSignal;
+use astra_services::session_workspace::{ContextTraceSignal, ContextTraceToolSelection};
 use astra_text_utils::str_preview::truncate_str;
 use astra_tools::task_mgmt::SessionTask;
 
@@ -19,6 +18,17 @@ fn enqueue_ingestion(_state: &SessionState, _event: &session_journal::JournalEve
 /// Public wrapper for enqueue_ingestion — used by main.rs for session_end.
 pub(super) fn enqueue_ingestion_pub(state: &SessionState, event: &session_journal::JournalEvent) {
     enqueue_ingestion(state, event);
+}
+
+fn cache_pending_context_assembly_trace(state: &mut SessionState, trace_json: &serde_json::Value) {
+    match serde_json::from_value::<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>(
+        trace_json.clone(),
+    ) {
+        Ok(trace) => state.latest_context_assembly_trace = Some(trace),
+        Err(err) => {
+            astra_core::agent_warn!("context_trace", "failed to cache context trace: {err}")
+        }
+    }
 }
 
 /// Map a runtime stall event's `stall_type` string to the journal confidence.
@@ -1788,6 +1798,9 @@ fn commit_turn_journal_workspace_and_sidecars(
 ) {
     // Capture stall flag before entering the journal borrow scope.
     let has_stalls = !result.stall_events.is_empty();
+    if let Some((_internal_turn, trace_json)) = &result.pending_context_assembly_trace {
+        cache_pending_context_assembly_trace(state, trace_json);
+    }
 
     if let Some(journal) = state.journal.as_ref() {
         // Flush turn observability events (llm_round, tool timing) before the turn summary.
@@ -3588,7 +3601,89 @@ pub(super) fn apply_pending_adaptive_state(state: &mut SessionState) {
     }
 }
 
+fn context_trace_signal_from_trace(
+    trace: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace,
+) -> ContextTraceSignal {
+    let tool_selection = (!trace.tools.selection_strategy.is_empty()
+        || !trace.tools.tools_selected.is_empty()
+        || trace.tools.tools_available > 0)
+        .then(|| ContextTraceToolSelection {
+            tools_available: trace.tools.tools_available,
+            selected_tools: trace
+                .tools
+                .tools_selected
+                .iter()
+                .map(|tool| tool.tool_name.clone())
+                .collect(),
+            selection_scope: "latest_round".to_string(),
+            rejected_tools: trace.tools.tools_rejected.len(),
+            strategy: trace.tools.selection_strategy.clone(),
+            confidence: trace.tools.selection_confidence,
+            latency_ms: trace.tools.selection_latency_ms,
+        });
+    let memory = (!trace.memory.query.trim().is_empty()
+        || !trace.memory.memories_selected.is_empty()
+        || trace.memory.candidates_considered > 0)
+        .then(
+            || astra_services::session_workspace::ContextTraceMemorySignal {
+                query: trace.memory.query.trim().chars().take(160).collect(),
+                candidates_considered: trace.memory.candidates_considered,
+                selected_memory_ids: trace
+                    .memory
+                    .memories_selected
+                    .iter()
+                    .map(|memory| memory.memory_id.clone())
+                    .collect(),
+                total_tokens: trace.memory.total_tokens,
+                latency_ms: trace.memory.retrieval_latency_ms,
+            },
+        );
+    let history = (trace.history.total_turns_available > 0
+        || !trace.history.turns_retained.is_empty()
+        || !trace.history.turns_compressed.is_empty()
+        || !trace.history.turns_dropped.is_empty())
+    .then_some(
+        astra_services::session_workspace::ContextTraceHistorySignal {
+            total_turns_available: trace.history.total_turns_available,
+            retained_turns: trace.history.turns_retained.len(),
+            compressed_turns: trace.history.turns_compressed.len(),
+            dropped_turns: trace.history.turns_dropped.len(),
+            compression_ratio: trace.history.compression_ratio,
+            tokens_before: trace.history.tokens_before,
+            tokens_after: trace.history.tokens_after,
+        },
+    );
+    let budget = (trace.token_budget.max_tokens > 0 || trace.token_budget.total_used > 0)
+        .then_some(ContextTraceBudgetSignal {
+            max_tokens: trace.token_budget.max_tokens,
+            total_used: trace.token_budget.total_used,
+            budget_pressure: trace.token_budget.budget_pressure,
+            compression_triggered: trace.token_budget.compression_triggered,
+        });
+
+    ContextTraceSignal {
+        turn_id: trace.turn_id.clone(),
+        captured_at: Some(chrono::DateTime::<chrono::Utc>::from(trace.timestamp).to_rfc3339()),
+        tool_selection,
+        memory,
+        history,
+        budget,
+        timing: None,
+        explanations: trace
+            .explanations
+            .iter()
+            .filter_map(|explanation| {
+                let trimmed = explanation.reasoning.trim();
+                (!trimmed.is_empty()).then(|| trimmed.chars().take(200).collect::<String>())
+            })
+            .collect(),
+    }
+}
+
 fn latest_context_trace_signal(state: &SessionState) -> Option<ContextTraceSignal> {
+    if let Some(trace) = state.latest_context_assembly_trace.as_ref() {
+        return Some(context_trace_signal_from_trace(trace));
+    }
     let obs = state.observability_session.as_ref()?;
     let guard = obs.read().ok()?;
     astra_runtime::observability_integration::latest_context_trace_signal(&guard)
@@ -5772,19 +5867,27 @@ mod tests {
             "finish_reason": "tool_calls",
         }));
         result.turn_observability_events = vec![llm_round];
-        result.pending_context_assembly_trace = Some((
-            99,
-            serde_json::json!({
-                "turn_id": "turn-99",
-                "tools": {
-                    "tools_selected": [
-                        {"tool_name": "git_diff"},
-                        {"tool_name": "read_file"}
-                    ]
-                },
-                "token_budget": {"total_used": 12_345}
-            }),
-        ));
+        let mut trace = astra_turn_core::context_assembly_trace::ContextAssemblyTrace {
+            turn_id: "turn-99".into(),
+            session_id: sid.clone(),
+            ..Default::default()
+        };
+        trace.tools.tools_selected = vec![
+            astra_turn_core::context_assembly_trace::ToolSelected {
+                tool_name: "git_diff".into(),
+                score: 0.0,
+                tokens: 0,
+                selection_factors: Vec::new(),
+            },
+            astra_turn_core::context_assembly_trace::ToolSelected {
+                tool_name: "read_file".into(),
+                score: 0.0,
+                tokens: 0,
+                selection_factors: Vec::new(),
+            },
+        ];
+        trace.token_budget.total_used = 12_345;
+        result.pending_context_assembly_trace = Some((99, trace.to_json_value()));
 
         let learning = analyze_chat_turn_learning("continue", state.turn, &[], &result);
         commit_turn_journal_workspace_and_sidecars(
@@ -5838,6 +5941,12 @@ mod tests {
             assembly_event.metadata.as_ref().unwrap()["total_tokens"],
             12_345
         );
+        let cached_trace = state
+            .latest_context_assembly_trace
+            .as_ref()
+            .expect("cached context trace");
+        assert_eq!(cached_trace.turn_id, "turn-99");
+        assert_eq!(cached_trace.token_budget.total_used, 12_345);
     }
 
     #[test]

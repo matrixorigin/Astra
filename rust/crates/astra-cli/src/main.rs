@@ -71,6 +71,7 @@ mod command_usage;
 mod context_dump;
 #[path = "cli/context_references.rs"]
 mod context_references;
+mod explain_dag;
 
 #[path = "cli/chat_turn.rs"]
 mod chat_turn;

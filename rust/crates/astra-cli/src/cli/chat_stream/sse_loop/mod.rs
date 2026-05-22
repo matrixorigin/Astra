@@ -36,9 +36,11 @@ use astra_runtime::{
     turn::turn_guard::TurnGuard,
 };
 
-use crate::{StreamResult, cli_utils::terminal_width_usize, edge_tools};
+use crate::{ExplainMode, StreamResult, cli_utils::terminal_width_usize, edge_tools};
 
 use super::ChatTurnParams;
+use super::StreamEvent;
+use super::explain_reports;
 use agentic_sse_loop::{
     StreamLoopSidecarEprint, StreamResultBuild, build_stream_result, eprint_stream_loop_sidecars,
     resolved_tool_metrics,
@@ -508,7 +510,7 @@ pub(crate) async fn stream_chat_sse(
         is_plan_subtask: p.is_plan_subtask,
         plan_subtask_id: p.plan_subtask_id,
         plan_assemble_line_release: p.plan_assemble_line_release.clone(),
-        stream_event_tx: p.stream_event_tx,
+        stream_event_tx: p.stream_event_tx.clone(),
         approval_request_tx: p.approval_request_tx,
         ask_user_request_tx: p.ask_user_request_tx,
         plan_review_request_tx: p.plan_review_request_tx,
@@ -882,6 +884,17 @@ pub(crate) async fn stream_chat_sse(
         start,
         model: p.model,
         explain_turns: &state.telemetry.explain_turns,
+        pending_context_assembly_trace: state
+            .telemetry
+            .pending_context_assembly_trace
+            .as_ref()
+            .map(|(_, trace_json)| trace_json),
+        tool_call_records: &state.stall.tool_call_records,
+        assistant_output: &state.final_text,
+        ttft_ms: state.telemetry.first_ttft_ms,
+        context_ms: state.telemetry.first_context_assembly_ms,
+        memoria_ms: state.telemetry.first_memoria_ms,
+        llm_rounds: Some(state.llm_rounds_completed),
         verdict_events: &state.stall.verdict_events,
         has_any_usage: state.has_any_usage,
         total_prompt: state.total_prompt,
@@ -890,6 +903,63 @@ pub(crate) async fn stream_chat_sse(
         total_completion: state.total_completion,
         current_session_id: state.current_session_id.as_deref(),
     });
+
+    // Forward explain / verdict to TUI stream (if wired).
+    if let Some(ref tx) = p.stream_event_tx {
+        let explain_turns = state.telemetry.explain_turns.clone();
+        let verdict_events = state.stall.verdict_events.clone();
+        let _ = tx.send(StreamEvent::ExplainReport(explain_turns));
+        if p.explain != ExplainMode::Off {
+            let tool_count = resolved_tool_metrics(
+                0,
+                std::iter::empty::<String>(),
+                &state.stall.tool_call_records,
+            )
+            .0;
+            let meta = crate::explain_dag::ExplainTurnMeta {
+                turn_label: None,
+                duration_ms: Some(start.elapsed().as_millis() as u64),
+                ttft_ms: state.telemetry.first_ttft_ms,
+                context_ms: state.telemetry.first_context_assembly_ms,
+                memoria_ms: state.telemetry.first_memoria_ms,
+                total_llm_ms: None,
+                total_tool_ms: Some(
+                    state
+                        .stall
+                        .tool_call_records
+                        .iter()
+                        .filter(|record| !record.is_synthetic_placeholder())
+                        .map(|record| record.ms)
+                        .sum(),
+                ),
+                prompt_tokens: Some(state.total_prompt),
+                completion_tokens: Some(state.total_completion),
+                cache_read_tokens: Some(state.total_cache_read),
+                cache_creation_tokens: Some(state.total_cache_creation),
+                tool_count: Some(tool_count),
+                llm_rounds: Some(state.llm_rounds_completed),
+                routing_domain_hint: None,
+                assistant_output: Some(&state.final_text),
+                tool_call_records: &state.stall.tool_call_records,
+                selection_strategy: None,
+                selection_confidence: None,
+                selected_tools: Vec::new(),
+            };
+            if let Some(text) = explain_reports::render_explain_report_text(
+                &state.telemetry.explain_turns,
+                Some(&meta),
+                state
+                    .telemetry
+                    .pending_context_assembly_trace
+                    .as_ref()
+                    .map(|(_, trace_json)| trace_json),
+                p.explain == ExplainMode::Verbose,
+            ) {
+                let _ = tx.send(StreamEvent::ExplainText(text));
+            }
+        }
+        let _ = tx.send(StreamEvent::VerdictReport(verdict_events));
+    }
 
     let final_messages = std::mem::take(&mut state.messages);
 
