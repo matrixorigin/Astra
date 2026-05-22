@@ -1675,6 +1675,12 @@ fn apply_request_body_overrides(
 }
 
 fn merge_json_object(target: &mut Value, overrides: &Map<String, Value>) {
+    merge_json_object_with_depth(target, overrides, 0);
+}
+
+const MAX_JSON_MERGE_DEPTH: usize = 64;
+
+fn merge_json_object_with_depth(target: &mut Value, overrides: &Map<String, Value>, depth: usize) {
     let Some(target_obj) = target.as_object_mut() else {
         tracing::warn!("merge_json_object called with non-object target; skipping");
         return;
@@ -1682,7 +1688,16 @@ fn merge_json_object(target: &mut Value, overrides: &Map<String, Value>) {
     for (key, override_value) in overrides {
         match (target_obj.get_mut(key), override_value) {
             (Some(existing), Value::Object(override_obj)) if existing.is_object() => {
-                merge_json_object(existing, override_obj);
+                if depth >= MAX_JSON_MERGE_DEPTH {
+                    tracing::warn!(
+                        key,
+                        max_depth = MAX_JSON_MERGE_DEPTH,
+                        "merge_json_object exceeded max depth; replacing nested object"
+                    );
+                    *existing = Value::Object(override_obj.clone());
+                } else {
+                    merge_json_object_with_depth(existing, override_obj, depth + 1);
+                }
             }
             _ => {
                 target_obj.insert(key.clone(), override_value.clone());

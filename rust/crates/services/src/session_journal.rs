@@ -24,6 +24,20 @@ thread_local! {
 static SESSION_START_STATE_CACHE: LazyLock<Mutex<HashMap<PathBuf, bool>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+fn with_session_start_state_cache<R>(f: impl FnOnce(&mut HashMap<PathBuf, bool>) -> R) -> R {
+    match SESSION_START_STATE_CACHE.lock() {
+        Ok(mut guard) => f(&mut guard),
+        Err(mut poisoned) => {
+            tracing::warn!(
+                "session_start_state_cache mutex poisoned; clearing cached state before reuse"
+            );
+            poisoned.get_mut().clear();
+            let mut guard = poisoned.into_inner();
+            f(&mut guard)
+        }
+    }
+}
+
 /// Resolved local `sessions` directory (`~/.astra/sessions` or a per-thread override).
 ///
 /// Step checkpoints, workspace metadata, and session journal files all live under this root.
@@ -40,18 +54,13 @@ pub fn local_sessions_dir() -> PathBuf {
 }
 
 fn cached_session_start_state(path: &Path) -> Option<bool> {
-    SESSION_START_STATE_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(path)
-        .copied()
+    with_session_start_state_cache(|cache| cache.get(path).copied())
 }
 
 fn set_cached_session_start_state(path: &Path, has_open_session_start: bool) {
-    SESSION_START_STATE_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(path.to_path_buf(), has_open_session_start);
+    with_session_start_state_cache(|cache| {
+        cache.insert(path.to_path_buf(), has_open_session_start);
+    });
 }
 
 fn update_cached_session_start_state_from_event(path: &Path, event_type: &JournalEventType) {

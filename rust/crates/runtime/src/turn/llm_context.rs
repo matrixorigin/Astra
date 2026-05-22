@@ -79,6 +79,11 @@ impl<'a> ToolSurfacePlan<'a> {
         self.selection_trace = trace;
         self
     }
+
+    pub(crate) fn with_deferred_tools_block(mut self, block: &'a str) -> Self {
+        self.deferred_tools_block = block;
+        self
+    }
 }
 
 /// Normalized runtime prompt signals for one LLM call.
@@ -196,59 +201,9 @@ fn cache_control_count(value: &Value) -> usize {
 /// the existing bridge pipeline helper until the bridge source collection is
 /// fully normalized into [`LlmContextAssemblyInput`].
 pub(crate) struct BridgeContextAssemblyInput<'a> {
-    pub tool_surface: BridgeToolSurfacePlan<'a>,
+    pub tool_surface: ToolSurfacePlan<'a>,
     pub runtime_signals: BridgeRuntimeSignals<'a>,
     pub session: BridgeSessionContextInput<'a>,
-}
-
-pub(crate) struct BridgeToolSurfacePlan<'a> {
-    pub tool_names: &'a [&'a str],
-    pub tool_schemas: &'a [Value],
-    pub pinned_tools: &'a [Value],
-    pub dynamic_tools: &'a [Value],
-    pub required_tools: &'a [Value],
-    pub deferred_tools_block: &'a str,
-    pub restricted_tools: &'a HashSet<String>,
-    pub selection_trace: Option<Value>,
-}
-
-impl<'a> BridgeToolSurfacePlan<'a> {
-    pub(crate) fn from_visible_tools(
-        tool_names: &'a [&'a str],
-        tool_schemas: &'a [Value],
-        restricted_tools: &'a HashSet<String>,
-    ) -> Self {
-        Self {
-            tool_names,
-            tool_schemas,
-            pinned_tools: tool_schemas,
-            dynamic_tools: &[],
-            required_tools: &[],
-            deferred_tools_block: "",
-            restricted_tools,
-            selection_trace: None,
-        }
-    }
-
-    pub(crate) fn with_deferred_tools_block(mut self, block: &'a str) -> Self {
-        self.deferred_tools_block = block;
-        self
-    }
-
-    pub(crate) fn with_selection_trace(mut self, trace: Option<Value>) -> Self {
-        self.selection_trace = trace;
-        self
-    }
-
-    fn effective_tool_schemas(&self) -> Vec<Value> {
-        let tools = effective_tool_schemas(
-            self.tool_schemas,
-            self.pinned_tools,
-            self.dynamic_tools,
-            self.required_tools,
-        );
-        filter_restricted_tool_schemas(tools, self.restricted_tools)
-    }
 }
 
 fn tool_name(schema: &Value) -> Option<&str> {
@@ -580,13 +535,13 @@ pub(crate) fn build_context_manifest_projection(
 pub(crate) fn assemble_bridge_context(
     input: BridgeContextAssemblyInput<'_>,
 ) -> BridgeContextAssemblyOutput {
-    let effective_tool_schemas = input.tool_surface.effective_tool_schemas();
+    let effective_tool_schemas = input.tool_surface.effective_tools();
     let effective_tool_names: Vec<&str> = effective_tool_schemas
         .iter()
         .filter_map(tool_name)
         .collect();
     let _tool_surface_metadata = (
-        input.tool_surface.tool_names.len(),
+        input.tool_surface.visible_tools.len(),
         input.tool_surface.pinned_tools.len(),
         input.tool_surface.dynamic_tools.len(),
         input.tool_surface.required_tools.len(),

@@ -267,20 +267,41 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaClient for CliSessionMe
 
 fn build_cli_session_memory_event_sink()
 -> std::sync::Arc<dyn Fn(&session_journal::JournalEvent) + Send + Sync> {
-    std::sync::Arc::new(|event: &session_journal::JournalEvent| {
+    let writers = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+        String,
+        session_journal::JournalWriter,
+    >::new()));
+    std::sync::Arc::new(move |event: &session_journal::JournalEvent| {
         let Some(session_id) = event.session_id.as_deref().filter(|sid| !sid.is_empty()) else {
             return;
         };
-        let writer = match session_journal::JournalWriter::new(session_id) {
-            Ok(writer) => writer,
-            Err(error) => {
+        let mut guard = match writers.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
                 tracing::warn!(
                     session_id,
                     event_type = ?event.event_type,
-                    ?error,
-                    "failed to open local journal for session-memory event"
+                    "session-memory journal writer cache poisoned; recovering"
                 );
-                return;
+                poisoned.into_inner()
+            }
+        };
+        let writer = match guard.entry(session_id.to_string()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let writer = match session_journal::JournalWriter::new(session_id) {
+                    Ok(writer) => writer,
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id,
+                            event_type = ?event.event_type,
+                            ?error,
+                            "failed to open local journal for session-memory event"
+                        );
+                        return;
+                    }
+                };
+                entry.insert(writer)
             }
         };
         if let Err(error) = writer.append(event) {

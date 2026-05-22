@@ -6,11 +6,10 @@
 //!
 //! diagnostics with token impact estimates and auto-remediation suggestions.
 
-use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 
 use crate::context_serializer::SerializedSystemBlock;
 
@@ -178,14 +177,9 @@ impl PromptStateSnapshot {
         model: &str,
         cache_eligible_tokens: usize,
     ) -> Self {
-        let system_prompt_text = system_blocks
-            .iter()
-            .map(|block| block.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        Self::capture_with_provider(
-            &system_prompt_text,
-            system_blocks,
+        Self::capture_with_hashes(
+            hash_serialized_system_prompt(system_blocks),
+            fingerprint_system_blocks(system_blocks),
             tool_schemas,
             provider,
             model,
@@ -201,8 +195,8 @@ impl PromptStateSnapshot {
         model: &str,
         cache_eligible_tokens: usize,
     ) -> Self {
-        Self::capture_with_fingerprints(
-            system_prompt_text,
+        Self::capture_with_hashes(
+            hash_str(system_prompt_text),
             fingerprint_system_blocks(system_blocks),
             tool_schemas,
             provider,
@@ -211,15 +205,14 @@ impl PromptStateSnapshot {
         )
     }
 
-    fn capture_with_fingerprints(
-        system_prompt_text: &str,
+    fn capture_with_hashes(
+        system_prompt_hash: u64,
         system_blocks: Vec<SystemBlockFingerprint>,
         tool_schemas: &[serde_json::Value],
         provider: &str,
         model: &str,
         cache_eligible_tokens: usize,
     ) -> Self {
-        let system_prompt_hash = hash_str(system_prompt_text);
         let cache_control_hash = hash_cache_control_state(&system_blocks);
 
         let per_tool_hashes: Vec<(String, u64)> = tool_schemas
@@ -232,7 +225,7 @@ impl PromptStateSnapshot {
                     .or_else(|| t.get("name").and_then(|n| n.as_str()))
                     .unwrap_or("unknown")
                     .to_string();
-                let h = hash_str(&t.to_string());
+                let h = hash_json_value(t);
                 (name, h)
             })
             .collect();
@@ -291,8 +284,8 @@ pub fn prompt_snapshot_from_messages(
     cache_eligible_tokens: usize,
 ) -> Option<PromptStateSnapshot> {
     let system_prompt_text = prompt_snapshot_system_text_from_messages(messages);
-    let snapshot = PromptStateSnapshot::capture_with_fingerprints(
-        &system_prompt_text,
+    let snapshot = PromptStateSnapshot::capture_with_hashes(
+        hash_str(&system_prompt_text),
         prompt_snapshot_fingerprint_system_blocks(messages),
         tool_schemas,
         provider,
@@ -473,11 +466,10 @@ pub struct CacheBreakDetectorState {
 ///
 /// # Concurrency
 ///
-/// `CacheBreakDetector` is deliberately **not** `Send + Sync`. It owns an
-/// internal `HashMap` and is designed to be used from a single task (thread
-/// or async future). In async contexts, Rust's borrow checker prevents any
-/// `&mut self` method from being called while another borrow is held across
-/// an `.await` point, so exclusive access is guaranteed without locks.
+/// `CacheBreakDetector` is intended to have a single logical owner per
+/// session/run. It stays `Send + Sync` so enclosing runtime state can move
+/// across tasks, but callers should not share mutable access without external
+/// synchronization.
 #[derive(Debug, Default)]
 pub struct CacheBreakDetector {
     /// Previous snapshot per source. LRU-evicted at [`MAX_TRACKED_SOURCES`]
@@ -511,7 +503,7 @@ pub struct CacheStats {
     /// Total tokens that had to be re-processed due to cache breaks.
     pub total_miss_tokens: usize,
     /// History of recent break events (last 10).
-    pub recent_breaks: Vec<CacheBreakEvent>,
+    pub recent_breaks: VecDeque<CacheBreakEvent>,
 }
 
 impl CacheStats {
@@ -613,14 +605,19 @@ impl CacheBreakDetector {
         if let Some(ref evt) = event {
             self.stats.cache_misses += 1;
             self.stats.total_miss_tokens += evt.estimated_token_impact;
-            self.stats.recent_breaks.push(evt.clone());
+            self.stats.recent_breaks.push_back(evt.clone());
             if self.stats.recent_breaks.len() > 10 {
-                self.stats.recent_breaks.remove(0);
+                self.stats.recent_breaks.pop_front();
             }
             if let Some(dir) = self.diff_dir.clone() {
                 self.diff_seq = self.diff_seq.wrapping_add(1);
-                let _ =
-                    write_diff_artifact(&dir, self.diff_seq, previous_for_source, &current, evt);
+                spawn_diff_artifact_write(
+                    dir,
+                    self.diff_seq,
+                    previous_for_source.cloned(),
+                    current.clone(),
+                    evt.clone(),
+                );
             }
         } else if previous_for_source.is_some() {
             self.stats.cache_hits += 1;
@@ -1005,6 +1002,40 @@ fn hash_str(s: &str) -> u64 {
     hasher.finish()
 }
 
+struct HashWriter<'a>(&'a mut DefaultHasher);
+
+impl std::io::Write for HashWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn hash_json_value(value: &serde_json::Value) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let mut writer = HashWriter(&mut hasher);
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => hasher.finish(),
+        Err(_) => hash_str(&value.to_string()),
+    }
+}
+
+fn hash_serialized_system_prompt(system_blocks: &[SerializedSystemBlock]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for (idx, block) in system_blocks.iter().enumerate() {
+        if idx > 0 {
+            hasher.write(b"\n\n");
+        }
+        hasher.write(block.text.as_bytes());
+    }
+    hasher.write_u8(0xff);
+    hasher.finish()
+}
+
 fn fingerprint_system_blocks(
     system_blocks: &[SerializedSystemBlock],
 ) -> Vec<SystemBlockFingerprint> {
@@ -1085,6 +1116,20 @@ fn write_diff_artifact(
         serde_json::to_vec_pretty(&payload).unwrap_or_else(|_| b"{}".to_vec()),
     )?;
     Ok(path)
+}
+
+fn spawn_diff_artifact_write(
+    dir: std::path::PathBuf,
+    seq: u32,
+    prev: Option<PromptStateSnapshot>,
+    curr: PromptStateSnapshot,
+    event: CacheBreakEvent,
+) {
+    let _ = std::thread::Builder::new()
+        .name("cache-diff-artifact".into())
+        .spawn(move || {
+            let _ = write_diff_artifact(&dir, seq, prev.as_ref(), &curr, &event);
+        });
 }
 
 fn render_unified_snapshot_patch(
@@ -1614,6 +1659,64 @@ mod tests {
     }
 
     #[test]
+    fn capture_serialized_matches_plain_hashing_contract() {
+        use crate::section_types::{CacheScope, SectionKind};
+
+        let block_a = SerializedSystemBlock {
+            kind: SectionKind::Identity,
+            scope: CacheScope::Session,
+            text: "alpha".into(),
+            cache_control: None,
+        };
+        let block_b = SerializedSystemBlock {
+            kind: SectionKind::ProjectContext,
+            scope: CacheScope::Session,
+            text: "beta".into(),
+            cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+        };
+        let tools = make_tools(&["bash", "grep"]);
+        let serialized = PromptStateSnapshot::capture_serialized(
+            &[block_a.clone(), block_b.clone()],
+            &tools,
+            "anthropic",
+            "claude",
+            42,
+        );
+        let plain = PromptStateSnapshot::capture_with_provider(
+            "alpha\n\nbeta",
+            &[block_a, block_b],
+            &tools,
+            "anthropic",
+            "claude",
+            42,
+        );
+
+        assert_eq!(serialized.system_prompt_hash, plain.system_prompt_hash);
+        assert_eq!(serialized.cache_control_hash, plain.cache_control_hash);
+        assert_eq!(serialized.tools_hash, plain.tools_hash);
+        assert_eq!(serialized.per_tool_hashes, plain.per_tool_hashes);
+    }
+
+    fn wait_for_artifacts(dir: &std::path::Path, expected: usize) -> Vec<std::path::PathBuf> {
+        for _ in 0..50 {
+            let files: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .collect();
+            if files.len() >= expected {
+                return files;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect()
+    }
+
+    #[test]
     fn empty_detector_status() {
         let det = CacheBreakDetector::new();
         assert!(det.status_line().contains("no turns"));
@@ -1879,10 +1982,9 @@ mod tests {
         det.record_turn(snap("v1", &make_tools(&["bash"]), "claude"), None);
         det.record_turn(snap("v2", &make_tools(&["bash"]), "claude"), None);
 
-        let files: Vec<_> = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
+        let files: Vec<_> = wait_for_artifacts(tmp.path(), 2)
+            .into_iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(files.len(), 2, "json + patch artifacts expected: {files:?}");
         let json_file = files
@@ -2085,11 +2187,7 @@ mod tests {
         // Now break B. The artifact's `prev` must be B's v1, not A's prompt.
         det.record_turn_for_source("B", snap("prompt-B-v2", &tools, "m"), None);
 
-        let files: Vec<_> = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .collect();
+        let files = wait_for_artifacts(tmp.path(), 2);
         assert_eq!(files.len(), 2, "json + patch artifacts expected");
         let json_path = files
             .iter()

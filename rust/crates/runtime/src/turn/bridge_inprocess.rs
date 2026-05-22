@@ -1444,9 +1444,6 @@ impl InProcessChatTurnBridge {
             let mut memory_preview: Vec<String> = Vec::new();
 
             // System prompt — tells LLM about available tools and how to use them
-            let tool_names: Vec<&str> = edge_tools.iter()
-                .filter_map(|t| t.get("function").and_then(|f| f.get("name")).and_then(Value::as_str))
-                .collect();
             // Environment context is split by cache volatility:
             //
             // * `environment_static`  (Platform, Shell, CWD, Home) →
@@ -1997,8 +1994,7 @@ impl InProcessChatTurnBridge {
             let pipeline_outcome = crate::turn::llm_context::assemble_bridge_context(
                 crate::turn::llm_context::BridgeContextAssemblyInput {
                     tool_surface:
-                        crate::turn::llm_context::BridgeToolSurfacePlan::from_visible_tools(
-                            &tool_names,
+                        crate::turn::llm_context::ToolSurfacePlan::from_visible_tools(
                             &edge_tools,
                             &bridge_restricted_snapshot,
                         )
@@ -6319,9 +6315,24 @@ mod tests {
             .session_dir(session_id)
             .expect("session dir")
             .join("prompt-cache-diffs");
-        let entries = std::fs::read_dir(&diff_dir)
-            .expect("prompt-cache diff dir")
-            .count();
+        let entries = (0..50)
+            .find_map(|_| match std::fs::read_dir(&diff_dir) {
+                Ok(read_dir) => {
+                    let count = read_dir.count();
+                    if count > 0 {
+                        Some(count)
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        None
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    None
+                }
+                Err(error) => panic!("prompt-cache diff dir: {error}"),
+            })
+            .unwrap_or(0);
         assert!(
             entries > 0,
             "bridge baseline should emit prompt-cache diff artifacts into the session dir"

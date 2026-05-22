@@ -63,6 +63,13 @@ pub const LLM_TIMEOUT: Duration = Duration::from_secs(30);
 /// this keeps per-call cost predictable on pricier selectors.
 pub const EXTRACTION_MAX_OUTPUT_TOKENS: usize = 4096;
 
+fn contains_ascii_case_insensitive(haystack: &str, needle: &[u8]) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 fn should_force_shutdown_refresh(messages: &[Value], current_tokens: usize) -> bool {
     let mut conversational_messages = 0usize;
     let mut total_chars = 0usize;
@@ -109,10 +116,9 @@ fn should_force_shutdown_refresh(messages: &[Value], current_tokens: usize) -> b
         };
         conversational_messages += 1;
         total_chars += text.chars().count();
-        let lower = text.to_ascii_lowercase();
-        if lower.contains("error")
-            || lower.contains("fail")
-            || lower.contains("panic")
+        if contains_ascii_case_insensitive(&text, b"error")
+            || contains_ascii_case_insensitive(&text, b"fail")
+            || contains_ascii_case_insensitive(&text, b"panic")
             || text.contains("错误")
             || text.contains("失败")
         {
@@ -351,16 +357,20 @@ impl MemoryExtractionService {
             return SpawnDecision::Skipped;
         }
 
-        let already_fresh = self
-            .session_states
-            .lock()
-            .ok()
-            .and_then(|states| states.get(&req.session_id).cloned())
-            .is_some_and(|state| {
+        let already_fresh = match self.session_states.lock() {
+            Ok(states) => states.get(&req.session_id).cloned().is_some_and(|state| {
                 !req.had_error
                     && state.initialized
                     && req.current_tokens <= state.tokens_at_last_extraction
-            });
+            }),
+            Err(_) => {
+                tracing::warn!(
+                    session_id = %req.session_id,
+                    "session_memory session_states mutex poisoned during shutdown flush freshness check"
+                );
+                false
+            }
+        };
         if already_fresh {
             return SpawnDecision::Skipped;
         }

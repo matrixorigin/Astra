@@ -845,6 +845,31 @@ fn evaluate_one(
             },
             Some(capture) => {
                 let report = analyze_pipeline_health(capture);
+                if report.turns_with_feedback == 0 {
+                    return if *optional {
+                        CriterionResult {
+                            criterion: c.clone(),
+                            severity: criterion_severity(c),
+                            passed: true,
+                            detail:
+                                "pipeline cache ratio skipped (optional + no pipeline feedback turns)"
+                                    .into(),
+                            full_detail: None,
+                            score: None,
+                        }
+                    } else {
+                        CriterionResult {
+                            criterion: c.clone(),
+                            severity: criterion_severity(c),
+                            passed: false,
+                            detail:
+                                "no pipeline feedback turns available — cannot evaluate cache ratio"
+                                    .into(),
+                            full_detail: None,
+                            score: None,
+                        }
+                    };
+                }
                 let passed = report.turns_with_feedback > 0 && report.avg_cache_hit_ratio >= *min;
                 CriterionResult {
                     criterion: c.clone(),
@@ -1448,6 +1473,38 @@ mod tests {
         );
         assert!(r[0].passed);
         assert!(r[0].detail.contains("skipped"));
+    }
+
+    #[test]
+    fn pipeline_avg_cache_hit_ratio_optional_skips_when_no_feedback_turns() {
+        let sess = mk_session(&[]);
+        let out = outcome_with_tools(&[]);
+        let r = evaluate_deterministic_with_session(
+            &[Criterion::PipelineAvgCacheHitRatio {
+                min: 0.8,
+                optional: true,
+            }],
+            &out,
+            Some(&sess),
+        );
+        assert!(r[0].passed, "optional=true must skip-pass");
+        assert!(r[0].detail.contains("skipped"));
+    }
+
+    #[test]
+    fn pipeline_avg_cache_hit_ratio_fails_when_no_feedback_turns_and_required() {
+        let sess = mk_session(&[]);
+        let out = outcome_with_tools(&[]);
+        let r = evaluate_deterministic_with_session(
+            &[Criterion::PipelineAvgCacheHitRatio {
+                min: 0.8,
+                optional: false,
+            }],
+            &out,
+            Some(&sess),
+        );
+        assert!(!r[0].passed);
+        assert!(r[0].detail.contains("no pipeline feedback turns"));
     }
 
     // ── validate_criterion / validate_criteria (R3 #2) ──

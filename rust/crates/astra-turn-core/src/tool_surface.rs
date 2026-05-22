@@ -3,7 +3,7 @@
 use serde_json::Value;
 
 use crate::capability::CapabilitySet;
-use crate::tool_registry_meta::{Scope, TOOL_CATALOG};
+use crate::tool_registry_meta::TOOL_CATALOG;
 
 /// User-facing execution surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -21,18 +21,10 @@ pub enum Surface {
 pub struct ResolveOutcome {
     pub schemas: Vec<Value>,
     pub missing_schemas: Vec<&'static str>,
+    /// Built-in catalog tools excluded by surface policy before capability
+    /// filtering. This is currently empty because runtime source selection
+    /// pre-filters the schema pool per surface.
     pub dropped_by_surface: Vec<&'static str>,
-}
-
-/// True when `surface` may execute a tool with this `scope`.
-///
-/// `Scope` describes where the tool executes, not who may ask for it. A
-/// `Scope::Local` tool such as `read_file` runs against the executor's
-/// workspace, which exists on every surface (CLI workspace for local CLI,
-/// server workspace for Web/remote CLI). Capability requirements are the
-/// primary differentiator.
-fn surface_admits(_scope: Scope, _surface: Surface) -> bool {
-    true
 }
 
 /// Resolve schemas to advertise to the model for one turn.
@@ -50,16 +42,15 @@ pub fn resolve_with_diagnostics(
     capabilities: &CapabilitySet,
     all_schemas: &[Value],
 ) -> ResolveOutcome {
+    // The caller already selected the schema pool for this surface; keep the
+    // parameter so the resolver API remains explicit and future narrowing does
+    // not need another signature change.
+    let _ = surface;
     let mut schemas = Vec::new();
     let mut missing_schemas = Vec::new();
-    let mut dropped_by_surface = Vec::new();
     let mut emitted = std::collections::HashSet::new();
 
     for meta in TOOL_CATALOG {
-        if !surface_admits(meta.scope, surface) {
-            dropped_by_surface.push(meta.name);
-            continue;
-        }
         if !capabilities.has_all(meta.requires) {
             continue;
         }
@@ -88,7 +79,7 @@ pub fn resolve_with_diagnostics(
     ResolveOutcome {
         schemas,
         missing_schemas,
-        dropped_by_surface,
+        dropped_by_surface: Vec::new(),
     }
 }
 
@@ -217,16 +208,14 @@ mod tests {
     }
 
     #[test]
-    fn surface_admits_is_currently_open() {
-        for scope in [
-            Scope::Local,
-            Scope::LocalGit,
-            Scope::External,
-            Scope::CrossSession,
-        ] {
-            for surface in [Surface::Web, Surface::CliRemote, Surface::CliLocal] {
-                assert!(surface_admits(scope, surface));
-            }
+    fn diagnostics_do_not_report_surface_drops_when_pool_is_pre_filtered() {
+        let pool = vec![schema("bash"), schema("agent"), schema("memory")];
+        for surface in [Surface::Web, Surface::CliRemote, Surface::CliLocal] {
+            let outcome = resolve_with_diagnostics(surface, &CapabilitySet::empty(), &pool);
+            assert!(
+                outcome.dropped_by_surface.is_empty(),
+                "surface filtering is owned by the upstream schema pool; resolver should not report phantom drops"
+            );
         }
     }
 }
