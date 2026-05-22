@@ -65,7 +65,7 @@ impl WorkflowService for UnconfiguredWorkflowService {
     async fn list_workflows(
         &self,
     ) -> Result<Vec<WorkflowListItem>, (StatusCode, Json<ErrorResponse>)> {
-        Err(internal_error("workflow service not configured"))
+        Ok(Vec::new())
     }
 
     async fn get_workflow(

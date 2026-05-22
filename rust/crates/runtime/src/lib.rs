@@ -52,6 +52,7 @@ pub mod sandbox;
 pub mod skill_config;
 pub mod skills;
 pub mod triggers;
+pub(crate) mod workflows;
 
 // ── Internal modules: runtime storage helpers ────────────────────────────────
 

@@ -66,6 +66,7 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             "/triggers/{trigger_id}/fire",
             post(triggers::fire_webhook_handler),
         )
+        .route("/workflows", get(workflows::list_workflows_handler))
         .route(
             "/sandbox",
             post(sandbox::create_sandbox_handler).get(sandbox::list_sandboxes_handler),

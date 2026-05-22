@@ -1019,14 +1019,14 @@ impl HarnessService for DatabaseHarnessService {
         let current = self
             .load_item_locked(&mut tx, &harness_run_id, &item_id)
             .await?;
-        if let Some(idempotency_key) = request.idempotency_key.as_deref() {
-            if decision_history_contains_idempotency(
+        if let Some(idempotency_key) = request.idempotency_key.as_deref()
+            && decision_history_contains_idempotency(
                 &current.decision_history_json,
                 idempotency_key,
-            ) {
-                tx.commit().await.map_err(internal_error)?;
-                return Ok(current);
-            }
+            )
+        {
+            tx.commit().await.map_err(internal_error)?;
+            return Ok(current);
         }
         let decision = request.decision.trim();
         let (status, final_output) = match decision {
@@ -1141,16 +1141,16 @@ impl HarnessService for DatabaseHarnessService {
         let current = self
             .load_skill_draft_locked(&mut tx, &harness_run_id, &skill_draft_id)
             .await?;
-        if let Some(idempotency_key) = request.idempotency_key.as_deref() {
-            if decision_history_contains_idempotency(
+        if let Some(idempotency_key) = request.idempotency_key.as_deref()
+            && decision_history_contains_idempotency(
                 &current.decision_history_json,
                 idempotency_key,
-            ) {
-                tx.commit().await.map_err(internal_error)?;
-                return self
-                    .load_skill_draft(&harness_run_id, &skill_draft_id)
-                    .await;
-            }
+            )
+        {
+            tx.commit().await.map_err(internal_error)?;
+            return self
+                .load_skill_draft(&harness_run_id, &skill_draft_id)
+                .await;
         }
         let decision = request.decision.trim();
         let (status, content_markdown, decision_after_json) = match decision {
@@ -1287,16 +1287,16 @@ impl HarnessService for DatabaseHarnessService {
         let current = self
             .load_skill_rule_locked(&mut tx, &harness_run_id, &skill_draft_id, &skill_rule_id)
             .await?;
-        if let Some(idempotency_key) = request.idempotency_key.as_deref() {
-            if decision_history_contains_idempotency(
+        if let Some(idempotency_key) = request.idempotency_key.as_deref()
+            && decision_history_contains_idempotency(
                 &current.decision_history_json,
                 idempotency_key,
-            ) {
-                tx.commit().await.map_err(internal_error)?;
-                return self
-                    .load_skill_draft(&harness_run_id, &skill_draft_id)
-                    .await;
-            }
+            )
+        {
+            tx.commit().await.map_err(internal_error)?;
+            return self
+                .load_skill_draft(&harness_run_id, &skill_draft_id)
+                .await;
         }
         let decision = request.decision.trim();
         let (status, statement, rationale, decision_after_json) = match decision {

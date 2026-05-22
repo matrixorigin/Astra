@@ -409,11 +409,7 @@ impl AskUserView {
             let focused = state.cursor_row == idx;
             let selected = state.selected.contains(&idx);
             let selector = if question.multi_select {
-                if selected {
-                    "[x]"
-                } else {
-                    "[ ]"
-                }
+                if selected { "[x]" } else { "[ ]" }
             } else if selected {
                 "(*)"
             } else {
