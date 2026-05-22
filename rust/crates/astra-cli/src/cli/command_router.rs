@@ -19,6 +19,21 @@ pub(super) enum ExitCode {
     ApiError = 3,
 }
 
+async fn start_http_server(host: &str, port: u16) -> Result<(), String> {
+    let addr: std::net::SocketAddr = format!("{host}:{port}")
+        .parse()
+        .map_err(|e| format!("Invalid listen address: {e}"))?;
+    eprintln!(
+        "  {} {} on {}",
+        "▸".bold().magenta(),
+        "Starting API server".bold(),
+        addr.to_string().magenta()
+    );
+    astra_runtime::serve(addr)
+        .await
+        .map_err(|e| format!("API server failed to start: {e}"))
+}
+
 impl From<ExitCode> for i32 {
     fn from(code: ExitCode) -> i32 {
         code as i32
@@ -502,6 +517,7 @@ async fn execute_headless_task_body(
         pm.mode(),
         skill_search.clone(),
         session_id.clone(),
+        global_model.map(str::to_owned),
     )
     .await;
     let spawner_handle_for_drain = spawner.clone();
@@ -1623,6 +1639,10 @@ async fn execute_repl_bridge_command(
     if let Ok(name) = std::env::var("ASTRA_CLI_SESSION_NAME") {
         state.session_name = Some(name);
     }
+    if slash_cmd == "/messaging" {
+        handle_messaging_command(arg, &state);
+        return Ok(ExitCode::Success);
+    }
     let task_service = session_runtime::resolve_task_service(profile).await;
     session_runtime::install_task_service(&mut state, task_service);
     let (task_store, task_notify_tx) =
@@ -1834,20 +1854,26 @@ pub(super) async fn execute_cli_command(
             Ok(ExitCode::Success)
         }
 
-        // Start embedded HTTP API server
         Some(Command::Serve(args)) => {
-            let addr: std::net::SocketAddr = format!("{}:{}", args.host, args.port)
-                .parse()
-                .map_err(|e| format!("Invalid listen address: {e}"))?;
-            eprintln!(
-                "  {} {} on {}",
-                "▸".bold().magenta(),
-                "Starting API server".bold(),
-                addr.to_string().magenta()
-            );
-            astra_runtime::serve(addr)
-                .await
-                .map_err(|e| format!("API server failed to start: {e}"))?;
+            match args.mode {
+                None => {
+                    start_http_server(&args.host, args.port).await?;
+                }
+                Some(crate::cli_args::ServeMode::Http(http_args)) => {
+                    start_http_server(&http_args.host, http_args.port).await?;
+                }
+                Some(crate::cli_args::ServeMode::Stdio) => {
+                    crate::app_server::run_stdio_app_server(
+                        "stdio://",
+                        api,
+                        profile.as_deref(),
+                        global_model.as_deref(),
+                        system_prompt.as_deref(),
+                        auto_approve,
+                    )
+                    .await?;
+                }
+            }
             Ok(ExitCode::Success)
         }
 
@@ -2377,6 +2403,10 @@ pub(super) async fn execute_cli_command(
                 pm.mode(),
                 skill_search.clone(),
                 session_id.clone(),
+                args.model
+                    .as_deref()
+                    .or(global_model.as_deref())
+                    .map(str::to_owned),
             )
             .await;
 
@@ -2450,6 +2480,7 @@ pub(super) async fn execute_cli_command(
             );
             params.pre_loaded_messages = continuation_messages.take();
             params.append_system_prompt = args.append_system_prompt.clone();
+            let turn_start = std::time::Instant::now();
             let mut sr = match stream_chat_sse(params).await {
                 Ok(sr) => sr,
                 Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
@@ -2471,6 +2502,13 @@ pub(super) async fn execute_cli_command(
             if let Some(sid) = &sr.session_id {
                 persist_profile_last_session(profile.as_deref(), sid)?;
             }
+            super::chat_turn::append_one_shot_journal_events(
+                sr.session_id.as_deref(),
+                args.model.as_deref().or(global_model.as_deref()),
+                &message,
+                &sr,
+                turn_start,
+            );
 
             // Drain any background-spawned child agents before
             // returning. Without this, background tasks (the
@@ -4010,6 +4048,7 @@ fn format_policy_output(
             "max_tools_per_turn": policy.max_tools_per_turn,
             "repeated_cache_hit_suppression": policy.repeated_cache_hit_suppression,
             "max_consecutive_empty_name": policy.max_consecutive_empty_name,
+            "parallel_batching_force_streak": policy.parallel_batching_force_streak,
             // Always present as an array (possibly empty) so json consumers
             // never have to special-case the absent-vs-empty case.
             "rejected_model_match_patterns": rejected_patterns,
@@ -4024,11 +4063,13 @@ fn format_policy_output(
              \n  max_identical_tool_calls       = {}\
              \n  max_tools_per_turn             = {}\
              \n  repeated_cache_hit_suppression = {}\
-             \n  max_consecutive_empty_name     = {}\n",
+             \n  max_consecutive_empty_name     = {}\
+             \n  parallel_batching_force_streak = {}\n",
             policy.max_identical_tool_calls,
             policy.max_tools_per_turn,
             policy.repeated_cache_hit_suppression,
             policy.max_consecutive_empty_name,
+            policy.parallel_batching_force_streak,
         );
         if !rejected_patterns.is_empty() {
             out.push_str(
@@ -4976,11 +5017,12 @@ mod show_policy_tests {
             max_tools_per_turn: 20,
             repeated_cache_hit_suppression: 4,
             max_consecutive_empty_name: 3,
+            parallel_batching_force_streak: 5,
         }
     }
 
     #[test]
-    fn human_output_includes_all_four_guard_fields_and_model_label() {
+    fn human_output_includes_all_guard_fields_and_model_label() {
         let out = format_policy_output(Some("opus"), &fake_policy(), "strict", &[], false);
         assert!(out.contains("opus"), "model label missing: {out}");
         assert!(
@@ -4996,6 +5038,10 @@ mod show_policy_tests {
         );
         assert!(
             out.contains("max_consecutive_empty_name"),
+            "field missing: {out}"
+        );
+        assert!(
+            out.contains("parallel_batching_force_streak"),
             "field missing: {out}"
         );
         assert!(

@@ -186,7 +186,12 @@ pub struct E2eMemoriaStub {
 
 #[async_trait]
 impl MemoriaForwarder for E2eMemoriaStub {
-    async fn forward(&self, endpoint: &str, body: Value) -> Result<Value, String> {
+    async fn forward(
+        &self,
+        _method: reqwest::Method,
+        endpoint: &str,
+        body: Value,
+    ) -> Result<Value, String> {
         self.calls.lock().await.push((endpoint.to_string(), body));
         if endpoint.contains("retrieve") {
             return Ok(json!({ "memories": [] }));

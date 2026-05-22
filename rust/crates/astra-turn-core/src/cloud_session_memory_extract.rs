@@ -169,7 +169,32 @@ fn render_recent(messages: &[Value]) -> String {
     let recent: Vec<_> = messages.iter().rev().take(20).collect();
     for msg in recent.into_iter().rev() {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("?");
-        let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
+        let content = if let Some(text) = msg.get("content").and_then(Value::as_str) {
+            text.to_string()
+        } else if role == "assistant" {
+            let names: Vec<&str> = msg
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .map(|tool_calls| {
+                    tool_calls
+                        .iter()
+                        .filter_map(|tool_call| {
+                            tool_call
+                                .get("function")
+                                .and_then(|function| function.get("name"))
+                                .and_then(Value::as_str)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if names.is_empty() {
+                String::new()
+            } else {
+                format!("[called: {}]", names.join(", "))
+            }
+        } else {
+            String::new()
+        };
         let trunc = if content.len() > 500 {
             // Safe truncation: walk backwards from 500 to find a valid char boundary
             let mut end = 500;
@@ -178,7 +203,7 @@ fn render_recent(messages: &[Value]) -> String {
             }
             &content[..end]
         } else {
-            content
+            &content
         };
         match role {
             "user" => out.push_str(&format!("[USER]: {trunc}\n")),

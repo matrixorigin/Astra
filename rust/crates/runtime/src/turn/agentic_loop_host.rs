@@ -855,6 +855,10 @@ pub struct AgenticLoopState {
     /// Actual number of LLM calls completed in this turn (not inflated by
     /// progressive penalty).  Used for round budget guidance injection.
     pub llm_rounds_completed: u32,
+    /// Number of history messages that were visible to the most recent LLM
+    /// request. Microcompact uses this to avoid rewriting older, already-sent
+    /// tool results while still allowing compaction of newly appended results.
+    pub last_request_message_count: Option<usize>,
     pub turn_guard: TurnGuard,
     pub restricted_tools: HashSet<String>,
     /// Positive allowlist bias populated by pipeline `add_tools` strategy.
@@ -1803,6 +1807,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
         current_round_index: 0,
         llm_rounds_completed: 0,
+        last_request_message_count: None,
         turn_guard: TurnGuard::new(),
         restricted_tools: HashSet::new(),
         boosted_tools: HashSet::new(),
@@ -2159,6 +2164,7 @@ pub(crate) mod tests {
             agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
             current_round_index: 0,
             llm_rounds_completed: 0,
+            last_request_message_count: None,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),
@@ -8288,33 +8294,59 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
     #[tokio::test]
     async fn microcompact_actually_reduces_content_size() {
-        // Direct verification: inject large tool results into messages,
-        // run the loop, and verify content was replaced.
+        // Direct verification of the runtime microcompact path: preserve the
+        // request prefix, then clear older compactable tool results in-place.
         let big = "x".repeat(1000);
-        let mut host = MockHost::new(vec![
-            // Iteration 1: returns tools
-            edge_tool_result(vec![make_edge_tool("bash", "ok")], 100, 50, Some(30)),
-            // Iteration 2: final text
-            text_result("Done.", 50, 20, None),
-        ]);
         let mut state = make_state();
         state
             .messages
             .push(json!({"role": "user", "content": "go"}));
+        state.last_request_message_count = Some(state.messages.len());
 
-        // Pre-populate messages with old tool results (simulating prior iterations).
-        // These are already in the history before the loop starts.
-        for i in 0..10 {
-            state.messages.push(json!({"role": "assistant", "content": "", "tool_calls": [{"id": format!("old-{i}"), "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]}));
-            state
-                .messages
-                .push(json!({"role": "tool", "tool_call_id": format!("old-{i}"), "content": &big}));
+        for (i, name) in [
+            "read_file",
+            "grep",
+            "git_diff",
+            "read_file",
+            "grep",
+            "git_show",
+            "read_file",
+            "glob",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let call_id = format!("call-{i}");
+            state.messages.push(json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": "{}"}
+                }]
+            }));
+            state.messages.push(json!({
+                "role": "tool",
+                "tool_call_id": format!("call-{i}"),
+                "content": &big,
+            }));
         }
 
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
+        let stats = astra_turn_core::microcompact::compact_tool_results_adaptive_with_persistence_protected_prefix(
+            &mut state.messages,
+            0.0,
+            state.compact_strategy,
+            None,
+            state.last_request_message_count,
+        );
 
-        // Count how many old tool results were compacted
+        assert!(
+            stats.results_compacted >= 2,
+            "expected at least 2 compacted results from 8 tool results (keep=6), got {}",
+            stats.results_compacted
+        );
+
         let compacted = state
             .messages
             .iter()
@@ -8326,11 +8358,9 @@ print(json.dumps({'context': 'user said: ' + msg}))
             })
             .count();
 
-        // 10 pre-populated + at least 1 from iteration 1 = 11+ tool results.
-        // Keep 6, so at least 5 should be compacted.
         assert!(
-            compacted >= 4,
-            "expected at least 4 compacted results from 10+ tool results (keep=6), got {}",
+            compacted >= 2,
+            "expected at least 2 compacted results from 8 tool results (keep=6), got {}",
             compacted
         );
 
@@ -8341,10 +8371,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
             .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
             .map(|m| m.get("content").and_then(Value::as_str).unwrap_or("").len())
             .sum();
-        // Without compaction: 10 * 1000 + small = ~10000 bytes
-        // With compaction: 4+ cleared (32 bytes each) + 6 kept (1000 each) = ~6200
         assert!(
-            total_content_bytes < 8000,
+            total_content_bytes < 7000,
             "expected reduced content after compaction, got {} bytes",
             total_content_bytes
         );

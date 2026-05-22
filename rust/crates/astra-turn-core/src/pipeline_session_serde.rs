@@ -151,6 +151,9 @@ mod tests {
                 recovery,
                 emergent: Default::default(),
                 working_memory: Default::default(),
+                cache_detector_state: Default::default(),
+                pending_prompt_snapshot: None,
+                turns_completed: 0,
             },
         );
         let value = serde_json::to_value(session.snapshot_full_state()).unwrap();
@@ -197,6 +200,8 @@ mod tests {
                     snapshot.working_memory.is_empty(),
                     "old checkpoints must restore with empty working memory instead of failing"
                 );
+                assert_eq!(snapshot.turns_completed, 0);
+                assert!(snapshot.pending_prompt_snapshot.is_none());
             }
             other => panic!("expected legacy snapshot to restore, got {other:?}"),
         }
@@ -233,6 +238,9 @@ mod tests {
                 recovery: RecoveryState::default(),
                 emergent: Default::default(),
                 working_memory: Default::default(),
+                cache_detector_state: Default::default(),
+                pending_prompt_snapshot: None,
+                turns_completed: 0,
             },
         );
         original

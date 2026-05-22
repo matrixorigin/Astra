@@ -618,8 +618,10 @@ pub struct ToolSelectionConfig {
 
     /// Mid-loop guard: number of consecutive single-tool rounds tolerated
     /// before the runtime injects a parallel-batching corrective. 0 = use
-    /// default (5). Lower values intervene more aggressively; higher values
-    /// give the model more rope before correction.
+    /// default (5 — one above the prompt-layer nudge at streak 4 so the
+    /// soft→hard cascade is preserved). Lower values intervene more
+    /// aggressively; higher values give the model more rope before
+    /// correction.
     #[serde(default)]
     pub parallel_batching_force_streak: u32,
 
@@ -729,6 +731,11 @@ pub struct ModelPolicyProfile {
     /// `MAX_CONSECUTIVE_EMPTY_NAME` (was 3).
     #[serde(default)]
     pub max_consecutive_empty_name: u32,
+
+    /// Override for the mid-loop parallel-batching force streak threshold.
+    /// 0 = inherit from the global [`ToolSelectionConfig`].
+    #[serde(default)]
+    pub parallel_batching_force_streak: u32,
 }
 
 /// Resolved per-model workflow-guard policy.
@@ -744,6 +751,9 @@ pub struct EffectiveToolPolicy {
     pub repeated_cache_hit_suppression: u32,
     /// Abort headless round after this many consecutive empty-name calls.
     pub max_consecutive_empty_name: u32,
+    /// Mid-loop guard threshold for escalating single-tool streaks into a
+    /// parallel-batching corrective.
+    pub parallel_batching_force_streak: u32,
 }
 
 impl ToolSelectionConfig {
@@ -782,6 +792,7 @@ impl ToolSelectionConfig {
             // legitimate, not a loop).
             repeated_cache_hit_suppression: 3,
             max_consecutive_empty_name: 3,
+            parallel_batching_force_streak: self.effective_parallel_batching_force_streak(),
         };
 
         let Some(model) = model.map(str::to_ascii_lowercase) else {
@@ -825,6 +836,7 @@ impl ToolSelectionConfig {
                     max_tools_per_turn: 20,
                     repeated_cache_hit_suppression: 4,
                     max_consecutive_empty_name: 3,
+                    parallel_batching_force_streak: 0,
                 },
                 // Sonnet 4.x — strong mid tier.
                 ModelPolicyProfile {
@@ -833,6 +845,7 @@ impl ToolSelectionConfig {
                     max_tools_per_turn: 18,
                     repeated_cache_hit_suppression: 4,
                     max_consecutive_empty_name: 3,
+                    parallel_batching_force_streak: 0,
                 },
                 // Haiku — fast tier, keep conservative to catch derps early.
                 ModelPolicyProfile {
@@ -841,6 +854,7 @@ impl ToolSelectionConfig {
                     max_tools_per_turn: 12,
                     repeated_cache_hit_suppression: 2,
                     max_consecutive_empty_name: 2,
+                    parallel_batching_force_streak: 0,
                 },
                 // GPT-5 / o-series — treat as strong tier.
                 ModelPolicyProfile {
@@ -849,6 +863,7 @@ impl ToolSelectionConfig {
                     max_tools_per_turn: 20,
                     repeated_cache_hit_suppression: 4,
                     max_consecutive_empty_name: 3,
+                    parallel_batching_force_streak: 0,
                 },
             ]
         })
@@ -906,10 +921,22 @@ impl ToolSelectionConfig {
         resolve_threshold(self.circuit_breaker_max_introspect_emissions, 3, 1)
     }
 
-    /// Resolved parallel-batching force streak threshold (0 → default of 5).
-    /// Floor of 2 prevents a misconfiguration from triggering on every round.
+    /// Resolved parallel-batching force streak threshold.
+    ///
+    /// Default = [`MIN_PARALLEL_BATCHING_FORCE_STREAK`] (currently
+    /// `PARALLEL_BATCHING_NUDGE_THRESHOLD + 1`: the nudge fires at streak 4;
+    /// the force is one round later so the model gets exactly one chance to
+    /// self-correct before we inject a hard `user`-role corrective).
+    /// Floor must stay strictly above `PARALLEL_BATCHING_NUDGE_THRESHOLD` (=4
+    /// in `astra_runtime::prompts::system`) so the soft→hard cascade is
+    /// preserved even when a user explicitly sets a small override; otherwise
+    /// the runtime hard corrective fires before the prompt-layer ever nudges.
+    /// The mirror-image floor in `apply_profile` MUST agree.
+    ///
+    /// This is the canonical non-model baseline used by
+    /// [`ToolSelectionConfig::resolve_for_model`] when seeding the base policy.
     pub fn effective_parallel_batching_force_streak(&self) -> u32 {
-        resolve_threshold(self.parallel_batching_force_streak, 5, 2)
+        resolve_parallel_batching_force_streak(self.parallel_batching_force_streak)
     }
 
     /// Resolved redundant-reads mid-loop corrective threshold (0 → default
@@ -960,6 +987,29 @@ impl ToolSelectionConfig {
 /// is 0, otherwise `value` clamped to at least `floor`.
 fn resolve_threshold(value: u32, default: u32, floor: u32) -> u32 {
     if value > 0 { value.max(floor) } else { default }
+}
+
+fn resolve_threshold_with_cap(value: u32, default: u32, floor: u32, cap: u32) -> u32 {
+    resolve_threshold(value, default, floor).min(cap)
+}
+
+/// Minimum admitted value for `parallel_batching_force_streak` (global and
+/// per-model). Mirrors `PARALLEL_BATCHING_NUDGE_THRESHOLD` (=4) in the
+/// runtime: the hard corrective MUST fire strictly later than the prompt
+/// nudge, so the floor is `nudge + 1 = 5`. Both `effective_*` and
+/// `apply_profile` use this constant — they MUST stay in lockstep.
+pub const MIN_PARALLEL_BATCHING_FORCE_STREAK: u32 = 5;
+/// Upper bound for `parallel_batching_force_streak` to keep the hard
+/// corrective reachable even under pathological user overrides.
+pub const MAX_PARALLEL_BATCHING_FORCE_STREAK: u32 = 50;
+
+fn resolve_parallel_batching_force_streak(value: u32) -> u32 {
+    resolve_threshold_with_cap(
+        value,
+        MIN_PARALLEL_BATCHING_FORCE_STREAK,
+        MIN_PARALLEL_BATCHING_FORCE_STREAK,
+        MAX_PARALLEL_BATCHING_FORCE_STREAK,
+    )
 }
 
 /// Minimum pattern length for a non-empty [`ModelPolicyProfile::model_match`].
@@ -1017,6 +1067,10 @@ impl ToolSelectionConfig {
 ///   the guard.
 /// - `max_consecutive_empty_name` floor 1 — 0 would abort on the very first
 ///   empty-name call.
+/// - `parallel_batching_force_streak` floor 5
+///   ([`MIN_PARALLEL_BATCHING_FORCE_STREAK`]) — must stay strictly above the
+///   prompt-layer nudge threshold so the soft→hard cascade is preserved even
+///   when a user configures a too-small per-model override.
 fn apply_profile(base: EffectiveToolPolicy, profile: &ModelPolicyProfile) -> EffectiveToolPolicy {
     EffectiveToolPolicy {
         max_identical_tool_calls: if profile.max_identical_tool_calls > 0 {
@@ -1038,6 +1092,11 @@ fn apply_profile(base: EffectiveToolPolicy, profile: &ModelPolicyProfile) -> Eff
             profile.max_consecutive_empty_name.max(1)
         } else {
             base.max_consecutive_empty_name
+        },
+        parallel_batching_force_streak: if profile.parallel_batching_force_streak > 0 {
+            resolve_parallel_batching_force_streak(profile.parallel_batching_force_streak)
+        } else {
+            base.parallel_batching_force_streak
         },
     }
 }
@@ -2494,21 +2553,122 @@ mod tests {
 
     #[test]
     fn parallel_batching_force_streak_default_and_floor() {
-        // 0 → default 5
+        // 0 → default 5 (must stay above PARALLEL_BATCHING_NUDGE_THRESHOLD=4
+        // so the prompt-side nudge fires before the runtime force corrective).
         let cfg = ToolSelectionConfig::default();
-        assert_eq!(cfg.effective_parallel_batching_force_streak(), 5);
+        assert_eq!(
+            cfg.effective_parallel_batching_force_streak(),
+            MIN_PARALLEL_BATCHING_FORCE_STREAK
+        );
         // explicit override respected
         let cfg = ToolSelectionConfig {
             parallel_batching_force_streak: 8,
             ..Default::default()
         };
         assert_eq!(cfg.effective_parallel_batching_force_streak(), 8);
-        // pathological override 1 floors to 2
+        let cfg = ToolSelectionConfig {
+            parallel_batching_force_streak: u32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.effective_parallel_batching_force_streak(),
+            MAX_PARALLEL_BATCHING_FORCE_STREAK
+        );
+        // pathological override 1 floors to MIN_PARALLEL_BATCHING_FORCE_STREAK
+        // (5 — strictly above PARALLEL_BATCHING_NUDGE_THRESHOLD=4 to preserve
+        // the soft→hard cascade).
         let cfg = ToolSelectionConfig {
             parallel_batching_force_streak: 1,
             ..Default::default()
         };
-        assert_eq!(cfg.effective_parallel_batching_force_streak(), 2);
+        assert_eq!(
+            cfg.effective_parallel_batching_force_streak(),
+            MIN_PARALLEL_BATCHING_FORCE_STREAK
+        );
+        // any value at or below the nudge threshold (4) is clamped up
+        for low in 2..=4 {
+            let cfg = ToolSelectionConfig {
+                parallel_batching_force_streak: low,
+                ..Default::default()
+            };
+            assert_eq!(
+                cfg.effective_parallel_batching_force_streak(),
+                MIN_PARALLEL_BATCHING_FORCE_STREAK,
+                "force-streak override {low} must clamp above the nudge threshold"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_for_model_parallel_batching_force_profile_uses_floor() {
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: "flash".to_string(),
+            parallel_batching_force_streak: 1,
+            ..Default::default()
+        });
+        let policy = cfg.resolve_for_model(Some("deepseek-v4-flash"));
+        assert_eq!(
+            policy.parallel_batching_force_streak,
+            MIN_PARALLEL_BATCHING_FORCE_STREAK
+        );
+
+        // Mid-range pathological overrides must also clamp — a profile that
+        // sets force=4 would let the hard corrective fire on the same round
+        // the prompt-layer first nudges, breaking the cascade.
+        for low in 2..=4 {
+            let mut cfg = ToolSelectionConfig::default();
+            cfg.model_profiles.push(ModelPolicyProfile {
+                model_match: "flash".to_string(),
+                parallel_batching_force_streak: low,
+                ..Default::default()
+            });
+            let policy = cfg.resolve_for_model(Some("deepseek-v4-flash"));
+            assert_eq!(
+                policy.parallel_batching_force_streak, MIN_PARALLEL_BATCHING_FORCE_STREAK,
+                "per-profile force-streak override {low} must clamp above the nudge threshold"
+            );
+        }
+
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: "flash".to_string(),
+            parallel_batching_force_streak: u32::MAX,
+            ..Default::default()
+        });
+        let policy = cfg.resolve_for_model(Some("deepseek-v4-flash"));
+        assert_eq!(
+            policy.parallel_batching_force_streak,
+            MAX_PARALLEL_BATCHING_FORCE_STREAK
+        );
+    }
+
+    /// Cross-crate invariant: the per-profile floor MUST equal the global
+    /// floor, otherwise a user can configure one path below the nudge
+    /// threshold and silently invert the soft→hard cascade.
+    #[test]
+    fn global_and_profile_floors_for_parallel_batching_force_agree() {
+        let global = ToolSelectionConfig {
+            parallel_batching_force_streak: 1,
+            ..Default::default()
+        }
+        .effective_parallel_batching_force_streak();
+
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: "flash".to_string(),
+            parallel_batching_force_streak: 1,
+            ..Default::default()
+        });
+        let via_profile = cfg
+            .resolve_for_model(Some("deepseek-v4-flash"))
+            .parallel_batching_force_streak;
+
+        assert_eq!(
+            global, via_profile,
+            "floor for parallel_batching_force_streak must be symmetric \
+             between global and per-profile paths"
+        );
     }
 
     #[test]
@@ -2840,6 +3000,7 @@ mod tests {
             max_tools_per_turn: 25,
             repeated_cache_hit_suppression: 0,
             max_consecutive_empty_name: 0,
+            parallel_batching_force_streak: 0,
         });
         let toml = cfg.to_toml().unwrap();
         assert!(toml.contains("model_profiles"));
@@ -2991,6 +3152,7 @@ mod tests {
             max_tools_per_turn: 0,
             repeated_cache_hit_suppression: 5,
             max_consecutive_empty_name: 4,
+            parallel_batching_force_streak: 0,
         });
         let policy = cfg.resolve_for_model(Some("custom-model"));
         // These two override…

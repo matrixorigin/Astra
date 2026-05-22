@@ -1477,6 +1477,7 @@ fn assert_bedrock_thinking_signature_contract(bedrock_messages: &[Value]) {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_provider_request_body(
     messages: &[Value],
     tools: &[Value],
@@ -1486,6 +1487,30 @@ pub(crate) fn build_provider_request_body(
     temperature: Option<f64>,
     streaming: bool,
     thinking: &astra_turn_core::thinking_config::ThinkingConfig,
+) -> Value {
+    build_provider_request_body_with_overrides(
+        messages,
+        tools,
+        model_name,
+        provider,
+        max_output_tokens,
+        temperature,
+        streaming,
+        thinking,
+        None,
+    )
+}
+
+pub(crate) fn build_provider_request_body_with_overrides(
+    messages: &[Value],
+    tools: &[Value],
+    model_name: &str,
+    provider: &str,
+    max_output_tokens: Option<usize>,
+    temperature: Option<f64>,
+    streaming: bool,
+    thinking: &astra_turn_core::thinking_config::ThinkingConfig,
+    request_body_overrides: Option<&Map<String, Value>>,
 ) -> Value {
     match llm_provider_protocol(provider) {
         LlmProviderProtocol::BedrockConverse => {
@@ -1527,6 +1552,7 @@ pub(crate) fn build_provider_request_body(
             if thinking.is_enabled() {
                 assert_bedrock_thinking_signature_contract(&bedrock_messages);
             }
+            apply_request_body_overrides(&mut body, request_body_overrides);
             body
         }
         LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::OpenAiCompatible => {
@@ -1554,6 +1580,7 @@ pub(crate) fn build_provider_request_body(
                     body["tool_choice"] = json!({"type": "auto"});
                 }
                 thinking.apply_anthropic(&mut body);
+                apply_request_body_overrides(&mut body, request_body_overrides);
                 return body;
             }
             let normalized_messages = normalize_openai_tool_message_content(messages);
@@ -1629,7 +1656,52 @@ pub(crate) fn build_provider_request_body(
             } else {
                 thinking.apply_openai(&mut body);
             }
+            apply_request_body_overrides(&mut body, request_body_overrides);
             body
+        }
+    }
+}
+
+fn apply_request_body_overrides(
+    body: &mut Value,
+    request_body_overrides: Option<&Map<String, Value>>,
+) {
+    let Some(overrides) = request_body_overrides else {
+        return;
+    };
+    let keys: Vec<&String> = overrides.keys().collect();
+    tracing::debug!(?keys, "applying request body overrides");
+    merge_json_object(body, overrides);
+}
+
+fn merge_json_object(target: &mut Value, overrides: &Map<String, Value>) {
+    merge_json_object_with_depth(target, overrides, 0);
+}
+
+const MAX_JSON_MERGE_DEPTH: usize = 64;
+
+fn merge_json_object_with_depth(target: &mut Value, overrides: &Map<String, Value>, depth: usize) {
+    let Some(target_obj) = target.as_object_mut() else {
+        tracing::warn!("merge_json_object called with non-object target; skipping");
+        return;
+    };
+    for (key, override_value) in overrides {
+        match (target_obj.get_mut(key), override_value) {
+            (Some(existing), Value::Object(override_obj)) if existing.is_object() => {
+                if depth >= MAX_JSON_MERGE_DEPTH {
+                    tracing::warn!(
+                        key,
+                        max_depth = MAX_JSON_MERGE_DEPTH,
+                        "merge_json_object exceeded max depth; replacing nested object"
+                    );
+                    *existing = Value::Object(override_obj.clone());
+                } else {
+                    merge_json_object_with_depth(existing, override_obj, depth + 1);
+                }
+            }
+            _ => {
+                target_obj.insert(key.clone(), override_value.clone());
+            }
         }
     }
 }
@@ -2284,6 +2356,7 @@ pub(crate) async fn call_llm_and_collect(
         None,
         None,
         None,
+        None,
         thinking,
     )
     .await
@@ -2302,6 +2375,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
     has_fallback: bool,
     cancel: LlmCancel<'_>,
     header_overrides: Option<&HashMap<String, String>>,
+    request_body_overrides: Option<&Map<String, Value>>,
     completions_url_override: Option<&str>,
     request_timeout: Option<std::time::Duration>,
     thinking: &ThinkingConfig,
@@ -2318,6 +2392,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
         has_fallback,
         cancel,
         header_overrides,
+        request_body_overrides,
         completions_url_override,
         request_timeout,
         thinking,
@@ -2339,6 +2414,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
     has_fallback: bool,
     cancel: LlmCancel<'_>,
     header_overrides: Option<&HashMap<String, String>>,
+    request_body_overrides: Option<&Map<String, Value>>,
     completions_url_override: Option<&str>,
     request_timeout: Option<std::time::Duration>,
     thinking: &ThinkingConfig,
@@ -2362,7 +2438,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
     // All providers stream — including Bedrock (via converse-stream +
     // AWS vnd.amazon.eventstream). The body builder and URL builder flip
     // to the streaming variant for every supported provider.
-    let body = build_provider_request_body(
+    let body = build_provider_request_body_with_overrides(
         &messages,
         tools,
         upstream_name,
@@ -2371,6 +2447,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
         None,
         true,
         thinking,
+        request_body_overrides,
     );
 
     let url = llm_request_url(
@@ -2595,6 +2672,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
                             max_output_tokens,
                             fb_timeout,
                             header_overrides,
+                            request_body_overrides,
                             completions_url_override,
                             request_timeout,
                             thinking,
@@ -2673,6 +2751,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
                         max_output_tokens,
                         fb_timeout,
                         header_overrides,
+                        request_body_overrides,
                         completions_url_override,
                         request_timeout,
                         thinking,
@@ -3495,6 +3574,7 @@ pub(crate) async fn call_llm_nonstream_fallback(
         None,
         None,
         None,
+        None,
         &ThinkingConfig::Off,
     )
     .await
@@ -3512,6 +3592,7 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
     max_output_tokens: Option<usize>,
     timeout: std::time::Duration,
     header_overrides: Option<&HashMap<String, String>>,
+    request_body_overrides: Option<&Map<String, Value>>,
     completions_url_override: Option<&str>,
     request_timeout: Option<std::time::Duration>,
     thinking: &ThinkingConfig,
@@ -3520,7 +3601,7 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
 
     let messages = consolidate_system_messages(messages);
 
-    let body = build_provider_request_body(
+    let body = build_provider_request_body_with_overrides(
         &messages,
         tools,
         model_name,
@@ -3529,6 +3610,7 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
         None,
         false,
         thinking,
+        request_body_overrides,
     );
 
     let url = llm_request_url(
@@ -4181,6 +4263,7 @@ mod tests {
             false,
             LlmCancel::None,
             Some(&overrides),
+            None,
             Some(&gateway_url),
             None,
             &ThinkingConfig::Off,
@@ -9269,6 +9352,70 @@ mod tests {
             body["max_completion_tokens"].as_u64(),
             Some(4_096),
             "thinking=off must never bump user's max"
+        );
+    }
+
+    #[test]
+    fn request_body_overrides_merge_anthropic_context_management() {
+        let overrides = Map::from_iter([(
+            "context_management".to_string(),
+            json!({
+                "edits": [{
+                    "type": "clear_tool_uses_20250919",
+                    "trigger": {"type": "input_tokens", "value": 180_000},
+                    "keep": {"type": "input_tokens", "value": 40_000}
+                }]
+            }),
+        )]);
+
+        let body = build_provider_request_body_with_overrides(
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            "claude-test",
+            "anthropic",
+            Some(2048),
+            None,
+            true,
+            &ThinkingConfig::Off,
+            Some(&overrides),
+        );
+
+        assert_eq!(
+            body["context_management"]["edits"][0]["type"],
+            "clear_tool_uses_20250919"
+        );
+        assert_eq!(body["model"], "claude-test");
+        assert_eq!(body["stream"], json!(true));
+    }
+
+    #[test]
+    fn request_body_overrides_merge_nested_bedrock_inference_config() {
+        let overrides = Map::from_iter([
+            ("inferenceConfig".to_string(), json!({"topP": 0.9})),
+            (
+                "additionalModelRequestFields".to_string(),
+                json!({"reasoningMode": "compact"}),
+            ),
+        ]);
+
+        let body = build_provider_request_body_with_overrides(
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            "claude-bedrock",
+            "bedrock",
+            Some(1024),
+            Some(0.2),
+            true,
+            &ThinkingConfig::Off,
+            Some(&overrides),
+        );
+
+        assert_eq!(body["inferenceConfig"]["maxTokens"], json!(1024));
+        assert_eq!(body["inferenceConfig"]["temperature"], json!(0.2));
+        assert_eq!(body["inferenceConfig"]["topP"], json!(0.9));
+        assert_eq!(
+            body["additionalModelRequestFields"]["reasoningMode"],
+            "compact"
         );
     }
 }

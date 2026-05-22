@@ -34,9 +34,15 @@ pub struct PipelineJournalEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_break_reason: Option<String>,
 
     // Alert fields
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,8 +70,14 @@ impl PipelineJournalEvent {
             turn,
             cache_hit_ratio: Some(feedback.cache_hit_ratio),
             prompt_tokens: Some(feedback.tokens.prompt),
+            cache_read_tokens: Some(feedback.tokens.cache_read),
+            cache_creation_tokens: Some(feedback.tokens.cache_creation),
             completion_tokens: Some(feedback.tokens.completion),
             model_id: Some(model_id.to_string()),
+            cache_break_reason: feedback
+                .cache_break_detected
+                .as_ref()
+                .map(ToString::to_string),
             alert_rule: None,
             alert_severity: None,
             alert_message: None,
@@ -83,8 +95,11 @@ impl PipelineJournalEvent {
             turn: alert.turn,
             cache_hit_ratio: None,
             prompt_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
             completion_tokens: None,
             model_id: None,
+            cache_break_reason: None,
             alert_rule: Some(alert.rule.clone()),
             alert_severity: Some(format!("{:?}", alert.severity)),
             alert_message: Some(alert.message.clone()),
@@ -107,8 +122,11 @@ impl PipelineJournalEvent {
             turn,
             cache_hit_ratio: None,
             prompt_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
             completion_tokens: None,
             model_id: None,
+            cache_break_reason: None,
             alert_rule: None,
             alert_severity: None,
             alert_message: None,
@@ -130,6 +148,8 @@ mod tests {
         assert_eq!(evt.kind, PipelineEventKind::Feedback);
         assert_eq!(evt.turn, 3);
         assert!((evt.cache_hit_ratio.unwrap() - 0.8).abs() < 1e-9);
+        assert_eq!(evt.cache_read_tokens, Some(800));
+        assert_eq!(evt.cache_creation_tokens, Some(200));
         assert_eq!(evt.completion_tokens, Some(500));
         assert_eq!(evt.model_id.as_deref(), Some("claude"));
     }

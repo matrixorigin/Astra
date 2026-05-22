@@ -1188,15 +1188,15 @@ fn build_remote_skill_http_client(
     // endpoints that should not be routed through the host's LLM proxy).
     // Only turn/llm_client.rs honours env proxy vars; every other reqwest
     // client in the runtime must call .no_proxy().
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        // audit-A4: remote skill URLs are attacker-controllable (via skill manifest).
-        // Without a timeout, a malicious skill server can hang the agent loop forever.
-        .connect_timeout(connect_timeout)
-        .timeout(request_timeout)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+    astra_core::net::build_internal_http_client(
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            // audit-A4: remote skill URLs are attacker-controllable (via skill manifest).
+            // Without a timeout, a malicious skill server can hang the agent loop forever.
+            .connect_timeout(connect_timeout)
+            .timeout(request_timeout),
+        "remote skill client",
+    )
 }
 
 fn allow_private_remote_network() -> bool {

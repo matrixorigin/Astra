@@ -1,0 +1,51 @@
+name: parallel_readonly_batching
+description: |
+  **What**: Single-turn batch of three independent read-only tools (read three small
+  files), evaluated across the heterogeneous provider matrix (Anthropic / Bedrock /
+  OpenAI dialects).
+  **Tests**: That the soft→hard cascade (`PARALLEL_BATCHING_NUDGE_THRESHOLD=4`,
+  `effective_parallel_batching_force_streak` defaults to 5) does not over-correct
+  on a healthy first turn — the model should batch reads in parallel, the runtime
+  must not fire a forced corrective that injects an unsolicited reminder, and total
+  tool-call count must be >=2 in one turn.
+  **Why**: A regression that lowers the force threshold below the nudge threshold
+  inverts the cascade — runtime would force-correct before the prompt-layer ever
+  nudged. This live case catches that across providers.
+  **Pass means**: The agent reads multiple files in parallel within the first turn.
+  **Fail means**: Serial reads only, or a forced corrective text leaks into output,
+  or zero tools are called.
+  **Note**: Uses repo fixtures so parallel CI runs do not race on shared `/tmp` paths.
+prompt: |
+  Please read these three files and tell me one short fact from each.
+  Read them in parallel in a single turn — issue all three read tool calls
+  together rather than one at a time:
+  - fixtures/harness/parallel_readonly_batching/a.txt
+  - fixtures/harness/parallel_readonly_batching/b.txt
+  - fixtures/harness/parallel_readonly_batching/c.txt
+capability: tool_use
+difficulty: 2
+weight: 2.0
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tools_count_between
+    min: 2
+    max: 12
+  - type: turn_rounds_between
+    min: 1
+    max: 3
+  - type: judger
+    question: |
+      Evaluate based on the tool calls and text output only — do not read
+      files yourself. The user asked the agent to read three files in
+      parallel within a single turn and report one fact from each. Files
+      A, B, C contain the literal facts: A→"the first letter is A",
+      B→"the second letter is B", C→"the third letter is G".
+      Score 1.0 if the agent issued multiple read tool calls in one turn
+      AND surfaced a paraphrase of all three facts (A=A, B=B, C=G)
+      without fabrication. Score 0.5 if all three facts appear but reads
+      were serialized over multiple turns. Score 0.0 if any fact is
+      missing or fabricated, or if the response includes a forced "you
+      should batch" corrective injected mid-turn.
+    threshold: 0.6

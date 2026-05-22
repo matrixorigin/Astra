@@ -129,7 +129,7 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Start the interactive TUI (default when no args given)
     Interactive,
-    /// Start the HTTP API server
+    /// Start an Astra service process
     Serve(ServeArgs),
     /// Register a new account
     Register(RegisterArgs),
@@ -276,7 +276,34 @@ pub(crate) struct LoginArgs {
 }
 
 #[derive(Args, Debug)]
+#[command(
+    after_help = "Examples:\n  astra serve\n  astra serve http --host 127.0.0.1 --port 8000\n  astra serve stdio\n\nModes:\n  http   Starts the Axum HTTP API server. This is also the default when no mode is provided.\n  stdio  Starts a long-lived app-server over stdin/stdout JSON-RPC. A parent process sends requests on stdin and reads events/responses from stdout, allowing one child process to keep session and turn state across requests. In stdio mode stdout is reserved for protocol messages; diagnostics must go to stderr or a log file."
+)]
 pub(crate) struct ServeArgs {
+    /// Serve mode. Defaults to `http` for backwards compatibility.
+    #[command(subcommand)]
+    pub mode: Option<ServeMode>,
+    /// Address to listen on for the default HTTP mode
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+    /// Port to listen on for the default HTTP mode
+    #[arg(short, long, default_value_t = 8000)]
+    pub port: u16,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ServeMode {
+    /// Start the HTTP API server
+    Http(ServeHttpArgs),
+    /// Start the stdio JSON-RPC app-server
+    #[command(
+        after_help = "This mode speaks newline-delimited JSON-RPC on stdin/stdout. The parent process writes requests to stdin, reads responses and notifications from stdout, and may keep the child alive for multiple turns. Do not print human-readable output to stdout in this mode; use stderr or ASTRA_LOG_FILE for diagnostics."
+    )]
+    Stdio,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ServeHttpArgs {
     /// Address to listen on
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,

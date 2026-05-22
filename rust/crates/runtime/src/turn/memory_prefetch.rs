@@ -766,12 +766,12 @@ async fn fetch_memories_structured(
     top_k: u32,
 ) -> Vec<RankableMemory> {
     let (connect_timeout, request_timeout) = fetch_memories_timeouts();
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(connect_timeout)
-        .timeout(request_timeout)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    let client = astra_core::net::build_internal_http_client(
+        reqwest::Client::builder()
+            .connect_timeout(connect_timeout)
+            .timeout(request_timeout),
+        "memory prefetch client",
+    );
     let mut payload = serde_json::json!({"query": query, "top_k": top_k});
     if !user_id.is_empty() {
         payload["session_id"] = serde_json::Value::String(user_id.to_string());

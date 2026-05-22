@@ -8,6 +8,7 @@
 //! API continuation, observability) a machine-readable interruption contract.
 
 use serde::{Deserialize, Serialize};
+use std::fmt::Write;
 
 /// Classification of why the agentic loop was interrupted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -248,6 +249,14 @@ pub struct InterruptionStateSummary {
     pub stall_signal: Option<String>,
 }
 
+fn parse_kv_stall_signal(signal: &str) -> std::collections::BTreeMap<&str, &str> {
+    signal
+        .split(';')
+        .filter_map(|segment| segment.split_once('='))
+        .map(|(key, value)| (key.trim(), value.trim()))
+        .collect()
+}
+
 /// Build a system-level resume guidance message from a persisted interruption record.
 ///
 /// When a session is restored from a checkpoint that was written during an
@@ -296,10 +305,12 @@ pub fn build_resume_guidance_with_context(
 
     let mut guidance = String::new();
     guidance.push_str("[RESUME CONTEXT] This session was previously interrupted.\n");
-    guidance.push_str(&format!("  Reason: {kind}\n"));
-    guidance.push_str(&format!(
-        "  Progress: {turns} turn(s), {tool_calls} tool call(s) completed\n"
-    ));
+    writeln!(guidance, "  Reason: {kind}").ok();
+    writeln!(
+        guidance,
+        "  Progress: {turns} turn(s), {tool_calls} tool call(s) completed"
+    )
+    .ok();
     if has_checkpoint {
         guidance.push_str("  Checkpoint: saved — prior tool results are preserved in context\n");
     }
@@ -319,21 +330,57 @@ pub fn build_resume_guidance_with_context(
         "budget_exhausted" | "token_budget_exceeded" | "cumulative_budget_exceeded" => {
             guidance.push_str(
                 "  Action: Prioritize completing the most important remaining work first. \
-                 Avoid exploratory tool calls — focus on delivering a result.\n",
+                  Avoid exploratory tool calls — focus on delivering a result.\n",
             );
-            // If the budget was exhausted because the model streaked on
-            // single-tool rounds, say so explicitly so the LLM can see
-            // the *cause* of its interruption and batch on resume.
-            if let Some(sig) = stall_signal
-                && sig.starts_with("single_tool_streak=")
+            if let Some(sig) = stall_signal {
+                if sig.starts_with("single_tool_streak=") {
+                    let streak = sig.trim_start_matches("single_tool_streak=");
+                    writeln!(
+                        guidance,
+                        "  Cause: the previous run used exactly ONE tool per round for {streak} \
+                         consecutive rounds, which exhausted the per-turn round budget. On \
+                         resume, batch independent calls (different files / greps / reads) \
+                         into a single parallel round instead."
+                    )
+                    .ok();
+                } else if sig.starts_with("exploration_family=") {
+                    let kv = parse_kv_stall_signal(sig);
+                    if let (Some(family), Some(streak)) =
+                        (kv.get("exploration_family"), kv.get("streak"))
+                    {
+                        let family_hint = match *family {
+                            "read" => "kept reopening files that were already in context",
+                            "search" => "kept expanding search instead of converging on a target",
+                            "diff" => "kept diff-scanning without switching to synthesis or action",
+                            other => {
+                                guidance.push_str(&format!(
+                                    "  Cause: the previous run stayed inside the same {other} exploration family for {streak} consecutive rounds. \
+                                     On resume, synthesize what is already known and switch tool families only if one specific fact is still missing.\n"
+                                ));
+                                ""
+                            }
+                        };
+                        if !family_hint.is_empty() {
+                            guidance.push_str(&format!(
+                                "  Cause: the previous run stayed inside the same {family} exploration family for {streak} consecutive rounds and {family_hint}. \
+                                 On resume, reuse the evidence already gathered and only fetch one specific missing fact if you still cannot finish.\n"
+                            ));
+                        }
+                    }
+                } else if sig.starts_with("redundant_reads=") {
+                    let count = sig.trim_start_matches("redundant_reads=");
+                    guidance.push_str(&format!(
+                        "  Cause: the previous run re-read overlapping file ranges {count} time(s) without any intervening edit. \
+                         On resume, reuse the file content already in context instead of reopening the same ranges.\n"
+                    ));
+                }
+            }
+            if let Some(detail) = interruption_json
+                .get("error_detail")
+                .and_then(|v| v.as_str())
+                .filter(|detail| detail.contains("Likely cause:"))
             {
-                let streak = sig.trim_start_matches("single_tool_streak=");
-                guidance.push_str(&format!(
-                    "  Cause: the previous run used exactly ONE tool per round for {streak} \
-                     consecutive rounds, which exhausted the per-turn round budget. On \
-                     resume, batch independent calls (different files / greps / reads) \
-                     into a single parallel round instead.\n"
-                ));
+                writeln!(guidance, "  Runtime detail: {detail}").ok();
             }
         }
         "rate_limited" | "cooldown_rejected" | "server_overload" => {
@@ -350,10 +397,12 @@ pub fn build_resume_guidance_with_context(
             // Enrich with compaction effectiveness context if available.
             if let Some(ctx) = compaction_context {
                 if ctx.compaction_attempts > 0 {
-                    guidance.push_str(&format!(
+                    write!(
+                        guidance,
                         "  Compaction: {} attempt(s), ~{} tokens freed total",
                         ctx.compaction_attempts, ctx.total_tokens_freed
-                    ));
+                    )
+                    .ok();
                     if ctx.last_was_insufficient {
                         guidance.push_str(
                             " (last compaction was insufficient — context may still be tight)",
@@ -388,7 +437,7 @@ pub fn build_resume_guidance_with_context(
         }
         _ => {
             if !user_msg.is_empty() {
-                guidance.push_str(&format!("  Detail: {user_msg}\n"));
+                writeln!(guidance, "  Detail: {user_msg}").ok();
             }
         }
     }
@@ -754,6 +803,56 @@ mod tests {
         assert!(
             guidance.contains("batch"),
             "corrective advice must tell the model to batch next: {guidance}"
+        );
+    }
+
+    #[test]
+    fn resume_guidance_budget_exhausted_with_exploration_family_signal_surfaces_cause() {
+        let irj = serde_json::json!({
+            "kind": "budget_exhausted",
+            "resumable": true,
+            "has_checkpoint": true,
+            "tool_calls_completed": 22,
+            "turns_completed": 14,
+            "remaining_turns": 135,
+            "user_message": "[budget_exhausted] 22 tool call(s) completed.",
+            "stall_signal": "exploration_family=read;streak=5"
+        });
+        let guidance = build_resume_guidance(&irj).expect("should produce guidance");
+        assert!(
+            guidance.contains("read exploration family"),
+            "guidance should surface the dominant churn family: {guidance}"
+        );
+        assert!(
+            guidance.contains("5 consecutive rounds"),
+            "streak should be preserved in resume guidance: {guidance}"
+        );
+        assert!(
+            guidance.contains("reuse the evidence already gathered"),
+            "guidance should tell the resumed turn to stop re-reading: {guidance}"
+        );
+    }
+
+    #[test]
+    fn resume_guidance_budget_exhausted_with_redundant_reads_signal_surfaces_cause() {
+        let irj = serde_json::json!({
+            "kind": "budget_exhausted",
+            "resumable": true,
+            "has_checkpoint": true,
+            "tool_calls_completed": 20,
+            "turns_completed": 14,
+            "remaining_turns": 135,
+            "user_message": "[budget_exhausted] 20 tool call(s) completed.",
+            "stall_signal": "redundant_reads=5"
+        });
+        let guidance = build_resume_guidance(&irj).expect("should produce guidance");
+        assert!(
+            guidance.contains("re-read overlapping file ranges 5 time"),
+            "guidance should explain the redundant-read cause: {guidance}"
+        );
+        assert!(
+            guidance.contains("already in context"),
+            "guidance should steer the resumed turn toward reuse: {guidance}"
         );
     }
 

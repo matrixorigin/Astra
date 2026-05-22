@@ -291,6 +291,7 @@ fn append_session_journal_event(
     session_id: &str,
     event: astra_services::session_journal::JournalEvent,
 ) {
+    let _ = astra_services::session_journal::ensure_session_start_event(session_id, None);
     match astra_services::session_journal::JournalWriter::new(session_id) {
         Ok(journal) => {
             if let Err(err) = journal.append(&event) {
@@ -1795,6 +1796,20 @@ mod tests {
             .collect()
     }
 
+    fn read_boundary_events(session_id: &str) -> Vec<JournalEvent> {
+        read_journal_events(session_id)
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type,
+                    JournalEventType::ExecutionBoundaryOpened
+                        | JournalEventType::ExecutionBoundaryCommitted
+                        | JournalEventType::ExecutionBoundaryAborted
+                )
+            })
+            .collect()
+    }
+
     fn cleanup_journal(session_id: &str) {
         let writer = JournalWriter::new(session_id).unwrap();
         std::fs::remove_file(writer.path()).ok();
@@ -1940,7 +1955,7 @@ esac
         )
         .await;
 
-        let events = read_journal_events(&session_id);
+        let events = read_boundary_events(&session_id);
         assert_eq!(events.len(), 2);
         assert_eq!(
             events[0].event_type,
@@ -1954,6 +1969,46 @@ esac
         assert_eq!(detail["executed_requests"].as_u64(), Some(1));
         assert_eq!(detail["file_entries_recorded"].as_u64(), Some(1));
         assert!(dir.path().join("ok.txt").exists());
+
+        let all_events = read_journal_events(&session_id);
+        assert_eq!(
+            all_events.len(),
+            3,
+            "expected session_start + open + commit"
+        );
+        assert_eq!(all_events[0].event_type, JournalEventType::SessionStart);
+        assert_eq!(
+            all_events[1].event_type,
+            JournalEventType::ExecutionBoundaryOpened
+        );
+        assert_eq!(
+            all_events[2].event_type,
+            JournalEventType::ExecutionBoundaryCommitted
+        );
+
+        append_session_journal_event(
+            &session_id,
+            astra_services::session_journal::JournalEvent::execution_boundary_committed(
+                Some(&session_id),
+                6,
+                EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK,
+                None,
+                None,
+            ),
+        );
+        let replay_events = read_journal_events(&session_id);
+        assert_eq!(
+            replay_events
+                .iter()
+                .filter(|event| event.event_type == JournalEventType::SessionStart)
+                .count(),
+            1,
+            "subsequent boundary writes must not duplicate SessionStart"
+        );
+        assert_eq!(
+            replay_events.last().map(|event| &event.event_type),
+            Some(&JournalEventType::ExecutionBoundaryCommitted)
+        );
 
         cleanup_session_artifacts(&session_id);
     }
@@ -2007,7 +2062,7 @@ esac
         )
         .await;
 
-        let events = read_journal_events(&session_id);
+        let events = read_boundary_events(&session_id);
         assert_eq!(events.len(), 2);
         assert_eq!(
             events[0].event_type,
@@ -2079,7 +2134,7 @@ esac
         )
         .await;
 
-        let events = read_journal_events(&session_id);
+        let events = read_boundary_events(&session_id);
         assert_eq!(events.len(), 2);
         assert_eq!(
             events[0].event_type,
@@ -2173,7 +2228,7 @@ esac
         )
         .await;
 
-        let events = read_journal_events(&session_id);
+        let events = read_boundary_events(&session_id);
         let boundary_events: Vec<_> = events
             .iter()
             .filter(|event| {
@@ -2307,7 +2362,7 @@ esac
         )
         .await;
 
-        let events = read_journal_events(&session_id);
+        let events = read_boundary_events(&session_id);
         assert_eq!(events.len(), 2, "expected open + committed, got {events:?}");
         assert_eq!(
             events[0].event_type,
@@ -2373,7 +2428,7 @@ esac
         )
         .await;
 
-        let events = read_journal_events(&session_id);
+        let events = read_boundary_events(&session_id);
         assert_eq!(events.len(), 2);
         assert_eq!(
             events[1].event_type,

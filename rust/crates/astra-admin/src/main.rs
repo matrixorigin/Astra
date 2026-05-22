@@ -79,6 +79,10 @@ fn yaml_str_vec(entry: &serde_yaml_ng::Value, key: &str) -> Option<Vec<String>> 
     })
 }
 
+fn yaml_json(entry: &serde_yaml_ng::Value, key: &str) -> Option<serde_json::Value> {
+    entry.get(key).and_then(|v| serde_json::to_value(v).ok())
+}
+
 /// Merge optional YAML model fields into an existing JSON object in-place.
 fn apply_optional_yaml_fields(
     obj: &mut serde_json::Map<String, serde_json::Value>,
@@ -128,6 +132,18 @@ fn apply_optional_yaml_fields(
         let quirks = obj.entry("quirks").or_insert_with(|| serde_json::json!({}));
         if let Some(qobj) = quirks.as_object_mut() {
             qobj.insert("wire_model_name".into(), serde_json::json!(wire));
+        }
+    }
+    if let Some(overrides) = yaml_json(entry, "request_body_overrides") {
+        if overrides.is_object() {
+            let quirks = obj.entry("quirks").or_insert_with(|| serde_json::json!({}));
+            if let Some(qobj) = quirks.as_object_mut() {
+                qobj.insert("request_body_overrides".into(), overrides);
+            }
+        } else {
+            eprintln!(
+                "warning: request_body_overrides must be a JSON object; ignoring non-object value"
+            );
         }
     }
 }

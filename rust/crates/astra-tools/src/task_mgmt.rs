@@ -111,6 +111,154 @@ pub trait TaskStore: Send + Sync {
             .filter(|t| matches!(t.status.as_str(), "pending" | "in_progress"))
             .collect())
     }
+
+    /// Archive historical tasks.
+    ///
+    /// Default implementation works session-locally so tests/offline mode
+    /// still have coherent semantics. SQL-backed stores can override to widen
+    /// the bulk scope (for example, all tasks owned by the current user).
+    async fn archive(&self, session_id: &str, args: &Value) -> Result<String, String> {
+        let task_id = args
+            .get("task_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let days_raw = args
+            .get("older_than_days")
+            .and_then(Value::as_u64)
+            .unwrap_or(30);
+        let days = i64::try_from(days_raw)
+            .map_err(|_| format!("older_than_days is too large: {days_raw}"))?;
+        let now = chrono::Utc::now();
+        let now_rfc3339 = now.to_rfc3339();
+        let cutoff = now - chrono::Duration::days(days);
+        let session_label = session_id.to_string();
+
+        self.mutate(
+            session_id,
+            Box::new(move |mut tasks, _next| {
+                if let Some(task_id) = task_id {
+                    let Some(task) = tasks.iter_mut().find(|t| t.id == task_id) else {
+                        return Ok(TaskMutationResult {
+                            tasks,
+                            next_task_id: None,
+                            response: prefix_summary(
+                                format!(
+                                    "Refused: task #{task_id} not found in session {session_label}"
+                                ),
+                                json!({
+                                    "success": false,
+                                    "task_id": task_id,
+                                    "message": format!(
+                                        "Task '{}' was not found in session '{}'",
+                                        task_id, session_label
+                                    ),
+                                })
+                                .to_string(),
+                            ),
+                        });
+                    };
+                    let previous_status = task.status.clone();
+                    if previous_status == "archived" {
+                        return Ok(TaskMutationResult {
+                            tasks,
+                            next_task_id: None,
+                            response: prefix_summary(
+                                format!("Refused: task #{task_id} is already archived"),
+                                json!({
+                                    "success": false,
+                                    "task_id": task_id,
+                                    "previous_status": previous_status,
+                                    "message": format!("Task '{}' is already archived", task_id),
+                                })
+                                .to_string(),
+                            ),
+                        });
+                    }
+                    if !matches!(previous_status.as_str(), "completed" | "failed" | "cancelled") {
+                        return Ok(TaskMutationResult {
+                            tasks,
+                            next_task_id: None,
+                            response: prefix_summary(
+                                format!(
+                                    "Refused: task #{task_id} is '{previous_status}' — only completed, failed, or cancelled tasks can be archived"
+                                ),
+                                json!({
+                                    "success": false,
+                                    "task_id": task_id,
+                                    "previous_status": previous_status,
+                                    "message": format!(
+                                        "Task '{}' must be completed, failed, or cancelled before it can be archived",
+                                        task_id
+                                    ),
+                                })
+                                .to_string(),
+                            ),
+                        });
+                    }
+
+                    task.status = "archived".to_string();
+                    task.updated_at = now_rfc3339.clone();
+                    return Ok(TaskMutationResult {
+                        tasks,
+                        next_task_id: None,
+                        response: prefix_summary(
+                            format!("Archived task #{task_id} (was {previous_status})"),
+                            json!({
+                                "success": true,
+                                "task_id": task_id,
+                                "previous_status": previous_status,
+                                "status": "archived",
+                                "message": format!("Task '{}' archived", task_id),
+                            })
+                            .to_string(),
+                        ),
+                    });
+                }
+
+                let mut archived = 0u64;
+                for task in &mut tasks {
+                    if task.status != "completed" {
+                        continue;
+                    }
+                    let updated_at = chrono::DateTime::parse_from_rfc3339(&task.updated_at)
+                        .map_err(|e| {
+                            format!(
+                                "task '{}' has invalid updated_at '{}' for archive cutoff: {e}",
+                                task.id, task.updated_at
+                            )
+                        })?
+                        .with_timezone(&chrono::Utc);
+                    if updated_at < cutoff {
+                        task.status = "archived".to_string();
+                        task.updated_at = now_rfc3339.clone();
+                        archived = archived.saturating_add(1);
+                    }
+                }
+                Ok(TaskMutationResult {
+                    tasks,
+                    next_task_id: None,
+                    response: prefix_summary(
+                        format!(
+                            "Archived {archived} completed task(s) older than {days} days in session {session_label}"
+                        ),
+                        json!({
+                            "success": true,
+                            "archived": archived,
+                            "older_than_days": days,
+                            "scope": "session",
+                            "session_id": session_label,
+                            "message": format!(
+                                "Archived {} completed task(s) older than {} days in session '{}'",
+                                archived, days, session_label
+                            ),
+                        })
+                        .to_string(),
+                    ),
+                })
+            }),
+        )
+        .await
+    }
     /// Replace the session's entire task list. The store must treat this as
     /// atomic from the caller's perspective.
     async fn save(&self, session_id: &str, tasks: Vec<SessionTask>) -> Result<(), String>;
@@ -347,7 +495,7 @@ pub struct TaskManager {
 /// serde_json. Claudecode's task tools do this via
 /// `mapToolResultToToolResultBlockParam` returning a plain string;
 /// we keep the JSON for back-compat and prefix the summary.
-fn prefix_summary(summary: impl Into<String>, json_body: String) -> String {
+pub(crate) fn prefix_summary(summary: impl Into<String>, json_body: String) -> String {
     format!("{}\n{}", summary.into(), json_body)
 }
 
@@ -1258,6 +1406,16 @@ impl TaskManager {
             )
             .await
         {
+            Ok(response) => response,
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    /// Archive historical work. Single-task archive is session-scoped;
+    /// bulk archive is store-defined (session-local for in-memory,
+    /// user-wide for MatrixOne-backed cloud mode).
+    pub async fn archive(&self, args: &Value) -> String {
+        match self.store.archive(&self.sid(), args).await {
             Ok(response) => response,
             Err(e) => format!("Error: {e}"),
         }
@@ -2378,5 +2536,59 @@ mod tests {
             out.contains("beta"),
             "all-filter must include completed; got: {out}"
         );
+    }
+
+    #[tokio::test]
+    async fn archive_single_task_requires_terminal_status() {
+        let m = mgr();
+        m.create(&json!({"title": "alpha"})).await;
+
+        let refused = m.archive(&json!({"task_id": "task-1"})).await;
+        assert!(refused.contains("Refused"), "{refused}");
+        assert!(refused.contains("pending"), "{refused}");
+
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        let archived = m.archive(&json!({"task_id": "task-1"})).await;
+        assert!(archived.contains("\"status\":\"archived\""), "{archived}");
+
+        let archived_list = m.list(&json!({"status_filter": "archived"})).await;
+        assert!(archived_list.contains("alpha"), "{archived_list}");
+        let active_list = m.list(&json!({"status_filter": "active"})).await;
+        assert!(!active_list.contains("alpha"), "{active_list}");
+    }
+
+    #[tokio::test]
+    async fn archive_bulk_only_moves_old_completed_tasks() {
+        let m = mgr();
+        m.create(&json!({"title": "old-done"})).await;
+        m.create(&json!({"title": "recent-done"})).await;
+        m.create(&json!({"title": "still-open"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        m.update(&json!({"task_id": "task-2", "new_status": "completed"}))
+            .await;
+
+        let mut snapshot = m.snapshot_state().await;
+        let old_ts = (chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339();
+        for task in &mut snapshot.tasks {
+            if task.id == "task-1" {
+                task.updated_at = old_ts.clone();
+            }
+        }
+        m.restore_snapshot(&snapshot)
+            .await
+            .expect("restore modified timestamps");
+
+        let archived = m.archive(&json!({"older_than_days": 7})).await;
+        assert!(archived.contains("\"archived\":1"), "{archived}");
+
+        let archived_list = m.list(&json!({"status_filter": "archived"})).await;
+        assert!(archived_list.contains("old-done"), "{archived_list}");
+        assert!(!archived_list.contains("recent-done"), "{archived_list}");
+
+        let completed_list = m.list(&json!({"status_filter": "completed"})).await;
+        assert!(completed_list.contains("recent-done"), "{completed_list}");
+        assert!(!completed_list.contains("old-done"), "{completed_list}");
     }
 }

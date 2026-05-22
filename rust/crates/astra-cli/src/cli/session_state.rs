@@ -153,12 +153,6 @@ pub(crate) struct SessionState {
     pub journal: Option<session_journal::JournalWriter>,
     /// Tools used in the last turn — fed into selection for recency boost.
     pub recent_tools: Vec<String>,
-    /// `memory(action=…)` action strings observed on this turn, in
-    /// call order. Emptied at the start of each turn and populated as
-    /// tool calls run. Used by the extraction gate to precisely skip
-    /// only when an actual write action fired — read actions
-    /// (`recall` / `expand` / `profile`) do not block extraction.
-    pub recent_memory_actions: Vec<String>,
     /// Session-persistent permission manager — "always"/"skip" survives across turns.
     pub perm_manager: PermissionManager,
     /// User ID for event ingestion attribution.
@@ -309,11 +303,8 @@ pub(crate) struct SessionState {
     /// Resolved memory model connection parameters (cached at first use).
     /// Used for memory relevance filtering with the cheapest model from the registry.
     pub memory_model_params: Option<astra_runtime::memory_relevance::LlmConnParams>,
-    /// Background memory extraction agent.
-    pub memory_extractor: super::memory_extraction::MemoryExtractor,
     /// Background session-memory.md extraction coordinator. `None` means
-    /// the current CLI path has no API-backed extraction service, so
-    /// extraction stays local-only with no LLM/events.
+    /// the current CLI path has no API-backed extraction service.
     pub session_memory_extractor:
         Option<std::sync::Arc<astra_runtime::session_memory::MemoryExtractionService>>,
 
@@ -485,7 +476,6 @@ impl Default for SessionState {
             context_budget: prompts::ContextBudget::default(),
             journal: None,
             recent_tools: Vec::new(),
-            recent_memory_actions: Vec::new(),
             perm_manager: PermissionManager::with_workspace_trust(
                 std::env::var("ASTRA_CLI_AUTO_APPROVE")
                     .map(|v| v == "1")
@@ -550,7 +540,6 @@ impl Default for SessionState {
             session_lessons_loaded: false,
             lesson_checkpointer: astra_runtime::lesson_checkpoint::LessonCheckpointer::new(),
             memory_model_params: None,
-            memory_extractor: super::memory_extraction::MemoryExtractor::new(),
             session_memory_extractor: None,
             auto_invoke_handler: None,
             latest_skill_diagnosis: None,

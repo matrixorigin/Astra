@@ -117,12 +117,94 @@ pub fn detect_project_languages(root: &Path) -> Vec<String> {
     langs
 }
 
-/// Max bytes for git diff stat output to avoid blowing up context.
-const MAX_GIT_STAT_BYTES: usize = 4096;
+/// Keep only a small sample of changed paths in the volatile Git tail.
+const MAX_GIT_CHANGED_FILES: usize = 5;
 
-/// Run `git diff --stat` (staged or unstaged), returning a compact summary.
-fn git_diff_stat(project_root: &Path, staged: bool) -> Option<String> {
-    let mut args = vec!["diff", "--stat", "--stat-width=80", "--no-color"];
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GitDiffSummary {
+    shortstat: Option<String>,
+    files: Vec<String>,
+}
+
+fn format_git_shortstat(files_changed: usize, insertions: u64, deletions: u64) -> Option<String> {
+    let mut parts = Vec::new();
+    parts.push(format!(
+        "{files_changed} {} changed",
+        if files_changed == 1 { "file" } else { "files" }
+    ));
+    if insertions > 0 {
+        parts.push(format!(
+            "{insertions} {}(+)",
+            if insertions == 1 {
+                "insertion"
+            } else {
+                "insertions"
+            }
+        ));
+    }
+    if deletions > 0 {
+        parts.push(format!(
+            "{deletions} {}(-)",
+            if deletions == 1 {
+                "deletion"
+            } else {
+                "deletions"
+            }
+        ));
+    }
+    Some(parts.join(", "))
+}
+
+fn parse_git_numstat_summary(output: &str) -> GitDiffSummary {
+    let mut files = Vec::new();
+    let mut insertions = 0_u64;
+    let mut deletions = 0_u64;
+    let mut saw_numeric_counts = false;
+
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let mut parts = line.splitn(3, '\t');
+        let Some(added) = parts.next() else {
+            continue;
+        };
+        let Some(removed) = parts.next() else {
+            continue;
+        };
+        let Some(path) = parts.next() else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        files.push(path.to_owned());
+        if let Ok(count) = added.parse::<u64>() {
+            insertions += count;
+            saw_numeric_counts = true;
+        }
+        if let Ok(count) = removed.parse::<u64>() {
+            deletions += count;
+            saw_numeric_counts = true;
+        }
+    }
+
+    GitDiffSummary {
+        shortstat: if files.is_empty() || !saw_numeric_counts {
+            None
+        } else {
+            format_git_shortstat(files.len(), insertions, deletions)
+        },
+        files,
+    }
+}
+
+/// Run one `git diff --numstat` (staged or unstaged) and derive both the
+/// compact summary and changed-file sample from the same snapshot.
+fn git_diff_summary(project_root: &Path, staged: bool) -> Option<GitDiffSummary> {
+    let mut args = vec!["diff", "--numstat", "--no-color"];
     if staged {
         args.push("--cached");
     }
@@ -131,17 +213,51 @@ fn git_diff_stat(project_root: &Path, staged: bool) -> Option<String> {
         .current_dir(project_root)
         .output()
         .ok()
+        .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| {
-            let s = s.trim().to_string();
-            if s.len() > MAX_GIT_STAT_BYTES {
-                let end = s.floor_char_boundary(MAX_GIT_STAT_BYTES);
-                format!("{}… (truncated)", &s[..end])
-            } else {
-                s
-            }
-        })
-        .filter(|s| !s.is_empty())
+        .map(|s| parse_git_numstat_summary(&s))
+}
+
+fn render_git_change_summary(
+    label: &str,
+    shortstat: Option<&str>,
+    files: &[String],
+) -> Option<String> {
+    let shortstat = shortstat.map(str::trim).filter(|s| !s.is_empty());
+    let mut files = files.iter().filter(|s| !s.is_empty());
+    let sample: Vec<&str> = files
+        .by_ref()
+        .take(MAX_GIT_CHANGED_FILES)
+        .map(String::as_str)
+        .collect();
+    let extra_count = files.count();
+    if shortstat.is_none() && sample.is_empty() {
+        return None;
+    }
+
+    let mut line = format!("- {label}:");
+    if let Some(shortstat) = shortstat {
+        line.push(' ');
+        line.push_str(shortstat);
+    } else {
+        let changed = sample.len() + extra_count;
+        line.push_str(&format!(" {changed} file(s) changed"));
+    }
+
+    if !sample.is_empty() {
+        line.push_str(" [files: ");
+        line.push_str(&sample.join(", "));
+        if extra_count > 0 {
+            line.push_str(&format!(", +{extra_count} more"));
+        }
+        line.push(']');
+    }
+
+    Some(line)
+}
+
+fn recent_commit_limit_for_dirty(dirty: bool) -> usize {
+    if dirty { 1 } else { 3 }
 }
 
 /// Run `git log --oneline -N` to get recent commit summaries.
@@ -228,15 +344,19 @@ pub fn build_volatile_environment_context(project_root: &Path) -> String {
     lines.push(format!("- Git branch: {branch}{status}"));
 
     if dirty {
-        if let Some(staged) = git_diff_stat(project_root, true) {
-            if !staged.is_empty() {
-                lines.push(format!("- Staged changes:\n{staged}"));
-            }
+        let staged = git_diff_summary(project_root, true).unwrap_or_default();
+        if let Some(staged) =
+            render_git_change_summary("Staged changes", staged.shortstat.as_deref(), &staged.files)
+        {
+            lines.push(staged);
         }
-        if let Some(unstaged) = git_diff_stat(project_root, false) {
-            if !unstaged.is_empty() {
-                lines.push(format!("- Unstaged changes:\n{unstaged}"));
-            }
+        let unstaged = git_diff_summary(project_root, false).unwrap_or_default();
+        if let Some(unstaged) = render_git_change_summary(
+            "Unstaged changes",
+            unstaged.shortstat.as_deref(),
+            &unstaged.files,
+        ) {
+            lines.push(unstaged);
         }
     }
 
@@ -245,7 +365,8 @@ pub fn build_volatile_environment_context(project_root: &Path) -> String {
     // ancient history that git_log/git_show can fetch on demand. The cap
     // was 5; observed volatile-block sessions (69657ca7) showed commits
     // 4-5 were always just context noise the model never cited.
-    if let Some(log) = git_recent_commits(project_root, 3) {
+    let recent_commit_limit = recent_commit_limit_for_dirty(dirty);
+    if let Some(log) = git_recent_commits(project_root, recent_commit_limit) {
         if !log.is_empty() {
             lines.push(format!("- Recent commits:\n{log}"));
         }
@@ -339,7 +460,59 @@ pub fn make_args_preview(tool_name: &str, args: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::process::Command;
     use tempfile::tempdir;
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: stdout={} stderr={}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_recent_commits_repo(dirty: bool) -> tempfile::TempDir {
+        let tmp = tempdir().unwrap();
+        run_git(tmp.path(), &["init", "-q"]);
+        run_git(tmp.path(), &["config", "user.name", "Astra Test"]);
+        run_git(
+            tmp.path(),
+            &["config", "user.email", "astra-test@example.com"],
+        );
+
+        let tracked = tmp.path().join("tracked.txt");
+        for i in 1..=4 {
+            std::fs::write(&tracked, format!("version {i}\n")).unwrap();
+            run_git(tmp.path(), &["add", "tracked.txt"]);
+            let msg = format!("commit-{i}");
+            run_git(tmp.path(), &["commit", "-q", "-m", &msg]);
+        }
+
+        if dirty {
+            std::fs::write(&tracked, "dirty working tree\n").unwrap();
+        }
+
+        tmp
+    }
+
+    fn count_recent_commit_lines(ctx: &str) -> usize {
+        let Some(start) = ctx.find("- Recent commits:") else {
+            return 0;
+        };
+        ctx[start..]
+            .lines()
+            .skip(1)
+            .take_while(|line| line.chars().take(7).all(|c| c.is_ascii_hexdigit()))
+            .count()
+    }
 
     #[test]
     fn make_args_preview_file_tool_uses_path() {
@@ -534,6 +707,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn volatile_context_empty_outside_git() {
         let tmp = tempdir().unwrap();
         unsafe {
@@ -580,20 +754,163 @@ mod tests {
     }
 
     #[test]
-    fn git_diff_stat_returns_some_in_git_repo() {
-        let cwd = std::env::current_dir().unwrap();
-        // Should return Some (possibly empty string) or None — just ensure no panic
-        let _ = git_diff_stat(&cwd, true);
-        let _ = git_diff_stat(&cwd, false);
+    fn render_git_change_summary_includes_shortstat_and_file_sample() {
+        let summary = render_git_change_summary(
+            "Unstaged changes",
+            Some("10 files changed, 128 insertions(+), 16 deletions(-)"),
+            &[
+                "a.rs".to_string(),
+                "b.rs".to_string(),
+                "c.rs".to_string(),
+                "d.rs".to_string(),
+                "e.rs".to_string(),
+                "f.rs".to_string(),
+            ],
+        )
+        .expect("summary");
+        assert!(summary.contains("10 files changed, 128 insertions(+), 16 deletions(-)"));
+        assert!(summary.contains("[files: a.rs, b.rs, c.rs, d.rs, e.rs, +1 more]"));
+        assert!(!summary.contains('\n'));
     }
 
     #[test]
-    fn git_diff_stat_returns_none_outside_repo() {
+    fn render_git_change_summary_uses_file_count_without_shortstat() {
+        let summary = render_git_change_summary(
+            "Staged changes",
+            None,
+            &["one.rs".to_string(), "two.rs".to_string()],
+        )
+        .expect("summary");
+        assert!(summary.contains("2 file(s) changed"));
+        assert!(summary.contains("[files: one.rs, two.rs]"));
+    }
+
+    /// Regression: even without a shortstat the file sample MUST be capped at
+    /// `MAX_GIT_CHANGED_FILES` so a wide-touch commit (rename across the
+    /// repo, codemod, generated-file refresh) cannot blow up volatile context.
+    /// Pins both the cap and the "+N more" overflow rendering.
+    #[test]
+    fn render_git_change_summary_truncates_files_at_cap_without_shortstat() {
+        // 12 files, no shortstat → expect 5 listed + "+7 more".
+        let files: Vec<String> = (0..12).map(|i| format!("file_{i:02}.rs")).collect();
+        let summary = render_git_change_summary("Unstaged changes", None, &files).expect("summary");
+
+        assert!(
+            summary.contains("12 file(s) changed"),
+            "total count must reflect all files: {summary}"
+        );
+        for kept in &files[..MAX_GIT_CHANGED_FILES] {
+            assert!(
+                summary.contains(kept),
+                "first {MAX_GIT_CHANGED_FILES} files must appear: missing {kept} in {summary}"
+            );
+        }
+        for dropped in &files[MAX_GIT_CHANGED_FILES..] {
+            assert!(
+                !summary.contains(dropped),
+                "files past the cap must NOT appear: leaked {dropped} in {summary}"
+            );
+        }
+        assert!(
+            summary.contains(&format!("+{} more", files.len() - MAX_GIT_CHANGED_FILES)),
+            "overflow tag must reflect dropped count: {summary}"
+        );
+        assert!(
+            !summary.contains('\n'),
+            "rendered summary must stay single-line for volatile-context budget"
+        );
+    }
+
+    #[test]
+    fn render_git_change_summary_keeps_shortstat_without_files() {
+        let summary = render_git_change_summary(
+            "Staged changes",
+            Some("2 files changed, 9 insertions(+)"),
+            &[],
+        )
+        .expect("summary");
+        assert_eq!(
+            summary,
+            "- Staged changes: 2 files changed, 9 insertions(+)"
+        );
+    }
+
+    #[test]
+    fn render_git_change_summary_returns_none_when_empty() {
+        assert!(
+            render_git_change_summary("Staged changes", None, &[]).is_none(),
+            "empty shortstat + empty file sample should not render a placeholder line"
+        );
+    }
+
+    #[test]
+    fn parse_git_numstat_summary_collects_shortstat_and_files_together() {
+        let summary = parse_git_numstat_summary("10\t2\ta.rs\n3\t0\tb.rs\n-\t-\tbinary.dat\n");
+        assert_eq!(
+            summary.shortstat.as_deref(),
+            Some("3 files changed, 13 insertions(+), 2 deletions(-)")
+        );
+        assert_eq!(summary.files, vec!["a.rs", "b.rs", "binary.dat"]);
+    }
+
+    #[test]
+    fn parse_git_numstat_summary_falls_back_to_files_when_counts_are_non_numeric() {
+        let summary = parse_git_numstat_summary("-\t-\tbinary.dat\n");
+        assert_eq!(summary.shortstat, None);
+        assert_eq!(summary.files, vec!["binary.dat"]);
+    }
+
+    #[test]
+    fn recent_commit_limit_prefers_tighter_budget_for_dirty_repos() {
+        assert_eq!(recent_commit_limit_for_dirty(true), 1);
+    }
+
+    #[test]
+    fn recent_commit_limit_keeps_longer_budget_for_clean_repos() {
+        assert_eq!(recent_commit_limit_for_dirty(false), 3);
+    }
+
+    /// Regression: the recent-commits cap is intentionally lower when the
+    /// working tree is dirty (the diff itself dominates the model's
+    /// attention budget). A regression that swaps the two limits would
+    /// silently waste tokens on every dirty render.
+    #[test]
+    fn build_volatile_environment_context_caps_recent_commits_lower_when_dirty() {
+        let clean_repo = init_recent_commits_repo(false);
+        let dirty_repo = init_recent_commits_repo(true);
+
+        let clean_ctx = build_volatile_environment_context(clean_repo.path());
+        let dirty_ctx = build_volatile_environment_context(dirty_repo.path());
+
+        let clean_commits = count_recent_commit_lines(&clean_ctx);
+        let dirty_commits = count_recent_commit_lines(&dirty_ctx);
+
+        assert!(
+            clean_commits <= 3,
+            "clean repo should cap recent commits at 3, got {clean_commits}\n{clean_ctx}"
+        );
+        assert!(
+            dirty_commits <= 1,
+            "dirty repo should cap recent commits at 1, got {dirty_commits}\n{dirty_ctx}"
+        );
+    }
+
+    #[test]
+    fn git_diff_summary_returns_some_in_git_repo() {
+        let cwd = std::env::current_dir().unwrap();
+        // Should return Some (possibly empty summary) or None — just ensure no panic
+        let _ = git_diff_summary(&cwd, true);
+        let _ = git_diff_summary(&cwd, false);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn git_diff_summary_returns_none_outside_repo() {
         let tmp = tempdir().unwrap();
         unsafe {
             std::env::set_var("GIT_CEILING_DIRECTORIES", tmp.path().parent().unwrap());
         }
-        let result = git_diff_stat(tmp.path(), false);
+        let result = git_diff_summary(tmp.path(), false);
         unsafe {
             std::env::remove_var("GIT_CEILING_DIRECTORIES");
         }
@@ -611,6 +928,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn git_recent_commits_returns_none_outside_repo() {
         let tmp = tempdir().unwrap();
         unsafe {

@@ -272,6 +272,7 @@ struct ResolvedTurnLlmConfig {
     provider: String,
     fallback_chain: Vec<String>,
     header_overrides: HashMap<String, String>,
+    request_body_overrides: Option<Map<String, Value>>,
     completions_url_override: Option<String>,
     request_timeout: Option<Duration>,
 }
@@ -286,6 +287,7 @@ struct RequestAwareSummaryClient {
     provider: String,
     max_output_tokens: usize,
     header_overrides: HashMap<String, String>,
+    request_body_overrides: Option<Map<String, Value>>,
     completions_url_override: Option<String>,
     request_timeout: Option<Duration>,
 }
@@ -309,6 +311,7 @@ impl astra_turn_core::cloud_summary::SummaryLlmClient for RequestAwareSummaryCli
             Some(self.max_output_tokens),
             llm_fallback_timeout(),
             (!self.header_overrides.is_empty()).then_some(&self.header_overrides),
+            self.request_body_overrides.as_ref(),
             self.completions_url_override.as_deref(),
             self.request_timeout,
             &ThinkingConfig::Off,
@@ -355,6 +358,7 @@ async fn resolve_llm_model_for_turn(
             provider: "openai".to_string(),
             fallback_chain: Vec::new(),
             header_overrides: forward_headers.clone(),
+            request_body_overrides: None,
             completions_url_override: Some(config.url.clone()),
             request_timeout: config.timeout_ms.map(Duration::from_millis),
         });
@@ -370,6 +374,7 @@ async fn resolve_llm_model_for_turn(
         provider: resolved.provider,
         fallback_chain: resolved.fallback_chain,
         header_overrides: HashMap::new(),
+        request_body_overrides: resolved.request_body_overrides,
         completions_url_override: None,
         request_timeout: None,
     })
@@ -1416,6 +1421,7 @@ impl ServerAgenticLoopHost {
             base_url: String::new(),
             fallback_chain: Vec::new(),
             header_overrides: HashMap::new(),
+            request_body_overrides: None,
             completions_url_override: None,
             request_timeout: None,
         };
@@ -2126,6 +2132,7 @@ impl ServerAgenticLoopHost {
             provider: llm_cfg.provider.clone(),
             max_output_tokens: compact_config.summary_token_budget,
             header_overrides: llm_cfg.header_overrides.clone(),
+            request_body_overrides: llm_cfg.request_body_overrides.clone(),
             completions_url_override: llm_cfg.completions_url_override.clone(),
             request_timeout: llm_cfg.request_timeout,
         };
@@ -2625,6 +2632,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     has_fallback,
                     llm_cancel,
                     (!llm_cfg.header_overrides.is_empty()).then_some(&llm_cfg.header_overrides),
+                    llm_cfg.request_body_overrides.as_ref(),
                     llm_cfg.completions_url_override.as_deref(),
                     llm_cfg.request_timeout,
                     &state.thinking,
@@ -3969,6 +3977,7 @@ mod tests {
             provider: "openai".into(),
             fallback_chain: Vec::new(),
             header_overrides: HashMap::new(),
+            request_body_overrides: None,
             completions_url_override: None,
             request_timeout: None,
         };
@@ -4766,6 +4775,7 @@ mod tests {
             agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
             current_round_index: 0,
             llm_rounds_completed: 0,
+            last_request_message_count: None,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),
@@ -5766,6 +5776,7 @@ mod tests {
             provider: "openai".to_string(),
             max_output_tokens: 128,
             header_overrides: forwarded,
+            request_body_overrides: None,
             completions_url_override: Some(format!("http://{addr}/gateway/chat/completions")),
             request_timeout: Some(Duration::from_secs(2)),
         };

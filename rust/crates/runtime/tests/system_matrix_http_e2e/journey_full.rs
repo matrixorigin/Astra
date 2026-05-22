@@ -1012,10 +1012,6 @@ pub async fn run_product_matrix_full_journey(
     .await;
     assert_eq!(st_intro, StatusCode::OK, "introspection skills: {intro_j}");
 
-    let intro_mem = format!("/introspection/memory?session_id={session_id}");
-    let (st_imem, imem_j) = get_json(app, &intro_mem, Some(auth_header.as_str()), &[]).await;
-    assert_eq!(st_imem, StatusCode::OK, "introspection memory: {imem_j}");
-
     let intro_ct = format!(
         "/introspection/context/trend?session_id={session_id}&turns=8&context_window=128000"
     );
@@ -1041,15 +1037,6 @@ pub async fn run_product_matrix_full_journey(
         st_irq,
         StatusCode::OK,
         "introspection retrieval quality: {irq_j}"
-    );
-
-    let intro_recall =
-        format!("/introspection/memory/recall?session_id={session_id}&query=matrix&limit=5");
-    let (st_irc, irc_j) = get_json(app, &intro_recall, Some(auth_header.as_str()), &[]).await;
-    assert_eq!(
-        st_irc,
-        StatusCode::OK,
-        "introspection memory recall: {irc_j}"
     );
 
     let (st_route, route_j) = post_json(

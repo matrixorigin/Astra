@@ -11,12 +11,31 @@
 
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use crate::SessionArtifactStore;
 
 thread_local! {
     static LOCAL_SESSIONS_DIR_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+static SESSION_START_STATE_CACHE: LazyLock<Mutex<HashMap<PathBuf, bool>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn with_session_start_state_cache<R>(f: impl FnOnce(&mut HashMap<PathBuf, bool>) -> R) -> R {
+    match SESSION_START_STATE_CACHE.lock() {
+        Ok(mut guard) => f(&mut guard),
+        Err(mut poisoned) => {
+            tracing::warn!(
+                "session_start_state_cache mutex poisoned; clearing cached state before reuse"
+            );
+            poisoned.get_mut().clear();
+            let mut guard = poisoned.into_inner();
+            f(&mut guard)
+        }
+    }
 }
 
 /// Resolved local `sessions` directory (`~/.astra/sessions` or a per-thread override).
@@ -32,6 +51,40 @@ pub fn local_sessions_dir() -> PathBuf {
             .join(".astra")
             .join("sessions")
     })
+}
+
+fn cached_session_start_state(path: &Path) -> Option<bool> {
+    with_session_start_state_cache(|cache| cache.get(path).copied())
+}
+
+fn set_cached_session_start_state(path: &Path, has_open_session_start: bool) {
+    with_session_start_state_cache(|cache| {
+        cache.insert(path.to_path_buf(), has_open_session_start);
+    });
+}
+
+fn update_cached_session_start_state_from_event(path: &Path, event_type: &JournalEventType) {
+    match event_type {
+        JournalEventType::SessionStart => set_cached_session_start_state(path, true),
+        JournalEventType::SessionEnd => set_cached_session_start_state(path, false),
+        _ => {}
+    }
+}
+
+fn update_cached_session_start_state_from_events(path: &Path, events: &[JournalEvent]) {
+    if let Some(last_type) = events
+        .iter()
+        .rev()
+        .map(|event| &event.event_type)
+        .find(|event_type| {
+            matches!(
+                event_type,
+                JournalEventType::SessionStart | JournalEventType::SessionEnd
+            )
+        })
+    {
+        update_cached_session_start_state_from_event(path, last_type);
+    }
 }
 
 /// Validate that a session ID is safe for use as a filesystem path component.
@@ -837,9 +890,8 @@ pub enum JournalEventType {
     /// Full LLM response payload for a single attempt within a round.
     LlmResponseFull,
     /// Background session-memory (session-memory.md) extraction completed.
-    /// Distinct from legacy Memoria memory extraction: this event
-    /// describes a single atomic rewrite of the session-memory L1
-    /// artifact, not a Memoria store.
+    /// Describes a single atomic rewrite of the session-memory L1
+    /// artifact.
     SessionMemoryExtraction,
     /// Context pipeline per-turn feedback (cache ratio, tokens, tier).
     PipelineFeedback,
@@ -927,6 +979,9 @@ pub struct SessionMemoryExtractionBreadcrumbs {
     /// Final attempt count (1 = succeeded first try, 2 = recovered
     /// after one retry). Absent when no persist attempt occurred.
     pub attempt: Option<u32>,
+    /// When the LLM fails before the final persist error, keep that
+    /// upstream reason so the journal reflects the full failure chain.
+    pub llm_reason: Option<SessionMemoryExtractionErrorReason>,
 }
 
 impl SessionMemoryExtractionOutcome {
@@ -969,6 +1024,9 @@ impl SessionMemoryExtractionOutcome {
             }
             if let Some(a) = bc.attempt {
                 map.insert("attempt".into(), serde_json::json!(a));
+            }
+            if let Some(llm_reason) = bc.llm_reason {
+                map.insert("llm_reason".into(), serde_json::json!(llm_reason));
             }
         }
         obj
@@ -1029,6 +1087,7 @@ impl JournalWriter {
         }
         // Ensure durability: flush to disk so a crash doesn't lose the event.
         file.sync_data()?;
+        update_cached_session_start_state_from_event(&self.path, &event.event_type);
         Ok(())
     }
 
@@ -1072,6 +1131,7 @@ impl JournalWriter {
         if sync {
             file.sync_data()?;
         }
+        update_cached_session_start_state_from_events(&self.path, events);
         Ok(())
     }
 }
@@ -1278,6 +1338,95 @@ pub fn read_journal(session_id: &str) -> std::io::Result<Vec<JournalEvent>> {
     }
     let content = std::fs::read_to_string(&path)?;
     Ok(parse_journal_text(&content).0)
+}
+
+/// Read the last `limit` events from a session journal file.
+///
+/// This avoids loading the entire journal into memory for long-running sessions
+/// where only recent events are relevant (e.g. cache-hit diagnostics).
+pub fn read_journal_tail(session_id: &str, limit: usize) -> std::io::Result<Vec<JournalEvent>> {
+    use std::collections::VecDeque;
+    use std::io::BufRead;
+
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let path = journal_dir().join(format!("{session_id}.jsonl"));
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let file = std::fs::File::open(&path)?;
+    let reader = std::io::BufReader::new(file);
+    let mut tail_lines = VecDeque::with_capacity(limit);
+    for line in reader.lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if tail_lines.len() == limit {
+            tail_lines.pop_front();
+        }
+        tail_lines.push_back(line.to_string());
+    }
+
+    let mut events = Vec::with_capacity(tail_lines.len());
+    for line in tail_lines {
+        if let Ok(event) = serde_json::from_str::<JournalEvent>(&line) {
+            events.push(event);
+        }
+    }
+    Ok(events)
+}
+
+pub fn journal_needs_session_start(session_id: &str) -> std::io::Result<bool> {
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let path = journal_dir().join(format!("{session_id}.jsonl"));
+    let is_missing_or_empty = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata.len() == 0,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(err) => return Err(err),
+    };
+    if is_missing_or_empty {
+        set_cached_session_start_state(&path, false);
+        return Ok(true);
+    }
+    if let Some(has_open_session_start) = cached_session_start_state(&path) {
+        return Ok(!has_open_session_start);
+    }
+    let events = read_journal(session_id)?;
+    let last_type = events.last().map(|e| &e.event_type);
+    let needs_session_start = match last_type {
+        None | Some(JournalEventType::SessionEnd) => true,
+        _ => {
+            let last_start = events
+                .iter()
+                .rposition(|e| e.event_type == JournalEventType::SessionStart);
+            let last_end = events
+                .iter()
+                .rposition(|e| e.event_type == JournalEventType::SessionEnd);
+            let has_unmatched_start = match (last_start, last_end) {
+                (Some(s), Some(e)) => s > e,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            !has_unmatched_start
+        }
+    };
+    set_cached_session_start_state(&path, !needs_session_start);
+    Ok(needs_session_start)
+}
+
+pub fn ensure_session_start_event(session_id: &str, model: Option<&str>) -> std::io::Result<()> {
+    if journal_needs_session_start(session_id)? {
+        let writer = JournalWriter::new(session_id)?;
+        writer.append(&JournalEvent::session_start(Some(session_id), model))?;
+    }
+    Ok(())
 }
 
 fn approval_metadata_str(metadata: &serde_json::Value, field: &str) -> Option<String> {
@@ -3367,7 +3516,6 @@ impl JournalEvent {
 
     /// Session-memory (session-memory.md) extraction outcome event.
     ///
-    /// Distinct from the legacy Memoria memory-extraction event.
     /// Metadata is a flat, self-describing object driven by the
     /// [`SessionMemoryExtractionOutcome`] enum.
     pub fn session_memory_extraction(
@@ -4357,6 +4505,33 @@ mod tests {
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.event_type, JournalEventType::SessionFork);
         assert!(parsed.session_lineage.is_some());
+    }
+
+    #[test]
+    fn read_journal_tail_returns_only_the_last_n_events() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "00000000-0000-0000-0000-000000000190";
+        let writer = JournalWriter::new(sid).expect("journal writer");
+        for turn in 1..=5 {
+            writer
+                .append(&JournalEvent::turn(
+                    Some(sid),
+                    turn,
+                    Some("test-model"),
+                    "user",
+                    "assistant",
+                    0,
+                    0,
+                    0,
+                    0,
+                ))
+                .expect("append turn");
+        }
+
+        let tail = read_journal_tail(sid, 2).expect("read tail");
+        let turns: Vec<u32> = tail.iter().filter_map(|event| event.turn).collect();
+        assert_eq!(turns, vec![4, 5]);
     }
 
     #[test]
@@ -6936,68 +7111,78 @@ mod turn_event_buffer_tests {
     }
 
     /// Verify the needs_start_event logic for resumed sessions.
-    /// This mirrors the rposition-based check in repl_turn::initialize_journal.
     #[test]
     fn needs_start_event_scenarios() {
         let tmp = tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
-
-        // Helper: same logic as repl_turn::initialize_journal
-        fn needs_start(events: &[JournalEvent]) -> bool {
-            let last_type = events.last().map(|e| &e.event_type);
-            match last_type {
-                None | Some(JournalEventType::SessionEnd) => true,
-                _ => {
-                    let last_start = events
-                        .iter()
-                        .rposition(|e| e.event_type == JournalEventType::SessionStart);
-                    let last_end = events
-                        .iter()
-                        .rposition(|e| e.event_type == JournalEventType::SessionEnd);
-                    let has_unmatched_start = match (last_start, last_end) {
-                        (Some(s), Some(e)) => s > e,
-                        (Some(_), None) => true,
-                        _ => false,
-                    };
-                    !has_unmatched_start
-                }
-            }
-        }
+        let sid = "needs-start-sid";
 
         // Empty journal → needs start
-        assert!(needs_start(&[]));
+        assert!(journal_needs_session_start(sid).unwrap());
 
         // Clean end → needs start
-        let events = vec![
+        let events = [
             JournalEvent::session_start(Some("s"), Some("m")),
             JournalEvent::base_public(JournalEventType::Turn, Some("s")),
             JournalEvent::session_end(Some("s"), 1),
         ];
-        assert!(needs_start(&events));
+        let writer = JournalWriter::new(sid).unwrap();
+        writer.append_bulk(&events).unwrap();
+        assert!(journal_needs_session_start(sid).unwrap());
 
         // Interrupted (start, turn, no end) → already has open start, skip
-        let events = vec![
+        let sid = "needs-start-open";
+        let events = [
             JournalEvent::session_start(Some("s"), Some("m")),
             JournalEvent::base_public(JournalEventType::Turn, Some("s")),
         ];
-        assert!(!needs_start(&events));
+        let writer = JournalWriter::new(sid).unwrap();
+        writer.append_bulk(&events).unwrap();
+        assert!(!journal_needs_session_start(sid).unwrap());
 
         // start → end → start → turn (interrupted) → already has open start, skip
-        let events = vec![
+        let sid = "needs-start-nested";
+        let events = [
             JournalEvent::session_start(Some("s"), Some("m")),
             JournalEvent::session_end(Some("s"), 1),
             JournalEvent::session_start(Some("s"), Some("m")),
             JournalEvent::base_public(JournalEventType::Turn, Some("s")),
         ];
-        assert!(!needs_start(&events));
+        let writer = JournalWriter::new(sid).unwrap();
+        writer.append_bulk(&events).unwrap();
+        assert!(!journal_needs_session_start(sid).unwrap());
 
         // start → end → turn (orphan turn after clean end) → needs start
-        let events = vec![
+        let sid = "needs-start-orphan";
+        let events = [
             JournalEvent::session_start(Some("s"), Some("m")),
             JournalEvent::session_end(Some("s"), 1),
             JournalEvent::base_public(JournalEventType::Turn, Some("s")),
         ];
-        assert!(needs_start(&events));
+        let writer = JournalWriter::new(sid).unwrap();
+        writer.append_bulk(&events).unwrap();
+        assert!(journal_needs_session_start(sid).unwrap());
+    }
+
+    #[test]
+    fn ensure_session_start_event_prepends_runtime_first_write() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "ensure-start-runtime-first-write";
+
+        ensure_session_start_event(sid, Some("gpt-5")).unwrap();
+        let writer = JournalWriter::new(sid).unwrap();
+        writer
+            .append(&JournalEvent::interruption_recorded(
+                Some(sid),
+                1,
+                serde_json::json!({"kind":"budget_exhausted","resumable":true}),
+            ))
+            .unwrap();
+
+        let events = read_journal(sid).unwrap();
+        assert_eq!(events[0].event_type, JournalEventType::SessionStart);
+        assert_eq!(events[1].event_type, JournalEventType::InterruptionRecorded);
     }
 }
 

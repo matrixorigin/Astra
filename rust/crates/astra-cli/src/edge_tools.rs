@@ -371,7 +371,13 @@ fn render_extraction_outcome_label(
         } => {
             format!("llm_failed_fallback({reason:?},bytes={bytes_written},attempt={store_attempt})")
         }
-        ExtractionOutcome::PersistFailed { reason } => format!("persist_failed({reason:?})"),
+        ExtractionOutcome::PersistFailed { reason, llm_reason } => {
+            if let Some(llm_reason) = llm_reason {
+                format!("persist_failed({reason:?},llm={llm_reason:?})")
+            } else {
+                format!("persist_failed({reason:?})")
+            }
+        }
         ExtractionOutcome::Skipped { reason } => format!("skipped({reason})"),
     }
 }
@@ -1935,10 +1941,10 @@ impl ToolExecutor {
         }
     }
 
-    /// `task(action='archive', older_than_days?)` — mark completed
-    /// tasks older than N days as archived (hidden from default list).
-    /// Server-side bulk update by user_id + status='completed' +
-    /// updated_at older than threshold.
+    /// `task(action='archive', task_id?)` — either archive one
+    /// current-session task immediately, or bulk-archive stale
+    /// completed history (cloud-backed stores may widen bulk scope
+    /// to the current user's sessions).
     async fn task_archive(&self, args: &Value) -> String {
         if self.cloud_base.is_none() {
             return "Error: task(action='archive') requires a cloud connection.".to_string();
@@ -2658,16 +2664,25 @@ impl ToolExecutor {
     fn render_session_memory_introspect(&self) -> String {
         use std::fmt::Write as _;
 
+        let journal_fallback = self.render_session_memory_journal_fallback();
         let Some(obs) = self.session_memory_observatory.as_ref() else {
-            return "# session-memory observatory\n\n\
-                No observatory attached to this runtime. This is expected \
-                for offline CLI or legacy test modes; production servers \
-                attach one so extractions + injections are traceable here."
-                .to_string();
+            return journal_fallback.unwrap_or_else(|| {
+                "# session-memory observatory\n\n\
+                    No observatory attached to this runtime. This is expected \
+                    for offline CLI or legacy test modes; production servers \
+                    attach one so extractions + injections are traceable here."
+                    .to_string()
+            });
         };
 
         let ext = obs.extractions_snapshot();
         let inj = obs.injections_snapshot();
+        if ext.is_empty()
+            && inj.is_empty()
+            && let Some(fallback) = journal_fallback
+        {
+            return fallback;
+        }
         let mut out = String::from("# session-memory observatory\n\n");
 
         writeln!(
@@ -2769,6 +2784,162 @@ impl ToolExecutor {
         }
 
         out
+    }
+
+    fn render_session_memory_journal_fallback(&self) -> Option<String> {
+        use std::fmt::Write as _;
+
+        let session_id = self.active_session_id().filter(|sid| !sid.is_empty())?;
+        let events = astra_services::session_journal::read_journal(&session_id).ok()?;
+        if events.is_empty() {
+            return None;
+        }
+
+        let extractions: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.event_type
+                    == astra_services::session_journal::JournalEventType::SessionMemoryExtraction
+            })
+            .collect();
+        let session_end = events.iter().any(|event| {
+            event.event_type == astra_services::session_journal::JournalEventType::SessionEnd
+        });
+        let last_turn_error = events.iter().rev().find(|event| {
+            event.event_type == astra_services::session_journal::JournalEventType::TurnError
+        });
+        let last_cache_break = events.iter().rev().find(|event| {
+            event.event_type == astra_services::session_journal::JournalEventType::PipelineAlert
+                && event
+                    .metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get("alert_rule"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("prompt_cache_break")
+        });
+
+        let mut out = String::from("# session-memory observatory\n\n");
+        writeln!(out, "source: local_journal").ok();
+        writeln!(out, "session_id: {session_id}").ok();
+        writeln!(
+            out,
+            "session_end: {}",
+            if session_end { "present" } else { "missing" }
+        )
+        .ok();
+
+        if extractions.is_empty() {
+            out.push_str("\n## extraction journal\n(none recorded in local journal)\n");
+        } else {
+            let extracted = extractions
+                .iter()
+                .filter(|event| {
+                    event
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("outcome"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("extracted")
+                })
+                .count();
+            let skipped = extractions
+                .iter()
+                .filter(|event| {
+                    event
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("outcome"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("skipped")
+                })
+                .count();
+            let errored = extractions
+                .iter()
+                .filter(|event| {
+                    event
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("outcome"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("errored")
+                })
+                .count();
+            writeln!(
+                out,
+                "\nextractions_journal: {}  extracted={} skipped={} errored={}",
+                extractions.len(),
+                extracted,
+                skipped,
+                errored
+            )
+            .ok();
+            out.push_str("\n## extraction journal (newest last)\n");
+            for event in extractions
+                .iter()
+                .rev()
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                let meta = event.metadata.as_ref();
+                let outcome = meta
+                    .and_then(|m| m.get("outcome"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                let reason = meta
+                    .and_then(|m| m.get("reason"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("-");
+                let model = meta
+                    .and_then(|m| m.get("selector_model"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("-");
+                let messages = meta
+                    .and_then(|m| m.get("messages_count"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                writeln!(
+                    out,
+                    "- t{} {} reason={} model={} messages={}",
+                    event.turn.unwrap_or(0),
+                    outcome,
+                    reason,
+                    model,
+                    messages
+                )
+                .ok();
+            }
+            if extractions.len() > 8 {
+                writeln!(out, "… ({} older records elided)", extractions.len() - 8).ok();
+            }
+        }
+
+        if let Some(event) = last_turn_error {
+            let error = event.error.as_deref().unwrap_or("-");
+            writeln!(
+                out,
+                "\nlast_turn_error: t{} {}",
+                event.turn.unwrap_or(0),
+                error
+            )
+            .ok();
+        }
+        if let Some(event) = last_cache_break {
+            let msg = event
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("alert_message"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("prompt cache break");
+            writeln!(out, "last_cache_alert: {msg}").ok();
+        }
+        if !session_end {
+            out.push_str(
+                "\nnote: session_end is missing, so any shutdown-time session-memory flush did not run.\n",
+            );
+        }
+        Some(out)
     }
 
     /// `introspect(subtopic="cache")` — scan recent `llm_capture_*.json`
@@ -5133,6 +5304,50 @@ mod tests {
         assert!(
             out.contains("No observatory attached"),
             "expected placeholder, got: {out}"
+        );
+    }
+
+    #[test]
+    fn introspect_session_memory_missing_observatory_falls_back_to_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = "sess-introspect-memory";
+        let writer = astra_services::session_journal::JournalWriter::new(session_id).unwrap();
+        let breadcrumbs = astra_services::session_journal::SessionMemoryExtractionBreadcrumbs {
+            messages_count: Some(13),
+            selector_model: Some("haiku".to_string()),
+            attempt: Some(1),
+            llm_reason: None,
+        };
+        writer
+            .append(&astra_services::session_journal::JournalEvent::session_memory_extraction(
+                Some(session_id),
+                2,
+                120,
+                astra_services::session_journal::SessionMemoryExtractionOutcome::Errored {
+                    reason: astra_services::session_journal::SessionMemoryExtractionErrorReason::LlmError,
+                },
+                &breadcrumbs,
+            ))
+            .unwrap();
+        let turn_error = astra_services::session_journal::JournalEvent::turn_error(
+            Some(session_id),
+            2,
+            Some("deepseek-v4-pro-anthropic"),
+            "continue",
+            "[cancelled] user_interrupted",
+            0,
+        );
+        writer.append(&turn_error).unwrap();
+
+        let executor = test_executor().with_active_session_id(session_id);
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        assert!(out.contains("source: local_journal"), "{out}");
+        assert!(out.contains("session_end: missing"), "{out}");
+        assert!(out.contains("errored reason=llm_error"), "{out}");
+        assert!(
+            out.contains("last_turn_error: t2 [cancelled] user_interrupted"),
+            "{out}"
         );
     }
 

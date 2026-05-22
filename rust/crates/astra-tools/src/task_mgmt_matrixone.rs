@@ -23,10 +23,13 @@
 
 use astra_core::sqlx::{self, MySql, MySqlConnection, Pool, QueryBuilder, Row};
 use async_trait::async_trait;
+use serde_json::{Value, json};
 
 use std::sync::Arc;
 
-use crate::task_mgmt::{InMemoryTaskStore, SessionSubtask, SessionTask, TaskMutation, TaskStore};
+use crate::task_mgmt::{
+    InMemoryTaskStore, SessionSubtask, SessionTask, TaskMutation, TaskStore, prefix_summary,
+};
 
 /// Soft cap on the number of rows a single `session_todos` full-replace
 /// is expected to handle. Above this the delete-all / insert-all strategy
@@ -89,13 +92,15 @@ async fn insert_session_tasks(
         let mut builder = QueryBuilder::<MySql>::new(
             "INSERT INTO session_todos (\
                 session_id, todo_id, user_id, ordinal, title, description, active_form, \
-                status, owner, metadata, blocks, blocked_by, subtasks, \
+                status, owner, metadata, blocks, blocked_by, subtasks, archived_at, \
                 created_at, updated_at) ",
         );
         builder.push_values(
             tasks[start..end].iter().enumerate(),
             |mut row, (offset, task)| {
                 let encoded = encode_task_json_fields(task);
+                let archived_at =
+                    (task.status == "archived").then(|| to_mo_datetime(&task.updated_at));
                 row.push_bind(session_id)
                     .push_bind(&task.id)
                     .push_bind(user_id)
@@ -109,6 +114,7 @@ async fn insert_session_tasks(
                     .push_bind(encoded.blocks)
                     .push_bind(encoded.blocked_by)
                     .push_bind(encoded.subtasks)
+                    .push_bind(archived_at)
                     .push_bind(to_mo_datetime(&task.created_at))
                     .push_bind(to_mo_datetime(&task.updated_at));
             },
@@ -326,6 +332,192 @@ impl TaskStore for MatrixOneTaskStore {
             tasks.push(row_to_task(&row).map_err(|e| e.to_string())?);
         }
         Ok(tasks)
+    }
+
+    async fn archive(&self, session_id: &str, args: &Value) -> Result<String, String> {
+        if let Some(task_id) = args.get("task_id").and_then(Value::as_str) {
+            let status_row: Option<(String,)> = if self.user_id.is_empty() {
+                sqlx::query_as(
+                    "SELECT status FROM session_todos \
+                     WHERE session_id = ? AND todo_id = ? LIMIT 1",
+                )
+                .bind(session_id)
+                .bind(task_id)
+                .fetch_optional(&self.pool)
+                .await
+            } else {
+                sqlx::query_as(
+                    "SELECT status FROM session_todos \
+                     WHERE user_id = ? AND session_id = ? AND todo_id = ? LIMIT 1",
+                )
+                .bind(&self.user_id)
+                .bind(session_id)
+                .bind(task_id)
+                .fetch_optional(&self.pool)
+                .await
+            }
+            .map_err(|e| e.to_string())?;
+
+            let Some((status,)) = status_row else {
+                return Ok(prefix_summary(
+                    format!("Refused: task #{task_id} not found in session {session_id}"),
+                    json!({
+                        "success": false,
+                        "task_id": task_id,
+                        "session_id": session_id,
+                        "message": format!(
+                            "Task '{}' was not found in session '{}'",
+                            task_id, session_id
+                        ),
+                    })
+                    .to_string(),
+                ));
+            };
+            if status == "archived" {
+                return Ok(prefix_summary(
+                    format!("Refused: task #{task_id} is already archived"),
+                    json!({
+                        "success": false,
+                        "task_id": task_id,
+                        "session_id": session_id,
+                        "previous_status": status,
+                        "message": format!("Task '{}' is already archived", task_id),
+                    })
+                    .to_string(),
+                ));
+            }
+            if !matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                return Ok(prefix_summary(
+                    format!(
+                        "Refused: task #{task_id} is '{status}' — only completed, failed, or cancelled tasks can be archived"
+                    ),
+                    json!({
+                        "success": false,
+                        "task_id": task_id,
+                        "session_id": session_id,
+                        "previous_status": status,
+                        "message": format!(
+                            "Task '{}' must be completed, failed, or cancelled before it can be archived",
+                            task_id
+                        ),
+                    })
+                    .to_string(),
+                ));
+            }
+
+            let result = if self.user_id.is_empty() {
+                sqlx::query(
+                    "UPDATE session_todos \
+                     SET status = 'archived', archived_at = NOW(6), updated_at = NOW(6) \
+                     WHERE session_id = ? AND todo_id = ? \
+                       AND status IN ('completed', 'failed', 'cancelled')",
+                )
+                .bind(session_id)
+                .bind(task_id)
+                .execute(&self.pool)
+                .await
+            } else {
+                sqlx::query(
+                    "UPDATE session_todos \
+                     SET status = 'archived', archived_at = NOW(6), updated_at = NOW(6) \
+                     WHERE user_id = ? AND session_id = ? AND todo_id = ? \
+                       AND status IN ('completed', 'failed', 'cancelled')",
+                )
+                .bind(&self.user_id)
+                .bind(session_id)
+                .bind(task_id)
+                .execute(&self.pool)
+                .await
+            }
+            .map_err(|e| e.to_string())?;
+
+            if result.rows_affected() == 0 {
+                return Ok(prefix_summary(
+                    format!(
+                        "Refused: task #{task_id} changed before it could be archived; reload and try again"
+                    ),
+                    json!({
+                        "success": false,
+                        "task_id": task_id,
+                        "session_id": session_id,
+                        "message": format!(
+                            "Task '{}' changed before archive could be applied; reload and try again",
+                            task_id
+                        ),
+                    })
+                    .to_string(),
+                ));
+            }
+
+            return Ok(prefix_summary(
+                format!("Archived task #{task_id} (was {status})"),
+                json!({
+                    "success": true,
+                    "task_id": task_id,
+                    "session_id": session_id,
+                    "previous_status": status,
+                    "status": "archived",
+                    "message": format!("Task '{}' archived", task_id),
+                })
+                .to_string(),
+            ));
+        }
+
+        let days_raw = args
+            .get("older_than_days")
+            .and_then(Value::as_u64)
+            .unwrap_or(30);
+        let days = i64::try_from(days_raw)
+            .map_err(|_| format!("older_than_days is too large: {days_raw}"))?;
+        let result = if self.user_id.is_empty() {
+            sqlx::query(
+                "UPDATE session_todos \
+                 SET status = 'archived', archived_at = NOW(6), updated_at = NOW(6) \
+                 WHERE session_id = ? AND status = 'completed' \
+                   AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
+            )
+            .bind(session_id)
+            .bind(days)
+            .execute(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "UPDATE session_todos \
+                 SET status = 'archived', archived_at = NOW(6), updated_at = NOW(6) \
+                 WHERE user_id = ? AND status = 'completed' \
+                   AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
+            )
+            .bind(&self.user_id)
+            .bind(days)
+            .execute(&self.pool)
+            .await
+        }
+        .map_err(|e| e.to_string())?;
+
+        let scope = if self.user_id.is_empty() {
+            format!("session {session_id}")
+        } else {
+            format!("user {}", self.user_id)
+        };
+        Ok(prefix_summary(
+            format!(
+                "Archived {} completed task(s) older than {days} days for {scope}",
+                result.rows_affected()
+            ),
+            json!({
+                "success": true,
+                "archived": result.rows_affected(),
+                "older_than_days": days,
+                "scope": scope,
+                "message": format!(
+                    "Archived {} completed task(s) older than {} days for {}",
+                    result.rows_affected(),
+                    days,
+                    scope
+                ),
+            })
+            .to_string(),
+        ))
     }
 
     async fn save(&self, session_id: &str, tasks: Vec<SessionTask>) -> Result<(), String> {

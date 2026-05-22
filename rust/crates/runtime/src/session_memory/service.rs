@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use serde_json::Value;
 
 use astra_services::event_ingestion::{IngestionEvent, IngestionSender};
 use astra_services::session_journal::{
@@ -51,6 +52,8 @@ use super::observatory::{
 use super::request::{ExtractionRequest, SpawnDecision};
 use super::runner::{ExtractionArtifacts, run_extraction};
 
+type LocalJournalEventSink = dyn Fn(&JournalEvent) + Send + Sync + 'static;
+
 /// Hard upper bound on one LLM call. Memory extraction is background
 /// work; a hung call must never linger past this.
 pub const LLM_TIMEOUT: Duration = Duration::from_secs(30);
@@ -59,6 +62,79 @@ pub const LLM_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`SessionMemoryExtractConfig`] (~12K) already bounds the document;
 /// this keeps per-call cost predictable on pricier selectors.
 pub const EXTRACTION_MAX_OUTPUT_TOKENS: usize = 4096;
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &[u8]) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn should_force_shutdown_refresh(messages: &[Value], current_tokens: usize) -> bool {
+    let mut conversational_messages = 0usize;
+    let mut total_chars = 0usize;
+    let mut has_error_signal = false;
+
+    for message in messages {
+        let Some(role) = message.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let content = message
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::trim);
+        let tool_call_names = if role == "assistant" {
+            message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .map(|tool_calls| {
+                    tool_calls
+                        .iter()
+                        .filter_map(|tool_call| {
+                            tool_call
+                                .get("function")
+                                .and_then(|function| function.get("name"))
+                                .and_then(Value::as_str)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let synthesized = (!tool_call_names.is_empty())
+            .then(|| format!("[called: {}]", tool_call_names.join(", ")));
+        let Some(text) = content
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .or(synthesized)
+        else {
+            continue;
+        };
+        conversational_messages += 1;
+        total_chars += text.chars().count();
+        if contains_ascii_case_insensitive(&text, b"error")
+            || contains_ascii_case_insensitive(&text, b"fail")
+            || contains_ascii_case_insensitive(&text, b"panic")
+            || text.contains("错误")
+            || text.contains("失败")
+        {
+            has_error_signal = true;
+        }
+    }
+
+    if conversational_messages < 2 {
+        return false;
+    }
+
+    has_error_signal
+        || current_tokens >= 1_024
+        || total_chars >= 120
+        || conversational_messages >= 4
+}
 
 // ───────────────────────────────────────────────────────────────────────
 // Selector-params resolution (async trait so tests can swap in a const)
@@ -133,6 +209,7 @@ pub struct MemoryExtractionService {
     /// — including skips — when this is `Some`. No effect on LLM
     /// payloads or cache hashes by construction.
     observatory: Option<Arc<SessionMemoryObservatory>>,
+    local_event_sink: Option<Arc<LocalJournalEventSink>>,
 }
 
 impl std::fmt::Debug for MemoryExtractionService {
@@ -169,6 +246,7 @@ impl MemoryExtractionService {
             pending_done: Arc::new(tokio::sync::Notify::new()),
             session_states: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             observatory: None,
+            local_event_sink: None,
         }
     }
 
@@ -177,6 +255,16 @@ impl MemoryExtractionService {
     /// site so both surfaces populate a single ring set for introspect.
     pub fn with_observatory(mut self, observatory: Arc<SessionMemoryObservatory>) -> Self {
         self.observatory = Some(observatory);
+        self
+    }
+
+    /// Mirror emitted journal events into a caller-owned local sink.
+    ///
+    /// CLI uses this to append session-memory extraction events to the
+    /// local `~/.astra/sessions/*.jsonl` journal even though cloud
+    /// ingestion remains server-owned.
+    pub fn with_local_event_sink(mut self, sink: Arc<LocalJournalEventSink>) -> Self {
+        self.local_event_sink = Some(sink);
         self
     }
 
@@ -250,6 +338,49 @@ impl MemoryExtractionService {
         Arc::clone(&self.broker)
     }
 
+    /// Best-effort final flush for short or lightly-active sessions.
+    ///
+    /// Normal turn-end extraction is still the primary path. This helper
+    /// exists for session shutdown: if a session never crossed the normal
+    /// init/growth gates but still accumulated meaningful state, enqueue one
+    /// last extraction before callers block in [`Self::wait_for_pending`].
+    ///
+    /// Skips silently when the session is trivial (for example "hi" / "hello")
+    /// or when the latest persisted snapshot is already fresh enough.
+    pub fn maybe_spawn_shutdown_flush(
+        self: &Arc<Self>,
+        mut req: ExtractionRequest,
+    ) -> SpawnDecision {
+        if req.session_id.is_empty()
+            || !should_force_shutdown_refresh(&req.messages, req.current_tokens)
+        {
+            return SpawnDecision::Skipped;
+        }
+
+        let already_fresh = match self.session_states.lock() {
+            Ok(states) => states.get(&req.session_id).cloned().is_some_and(|state| {
+                !req.had_error
+                    && state.initialized
+                    && req.current_tokens <= state.tokens_at_last_extraction
+            }),
+            Err(_) => {
+                tracing::warn!(
+                    session_id = %req.session_id,
+                    "session_memory session_states mutex poisoned during shutdown flush freshness check"
+                );
+                false
+            }
+        };
+        if already_fresh {
+            return SpawnDecision::Skipped;
+        }
+
+        req.config.min_tokens_to_init = 0;
+        req.config.min_tokens_between_updates = 0;
+        req.config.min_tool_calls_between_updates = 0;
+        self.maybe_spawn(req)
+    }
+
     /// Synchronous entry point. Evaluates the gate against the service's
     /// own per-session debounce state, emits a skip event inline when
     /// rejected, advances the debounce state and spawns the async worker
@@ -264,6 +395,7 @@ impl MemoryExtractionService {
             messages_count: Some(req.messages.len() as u32),
             selector_model: None,
             attempt: None,
+            llm_reason: None,
         };
 
         enum Admission {
@@ -543,6 +675,7 @@ impl MemoryExtractionService {
                 messages_count: Some(messages_count),
                 selector_model: model_name.clone(),
                 attempt: None,
+                llm_reason: None,
             };
             self.emit_skip_event(
                 Some(&session_id),
@@ -615,8 +748,17 @@ impl MemoryExtractionService {
                         "LlmFailedPersistedFallback{{err={error_reason:?}, bytes={bytes_written}, attempt={store_attempt}}}"
                     )
                 }
-                ExtractionArtifacts::PersistFailed { error_reason } => {
-                    format!("PersistFailed{{err={error_reason:?}}}")
+                ExtractionArtifacts::PersistFailed {
+                    error_reason,
+                    llm_error_reason,
+                } => {
+                    if let Some(llm_error_reason) = llm_error_reason {
+                        format!(
+                            "PersistFailed{{err={error_reason:?}, llm_err={llm_error_reason:?}}}"
+                        )
+                    } else {
+                        format!("PersistFailed{{err={error_reason:?}}}")
+                    }
                 }
             };
             eprintln!(
@@ -657,6 +799,7 @@ impl MemoryExtractionService {
                         SessionMemoryExtractionSource::RuleFallback => None,
                     },
                     attempt: Some(store_attempt),
+                    llm_reason: None,
                 };
                 self.emit_success_event(
                     Some(&session_id),
@@ -708,6 +851,7 @@ impl MemoryExtractionService {
                     messages_count: Some(messages_count),
                     selector_model: selector_model_used.clone(),
                     attempt: Some(store_attempt),
+                    llm_reason: None,
                 };
                 self.emit_error_event(Some(&session_id), turn, error_reason, duration_ms, &bc);
                 self.broker.emit(BackgroundActivity::Finished {
@@ -732,7 +876,15 @@ impl MemoryExtractionService {
                     latency,
                 );
             }
-            ExtractionArtifacts::PersistFailed { error_reason } => {
+            ExtractionArtifacts::PersistFailed {
+                error_reason,
+                llm_error_reason,
+            } => {
+                if llm_error_reason.is_some()
+                    && let Some(name) = params_for_health.as_deref()
+                {
+                    self.health.mark_failed(name);
+                }
                 // Memoria persist failed → breaker counts it. Enough
                 // consecutive failures trip the breaker and skip
                 // future `maybe_spawn` until the cooldown elapses.
@@ -747,6 +899,7 @@ impl MemoryExtractionService {
                     // counts when nothing landed; use None so the
                     // field is omitted rather than misleadingly 0.
                     attempt: None,
+                    llm_reason: llm_error_reason,
                 };
                 self.emit_error_event(Some(&session_id), turn, error_reason, duration_ms, &bc);
                 self.broker.emit(BackgroundActivity::Errored {
@@ -762,6 +915,7 @@ impl MemoryExtractionService {
                     selector_model_used.clone(),
                     ObsExtractionOutcome::PersistFailed {
                         reason: error_reason.into(),
+                        llm_reason: llm_error_reason.map(Into::into),
                     },
                     Vec::new(),
                     String::new(),
@@ -850,13 +1004,33 @@ fn summarize_persisted_content(content: &str) -> (Vec<String>, String) {
 }
 
 impl MemoryExtractionService {
-    async fn load_current_memory(&self, _session_id: &str) -> String {
-        String::new()
+    async fn load_current_memory(&self, session_id: &str) -> String {
+        let query = format!(
+            "{} {} session memory",
+            super::runner::SESSION_MEMORY_PREFIX,
+            session_id
+        );
+        let Ok(memories) = self
+            .memoria_client
+            .retrieve_ext(&query, Some(session_id), 5, true)
+            .await
+        else {
+            return String::new();
+        };
+        memories
+            .iter()
+            .find_map(|memory| {
+                super::runner::decode_session_memory_entry(&memory.content, session_id)
+            })
+            .unwrap_or_default()
     }
 
     // ── event emission helpers ────────────────────────────────────────
 
     fn enqueue(&self, event: JournalEvent) {
+        if let Some(sink) = self.local_event_sink.as_ref() {
+            sink(&event);
+        }
         let ingestion_event = IngestionEvent::from_journal_event(&event, &self.user_id);
         self.ingestion.enqueue(ingestion_event);
     }
@@ -1082,6 +1256,21 @@ mod tests {
         }
     }
 
+    fn meaningful_shutdown_req(session_id: &str, tokens: usize) -> ExtractionRequest {
+        ExtractionRequest {
+            session_id: session_id.to_string(),
+            messages: vec![
+                json!({"role": "user", "content": "Need a cache-safe session memory design that still captures shutdown summaries for short sessions and resumed work."}),
+                json!({"role": "assistant", "content": "I removed the legacy extractor, fixed the model poisoning bug, and am wiring a final shutdown flush plus resume recap next."}),
+            ],
+            current_tokens: tokens,
+            current_tool_calls: 0,
+            had_error: false,
+            turn_number: 1,
+            config: SessionMemoryExtractConfig::default(),
+        }
+    }
+
     fn collect_extraction_events(
         rx: &mut tokio::sync::mpsc::Receiver<IngestionEvent>,
     ) -> Vec<IngestionEvent> {
@@ -1102,6 +1291,33 @@ mod tests {
             .as_nanos()
     }
 
+    #[test]
+    fn force_shutdown_refresh_counts_assistant_tool_calls_as_conversational() {
+        let messages = vec![
+            json!({"role": "user", "content": "open the homepage"}),
+            json!({
+                "role": "assistant",
+                "content": serde_json::Value::Null,
+                "tool_calls": [{"function": {"name": "web_fetch"}}]
+            }),
+            json!({
+                "role": "assistant",
+                "content": serde_json::Value::Null,
+                "tool_calls": [{"function": {"name": "read_file"}}]
+            }),
+            json!({
+                "role": "assistant",
+                "content": serde_json::Value::Null,
+                "tool_calls": [{"function": {"name": "bash"}}]
+            }),
+        ];
+
+        assert!(
+            should_force_shutdown_refresh(&messages, 100),
+            "tool-only web-agent rounds should still count toward shutdown refresh heuristics"
+        );
+    }
+
     #[tokio::test]
     async fn skip_below_gate_emits_skipped_event_with_reason() {
         let mut ctx = build_ctx(None);
@@ -1113,6 +1329,42 @@ mod tests {
         let m = events[0].metadata.as_ref().unwrap();
         assert_eq!(m["outcome"], "skipped");
         assert_eq!(m["reason"], "below_init_gate");
+        assert!(ctx.memoria.stored.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_flush_spawns_for_short_meaningful_session() {
+        let ctx = build_ctx(None);
+        let sid = format!("shutdown-flush-{}", nanos());
+        let req = meaningful_shutdown_req(&sid, 600);
+        assert_eq!(
+            ctx.svc.maybe_spawn_shutdown_flush(req),
+            SpawnDecision::Spawned
+        );
+        let leftover = ctx.svc.wait_for_pending(Duration::from_secs(2)).await;
+        assert_eq!(leftover, 0);
+        assert_eq!(ctx.memoria.stored.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_flush_skips_trivial_session() {
+        let ctx = build_ctx(None);
+        let req = ExtractionRequest {
+            session_id: format!("shutdown-trivial-{}", nanos()),
+            messages: vec![
+                json!({"role": "user", "content": "hi"}),
+                json!({"role": "assistant", "content": "hello"}),
+            ],
+            current_tokens: 12,
+            current_tool_calls: 0,
+            had_error: false,
+            turn_number: 1,
+            config: SessionMemoryExtractConfig::default(),
+        };
+        assert_eq!(
+            ctx.svc.maybe_spawn_shutdown_flush(req),
+            SpawnDecision::Skipped
+        );
         assert!(ctx.memoria.stored.lock().unwrap().is_empty());
     }
 

@@ -10,17 +10,12 @@ use astra_core::{
 use super::scoring::{
     DEGRADATION_DELTA, QUALITY_DEGRADED, QUALITY_GOOD, TOKEN_CHAR_RATIO, analyze_context_health,
     billable_input_from_canonical, compaction_effectiveness, compaction_forecast, compute_drift,
-    compute_trend, memory_recall_final_score, memory_recall_score, parse_relevance_scores,
-    parse_token_usage, pollution_ratio, relevance_quality, zone_balance,
+    compute_trend, parse_relevance_scores, parse_token_usage, pollution_ratio, relevance_quality,
+    zone_balance,
 };
-use super::{
-    EpisodicStats, IntrospectionService, MemoryIntrospectionResponse, ProceduralStats,
-    SemanticStats, ServiceResult, SkillInfo, SkillsIntrospectionResponse,
-};
+use super::{IntrospectionService, ServiceResult, SkillInfo, SkillsIntrospectionResponse};
 
-const MAX_INTROSPECTION_SNAPSHOTS: i32 = 128;
 const MAX_INTROSPECTION_USAGE_ROWS: i32 = 128;
-const MAX_MEMORY_RECALL_RESULTS: i32 = 50;
 const ASK_USER_HISTORY_EVENT_LIMIT: i32 = 50;
 
 #[derive(Clone, Debug)]
@@ -204,202 +199,6 @@ fn build_ask_user_history_summary(rows: &[AskUserHistoryRow]) -> Value {
 
 #[async_trait]
 impl IntrospectionService for DatabaseIntrospectionService {
-    async fn get_memory_introspection(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> ServiceResult<MemoryIntrospectionResponse> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        self.verify_session_owner(&pool, session_id, user_id)
-            .await?;
-
-        // Episodic stats
-        let episodic = {
-            let row = query(
-                "SELECT COUNT(*) AS total, \
-                 SUM(CASE WHEN event_type = 'user_query' THEN 1 ELSE 0 END) AS user_queries, \
-                 SUM(CASE WHEN event_type IN ('tool_call','tool_result') THEN 1 ELSE 0 END) AS tool_calls \
-                 FROM agent_events WHERE session_id = ?",
-            )
-            .bind(session_id)
-            .fetch_one(&pool)
-            .await
-            .map_err(internal_error)?;
-
-            let total: i64 = row.try_get("total").unwrap_or(0);
-            let turns: i64 = row.try_get("user_queries").unwrap_or(0);
-            let tool_calls: i64 = row.try_get("tool_calls").unwrap_or(0);
-
-            let tool_ratio = tool_calls as f64 / total.max(1) as f64;
-            let tool_intensity = if tool_ratio > 0.5 {
-                "high"
-            } else if tool_ratio > 0.2 {
-                "medium"
-            } else {
-                "low"
-            };
-            let session_depth = if turns >= 10 {
-                "deep"
-            } else if turns >= 4 {
-                "moderate"
-            } else {
-                "shallow"
-            };
-
-            EpisodicStats {
-                turns,
-                total_events: total,
-                tool_intensity: tool_intensity.into(),
-                session_depth: session_depth.into(),
-            }
-        };
-
-        // Semantic stats
-        let semantic = {
-            let snap_rows = query(
-                "SELECT token_budget, total_tokens, assembly_time_ms, created_at \
-                 FROM ctx_snapshots WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
-            )
-            .bind(session_id)
-            .bind(MAX_INTROSPECTION_SNAPSHOTS)
-            .fetch_all(&pool)
-            .await
-            .map_err(internal_error)?;
-
-            let count = snap_rows.len() as i64;
-            let token_history: Vec<i64> = snap_rows
-                .iter()
-                .filter_map(|r| r.try_get::<i64, _>("total_tokens").ok())
-                .collect();
-            let peak = token_history.iter().copied().max().unwrap_or(0);
-
-            let mut stats = SemanticStats {
-                ctx_snapshots: count,
-                peak_tokens: peak,
-                context_managed_tokens: None,
-                last_assembly_ms: None,
-                llm_prompt_tokens: None,
-                llm_completion_tokens: None,
-                llm_total_tokens: None,
-                health: None,
-            };
-
-            if let Some(latest) = snap_rows.first() {
-                stats.context_managed_tokens = latest.try_get("total_tokens").ok();
-                stats.last_assembly_ms = latest.try_get("assembly_time_ms").ok();
-
-                let usage_rows = query(
-                    "SELECT IFNULL(CAST(token_usage AS CHAR), '{}') AS token_usage \
-                      FROM agent_events \
-                      WHERE session_id = ? AND event_type = 'llm_response' \
-                        AND token_usage IS NOT NULL \
-                      ORDER BY created_at DESC LIMIT ?",
-                )
-                .bind(session_id)
-                .bind(MAX_INTROSPECTION_USAGE_ROWS)
-                .fetch_all(&pool)
-                .await
-                .map_err(internal_error)?;
-
-                let mut llm_usage_val: Option<Value> = None;
-                if let Some(first) = usage_rows.first() {
-                    let raw: String = first.try_get("token_usage").unwrap_or_default();
-                    llm_usage_val = parse_token_usage(&raw);
-                }
-
-                if let Some(ref usage) = llm_usage_val {
-                    stats.llm_prompt_tokens = billable_input_from_canonical(usage);
-                    stats.llm_completion_tokens =
-                        usage.get("output_tokens").and_then(|v| v.as_i64());
-                    stats.llm_total_tokens = usage.get("total_tokens").and_then(|v| v.as_i64());
-                }
-
-                let budget_raw: Option<String> = latest.try_get("token_budget").ok();
-                if let Some(ref budget_str) = budget_raw
-                    && let Ok(budget) = serde_json::from_str::<Value>(budget_str)
-                {
-                    let prompt_history: Vec<i64> = usage_rows
-                        .iter()
-                        .filter_map(|r| {
-                            let raw: String = r.try_get("token_usage").ok()?;
-                            let u = parse_token_usage(&raw)?;
-                            billable_input_from_canonical(&u)
-                        })
-                        .collect();
-
-                    let health = analyze_context_health(
-                        &budget,
-                        &prompt_history,
-                        None,
-                        llm_usage_val.as_ref(),
-                        128000,
-                    );
-                    stats.health = serde_json::to_value(&health).ok();
-                }
-            }
-
-            stats
-        };
-
-        // Procedural stats
-        let procedural = {
-            let row = query(
-                "SELECT COUNT(*) AS total, \
-                 SUM(CASE WHEN user_feedback_score > 0 THEN 1 ELSE 0 END) AS positive \
-                 FROM skill_selection_events WHERE session_id = ?",
-            )
-            .bind(session_id)
-            .fetch_one(&pool)
-            .await
-            .map_err(internal_error)?;
-
-            let total: i64 = row.try_get("total").unwrap_or(0);
-            let positive: i64 = row.try_get("positive").unwrap_or(0);
-            let accuracy = if total >= 10 {
-                Some(((positive as f64 / total as f64) * 100.0).round() / 100.0)
-            } else {
-                None
-            };
-
-            ProceduralStats {
-                skill_selections: total,
-                accuracy_rate: accuracy,
-            }
-        };
-
-        // Profile memories
-        let profile = {
-            let rows = query(
-                "SELECT SUBSTRING(CAST(content AS CHAR), 1, 8192) AS content FROM mem_memories \
-                 WHERE user_id = ? AND is_active = 1 AND memory_type = 'profile' \
-                 ORDER BY updated_at DESC LIMIT 20",
-            )
-            .bind(user_id)
-            .fetch_all(&pool)
-            .await
-            .ok();
-
-            rows.and_then(|rs| {
-                if rs.is_empty() {
-                    None
-                } else {
-                    Some(
-                        rs.iter()
-                            .filter_map(|r| r.try_get::<String, _>("content").ok())
-                            .collect(),
-                    )
-                }
-            })
-        };
-
-        Ok(MemoryIntrospectionResponse {
-            episodic,
-            semantic,
-            procedural,
-            profile,
-        })
-    }
-
     async fn get_skills_introspection(
         &self,
         user_id: &str,
@@ -831,109 +630,6 @@ impl IntrospectionService for DatabaseIntrospectionService {
         }))
     }
 
-    async fn get_memory_recall(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        query_str: &str,
-        task_hint: &str,
-        limit: i32,
-    ) -> ServiceResult<Value> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        self.verify_session_owner(&pool, session_id, user_id)
-            .await?;
-        let limit = limit.clamp(1, MAX_MEMORY_RECALL_RESULTS);
-
-        let terms: Vec<&str> = query_str
-            .split_whitespace()
-            .filter(|t| !t.is_empty())
-            .collect();
-
-        let rows = query(
-            "SELECT memory_id, SUBSTRING(CAST(content AS CHAR), 1, 32768) AS content, \
-                    initial_confidence, observed_at, created_at \
-             FROM mem_memories \
-             WHERE user_id = ? AND is_active = 1 \
-             ORDER BY COALESCE(observed_at, created_at) DESC LIMIT 200",
-        )
-        .bind(user_id)
-        .fetch_all(&pool)
-        .await;
-
-        let rows = match rows {
-            Ok(r) => r,
-            Err(_) => {
-                return Ok(empty_memory_recall(query_str, task_hint));
-            }
-        };
-
-        if rows.is_empty() {
-            return Ok(empty_memory_recall(query_str, task_hint));
-        }
-
-        let now = chrono::Utc::now();
-        let mut ranking: Vec<Value> = Vec::new();
-
-        for row in &rows {
-            let memory_id: String = row.try_get("memory_id").unwrap_or_default();
-            let content: String = row.try_get("content").unwrap_or_default();
-            let confidence: f64 = row.try_get("initial_confidence").unwrap_or(0.0);
-
-            let observed_str: Option<String> = row
-                .try_get("observed_at")
-                .ok()
-                .or_else(|| row.try_get("created_at").ok());
-
-            let age_days = observed_str
-                .and_then(|s| {
-                    chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
-                        .ok()
-                        .or_else(|| {
-                            chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S").ok()
-                        })
-                })
-                .map(|dt| {
-                    let aware = dt.and_utc();
-                    (now - aware).num_seconds().max(0) as f64 / 86400.0
-                })
-                .unwrap_or(15.0);
-
-            let breakdown = memory_recall_score(&content, &terms, confidence, age_days);
-            let final_score = memory_recall_final_score(&content, &terms, confidence, age_days);
-
-            ranking.push(serde_json::json!({
-                "memory_id": memory_id,
-                "final_score": final_score,
-                "scores": breakdown,
-            }));
-        }
-
-        ranking.sort_by(|a, b| {
-            let sa = a.get("final_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let sb = b.get("final_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        ranking.truncate(limit as usize);
-
-        for (idx, item) in ranking.iter_mut().enumerate() {
-            item.as_object_mut()
-                .map(|o| o.insert("rank".into(), serde_json::json!(idx + 1)));
-        }
-
-        Ok(serde_json::json!({
-            "query": query_str,
-            "task_hint": task_hint,
-            "retrieved_count": ranking.len(),
-            "total_ms": 0,
-            "phases": {
-                "keyword": {"candidates": rows.len(), "ms": 0},
-                "vector": {"candidates": rows.len(), "ms": 0},
-                "merge": {"candidates": ranking.len(), "ms": 0},
-            },
-            "ranking": ranking,
-        }))
-    }
-
     async fn get_decision_trace(
         &self,
         user_id: &str,
@@ -1220,21 +916,6 @@ impl IntrospectionService for DatabaseIntrospectionService {
     }
 }
 
-fn empty_memory_recall(query_str: &str, task_hint: &str) -> Value {
-    serde_json::json!({
-        "query": query_str,
-        "task_hint": task_hint,
-        "retrieved_count": 0,
-        "total_ms": 0,
-        "phases": {
-            "keyword": {"candidates": 0, "ms": 0},
-            "vector": {"candidates": 0, "ms": 0},
-            "merge": {"candidates": 0, "ms": 0},
-        },
-        "ranking": [],
-    })
-}
-
 fn summarize_contents(
     selected_events: Option<&str>,
     code_context: Option<&str>,
@@ -1362,25 +1043,6 @@ fn raw_contents(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── empty_memory_recall ──────────────────────────────────────────────
-
-    #[test]
-    fn empty_memory_recall_structure() {
-        let result = empty_memory_recall("test query", "code_gen");
-        assert_eq!(result["query"], "test query");
-        assert_eq!(result["task_hint"], "code_gen");
-        assert_eq!(result["retrieved_count"], 0);
-        assert!(result["ranking"].as_array().unwrap().is_empty());
-        assert_eq!(result["phases"]["keyword"]["candidates"], 0);
-    }
-
-    #[test]
-    fn empty_memory_recall_empty_strings() {
-        let result = empty_memory_recall("", "");
-        assert_eq!(result["query"], "");
-        assert_eq!(result["task_hint"], "");
-    }
 
     // ── summarize_contents ──────────────────────────────────────────────
 
@@ -1646,7 +1308,6 @@ mod tests {
     async fn unconfigured_service_returns_errors() {
         use super::super::{IntrospectionService, UnconfiguredIntrospectionService};
         let svc = UnconfiguredIntrospectionService;
-        assert!(svc.get_memory_introspection("u1", "s1").await.is_err());
         assert!(svc.get_skills_introspection("u1").await.is_err());
         assert!(svc.get_context_trend("u1", "s1", 10, 128000).await.is_err());
         assert!(
@@ -1655,11 +1316,6 @@ mod tests {
                 .is_err()
         );
         assert!(svc.get_retrieval_quality("u1", "s1", 5).await.is_err());
-        assert!(
-            svc.get_memory_recall("u1", "s1", "q", "hint", 10)
-                .await
-                .is_err()
-        );
     }
 
     // ── Query type serde defaults ───────────────────────────────────────
@@ -1687,14 +1343,5 @@ mod tests {
         use super::super::RetrievalQualityQuery;
         let q: RetrievalQualityQuery = serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
         assert_eq!(q.turns, 5);
-    }
-
-    #[test]
-    fn memory_recall_query_defaults() {
-        use super::super::MemoryRecallQuery;
-        let q: MemoryRecallQuery =
-            serde_json::from_str(r#"{"session_id":"s1","query":"test"}"#).unwrap();
-        assert_eq!(q.task_hint, "default");
-        assert_eq!(q.limit, 10);
     }
 }

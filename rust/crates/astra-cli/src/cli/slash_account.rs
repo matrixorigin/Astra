@@ -84,12 +84,9 @@ pub(super) async fn handle_account_command(
                 );
             } else {
                 let _ = persist_profile_memoria_api_key(profile, arg);
-                // SAFETY: This runs during single-threaded REPL command processing.
-                // No concurrent threads read MEMORIA_MASTER_KEY at this point.
-                unsafe {
-                    std::env::set_var("MEMORIA_MASTER_KEY", arg);
-                }
-                cli_ok!("Memoria API key saved");
+                cli_ok!(
+                    "Memoria API key saved (CLI memory traffic now goes through the Astra server)"
+                );
             }
         }
         _ => unreachable!("unexpected account command: {cmd}"),

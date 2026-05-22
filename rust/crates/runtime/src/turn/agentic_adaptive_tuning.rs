@@ -1117,6 +1117,10 @@ fn write_session_journal_event(
     let Some(session_id) = state.current_session_id.as_deref() else {
         return;
     };
+    let _ = astra_services::session_journal::ensure_session_start_event(
+        session_id,
+        state.context_manifest_model_name.as_deref(),
+    );
     let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) else {
         return;
     };

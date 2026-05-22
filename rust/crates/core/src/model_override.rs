@@ -5,7 +5,10 @@
 /// sent as a model override.
 pub fn normalize_model_override(model: Option<&str>) -> Option<&str> {
     let model = model?.trim();
-    if model.is_empty() || model.eq_ignore_ascii_case("default") {
+    if model.is_empty()
+        || model.eq_ignore_ascii_case("default")
+        || model.chars().any(char::is_control)
+    {
         None
     } else {
         Some(model)
@@ -26,6 +29,8 @@ mod tests {
         assert_eq!(normalize_model_override(Some("")), None);
         assert_eq!(normalize_model_override(Some(" default ")), None);
         assert_eq!(normalize_model_override(Some("DEFAULT")), None);
+        assert_eq!(normalize_model_override(Some("bad\nmodel")), None);
+        assert_eq!(normalize_model_override(Some("bad\tmodel")), None);
         assert_eq!(
             normalize_model_override(Some("MiniMax-M2.7")),
             Some("MiniMax-M2.7")

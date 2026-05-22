@@ -102,6 +102,26 @@ pub(super) async fn finalize_session(state: &mut SessionState) {
     //    generous — the worker's internal LLM_TIMEOUT is 30s but real
     //    selector calls return in well under 5s.
     if let Some(svc) = state.session_memory_extractor.as_ref() {
+        if let Some(session_id) = state.session_id.as_deref().filter(|sid| !sid.is_empty()) {
+            let _ = svc.maybe_spawn_shutdown_flush(astra_runtime::session_memory::ExtractionRequest {
+                session_id: session_id.to_string(),
+                messages: super::chat_turn::history_as_messages(&state.history),
+                current_tokens: state
+                    .total_prompt_tokens
+                    .saturating_add(state.total_cache_read_tokens)
+                    .saturating_add(state.total_cache_creation_tokens) as usize,
+                current_tool_calls: 0,
+                had_error: state
+                    .last_turn_event
+                    .as_ref()
+                    .and_then(|event| event.error.as_ref())
+                    .is_some(),
+                turn_number: state.turn,
+                config:
+                    astra_turn_core::cloud_session_memory_extract::SessionMemoryExtractConfig::default(
+                    ),
+            });
+        }
         let leftover = svc
             .wait_for_pending(std::time::Duration::from_secs(10))
             .await;
@@ -183,57 +203,23 @@ pub(super) async fn finalize_session(state: &mut SessionState) {
                 .await;
                 // Only purge AFTER store completes.
                 if let Some(sid) = sid_for_purge {
-                    if let Some((client, base, key)) =
-                        edge_tools::memoria::memoria_oneshot_client_pub(5)
-                    {
-                        let _ = client
-                            .post(format!("{base}/v1/memories/purge"))
-                            .header("Authorization", format!("Bearer {key}"))
-                            .json(&serde_json::json!({
-                                "topic": format!("LESSON session:{sid}"),
-                                "reason": "session-end promotion to semantic T3",
-                            }))
-                            .send()
-                            .await;
-                    }
+                    let _ = edge_tools::memoria::memoria_purge(&serde_json::json!({
+                        "topic": format!("LESSON session:{sid}"),
+                        "reason": "session-end promotion to semantic T3",
+                    }))
+                    .await;
                 }
             });
         } else if let Some(ref sid) = state.session_id {
             // No new lessons but still purge stale T4 working copies.
             let sid = sid.clone();
             tokio::spawn(async move {
-                if let Some((client, base, key)) =
-                    edge_tools::memoria::memoria_oneshot_client_pub(5)
-                {
-                    let _ = client
-                        .post(format!("{base}/v1/memories/purge"))
-                        .header("Authorization", format!("Bearer {key}"))
-                        .json(&serde_json::json!({
-                            "topic": format!("LESSON session:{sid}"),
-                            "reason": "session-end cleanup (no new lessons)",
-                        }))
-                        .send()
-                        .await;
-                }
+                let _ = edge_tools::memoria::memoria_purge(&serde_json::json!({
+                    "topic": format!("LESSON session:{sid}"),
+                    "reason": "session-end cleanup (no new lessons)",
+                }))
+                .await;
             });
-        }
-    }
-    // 3f. Drain any in-flight memory extraction (bounded 5s).
-    //
-    // Use the centralized journal_event_for_outcome builder so that
-    // variant-specific metadata (prior_turn for SkippedBusy, error string
-    // for Error) reaches the session-end journal — previously the manual
-    // constructor here dropped those fields and operators investigating
-    // a session end saw only `tag=skipped_busy` with no blocker context.
-    if let Some(outcome) = state.memory_extractor.drain(Duration::from_secs(5)).await {
-        if let Some(ref j) = state.journal {
-            let evt = super::memory_extraction::journal_event_for_outcome(
-                state.session_id.as_deref(),
-                state.turn,
-                &outcome,
-            );
-            let _ = j.append(&evt);
-            enqueue_ingestion_pub(state, &evt);
         }
     }
     // 3e. End observability only after session-derived lessons/outcomes have
@@ -248,6 +234,22 @@ pub(super) async fn finalize_session(state: &mut SessionState) {
     })
     .await;
     if let Some(sid) = state.session_id.as_deref() {
+        let report = super::chat_turn::close_pending_memory_feedback_at_turn_end(
+            Some(sid),
+            Some(crate::command_router::resolve_api_url(None)),
+            super::session_runtime::current_access_token(None),
+            "cli-session-end",
+        )
+        .await;
+        if report.attempted > 0 {
+            tracing::debug!(
+                session_id = %sid,
+                attempted = report.attempted,
+                succeeded = report.succeeded,
+                failed = report.failed,
+                "closed pending recall feedback during session cleanup"
+            );
+        }
         astra_tools::memoria::MemoriaClient::reset_session_process_state(sid);
     }
     // 5. Clear panic guard

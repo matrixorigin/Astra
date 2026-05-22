@@ -69,6 +69,8 @@ pub struct CliSpawnAgentExecutor {
     /// Threaded into the child's ToolExecutor so spawned sub-agents
     /// can also use `agent_job(action='shell')`.
     bg_task_commands: Option<Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
+    /// Session/default model fallback when the spawn request itself omits one.
+    default_model: Option<String>,
 }
 
 /// Build the child agent's message array from system prompt, optional
@@ -306,7 +308,13 @@ impl CliSpawnAgentExecutor {
             fork_cache_sink: None,
             journal: None,
             bg_task_commands: None,
+            default_model: None,
         }
+    }
+
+    pub fn with_default_model(mut self, model: Option<String>) -> Self {
+        self.default_model = model;
+        self
     }
 
     /// Install a token provider so each spawn reads the freshest
@@ -330,6 +338,12 @@ impl CliSpawnAgentExecutor {
             }
         }
         self.token.clone()
+    }
+
+    fn resolve_effective_model(&self, config_model: Option<&str>) -> Option<String> {
+        config_model
+            .map(ToOwned::to_owned)
+            .or_else(|| self.default_model.clone())
     }
 
     async fn resolve_token_async(&self) -> Result<String, String> {
@@ -447,6 +461,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 return Err(err);
             }
         };
+        let effective_model = self.resolve_effective_model(config.model.as_deref());
+
         let mut executor = edge_tools::ToolExecutor::new(&effective_root)
             .with_cloud(self.api.api_origin(), &token);
         if let Some(ref cmds) = self.bg_task_commands {
@@ -460,12 +476,12 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         // `SubRunHost::tool_cache` and the `AgenticLoopState` below.
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_selection
-            .resolve_for_model(config.model.as_deref());
+            .resolve_for_model(effective_model.as_deref());
 
         let mut host = SubRunHost {
             api: self.api.clone(),
             token: token.clone(),
-            model: config.model.clone(),
+            model: effective_model.clone(),
             project_root: effective_root.clone(),
             executor: std::sync::Arc::new(executor),
             all_schemas,
@@ -589,7 +605,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             current_run_id: Some(config.run_id.clone()),
             context_manifest_pool: None,
             context_manifest_user_id: None,
-            context_manifest_model_name: None,
+            context_manifest_model_name: effective_model,
             recursion_depth: config.recursion_depth,
             final_text: String::new(),
             final_text_streamed: false,
@@ -608,6 +624,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             agentic_turn_budget: task_profile.agentic_turn_budget,
             current_round_index: 0,
             llm_rounds_completed: 0,
+            last_request_message_count: None,
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             boosted_tools: HashSet::new(),
@@ -945,6 +962,31 @@ mod tests {
             executor.token_provider.is_none(),
             "fresh executor must have no provider — production wires \
              one via with_token_provider"
+        );
+        assert!(executor.default_model.is_none());
+    }
+
+    #[test]
+    fn resolve_effective_model_prefers_spawn_model_then_default() {
+        let api = astra_thin_client::ThinClient::new("http://test", None).expect("test api");
+        let executor = CliSpawnAgentExecutor::new(
+            api,
+            "token".to_string(),
+            PathBuf::from("/tmp"),
+            PermissionMode::Prompt,
+            None,
+        )
+        .with_default_model(Some("session-default".to_string()));
+
+        assert_eq!(
+            executor
+                .resolve_effective_model(Some("spawn-model"))
+                .as_deref(),
+            Some("spawn-model")
+        );
+        assert_eq!(
+            executor.resolve_effective_model(None).as_deref(),
+            Some("session-default")
         );
     }
 

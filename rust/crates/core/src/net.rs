@@ -13,6 +13,38 @@
 //! LLM client and `validate_connectivity` in `astra-services` call it. Do not
 //! duplicate this logic elsewhere — add a new caller instead.
 
+/// Build an internal `reqwest` client that must never honor env proxy vars.
+///
+/// Callers should pass any desired timeouts / redirect policy / TLS settings in
+/// `builder`; this helper enforces `.no_proxy()` and, if the customized build
+/// fails, retries once with a minimal no-proxy client so internal service calls
+/// never silently fall back to `reqwest::Client::new()` (which would re-enable
+/// env proxy handling).
+pub fn build_internal_http_client(
+    builder: reqwest::ClientBuilder,
+    client_name: &'static str,
+) -> reqwest::Client {
+    match builder.no_proxy().build() {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(
+                target: "astra_core::net",
+                client_name,
+                error = %error,
+                "failed to build configured internal HTTP client; retrying with minimal no-proxy client"
+            );
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|fallback_error| {
+                    panic!(
+                        "failed to build minimal no-proxy client for {client_name}: {fallback_error}"
+                    )
+                })
+        }
+    }
+}
+
 /// Apply proxy settings from the environment to a `reqwest::ClientBuilder`.
 ///
 /// Precedence (first match wins): `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`,

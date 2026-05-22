@@ -45,6 +45,8 @@ use serde::{Deserialize, Serialize};
 mod agent_loader;
 #[path = "cli/agent_runtime.rs"]
 mod agent_runtime;
+#[path = "cli/app_server.rs"]
+mod app_server;
 #[path = "cli/auth_flow.rs"]
 mod auth_flow;
 #[path = "cli/chat_stream/mod.rs"]
@@ -102,8 +104,6 @@ mod journal_diff;
 mod journal_digest;
 #[path = "cli/journal_tree.rs"]
 mod journal_tree;
-#[path = "cli/memory_extraction.rs"]
-mod memory_extraction;
 #[path = "cli/mock_llm.rs"]
 mod mock_llm;
 #[path = "cli/notifications.rs"]
@@ -395,21 +395,6 @@ async fn main() {
             std::process::exit(1);
         }
     };
-
-    // Set MEMORIA_MASTER_KEY from credentials if not already set
-    if std::env::var("MEMORIA_MASTER_KEY").is_err() {
-        let creds = load_credentials();
-        let name = profile_name(cli.profile.as_deref(), &creds);
-        if let Some(key) = creds
-            .profiles
-            .get(&name)
-            .and_then(|p| p.memoria_api_key.as_deref())
-        {
-            unsafe {
-                std::env::set_var("MEMORIA_MASTER_KEY", key);
-            }
-        }
-    }
 
     let Cli {
         api_url: _,

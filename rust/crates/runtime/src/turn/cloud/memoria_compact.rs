@@ -457,12 +457,12 @@ impl HttpMemoriaClient {
         Self {
             base_url,
             api_key,
-            http: reqwest::Client::builder()
-                .no_proxy()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(60))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            http: astra_core::net::build_internal_http_client(
+                reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .timeout(std::time::Duration::from_secs(60)),
+                "memoria compact client",
+            ),
             focus_store: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -495,6 +495,30 @@ impl HttpMemoriaClient {
             .iter()
             .map(|h| (h.focus_type.clone(), h.value.clone(), h.boost))
             .collect()
+    }
+
+    pub async fn health_check(&self) -> Result<(), String> {
+        let url = format!("{}/v1/health/analyze", self.base_url.trim_end_matches('/'));
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.http
+                .get(url)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .send(),
+        )
+        .await
+        .map_err(|_| "Memoria health check timed out after 5s".to_string())?
+        .map_err(|error| format!("Memoria health check request failed: {error}"))?;
+
+        if response.status().is_success() {
+            return Ok(());
+        }
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(format!(
+            "Memoria health check failed: status={status}, body={body}"
+        ))
     }
 }
 
@@ -952,11 +976,19 @@ fn build_memory_context(memories: &[MemoriaMemory], max_tokens: usize) -> String
     let mut total_tokens = 0;
 
     for mem in memories {
-        let mem_tokens = crate::prompts::estimate_str_tokens(&mem.content);
+        let rendered = mem
+            .session_id
+            .as_deref()
+            .and_then(|session_id| {
+                crate::session_memory::runner::decode_session_memory_entry(&mem.content, session_id)
+            })
+            .map(|body| format!("Session memory summary:\n{body}"))
+            .unwrap_or_else(|| mem.content.clone());
+        let mem_tokens = crate::prompts::estimate_str_tokens(&rendered);
         if total_tokens + mem_tokens > max_tokens {
             break;
         }
-        parts.push(format!("• {}", mem.content));
+        parts.push(format!("• {}", rendered.replace('\n', "\n  ")));
         total_tokens += mem_tokens;
     }
 
@@ -1718,6 +1750,24 @@ mod tests {
         let ctx = build_memory_context(&memories, 1000);
         assert!(ctx.contains("User prefers Rust"));
         assert!(ctx.contains("[Session Context from Memory]"));
+    }
+
+    #[test]
+    fn build_memory_context_decodes_session_memory_entries() {
+        let memories = vec![MemoriaMemory {
+            memory_id: "m1".to_string(),
+            content: crate::session_memory::runner::encode_session_memory_entry(
+                "sess-1",
+                "## Active Goals\n- Fix memory\n",
+            ),
+            memory_type: "working".to_string(),
+            session_id: Some("sess-1".to_string()),
+            ..Default::default()
+        }];
+        let ctx = build_memory_context(&memories, 1000);
+        assert!(ctx.contains("Session memory summary"));
+        assert!(ctx.contains("Fix memory"));
+        assert!(!ctx.contains(crate::session_memory::runner::SESSION_MEMORY_PREFIX));
     }
 
     #[test]
@@ -2797,6 +2847,57 @@ mod tests {
             err.contains("non-empty"),
             "expected validation error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn health_check_accepts_success_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await.unwrap();
+            let payload = b"{\"status\":\"ok\"}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.write_all(payload).await;
+            let _ = sock.shutdown().await;
+        });
+
+        let client = HttpMemoriaClient::new(format!("http://{addr}"), "test-key".to_string());
+        client.health_check().await.expect("health should pass");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_check_reports_non_success_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await.unwrap();
+            let payload = b"{\"error\":\"unhealthy\"}";
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.write_all(payload).await;
+            let _ = sock.shutdown().await;
+        });
+
+        let client = HttpMemoriaClient::new(format!("http://{addr}"), "test-key".to_string());
+        let err = client.health_check().await.unwrap_err();
+        assert!(err.contains("503"), "expected status in error: {err}");
+        server.await.unwrap();
     }
 
     // ── P7: parse_reflect_candidates ──────────────────────────────────

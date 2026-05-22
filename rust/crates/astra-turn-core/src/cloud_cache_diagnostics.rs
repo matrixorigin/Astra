@@ -78,7 +78,7 @@ pub fn diff_fingerprints(old: &CacheFingerprint, new: &CacheFingerprint) -> Vec<
 
 /// Stateful detector that tracks fingerprints across turns.
 #[derive(Debug)]
-pub struct CacheBreakDetector {
+pub struct CloudCacheBreakDetector {
     last_fingerprint: Option<CacheFingerprint>,
     last_cache_read_tokens: u64,
     last_timestamp_secs: u64,
@@ -107,13 +107,13 @@ impl CacheStats {
     }
 }
 
-impl Default for CacheBreakDetector {
+impl Default for CloudCacheBreakDetector {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl CacheBreakDetector {
+impl CloudCacheBreakDetector {
     pub fn new() -> Self {
         Self {
             last_fingerprint: None,
@@ -224,6 +224,8 @@ impl CacheBreakDetector {
     }
 }
 
+pub type CacheBreakDetector = CloudCacheBreakDetector;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,7 +250,7 @@ mod tests {
 
     #[test]
     fn detect_break_on_hash_change_with_cold_cache() {
-        let mut d = CacheBreakDetector::new();
+        let mut d = CloudCacheBreakDetector::new();
         let fp1 = fp("prompt_v1", "tools", "gpt-4o", "openai");
         let fp2 = fp("prompt_v2", "tools", "gpt-4o", "openai");
         // First turn: establish baseline with cache hits
@@ -266,13 +268,13 @@ mod tests {
 
     #[test]
     fn no_break_on_first_turn() {
-        let mut d = CacheBreakDetector::new();
+        let mut d = CloudCacheBreakDetector::new();
         assert!(d.detect_break(&fp("p", "t", "m", "pr"), 0).is_none());
     }
 
     #[test]
     fn break_when_fingerprint_changes_even_with_cache_hit() {
-        let mut d = CacheBreakDetector::new();
+        let mut d = CloudCacheBreakDetector::new();
         let fp1 = fp("v1", "t", "m", "p");
         let fp2 = fp("v2", "t", "m", "p");
         d.detect_break(&fp1, 5000);
@@ -287,7 +289,7 @@ mod tests {
 
     #[test]
     fn no_break_when_fingerprint_stable_and_cache_hitting() {
-        let mut d = CacheBreakDetector::new();
+        let mut d = CloudCacheBreakDetector::new();
         let fp1 = fp("p", "t", "m", "prov");
         d.detect_break(&fp1, 5000);
         // Same fingerprint, cache still hitting — genuine hit, no break

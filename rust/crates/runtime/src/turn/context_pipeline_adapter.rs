@@ -338,13 +338,16 @@ pub(crate) fn build_session_context(
     project_context: Option<&str>,
 ) -> SessionContext {
     let provider_policy = super::prompt_cache::provider_cache_policy_for(provider, model_name);
+    let provider_strategy =
+        ProviderCacheStrategy::from_provider_and_model(Some(provider), Some(model_name));
     SessionContext {
         session_id: session_id.to_string(),
         run_id: run_id.unwrap_or_default().to_string(),
         model_id: model_name.to_string(),
+        provider_name: provider.to_string(),
         model_limit: u32::try_from(max_input_tokens).unwrap_or(u32::MAX),
         provider_policy,
-        provider_strategy: ProviderCacheStrategy::default(),
+        provider_strategy,
         // Cross-session project context (summaries of prior sessions on
         // this repo) is session-stable — feeding it through the pipeline's
         // `ProjectContext` section puts it in CacheScope::Session behind the
@@ -704,7 +707,7 @@ mod tests {
         let state = make_state();
         let ci = build_composite_inputs(&state, &ep, "anthropic", "claude-sonnet-4-6", "hello");
 
-        let sess = PipelineSession::new(PipelineConfig {
+        let mut sess = PipelineSession::new(PipelineConfig {
             provider_policy: ci.session.provider_policy.clone(),
         });
         let output = sess
@@ -755,7 +758,7 @@ mod tests {
         let state = make_state();
         let ci = build_composite_inputs(&state, &ep, "anthropic", "claude-sonnet-4-6", "hello");
 
-        let sess = PipelineSession::new(PipelineConfig {
+        let mut sess = PipelineSession::new(PipelineConfig {
             provider_policy: ci.session.provider_policy.clone(),
         });
         let output = sess
@@ -803,7 +806,7 @@ mod tests {
         let state = make_state();
         let ci = build_composite_inputs(&state, &ep, "openai", "gpt-4o", "hello");
 
-        let sess = PipelineSession::new(PipelineConfig {
+        let mut sess = PipelineSession::new(PipelineConfig {
             provider_policy: ci.session.provider_policy.clone(),
         });
         let output = sess
@@ -845,7 +848,7 @@ mod tests {
         let state = make_state();
         let ci = build_composite_inputs(&state, &ep, "anthropic", "claude-sonnet-4-6", "hello");
 
-        let sess = PipelineSession::new(PipelineConfig {
+        let mut sess = PipelineSession::new(PipelineConfig {
             provider_policy: ci.session.provider_policy.clone(),
         });
         let output = sess
@@ -913,7 +916,7 @@ mod tests {
             Value::String("## User Memories\n- uses rustfmt".into()),
         );
         let ci = build_composite_inputs(&state, &ep_with, "anthropic", "claude-sonnet-4-6", "hi");
-        let sess = PipelineSession::new(PipelineConfig {
+        let mut sess = PipelineSession::new(PipelineConfig {
             provider_policy: ci.session.provider_policy.clone(),
         });
         let out_with = sess
@@ -939,7 +942,7 @@ mod tests {
         let ep_without = serde_json::Map::new();
         let ci2 =
             build_composite_inputs(&state, &ep_without, "anthropic", "claude-sonnet-4-6", "hi");
-        let sess2 = PipelineSession::new(PipelineConfig {
+        let mut sess2 = PipelineSession::new(PipelineConfig {
             provider_policy: ci2.session.provider_policy.clone(),
         });
         let out_without = sess2

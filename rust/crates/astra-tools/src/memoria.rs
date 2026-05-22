@@ -95,8 +95,22 @@ pub fn parse_memory_search_hits(raw: &str) -> Vec<BoostSearchHit> {
 /// Return true when text appears to contain credentials or similarly
 /// sensitive material that must never become durable memory.
 pub fn contains_sensitive_memory_content(text: &str) -> bool {
+    // Fast path: case-sensitive patterns (no allocation needed).
+    let raw = text.trim();
+    if raw.contains("ghp_")
+        || raw.contains("github_pat_")
+        || raw.contains("sk-live-")
+        || raw.contains("sk_test_")
+        || raw.contains("xoxb-")
+        || raw.contains("xoxp-")
+        || raw.contains("AKIA")
+    {
+        return true;
+    }
+
+    // Slow path: case-insensitive search.
     let lower = text.to_ascii_lowercase();
-    let compact: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+    let has_whitespace = lower.chars().any(char::is_whitespace);
     const NEEDLES: &[&str] = &[
         "password:",
         "password=",
@@ -119,20 +133,212 @@ pub fn contains_sensitive_memory_content(text: &str) -> bool {
         "beginrsaprivatekey",
         "beginopensshprivatekey",
     ];
-    if NEEDLES.iter().any(|needle| compact.contains(needle)) {
+    if NEEDLES.iter().any(|needle| lower.contains(needle)) {
         return true;
     }
-    if lower.contains("bearer ") {
-        return true;
+    if has_whitespace {
+        let compact: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+        if NEEDLES.iter().any(|needle| compact.contains(needle)) {
+            return true;
+        }
     }
-    let raw = text.trim();
-    raw.contains("ghp_")
-        || raw.contains("github_pat_")
-        || raw.contains("sk-live-")
-        || raw.contains("sk_test_")
-        || raw.contains("xoxb-")
-        || raw.contains("xoxp-")
-        || raw.contains("AKIA")
+    lower.contains("bearer ")
+}
+
+const MEMORY_COMPACT_VIEW_MAX_CHARS: usize = 96;
+const MEMORY_OVERVIEW_VIEW_MAX_CHARS: usize = 280;
+const ASTRA_VIEWS_KEY: &str = "astra_views";
+const ASTRA_VIEWS_VERSION: u64 = 1;
+const ASTRA_SOURCE_LABEL_KEY: &str = "label";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryContentViews {
+    pub compact: String,
+    pub overview: String,
+    pub full: String,
+}
+
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    let char_count = trimmed.chars().count();
+    if char_count <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed.chars().take(max_chars).collect();
+    // Back up past any trailing combining marks to avoid splitting a grapheme cluster.
+    while out.chars().last().is_some_and(is_combining_mark) {
+        out.pop();
+    }
+    while out.chars().last().is_some_and(char::is_whitespace) {
+        out.pop();
+    }
+    out.push('…');
+    out
+}
+
+/// Check whether a Unicode code point is a combining mark.
+fn is_combining_mark(c: char) -> bool {
+    matches!(c as u32,
+        0x0300..=0x036F |      // Combining Diacritical Marks
+        0x1DC0..=0x1DFF |      // Combining Diacritical Marks Supplement
+        0x20D0..=0x20FF |      // Combining Diacritical Marks for Symbols
+        0xFE20..=0xFE2F        // Combining Half Marks
+    )
+}
+
+fn collapse_inline_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn first_sentenceish(text: &str) -> Option<String> {
+    let first_line = text.lines().find(|line| !line.trim().is_empty())?.trim();
+    if first_line.is_empty() {
+        return None;
+    }
+    for delimiter in ['.', '!', '?', ';', '—'] {
+        if let Some((head, _)) = first_line.split_once(delimiter) {
+            let candidate = head.trim();
+            if !candidate.is_empty() {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    Some(first_line.to_string())
+}
+
+pub fn derive_memory_content_views(content: &str) -> MemoryContentViews {
+    let full = content.trim().to_string();
+    let compact_seed = first_sentenceish(&full).unwrap_or_else(|| full.clone());
+    let compact = truncate_with_ellipsis(
+        &collapse_inline_whitespace(&compact_seed),
+        MEMORY_COMPACT_VIEW_MAX_CHARS,
+    );
+    let overview = truncate_with_ellipsis(&full, MEMORY_OVERVIEW_VIEW_MAX_CHARS);
+    MemoryContentViews {
+        compact,
+        overview,
+        full,
+    }
+}
+
+fn source_object_from_value(value: &Value) -> Option<serde_json::Map<String, Value>> {
+    match value {
+        Value::Object(map) => Some(map.clone()),
+        Value::String(raw) => serde_json::from_str::<Value>(raw)
+            .ok()?
+            .as_object()
+            .cloned(),
+        _ => None,
+    }
+}
+
+fn source_payload_object(existing_source: Option<&Value>) -> serde_json::Map<String, Value> {
+    match existing_source {
+        Some(Value::String(raw)) => source_object_from_value(&Value::String(raw.clone()))
+            .unwrap_or_else(|| {
+                let mut map = serde_json::Map::new();
+                if !raw.trim().is_empty() {
+                    map.insert(
+                        ASTRA_SOURCE_LABEL_KEY.to_string(),
+                        Value::String(raw.clone()),
+                    );
+                }
+                map
+            }),
+        Some(other) => source_object_from_value(other).unwrap_or_default(),
+        None => serde_json::Map::new(),
+    }
+}
+
+fn extract_stored_views(item: &Value, content: &str) -> Option<MemoryContentViews> {
+    let views = item
+        .get("source")
+        .and_then(source_object_from_value)
+        .and_then(|source| source.get(ASTRA_VIEWS_KEY).cloned())?;
+    if views.get("version").and_then(Value::as_u64) != Some(ASTRA_VIEWS_VERSION) {
+        return None;
+    }
+    let compact = views.get("compact")?.as_str()?.trim();
+    let overview = views.get("overview")?.as_str()?.trim();
+    let full = views.get("full")?.as_str()?.trim();
+    if compact.is_empty() || overview.is_empty() || full.is_empty() || full != content.trim() {
+        return None;
+    }
+    Some(MemoryContentViews {
+        compact: compact.to_string(),
+        overview: overview.to_string(),
+        full: full.to_string(),
+    })
+}
+
+fn views_for_memory_item(item: &Value) -> Option<MemoryContentViews> {
+    let content = item.get("content").and_then(Value::as_str)?.trim();
+    if content.is_empty() {
+        return None;
+    }
+    extract_stored_views(item, content).or_else(|| Some(derive_memory_content_views(content)))
+}
+
+fn view_content_for_recall(item: &Value, requested_view: Option<&str>) -> Option<String> {
+    let views = views_for_memory_item(item)?;
+    Some(match requested_view.unwrap_or("full") {
+        "compact" => views.compact,
+        "overview" => views.overview,
+        _ => views.full,
+    })
+}
+
+fn content_for_expand_level(item: &Value, requested_level: Option<&str>) -> Option<String> {
+    let views = views_for_memory_item(item)?;
+    Some(match requested_level.unwrap_or("detail") {
+        "abstract" => views.compact,
+        "overview" => views.overview,
+        _ => views.full,
+    })
+}
+
+pub fn enrich_store_payload_with_views(payload: &mut Value) {
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+    let Some(content) = obj
+        .get("content")
+        .and_then(Value::as_str)
+        .map(|content| content.trim().to_string())
+        .filter(|content| !content.is_empty())
+    else {
+        return;
+    };
+    let views = derive_memory_content_views(&content);
+    let existing_source = obj.get("source").cloned();
+    let existing_item = existing_source.as_ref().map(|source| {
+        json!({
+            "content": content,
+            "source": source,
+        })
+    });
+    let source_is_v1_string = existing_source.as_ref().is_some_and(Value::is_string);
+    if source_is_v1_string
+        && existing_item
+            .as_ref()
+            .is_some_and(|item| extract_stored_views(item, &content).is_some())
+    {
+        return;
+    }
+
+    let mut source_obj = source_payload_object(existing_source.as_ref());
+    source_obj.insert(
+        ASTRA_VIEWS_KEY.to_string(),
+        json!({
+            "version": ASTRA_VIEWS_VERSION,
+            "compact": views.compact,
+            "overview": views.overview,
+            "full": views.full,
+        }),
+    );
+    if let Ok(serialized) = serde_json::to_string(&Value::Object(source_obj)) {
+        obj.insert("source".to_string(), Value::String(serialized));
+    }
 }
 
 /// A single `focus` hint: a session-scoped attention boost with TTL.
@@ -705,6 +911,15 @@ impl MemoriaClient {
         seen: &std::collections::HashSet<String>,
         newly_surfaced: &mut Vec<String>,
     ) -> String {
+        Self::decorate_recall_response_with_view(raw_text, seen, newly_surfaced, None)
+    }
+
+    pub fn decorate_recall_response_with_view(
+        raw_text: &str,
+        seen: &std::collections::HashSet<String>,
+        newly_surfaced: &mut Vec<String>,
+        requested_view: Option<&str>,
+    ) -> String {
         let Ok(mut parsed) = serde_json::from_str::<Value>(raw_text) else {
             return raw_text.to_string();
         };
@@ -732,6 +947,11 @@ impl MemoriaClient {
                 .get("trust_tier")
                 .and_then(Value::as_str)
                 .map(String::from);
+            if let Some(content) = view_content_for_recall(item, requested_view)
+                && let Some(slot) = item.get_mut("content")
+            {
+                *slot = Value::String(content);
+            }
             if let Some(days) = days {
                 let suffix = astra_turn_types::freshness_suffix_for(days, trust_tier.as_deref());
                 if !suffix.is_empty()
@@ -746,6 +966,26 @@ impl MemoriaClient {
             {
                 newly_surfaced.push(id);
             }
+        }
+        serde_json::to_string(&parsed).unwrap_or_else(|_| raw_text.to_string())
+    }
+
+    pub fn decorate_expand_response(raw_text: &str, requested_level: Option<&str>) -> String {
+        let Ok(mut parsed) = serde_json::from_str::<Value>(raw_text) else {
+            return raw_text.to_string();
+        };
+        let Some(obj) = parsed.as_object_mut() else {
+            return raw_text.to_string();
+        };
+        let item = Value::Object(obj.clone());
+        if let Some(content) = content_for_expand_level(&item, requested_level) {
+            obj.insert("content".to_string(), Value::String(content));
+        }
+        if let Some(level) = requested_level {
+            obj.insert(
+                "resolved_level".to_string(),
+                Value::String(level.to_string()),
+            );
         }
         serde_json::to_string(&parsed).unwrap_or_else(|_| raw_text.to_string())
     }
@@ -827,15 +1067,15 @@ impl MemoriaClient {
         // write path must stay fast when there are no conflicts.
         let mem = astra_core::MemoriaSettings::from_env();
         let key = mem.master_key?;
+        let mut body = json!({"query": new_content, "top_k": 3});
+        if let Some(sid) = session_id {
+            body["session_id"] = json!(sid);
+        }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .no_proxy()
             .build()
             .ok()?;
-        let mut body = json!({"query": new_content, "top_k": 3});
-        if let Some(sid) = session_id {
-            body["session_id"] = json!(sid);
-        }
         let resp = client
             .post(format!("{}/v1/memories/retrieve", mem.base_url))
             .header("Authorization", format!("Bearer {key}"))
@@ -902,43 +1142,19 @@ impl MemoriaClient {
         // `build_direct_request` for the `remember` branch. No
         // pre-normalization needed here.
 
-        let (endpoint, mut payload, auth_header, method) = if let (Some(cloud_base), Some(token)) =
-            (&self.cloud_base, &self.cloud_token)
-        {
-            // Cloud proxy: route v2 verbs via a dedicated `/memory/v2/:op`
-            // namespace so the server-side executor can translate to v1
-            // using its own credentials. If the cloud doesn't implement
-            // v2 yet, the fall-through direct path still works via the
-            // agent's own MEMORIA_MASTER_KEY.
-            (
-                format!("{cloud_base}/memory/v2/{op}"),
-                args.clone(),
-                format!("Bearer {token}"),
-                HttpMethod::Post,
-            )
-        } else {
-            let mem = astra_core::MemoriaSettings::from_env();
-            let key = match mem.master_key {
-                Some(k) => k,
-                None => {
-                    return json!({
-                            "error": "Memory unavailable: not connected to cloud and MEMORIA_MASTER_KEY not set",
-                            "hint": "Login with /login to enable cloud-backed memory with user isolation"
-                        })
-                        .to_string();
-                }
-            };
-            let (ep, pl, m) = Self::build_direct_request(&mem.base_url, op, args);
-            if ep.is_empty() {
-                // Validation errors (and anything else the mapper decides
-                // to short-circuit) return the payload verbatim. Must
-                // happen BEFORE the auto-snapshot below so rejected
-                // calls don't produce orphan `pre_<op>_*` snapshots.
-                return pl.to_string();
-            }
-            (ep, pl, format!("Bearer {key}"), m)
+        let (endpoint, mut payload, auth_header, method) = match Self::build_request_transport(
+            self.cloud_base.as_deref(),
+            self.cloud_token.as_deref(),
+            op,
+            args,
+        ) {
+            Ok(request) => request,
+            Err(response) => return response,
         };
 
+        // `build_request_transport` preserves the old `if ep.is_empty()`
+        // short-circuit before we reach this point, so rejected destructive
+        // calls still bypass auto-snapshot creation.
         // Auto-snapshot before destructive ops so `memory_rollback` is a
         // real recovery path. Happens AFTER validation (endpoint is
         // non-empty, required args were verified) so rejected
@@ -954,7 +1170,7 @@ impl MemoriaClient {
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
             let name = pre_op_snapshot_name(op, ts);
-            if let Err(e) = memoria_snapshot_create(&name).await {
+            if let Err(e) = self.proxy_snapshot_create(&name).await {
                 tracing::warn!(
                     target: "astra::memory::auto_snapshot",
                     op = %op,
@@ -989,16 +1205,33 @@ impl MemoriaClient {
                     .send()
                     .await
                 {
-                    Ok(resp) => match resp.text().await {
-                        Ok(text) => {
-                            self.fail_count.store(0, Ordering::Relaxed);
-                            text
+                    Ok(resp) => {
+                        let status = resp.status();
+                        match resp.text().await {
+                            Ok(text) => {
+                                if !status.is_success() {
+                                    self.fail_count.fetch_add(1, Ordering::Relaxed);
+                                    json!({
+                                        "error": format!(
+                                            "memoria request failed: status={status}, body={}",
+                                            text.trim()
+                                        )
+                                    })
+                                    .to_string()
+                                } else if text.trim().is_empty() {
+                                    self.fail_count.store(0, Ordering::Relaxed);
+                                    Self::empty_success_response(op, args).to_string()
+                                } else {
+                                    self.fail_count.store(0, Ordering::Relaxed);
+                                    text
+                                }
+                            }
+                            Err(e) => {
+                                self.fail_count.fetch_add(1, Ordering::Relaxed);
+                                json!({"error": format!("read response: {e}")}).to_string()
+                            }
                         }
-                        Err(e) => {
-                            self.fail_count.fetch_add(1, Ordering::Relaxed);
-                            json!({"error": format!("read response: {e}")}).to_string()
-                        }
-                    },
+                    }
                     Err(e) => {
                         self.fail_count.fetch_add(1, Ordering::Relaxed);
                         json!({"error": format!("memoria request failed: {e}")}).to_string()
@@ -1008,15 +1241,20 @@ impl MemoriaClient {
             Err(e) => json!({"error": format!("build client: {e}")}).to_string(),
         };
 
-        // Post-process recall responses with freshness suffixes + surface-
-        // once dedup so LLM-driven recalls carry the same signals as the
-        // bridge-side prefetch path. Other verbs pass through verbatim.
+        // Post-process recall responses with requested view shaping,
+        // freshness suffixes, and surface-once dedup so LLM-driven recalls
+        // carry the same signals as the bridge-side prefetch path.
         if op == "recall" {
             let session_id = args.get("session_id").and_then(Value::as_str).unwrap_or("");
             let turn = args.get("turn").and_then(Value::as_u64).unwrap_or(0) as u32;
             let seen = Self::seen_snapshot(session_id);
             let mut newly_surfaced = Vec::new();
-            let decorated = Self::decorate_recall_response(&raw_text, &seen, &mut newly_surfaced);
+            let decorated = Self::decorate_recall_response_with_view(
+                &raw_text,
+                &seen,
+                &mut newly_surfaced,
+                args.get("view").and_then(Value::as_str),
+            );
             if !newly_surfaced.is_empty() {
                 // (a) dedup store: don't re-show same id this session
                 Self::record_seen(session_id, newly_surfaced.clone());
@@ -1028,7 +1266,144 @@ impl MemoriaClient {
             }
             return decorated;
         }
+        if op == "expand" {
+            return Self::decorate_expand_response(
+                &raw_text,
+                args.get("level").and_then(Value::as_str),
+            );
+        }
         raw_text
+    }
+
+    fn build_request_transport(
+        cloud_base: Option<&str>,
+        cloud_token: Option<&str>,
+        op: &str,
+        args: &Value,
+    ) -> Result<(String, Value, String, HttpMethod), String> {
+        if let (Some(cloud_base), Some(token)) = (cloud_base, cloud_token)
+            && let Some((endpoint, payload, method)) =
+                Self::build_cloud_proxy_request(cloud_base, op, args)
+        {
+            if endpoint.is_empty() {
+                return Err(payload.to_string());
+            }
+            return Ok((endpoint, payload, format!("Bearer {token}"), method));
+        }
+
+        let mem = astra_core::MemoriaSettings::from_env();
+        let key = match mem.master_key {
+            Some(k) => k,
+            None => {
+                return Err(
+                    json!({
+                        "error": "Memory unavailable: not connected to cloud and MEMORIA_MASTER_KEY not set",
+                        "hint": "Login with /login to enable cloud-backed memory with user isolation"
+                    })
+                    .to_string(),
+                );
+            }
+        };
+        let (ep, pl, m) = Self::build_direct_request(&mem.base_url, op, args);
+        if ep.is_empty() {
+            return Err(pl.to_string());
+        }
+        Ok((ep, pl, format!("Bearer {key}"), m))
+    }
+
+    fn build_cloud_proxy_request(
+        cloud_base: &str,
+        op: &str,
+        args: &Value,
+    ) -> Option<(String, Value, HttpMethod)> {
+        let (direct_endpoint, payload, method) = Self::build_direct_request("", op, args);
+        if direct_endpoint.is_empty() {
+            return Some((String::new(), payload, method));
+        }
+        let endpoint = if direct_endpoint == "/v1/memories" {
+            format!("{cloud_base}/memory/store")
+        } else if direct_endpoint == "/v1/memories/retrieve" {
+            format!("{cloud_base}/memory/retrieve")
+        } else if direct_endpoint == "/v1/memories/search" {
+            format!("{cloud_base}/memory/search")
+        } else if direct_endpoint == "/v1/memories/purge" {
+            format!("{cloud_base}/memory/purge")
+        } else if direct_endpoint == "/v1/memories/correct" {
+            format!("{cloud_base}/memory/correct")
+        } else if direct_endpoint == "/v1/profiles/me" {
+            format!("{cloud_base}/memory/profile")
+        } else if direct_endpoint == "/v1/reflect" {
+            format!("{cloud_base}/memory/reflect")
+        } else if let Some(memory_id) = direct_endpoint
+            .strip_prefix("/v1/memories/")
+            .and_then(|tail| tail.strip_suffix("/correct"))
+        {
+            format!("{cloud_base}/memory/correct/{memory_id}")
+        } else if let Some(memory_id) = direct_endpoint
+            .strip_prefix("/v1/memories/")
+            .and_then(|tail| tail.strip_suffix("/feedback"))
+        {
+            format!("{cloud_base}/memory/feedback/{memory_id}")
+        } else if let Some(memory_id) = direct_endpoint.strip_prefix("/v1/memories/") {
+            format!("{cloud_base}/memory/expand/{memory_id}")
+        } else {
+            return None;
+        };
+        Some((endpoint, payload, method))
+    }
+
+    async fn proxy_snapshot_create(&self, name: &str) -> Result<(), String> {
+        let Some(cloud_base) = self.cloud_base.as_deref() else {
+            return memoria_snapshot_create(name).await.map(|_| ());
+        };
+        let Some(token) = self.cloud_token.as_deref() else {
+            return memoria_snapshot_create(name).await.map(|_| ());
+        };
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .no_proxy()
+            .build()
+            .map_err(|e| format!("build client: {e}"))?;
+        let resp = client
+            .post(format!("{cloud_base}/memory/snapshots"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&json!({ "name": name }))
+            .send()
+            .await
+            .map_err(|e| format!("memoria snapshot request failed: {e}"))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            Err(format!(
+                "memoria snapshot request failed: status={status}, body={body}"
+            ))
+        }
+    }
+
+    fn empty_success_response(op: &str, args: &Value) -> Value {
+        match op {
+            "recall" => json!([]),
+            "remember" => json!({
+                "status": "ok",
+                "message": "memory stored",
+                "content": args.get("content").and_then(Value::as_str).unwrap_or(""),
+            }),
+            "forget" => json!({
+                "status": "ok",
+                "message": "memory purge completed",
+            }),
+            "update" => json!({
+                "status": "ok",
+                "message": "memory updated",
+            }),
+            "feedback" => json!({
+                "status": "ok",
+                "message": "memory feedback recorded",
+            }),
+            _ => json!({"status": "ok"}),
+        }
     }
 
     /// Boost search: best-effort memory lookup on the critical path.
@@ -1036,9 +1411,12 @@ impl MemoriaClient {
         if query.trim().is_empty() || self.is_circuit_open() {
             return vec![];
         }
-        let mem = astra_core::MemoriaSettings::from_env();
-        let token = match mem.bearer_token() {
-            Some(t) => t,
+        let cloud_base = match self.cloud_base.as_deref() {
+            Some(base) => base,
+            None => return vec![],
+        };
+        let token = match self.cloud_token.as_deref() {
+            Some(token) => token,
             None => return vec![],
         };
         let client = match reqwest::Client::builder()
@@ -1050,8 +1428,8 @@ impl MemoriaClient {
             Err(_) => return vec![],
         };
         match client
-            .post(format!("{}/v1/memories/retrieve", mem.base_url))
-            .header("Authorization", token)
+            .post(format!("{cloud_base}/memory/retrieve"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&json!({
                 "query": query,
                 "top_k": top_k,
@@ -1289,6 +1667,7 @@ impl MemoriaClient {
                     );
                 }
 
+                enrich_store_payload_with_views(&mut payload);
                 (format!("{base}/v1/memories"), payload, HttpMethod::Post)
             }
             // ── recall → v1 retrieve (`POST /v1/memories/retrieve`) ──────
@@ -2029,6 +2408,38 @@ mod tests {
     }
 
     #[test]
+    fn remember_payload_attaches_astra_views() {
+        let args = json!({
+            "content": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites.",
+            "memory_type": "feedback",
+        });
+        let (_, payload, _) = MemoriaClient::build_direct_request("http://mem", "remember", &args);
+        let source: Value = serde_json::from_str(
+            payload["source"]
+                .as_str()
+                .expect("Memoria v1 store payload must keep source as a string"),
+        )
+        .expect("source json");
+        assert_eq!(
+            source["astra_views"]["full"],
+            "[feedback] Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites."
+        );
+        assert!(
+            source["astra_views"]["compact"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Integration tests must hit a real database")
+        );
+        assert!(
+            source["astra_views"]["overview"]
+                .as_str()
+                .unwrap_or("")
+                .contains("mock drift hid a migration bug")
+        );
+        assert_eq!(source["astra_views"]["version"], ASTRA_VIEWS_VERSION);
+    }
+
+    #[test]
     fn build_direct_request_propagates_session_and_user_id() {
         let args = json!({
             "query": "rust patterns",
@@ -2115,6 +2526,102 @@ mod tests {
         let args = json!({"query": "q", "min_confidence": 0.7});
         let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "recall", &args);
         assert_eq!(pl["min_confidence"], json!(0.7));
+    }
+
+    #[test]
+    fn build_cloud_proxy_request_maps_remember_to_store_route() {
+        let args = json!({
+            "content": "prefers smoke tests",
+            "memory_type": "profile",
+            "session_id": "sess-1",
+            "user_id": "user-1"
+        });
+        let (endpoint, payload, method) =
+            MemoriaClient::build_cloud_proxy_request("https://cloud.example", "remember", &args)
+                .expect("cloud remember route");
+        assert_eq!(endpoint, "https://cloud.example/memory/store");
+        assert!(matches!(method, HttpMethod::Post));
+        assert_eq!(payload["content"], "prefers smoke tests");
+    }
+
+    #[test]
+    fn build_cloud_proxy_request_maps_recall_to_retrieve_route() {
+        let args = json!({
+            "query": "smoke tests",
+            "session_id": "sess-1",
+            "user_id": "user-1"
+        });
+        let (endpoint, payload, method) =
+            MemoriaClient::build_cloud_proxy_request("https://cloud.example", "recall", &args)
+                .expect("cloud recall route");
+        assert_eq!(endpoint, "https://cloud.example/memory/retrieve");
+        assert!(matches!(method, HttpMethod::Post));
+        assert_eq!(payload["query"], "smoke tests");
+    }
+
+    #[test]
+    fn build_cloud_proxy_request_maps_update_by_id_route() {
+        let args = json!({
+            "memory_id": "mem-1",
+            "content": "updated text",
+            "reason": "correction"
+        });
+        let (endpoint, payload, method) =
+            MemoriaClient::build_cloud_proxy_request("https://cloud.example", "update", &args)
+                .expect("cloud update route");
+        assert_eq!(endpoint, "https://cloud.example/memory/correct/mem-1");
+        assert!(matches!(method, HttpMethod::Put));
+        assert_eq!(payload["new_content"], "updated text");
+    }
+
+    #[test]
+    fn build_cloud_proxy_request_maps_feedback_route() {
+        let args = json!({
+            "memory_id": "mem-2",
+            "signal": "useful"
+        });
+        let (endpoint, payload, method) =
+            MemoriaClient::build_cloud_proxy_request("https://cloud.example", "feedback", &args)
+                .expect("cloud feedback route");
+        assert_eq!(endpoint, "https://cloud.example/memory/feedback/mem-2");
+        assert!(matches!(method, HttpMethod::Post));
+        assert_eq!(payload["signal"], "useful");
+    }
+
+    #[test]
+    fn build_request_transport_requires_server_proxy_auth() {
+        let result = MemoriaClient::build_request_transport(
+            None,
+            None,
+            "remember",
+            &json!({
+                "content": "prefers smoke tests"
+            }),
+        );
+        match astra_core::MemoriaSettings::from_env().master_key {
+            Some(_) => assert!(result.is_ok(), "direct server path must remain available"),
+            None => {
+                let error = result.expect_err("without direct config this should stay an error");
+                assert!(error.contains("MEMORIA_MASTER_KEY"));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_success_response_recall_returns_empty_array() {
+        let value = MemoriaClient::empty_success_response("recall", &json!({"query": "q"}));
+        assert_eq!(value, json!([]));
+    }
+
+    #[test]
+    fn empty_success_response_remember_returns_ack() {
+        let value = MemoriaClient::empty_success_response(
+            "remember",
+            &json!({"content": "prefers smoke tests"}),
+        );
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["message"], "memory stored");
+        assert_eq!(value["content"], "prefers smoke tests");
     }
 
     // ── Session isolation via v2 `scope` → v1 `session_scope` ──
@@ -2374,7 +2881,7 @@ mod tests {
     /// validates args. A rejected `forget` (missing reason, missing
     /// memory_id/topic, etc.) must not produce an orphan `pre_forget_*`
     /// snapshot. Verified by source ordering: in `call_with_timeout`
-    /// the `memoria_snapshot_create` call must appear after the early-
+    /// the snapshot-create call must appear after the early-
     /// return `ep.is_empty()` guard.
     #[test]
     fn auto_snapshot_is_ordered_after_validation() {
@@ -2390,7 +2897,7 @@ mod tests {
         let body = &src[fn_start..fn_end];
 
         let snapshot_at = body
-            .find("memoria_snapshot_create")
+            .find("proxy_snapshot_create")
             .expect("auto-snapshot call must exist in call_with_timeout");
         let validation_short_circuit_at = body
             .find("if ep.is_empty()")
@@ -2537,6 +3044,17 @@ mod memoria_http_client_tests {
         assert!(enriched["message"].as_str().unwrap().contains("0 deleted"));
     }
 
+    #[test]
+    fn sensitive_memory_detection_preserves_whitespace_insensitive_needles() {
+        use super::*;
+        assert!(contains_sensitive_memory_content(
+            "Please remember p a s s w o r d : hunter2 for later"
+        ));
+        assert!(contains_sensitive_memory_content(
+            "api_key = secret-value\nkeep this handy"
+        ));
+    }
+
     // ── P6: decorate_recall_response (freshness + surface-once) ────────
 
     fn days_ago_ts(days: i64) -> String {
@@ -2622,6 +3140,154 @@ mod memoria_http_client_tests {
         assert_eq!(arr.len(), 1, "seen id must be filtered");
         assert_eq!(arr[0]["memory_id"].as_str(), Some("m-new"));
         assert_eq!(newly, vec!["m-new"], "only surviving ids recorded");
+    }
+
+    #[test]
+    fn decorate_recall_honors_compact_view() {
+        use super::*;
+        let raw = serde_json::json!([
+            {
+                "memory_id": "m1",
+                "content": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites.",
+                "source": {
+                    "astra_views": {
+                        "compact": "Integration tests must hit a real database",
+                        "overview": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.",
+                        "full": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites."
+                    }
+                }
+            }
+        ])
+        .to_string();
+        let seen = std::collections::HashSet::new();
+        let mut newly = Vec::new();
+        let out = MemoriaClient::decorate_recall_response_with_view(
+            &raw,
+            &seen,
+            &mut newly,
+            Some("compact"),
+        );
+        let arr: Vec<Value> = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            arr[0]["content"].as_str(),
+            Some("Integration tests must hit a real database")
+        );
+    }
+
+    #[test]
+    fn decorate_expand_honors_requested_level() {
+        use super::*;
+        let raw = serde_json::json!({
+            "memory_id": "m1",
+            "content": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites.",
+            "source": {
+                "astra_views": {
+                    "version": ASTRA_VIEWS_VERSION,
+                    "compact": "Integration tests must hit a real database",
+                    "overview": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.",
+                    "full": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites."
+                }
+            }
+        })
+        .to_string();
+        let overview = MemoriaClient::decorate_expand_response(&raw, Some("overview"));
+        let parsed: Value = serde_json::from_str(&overview).unwrap();
+        assert_eq!(
+            parsed["content"].as_str(),
+            Some(
+                "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug."
+            )
+        );
+        assert_eq!(parsed["resolved_level"].as_str(), Some("overview"));
+    }
+
+    #[test]
+    fn views_fall_back_when_stored_version_is_stale() {
+        use super::*;
+        let item = json!({
+            "content": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites.",
+            "source": serde_json::to_string(&json!({
+                "astra_views": {
+                    "version": 0,
+                    "compact": "stale compact",
+                    "overview": "stale overview",
+                    "full": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites."
+                }
+            }))
+            .unwrap()
+        });
+        let views = views_for_memory_item(&item).expect("fallback views");
+        assert_ne!(views.compact, "stale compact");
+        assert!(
+            views
+                .compact
+                .contains("Integration tests must hit a real database")
+        );
+    }
+
+    #[test]
+    fn views_fall_back_when_stored_fields_are_malformed() {
+        use super::*;
+        let item = json!({
+            "content": "Use rg for repo-wide code search because it respects ignore files.",
+            "source": serde_json::to_string(&json!({
+                "astra_views": {
+                    "version": ASTRA_VIEWS_VERSION,
+                    "compact": serde_json::Value::Null,
+                    "overview": "",
+                    "full": "Use rg for repo-wide code search because it respects ignore files."
+                }
+            }))
+            .unwrap()
+        });
+        let views = views_for_memory_item(&item).expect("fallback views");
+        assert_eq!(
+            views.full,
+            "Use rg for repo-wide code search because it respects ignore files."
+        );
+        assert!(views.compact.contains("Use rg for repo-wide code search"));
+    }
+
+    #[test]
+    fn enrich_store_payload_is_idempotent_for_current_views() {
+        use super::*;
+        let mut payload = json!({
+            "content": "[feedback] Prefer Rust integration tests over mocks.",
+            "source": serde_json::to_string(&json!({
+                "astra_views": {
+                    "version": ASTRA_VIEWS_VERSION,
+                    "compact": "Prefer Rust integration tests over mocks",
+                    "overview": "[feedback] Prefer Rust integration tests over mocks.",
+                    "full": "[feedback] Prefer Rust integration tests over mocks."
+                }
+            }))
+            .unwrap()
+        });
+        enrich_store_payload_with_views(&mut payload);
+        let source: Value = serde_json::from_str(payload["source"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            source["astra_views"]["compact"],
+            "Prefer Rust integration tests over mocks"
+        );
+        assert_eq!(source["astra_views"]["version"], ASTRA_VIEWS_VERSION);
+    }
+
+    #[test]
+    fn enrich_store_payload_converts_legacy_object_source_to_v1_string() {
+        use super::*;
+        let mut payload = json!({
+            "content": "[feedback] Prefer Rust integration tests over mocks.",
+            "source": {
+                "agent": "extraction"
+            }
+        });
+        enrich_store_payload_with_views(&mut payload);
+        let source = payload["source"]
+            .as_str()
+            .expect("source must be serialized as a string for Memoria v1");
+        let parsed: Value = serde_json::from_str(source).unwrap();
+        assert_eq!(parsed["agent"], "extraction");
+        assert_eq!(parsed["astra_views"]["version"], ASTRA_VIEWS_VERSION);
     }
 
     #[test]

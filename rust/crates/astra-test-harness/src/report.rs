@@ -214,16 +214,17 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
     };
     let wall_secs = wall_ms / 1000;
 
-    let cache_ratio_pct = if total_cache_read + total_cache_create > 0 {
+    let total_billable_input = total_prompt + total_cache_read + total_cache_create;
+    let cache_ratio_pct = if total_cache_read > 0 {
         format!(
-            " cache={:.0}%",
-            total_cache_read as f64 / (total_cache_read + total_cache_create) as f64 * 100.0
+            " cache-read={:.0}%",
+            total_cache_read as f64 / total_billable_input as f64 * 100.0
         )
     } else {
         String::new()
     };
     s.push_str(&format!(
-        "total={} passed={} failed={} | tokens: {}in/{}out{} | wall: {}m{}s (sum: {}m{}s)\n\n",
+        "total={} passed={} failed={} | tokens: {} fresh-in/{}out{} | wall: {}m{}s (sum: {}m{}s)\n\n",
         report.total(),
         report.passed(),
         report.failed(),
@@ -1008,10 +1009,133 @@ mod tests {
         };
         let out = render_text(&r, false);
         assert!(
-            out.contains("tokens: 0in/0out"),
+            out.contains("tokens: 0 fresh-in/0out"),
             "missing token summary: {out}"
         );
         assert!(out.contains("wall: 0m5s"), "missing wall time: {out}");
+    }
+
+    #[test]
+    fn render_text_uses_total_input_for_cache_read_share() {
+        let r = SuiteReport {
+            runs: vec![CaseRunReport {
+                case_name: "cache".into(),
+                model: "m".into(),
+                passed: true,
+                run_index: 0,
+                capability: None,
+                weight: 1.0,
+                difficulty: None,
+                outcome: {
+                    let mut o = RunOutcome::new("m");
+                    o.prompt_tokens = 200;
+                    o.completion_tokens = 50;
+                    o.cached_input_tokens = 800;
+                    o.cache_creation_tokens = 0;
+                    o
+                },
+                criteria: vec![],
+                steps: vec![],
+                failure_class: None,
+                has_warnings: false,
+                session: None,
+                reproducer: None,
+                digest: None,
+                digest_error: None,
+            }],
+            ..Default::default()
+        };
+
+        let out = render_text(&r, false);
+        assert!(
+            out.contains("tokens: 200 fresh-in/50out cache-read=80%"),
+            "cache share must use fresh+read+creation denominator: {out}"
+        );
+    }
+
+    /// Regression: the denominator must include `cache_creation_tokens`,
+    /// otherwise a turn that wrote 200 cache tokens on top of 200 reads
+    /// would appear to have read=50% when it actually read 200/(200+200+200)
+    /// = 33% of total billable input. Anthropic and Bedrock reports both
+    /// surface non-zero `cache_creation_tokens` on the first cached call,
+    /// so this case is real.
+    #[test]
+    fn render_text_cache_read_share_includes_cache_creation_in_denominator() {
+        let r = SuiteReport {
+            runs: vec![CaseRunReport {
+                case_name: "cache".into(),
+                model: "m".into(),
+                passed: true,
+                run_index: 0,
+                capability: None,
+                weight: 1.0,
+                difficulty: None,
+                outcome: {
+                    let mut o = RunOutcome::new("m");
+                    o.prompt_tokens = 100;
+                    o.completion_tokens = 40;
+                    o.cached_input_tokens = 200;
+                    o.cache_creation_tokens = 200;
+                    o
+                },
+                criteria: vec![],
+                steps: vec![],
+                failure_class: None,
+                has_warnings: false,
+                session: None,
+                reproducer: None,
+                digest: None,
+                digest_error: None,
+            }],
+            ..Default::default()
+        };
+
+        let out = render_text(&r, false);
+        // 200 / (100 + 200 + 200) = 0.40 → 40%. If the denominator drops
+        // `cache_creation_tokens`, the share would render as 200/(100+200)
+        // = 67% — the assertion catches that regression.
+        assert!(
+            out.contains("cache-read=40%"),
+            "cache_creation_tokens must contribute to the denominator: {out}"
+        );
+    }
+
+    #[test]
+    fn render_text_omits_cache_read_share_when_no_cache_read_occurred() {
+        let r = SuiteReport {
+            runs: vec![CaseRunReport {
+                case_name: "cache-create-only".into(),
+                model: "m".into(),
+                passed: true,
+                run_index: 0,
+                capability: None,
+                weight: 1.0,
+                difficulty: None,
+                outcome: {
+                    let mut o = RunOutcome::new("m");
+                    o.prompt_tokens = 100;
+                    o.completion_tokens = 40;
+                    o.cached_input_tokens = 0;
+                    o.cache_creation_tokens = 200;
+                    o
+                },
+                criteria: vec![],
+                steps: vec![],
+                failure_class: None,
+                has_warnings: false,
+                session: None,
+                reproducer: None,
+                digest: None,
+                digest_error: None,
+            }],
+            ..Default::default()
+        };
+
+        let out = render_text(&r, false);
+        assert!(
+            !out.contains("cache-read="),
+            "cache-read share should stay hidden until some cached input was actually read: {out}"
+        );
     }
 
     #[test]

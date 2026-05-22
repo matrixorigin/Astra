@@ -7,6 +7,10 @@
 //! This replaces the scattered inline assembly with a structured, testable
 //! pipeline invocation that carries forward learned behavior across turns.
 
+use crate::cache_diagnostics::{
+    CacheBreakDetector, CacheBreakDetectorState, DEFAULT_MIN_CACHE_BREAK_TOKENS,
+    PromptStateSnapshot,
+};
 use crate::compaction_types::CompactionTier;
 use crate::context_feedback::ContextFeedback;
 use crate::context_optimizer::ContextOptimized;
@@ -78,8 +82,16 @@ pub struct PipelineSession {
     pub emergent: EmergentContext,
     pub recovery: RecoveryState,
     working_memory: WorkingMemoryState,
+    cache_detector: CacheBreakDetector,
+    pending_prompt_snapshot: Option<PendingPromptSnapshot>,
     turns_completed: u32,
     pending_audits: Vec<crate::pipeline_journal::PipelineJournalEvent>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PendingPromptSnapshot {
+    query_source: String,
+    snapshot: PromptStateSnapshot,
 }
 
 impl PipelineSession {
@@ -93,6 +105,8 @@ impl PipelineSession {
             emergent: EmergentContext::default(),
             recovery: RecoveryState::default(),
             working_memory: WorkingMemoryState::default(),
+            cache_detector: CacheBreakDetector::new(),
+            pending_prompt_snapshot: None,
             turns_completed: 0,
             pending_audits: Vec::new(),
         }
@@ -108,6 +122,8 @@ impl PipelineSession {
             emergent: EmergentContext::default(),
             recovery: RecoveryState::default(),
             working_memory: WorkingMemoryState::default(),
+            cache_detector: CacheBreakDetector::new(),
+            pending_prompt_snapshot: None,
             turns_completed: 0,
             pending_audits: Vec::new(),
         }
@@ -132,6 +148,8 @@ impl PipelineSession {
             emergent: EmergentContext::default(),
             recovery,
             working_memory: WorkingMemoryState::default(),
+            cache_detector: CacheBreakDetector::new(),
+            pending_prompt_snapshot: None,
             turns_completed: 0,
             pending_audits: Vec::new(),
         }
@@ -146,7 +164,7 @@ impl PipelineSession {
     /// Run the pipeline for one turn. Returns the serialized provider request
     /// and associated metadata, or an abort if the session is in an
     /// unrecoverable error state.
-    pub fn run_turn(&self, input: TurnInput<'_>) -> Result<TurnOutput, PipelineAbort> {
+    pub fn run_turn(&mut self, input: TurnInput<'_>) -> Result<TurnOutput, PipelineAbort> {
         let sources = ContextSources {
             statics: input.statics,
             agent: input.agent,
@@ -178,13 +196,20 @@ impl PipelineSession {
             metrics,
         } = self.pipeline.run(run_input)?;
 
-        Ok(TurnOutput {
+        let output = TurnOutput {
             plan,
             optimized,
             serialized,
             explain,
             metrics,
-        })
+        };
+        self.pending_prompt_snapshot = Some(PendingPromptSnapshot::capture(
+            input.query_source,
+            input.session,
+            input.model_id,
+            &output,
+        ));
+        Ok(output)
     }
 
     /// Run the pipeline with tier-adaptive limits. The Plan phase determines
@@ -192,7 +217,7 @@ impl PipelineSession {
     /// When a compaction cascade is active, clearing is suppressed to break the loop.
     /// This is the preferred entry point for runtime integration.
     pub fn run_turn_adaptive(
-        &self,
+        &mut self,
         input: AdaptiveTurnInput<'_>,
     ) -> Result<TurnOutput, PipelineAbort> {
         let limits = self.cascade_aware_limits(input.session.model_limit);
@@ -212,7 +237,7 @@ impl PipelineSession {
     /// Run the pipeline in shadow mode: produce pipeline output AND compare
     /// against a pre-computed legacy `ContextOptimized` for diffing.
     pub fn run_turn_shadow(
-        &self,
+        &mut self,
         input: TurnInput<'_>,
         legacy_output: &ContextOptimized,
     ) -> Result<ShadowTurnOutput, PipelineAbort> {
@@ -226,7 +251,8 @@ impl PipelineSession {
     }
 
     /// Record feedback from the API response. Updates stats, recovery state,
-    /// and detects cache breaks. Call this after every successful API response.
+    /// and enriches `feedback.cache_break_detected` from the pending prompt
+    /// snapshot before persisting the turn into `PipelineStats`.
     ///
     /// Pass `turn_output` to also record per-section token usage (enables
     /// adaptive budget allocation). If unavailable, pass `None`.
@@ -234,10 +260,39 @@ impl PipelineSession {
         &mut self,
         model_id: &str,
         query_source: &str,
-        feedback: ContextFeedback,
+        feedback: &mut ContextFeedback,
         turn_output: Option<&TurnOutput>,
     ) {
-        self.stats.record(model_id, query_source, &feedback);
+        let pending_snapshot = self.pending_prompt_snapshot.take();
+        let had_cache_baseline = pending_snapshot.as_ref().is_some_and(|pending| {
+            self.cache_detector
+                .snapshot_for_source(&pending.query_source)
+                .is_some()
+        });
+        if let Some(pending) = pending_snapshot {
+            if let Some(event) = self.cache_detector.record_turn_for_source(
+                &pending.query_source,
+                pending.snapshot,
+                Some(feedback.tokens.cache_read),
+            ) {
+                feedback.attribute_cache_break(event.reason);
+            } else if !had_cache_baseline {
+                // First-turn / post-compaction cold starts are expected.
+            } else {
+                feedback.detect_cache_break(
+                    self.stats.turns_executed + 1,
+                    DEFAULT_MIN_CACHE_BREAK_TOKENS,
+                );
+            }
+        } else {
+            let _ = query_source;
+            feedback.detect_cache_break(
+                self.stats.turns_executed + 1,
+                DEFAULT_MIN_CACHE_BREAK_TOKENS,
+            );
+        }
+
+        self.stats.record(model_id, query_source, feedback);
         self.recovery.process_feedback(feedback.was_truncated);
 
         if feedback.was_truncated
@@ -329,6 +384,8 @@ impl PipelineSession {
     /// Record a compaction operation for audit trail emission.
     /// The runtime calls this after each compaction step in the optimizer.
     pub fn record_compaction_audit(&mut self, strategy: &str, items: u32, tokens_freed: u32) {
+        self.pending_prompt_snapshot = None;
+        self.cache_detector.reset_all_sources();
         self.pending_audits.push(
             crate::pipeline_journal::PipelineJournalEvent::compaction_audit(
                 self.stats.turns_executed,
@@ -343,6 +400,11 @@ impl PipelineSession {
     /// The runtime calls this at end-of-turn to emit journal entries.
     pub fn drain_pending_audits(&mut self) -> Vec<crate::pipeline_journal::PipelineJournalEvent> {
         std::mem::take(&mut self.pending_audits)
+    }
+
+    /// Configure where prompt-cache break diff artifacts should be written.
+    pub fn set_prompt_cache_diff_dir(&mut self, dir: impl Into<std::path::PathBuf>) {
+        self.cache_detector.set_diff_dir(dir);
     }
 
     // ── Emergent Context Lifecycle ───────────────────────────────────────────
@@ -449,6 +511,9 @@ impl PipelineSession {
             recovery: self.recovery,
             emergent: self.emergent.clone(),
             working_memory: self.working_memory.clone(),
+            cache_detector_state: self.cache_detector.snapshot_state(),
+            pending_prompt_snapshot: self.pending_prompt_snapshot.clone(),
+            turns_completed: self.turns_completed,
         }
     }
 
@@ -468,7 +533,9 @@ impl PipelineSession {
             emergent: snapshot.emergent,
             recovery,
             working_memory: snapshot.working_memory,
-            turns_completed: 0,
+            cache_detector: CacheBreakDetector::from_state(snapshot.cache_detector_state),
+            pending_prompt_snapshot: snapshot.pending_prompt_snapshot,
+            turns_completed: snapshot.turns_completed,
             pending_audits: Vec::new(),
         }
     }
@@ -483,6 +550,12 @@ pub struct PipelineSessionSnapshot {
     pub emergent: EmergentContext,
     #[serde(default)]
     pub working_memory: WorkingMemoryState,
+    #[serde(default)]
+    pub cache_detector_state: CacheBreakDetectorState,
+    #[serde(default)]
+    pub(crate) pending_prompt_snapshot: Option<PendingPromptSnapshot>,
+    #[serde(default)]
+    pub turns_completed: u32,
 }
 
 /// Summary metrics extracted from pipeline state for cloud_session_facts.
@@ -514,6 +587,33 @@ fn content_dedup_hash(content: &str) -> u64 {
     hasher.finish()
 }
 
+impl PendingPromptSnapshot {
+    fn capture(
+        query_source: &str,
+        session: &SessionContext,
+        model_id: &str,
+        output: &TurnOutput,
+    ) -> Self {
+        let cache_eligible_tokens = output
+            .optimized
+            .sections
+            .iter()
+            .filter(|section| section.plan.scope != crate::section_types::CacheScope::None)
+            .map(|section| section.actual_tokens as usize)
+            .sum();
+        Self {
+            query_source: query_source.to_string(),
+            snapshot: PromptStateSnapshot::capture_serialized(
+                &output.serialized.system_blocks,
+                &output.optimized.tool_schemas,
+                &session.provider_name,
+                model_id,
+                cache_eligible_tokens,
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,6 +632,7 @@ mod tests {
             session_id: "sess-1".into(),
             run_id: "run-1".into(),
             model_id: "claude-sonnet-4-6".into(),
+            provider_name: "anthropic".into(),
             model_limit: 200_000,
             provider_policy: ProviderCachePolicy::anthropic(),
             provider_strategy: ProviderCacheStrategy::default(),
@@ -574,7 +675,7 @@ mod tests {
 
     #[test]
     fn run_turn_produces_valid_output() {
-        let sess = PipelineSession::new(PipelineConfig::default());
+        let mut sess = PipelineSession::new(PipelineConfig::default());
         let statics = test_statics();
         let agent = AgentContext::default();
         let session = test_session_context();
@@ -601,8 +702,8 @@ mod tests {
     #[test]
     fn record_feedback_increments_turns() {
         let mut sess = PipelineSession::new(PipelineConfig::default());
-        let feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);
-        sess.record_feedback("model", "repl", feedback, None);
+        let mut feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);
+        sess.record_feedback("model", "repl", &mut feedback, None);
         assert_eq!(sess.turns_completed(), 1);
         assert_eq!(sess.stats.turns_executed, 1);
     }
@@ -610,8 +711,8 @@ mod tests {
     #[test]
     fn feedback_updates_cache_hit_ratio() {
         let mut sess = PipelineSession::new(PipelineConfig::default());
-        let feedback = ContextFeedback::from_usage(0, 900, 100, 200, false);
-        sess.record_feedback("model", "repl", feedback, None);
+        let mut feedback = ContextFeedback::from_usage(0, 900, 100, 200, false);
+        sess.record_feedback("model", "repl", &mut feedback, None);
         assert!((sess.stats.avg_cache_hit_ratio - 0.9).abs() < 1e-9);
     }
 
@@ -681,8 +782,8 @@ mod tests {
     fn successful_feedback_resets_recovery_after_clean_state() {
         let mut sess = PipelineSession::new(PipelineConfig::default());
         // Simulate: no PTL errors, just a normal successful turn
-        let feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);
-        sess.record_feedback("model", "repl", feedback, None);
+        let mut feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);
+        sess.record_feedback("model", "repl", &mut feedback, None);
         assert_eq!(sess.recovery.consecutive_ptl_errors, 0);
         assert!(!sess.recovery.is_in_recovery());
     }
@@ -695,15 +796,15 @@ mod tests {
         assert_eq!(sess.recovery.consecutive_ptl_errors, 2);
 
         // A successful response (not truncated) means recovery worked — clear PTL state
-        let feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);
-        sess.record_feedback("model", "repl", feedback, None);
+        let mut feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);
+        sess.record_feedback("model", "repl", &mut feedback, None);
         assert_eq!(sess.recovery.consecutive_ptl_errors, 0);
         assert!(!sess.recovery.is_in_recovery());
     }
 
     #[test]
     fn shadow_mode_detects_no_diff_on_same_output() {
-        let sess = PipelineSession::new(PipelineConfig::default());
+        let mut sess = PipelineSession::new(PipelineConfig::default());
         let statics = test_statics();
         let agent = AgentContext::default();
         let session = test_session_context();
@@ -761,8 +862,8 @@ mod tests {
                 query_source: "repl",
             };
             let _output = sess.run_turn(input).expect("should not abort");
-            let feedback = ContextFeedback::from_usage(0, 800, 200, 300 + i as u64 * 50, false);
-            sess.record_feedback("claude-sonnet-4-6", "repl", feedback, None);
+            let mut feedback = ContextFeedback::from_usage(0, 800, 200, 300 + i as u64 * 50, false);
+            sess.record_feedback("claude-sonnet-4-6", "repl", &mut feedback, None);
         }
 
         assert_eq!(sess.turns_completed(), 5);
@@ -772,7 +873,7 @@ mod tests {
 
     #[test]
     fn run_turn_adaptive_uses_tier_based_limits() {
-        let sess = PipelineSession::new(PipelineConfig::default());
+        let mut sess = PipelineSession::new(PipelineConfig::default());
         let statics = test_statics();
         let agent = AgentContext::default();
         let session = test_session_context();
@@ -844,13 +945,65 @@ mod tests {
         };
         let output = sess.run_turn(input).unwrap();
 
-        let feedback = ContextFeedback::from_usage(0, 800, 200, 500, false);
-        sess.record_feedback("model", "repl", feedback, Some(&output));
+        let mut feedback = ContextFeedback::from_usage(0, 800, 200, 500, false);
+        sess.record_feedback("model", "repl", &mut feedback, Some(&output));
 
         let history = sess.stats.section_token_history();
         assert!(
             !history.is_empty(),
             "section usage should be recorded from turn output"
+        );
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_pending_prompt_snapshot_and_turn_count() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        let statics = test_statics();
+        let agent = AgentContext::default();
+        let session = test_session_context();
+        let external = test_external();
+        let limits = OptimizeLimits::default();
+
+        let first_turn = test_turn_state(1);
+        let first_output = sess
+            .run_turn(TurnInput {
+                statics: &statics,
+                agent: &agent,
+                session: &session,
+                turn: &first_turn,
+                external: &external,
+                optimize_limits: &limits,
+                model_id: "model",
+                query_source: "repl",
+            })
+            .unwrap();
+        let mut first_feedback = ContextFeedback::from_usage(0, 800, 200, 500, false);
+        sess.record_feedback("model", "repl", &mut first_feedback, Some(&first_output));
+
+        let second_turn = test_turn_state(2);
+        let _second_output = sess
+            .run_turn(TurnInput {
+                statics: &statics,
+                agent: &agent,
+                session: &session,
+                turn: &second_turn,
+                external: &external,
+                optimize_limits: &limits,
+                model_id: "model",
+                query_source: "repl",
+            })
+            .unwrap();
+
+        assert_eq!(sess.turns_completed(), 1);
+        assert!(sess.pending_prompt_snapshot.is_some());
+
+        let restored =
+            PipelineSession::from_snapshot(PipelineConfig::default(), sess.snapshot_full_state());
+
+        assert_eq!(restored.turns_completed(), 1);
+        assert!(
+            restored.pending_prompt_snapshot.is_some(),
+            "mid-turn pending prompt snapshot must survive restore for exact cache-break attribution"
         );
     }
 

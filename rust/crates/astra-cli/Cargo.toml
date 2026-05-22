@@ -87,6 +87,7 @@ nucleo-matcher = "0.3"
 toml = { version = "1.1.2", features = ["preserve_order"] }
 tempfile = "3"
 fs2 = "0.4"
+shell-words = "1.1.1"
 
 [dev-dependencies]
 itertools = "0.13"

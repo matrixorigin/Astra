@@ -1849,85 +1849,6 @@ pub async fn ensure_core_schema(
         add_index_if_missing(&pool, &settings.database, table, index, ddl).await?;
     }
 
-    query(
-        "CREATE TABLE IF NOT EXISTS harness_artifacts (
-            harness_artifact_id VARCHAR(128) PRIMARY KEY,
-            harness_run_id VARCHAR(128) NOT NULL,
-            artifact_id VARCHAR(128) NULL,
-            artifact_kind VARCHAR(64) NOT NULL,
-            status VARCHAR(64) NOT NULL,
-            metadata_json LONGTEXT NOT NULL,
-            created_by_node_id VARCHAR(128) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_harness_artifacts_run_kind (harness_run_id, artifact_kind, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    query(
-        "CREATE TABLE IF NOT EXISTS harness_agent_roles (
-            agent_role_id VARCHAR(128) PRIMARY KEY,
-            version_id VARCHAR(128) NOT NULL,
-            role_name VARCHAR(128) NOT NULL,
-            purpose TEXT NULL,
-            input_schema_json LONGTEXT NOT NULL,
-            output_schema_json LONGTEXT NOT NULL,
-            tool_scope_json LONGTEXT NOT NULL,
-            source_scope_json LONGTEXT NOT NULL,
-            assertion_policy_json LONGTEXT NOT NULL,
-            max_parallelism INT NOT NULL DEFAULT 1,
-            timeout_ms BIGINT NULL,
-            model_policy_json LONGTEXT NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_harness_agent_roles_version (version_id, role_name)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    query(
-        "CREATE TABLE IF NOT EXISTS harness_subagent_runs (
-            subagent_run_id VARCHAR(128) PRIMARY KEY,
-            harness_run_id VARCHAR(128) NOT NULL,
-            node_id VARCHAR(128) NOT NULL,
-            item_id VARCHAR(128) NULL,
-            agent_role_id VARCHAR(128) NOT NULL,
-            parent_agent_run_id VARCHAR(128) NULL,
-            child_agent_run_id VARCHAR(128) NOT NULL,
-            status VARCHAR(64) NOT NULL,
-            input_ref VARCHAR(255) NULL,
-            output_ref VARCHAR(255) NULL,
-            failure_reason TEXT NULL,
-            started_at DATETIME(6) NULL,
-            completed_at DATETIME(6) NULL,
-            INDEX idx_harness_subagents_run (harness_run_id, node_id, status),
-            INDEX idx_harness_subagents_child_run (child_agent_run_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    query(
-        "CREATE TABLE IF NOT EXISTS harness_blackboard_entries (
-            blackboard_entry_id VARCHAR(128) PRIMARY KEY,
-            harness_run_id VARCHAR(128) NOT NULL,
-            item_id VARCHAR(128) NULL,
-            created_by_node_id VARCHAR(128) NULL,
-            created_by_agent_role_id VARCHAR(128) NULL,
-            entry_kind VARCHAR(64) NOT NULL,
-            payload_json LONGTEXT NOT NULL,
-            citation_ids LONGTEXT NOT NULL,
-            confidence DOUBLE NULL,
-            status VARCHAR(64) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_harness_blackboard_run_item (harness_run_id, item_id, entry_kind, status),
-            INDEX idx_harness_blackboard_role (created_by_agent_role_id, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // Context / decisions / evaluation essentials used by turn persistence
     query(
         "CREATE TABLE IF NOT EXISTS ctx_snapshots (
@@ -1988,23 +1909,6 @@ pub async fn ensure_core_schema(
             INDEX idx_skill_selection_session_created (session_id, created_at),
             INDEX idx_skill_selection_user_created (user_id, created_at),
             INDEX idx_skill_selection_skill_created (skill_name, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    query(
-        "CREATE TABLE IF NOT EXISTS eval_llm_feedback (
-            feedback_id VARCHAR(64) PRIMARY KEY,
-            prompt_template_id VARCHAR(255) NULL,
-            prompt_version VARCHAR(64) NULL,
-            llm_request_id VARCHAR(64) NULL,
-            rating BIGINT NULL,
-            comment TEXT NULL,
-            metadata JSON NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_eval_feedback_llm_request_id (llm_request_id),
-            INDEX idx_eval_feedback_created_at (created_at)
         )",
     )
     .execute(&pool)
@@ -2089,24 +1993,6 @@ pub async fn ensure_core_schema(
             version INT NOT NULL DEFAULT 1,
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             UNIQUE KEY idx_prefs_user_key (user_id, pref_key)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // Preference change history for audit trail and rollback
-    query(
-        "CREATE TABLE IF NOT EXISTS user_preference_history (
-            history_id VARCHAR(64) PRIMARY KEY,
-            user_id VARCHAR(64) NOT NULL,
-            pref_key VARCHAR(100) NOT NULL,
-            old_value LONGTEXT NULL,
-            new_value LONGTEXT NOT NULL,
-            old_version INT NULL,
-            new_version INT NOT NULL,
-            source VARCHAR(50) NOT NULL DEFAULT 'edge',
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_pref_history_user_key (user_id, pref_key, created_at)
         )",
     )
     .execute(&pool)
@@ -2634,25 +2520,6 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    // Step Protocol idempotency cache
-    query(
-        "CREATE TABLE IF NOT EXISTS step_idempotency_cache (
-            cache_key VARCHAR(200) PRIMARY KEY,
-            step_id VARCHAR(100) NOT NULL,
-            tool_index INT NOT NULL,
-            content_hash VARCHAR(64) NOT NULL,
-            tool_name VARCHAR(100) NOT NULL,
-            output LONGTEXT NOT NULL,
-            is_error SMALLINT NOT NULL DEFAULT 0,
-            cached_at BIGINT NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_idempotency_step_tool (step_id, tool_index),
-            INDEX idx_idempotency_hash (content_hash)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // ── Durable Task System ─────────────────────────────────────────────────
 
     // Task contracts: verifiable acceptance criteria for long-term tasks
@@ -3011,47 +2878,6 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    // ─── Memory and knowledge tables ─────────────────────────────────────────────
-
-    query(
-        "CREATE TABLE IF NOT EXISTS mem_memories (
-            memory_id          VARCHAR(36) PRIMARY KEY,
-            user_id            VARCHAR(36) NOT NULL,
-            content            TEXT NOT NULL,
-            memory_type        VARCHAR(32) NOT NULL DEFAULT 'semantic',
-            is_active          SMALLINT NOT NULL DEFAULT 1,
-            initial_confidence DECIMAL(5,4) DEFAULT 0.5,
-            observed_at        DATETIME(6),
-            created_at         DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at         DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            INDEX idx_mm_user (user_id),
-            INDEX idx_mm_type (memory_type),
-            INDEX idx_mm_active (is_active),
-            INDEX idx_mm_user_active_type_updated (user_id, is_active, memory_type, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    query(
-        "CREATE TABLE IF NOT EXISTS sk_knowledge_entries (
-            entry_id     VARCHAR(36) PRIMARY KEY,
-            skill_name   VARCHAR(128) NOT NULL,
-            user_id      VARCHAR(36),
-            entry_type   VARCHAR(64) NOT NULL,
-            content      LONGTEXT NOT NULL,
-            metadata     LONGTEXT,
-            is_active    SMALLINT NOT NULL DEFAULT 1,
-            created_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            INDEX idx_ske_skill (skill_name),
-            INDEX idx_ske_user (user_id),
-            INDEX idx_ske_type (entry_type)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // ─── Data versioning tables ──────────────────────────────────────────────────
 
     query(
@@ -3139,19 +2965,6 @@ pub async fn ensure_core_schema(
             INDEX idx_euf_created (created_at),
             INDEX idx_euf_session (session_id),
             INDEX idx_euf_type_created (feedback_type, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    query(
-        "CREATE TABLE IF NOT EXISTS governance_runs (
-            run_id     VARCHAR(36) PRIMARY KEY,
-            task_name  VARCHAR(128) NOT NULL,
-            result     LONGTEXT,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_gr_task (task_name),
-            INDEX idx_gr_created (created_at)
         )",
     )
     .execute(&pool)
@@ -3281,6 +3094,50 @@ async fn run_migration(
         return Ok(());
     }
 
+    execute_idempotent_migration_sql(pool, sql).await?;
+
+    query("INSERT IGNORE INTO schema_migrations (version, description) VALUES (?, ?)")
+        .bind(version)
+        .bind(description)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
+async fn run_migration_batch(
+    pool: &sqlx::Pool<MySql>,
+    version: i32,
+    description: &str,
+    statements: &[&str],
+) -> Result<(), sqlx::Error> {
+    let already_applied: bool = query("SELECT 1 FROM schema_migrations WHERE version = ?")
+        .bind(version)
+        .fetch_optional(pool)
+        .await?
+        .is_some();
+
+    if already_applied {
+        return Ok(());
+    }
+
+    for statement in statements {
+        execute_idempotent_migration_sql(pool, statement).await?;
+    }
+
+    query("INSERT IGNORE INTO schema_migrations (version, description) VALUES (?, ?)")
+        .bind(version)
+        .bind(description)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
+async fn execute_idempotent_migration_sql(
+    pool: &sqlx::Pool<MySql>,
+    sql: &str,
+) -> Result<(), sqlx::Error> {
     // Idempotent migrations need tolerance for vendor-specific error codes
     // when the target is already in the desired state:
     //   * 1060 — ALTER ADD COLUMN on an existing column (fresh DB where
@@ -3309,25 +3166,10 @@ async fn run_migration(
         }
         Err(e) => return Err(e),
     }
-
-    query("INSERT IGNORE INTO schema_migrations (version, description) VALUES (?, ?)")
-        .bind(version)
-        .bind(description)
-        .execute(pool)
-        .await?;
-
     Ok(())
 }
 
 async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
-    run_migration(
-        pool,
-        1,
-        "add composite index on mem_memories for profile queries",
-        "SELECT 1", // index already in CREATE TABLE above; marker only
-    )
-    .await?;
-
     run_migration(
         pool,
         2,
@@ -3472,6 +3314,25 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
     )
     .await?;
 
+    run_migration_batch(
+        pool,
+        15,
+        "drop obsolete harness and memory tables once",
+        &[
+            "DROP TABLE IF EXISTS harness_artifacts",
+            "DROP TABLE IF EXISTS harness_agent_roles",
+            "DROP TABLE IF EXISTS harness_subagent_runs",
+            "DROP TABLE IF EXISTS harness_blackboard_entries",
+            "DROP TABLE IF EXISTS step_idempotency_cache",
+            "DROP TABLE IF EXISTS mem_memories",
+            "DROP TABLE IF EXISTS sk_knowledge_entries",
+            "DROP TABLE IF EXISTS governance_runs",
+            "DROP TABLE IF EXISTS eval_llm_feedback",
+            "DROP TABLE IF EXISTS user_preference_history",
+        ],
+    )
+    .await?;
+
     Ok(())
 }
 
@@ -3611,8 +3472,6 @@ pub struct RetentionPolicy {
     pub auth_token_days: u32,
     /// Max age in days for expired task leases (default: 7)
     pub task_lease_days: u32,
-    /// Max age in days for idempotency cache entries (default: 3)
-    pub idempotency_cache_days: u32,
     /// Max age in days for sync log entries (default: 30)
     pub sync_log_days: u32,
     /// Max age in days for audit logs (default: 90)
@@ -3627,7 +3486,6 @@ impl Default for RetentionPolicy {
             refresh_token_days: 7,
             auth_token_days: 30,
             task_lease_days: 7,
-            idempotency_cache_days: 3,
             sync_log_days: 30,
             audit_log_days: 90,
             event_days: 90,
@@ -3700,24 +3558,7 @@ pub async fn cleanup_expired_data(
         rows_deleted: deleted,
     });
 
-    // 4. Stale idempotency cache entries
-    let deleted = sqlx::query(
-        "DELETE FROM step_idempotency_cache \
-         WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
-         LIMIT ?",
-    )
-    .bind(policy.idempotency_cache_days)
-    .bind(BATCH_LIMIT)
-    .execute(pool)
-    .await
-    .map(|r| r.rows_affected())
-    .unwrap_or(0);
-    results.push(CleanupResult {
-        table: "step_idempotency_cache",
-        rows_deleted: deleted,
-    });
-
-    // 5. Old sync log entries
+    // 4. Old sync log entries
     let deleted = sqlx::query(
         "DELETE FROM session_sync_log \
          WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
@@ -3734,7 +3575,7 @@ pub async fn cleanup_expired_data(
         rows_deleted: deleted,
     });
 
-    // 6. Old audit logs
+    // 5. Old audit logs
     let deleted = sqlx::query(
         "DELETE FROM auth_audit_logs \
          WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
@@ -3751,7 +3592,7 @@ pub async fn cleanup_expired_data(
         rows_deleted: deleted,
     });
 
-    // 7. Old agent events
+    // 6. Old agent events
     let expired_event_rows = sqlx::query(
         "SELECT event_id FROM agent_events \
          WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \

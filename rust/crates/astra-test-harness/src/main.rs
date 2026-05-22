@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use astra_test_harness::case::{Case, matches_filter};
+use astra_test_harness::criteria::requires_session_capture;
 use astra_test_harness::digest::AstraCliDigestCollector;
 use astra_test_harness::exec::AstraCliExecutor;
 use astra_test_harness::judger::{
@@ -169,7 +170,7 @@ fn resolve_suite_dir(explicit: &std::path::Path, astra_bin: &std::path::Path) ->
     }
     let astra_abs = std::fs::canonicalize(astra_bin).unwrap_or_else(|_| astra_bin.to_path_buf());
     // Walk up from the astra binary to find the repo root containing the cases dir.
-    // Binary is at <repo>/rust/target/release/astra, so check each ancestor.
+    // Binary is at <repo>/rust/target/{debug,release}/astra, so check each ancestor.
     let mut dir = astra_abs.as_path();
     while let Some(parent) = dir.parent() {
         let candidate = parent.join("rust/crates/astra-test-harness/cases");
@@ -212,6 +213,26 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
     None
 }
 
+fn newer_workspace_binary(a: PathBuf, b: PathBuf) -> PathBuf {
+    let a_mtime = std::fs::metadata(&a).and_then(|m| m.modified()).ok();
+    let b_mtime = std::fs::metadata(&b).and_then(|m| m.modified()).ok();
+    match (a_mtime, b_mtime) {
+        (Some(a_time), Some(b_time)) if b_time > a_time => b,
+        _ => a,
+    }
+}
+
+fn resolve_workspace_astra_bin(ancestor: &std::path::Path) -> Option<PathBuf> {
+    let debug = ancestor.join("rust/target/debug/astra");
+    let release = ancestor.join("rust/target/release/astra");
+    match (debug.is_file(), release.is_file()) {
+        (true, true) => Some(newer_workspace_binary(debug, release)),
+        (true, false) => Some(debug),
+        (false, true) => Some(release),
+        (false, false) => None,
+    }
+}
+
 fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = explicit {
         if !p.is_file() {
@@ -243,8 +264,7 @@ fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     }
     let cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("cwd: {e}"))?;
     for ancestor in cwd.ancestors() {
-        let candidate = ancestor.join("rust/target/release/astra");
-        if candidate.is_file() {
+        if let Some(candidate) = resolve_workspace_astra_bin(ancestor) {
             eprintln!(
                 "[astra-test] using astra bin from workspace: {}",
                 candidate.display()
@@ -254,7 +274,7 @@ fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     }
     anyhow::bail!(
         "could not locate the astra binary. Tried: --astra-bin flag, \
-         ASTRA_BIN env var, `astra` on PATH, and rust/target/release/astra \
+         ASTRA_BIN env var, `astra` on PATH, and rust/target/{{debug,release}}/astra \
          relative to any ancestor of {}",
         cwd.display()
     )
@@ -398,7 +418,10 @@ async fn main() -> Result<()> {
     }
 
     let session_loader = DiskSessionLoader;
-    let session_mode = if args.capture_session || args.verbose {
+    let needs_session_capture = cases
+        .iter()
+        .any(|case| requires_session_capture(&case.criteria));
+    let session_mode = if args.capture_session || args.verbose || needs_session_capture {
         SessionCaptureMode::Always
     } else {
         SessionCaptureMode::OnDebugLog
@@ -521,4 +544,45 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_workspace_astra_bin;
+    use std::fs;
+    use std::time::Duration;
+
+    #[test]
+    fn workspace_bin_prefers_only_available_debug_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let debug = dir.path().join("rust/target/debug");
+        fs::create_dir_all(&debug).unwrap();
+        let debug_bin = debug.join("astra");
+        fs::write(&debug_bin, b"debug").unwrap();
+
+        assert_eq!(resolve_workspace_astra_bin(dir.path()), Some(debug_bin));
+    }
+
+    #[test]
+    fn workspace_bin_prefers_newer_profile_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("rust/target/release");
+        let debug = dir.path().join("rust/target/debug");
+        fs::create_dir_all(&release).unwrap();
+        fs::create_dir_all(&debug).unwrap();
+        let release_bin = release.join("astra");
+        let debug_bin = debug.join("astra");
+
+        fs::write(&release_bin, b"release").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&debug_bin, b"debug").unwrap();
+        assert_eq!(
+            resolve_workspace_astra_bin(dir.path()),
+            Some(debug_bin.clone())
+        );
+
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&release_bin, b"release-newer").unwrap();
+        assert_eq!(resolve_workspace_astra_bin(dir.path()), Some(release_bin));
+    }
 }

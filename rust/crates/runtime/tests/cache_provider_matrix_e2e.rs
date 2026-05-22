@@ -493,10 +493,15 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
         let guard = capture.lock().unwrap();
         let r1 = &guard[0];
         let r2 = &guard[1];
-        // The first `min(r1.len, r2.len)` message hashes must be identical.
-        let shared = r1.message_sha256.len().min(r2.message_sha256.len());
-        assert!(shared >= 3, "round 1 should produce at least 3 hashed msgs");
-        for i in 0..shared {
+        // The original seeded history is exactly
+        // [user, assistant(tool_call), tool]. Tail-only reminder synthesis may
+        // append extra messages, but must never rewrite those first three
+        // historical entries across rounds.
+        assert!(
+            r1.message_sha256.len() >= 3 && r2.message_sha256.len() >= 3,
+            "tool-loop rounds must preserve at least the seeded 3-message history"
+        );
+        for i in 0..3 {
             assert_eq!(
                 r1.message_sha256[i],
                 r2.message_sha256[i],

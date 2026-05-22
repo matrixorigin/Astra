@@ -6,11 +6,12 @@
 //!
 //! diagnostics with token impact estimates and auto-remediation suggestions.
 
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 
-use serde::{Deserialize, Serialize};
+use crate::context_serializer::SerializedSystemBlock;
 
 /// Default source key used by the shortcut `record_turn` API. Callers that
 /// only track a single query stream (e.g., a CLI main loop) never need to
@@ -36,6 +37,8 @@ const MAX_TRACKED_SOURCES: usize = 10;
 pub enum CacheBreakReason {
     /// System prompt text changed (e.g., profile, task type).
     SystemPromptChanged,
+    /// Cache-control markers or cache-boundary placement changed.
+    CacheControlChanged,
     /// Tool schemas changed (added, removed, or modified).
     ///
     /// `changed` lists tools whose name is present in both snapshots but
@@ -64,6 +67,7 @@ impl std::fmt::Display for CacheBreakReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SystemPromptChanged => write!(f, "SystemPromptChanged"),
+            Self::CacheControlChanged => write!(f, "CacheControlChanged"),
             Self::ToolSchemasChanged {
                 added,
                 removed,
@@ -116,7 +120,15 @@ pub struct CacheBreakEvent {
 // ---------------------------------------------------------------------------
 
 /// Snapshot of the cacheable prompt prefix for one turn.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SystemBlockFingerprint {
+    pub kind: String,
+    pub scope: String,
+    pub text_hash: u64,
+    pub cache_control_hash: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PromptStateSnapshot {
     /// Hash of the full system prompt text (all sections concatenated).
     pub system_prompt_hash: u64,
@@ -124,6 +136,12 @@ pub struct PromptStateSnapshot {
     pub tools_hash: u64,
     /// Per-tool hashes for diffing which tool changed.
     pub per_tool_hashes: Vec<(String, u64)>,
+    /// Hash of cache-control / cache-boundary-bearing system metadata.
+    pub cache_control_hash: u64,
+    /// Per-system-block hashes for summary diff artifacts.
+    pub system_blocks: Vec<SystemBlockFingerprint>,
+    /// Provider name used for this turn.
+    pub provider: String,
     /// Model name used for this turn.
     pub model: String,
     /// Timestamp (seconds since epoch) of when this snapshot was taken.
@@ -140,7 +158,62 @@ impl PromptStateSnapshot {
         model: &str,
         cache_eligible_tokens: usize,
     ) -> Self {
-        let system_prompt_hash = hash_str(system_prompt_text);
+        Self::capture_with_provider(
+            system_prompt_text,
+            &[],
+            tool_schemas,
+            "unknown",
+            model,
+            cache_eligible_tokens,
+        )
+    }
+
+    /// Create a snapshot from serialized system blocks + tool schemas.
+    #[must_use]
+    pub fn capture_serialized(
+        system_blocks: &[SerializedSystemBlock],
+        tool_schemas: &[serde_json::Value],
+        provider: &str,
+        model: &str,
+        cache_eligible_tokens: usize,
+    ) -> Self {
+        Self::capture_with_hashes(
+            hash_serialized_system_prompt(system_blocks),
+            fingerprint_system_blocks(system_blocks),
+            tool_schemas,
+            provider,
+            model,
+            cache_eligible_tokens,
+        )
+    }
+
+    fn capture_with_provider(
+        system_prompt_text: &str,
+        system_blocks: &[SerializedSystemBlock],
+        tool_schemas: &[serde_json::Value],
+        provider: &str,
+        model: &str,
+        cache_eligible_tokens: usize,
+    ) -> Self {
+        Self::capture_with_hashes(
+            hash_str(system_prompt_text),
+            fingerprint_system_blocks(system_blocks),
+            tool_schemas,
+            provider,
+            model,
+            cache_eligible_tokens,
+        )
+    }
+
+    fn capture_with_hashes(
+        system_prompt_hash: u64,
+        system_blocks: Vec<SystemBlockFingerprint>,
+        tool_schemas: &[serde_json::Value],
+        provider: &str,
+        model: &str,
+        cache_eligible_tokens: usize,
+    ) -> Self {
+        let cache_control_hash = hash_cache_control_state(&system_blocks);
 
         let per_tool_hashes: Vec<(String, u64)> = tool_schemas
             .iter()
@@ -152,7 +225,7 @@ impl PromptStateSnapshot {
                     .or_else(|| t.get("name").and_then(|n| n.as_str()))
                     .unwrap_or("unknown")
                     .to_string();
-                let h = hash_str(&t.to_string());
+                let h = hash_json_value(t);
                 (name, h)
             })
             .collect();
@@ -174,6 +247,9 @@ impl PromptStateSnapshot {
             system_prompt_hash,
             tools_hash,
             per_tool_hashes,
+            cache_control_hash,
+            system_blocks,
+            provider: provider.to_string(),
             model: model.to_string(),
             timestamp_secs: now,
             cache_eligible_tokens,
@@ -181,12 +257,181 @@ impl PromptStateSnapshot {
     }
 }
 
+/// Extract the canonical system-prompt text from a provider request message list.
+///
+/// Uses all `role=system` messages when present, otherwise falls back to the
+/// first message. Structured content arrays/objects are flattened into text using
+/// the same rules across CLI and runtime journal reconstruction.
+#[must_use]
+pub fn prompt_snapshot_system_text_from_messages(messages: &[serde_json::Value]) -> String {
+    prompt_snapshot_selected_message_contents(messages)
+        .into_iter()
+        .map(prompt_snapshot_content_value_text)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Build a [`PromptStateSnapshot`] from a raw provider message list plus tool schemas.
+///
+/// This is the shared bridge/CLI journal reconstruction path so prompt-cache
+/// diagnostics cannot drift between the two execution surfaces.
+pub fn prompt_snapshot_from_messages(
+    messages: &[serde_json::Value],
+    tool_schemas: &[serde_json::Value],
+    provider: &str,
+    model: &str,
+    cache_eligible_tokens: usize,
+) -> Option<PromptStateSnapshot> {
+    let system_prompt_text = prompt_snapshot_system_text_from_messages(messages);
+    let snapshot = PromptStateSnapshot::capture_with_hashes(
+        hash_str(&system_prompt_text),
+        prompt_snapshot_fingerprint_system_blocks(messages),
+        tool_schemas,
+        provider,
+        model,
+        cache_eligible_tokens,
+    );
+    Some(snapshot)
+}
+
+fn prompt_snapshot_selected_message_contents(
+    messages: &[serde_json::Value],
+) -> Vec<&serde_json::Value> {
+    let system_contents: Vec<&serde_json::Value> = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+        .filter_map(|message| message.get("content"))
+        .collect();
+    if system_contents.is_empty() {
+        messages
+            .first()
+            .and_then(|message| message.get("content"))
+            .into_iter()
+            .collect()
+    } else {
+        system_contents
+    }
+}
+
+fn prompt_snapshot_content_value_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => {
+            let mut out = String::new();
+            for item in items {
+                let text = prompt_snapshot_content_block_text(item);
+                if text.is_empty() {
+                    continue;
+                }
+                if prompt_snapshot_is_separator_block(item) {
+                    if !out.ends_with("\n\n") {
+                        out.push_str("\n\n");
+                    }
+                    continue;
+                }
+                if !out.is_empty() && !out.ends_with("\n\n") {
+                    out.push_str("\n\n");
+                }
+                out.push_str(&text);
+            }
+            out
+        }
+        serde_json::Value::Object(map) => map
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default()),
+        _ => value.to_string(),
+    }
+}
+
+fn prompt_snapshot_fingerprint_system_blocks(
+    messages: &[serde_json::Value],
+) -> Vec<SystemBlockFingerprint> {
+    prompt_snapshot_selected_message_contents(messages)
+        .into_iter()
+        .flat_map(prompt_snapshot_content_value_blocks)
+        .collect()
+}
+
+fn prompt_snapshot_content_value_blocks(value: &serde_json::Value) -> Vec<SystemBlockFingerprint> {
+    match value {
+        serde_json::Value::Null => Vec::new(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(prompt_snapshot_content_block_fingerprint)
+            .collect(),
+        _ => prompt_snapshot_content_block_fingerprint(value)
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn prompt_snapshot_content_block_fingerprint(
+    value: &serde_json::Value,
+) -> Option<SystemBlockFingerprint> {
+    if prompt_snapshot_is_separator_block(value) {
+        return None;
+    }
+    let text = prompt_snapshot_content_block_text(value);
+    let cache_control_hash = value
+        .get("cache_control")
+        .map_or(0, |cache_control| hash_str(&cache_control.to_string()));
+    if text.is_empty() && cache_control_hash == 0 {
+        return None;
+    }
+    Some(SystemBlockFingerprint {
+        kind: value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(match value {
+                serde_json::Value::String(_) => "text",
+                serde_json::Value::Object(_) => "object",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::Null => "null",
+            })
+            .to_string(),
+        scope: "provider_visible".to_string(),
+        text_hash: hash_str(&text),
+        cache_control_hash,
+    })
+}
+
+fn prompt_snapshot_content_block_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Object(map) => map
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default()),
+        serde_json::Value::Array(_) => prompt_snapshot_content_value_text(value),
+        _ => value.to_string(),
+    }
+}
+
+fn prompt_snapshot_is_separator_block(value: &serde_json::Value) -> bool {
+    value.get("cache_control").is_none()
+        && value.get("type").and_then(serde_json::Value::as_str) == Some("text")
+        && value.get("text").and_then(serde_json::Value::as_str) == Some("\n\n")
+}
+
 // ---------------------------------------------------------------------------
 // Detector: compares consecutive snapshots
 // ---------------------------------------------------------------------------
 
-/// Minimum cache miss tokens to consider a break significant.
-const MIN_CACHE_MISS_TOKENS: usize = 2_000;
+/// Upper bound for the "near-zero cache read" heuristic.
+///
+/// Large cached prefixes still need a meaningful floor before we infer a cold
+/// cache from token accounting alone, but smaller prompts should scale down so
+/// a 1k-token prefix doesn't need a 2k-token read to count as a hit.
+pub const DEFAULT_MIN_CACHE_BREAK_TOKENS: u64 = 2_000;
+const MIN_DYNAMIC_CACHE_BREAK_TOKENS: u64 = 128;
 
 /// Cache TTL thresholds for expiration detection.
 const CACHE_TTL_5MIN_SECS: u64 = 300;
@@ -205,6 +450,26 @@ const CACHE_TTL_1HOUR_SECS: u64 = 3_600;
 /// Backwards compatibility: the legacy `record_turn(snapshot, actual)`
 /// helper writes through to the [`DEFAULT_SOURCE`] slot, so pre-existing
 /// single-stream callers are unaffected.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CacheBreakDetectorState {
+    pub per_source: HashMap<String, PromptStateSnapshot>,
+    pub source_order: Vec<String>,
+    pub stats: CacheStats,
+    #[serde(default)]
+    pub diff_seq: u32,
+}
+
+/// In-memory cache-break detector for prompt caching systems.
+///
+/// Compares sequential [`PromptStateSnapshot`]s across turns to detect when
+/// provider-side prompt caches become invalid and need to be rebuilt.
+///
+/// # Concurrency
+///
+/// `CacheBreakDetector` is intended to have a single logical owner per
+/// session/run. It stays `Send + Sync` so enclosing runtime state can move
+/// across tasks, but callers should not share mutable access without external
+/// synchronization.
 #[derive(Debug, Default)]
 pub struct CacheBreakDetector {
     /// Previous snapshot per source. LRU-evicted at [`MAX_TRACKED_SOURCES`]
@@ -238,7 +503,7 @@ pub struct CacheStats {
     /// Total tokens that had to be re-processed due to cache breaks.
     pub total_miss_tokens: usize,
     /// History of recent break events (last 10).
-    pub recent_breaks: Vec<CacheBreakEvent>,
+    pub recent_breaks: VecDeque<CacheBreakEvent>,
 }
 
 impl CacheStats {
@@ -256,6 +521,27 @@ impl CacheBreakDetector {
         Self::default()
     }
 
+    #[must_use]
+    pub fn from_state(state: CacheBreakDetectorState) -> Self {
+        Self {
+            per_source: state.per_source,
+            source_order: state.source_order,
+            stats: state.stats,
+            diff_dir: None,
+            diff_seq: state.diff_seq,
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot_state(&self) -> CacheBreakDetectorState {
+        CacheBreakDetectorState {
+            per_source: self.per_source.clone(),
+            source_order: self.source_order.clone(),
+            stats: self.stats.clone(),
+            diff_seq: self.diff_seq,
+        }
+    }
+
     /// Enable per-break diagnostic artifact emission to `dir`. The directory
     /// is created lazily on the first break. Errors during directory create
     /// or file write are swallowed to avoid perturbing the live turn — this
@@ -263,6 +549,11 @@ impl CacheBreakDetector {
     pub fn with_diff_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.diff_dir = Some(dir.into());
         self
+    }
+
+    /// Enable/update the runtime diff artifact directory.
+    pub fn set_diff_dir(&mut self, dir: impl Into<std::path::PathBuf>) {
+        self.diff_dir = Some(dir.into());
     }
 
     /// Record a turn against the [`DEFAULT_SOURCE`] stream. Shortcut for
@@ -301,7 +592,7 @@ impl CacheBreakDetector {
     ) -> Option<CacheBreakEvent> {
         self.stats.total_turns += 1;
 
-        let previous_for_source = self.per_source.get(source).cloned();
+        let previous_for_source = self.per_source.get(source);
 
         let event = if let Some(prev) = previous_for_source.as_ref() {
             self.detect_break(prev, &current, actual_cache_read_tokens)
@@ -314,18 +605,18 @@ impl CacheBreakDetector {
         if let Some(ref evt) = event {
             self.stats.cache_misses += 1;
             self.stats.total_miss_tokens += evt.estimated_token_impact;
-            self.stats.recent_breaks.push(evt.clone());
+            self.stats.recent_breaks.push_back(evt.clone());
             if self.stats.recent_breaks.len() > 10 {
-                self.stats.recent_breaks.remove(0);
+                self.stats.recent_breaks.pop_front();
             }
             if let Some(dir) = self.diff_dir.clone() {
                 self.diff_seq = self.diff_seq.wrapping_add(1);
-                let _ = write_diff_artifact(
-                    &dir,
+                spawn_diff_artifact_write(
+                    dir,
                     self.diff_seq,
-                    previous_for_source.as_ref(),
-                    &current,
-                    evt,
+                    previous_for_source.cloned(),
+                    current.clone(),
+                    evt.clone(),
                 );
             }
         } else if previous_for_source.is_some() {
@@ -334,6 +625,13 @@ impl CacheBreakDetector {
 
         self.write_source_snapshot(source, current);
         event
+    }
+
+    /// Reset all tracked source baselines after an expected cache-boundary
+    /// event such as compaction or native provider history clearing.
+    pub fn reset_all_sources(&mut self) {
+        self.per_source.clear();
+        self.source_order.clear();
     }
 
     /// Insert/refresh a source's snapshot and maintain LRU order. Called
@@ -382,9 +680,22 @@ impl CacheBreakDetector {
             });
         }
 
+        // 1b. Provider change
+        if prev.provider != curr.provider {
+            reasons.push(CacheBreakReason::ProviderChanged {
+                from: prev.provider.clone(),
+                to: curr.provider.clone(),
+            });
+        }
+
         // 2. System prompt change
         if prev.system_prompt_hash != curr.system_prompt_hash {
             reasons.push(CacheBreakReason::SystemPromptChanged);
+        }
+
+        // 2b. Cache-control / stable-boundary change
+        if prev.cache_control_hash != curr.cache_control_hash {
+            reasons.push(CacheBreakReason::CacheControlChanged);
         }
 
         // 3. Tool schemas change — diff which tools changed
@@ -428,12 +739,16 @@ impl CacheBreakDetector {
             });
         }
 
-        // 4. If hashes match but API says cache miss → TTL expiry
+        // 4. If hashes match but API says cache miss → TTL expiry / unexplained cold start.
         if reasons.is_empty() {
             if let Some(cache_read) = actual_cache_read {
-                let gap = curr.timestamp_secs.saturating_sub(prev.timestamp_secs);
-                if cache_read < MIN_CACHE_MISS_TOKENS as u64 && gap > CACHE_TTL_5MIN_SECS {
-                    reasons.push(CacheBreakReason::TtlExpired { gap_seconds: gap });
+                if cache_read < cache_miss_threshold_tokens(curr) {
+                    let gap = curr.timestamp_secs.saturating_sub(prev.timestamp_secs);
+                    if gap > CACHE_TTL_5MIN_SECS {
+                        reasons.push(CacheBreakReason::TtlExpired { gap_seconds: gap });
+                    } else {
+                        reasons.push(CacheBreakReason::UnknownColdStart);
+                    }
                 }
             }
         }
@@ -464,6 +779,13 @@ impl CacheBreakDetector {
                     return Some(
                         "System prompt changed — check if dynamic profile injection is \
                          causing unnecessary variation. Consider stabilizing the profile section."
+                            .into(),
+                    );
+                }
+                CacheBreakReason::CacheControlChanged => {
+                    return Some(
+                        "cache_control / cache-boundary placement changed — check session vs \
+                         volatile scope routing and provider-native cache markers."
                             .into(),
                     );
                 }
@@ -593,6 +915,20 @@ impl CacheBreakDetector {
         message_count: usize,
         system_message_count: usize,
     ) -> CacheAwareCompressionHint {
+        self.compression_hint_for_source(DEFAULT_SOURCE, message_count, system_message_count)
+    }
+
+    /// Generate a compression hint for a specific query source.
+    ///
+    /// If the requested source has not been written yet, fall back to the most
+    /// recently refreshed source so replay-only streams do not silently lose the
+    /// protected-token estimate.
+    pub fn compression_hint_for_source(
+        &self,
+        source: &str,
+        message_count: usize,
+        system_message_count: usize,
+    ) -> CacheAwareCompressionHint {
         let stats = &self.stats;
         let hit_rate = stats.hit_rate_percent();
 
@@ -618,19 +954,18 @@ impl CacheBreakDetector {
             0
         };
 
-        // Compression hints are a whole-session property, not per-source.
-        // We use the DEFAULT_SOURCE (main stream) as the representative
-        // snapshot: the protected prefix tokens are whatever the main
-        // conversation last saw. Subagent streams don't influence what
-        // the main compression pipeline treats as cache-valid prefix.
-        //
-        // NOTE: if the main turn loop is ever wired to record under a
-        // different source key (e.g. `"repl_main_thread"`), this lookup
-        // must be updated in lockstep or the protected-token estimate
-        // will silently fall to 0.
+        // Compression hints are a whole-session property, but the token estimate
+        // still needs a representative snapshot. Prefer the caller's stream, and
+        // fall back to the most recently refreshed tracked stream so bridge-only
+        // replay state remains usable.
         let protected_token_estimate = self
             .per_source
-            .get(DEFAULT_SOURCE)
+            .get(source)
+            .or_else(|| {
+                self.source_order
+                    .last()
+                    .and_then(|latest| self.per_source.get(latest))
+            })
             .map(|s| s.cache_eligible_tokens)
             .unwrap_or(0);
 
@@ -667,6 +1002,73 @@ fn hash_str(s: &str) -> u64 {
     hasher.finish()
 }
 
+struct HashWriter<'a>(&'a mut DefaultHasher);
+
+impl std::io::Write for HashWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn hash_json_value(value: &serde_json::Value) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let mut writer = HashWriter(&mut hasher);
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => hasher.finish(),
+        Err(_) => hash_str(&value.to_string()),
+    }
+}
+
+fn hash_serialized_system_prompt(system_blocks: &[SerializedSystemBlock]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for (idx, block) in system_blocks.iter().enumerate() {
+        if idx > 0 {
+            hasher.write(b"\n\n");
+        }
+        hasher.write(block.text.as_bytes());
+    }
+    hasher.write_u8(0xff);
+    hasher.finish()
+}
+
+fn fingerprint_system_blocks(
+    system_blocks: &[SerializedSystemBlock],
+) -> Vec<SystemBlockFingerprint> {
+    system_blocks
+        .iter()
+        .map(|block| SystemBlockFingerprint {
+            kind: format!("{:?}", block.kind),
+            scope: format!("{:?}", block.scope),
+            text_hash: hash_str(&block.text),
+            cache_control_hash: block
+                .cache_control
+                .as_ref()
+                .map_or(0, |value| hash_str(&value.to_string())),
+        })
+        .collect()
+}
+
+fn hash_cache_control_state(system_blocks: &[SystemBlockFingerprint]) -> u64 {
+    let mut h = DefaultHasher::new();
+    for block in system_blocks {
+        block.cache_control_hash.hash(&mut h);
+    }
+    h.finish()
+}
+
+fn cache_miss_threshold_tokens(snapshot: &PromptStateSnapshot) -> u64 {
+    if snapshot.cache_eligible_tokens == 0 {
+        return 0;
+    }
+    let adaptive = (snapshot.cache_eligible_tokens as u64 / 4).max(MIN_DYNAMIC_CACHE_BREAK_TOKENS);
+    adaptive.min(DEFAULT_MIN_CACHE_BREAK_TOKENS)
+}
+
 // ---------------------------------------------------------------------------
 // Diff artifact writer
 // ---------------------------------------------------------------------------
@@ -679,17 +1081,23 @@ fn write_diff_artifact(
     event: &CacheBreakEvent,
 ) -> std::io::Result<std::path::PathBuf> {
     std::fs::create_dir_all(dir)?;
-    let path = dir.join(format!(
-        "cache-break-{:010}-{:04}.json",
-        curr.timestamp_secs, seq
-    ));
+    let stem = format!("cache-break-{:010}-{:04}", curr.timestamp_secs, seq);
+    let path = dir.join(format!("{stem}.json"));
+    let patch_path = dir.join(format!("{stem}.patch"));
+    let _ = std::fs::write(
+        &patch_path,
+        render_unified_snapshot_patch(prev, curr, event).into_bytes(),
+    );
     let snapshot_summary = |s: Option<&PromptStateSnapshot>| {
         s.map(|s| {
             serde_json::json!({
+                "provider": s.provider,
+                "model": s.model,
                 "system_prompt_hash": s.system_prompt_hash,
+                "cache_control_hash": s.cache_control_hash,
+                "system_blocks": s.system_blocks,
                 "tools_hash": s.tools_hash,
                 "per_tool_hashes": s.per_tool_hashes,
-                "model": s.model,
                 "timestamp_secs": s.timestamp_secs,
                 "cache_eligible_tokens": s.cache_eligible_tokens,
             })
@@ -701,12 +1109,102 @@ fn write_diff_artifact(
         "prev": snapshot_summary(prev),
         "curr": snapshot_summary(Some(curr)),
         "event": event,
+        "patch_path": patch_path,
     });
     std::fs::write(
         &path,
         serde_json::to_vec_pretty(&payload).unwrap_or_else(|_| b"{}".to_vec()),
     )?;
     Ok(path)
+}
+
+fn spawn_diff_artifact_write(
+    dir: std::path::PathBuf,
+    seq: u32,
+    prev: Option<PromptStateSnapshot>,
+    curr: PromptStateSnapshot,
+    event: CacheBreakEvent,
+) {
+    let dir_for_thread = dir.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("cache-diff-artifact".into())
+        .spawn(move || {
+            if let Err(error) =
+                write_diff_artifact(&dir_for_thread, seq, prev.as_ref(), &curr, &event)
+            {
+                tracing::warn!(
+                    target: "astra::cache",
+                    ?error,
+                    path = %dir_for_thread.display(),
+                    seq,
+                    "failed to write cache diff artifact"
+                );
+            }
+        })
+    {
+        tracing::warn!(
+            target: "astra::cache",
+            ?error,
+            path = %dir.display(),
+            seq,
+            "failed to spawn cache diff artifact writer"
+        );
+    }
+}
+
+fn render_unified_snapshot_patch(
+    prev: Option<&PromptStateSnapshot>,
+    curr: &PromptStateSnapshot,
+    event: &CacheBreakEvent,
+) -> String {
+    let before = prev
+        .map(render_snapshot_summary)
+        .unwrap_or_else(|| "# no previous baseline\n".to_string());
+    let after = render_snapshot_summary(curr);
+    let before_lines: Vec<&str> = before.lines().collect();
+    let after_lines: Vec<&str> = after.lines().collect();
+
+    let mut patch = String::new();
+    patch.push_str("--- prompt-cache-before\n");
+    patch.push_str("+++ prompt-cache-after\n");
+    patch.push_str(&format!(
+        "@@ -1,{} +1,{} @@ reason={}\n",
+        before_lines.len(),
+        after_lines.len(),
+        event.reason
+    ));
+    for line in before_lines {
+        patch.push('-');
+        patch.push_str(line);
+        patch.push('\n');
+    }
+    for line in after_lines {
+        patch.push('+');
+        patch.push_str(line);
+        patch.push('\n');
+    }
+    patch
+}
+
+fn render_snapshot_summary(snapshot: &PromptStateSnapshot) -> String {
+    let mut lines = vec![
+        format!("provider={}", snapshot.provider),
+        format!("model={}", snapshot.model),
+        format!("system_prompt_hash={}", snapshot.system_prompt_hash),
+        format!("cache_control_hash={}", snapshot.cache_control_hash),
+        format!("tools_hash={}", snapshot.tools_hash),
+        format!("cache_eligible_tokens={}", snapshot.cache_eligible_tokens),
+    ];
+    for (idx, block) in snapshot.system_blocks.iter().enumerate() {
+        lines.push(format!(
+            "system_block[{idx}] kind={} scope={} text_hash={} cache_control_hash={}",
+            block.kind, block.scope, block.text_hash, block.cache_control_hash
+        ));
+    }
+    for (name, hash) in &snapshot.per_tool_hashes {
+        lines.push(format!("tool[{name}]={hash}"));
+    }
+    lines.join("\n") + "\n"
 }
 
 // ---------------------------------------------------------------------------
@@ -737,6 +1235,91 @@ mod tests {
         let mut s = PromptStateSnapshot::capture(prompt, tools, model, 15_000);
         s.timestamp_secs = 1000; // fixed for testing
         s
+    }
+
+    #[test]
+    fn prompt_snapshot_from_messages_prefers_system_role_and_flattens_structured_content() {
+        let messages = vec![
+            json!({"role": "user", "content": "ignored"}),
+            json!({
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "System rules"},
+                    {"type": "text", "text": "Second paragraph"},
+                    "tail"
+                ]
+            }),
+        ];
+        assert_eq!(
+            prompt_snapshot_system_text_from_messages(&messages),
+            "System rules\n\nSecond paragraph\n\ntail"
+        );
+    }
+
+    #[test]
+    fn prompt_snapshot_from_messages_preserves_provider_and_model() {
+        let messages = vec![json!({"role": "system", "content": {"text": "Prompt"}})];
+        let tools = make_tools(&["bash"]);
+        let snapshot = prompt_snapshot_from_messages(&messages, &tools, "anthropic", "claude", 42)
+            .expect("snapshot");
+        assert_eq!(snapshot.provider, "anthropic");
+        assert_eq!(snapshot.model, "claude");
+        assert_eq!(snapshot.cache_eligible_tokens, 42);
+        assert_eq!(snapshot.system_prompt_hash, hash_str("Prompt"));
+    }
+
+    #[test]
+    fn prompt_snapshot_from_messages_matches_serialized_cache_control_fingerprint() {
+        use crate::section_types::{CacheScope, SectionKind};
+
+        let serialized = [SerializedSystemBlock {
+            kind: SectionKind::Identity,
+            scope: CacheScope::Session,
+            text: "Prompt".into(),
+            cache_control: Some(json!({"type": "ephemeral", "ttl": "1h"})),
+        }];
+        let messages = vec![json!({
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "Prompt", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ]
+        })];
+
+        let from_serialized =
+            PromptStateSnapshot::capture_serialized(&serialized, &[], "anthropic", "claude", 42);
+        let from_messages =
+            prompt_snapshot_from_messages(&messages, &[], "anthropic", "claude", 42)
+                .expect("snapshot");
+
+        assert_eq!(
+            from_messages.system_prompt_hash,
+            from_serialized.system_prompt_hash
+        );
+        assert_eq!(
+            from_messages.cache_control_hash,
+            from_serialized.cache_control_hash
+        );
+    }
+
+    #[test]
+    fn prompt_snapshot_from_messages_handles_explicit_separator_blocks() {
+        let messages = vec![json!({
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "A"},
+                {"type": "text", "text": "\n\n"},
+                {"type": "text", "text": "B", "cache_control": {"type": "ephemeral"}}
+            ]
+        })];
+
+        let snapshot = prompt_snapshot_from_messages(&messages, &[], "anthropic", "claude", 42)
+            .expect("snapshot");
+
+        assert_eq!(
+            prompt_snapshot_system_text_from_messages(&messages),
+            "A\n\nB"
+        );
+        assert_eq!(snapshot.system_blocks.len(), 2);
     }
 
     #[test]
@@ -896,6 +1479,124 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_change_does_not_also_claim_cache_control_changed() {
+        use crate::section_types::{CacheScope, SectionKind};
+
+        let block_v1 = SerializedSystemBlock {
+            kind: SectionKind::Identity,
+            scope: CacheScope::Session,
+            text: "system v1".into(),
+            cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+        };
+        let block_v2 = SerializedSystemBlock {
+            text: "system v2".into(),
+            ..block_v1.clone()
+        };
+
+        let mut det = CacheBreakDetector::new();
+        det.record_turn(
+            PromptStateSnapshot::capture_serialized(&[block_v1], &[], "anthropic", "claude", 8_000),
+            None,
+        );
+        let event = det
+            .record_turn(
+                PromptStateSnapshot::capture_serialized(
+                    &[block_v2],
+                    &[],
+                    "anthropic",
+                    "claude",
+                    8_000,
+                ),
+                Some(0),
+            )
+            .expect("system prompt change should be detected");
+
+        let reasons = match event.reason {
+            CacheBreakReason::Multiple(reasons) => reasons,
+            other => vec![other],
+        };
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| matches!(reason, CacheBreakReason::SystemPromptChanged))
+        );
+        assert!(
+            reasons
+                .iter()
+                .all(|reason| !matches!(reason, CacheBreakReason::CacheControlChanged)),
+            "text-only changes must not be misattributed as cache-control churn"
+        );
+    }
+
+    #[test]
+    fn detect_cache_control_change() {
+        use crate::section_types::{CacheScope, SectionKind};
+
+        let block_v1 = SerializedSystemBlock {
+            kind: SectionKind::Identity,
+            scope: CacheScope::Session,
+            text: "stable".into(),
+            cache_control: Some(json!({"type": "ephemeral"})),
+        };
+        let block_v2 = SerializedSystemBlock {
+            cache_control: Some(json!({"type": "ephemeral", "ttl": "1h"})),
+            ..block_v1.clone()
+        };
+
+        let mut det = CacheBreakDetector::new();
+        det.record_turn(
+            PromptStateSnapshot::capture_serialized(&[block_v1], &[], "anthropic", "claude", 8_000),
+            None,
+        );
+        let event = det
+            .record_turn(
+                PromptStateSnapshot::capture_serialized(
+                    &[block_v2],
+                    &[],
+                    "anthropic",
+                    "claude",
+                    8_000,
+                ),
+                Some(0),
+            )
+            .expect("cache-control change should be detected");
+
+        assert_eq!(event.reason, CacheBreakReason::CacheControlChanged);
+    }
+
+    #[test]
+    fn small_prefix_uses_adaptive_cache_miss_threshold() {
+        let tools = make_tools(&["bash"]);
+        let mut det = CacheBreakDetector::new();
+        let mut snapshot = snap("prompt", &tools, "claude");
+        snapshot.cache_eligible_tokens = 512;
+
+        det.record_turn(snapshot.clone(), None);
+        let event = det.record_turn(snapshot, Some(900));
+        assert!(
+            event.is_none(),
+            "small stable prefixes should not need a 2k cache_read to count as a hit"
+        );
+    }
+
+    #[test]
+    fn unexplained_cold_start_is_explicitly_reported() {
+        let tools = make_tools(&["bash"]);
+        let mut det = CacheBreakDetector::new();
+
+        let mut s1 = snap("prompt", &tools, "claude");
+        s1.timestamp_secs = 1_000;
+        det.record_turn(s1, None);
+
+        let mut s2 = snap("prompt", &tools, "claude");
+        s2.timestamp_secs = 1_100;
+        let event = det
+            .record_turn(s2, Some(0))
+            .expect("near-zero cache read with same fingerprint should surface");
+        assert_eq!(event.reason, CacheBreakReason::UnknownColdStart);
+    }
+
+    #[test]
     fn multiple_reasons_combined() {
         let mut det = CacheBreakDetector::new();
 
@@ -912,6 +1613,20 @@ mod tests {
             }
             _ => panic!("expected Multiple reasons"),
         }
+    }
+
+    #[test]
+    fn reset_all_sources_treats_next_turn_as_fresh_baseline() {
+        let mut det = CacheBreakDetector::new();
+        det.record_turn(snap("prompt v1", &make_tools(&["bash"]), "claude"), None);
+        det.reset_all_sources();
+
+        let event = det.record_turn(snap("prompt v2", &make_tools(&["bash"]), "claude"), Some(0));
+        assert!(
+            event.is_none(),
+            "post-reset cold start should not be misclassified"
+        );
+        assert_eq!(det.stats.cache_misses, 2);
     }
 
     #[test]
@@ -961,6 +1676,64 @@ mod tests {
         assert_eq!(snap.per_tool_hashes[0].0, "bash");
         assert_eq!(snap.per_tool_hashes[1].0, "edit");
         assert_eq!(snap.per_tool_hashes[2].0, "grep");
+    }
+
+    #[test]
+    fn capture_serialized_matches_plain_hashing_contract() {
+        use crate::section_types::{CacheScope, SectionKind};
+
+        let block_a = SerializedSystemBlock {
+            kind: SectionKind::Identity,
+            scope: CacheScope::Session,
+            text: "alpha".into(),
+            cache_control: None,
+        };
+        let block_b = SerializedSystemBlock {
+            kind: SectionKind::ProjectContext,
+            scope: CacheScope::Session,
+            text: "beta".into(),
+            cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+        };
+        let tools = make_tools(&["bash", "grep"]);
+        let serialized = PromptStateSnapshot::capture_serialized(
+            &[block_a.clone(), block_b.clone()],
+            &tools,
+            "anthropic",
+            "claude",
+            42,
+        );
+        let plain = PromptStateSnapshot::capture_with_provider(
+            "alpha\n\nbeta",
+            &[block_a, block_b],
+            &tools,
+            "anthropic",
+            "claude",
+            42,
+        );
+
+        assert_eq!(serialized.system_prompt_hash, plain.system_prompt_hash);
+        assert_eq!(serialized.cache_control_hash, plain.cache_control_hash);
+        assert_eq!(serialized.tools_hash, plain.tools_hash);
+        assert_eq!(serialized.per_tool_hashes, plain.per_tool_hashes);
+    }
+
+    fn wait_for_artifacts(dir: &std::path::Path, expected: usize) -> Vec<std::path::PathBuf> {
+        for _ in 0..50 {
+            let files: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .collect();
+            if files.len() >= expected {
+                return files;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect()
     }
 
     #[test]
@@ -1159,6 +1932,39 @@ mod tests {
     }
 
     #[test]
+    fn compression_hint_falls_back_to_latest_tracked_source() {
+        let tools = make_tools(&["bash"]);
+        let mut det = CacheBreakDetector::new();
+
+        for _ in 0..5 {
+            det.record_turn_for_source("bridge_inprocess", snap("prompt", &tools, "claude"), None);
+        }
+
+        let hint = det.compression_hint(20, 2);
+        assert!(hint.cache_healthy);
+        assert_eq!(hint.protected_token_estimate, 15_000);
+    }
+
+    #[test]
+    fn compression_hint_for_source_prefers_requested_snapshot() {
+        let tools = make_tools(&["bash"]);
+        let mut det = CacheBreakDetector::new();
+
+        let mut main = snap("main", &tools, "claude");
+        main.cache_eligible_tokens = 7_000;
+        let mut bridge = snap("bridge", &tools, "claude");
+        bridge.cache_eligible_tokens = 11_000;
+
+        det.record_turn_for_source(DEFAULT_SOURCE, main.clone(), None);
+        det.record_turn_for_source(DEFAULT_SOURCE, main, None);
+        det.record_turn_for_source("bridge_inprocess", bridge.clone(), None);
+        det.record_turn_for_source("bridge_inprocess", bridge, None);
+
+        let hint = det.compression_hint_for_source(DEFAULT_SOURCE, 20, 2);
+        assert_eq!(hint.protected_token_estimate, 7_000);
+    }
+
+    #[test]
     fn would_break_cache_detects_overlap() {
         let tools = make_tools(&["bash"]);
         let mut det = CacheBreakDetector::new();
@@ -1196,18 +2002,30 @@ mod tests {
         det.record_turn(snap("v1", &make_tools(&["bash"]), "claude"), None);
         det.record_turn(snap("v2", &make_tools(&["bash"]), "claude"), None);
 
-        let files: Vec<_> = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
+        let files: Vec<_> = wait_for_artifacts(tmp.path(), 2)
+            .into_iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(files.len(), 1, "exactly one artifact expected: {files:?}");
+        assert_eq!(files.len(), 2, "json + patch artifacts expected: {files:?}");
+        let json_file = files
+            .iter()
+            .find(|name| name.ends_with(".json"))
+            .expect("json artifact should exist");
+        let patch_file = files
+            .iter()
+            .find(|name| name.ends_with(".patch"))
+            .expect("patch artifact should exist");
         assert!(
-            files[0].starts_with("cache-break-"),
+            json_file.starts_with("cache-break-"),
             "name should be stable-prefixed, got {}",
-            files[0]
+            json_file
         );
-        let body = std::fs::read_to_string(tmp.path().join(&files[0])).unwrap();
+        assert!(
+            patch_file.starts_with("cache-break-"),
+            "name should be stable-prefixed, got {}",
+            patch_file
+        );
+        let body = std::fs::read_to_string(tmp.path().join(json_file)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v["prev"].is_object(), "prev snapshot missing");
         assert!(v["curr"].is_object(), "curr snapshot missing");
@@ -1389,13 +2207,13 @@ mod tests {
         // Now break B. The artifact's `prev` must be B's v1, not A's prompt.
         det.record_turn_for_source("B", snap("prompt-B-v2", &tools, "m"), None);
 
-        let files: Vec<_> = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .collect();
-        assert_eq!(files.len(), 1, "exactly one artifact expected");
-        let body = std::fs::read_to_string(&files[0]).unwrap();
+        let files = wait_for_artifacts(tmp.path(), 2);
+        assert_eq!(files.len(), 2, "json + patch artifacts expected");
+        let json_path = files
+            .iter()
+            .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .expect("json artifact should exist");
+        let body = std::fs::read_to_string(json_path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         // We can't read the prompt text back (only hashes are stored), but
         // we can verify the prev system_prompt_hash matches B's v1 hash,

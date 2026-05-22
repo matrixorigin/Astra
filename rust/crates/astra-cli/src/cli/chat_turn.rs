@@ -936,6 +936,78 @@ fn active_task_anchor_section(active_tasks: &[SessionTask]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+fn extract_session_memory_section(md: &str, section_name: &str) -> Option<String> {
+    let header = format!("## {section_name}");
+    let start = md.find(&header)?;
+    let content_start = md[start..].find('\n').map(|i| start + i + 1)?;
+    let rest = &md[content_start..];
+    let next_section = rest
+        .find("\n## ")
+        .map(|i| content_start + i)
+        .unwrap_or(md.len());
+    Some(md[content_start..next_section].to_string())
+}
+
+fn session_memory_recap(memory_md: &str) -> Option<String> {
+    const SECTIONS: &[(&str, &str, usize)] = &[
+        ("Active Goals", "Session goals", 2),
+        ("Pending Todos", "Session pending", 3),
+        ("Current State", "Session state", 2),
+        ("Errors & Corrections", "Session corrections", 2),
+        ("Completed", "Session completed", 2),
+    ];
+    let mut blocks = Vec::new();
+    let mut total_chars = 0usize;
+    for (section, label, max_lines) in SECTIONS {
+        let Some(content) = extract_session_memory_section(memory_md, section) else {
+            continue;
+        };
+        let lines: Vec<String> = content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("<!--"))
+            .map(|line| line.trim_start_matches("- ").to_string())
+            .take(*max_lines)
+            .collect();
+        if lines.is_empty() {
+            continue;
+        }
+        let block = format!("{label}:\n- {}", lines.join("\n- "));
+        total_chars += block.len();
+        if total_chars > 700 {
+            break;
+        }
+        blocks.push(block);
+    }
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(blocks.join("\n"))
+    }
+}
+
+pub(super) fn merge_continuation_anchor_with_session_memory(
+    anchor: Option<String>,
+    session_memory_markdown: Option<&str>,
+) -> Option<String> {
+    let Some(recap) = session_memory_markdown.and_then(session_memory_recap) else {
+        return anchor;
+    };
+    if anchor
+        .as_deref()
+        .is_some_and(|existing| existing.contains("[Session memory recap]"))
+    {
+        return anchor;
+    }
+    let merged = match anchor {
+        Some(anchor) if !anchor.trim().is_empty() => {
+            format!("{anchor}\n\n[Session memory recap]\n{recap}")
+        }
+        _ => format!("[Session memory recap]\n{recap}"),
+    };
+    Some(truncate_str(&merged, 900))
+}
+
 async fn load_active_tasks_for_anchor(state: &SessionState) -> Vec<SessionTask> {
     let session_id = state.task_manager.session_id();
     let tasks = state
@@ -1123,7 +1195,7 @@ async fn run_chat_turn(
             auth_profile: ctx.profile,
             message,
             session_id,
-            model: state.model.as_deref(),
+            model: astra_core::model_override::normalize_model_override(state.model.as_deref()),
             provider: None,
             explain: state.explain,
             render_md: true,
@@ -1398,6 +1470,313 @@ fn build_history_text(full_text: &str, records: &[session_journal::ToolCallRecor
     format!("{full_text}{summary}")
 }
 
+#[derive(Clone)]
+struct JournalPromptTurn {
+    snapshot: astra_turn_core::cache_diagnostics::PromptStateSnapshot,
+    usage: astra_runtime::turn::token_usage::TokenUsage,
+}
+
+fn build_bridge_pipeline_journal_events(
+    session_id: Option<&str>,
+    turn: u32,
+    model_id: &str,
+    current_turn_events: &[session_journal::JournalEvent],
+) -> Vec<session_journal::JournalEvent> {
+    let Some(session_id) = session_id.filter(|sid| !sid.is_empty()) else {
+        return Vec::new();
+    };
+    let Ok(mut events) = session_journal::read_journal(session_id) else {
+        return Vec::new();
+    };
+    events.extend_from_slice(current_turn_events);
+    if events.iter().any(|event| {
+        event.turn == Some(turn)
+            && matches!(
+                event.event_type,
+                session_journal::JournalEventType::PipelineFeedback
+                    | session_journal::JournalEventType::PipelineAlert
+            )
+    }) {
+        return Vec::new();
+    }
+
+    let turns = journal_prompt_turns(&events);
+    let Some(current) = turns.last() else {
+        return Vec::new();
+    };
+
+    let mut feedback = astra_turn_core::context_feedback::ContextFeedback::from_usage(
+        current.usage.input_tokens,
+        current.usage.cached_input_tokens,
+        current.usage.cache_creation_tokens,
+        current.usage.output_tokens,
+        false,
+    );
+
+    if let Some(previous) = turns.iter().rev().nth(1) {
+        let mut detector = astra_turn_core::cache_diagnostics::CacheBreakDetector::new();
+        let _ = detector.record_turn_for_source(
+            "bridge_inprocess",
+            previous.snapshot.clone(),
+            Some(previous.usage.cached_input_tokens),
+        );
+        if let Some(event) = detector.record_turn_for_source(
+            "bridge_inprocess",
+            current.snapshot.clone(),
+            Some(current.usage.cached_input_tokens),
+        ) {
+            feedback.attribute_cache_break(event.reason);
+        }
+    }
+
+    let prior_feedback_ratios: Vec<f64> = events
+        .iter()
+        .filter(|event| {
+            event.turn.unwrap_or(0) < turn
+                && event.event_type == session_journal::JournalEventType::PipelineFeedback
+        })
+        .filter_map(|event| {
+            event
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get("cache_hit_ratio"))
+                .and_then(serde_json::Value::as_f64)
+        })
+        .collect();
+    let prior_ratios = if prior_feedback_ratios.is_empty() {
+        turns
+            .iter()
+            .take(turns.len().saturating_sub(1))
+            .filter_map(|turn| {
+                let total_input = turn
+                    .usage
+                    .input_tokens
+                    .saturating_add(turn.usage.cached_input_tokens)
+                    .saturating_add(turn.usage.cache_creation_tokens);
+                (total_input > 0)
+                    .then_some(turn.usage.cached_input_tokens as f64 / total_input as f64)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        prior_feedback_ratios
+    };
+    let avg_cache_hit_ratio = if prior_ratios.is_empty() {
+        0.0
+    } else {
+        prior_ratios.iter().sum::<f64>() / prior_ratios.len() as f64
+    };
+    let stats = astra_turn_core::pipeline_stats::PipelineStats {
+        turns_executed: prior_ratios.len() as u32,
+        avg_cache_hit_ratio,
+        ..Default::default()
+    };
+
+    let feedback_evt = astra_turn_core::pipeline_journal::PipelineJournalEvent::from_feedback(
+        turn, model_id, &feedback,
+    );
+    let mut journal_events = Vec::new();
+    if let Ok(payload) = serde_json::to_value(&feedback_evt) {
+        journal_events.push(session_journal::JournalEvent::pipeline_feedback(
+            Some(session_id),
+            turn,
+            payload,
+        ));
+    }
+
+    for alert in astra_turn_core::trace_alert::evaluate_alerts(
+        turn,
+        &feedback,
+        &stats,
+        &astra_turn_core::recovery_state::RecoveryState::default(),
+    ) {
+        let alert_evt = astra_turn_core::pipeline_journal::PipelineJournalEvent::from_alert(&alert);
+        if let Ok(payload) = serde_json::to_value(&alert_evt) {
+            journal_events.push(session_journal::JournalEvent::pipeline_alert(
+                Some(session_id),
+                turn,
+                payload,
+            ));
+        }
+    }
+    journal_events
+}
+
+pub(crate) fn append_one_shot_journal_events(
+    session_id: Option<&str>,
+    model_id: Option<&str>,
+    line: &str,
+    result: &StreamResult,
+    turn_start: Instant,
+) {
+    let Some(session_id) = session_id.filter(|sid| !sid.is_empty()) else {
+        return;
+    };
+    let Ok(writer) = session_journal::JournalWriter::new(session_id) else {
+        return;
+    };
+    let Ok(existing_events) = session_journal::read_journal(session_id) else {
+        return;
+    };
+
+    let mut prompt_events = existing_events.clone();
+    prompt_events.extend_from_slice(&result.turn_observability_events);
+    let turn = journal_prompt_turns(&prompt_events).len() as u32;
+    if turn == 0 {
+        return;
+    }
+    if existing_events.iter().any(|event| {
+        event.turn == Some(turn) && event.event_type == session_journal::JournalEventType::Turn
+    }) {
+        return;
+    }
+
+    let mut append_events = build_bridge_pipeline_journal_events(
+        Some(session_id),
+        turn,
+        model_id.unwrap_or("unknown"),
+        &result.turn_observability_events,
+    );
+    append_events.push(
+        session_journal::JournalEvent::turn(
+            Some(session_id),
+            turn,
+            model_id,
+            line,
+            &result.full_text,
+            result.tool_calls_count,
+            result.prompt_tokens,
+            result.completion_tokens,
+            turn_start.elapsed().as_millis() as u64,
+        )
+        .with_tool_selection(
+            result.tools_selected.clone(),
+            result.selected_skills.clone(),
+            result.tools_used.clone(),
+            result.budget_used,
+        )
+        .with_run_id(result.run_id.as_deref())
+        .with_budget_pressure(result.budget_pressure)
+        .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens),
+    );
+    if let Err(e) = writer.append_bulk(&append_events) {
+        astra_core::agent_warn!("journal", "failed to append one-shot journal events: {e}");
+    }
+}
+
+fn journal_prompt_turns(events: &[session_journal::JournalEvent]) -> Vec<JournalPromptTurn> {
+    let mut pending_request: Option<(
+        String,
+        Vec<serde_json::Value>,
+        Vec<serde_json::Value>,
+        String,
+    )> = None;
+    let mut turns = Vec::new();
+
+    for event in events {
+        match event.event_type {
+            session_journal::JournalEventType::LlmRequestFull => {
+                let Some(metadata) = event.metadata.as_ref() else {
+                    continue;
+                };
+                let Some(request) = metadata
+                    .get("request")
+                    .and_then(serde_json::Value::as_object)
+                else {
+                    continue;
+                };
+                let messages = request
+                    .get("messages")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let tools = request
+                    .get("tools")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let model = metadata
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let provider = metadata
+                    .get("provider")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                pending_request = Some((model, messages, tools, provider));
+            }
+            session_journal::JournalEventType::LlmResponseFull => {
+                let Some((model, messages, tools, provider)) = pending_request.take() else {
+                    continue;
+                };
+                let Some(usage) = journal_usage_from_response_event(event) else {
+                    continue;
+                };
+                let total_input = usage
+                    .input_tokens
+                    .saturating_add(usage.cached_input_tokens)
+                    .saturating_add(usage.cache_creation_tokens);
+                let Some(mut snapshot) = journal_prompt_snapshot_from_messages(
+                    &messages,
+                    &tools,
+                    &model,
+                    &provider,
+                    total_input,
+                ) else {
+                    continue;
+                };
+                snapshot.provider = provider;
+                turns.push(JournalPromptTurn { snapshot, usage });
+            }
+            _ => {}
+        }
+    }
+    turns
+}
+
+fn journal_usage_from_response_event(
+    event: &session_journal::JournalEvent,
+) -> Option<astra_runtime::turn::token_usage::TokenUsage> {
+    let usage = event
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("response"))
+        .and_then(|response| response.get("response"))
+        .and_then(|response| response.get("usage"))
+        .and_then(serde_json::Value::as_object)?;
+    let canonical = astra_runtime::turn::token_usage::TokenUsage::from_json_map(usage);
+    if !canonical.is_empty() {
+        return Some(canonical);
+    }
+    let provider = event
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("provider"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("openai");
+    astra_runtime::turn::token_usage::extract_usage(
+        astra_runtime::turn::token_usage::UsageDialect::for_provider(provider),
+        usage,
+    )
+}
+
+fn journal_prompt_snapshot_from_messages(
+    messages: &[serde_json::Value],
+    tools: &[serde_json::Value],
+    model: &str,
+    provider: &str,
+    cache_eligible_tokens: u64,
+) -> Option<astra_turn_core::cache_diagnostics::PromptStateSnapshot> {
+    astra_turn_core::cache_diagnostics::prompt_snapshot_from_messages(
+        messages,
+        tools,
+        provider,
+        model,
+        cache_eligible_tokens as usize,
+    )
+}
+
 /// After `state.turn` has been incremented: journal turn row, workspace + checkpoints,
 /// stall/verdict/step sidecars. Shared by normal chat and plan-only LLM turns.
 fn commit_turn_journal_workspace_and_sidecars(
@@ -1412,8 +1791,17 @@ fn commit_turn_journal_workspace_and_sidecars(
 
     if let Some(journal) = state.journal.as_ref() {
         // Flush turn observability events (llm_round, tool timing) before the turn summary.
-        if !result.turn_observability_events.is_empty() {
-            if let Err(e) = journal.append_bulk(&result.turn_observability_events) {
+        let mut turn_observability_events = result.turn_observability_events.clone();
+        let bridge_pipeline_events = build_bridge_pipeline_journal_events(
+            state.session_id.as_deref(),
+            state.turn,
+            astra_core::model_override::normalize_model_override(state.model.as_deref())
+                .unwrap_or("unknown"),
+            &turn_observability_events,
+        );
+        turn_observability_events.extend(bridge_pipeline_events);
+        if !turn_observability_events.is_empty() {
+            if let Err(e) = journal.append_bulk(&turn_observability_events) {
                 astra_core::agent_warn!("journal", "failed to write observability events: {e}");
             }
         }
@@ -1421,7 +1809,7 @@ fn commit_turn_journal_workspace_and_sidecars(
         let mut turn_event = session_journal::JournalEvent::turn(
             state.session_id.as_deref(),
             state.turn,
-            state.model.as_deref(),
+            astra_core::model_override::normalize_model_override(state.model.as_deref()),
             line,
             &result.full_text,
             result.tool_calls_count,
@@ -1827,6 +2215,25 @@ fn apply_turn_success(
     check_skill_improvement_inner(state);
 }
 
+pub(super) async fn close_pending_memory_feedback_at_turn_end(
+    session_id: Option<&str>,
+    cloud_base: Option<String>,
+    cloud_token: Option<String>,
+    context_prefix: &str,
+) -> astra_tools::memoria::FeedbackDrainReport {
+    let Some(session_id) = session_id.filter(|sid| !sid.trim().is_empty()) else {
+        return astra_tools::memoria::FeedbackDrainReport::default();
+    };
+    crate::edge_tools::memoria::close_pending_recall_feedback_with_proxy(
+        session_id,
+        "useful",
+        context_prefix,
+        cloud_base,
+        cloud_token,
+    )
+    .await
+}
+
 async fn apply_turn_success_async(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
@@ -1839,6 +2246,22 @@ async fn apply_turn_success_async(
     let final_messages = std::mem::take(&mut result.final_messages);
     let csl_checkpoint_fields = extract_csl_fields_from_result(&result);
     apply_turn_success_sync(state, profile, line, result, turn_start);
+    let report = close_pending_memory_feedback_at_turn_end(
+        state.session_id.as_deref(),
+        Some(crate::command_router::resolve_api_url(None)),
+        super::session_runtime::current_access_token(profile),
+        "cli-turn-end",
+    )
+    .await;
+    if report.attempted > 0 {
+        tracing::debug!(
+            session_id = ?state.session_id,
+            attempted = report.attempted,
+            succeeded = report.succeeded,
+            failed = report.failed,
+            "closed pending recall feedback at turn end"
+        );
+    }
     rebuild_continuation_anchor_from_live_state(state).await;
 
     // Persist CSL via CslManager.
@@ -1869,64 +2292,6 @@ async fn apply_turn_success_async(
         astra_core::agent_warn!("plan", "failed to sync mirrored plan mode state: {error}");
     }
     check_skill_improvement_async(state).await;
-
-    // Background memory extraction: analyze this turn for durable memories.
-    let tools_used: Vec<String> = state.recent_tools.to_vec();
-    let recent_memory_actions: Vec<String> = state.recent_memory_actions.to_vec();
-    let extraction_turn = state.turn;
-
-    // Resolve fork prefix for extraction cache sharing: look up the
-    // current run's captured prefix from the spawner's store.
-    let fork_prefix = state
-        .agent_spawner
-        .as_ref()
-        .and_then(|s| s.prefix_store())
-        .and_then(|store| {
-            state
-                .run_id
-                .as_deref()
-                .and_then(|rid| store.get_prefix(rid))
-        });
-
-    state
-        .memory_extractor
-        .set_enabled(state.auto_memory_enabled);
-    let outcome =
-        state
-            .memory_extractor
-            .maybe_extract(super::memory_extraction::ExtractionContext {
-                turn: extraction_turn,
-                memory_model_params: state.memory_model_params.as_ref(),
-                user_message: line,
-                assistant_response: state.last_response.as_deref().unwrap_or(""),
-                tools_used: &tools_used,
-                recent_memory_actions: &recent_memory_actions,
-                session_id: state.session_id.as_deref(),
-                existing_manifest: "",
-                fork_prefix,
-            });
-    // Journal: record extraction skip reasons for audit trail.
-    // Started outcomes are journaled when drain() completes (session end).
-    match &outcome {
-        super::memory_extraction::ExtractionOutcome::SkippedMainWrote
-        | super::memory_extraction::ExtractionOutcome::SkippedNoModel
-        | super::memory_extraction::ExtractionOutcome::SkippedBusy { .. }
-        | super::memory_extraction::ExtractionOutcome::Error(_) => {
-            // Use the centralized builder so variant-specific fields
-            // (prior_turn, error) reach the journal metadata instead of
-            // being silently dropped during manual construction.
-            let evt = super::memory_extraction::journal_event_for_outcome(
-                state.session_id.as_deref(),
-                extraction_turn,
-                &outcome,
-            );
-            enqueue_ingestion(state, &evt);
-            if let Some(ref j) = state.journal {
-                let _ = j.append(&evt);
-            }
-        }
-        _ => {}
-    }
 
     // ── Desktop notification (fire-and-forget) ──────────────────────────
     let elapsed = turn_start.elapsed();
@@ -2024,8 +2389,6 @@ fn apply_turn_success_sync(
         build_history_text(&result.full_text, &result.tool_call_records),
     ));
     state.recent_tools = result.tools_used.clone();
-    state.recent_memory_actions =
-        super::memory_extraction::extract_memory_actions(&result.tool_call_records);
 
     // Persist tool health for cross-session error budgets
     if !result.tool_health_export.is_empty() {
@@ -2761,39 +3124,17 @@ fn initialize_journal(state: &mut SessionState, session_id: &str) {
         };
     }
 
-    let needs_start_event = match session_journal::read_journal(session_id) {
-        Ok(events) => {
-            // Write session_start if: journal is empty, last event is session_end
-            // (clean restart), or we're resuming an interrupted session (no open
-            // session_start). Use rposition to find the LAST start/end pair.
-            let last_type = events.last().map(|e| &e.event_type);
-            match last_type {
-                None | Some(session_journal::JournalEventType::SessionEnd) => true,
-                _ => {
-                    let last_start = events.iter().rposition(|e| {
-                        e.event_type == session_journal::JournalEventType::SessionStart
-                    });
-                    let last_end = events.iter().rposition(|e| {
-                        e.event_type == session_journal::JournalEventType::SessionEnd
-                    });
-                    let has_unmatched_start = match (last_start, last_end) {
-                        (Some(s), Some(e)) => s > e,
-                        (Some(_), None) => true,
-                        _ => false,
-                    };
-                    !has_unmatched_start
-                }
-            }
-        }
-        Err(_) => true,
-    };
+    let needs_start_event =
+        session_journal::journal_needs_session_start(session_id).unwrap_or(true);
 
     if !already_attached && needs_start_event {
         let Some(journal) = state.journal.as_ref() else {
             return;
         };
-        let start_event =
-            session_journal::JournalEvent::session_start(Some(session_id), state.model.as_deref());
+        let start_event = session_journal::JournalEvent::session_start(
+            Some(session_id),
+            astra_core::model_override::normalize_model_override(state.model.as_deref()),
+        );
         let _ = journal.append(&start_event);
         // enqueue_ingestion is server-owned and remains a local no-op.
         enqueue_ingestion(state, &start_event);
@@ -2833,7 +3174,8 @@ fn initialize_journal(state: &mut SessionState, session_id: &str) {
             Err(_) => (
                 astra_services::session_workspace::WorkspaceMetadata::new(
                     session_id,
-                    state.model.as_deref().unwrap_or("default"),
+                    astra_core::model_override::normalize_model_override(state.model.as_deref())
+                        .unwrap_or("default"),
                 ),
                 true,
                 false,
@@ -3112,7 +3454,7 @@ fn report_turn_failure(
         let mut err_event = session_journal::JournalEvent::turn_error(
             state.session_id.as_deref(),
             state.turn + 1,
-            state.model.as_deref(),
+            astra_core::model_override::normalize_model_override(state.model.as_deref()),
             line,
             &failure.error,
             turn_start.elapsed().as_millis() as u64,
@@ -4860,6 +5202,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_pending_memory_feedback_at_turn_end_drains_recall_queue() {
+        let session_id = "chat-turn-close-feedback";
+        astra_tools::memoria::MemoriaClient::reset_recall_ledger(session_id);
+        astra_tools::memoria::MemoriaClient::record_recall(session_id, 4, vec!["m1".into()]);
+
+        let report = close_pending_memory_feedback_at_turn_end(
+            Some(session_id),
+            Some("http://127.0.0.1:9".to_string()),
+            Some("token".to_string()),
+            "unit-test",
+        )
+        .await;
+
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.succeeded, 0);
+        assert_eq!(
+            astra_tools::memoria::MemoriaClient::pending_recall_count(session_id),
+            0
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn apply_turn_success_async_drains_pending_recall_feedback_before_returning() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let server = MockServer::start().await;
+        let _api_url = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
+        let _token = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "token");
+        Mock::given(method("POST"))
+            .and(path("/memory/feedback/m1"))
+            .and(header("authorization", "Bearer token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = SessionState::default();
+        let session_id = "sess-memory-drain";
+        astra_tools::memoria::MemoriaClient::reset_recall_ledger(session_id);
+        astra_tools::memoria::MemoriaClient::record_recall(session_id, 1, vec!["m1".into()]);
+        let mut result = stub_stream_result("Used the recalled memory.");
+        result.session_id = Some(session_id.to_string());
+        result.tools_used = vec!["memory".to_string()];
+        let mut ui = CollectingUi::default();
+
+        apply_turn_success_async(
+            &mut state,
+            &api,
+            None,
+            "remember that",
+            result,
+            Instant::now(),
+            &mut ui,
+        )
+        .await;
+
+        assert_eq!(
+            astra_tools::memoria::MemoriaClient::pending_recall_count(session_id),
+            0,
+            "turn completion must synchronously drain recall feedback so cleanup cannot race it"
+        );
+    }
+
+    #[tokio::test]
     #[serial_test::serial]
     async fn apply_turn_success_async_warns_and_marks_plan_mirror_stale_when_sync_fails() {
         let (_tmp, _g) = isolated_sessions_dir();
@@ -5554,6 +5962,36 @@ mod tests {
         assert!(anchor.contains("Active task board:"), "{anchor}");
         assert!(anchor.contains("Finish slash command repair"), "{anchor}");
         assert!(anchor.contains("[in_progress]"), "{anchor}");
+    }
+
+    #[test]
+    fn merge_continuation_anchor_with_session_memory_adds_recap() {
+        let memory = "# Session Memory
+
+## Active Goals
+- Improve prompt cache
+
+## Pending Todos
+- Add shutdown flush
+
+## Current State
+- Investigating resume behavior
+
+## Errors & Corrections
+- Fixed model override poisoning
+
+## Completed
+- Removed legacy extractor
+";
+        let merged = merge_continuation_anchor_with_session_memory(
+            Some("Latest user task: tighten session memory".to_string()),
+            Some(memory),
+        )
+        .expect("merged anchor");
+        assert!(merged.contains("Latest user task: tighten session memory"));
+        assert!(merged.contains("[Session memory recap]"));
+        assert!(merged.contains("Session pending"));
+        assert!(merged.contains("Add shutdown flush"));
     }
 
     /// Simulates a multi-turn error recovery scenario:

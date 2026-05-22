@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 
+use astra_services::SessionArtifactStore;
 use serde_json::{Map, Value, json};
 
 use super::agentic_loop_host::AgenticLoopState;
@@ -76,6 +77,11 @@ impl<'a> ToolSurfacePlan<'a> {
 
     pub(crate) fn with_selection_trace(mut self, trace: Option<Value>) -> Self {
         self.selection_trace = trace;
+        self
+    }
+
+    pub(crate) fn with_deferred_tools_block(mut self, block: &'a str) -> Self {
+        self.deferred_tools_block = block;
         self
     }
 }
@@ -195,59 +201,9 @@ fn cache_control_count(value: &Value) -> usize {
 /// the existing bridge pipeline helper until the bridge source collection is
 /// fully normalized into [`LlmContextAssemblyInput`].
 pub(crate) struct BridgeContextAssemblyInput<'a> {
-    pub tool_surface: BridgeToolSurfacePlan<'a>,
+    pub tool_surface: ToolSurfacePlan<'a>,
     pub runtime_signals: BridgeRuntimeSignals<'a>,
     pub session: BridgeSessionContextInput<'a>,
-}
-
-pub(crate) struct BridgeToolSurfacePlan<'a> {
-    pub tool_names: &'a [&'a str],
-    pub tool_schemas: &'a [Value],
-    pub pinned_tools: &'a [Value],
-    pub dynamic_tools: &'a [Value],
-    pub required_tools: &'a [Value],
-    pub deferred_tools_block: &'a str,
-    pub restricted_tools: &'a HashSet<String>,
-    pub selection_trace: Option<Value>,
-}
-
-impl<'a> BridgeToolSurfacePlan<'a> {
-    pub(crate) fn from_visible_tools(
-        tool_names: &'a [&'a str],
-        tool_schemas: &'a [Value],
-        restricted_tools: &'a HashSet<String>,
-    ) -> Self {
-        Self {
-            tool_names,
-            tool_schemas,
-            pinned_tools: tool_schemas,
-            dynamic_tools: &[],
-            required_tools: &[],
-            deferred_tools_block: "",
-            restricted_tools,
-            selection_trace: None,
-        }
-    }
-
-    pub(crate) fn with_deferred_tools_block(mut self, block: &'a str) -> Self {
-        self.deferred_tools_block = block;
-        self
-    }
-
-    pub(crate) fn with_selection_trace(mut self, trace: Option<Value>) -> Self {
-        self.selection_trace = trace;
-        self
-    }
-
-    fn effective_tool_schemas(&self) -> Vec<Value> {
-        let tools = effective_tool_schemas(
-            self.tool_schemas,
-            self.pinned_tools,
-            self.dynamic_tools,
-            self.required_tools,
-        );
-        filter_restricted_tool_schemas(tools, self.restricted_tools)
-    }
 }
 
 fn tool_name(schema: &Value) -> Option<&str> {
@@ -579,13 +535,13 @@ pub(crate) fn build_context_manifest_projection(
 pub(crate) fn assemble_bridge_context(
     input: BridgeContextAssemblyInput<'_>,
 ) -> BridgeContextAssemblyOutput {
-    let effective_tool_schemas = input.tool_surface.effective_tool_schemas();
+    let effective_tool_schemas = input.tool_surface.effective_tools();
     let effective_tool_names: Vec<&str> = effective_tool_schemas
         .iter()
         .filter_map(tool_name)
         .collect();
     let _tool_surface_metadata = (
-        input.tool_surface.tool_names.len(),
+        input.tool_surface.visible_tools.len(),
         input.tool_surface.pinned_tools.len(),
         input.tool_surface.dynamic_tools.len(),
         input.tool_surface.required_tools.len(),
@@ -733,6 +689,12 @@ pub(crate) fn assemble_context_pipeline(
             .pipeline_session
             .as_mut()
             .expect("pipeline_session must be initialized for all production paths");
+        if let Some(session_id) = state.current_session_id.as_deref()
+            && let Ok(session_dir) =
+                astra_services::local_session_artifact_store().session_dir(session_id)
+        {
+            pipeline_sess.set_prompt_cache_diff_dir(session_dir.join("prompt-cache-diffs"));
+        }
         pipeline_sess.run_turn_adaptive(adaptive)
     };
 
@@ -950,31 +912,45 @@ pub(crate) fn apply_message_cache_metadata(
 ///
 /// The bridge currently compacts and mutates its message vector inline. This
 /// helper centralizes the cache-sensitive tail rule shared with
-/// [`assemble_wire_messages`]: volatile runtime text must be prepended to the
-/// final user message so the stable prefix remains byte-identical for prefix
-/// caches.
+/// [`assemble_wire_messages`]: volatile runtime text must live on the true
+/// tail, not be spliced into historical user turns.
 pub(crate) fn finalize_bridge_wire_messages(
-    llm_messages: &mut [Value],
+    llm_messages: &mut Vec<Value>,
     volatile_text: Option<String>,
     provider: &str,
     model_name: &str,
-) {
+) -> bool {
     astra_turn_core::edge_ledger::strip_stale_reasoning(llm_messages, provider, model_name);
+    let mut appended_synthetic_tail = false;
     if let Some(text) = volatile_text
         && !text.is_empty()
-        && let Some(last_user) = llm_messages
-            .iter_mut()
-            .rev()
-            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
     {
-        let existing = last_user
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        last_user["content"] = Value::String(format!(
-            "<system-reminder>\n{text}</system-reminder>\n\n{existing}"
-        ));
+        let wrapped = format!("<system-reminder>\n{text}</system-reminder>");
+        let tail_role = llm_messages
+            .last()
+            .and_then(|m| m.get("role").and_then(Value::as_str));
+        if tail_role == Some("user") {
+            let last_user = llm_messages
+                .last_mut()
+                .expect("tail_role=user implies a last message exists");
+            let existing = last_user
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            last_user["content"] = Value::String(format!("{wrapped}\n\n{existing}"));
+        } else if tail_role == Some("tool") {
+            llm_messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": "Understood.",
+            }));
+            llm_messages.push(serde_json::json!({"role": "user", "content": wrapped}));
+            appended_synthetic_tail = true;
+        } else {
+            llm_messages.push(serde_json::json!({"role": "user", "content": wrapped}));
+            appended_synthetic_tail = true;
+        }
     }
+    appended_synthetic_tail
 }
 
 pub(crate) fn augment_manifest_trace_with_wire(
@@ -1093,5 +1069,47 @@ mod context_cache_contract_tests {
         assert_eq!(trace["wire"]["message_cache_control_count"], 1);
         assert_eq!(trace["wire"]["tool_cache_control_count"], 1);
         assert_eq!(trace["wire"]["total_cache_control_count"], 2);
+    }
+
+    #[test]
+    fn finalize_bridge_wire_messages_keeps_historical_user_stable_when_tail_is_tool() {
+        let mut messages = vec![
+            json!({"role": "user", "content": "original user"}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": "tool output", "tool_call_id": "c1"}),
+        ];
+
+        finalize_bridge_wire_messages(
+            &mut messages,
+            Some("volatile".to_string()),
+            "openai",
+            "gpt-4",
+        );
+
+        assert_eq!(messages[0]["content"], "original user");
+        assert_eq!(messages[3]["role"], "assistant");
+        assert_eq!(messages[3]["content"], "Understood.");
+        assert_eq!(
+            messages[4]["content"],
+            "<system-reminder>\nvolatile</system-reminder>"
+        );
+    }
+
+    #[test]
+    fn finalize_bridge_wire_messages_prepends_to_tail_user_when_available() {
+        let mut messages = vec![json!({"role": "user", "content": "original user"})];
+
+        finalize_bridge_wire_messages(
+            &mut messages,
+            Some("volatile".to_string()),
+            "openai",
+            "gpt-4",
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0]["content"],
+            "<system-reminder>\nvolatile</system-reminder>\n\noriginal user"
+        );
     }
 }

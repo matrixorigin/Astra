@@ -333,6 +333,13 @@ fn estimate_tokens(s: &str) -> usize {
     s.len() / 4
 }
 
+fn should_preserve_protected_prefix_result(
+    message_index: usize,
+    protected_prefix_len: Option<usize>,
+) -> bool {
+    protected_prefix_len.is_some_and(|len| message_index < len)
+}
+
 /// Compact old tool results in the message history.
 ///
 /// Returns the number of tool results compacted and estimated tokens saved.
@@ -348,7 +355,7 @@ pub fn compact_tool_results(
             token_budget: TOKEN_BUDGET,
         })
         .unwrap_or_default();
-    compact_tool_results_with_config(messages, &config, strategy)
+    compact_tool_results_with_config(messages, &config, strategy, None)
 }
 
 /// Pressure-adaptive variant: compact with parameters derived from context
@@ -360,7 +367,7 @@ pub fn compact_tool_results_adaptive(
 ) -> CompactStats {
     crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
     let config = AdaptiveCompactConfig::from_pressure(pressure);
-    compact_tool_results_with_config(messages, &config, strategy)
+    compact_tool_results_with_config(messages, &config, strategy, None)
 }
 
 /// Pressure-adaptive compaction with optional disk persistence.
@@ -376,9 +383,31 @@ pub fn compact_tool_results_adaptive_with_persistence(
     strategy: CompactStrategy,
     session_dir: Option<&std::path::Path>,
 ) -> CompactStats {
+    compact_tool_results_adaptive_with_persistence_protected_prefix(
+        messages,
+        pressure,
+        strategy,
+        session_dir,
+        None,
+    )
+}
+
+pub fn compact_tool_results_adaptive_with_persistence_protected_prefix(
+    messages: &mut [Value],
+    pressure: f64,
+    strategy: CompactStrategy,
+    session_dir: Option<&std::path::Path>,
+    protected_prefix_len: Option<usize>,
+) -> CompactStats {
     crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
     let config = AdaptiveCompactConfig::from_pressure(pressure);
-    compact_tool_results_with_persistence(messages, &config, strategy, session_dir)
+    compact_tool_results_with_persistence(
+        messages,
+        &config,
+        strategy,
+        session_dir,
+        protected_prefix_len,
+    )
 }
 
 /// State-aware variant: uses `SessionFacts.active_files` as a pin list.
@@ -393,7 +422,7 @@ pub fn compact_tool_results_state_aware(
 ) -> CompactStats {
     crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
     let config = AdaptiveCompactConfig::from_pressure(pressure);
-    compact_tool_results_with_pin_list(messages, &config, facts, pin_turns, strategy, None)
+    compact_tool_results_with_pin_list(messages, &config, facts, pin_turns, strategy, None, None)
 }
 
 /// State-aware compaction with optional disk persistence.
@@ -405,9 +434,37 @@ pub fn compact_tool_results_state_aware_with_persistence(
     strategy: CompactStrategy,
     session_dir: Option<&std::path::Path>,
 ) -> CompactStats {
+    compact_tool_results_state_aware_with_persistence_protected_prefix(
+        messages,
+        pressure,
+        facts,
+        pin_turns,
+        strategy,
+        session_dir,
+        None,
+    )
+}
+
+pub fn compact_tool_results_state_aware_with_persistence_protected_prefix(
+    messages: &mut [Value],
+    pressure: f64,
+    facts: &crate::cloud_session_facts::SessionFacts,
+    pin_turns: u32,
+    strategy: CompactStrategy,
+    session_dir: Option<&std::path::Path>,
+    protected_prefix_len: Option<usize>,
+) -> CompactStats {
     crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
     let config = AdaptiveCompactConfig::from_pressure(pressure);
-    compact_tool_results_with_pin_list(messages, &config, facts, pin_turns, strategy, session_dir)
+    compact_tool_results_with_pin_list(
+        messages,
+        &config,
+        facts,
+        pin_turns,
+        strategy,
+        session_dir,
+        protected_prefix_len,
+    )
 }
 
 fn compact_tool_results_with_pin_list(
@@ -417,6 +474,7 @@ fn compact_tool_results_with_pin_list(
     pin_turns: u32,
     strategy: CompactStrategy,
     session_dir: Option<&std::path::Path>,
+    protected_prefix_len: Option<usize>,
 ) -> CompactStats {
     let keep = config.keep_recent;
 
@@ -426,6 +484,9 @@ fn compact_tool_results_with_pin_list(
     // Collect compactable results, split into pinned vs unpinned
     let mut unpinned: Vec<(usize, usize)> = Vec::new();
     for (i, msg) in messages.iter().enumerate() {
+        if should_preserve_protected_prefix_result(i, protected_prefix_len) {
+            continue;
+        }
         if !is_compactable_tool_result(msg, &id_to_name) {
             continue;
         }
@@ -564,6 +625,7 @@ fn compact_tool_results_with_config(
     messages: &mut [Value],
     config: &AdaptiveCompactConfig,
     strategy: CompactStrategy,
+    protected_prefix_len: Option<usize>,
 ) -> CompactStats {
     let keep = config.keep_recent;
 
@@ -575,6 +637,9 @@ fn compact_tool_results_with_config(
         .iter()
         .enumerate()
         .filter_map(|(i, msg)| {
+            if should_preserve_protected_prefix_result(i, protected_prefix_len) {
+                return None;
+            }
             if !is_compactable_tool_result(msg, &id_to_name) {
                 return None;
             }
@@ -634,6 +699,7 @@ fn compact_tool_results_with_persistence(
     config: &AdaptiveCompactConfig,
     strategy: CompactStrategy,
     session_dir: Option<&std::path::Path>,
+    protected_prefix_len: Option<usize>,
 ) -> CompactStats {
     crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
     let keep = config.keep_recent;
@@ -645,6 +711,9 @@ fn compact_tool_results_with_persistence(
         .iter()
         .enumerate()
         .filter_map(|(i, msg)| {
+            if should_preserve_protected_prefix_result(i, protected_prefix_len) {
+                return None;
+            }
             if !is_compactable_tool_result(msg, &id_to_name) {
                 return None;
             }
@@ -823,6 +892,33 @@ mod tests {
         );
         assert_eq!(messages[6]["content"], big); // recent kept
         assert_eq!(messages[7]["content"], big);
+    }
+
+    #[test]
+    fn protected_prefix_len_preserves_previously_sent_results() {
+        let big = "x".repeat(1000);
+        let mut messages = vec![
+            json!({"role": "user", "content": "task"}),
+            assistant_with_tools(&[("c1", "read_file"), ("c2", "read_file")]),
+            tool_result("c1", &big),
+            tool_result("c2", &big),
+            assistant_with_tools(&[("c3", "read_file"), ("c4", "read_file")]),
+            tool_result("c3", &big),
+            tool_result("c4", &big),
+        ];
+
+        let cfg = AdaptiveCompactConfig {
+            keep_recent: 0,
+            token_budget: 0,
+        };
+        let stats =
+            compact_tool_results_with_config(&mut messages, &cfg, Default::default(), Some(4));
+
+        assert_eq!(stats.results_compacted, 2);
+        assert_eq!(messages[2]["content"], big);
+        assert_eq!(messages[3]["content"], big);
+        assert!(content_is_cleared(&messages[5]));
+        assert!(content_is_cleared(&messages[6]));
     }
 
     // ── Token-based compaction ───────────────────────────────────────────

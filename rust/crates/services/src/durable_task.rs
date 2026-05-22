@@ -5728,6 +5728,7 @@ mod tests {
             provider: "openai".into(),
             fallback_chain: vec![],
             tags: vec![],
+            request_body_overrides: None,
             thinking_capability: None,
         };
         let config = CloudLlmConfig::from_resolved(resolved);

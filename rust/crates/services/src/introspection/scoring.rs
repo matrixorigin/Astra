@@ -116,14 +116,6 @@ pub struct RelevanceQualityResult {
     pub quality: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct MemoryScoreBreakdown {
-    pub vector: f64,
-    pub keyword: f64,
-    pub temporal: f64,
-    pub confidence: f64,
-}
-
 // ── Pure analysis functions ──────────────────────────────────────────────────
 
 pub fn compute_trend(token_history: &[i64]) -> &'static str {
@@ -551,57 +543,6 @@ pub fn relevance_quality(relevance_scores: &HashMap<String, f64>) -> RelevanceQu
     }
 }
 
-pub fn memory_recall_score(
-    content: &str,
-    query_terms: &[&str],
-    confidence: f64,
-    age_days: f64,
-) -> MemoryScoreBreakdown {
-    let keyword = if query_terms.is_empty() {
-        0.0
-    } else {
-        let content_lower = content.to_lowercase();
-        let matches = query_terms
-            .iter()
-            .filter(|t| content_lower.contains(&t.to_lowercase()))
-            .count();
-        matches as f64 / query_terms.len() as f64
-    };
-    let temporal = (1.0 - (age_days / 30.0).min(1.0)).max(0.0);
-    let vector = keyword;
-
-    let _final_score =
-        ((vector * 0.6 + temporal * 0.2 + confidence * 0.2) * 10000.0).round() / 10000.0;
-
-    MemoryScoreBreakdown {
-        vector: (keyword * 10000.0).round() / 10000.0,
-        keyword: (keyword * 10000.0).round() / 10000.0,
-        temporal: (temporal * 10000.0).round() / 10000.0,
-        confidence: (confidence * 10000.0).round() / 10000.0,
-    }
-}
-
-pub fn memory_recall_final_score(
-    content: &str,
-    query_terms: &[&str],
-    confidence: f64,
-    age_days: f64,
-) -> f64 {
-    let keyword = if query_terms.is_empty() {
-        0.0
-    } else {
-        let content_lower = content.to_lowercase();
-        let matches = query_terms
-            .iter()
-            .filter(|t| content_lower.contains(&t.to_lowercase()))
-            .count();
-        matches as f64 / query_terms.len() as f64
-    };
-    let temporal = (1.0 - (age_days / 30.0).min(1.0)).max(0.0);
-    let vector = keyword;
-    ((vector * 0.6 + temporal * 0.2 + confidence * 0.2) * 10000.0).round() / 10000.0
-}
-
 // ── JSON column parsing helper ───────────────────────────────────────────────
 
 pub fn parse_token_usage(raw: &str) -> Option<Value> {
@@ -927,37 +868,6 @@ mod tests {
         assert_eq!(result.mean, None);
         assert_eq!(result.total, 0);
         assert_eq!(result.quality, None);
-    }
-
-    #[test]
-    fn test_recall_all_terms_match() {
-        let breakdown = memory_recall_score("hello world test", &["hello", "world"], 0.9, 1.0);
-        assert!((breakdown.keyword - 1.0).abs() < 0.001);
-        assert!(breakdown.temporal > 0.9);
-    }
-
-    #[test]
-    fn test_recall_no_terms() {
-        let breakdown = memory_recall_score("anything", &[], 0.5, 10.0);
-        assert!((breakdown.keyword - 0.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_recall_old_memory() {
-        let breakdown = memory_recall_score("test content", &["test"], 0.5, 60.0);
-        assert!((breakdown.temporal - 0.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_recall_final_score() {
-        let score = memory_recall_final_score("hello world", &["hello", "world"], 0.8, 0.0);
-        assert!((score - 0.96).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_recall_partial_match() {
-        let score = memory_recall_final_score("hello foo", &["hello", "world"], 0.5, 15.0);
-        assert!((score - 0.5).abs() < 0.001);
     }
 
     // ── compute_drift ──────────────────────────────────────────────────

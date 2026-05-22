@@ -85,6 +85,7 @@ impl MockLoopState {
             session_id: self.session_id.clone(),
             run_id: "run-1".into(),
             model_id: self.model_id.clone(),
+            provider_name: "anthropic".into(),
             model_limit: self.model_limit,
             provider_policy: ProviderCachePolicy::anthropic(),
             provider_strategy: ProviderCacheStrategy::default(),
@@ -138,7 +139,7 @@ fn pipeline_output_flattened_matches_concatenation_of_blocks() {
     let external = mock.build_external();
     let limits = OptimizeLimits::default();
 
-    let sess = PipelineSession::new(PipelineConfig {
+    let mut sess = PipelineSession::new(PipelineConfig {
         provider_policy: ProviderCachePolicy::anthropic(),
     });
 
@@ -179,7 +180,7 @@ fn pipeline_to_anthropic_message_format() {
     let external = mock.build_external();
     let limits = OptimizeLimits::default();
 
-    let sess = PipelineSession::new(PipelineConfig {
+    let mut sess = PipelineSession::new(PipelineConfig {
         provider_policy: ProviderCachePolicy::anthropic(),
     });
 

@@ -491,6 +491,10 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     // Emit structured interruption to journal if one was recorded.
     if let Some(ref interruption) = state.interruption {
         if let Some(ref sid) = state.current_session_id {
+            let _ = astra_services::session_journal::ensure_session_start_event(
+                sid,
+                state.context_manifest_model_name.as_deref(),
+            );
             // Best-effort flush of turn observability events on interruption.
             if let Some(buf) = state.turn_event_buffer.as_mut() {
                 if !buf.is_empty() {
@@ -557,6 +561,7 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     );
 
     finalize_turn_trace(state).await;
+    close_pending_memory_feedback_at_turn_end(state).await;
 
     // Background session-memory extraction. Fire-and-forget; service
     // handles LLM vs. rule-based decision, event emission, UX broker,
@@ -708,6 +713,37 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
     };
 
     let _ = svc.maybe_spawn(req);
+}
+
+async fn close_pending_memory_feedback_at_turn_end(state: &mut AgenticLoopState) {
+    let Some(session_id) = state
+        .current_session_id
+        .as_deref()
+        .filter(|sid| !sid.is_empty())
+    else {
+        return;
+    };
+    if astra_tools::memoria::MemoriaClient::pending_recall_count(session_id) == 0 {
+        return;
+    }
+    let report = if let Some(executor) = state.server_tool_executor.as_deref() {
+        executor
+            .close_pending_memory_feedback_at_turn_end("server-turn-end")
+            .await
+    } else {
+        astra_tools::memoria::MemoriaClient::new(None, None)
+            .feedback_pending_recalls(session_id, "useful", "server-turn-end")
+            .await
+    };
+    if report.attempted > 0 {
+        tracing::debug!(
+            session_id = %session_id,
+            attempted = report.attempted,
+            succeeded = report.succeeded,
+            failed = report.failed,
+            "closed pending recall feedback at server turn end"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -956,6 +992,46 @@ mod tests {
             "interrupted tool-only turns must not persist an empty or success-shaped final answer"
         );
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+    }
+
+    #[tokio::test]
+    async fn run_loop_writes_session_start_before_interruption_on_fresh_journal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        let sid = "11111111-2222-3333-4444-555555555555";
+        state.current_session_id = Some(sid.to_string());
+        state.context_manifest_model_name = Some("gpt-5".to_string());
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+            astra_turn_core::interruption::InterruptionStateSummary {
+                has_checkpoint: false,
+                tool_calls_completed: 2,
+                turns_completed: 3,
+                remaining_turns: 0,
+                error_detail: Some("forced for test".to_string()),
+                stall_signal: None,
+            },
+        ));
+
+        let result = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(
+            result.is_err(),
+            "mock loop should error once turn results are exhausted"
+        );
+
+        let events = astra_services::session_journal::read_journal(sid).unwrap();
+        assert_eq!(
+            events.first().map(|event| event.event_type.clone()),
+            Some(astra_services::session_journal::JournalEventType::SessionStart)
+        );
+        assert_eq!(
+            events.get(1).map(|event| event.event_type.clone()),
+            Some(astra_services::session_journal::JournalEventType::InterruptionRecorded)
+        );
     }
 
     #[tokio::test]
@@ -1475,6 +1551,34 @@ mod tests {
         assert!(state.memory_extraction_service.is_none());
         finalize_and_render(&mut host, &mut state).await;
         // Implicit: no panic, no file, no events.
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_drains_pending_recall_feedback_for_server_executor() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        let session_id = format!("server-finalize-feedback-{}", uuid::Uuid::new_v4());
+        let workspace = tempfile::TempDir::new().unwrap();
+        let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
+            workspace.path().to_path_buf(),
+            "test-user".into(),
+            session_id.clone(),
+            None,
+            None,
+        );
+        astra_tools::memoria::MemoriaClient::reset_recall_ledger(&session_id);
+        astra_tools::memoria::MemoriaClient::record_recall(&session_id, 1, vec!["m1".into()]);
+        state.current_session_id = Some(session_id.clone());
+        state.server_tool_executor = Some(std::sync::Arc::new(executor));
+        state.final_text = "Done.".into();
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        assert_eq!(
+            astra_tools::memoria::MemoriaClient::pending_recall_count(&session_id),
+            0,
+            "server finalization must drain pending recall feedback on memory-only turns"
+        );
     }
 
     // I11 test removed in rebase: the branch wired a now-deleted

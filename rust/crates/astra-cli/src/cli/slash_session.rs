@@ -4834,6 +4834,16 @@ async fn apply_restored_session(
             .cloned();
     }
     chat_turn::rebuild_continuation_anchor_from_live_state(state).await;
+    let session_memory = super::slash_memory::load_current_session_memory_body_with_profile(
+        api,
+        profile,
+        &restored.session_id,
+    )
+    .await;
+    state.continuation_anchor = chat_turn::merge_continuation_anchor_with_session_memory(
+        state.continuation_anchor.take(),
+        session_memory.as_deref(),
+    );
 
     if let Some(ref json) = restored.executing_plan_json {
         state.executing_plan = serde_json::from_str(json).ok();
@@ -5879,6 +5889,69 @@ mod resume_tests {
         assert_eq!(state.turn, 2);
         assert_eq!(state.total_prompt_tokens, 15);
         assert_eq!(state.total_completion_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn restore_session_into_state_merges_session_memory_into_anchor() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = format!("resume-memory-anchor-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 2);
+        write_profile_with_token(&session_id);
+
+        let memory_body = "# Session Memory
+
+## Active Goals
+- Improve prompt cache behavior
+
+## Pending Todos
+- Add shutdown flush
+
+## Current State
+- Resume should carry session memory forward
+
+## Completed
+- Removed legacy memory extraction
+";
+        let encoded = astra_runtime::session_memory::runner::encode_session_memory_entry(
+            &session_id,
+            memory_body,
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "status": "active"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/memory/retrieve"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "memories": [{
+                    "memory_id": "mem-1",
+                    "content": encoded,
+                    "memory_type": "working",
+                    "session_id": session_id
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let mut state = SessionState::default();
+        restore_session_into_state(&session_id, None, &api, &mut state)
+            .await
+            .unwrap();
+
+        let anchor = state.continuation_anchor.expect("continuation anchor");
+        assert!(anchor.contains("[Session memory recap]"), "{anchor}");
+        assert!(anchor.contains("Improve prompt cache behavior"), "{anchor}");
+        assert!(anchor.contains("Add shutdown flush"), "{anchor}");
     }
 
     #[tokio::test]

@@ -97,7 +97,7 @@
 
   ─────────────────────────────────────────────────────────────────────────────────
   STORAGE LAYERS:
-  
+
   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
   │  Sensory    │  │   Working   │  │  Episodic   │  │  Semantic   │
   │  (memory)   │  │ (scratchpad)│  │  (events)   │  │ (memories)  │
@@ -105,6 +105,105 @@
        1 turn         session         90 days          permanent
                                       + decay           + decay
 ```
+
+---
+
+## Session Memory 闭环架构
+
+> 本节描述从会话创建到销毁的完整闭环，覆盖 CLI / TUI / Web-Agent 三种运行模式。
+
+### 数据层：五份关键文件/表
+
+| 层                  | 位置                                       | 格式              | 内容                                   |
+| ------------------- | ------------------------------------------ | ----------------- | -------------------------------------- |
+| **Journal**         | `~/.astra/sessions/<id>.jsonl`             | append-only JSONL | 每 turn 完整事件流                     |
+| **Workspace**       | `~/.astra/sessions/<id>/workspace.yaml`    | YAML              | 会话元数据（turn / 工具 / 上下文追踪） |
+| **Step Checkpoint** | `~/.astra/sessions/<id>/checkpoints/`      | JSON              | 每 5 turn 恢复快照                     |
+| **Session Memory**  | `~/.astra/sessions/<id>/session-memory.md` | Markdown          | LLM 提取的 L1 记忆                     |
+| **Cloud DB**        | `agent_sessions` / `agent_events`          | MySQL             | 云端审计、恢复、分析（Web-Agent 专属） |
+
+### 会话生命周期
+
+```
+START (session_startup.rs + session_runtime.rs):
+  ├── initialize_session_state()
+  │   ├── 检测 pending_recovery（journal 尾部 Interrupted/Zombie）
+  │   ├── 不隐式续接旧 session
+  │   └── 打印 recovery hint
+  ├── build_cli_session_memory_extractor()
+  │   ├── SelectorResolver（从 profile 获取 LLM 参数）
+  │   ├── MemoriaClient（ThinClient → Memoria API）
+  │   └── event_sink → 写 journal
+  └── complete_session_startup() → banner
+
+RUN（每 turn，agentic_loop_finalization.rs）:
+  ├── 更新 SessionFacts（文件 / 工具 / 错误）
+  ├── heavy checkpoint（中断恢复）
+  ├── context trace signal（工具选择 / 记忆 / 预算 / 时序）
+  ├── step checkpoint（每 5 turn）
+  ├── session memory extraction（fire-and-forget）
+  └── 持久化 workspace.yaml（turn 计数 / token 累计）
+
+END（session_end_governance.rs，15min debounce）:
+  ├── purge working memory（Memoria）
+  ├── store_episode（从 SessionFacts 构建确定性摘要）
+  ├── reflection（Memoria graph consolidation）
+  └── session_end → journal
+
+CLEANUP（session_reaper.rs，每 5min sweep）:
+  active → idle（30min 无活动）→ ended（2h 空闲）→ deleted（1 天后）
+```
+
+### 运行模式差异
+
+| 维度               | CLI                        | TUI 交互   | Web-Agent                            |
+| ------------------ | -------------------------- | ---------- | ------------------------------------ |
+| **Journal**        | 本地 JSONL                 | 本地 JSONL | 本地 + Cloud DB (`agent_events`)     |
+| **Workspace**      | 本地 YAML                  | 本地 YAML  | 本地 + Cloud artifact store          |
+| **Session Memory** | 本地 extraction + Memoria  | 同 CLI     | 同 CLI + cloud sync                  |
+| **Checkpoint**     | 本地                       | 本地       | 本地 + cloud step checkpoint         |
+| **Resume**         | `/resume`, `-c/-r`, "继续" | 同 CLI     | Cloud restore (`session_restore.rs`) |
+| **Audit**          | 无                         | 无         | `SessionAuditService`（DB 查询）     |
+| **成本统计**       | 无                         | 无         | `summarize_session_cost()`           |
+
+Web-Agent 额外闭环：`session_handlers.rs`（HTTP API）、`session_quota.rs`（配额控制）、`session_todo_handlers.rs`（待办事项）、`session_trace.rs`（上下文追踪 HTTP 接口）。
+
+### Resume（恢复）
+
+触发路径（统一入 shared restore helper）：
+
+1. `/resume <session_id>`
+2. `-c/-r` CLI flag
+3. 首条消息 = "继续" / "resume" / "continue" + pending_recovery 存在
+
+`HybridRestoreService` 9 步恢复 → `RestoredSession { history, plan, task, adaptive_state... }`。恢复注入包含 interruption guidance + session-memory backflow（Learnings + Errors & Corrections），首次 turn 消耗后清空。Stale server session：`/chat/turn(old_sid) → 404 → 清除 stale sid → 重试`。
+
+### Fork（分叉）
+
+`session_fork.rs::fork_local_session()`：验证 parent → 新 UUID → 复制 journal events（排除 session_start/end，插入 fork 标记）→ 复制 workspace（记录 parent_lineage）→ 复制 checkpoints（到 fork 点）。扩展：可从 MatrixOne data branch / snapshot fork，`CompositeSnapshot` 引用所有 state 维度。
+
+### 审计（Web-Agent 专属）
+
+`SessionAuditService`（`session_audit.rs`，DB-backed）：`get_summary()` / `list_turns()` / `get_turn_detail()` / `list_context_traces()` / `get_tool_analytics()` / `list_errors()` / `list_sessions()` / `get_cross_session_stats()` / `get_cross_session_tools()`。
+
+截断策略：TURN_LIST_PREVIEW=200, TURN_DETAIL_CHILD=65536, TOOL_LAST_ERROR=2048, ERROR_LIST_ENTRY=8192（字符）。
+
+### 事件流全景
+
+```
+JournalEvent:
+  session_start
+    → turn_start → turn_eval → turn_end（循环）
+    → session_memory_extraction（每 turn 后台触发）
+    → session_config_change
+    → session_pause / session_resume
+    → compaction
+    → session_fork
+    → runtime_promotion_verdict
+  session_end
+```
+
+双写：本地 `JournalWriter` → JSONL；云端 `IngestionSender` → `agent_events`（仅 Web-Agent）。
 
 ---
 
@@ -119,22 +218,22 @@ This document defines how astra-engine thinks about, stores, retrieves, and mana
 Before diving into architecture, it helps to think about memory the way humans
 experience it — and why each behavior is critical for agents.
 
-| Behavior | Human Analogy | Why Agents Need It | Our Mechanism | Industry |
-|----------|--------------|-------------------|---------------|----------|
-| **Short-term recall** | "What did you just say?" | Without it, agent forgets mid-conversation. Every turn is a cold start. | Sensory buffer (in-memory) + Working memory (`agent_scratchpad`) | All frameworks (context window) |
-| **Long-term memory** | "Last month you said you prefer Go" | Without it, agent can't build relationship or accumulate knowledge across sessions. | `memories` table (semantic/profile/procedural) with confidence decay | Letta: core/archival memory. Zep, Mem0: user memory store |
-| **Forgetting** | Outdated facts fade; you stop remembering old phone numbers | Without it, stale knowledge pollutes decisions. Agent confidently uses a deprecated API. | Confidence decay: `effective_confidence = initial × 0.5^(days/half_life)`. Below threshold → quarantine. | Letta: manual eviction. Most frameworks: ❌ no decay |
-| **Recall** | "What was that restaurant name?" — retrieval from partial cue | Agent must find relevant memories from vague queries, not just exact match. | Hybrid retrieval: vector similarity + fulltext keyword + temporal recency + confidence weighting | Letta: embedding search. Standard RAG: vector-only |
-| **Reflection** | "Looking back, those three incidents were all about the same bug" | Agent must synthesize patterns from individual experiences — not just store raw facts. | ✅ **Designed** — shared `ReflectionEngine` in `core/memory/reflection/`. Backend-agnostic: each backend provides candidates, engine does importance scoring → LLM synthesis → scene creation. See [graph-memory.md §4.3](graph-memory.md) for full design. | Generative Agents (Park et al.): reflection. Letta: ❌. Most: ❌ |
-| **Contradiction resolution** | "Wait, you said X before but now Y — which is it?" | Without it, agent holds conflicting beliefs simultaneously. | Observer: L2_DISTANCE finds similar existing memories; if content differs → atomic supersede (deactivate old + insert new) | Letta: overwrite block. Most: ❌ silent conflict |
-| **Memory tampering protection** | You can't secretly rewrite someone's memories | Agent memories must be auditable — no silent edits, no untracked deletions. | Immutable `source_event_ids` provenance. Supersede chain (never hard delete). PITR time-travel to verify any past state. `context_snapshot` records what agent saw. | Letta: git log. Most: ❌ no audit trail |
-| **Retrospection** | "If I had known then what I know now..." | Debug bad decisions by replaying with corrected memory. | Sandbox branch → modify memories → replay session → compare outcomes. Zero-copy via MO `data branch`. | Letta: git branch. Most: ❌ |
-| **Consolidation** | Sleeping on it — short-term → long-term overnight | Raw experiences must be distilled into durable knowledge, or memory grows unbounded. | Observer (per-turn extraction) → SessionSummarizer (periodic/close) → Governance (cleanup/quarantine) | EverMemOS: consolidation loop. Letta: ❌ manual. Most: ❌ |
-| **Selective attention** | You remember what matters, not every detail | Agent can't stuff everything into context window. Must select the most relevant subset. | TieredLoader: L0 profile (always) + L1 retrieval (query-relevant). PromptAssembler enforces token budget. | Letta: core vs archival split. MemGPT: page in/out |
+| Behavior                        | Human Analogy                                                     | Why Agents Need It                                                                       | Our Mechanism                                                                                                                                                                                                                                               | Industry                                                         |
+| ------------------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| **Short-term recall**           | "What did you just say?"                                          | Without it, agent forgets mid-conversation. Every turn is a cold start.                  | Sensory buffer (in-memory) + Working memory (`agent_scratchpad`)                                                                                                                                                                                            | All frameworks (context window)                                  |
+| **Long-term memory**            | "Last month you said you prefer Go"                               | Without it, agent can't build relationship or accumulate knowledge across sessions.      | `memories` table (semantic/profile/procedural) with confidence decay                                                                                                                                                                                        | Letta: core/archival memory. Zep, Mem0: user memory store        |
+| **Forgetting**                  | Outdated facts fade; you stop remembering old phone numbers       | Without it, stale knowledge pollutes decisions. Agent confidently uses a deprecated API. | Confidence decay: `effective_confidence = initial × 0.5^(days/half_life)`. Below threshold → quarantine.                                                                                                                                                    | Letta: manual eviction. Most frameworks: ❌ no decay             |
+| **Recall**                      | "What was that restaurant name?" — retrieval from partial cue     | Agent must find relevant memories from vague queries, not just exact match.              | Hybrid retrieval: vector similarity + fulltext keyword + temporal recency + confidence weighting                                                                                                                                                            | Letta: embedding search. Standard RAG: vector-only               |
+| **Reflection**                  | "Looking back, those three incidents were all about the same bug" | Agent must synthesize patterns from individual experiences — not just store raw facts.   | ✅ **Designed** — shared `ReflectionEngine` in `core/memory/reflection/`. Backend-agnostic: each backend provides candidates, engine does importance scoring → LLM synthesis → scene creation. See [graph-memory.md §4.3](graph-memory.md) for full design. | Generative Agents (Park et al.): reflection. Letta: ❌. Most: ❌ |
+| **Contradiction resolution**    | "Wait, you said X before but now Y — which is it?"                | Without it, agent holds conflicting beliefs simultaneously.                              | Observer: L2_DISTANCE finds similar existing memories; if content differs → atomic supersede (deactivate old + insert new)                                                                                                                                  | Letta: overwrite block. Most: ❌ silent conflict                 |
+| **Memory tampering protection** | You can't secretly rewrite someone's memories                     | Agent memories must be auditable — no silent edits, no untracked deletions.              | Immutable `source_event_ids` provenance. Supersede chain (never hard delete). PITR time-travel to verify any past state. `context_snapshot` records what agent saw.                                                                                         | Letta: git log. Most: ❌ no audit trail                          |
+| **Retrospection**               | "If I had known then what I know now..."                          | Debug bad decisions by replaying with corrected memory.                                  | Sandbox branch → modify memories → replay session → compare outcomes. Zero-copy via MO `data branch`.                                                                                                                                                       | Letta: git branch. Most: ❌                                      |
+| **Consolidation**               | Sleeping on it — short-term → long-term overnight                 | Raw experiences must be distilled into durable knowledge, or memory grows unbounded.     | Observer (per-turn extraction) → SessionSummarizer (periodic/close) → Governance (cleanup/quarantine)                                                                                                                                                       | EverMemOS: consolidation loop. Letta: ❌ manual. Most: ❌        |
+| **Selective attention**         | You remember what matters, not every detail                       | Agent can't stuff everything into context window. Must select the most relevant subset.  | TieredLoader: L0 profile (always) + L1 retrieval (query-relevant). PromptAssembler enforces token budget.                                                                                                                                                   | Letta: core vs archival split. MemGPT: page in/out               |
 
 **Key insight**: Most agent frameworks implement only 2-3 of these behaviors
 (short-term recall + long-term storage + basic recall). The gap between "has
-memory" and "has a memory *system*" is the difference between a chatbot that
+memory" and "has a memory _system_" is the difference between a chatbot that
 remembers your name and an agent that can detect its own knowledge is outdated,
 resolve contradictions, explain why it made a past decision, and improve over time.
 
@@ -185,15 +284,15 @@ Inspired by cognitive science and aligned with the latest industry research (Gen
 
 ### Layer → Storage Mapping
 
-| Layer | Table(s) | Retriever | Index | Lifecycle |
-|-------|----------|-----------|-------|-----------|
-| Sensory Buffer | (in-memory only) | — | — | Discarded after inference turn |
-| Working Memory | `agent_scratchpad` | Direct query by `session_id` | B-tree on `session_id`, `user_id` | Task/chain scoped; archived on completion |
-| Episodic | `conversation_events` + `event_embeddings` | HybridRetriever | IVF-flat vector + fulltext on `content` | Append-only; cross-session via session summaries |
-| Semantic | `memories` (type=semantic) + `sk_knowledge_entries` | MemoryRetriever | IVF-flat vector + fulltext on `content` | Confidence decay (query-time, per trust tier) |
-| Procedural | `memories` (type=procedural) | MemoryRetriever | Same as semantic | Versioned; permanent |
-| Profile | `memories` (type=profile) | MemoryRetriever (L0 cache via ProfileManager) | Same as semantic | Synthesized from semantic; cached |
-| Tool Result | `memories` (type=tool_result) | MemoryRetriever | Same as semantic | Session-scoped; 7-day decay |
+| Layer          | Table(s)                                            | Retriever                                     | Index                                   | Lifecycle                                        |
+| -------------- | --------------------------------------------------- | --------------------------------------------- | --------------------------------------- | ------------------------------------------------ |
+| Sensory Buffer | (in-memory only)                                    | —                                             | —                                       | Discarded after inference turn                   |
+| Working Memory | `agent_scratchpad`                                  | Direct query by `session_id`                  | B-tree on `session_id`, `user_id`       | Task/chain scoped; archived on completion        |
+| Episodic       | `conversation_events` + `event_embeddings`          | HybridRetriever                               | IVF-flat vector + fulltext on `content` | Append-only; cross-session via session summaries |
+| Semantic       | `memories` (type=semantic) + `sk_knowledge_entries` | MemoryRetriever                               | IVF-flat vector + fulltext on `content` | Confidence decay (query-time, per trust tier)    |
+| Procedural     | `memories` (type=procedural)                        | MemoryRetriever                               | Same as semantic                        | Versioned; permanent                             |
+| Profile        | `memories` (type=profile)                           | MemoryRetriever (L0 cache via ProfileManager) | Same as semantic                        | Synthesized from semantic; cached                |
+| Tool Result    | `memories` (type=tool_result)                       | MemoryRetriever                               | Same as semantic                        | Session-scoped; 7-day decay                      |
 
 > **Architecture Decision**: Episodic memory lives exclusively in
 > `conversation_events`, NOT in the `memories` table. The `memories` table stores
@@ -231,11 +330,11 @@ User (alice)
     └── (isolated from Session A's working state)
 ```
 
-| Dimension | Key Column | Isolation Rule |
-|-----------|-----------|----------------|
-| **User** | `user_id` (mandatory, every query) | Hard boundary. User A never sees User B's memories. No exceptions. |
-| **Session** | `session_id` (nullable) | Soft boundary. `session_id = NULL` means cross-session (profile, semantic, procedural). Session-scoped types (working, tool_result) are only visible within that session. Retriever's `include_cross_session` flag controls whether cross-session memories are included. |
-| **Agent** | (not stored) | No isolation. All agents serving the same user share the same memory pool. Intentional — see below. |
+| Dimension   | Key Column                         | Isolation Rule                                                                                                                                                                                                                                                           |
+| ----------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **User**    | `user_id` (mandatory, every query) | Hard boundary. User A never sees User B's memories. No exceptions.                                                                                                                                                                                                       |
+| **Session** | `session_id` (nullable)            | Soft boundary. `session_id = NULL` means cross-session (profile, semantic, procedural). Session-scoped types (working, tool_result) are only visible within that session. Retriever's `include_cross_session` flag controls whether cross-session memories are included. |
+| **Agent**   | (not stored)                       | No isolation. All agents serving the same user share the same memory pool. Intentional — see below.                                                                                                                                                                      |
 
 #### Why No Agent-Level Isolation
 
@@ -254,15 +353,16 @@ agent's Observer can supersede any memory for that user. There is no explicit
 
 #### Session Isolation Semantics
 
-| Memory Type | `session_id` | Visibility | Rationale |
-|-------------|-------------|------------|-----------|
-| profile | NULL | All sessions | User identity is global |
-| semantic | NULL | All sessions | Learned knowledge persists |
-| procedural | NULL | All sessions | Behavioral patterns persist |
-| working | Set | This session only | Active reasoning state is task-specific |
-| tool_result | Set | This session only | Raw tool outputs are ephemeral |
+| Memory Type | `session_id` | Visibility        | Rationale                               |
+| ----------- | ------------ | ----------------- | --------------------------------------- |
+| profile     | NULL         | All sessions      | User identity is global                 |
+| semantic    | NULL         | All sessions      | Learned knowledge persists              |
+| procedural  | NULL         | All sessions      | Behavioral patterns persist             |
+| working     | Set          | This session only | Active reasoning state is task-specific |
+| tool_result | Set          | This session only | Raw tool outputs are ephemeral          |
 
 The retriever enforces this via SQL:
+
 - `include_cross_session=True` (default): `WHERE (session_id = :sid OR session_id IS NULL)` — sees session-local + global
 - `include_cross_session=False`: `WHERE session_id = :sid` — sees only session-local
 
@@ -270,13 +370,13 @@ The retriever enforces this via SQL:
 
 Memory is a long-lived store — sensitive information requires explicit treatment:
 
-| Concern | Mechanism |
-|---------|-----------|
-| **PII in memories** | Sensitivity filter detects and redacts PII before persistence |
-| **Credential leakage** | Sensitivity filter discards credential-containing content; `tool_result` type has 7-day decay + session scope as defense-in-depth |
-| **Cross-session leakage** | Session-scoped types (working, tool_result) have `session_id` set; cross-session types (profile, semantic, procedural) have `session_id=NULL`. Retriever enforces via SQL. |
-| **Memory deletion (right to forget)** | `is_active = 0` soft-deletes exclude from retrieval. True erasure via PITR retention expiry (configurable) |
-| **Audit trail vs privacy** | `context_snapshot` stores memory_ids, not content. Content looked up at audit time (respects current `is_active` state) |
+| Concern                               | Mechanism                                                                                                                                                                  |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **PII in memories**                   | Sensitivity filter detects and redacts PII before persistence                                                                                                              |
+| **Credential leakage**                | Sensitivity filter discards credential-containing content; `tool_result` type has 7-day decay + session scope as defense-in-depth                                          |
+| **Cross-session leakage**             | Session-scoped types (working, tool_result) have `session_id` set; cross-session types (profile, semantic, procedural) have `session_id=NULL`. Retriever enforces via SQL. |
+| **Memory deletion (right to forget)** | `is_active = 0` soft-deletes exclude from retrieval. True erasure via PITR retention expiry (configurable)                                                                 |
+| **Audit trail vs privacy**            | `context_snapshot` stores memory_ids, not content. Content looked up at audit time (respects current `is_active` state)                                                    |
 
 #### Sensitivity Filter (Pre-Persist Hook)
 
@@ -327,15 +427,15 @@ Every piece of information follows a lifecycle:
 Perceive → Encode → Store → Consolidate → Retrieve → Update → Decay/Archive
 ```
 
-| Phase | What Happens | Mechanism |
-|-------|-------------|-----------|
-| **Perceive** | Raw input enters sensory buffer | HTTP request, tool result, stream chunk |
-| **Encode** | Extract structured information | Event creation with metadata, entity extraction |
-| **Store** | Persist to appropriate layer | MatrixOne (events, knowledge); embeddings async |
-| **Consolidate** | Promote, summarize, connect | Post-chain hooks: summarization, knowledge extraction, entity linking |
-| **Retrieve** | Find relevant memories for current task | Hybrid search: causal chain + semantic + temporal + entity overlap |
-| **Update** | Revise beliefs based on new evidence | Knowledge entry versioning, confidence decay |
-| **Decay/Archive** | Remove or compress stale information | Intelligent decay based on recency × relevance × utility |
+| Phase             | What Happens                            | Mechanism                                                             |
+| ----------------- | --------------------------------------- | --------------------------------------------------------------------- |
+| **Perceive**      | Raw input enters sensory buffer         | HTTP request, tool result, stream chunk                               |
+| **Encode**        | Extract structured information          | Event creation with metadata, entity extraction                       |
+| **Store**         | Persist to appropriate layer            | MatrixOne (events, knowledge); embeddings async                       |
+| **Consolidate**   | Promote, summarize, connect             | Post-chain hooks: summarization, knowledge extraction, entity linking |
+| **Retrieve**      | Find relevant memories for current task | Hybrid search: causal chain + semantic + temporal + entity overlap    |
+| **Update**        | Revise beliefs based on new evidence    | Knowledge entry versioning, confidence decay                          |
+| **Decay/Archive** | Remove or compress stale information    | Intelligent decay based on recency × relevance × utility              |
 
 ### Memory Lifecycle Governance
 
@@ -343,13 +443,13 @@ Decay, trust, and cleanup are not ad-hoc — they're a formal governance model w
 
 #### Retention Policy by Memory Type
 
-| Memory Type | Default TTL | Decay Behavior | Deletion | Status |
-|---|---|---|---|---|
-| **Sensory** (raw stream chunks) | 1 hour | Auto-purge after consolidation into events | Hard delete (no audit need) | 🔵 Design Target |
-| **Working** (active plan state) | Session lifetime | ✅ Archived by `run_hourly()` after 2h inactivity | Soft delete (queryable via time-travel) | ✅ Implemented |
-| **Semantic** (knowledge entries) | No TTL (explicit lifecycle) | ✅ Query-time confidence decay with per-tier half-life | ✅ Quarantine by `run_daily()` when effective_confidence < 0.3 | ✅ Implemented |
-| **Procedural** (skills, prompt templates) | No TTL (versioned) | Never auto-decay | Deprecate → version tombstone | ✅ Implemented |
-| **Tool Result** | 24 hours | ✅ TTL-based cleanup by `run_hourly()` | Hard delete | ✅ Implemented |
+| Memory Type                               | Default TTL                 | Decay Behavior                                         | Deletion                                                       | Status           |
+| ----------------------------------------- | --------------------------- | ------------------------------------------------------ | -------------------------------------------------------------- | ---------------- |
+| **Sensory** (raw stream chunks)           | 1 hour                      | Auto-purge after consolidation into events             | Hard delete (no audit need)                                    | 🔵 Design Target |
+| **Working** (active plan state)           | Session lifetime            | ✅ Archived by `run_hourly()` after 2h inactivity      | Soft delete (queryable via time-travel)                        | ✅ Implemented   |
+| **Semantic** (knowledge entries)          | No TTL (explicit lifecycle) | ✅ Query-time confidence decay with per-tier half-life | ✅ Quarantine by `run_daily()` when effective_confidence < 0.3 | ✅ Implemented   |
+| **Procedural** (skills, prompt templates) | No TTL (versioned)          | Never auto-decay                                       | Deprecate → version tombstone                                  | ✅ Implemented   |
+| **Tool Result**                           | 24 hours                    | ✅ TTL-based cleanup by `run_hourly()`                 | Hard delete                                                    | ✅ Implemented   |
 
 #### Automated Confidence Decay
 
@@ -371,6 +471,7 @@ This is stateless and idempotent.
 Retriever computes in SQL: `initial_confidence * EXP(-TIMESTAMPDIFF(DAY, observed_at, NOW()) / :half_life)`
 
 When effective confidence drops below retrieval threshold (default 0.3):
+
 - Entry excluded from retrieval results
 - Queued for revalidation (automated or human)
 - If revalidated: confidence reset to validated level, timer restarts
@@ -380,12 +481,12 @@ When effective confidence drops below retrieval threshold (default 0.3):
 
 Not all information sources are equally reliable. Trust tier determines initial confidence and decay rate:
 
-| Trust Tier | Sources | Initial Confidence | Half-Life | Verification |
-|---|---|---|---|---|
-| **T1: Verified** | Official docs, verified APIs, system-generated | 0.95 | 365 days | Auto-verified against source URL/API |
-| **T2: Curated** | Human-reviewed, team knowledge bases | 0.85 | 180 days | Periodic human review cycle |
-| **T3: Inferred** | Agent-extracted from conversations, LLM-generated summaries | 0.65 | 60 days | Cross-reference against T1/T2 sources |
-| **T4: Unverified** | Raw user input, unvalidated claims | 0.40 | 30 days | Must be promoted to T3+ or decays to quarantine |
+| Trust Tier         | Sources                                                     | Initial Confidence | Half-Life | Verification                                    |
+| ------------------ | ----------------------------------------------------------- | ------------------ | --------- | ----------------------------------------------- |
+| **T1: Verified**   | Official docs, verified APIs, system-generated              | 0.95               | 365 days  | Auto-verified against source URL/API            |
+| **T2: Curated**    | Human-reviewed, team knowledge bases                        | 0.85               | 180 days  | Periodic human review cycle                     |
+| **T3: Inferred**   | Agent-extracted from conversations, LLM-generated summaries | 0.65               | 60 days   | Cross-reference against T1/T2 sources           |
+| **T4: Unverified** | Raw user input, unvalidated claims                          | 0.40               | 30 days   | Must be promoted to T3+ or decays to quarantine |
 
 #### Governance Cycles
 
@@ -495,15 +596,15 @@ Cache-friendly layout — stable prefix maximizes prompt caching, dynamic suffix
 
 `ContextBudgetManager` allocates the available context window (model limit − output reserve) across 7 sources. Ratios vary by conversation stage:
 
-| Source | Query | Analysis | Generation | Planning |
-|--------|-------|----------|------------|----------|
-| System prompt | 10% | 8% | 10% | 10% |
-| History | 25% | 15% | 20% | **30%** |
-| Tool output | 25% | **35%** | 20% | 20% |
-| Memory L0 (profile) | 5% | 5% | 5% | 5% |
-| Memory L1 (retrieval) | 15% | 12% | 10% | 15% |
-| Code context | 10% | 15% | **25%** | 10% |
-| Documentation | 10% | 10% | 10% | 10% |
+| Source                | Query | Analysis | Generation | Planning |
+| --------------------- | ----- | -------- | ---------- | -------- |
+| System prompt         | 10%   | 8%       | 10%        | 10%      |
+| History               | 25%   | 15%      | 20%        | **30%**  |
+| Tool output           | 25%   | **35%**  | 20%        | 20%      |
+| Memory L0 (profile)   | 5%    | 5%       | 5%         | 5%       |
+| Memory L1 (retrieval) | 15%   | 12%      | 10%        | 15%      |
+| Code context          | 10%   | 15%      | **25%**    | 10%      |
+| Documentation         | 10%   | 10%      | 10%        | 10%      |
 
 Example: 128K context, 4K output reserve → 124K available. In `analysis` stage:
 system 10K, history 19K, tool output **43K**, memory 21K, code 19K, docs 12K.
@@ -570,12 +671,12 @@ When a user returns after hours/days:
 
 Summaries are generated at multiple points to handle both short and long sessions:
 
-| Trigger | Condition | Summary Type | Rationale |
-|---------|-----------|--------------|-----------|
-| **Session close** | `POST /sessions/{id}/close` | Full session summary | Natural boundary; user explicitly ends |
-| **Turn threshold** | Every N turns (default: 50) | Incremental summary | Long sessions (days without close) need periodic consolidation |
-| **Time threshold** | Every T hours (default: 2h) | Incremental summary | Backup for sessions with sparse but long-running activity |
-| **Context overflow** | History exceeds budget | Compaction summary | Emergency consolidation to free context space |
+| Trigger              | Condition                   | Summary Type         | Rationale                                                      |
+| -------------------- | --------------------------- | -------------------- | -------------------------------------------------------------- |
+| **Session close**    | `POST /sessions/{id}/close` | Full session summary | Natural boundary; user explicitly ends                         |
+| **Turn threshold**   | Every N turns (default: 50) | Incremental summary  | Long sessions (days without close) need periodic consolidation |
+| **Time threshold**   | Every T hours (default: 2h) | Incremental summary  | Backup for sessions with sparse but long-running activity      |
+| **Context overflow** | History exceeds budget      | Compaction summary   | Emergency consolidation to free context space                  |
 
 **Incremental vs Full summaries**:
 
@@ -589,6 +690,7 @@ Session with 200 turns over 8 hours:
 ```
 
 **Storage**:
+
 - Incremental: `type=semantic`, `subtype=session_incremental`, `session_id=current`
 - Full: `type=semantic`, `subtype=session_summary`, `session_id=NULL` (cross-session)
 
@@ -596,6 +698,7 @@ Incremental summaries are session-scoped (only visible within that session) unti
 the full summary is generated, which supersedes them and becomes cross-session.
 
 **Implementation**: `SessionSummarizer` is called by:
+
 1. `SessionManager.close_session()` — full summary
 2. `TurnHooks.post_turn()` — checks turn/time thresholds, generates incremental
 3. `ContextBudgetManager.on_overflow()` — emergency compaction summary
@@ -616,24 +719,24 @@ as a coherent system.
 
 ### Capability Comparison
 
-| Capability | Standard RAG | MemGPT/Letta | Us | Notes |
-|-----------|-------------|-------------|-----|-------|
-| Episodic memory | ❌ | ✅ | ✅ + causal chains + time-travel | |
-| Semantic memory | Flat chunks | Editable core blocks | Versioned knowledge entries with provenance | |
-| Procedural memory | ❌ | ❌ | ✅ Skill learnings, prompt evolution | |
-| Memory versioning | ❌ | ✅ Git-based context repos | ✅ MO-native: PITR, snapshot, zero-copy branch | Row-level vs file-level |
-| Memory rollback | ❌ | ✅ `git revert` | ✅ `restore from pitr` (row-level, sub-second) | |
-| Agent self-edit memory | ❌ | ✅ Agent commits to git repo | ✅ Observer auto-extracts + supersedes | Letta: explicit; Us: implicit + explicit |
-| Multi-agent shared memory | ❌ | ✅ Shared context repos | ✅ Per-user memory pool (all agents share by `user_id`) | Different model: Letta shares repos; we share by user |
-| Memory audit | ❌ | Git log (commit-level) | ✅ Every retrieval in context_snapshot + provenance | |
-| Memory experimentation | ❌ | Git branch (full copy) | ✅ Zero-copy branch → sandbox replay → merge | MO branch = no storage overhead |
-| Automated decay | ❌ | ❌ Manual eviction | ✅ Query-time `effective_confidence` | |
-| Automated consolidation | ❌ | ❌ Manual | ✅ Observer → SessionSummarizer → Governance pipeline | |
-| Contradiction detection | ❌ | Overwrite block | ✅ DB-side L2_DISTANCE → atomic supersede | |
-| Cross-session continuity | Vector search only | Archival search | Session summaries (auto-generated by SessionSummarizer) + knowledge entries | |
-| Vector + Fulltext + SQL | 3 separate systems | External vector DB | MO native (fulltext only in WHERE — 3-phase workaround) | |
-| Vector time-travel | ❌ | ❌ | ✅ Snapshot restores vector indexes too | |
-| Tool context integration | ❌ | ❌ | ✅ TOOL_RESULT type + rule-based summary + memory_read | |
+| Capability                | Standard RAG       | MemGPT/Letta                 | Us                                                                          | Notes                                                 |
+| ------------------------- | ------------------ | ---------------------------- | --------------------------------------------------------------------------- | ----------------------------------------------------- |
+| Episodic memory           | ❌                 | ✅                           | ✅ + causal chains + time-travel                                            |                                                       |
+| Semantic memory           | Flat chunks        | Editable core blocks         | Versioned knowledge entries with provenance                                 |                                                       |
+| Procedural memory         | ❌                 | ❌                           | ✅ Skill learnings, prompt evolution                                        |                                                       |
+| Memory versioning         | ❌                 | ✅ Git-based context repos   | ✅ MO-native: PITR, snapshot, zero-copy branch                              | Row-level vs file-level                               |
+| Memory rollback           | ❌                 | ✅ `git revert`              | ✅ `restore from pitr` (row-level, sub-second)                              |                                                       |
+| Agent self-edit memory    | ❌                 | ✅ Agent commits to git repo | ✅ Observer auto-extracts + supersedes                                      | Letta: explicit; Us: implicit + explicit              |
+| Multi-agent shared memory | ❌                 | ✅ Shared context repos      | ✅ Per-user memory pool (all agents share by `user_id`)                     | Different model: Letta shares repos; we share by user |
+| Memory audit              | ❌                 | Git log (commit-level)       | ✅ Every retrieval in context_snapshot + provenance                         |                                                       |
+| Memory experimentation    | ❌                 | Git branch (full copy)       | ✅ Zero-copy branch → sandbox replay → merge                                | MO branch = no storage overhead                       |
+| Automated decay           | ❌                 | ❌ Manual eviction           | ✅ Query-time `effective_confidence`                                        |                                                       |
+| Automated consolidation   | ❌                 | ❌ Manual                    | ✅ Observer → SessionSummarizer → Governance pipeline                       |                                                       |
+| Contradiction detection   | ❌                 | Overwrite block              | ✅ DB-side L2_DISTANCE → atomic supersede                                   |                                                       |
+| Cross-session continuity  | Vector search only | Archival search              | Session summaries (auto-generated by SessionSummarizer) + knowledge entries |                                                       |
+| Vector + Fulltext + SQL   | 3 separate systems | External vector DB           | MO native (fulltext only in WHERE — 3-phase workaround)                     |                                                       |
+| Vector time-travel        | ❌                 | ❌                           | ✅ Snapshot restores vector indexes too                                     |                                                       |
+| Tool context integration  | ❌                 | ❌                           | ✅ TOOL_RESULT type + rule-based summary + memory_read                      |                                                       |
 
 ### Letta Context Repositories: Respect and Differentiation
 
@@ -642,6 +745,7 @@ use git to actively manage their own memory — commit, branch, revert, share re
 across agents. This is a genuine innovation in agent self-management.
 
 **What Letta does well that we should acknowledge**:
+
 - Agents have an explicit mental model of "saving" their memory state
 - Git semantics are intuitive and well-understood
 - Shared repos give multi-agent memory sharing with familiar access control
@@ -649,28 +753,28 @@ across agents. This is a genuine innovation in agent self-management.
 
 **What we can do that Letta can do**:
 
-| Letta Capability | Our Equivalent |
-|-----------------|----------------|
-| Agent commits memory | Observer auto-extracts; agent can also explicitly write via memory API |
-| Agent branches memory | `data branch create table memories` — zero-copy |
-| Agent reverts memory | `restore from pitr` — any timestamp, row-level |
-| Shared memory repos | Per-user memory pool — all agents share automatically |
-| Git log for audit | `context_snapshot` + `source_event_ids` + supersede chain |
+| Letta Capability      | Our Equivalent                                                         |
+| --------------------- | ---------------------------------------------------------------------- |
+| Agent commits memory  | Observer auto-extracts; agent can also explicitly write via memory API |
+| Agent branches memory | `data branch create table memories` — zero-copy                        |
+| Agent reverts memory  | `restore from pitr` — any timestamp, row-level                         |
+| Shared memory repos   | Per-user memory pool — all agents share automatically                  |
+| Git log for audit     | `context_snapshot` + `source_event_ids` + supersede chain              |
 
 **What we can do that Letta cannot**:
 
-| Capability | Why Letta Can't | Our Mechanism |
-|-----------|----------------|---------------|
-| **Row-level rollback** | Git reverts entire files | MO PITR operates on individual rows |
-| **Transactional consistency** | Git commits are manual checkpoints | MO PITR respects MVCC — captures in-flight state |
-| **Zero-cost branching** | Git copies working tree | MO `data branch` is copy-on-write at storage layer |
-| **Vector index time-travel** | Git has no concept of vector indexes | MO snapshot restores IVF-flat atomically |
-| **Automated governance** | Agent must manually manage lifecycle | Observer + SessionSummarizer + Governance run automatically |
-| **Automated contradiction detection** | Agent must notice conflicts | DB-side L2_DISTANCE finds contradictions on every write |
-| **Query-time decay** | No decay model | `effective_confidence` computed in every retrieval |
-| **Retrieval audit** | Git log shows writes, not reads | `context_snapshot` records exactly what was retrieved and scored |
-| **Sandbox replay** | Can branch, but no replay infrastructure | Branch → modify → replay session → compare outcomes |
-| **Tool output management** | No tool context integration | TOOL_RESULT type + rule-based summary + memory_read |
+| Capability                            | Why Letta Can't                          | Our Mechanism                                                    |
+| ------------------------------------- | ---------------------------------------- | ---------------------------------------------------------------- |
+| **Row-level rollback**                | Git reverts entire files                 | MO PITR operates on individual rows                              |
+| **Transactional consistency**         | Git commits are manual checkpoints       | MO PITR respects MVCC — captures in-flight state                 |
+| **Zero-cost branching**               | Git copies working tree                  | MO `data branch` is copy-on-write at storage layer               |
+| **Vector index time-travel**          | Git has no concept of vector indexes     | MO snapshot restores IVF-flat atomically                         |
+| **Automated governance**              | Agent must manually manage lifecycle     | Observer + SessionSummarizer + Governance run automatically      |
+| **Automated contradiction detection** | Agent must notice conflicts              | DB-side L2_DISTANCE finds contradictions on every write          |
+| **Query-time decay**                  | No decay model                           | `effective_confidence` computed in every retrieval               |
+| **Retrieval audit**                   | Git log shows writes, not reads          | `context_snapshot` records exactly what was retrieved and scored |
+| **Sandbox replay**                    | Can branch, but no replay infrastructure | Branch → modify → replay session → compare outcomes              |
+| **Tool output management**            | No tool context integration              | TOOL_RESULT type + rule-based summary + memory_read              |
 
 **The fundamental difference**: Letta's model is **agent-driven** (agent decides
 when to save/load). Ours is **system-driven** (governance runs automatically) with
@@ -694,10 +798,10 @@ Because every memory retrieval is recorded in `context_snapshot`, we can answer:
 
 The memory module is **architecturally isolated** — it has only two external dependencies:
 
-| Dependency | Purpose | Files |
-|---|---|---|
-| `core.db_consumer` (DbFactory/DbConsumer) | Database access abstraction | 9 |
-| `api.models.memory` (MemoryRecord) | SQLAlchemy ORM model | 3 |
+| Dependency                                | Purpose                     | Files |
+| ----------------------------------------- | --------------------------- | ----- |
+| `core.db_consumer` (DbFactory/DbConsumer) | Database access abstraction | 9     |
+| `api.models.memory` (MemoryRecord)        | SQLAlchemy ORM model        | 3     |
 
 It does **not** depend on core.context, core.events, core.llm, core.agent, core.skills, or core.embedding. The dependency graph is strictly one-directional: other modules depend on memory, never the reverse.
 
@@ -793,13 +897,13 @@ Memory module has no knowledge of memory_mode, router, or prompt assembly. Inten
 
 ### Migration Plan
 
-| Step | Change | Risk |
-|---|---|---|
-| 1 | Add `core/memory/interfaces.py` with Protocol definitions | None — additive |
-| 2 | Add `MemoryService` facade implementing the Protocols | None — additive |
-| 3 | Move `TieredMemoryLoader` to `core/context/tiered_loader.py` | Medium — update imports |
-| 4 | Migrate consumers to use `MemoryService` instead of direct imports | Medium — incremental |
-| 5 | Mark internal classes as `_internal` or remove from `__init__.py` | Low — after step 4 |
+| Step | Change                                                             | Risk                    |
+| ---- | ------------------------------------------------------------------ | ----------------------- |
+| 1    | Add `core/memory/interfaces.py` with Protocol definitions          | None — additive         |
+| 2    | Add `MemoryService` facade implementing the Protocols              | None — additive         |
+| 3    | Move `TieredMemoryLoader` to `core/context/tiered_loader.py`       | Medium — update imports |
+| 4    | Migrate consumers to use `MemoryService` instead of direct imports | Medium — incremental    |
+| 5    | Mark internal classes as `_internal` or remove from `__init__.py`  | Low — after step 4      |
 
 Step 1-2 are prerequisites for intent-driven memory loading (Phase 2 in [intent-driven-loading.md](intent-driven-loading.md)).
 

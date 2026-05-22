@@ -1302,8 +1302,6 @@ pub(super) async fn handle_info_command(
             state.total_prompt_tokens += sr.prompt_tokens;
             state.total_completion_tokens += sr.completion_tokens;
             state.recent_tools = sr.tools_used.clone();
-            state.recent_memory_actions =
-                super::memory_extraction::extract_memory_actions(&sr.tool_call_records);
 
             // Write turn event to journal (same as normal chat turns).
             if let Some(journal) = state.journal.as_ref() {
@@ -1455,45 +1453,17 @@ pub(super) async fn handle_info_command(
             }
 
             // Memoria
-            let mem = astra_core::MemoriaSettings::from_env();
-            if mem.is_configured() {
-                let memoria_base = mem.base_url;
-                let memoria_health = format!("{}/health", memoria_base.trim_end_matches('/'));
-                match api.get_url(&memoria_health).await {
-                    Ok(r) if r.status().is_success() => {
-                        rows.push((true, "memoria", format!("reachable at {memoria_base}")));
-                    }
-                    Ok(r) => {
-                        rows.push((
-                            false,
-                            "memoria",
-                            format!("HTTP {} at {memoria_base}", r.status()),
-                        ));
-                    }
-                    Err(_) => {
-                        // When https fails, probe http to give an actionable hint
-                        let hint = if memoria_base.starts_with("https://") {
-                            let http_url = memoria_base.replacen("https://", "http://", 1);
-                            let http_health = format!("{}/health", http_url.trim_end_matches('/'));
-                            if api
-                                .get_url(&http_health)
-                                .await
-                                .is_ok_and(|r| r.status().is_success())
-                            {
-                                format!(
-                                    "reachable over http, not https — set MEMORIA_BASE_URL={http_url}"
-                                )
-                            } else {
-                                format!("unreachable ({memoria_base})")
-                            }
-                        } else {
-                            format!("unreachable ({memoria_base})")
-                        };
-                        rows.push((false, "memoria", hint));
-                    }
-                }
-            } else {
-                rows.push((false, "memoria", "MEMORIA_MASTER_KEY not set".to_string()));
+            let memoria_base = crate::command_router::resolve_api_url(None);
+            match crate::edge_tools::memoria::memoria_health().await {
+                Ok(_) => rows.push((
+                    true,
+                    "memoria",
+                    format!(
+                        "reachable via {}/memory/health",
+                        memoria_base.trim_end_matches('/')
+                    ),
+                )),
+                Err(e) => rows.push((false, "memoria", e)),
             }
 
             // Print table

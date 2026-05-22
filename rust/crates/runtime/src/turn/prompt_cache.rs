@@ -266,10 +266,13 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     };
 
     let provider_policy = provider_cache_policy_for(provider, model_id);
+    let provider_strategy =
+        ProviderCacheStrategy::from_provider_and_model(Some(provider), Some(model_id));
     let session_ctx = SessionContext {
         session_id: session_id.to_string(),
         run_id: String::new(),
         model_id: model_id.to_string(),
+        provider_name: provider.to_string(),
         // Resolve the true per-model context window via the shared
         // `budget_for_model` table. Previously hardcoded to 200_000, which
         // severely under-reported budget pressure on 32K/8K-window models
@@ -278,7 +281,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         model_limit: u32::try_from(crate::prompts::budget_for_model(Some(model_id)).model_limit)
             .unwrap_or(u32::MAX),
         provider_policy: provider_policy.clone(),
-        provider_strategy: ProviderCacheStrategy::default(),
+        provider_strategy,
         project_context: project_context.unwrap_or("").to_string(),
         edge_profile: EdgeProfile {
             cwd: edge_profile_cwd.map(String::from),
@@ -312,7 +315,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     // Ephemeral per-request session. Bridge doesn't persist a session across
     // turns — its compaction lives elsewhere — so a fresh session per call
     // is the right lifecycle. Stats/recovery/latches all start at default.
-    let session = PipelineSession::new(PipelineConfig {
+    let mut session = PipelineSession::new(PipelineConfig {
         provider_policy: provider_policy.clone(),
     });
     let input = AdaptiveTurnInput {

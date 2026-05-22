@@ -281,10 +281,7 @@ impl TraceEventWriter for DatabaseTraceEventWriter {
 #[async_trait]
 impl TurnHookDbWriter for DatabaseTurnHookDbWriter {
     async fn persist(&self, plan: TurnHookDbPersistPlan) -> Result<(), String> {
-        if plan.decision_audit.is_none()
-            && plan.skill_selection.is_none()
-            && plan.implicit_feedback.is_none()
-        {
+        if plan.decision_audit.is_none() && plan.skill_selection.is_none() {
             return Ok(());
         }
         let pool = self.get_pool()?;
@@ -319,11 +316,6 @@ impl TurnHookDbWriter for DatabaseTurnHookDbWriter {
                 .await
                 .map_err(|error| error.to_string())?;
             }
-        }
-        if let Some(implicit_feedback) = plan.implicit_feedback.as_ref() {
-            insert_turn_implicit_feedback(&mut tx, implicit_feedback)
-                .await
-                .map_err(|error| error.to_string())?;
         }
         tx.commit().await.map_err(|error| error.to_string())?;
         Ok(())
@@ -687,7 +679,6 @@ mod tests {
                     context_capture_id: None,
                 }),
                 skill_selection: None,
-                implicit_feedback: None,
                 reflection_lesson: None,
                 reflection_mark: None,
             })

@@ -33,6 +33,316 @@ async fn prune_stale_pending_recovery(
     }
 }
 
+#[derive(Debug)]
+struct CliSessionMemorySelectorResolver {
+    api: astra_thin_client::ThinClient,
+    profile: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl astra_runtime::session_memory::SelectorParamsResolver for CliSessionMemorySelectorResolver {
+    async fn resolve(&self) -> Option<astra_runtime::memory_relevance::LlmConnParams> {
+        #[derive(serde::Deserialize)]
+        struct MemoryModelWire {
+            model_name: String,
+        }
+
+        let token = session_runtime::fresh_access_token(&self.api, self.profile.as_deref()).await?;
+        let body = self
+            .api
+            .get_authed_path_text(&token, astra_thin_client::paths::model_memory())
+            .await
+            .ok()?;
+        let response = serde_json::from_str::<MemoryModelWire>(&body).ok()?;
+        Some(astra_runtime::memory_relevance::LlmConnParams {
+            base_url: format!("{}/v1", self.api.api_origin()),
+            api_key: token,
+            model_name: response.model_name,
+            provider: "openai".to_string(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CliSessionMemoryMemoriaClient {
+    api: astra_thin_client::ThinClient,
+    profile: Option<String>,
+    working_ids: std::sync::Mutex<std::collections::HashMap<String, String>>,
+}
+
+impl CliSessionMemoryMemoriaClient {
+    fn new(api: astra_thin_client::ThinClient, profile: Option<&str>) -> Self {
+        Self {
+            api,
+            profile: profile.map(str::to_string),
+            working_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    async fn fresh_token(&self) -> Result<String, String> {
+        session_runtime::fresh_access_token(&self.api, self.profile.as_deref())
+            .await
+            .ok_or_else(|| "no CLI access token available".to_string())
+    }
+
+    fn parse_memories(
+        body: &serde_json::Value,
+    ) -> Vec<astra_runtime::turn::cloud::memoria_compact::MemoriaMemory> {
+        body.get("memories")
+            .and_then(serde_json::Value::as_array)
+            .or_else(|| body.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| serde_json::from_value(entry.clone()).ok())
+            .collect()
+    }
+
+    fn track_working_id_from_memories(
+        &self,
+        session_id: &str,
+        memories: &[astra_runtime::turn::cloud::memoria_compact::MemoriaMemory],
+    ) {
+        if let Some(memory) = memories.iter().find(|memory| {
+            astra_runtime::session_memory::runner::decode_session_memory_entry(
+                &memory.content,
+                session_id,
+            )
+            .is_some()
+        }) {
+            if let Ok(mut guard) = self.working_ids.lock() {
+                guard.insert(session_id.to_string(), memory.memory_id.clone());
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl astra_runtime::turn::cloud::memoria_compact::MemoriaClient for CliSessionMemoryMemoriaClient {
+    async fn retrieve_ext(
+        &self,
+        query: &str,
+        session_id: Option<&str>,
+        top_k: usize,
+        filter_session: bool,
+    ) -> Result<Vec<astra_runtime::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+        let token = self.fresh_token().await?;
+        let mut body = serde_json::json!({
+            "query": query,
+            "top_k": top_k,
+        });
+        if let Some(session_id) = session_id {
+            body["session_id"] = serde_json::json!(session_id);
+            if filter_session {
+                body["session_scope"] = serde_json::json!("only");
+            }
+        }
+        let response = self
+            .api
+            .post_memory_retrieve_json(&token, &body)
+            .await
+            .map_err(|error| format!("memory retrieve failed: {error}"))?;
+        let status = response.status();
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| format!("memory retrieve parse failed: {error}"))?;
+        if !status.is_success() {
+            return Err(format!("memory retrieve HTTP {status}"));
+        }
+        let memories = Self::parse_memories(&payload);
+        if let Some(session_id) = session_id {
+            self.track_working_id_from_memories(session_id, &memories);
+        }
+        Ok(memories)
+    }
+
+    async fn store(
+        &self,
+        content: &str,
+        memory_type: &str,
+        session_id: Option<&str>,
+        trust_tier: Option<&str>,
+    ) -> Result<String, String> {
+        let token = self.fresh_token().await?;
+        if memory_type == "working"
+            && let Some(session_id) = session_id
+            && let Some(memory_id) = self
+                .working_ids
+                .lock()
+                .ok()
+                .and_then(|guard| guard.get(session_id).cloned())
+        {
+            let path = format!("/memory/{memory_id}/correct");
+            let body = serde_json::json!({
+                "new_content": content,
+                "reason": "session memory update",
+            });
+            if self
+                .api
+                .put_bearer_path_json_text(&token, &path, &body)
+                .await
+                .is_ok()
+            {
+                return Ok(memory_id);
+            }
+            if let Ok(mut guard) = self.working_ids.lock() {
+                guard.remove(session_id);
+            }
+        }
+
+        let mut body = serde_json::json!({
+            "content": content,
+            "memory_type": memory_type,
+        });
+        if let Some(session_id) = session_id {
+            body["session_id"] = serde_json::json!(session_id);
+        }
+        if let Some(trust_tier) = trust_tier {
+            body["trust_tier"] = serde_json::json!(trust_tier);
+        }
+        let response = self
+            .api
+            .post_memory_store_json(&token, &body)
+            .await
+            .map_err(|error| format!("memory store failed: {error}"))?;
+        let status = response.status();
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| format!("memory store parse failed: {error}"))?;
+        if !status.is_success() {
+            return Err(format!("memory store HTTP {status}"));
+        }
+        let memory_id = payload
+            .get("memory_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "memory store missing memory_id".to_string())?
+            .to_string();
+        if memory_type == "working"
+            && let Some(session_id) = session_id
+            && let Ok(mut guard) = self.working_ids.lock()
+        {
+            guard.insert(session_id.to_string(), memory_id.clone());
+        }
+        Ok(memory_id)
+    }
+
+    async fn purge_working(&self, session_id: &str) -> Result<u64, String> {
+        let Some(memory_id) = self
+            .working_ids
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(session_id).cloned())
+        else {
+            return Ok(0);
+        };
+
+        let token = self.fresh_token().await?;
+        let body = serde_json::json!({
+            "memory_ids": [memory_id],
+            "reason": "session memory purge",
+        });
+        let response = self
+            .api
+            .post_memory_purge_json(&token, &body)
+            .await
+            .map_err(|error| format!("memory purge failed: {error}"))?;
+        let status = response.status();
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| format!("memory purge parse failed: {error}"))?;
+        if !status.is_success() {
+            return Err(format!("memory purge HTTP {status}"));
+        }
+        if let Ok(mut guard) = self.working_ids.lock() {
+            guard.remove(session_id);
+        }
+        Ok(payload
+            .get("deleted_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0))
+    }
+}
+
+fn build_cli_session_memory_event_sink()
+-> std::sync::Arc<dyn Fn(&session_journal::JournalEvent) + Send + Sync> {
+    let writers = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+        String,
+        session_journal::JournalWriter,
+    >::new()));
+    std::sync::Arc::new(move |event: &session_journal::JournalEvent| {
+        let Some(session_id) = event.session_id.as_deref().filter(|sid| !sid.is_empty()) else {
+            return;
+        };
+        let mut guard = match writers.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!(
+                    session_id,
+                    event_type = ?event.event_type,
+                    "session-memory journal writer cache poisoned; recovering"
+                );
+                poisoned.into_inner()
+            }
+        };
+        let writer = match guard.entry(session_id.to_string()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let writer = match session_journal::JournalWriter::new(session_id) {
+                    Ok(writer) => writer,
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id,
+                            event_type = ?event.event_type,
+                            ?error,
+                            "failed to open local journal for session-memory event"
+                        );
+                        return;
+                    }
+                };
+                entry.insert(writer)
+            }
+        };
+        if let Err(error) = writer.append(event) {
+            tracing::warn!(
+                session_id,
+                event_type = ?event.event_type,
+                ?error,
+                "failed to append session-memory event to local journal"
+            );
+        }
+    })
+}
+
+async fn build_cli_session_memory_extractor(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+) -> Option<std::sync::Arc<astra_runtime::session_memory::MemoryExtractionService>> {
+    #[derive(serde::Deserialize)]
+    struct AuthMeWire {
+        user_id: String,
+    }
+
+    let token = session_runtime::fresh_access_token(api, profile).await?;
+    let me_body = api.get_auth_me_text(&token).await.ok()?;
+    let me = serde_json::from_str::<AuthMeWire>(&me_body).ok()?;
+    let selector = std::sync::Arc::new(CliSessionMemorySelectorResolver {
+        api: api.clone(),
+        profile: profile.map(str::to_string),
+    });
+    let memoria = std::sync::Arc::new(CliSessionMemoryMemoriaClient::new(api.clone(), profile))
+        as std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaClient>;
+    let ingestion = astra_services::event_ingestion::IngestionSender::disconnected();
+    let broker =
+        std::sync::Arc::new(astra_runtime::session_memory::BackgroundActivityBroker::new());
+    let service = astra_runtime::session_memory::MemoryExtractionService::new(
+        selector, memoria, ingestion, me.user_id, broker,
+    )
+    .with_local_event_sink(build_cli_session_memory_event_sink());
+    Some(std::sync::Arc::new(service))
+}
+
 pub(crate) async fn complete_session_startup(
     state: &mut SessionState,
     tracer: &mut StartupTracer,
@@ -182,7 +492,7 @@ pub(crate) async fn complete_session_startup(
         state.synced_tool_health_entries = cross_session_health_entries;
     }
 
-    state.session_memory_extractor = None;
+    state.session_memory_extractor = build_cli_session_memory_extractor(api, profile).await;
     state.team_store = std::sync::Arc::new(crate::http_team_store::HttpTeamStore::new(
         api.api_origin(),
         profile,
@@ -428,5 +738,51 @@ mod tests {
         prune_stale_pending_recovery(&api, None, &mut state).await;
 
         assert_eq!(state.pending_recovery.as_deref(), Some(session_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn build_cli_session_memory_extractor_initializes_when_authenticated() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        write_profile_with_token("sess-memory");
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/auth/me"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user_id": "user-123"
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let svc = build_cli_session_memory_extractor(&api, None).await;
+        assert!(
+            svc.is_some(),
+            "authenticated CLI should build session memory extractor"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_cli_session_memory_extractor_skips_when_auth_me_fails() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        write_profile_with_token("sess-memory");
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/auth/me"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "detail": "unauthorized"
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let svc = build_cli_session_memory_extractor(&api, None).await;
+        assert!(
+            svc.is_none(),
+            "missing auth identity should disable session memory extractor"
+        );
     }
 }

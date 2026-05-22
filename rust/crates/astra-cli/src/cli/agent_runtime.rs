@@ -38,6 +38,7 @@ pub(crate) async fn build_one_shot_spawner(
     perm_mode: super::permission_manager::PermissionMode,
     skill_search: astra_core::SkillSearchSettings,
     session_id: Option<String>,
+    default_model: Option<String>,
 ) -> std::sync::Arc<astra_runtime::orchestration::DynamicAgentSpawner> {
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let skill_resolver = build_turn_skill_resolver(unified_skill_registry).await;
@@ -54,6 +55,7 @@ pub(crate) async fn build_one_shot_spawner(
 
     let mut spawn_executor =
         spawn_subrun::CliSpawnAgentExecutor::new(api.clone(), token, project_root, perm_mode, None)
+            .with_default_model(default_model)
             .with_skill_resolver(skill_resolver)
             .with_skill_search(skill_search);
     // One-shot `chat -m` uses the captured token only — no profile to
@@ -198,6 +200,7 @@ pub(crate) async fn initialize_multi_agent_runtime(
         state.perm_manager.mode(),
         None,
     )
+    .with_default_model(state.model.clone())
     .with_skill_resolver(skill_resolver)
     .with_skill_search(state.skill_search.clone())
     .with_bg_task_commands(state.bg_task_commands.clone());

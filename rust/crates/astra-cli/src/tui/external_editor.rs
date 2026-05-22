@@ -76,10 +76,7 @@ fn edit_in_external_editor_with_command(
         })?;
     let file = tempfile::NamedTempFile::new().map_err(|e| format!("create temp draft: {e}"))?;
     std::fs::write(file.path(), initial).map_err(|e| format!("write temp draft: {e}"))?;
-    let status = Command::new("sh")
-        .arg("-lc")
-        .arg(format!(r#"{editor} "$ASTRA_EDITOR_TARGET""#))
-        .env("ASTRA_EDITOR_TARGET", file.path())
+    let status = build_editor_process(&editor, file.path())?
         .status()
         .map_err(|e| format!("launch external editor: {e}"))?;
     if !status.success() {
@@ -92,6 +89,92 @@ fn edit_in_external_editor_with_command(
         ));
     }
     std::fs::read_to_string(file.path()).map_err(|e| format!("read edited draft: {e}"))
+}
+
+fn build_editor_process(editor: &str, target: &std::path::Path) -> Result<Command, String> {
+    if requires_shell_evaluation(editor) {
+        let mut command = Command::new("sh");
+        command
+            .arg("-lc")
+            .arg(r#"editor_cmd=$1; target=$2; eval "$editor_cmd \"\$target\"""#)
+            .arg("astra-editor")
+            .arg(editor)
+            .arg(target)
+            .env("ASTRA_EDITOR_TARGET", target);
+        return Ok(command);
+    }
+
+    let tokens =
+        shell_words::split(editor).map_err(|e| format!("parse external editor command: {e}"))?;
+    if tokens.is_empty() {
+        return Err("external editor command is empty".to_string());
+    }
+
+    let mut command_index = 0usize;
+    while command_index < tokens.len() && looks_like_env_assignment(&tokens[command_index]) {
+        command_index += 1;
+    }
+    if command_index == tokens.len() {
+        return Err("external editor command must include a program".to_string());
+    }
+
+    let mut command = Command::new(&tokens[command_index]);
+    command.args(&tokens[command_index + 1..]);
+    for assignment in &tokens[..command_index] {
+        let (key, value) = assignment
+            .split_once('=')
+            .expect("env assignment already validated");
+        command.env(key, value);
+    }
+    command.env("ASTRA_EDITOR_TARGET", target).arg(target);
+    Ok(command)
+}
+
+fn looks_like_env_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn requires_shell_evaluation(command: &str) -> bool {
+    let mut escaped = false;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    for ch in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if !in_single => {
+                escaped = true;
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+            }
+            '$' | '`' if !in_single => {
+                return true;
+            }
+            '&' | '|' | ';' | '<' | '>' | '(' | ')' if !in_single && !in_double => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -122,6 +205,32 @@ mod tests {
     }
 
     #[test]
+    fn external_editor_supports_quoted_paths_and_env_prefixes() {
+        let dir = tempfile::Builder::new()
+            .prefix("external editor ")
+            .tempdir()
+            .unwrap();
+        let script = dir.path().join("editor script.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n[ \"$EDITOR_MODE\" = \"test\" ] || exit 9\nprintf 'edited with args\\n' > \"$1\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let edited = edit_in_external_editor_with_command(
+            "before",
+            Some(&format!("EDITOR_MODE=test sh '{}'", script.display())),
+        )
+        .unwrap();
+        assert_eq!(edited, "edited with args\n");
+    }
+
+    #[test]
     fn first_available_editor_picks_first_present_candidate() {
         let picked = first_available_editor(&["nvim", "vim", "nano"], |binary| binary == "vim");
         assert_eq!(picked.as_deref(), Some("vim"));
@@ -131,5 +240,21 @@ mod tests {
     fn first_available_editor_returns_none_when_no_candidate_exists() {
         let picked = first_available_editor(&["nvim", "vim"], |_| false);
         assert!(picked.is_none());
+    }
+
+    #[test]
+    fn simple_editor_commands_do_not_require_shell() {
+        assert!(!requires_shell_evaluation("sh /tmp/editor.sh"));
+        assert!(!requires_shell_evaluation(
+            "EDITOR_MODE=test sh '/tmp/editor script.sh'"
+        ));
+    }
+
+    #[test]
+    fn compound_editor_commands_require_shell() {
+        assert!(requires_shell_evaluation(
+            "EDITOR_MODE=test sh editor.sh && echo done"
+        ));
+        assert!(requires_shell_evaluation("sh -lc \"nvim \\\"$1\\\"\""));
     }
 }

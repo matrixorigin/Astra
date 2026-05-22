@@ -20,6 +20,12 @@ const SECTION_DISPLAY_NAMES: &[(&str, &str)] = &[
     ("L2 Contextual", "📋 Context (L2)"),
 ];
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionMemoryRecord {
+    memory_id: String,
+    body: String,
+}
+
 fn parse_memory_forget_args(input: &str) -> Result<(String, String), String> {
     let mut parts = input.splitn(2, "--reason");
     let memory_id = parts.next().unwrap_or("").trim().to_string();
@@ -183,24 +189,12 @@ pub(super) async fn handle_memory_domain_command(
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("?");
                                         let preview: String = content.chars().take(60).collect();
-                                        // Send "irrelevant" feedback to lower retrieval score
-                                        let mem = astra_core::MemoriaSettings::from_env();
-                                        let fb_url =
-                                            format!("{}/v1/memories/{mid}/feedback", mem.base_url);
-                                        if let (Ok(client), Some(token)) = (
-                                            reqwest::Client::builder()
-                                                .timeout(std::time::Duration::from_secs(3))
-                                                .no_proxy()
-                                                .build(),
-                                            mem.bearer_token(),
-                                        ) {
-                                            let _ = client
-                                                .post(&fb_url)
-                                                .header("Authorization", token)
-                                                .json(&serde_json::json!({"signal": "irrelevant", "context": "user /memory dismiss"}))
-                                                .send()
-                                                .await;
-                                        }
+                                        let _ = super::edge_tools::memoria::memoria_feedback(
+                                            mid,
+                                            "irrelevant",
+                                            Some("user /memory dismiss"),
+                                        )
+                                        .await;
                                         eprintln!("  {} dismissed: {preview}", theme::icon_err());
                                         dismissed += 1;
                                     }
@@ -220,43 +214,9 @@ pub(super) async fn handle_memory_domain_command(
                 // ─── Inspect one memory by id ──────────────────────
                 "show" if !sub_arg.is_empty() => {
                     let memory_id = sub_arg.trim();
-                    let mem = astra_core::MemoriaSettings::from_env();
-                    let Some(bearer) = mem.bearer_token() else {
-                        eprintln!(
-                            "  {}",
-                            "Memoria not configured (MEMORIA_MASTER_KEY missing).".red()
-                        );
-                        return Ok(());
-                    };
-                    match reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(5))
-                        .no_proxy()
-                        .build()
-                    {
-                        Ok(client) => {
-                            let url = format!("{}/v1/memories/{memory_id}", mem.base_url);
-                            match client
-                                .get(&url)
-                                .header("Authorization", bearer)
-                                .send()
-                                .await
-                            {
-                                Ok(r) if r.status().is_success() => {
-                                    let body = r.text().await.unwrap_or_default();
-                                    print_json_or_raw(&body);
-                                }
-                                Ok(r) => eprintln!(
-                                    "{}",
-                                    format!("  ✗ Not found ({}): {memory_id}", r.status()).red()
-                                ),
-                                Err(e) => {
-                                    eprintln!("{}", format!("  ✗ Memoria unreachable: {e}").red())
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("{}", format!("  ✗ Client build failed: {e}").red())
-                        }
+                    match super::edge_tools::memoria::memoria_show(memory_id).await {
+                        Ok(body) => print_json_or_raw(&body),
+                        Err(e) => eprintln!("{}", format!("  ✗ Show failed: {e}").red()),
                     }
                 }
                 // ─── Hard-delete one memory by id ──────────────────
@@ -269,50 +229,17 @@ pub(super) async fn handle_memory_domain_command(
                             return Ok(());
                         }
                     };
-                    let mem = astra_core::MemoriaSettings::from_env();
-                    let Some(bearer) = mem.bearer_token() else {
-                        eprintln!(
-                            "  {}",
-                            "Memoria not configured (MEMORIA_MASTER_KEY missing).".red()
-                        );
-                        return Ok(());
-                    };
-                    // v1 /v1/memories/purge with memory_ids=[id], reason.
-                    let url = format!("{}/v1/memories/purge", mem.base_url);
                     let body =
                         serde_json::json!({"memory_ids": [memory_id.clone()], "reason": reason});
-                    match reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(5))
-                        .no_proxy()
-                        .build()
-                    {
-                        Ok(client) => {
-                            match client
-                                .post(&url)
-                                .header("Authorization", bearer)
-                                .json(&body)
-                                .send()
-                                .await
-                            {
-                                Ok(r) if r.status().is_success() => {
-                                    eprintln!(
-                                        "  {} Forgot memory {}",
-                                        theme::icon_ok(),
-                                        memory_id.magenta()
-                                    );
-                                }
-                                Ok(r) => eprintln!(
-                                    "{}",
-                                    format!("  ✗ Purge failed ({}): {memory_id}", r.status()).red()
-                                ),
-                                Err(e) => {
-                                    eprintln!("{}", format!("  ✗ Memoria unreachable: {e}").red())
-                                }
-                            }
+                    match super::edge_tools::memoria::memoria_purge(&body).await {
+                        Ok(_) => {
+                            eprintln!(
+                                "  {} Forgot memory {}",
+                                theme::icon_ok(),
+                                memory_id.magenta()
+                            );
                         }
-                        Err(e) => {
-                            eprintln!("{}", format!("  ✗ Client build failed: {e}").red())
-                        }
+                        Err(e) => eprintln!("{}", format!("  ✗ Purge failed: {e}").red()),
                     }
                 }
                 // ─── Cloud: Snapshots ──────────────────────────────
@@ -417,29 +344,16 @@ pub(super) async fn handle_memory_domain_command(
                 },
                 // ─── Current session memory ───────────────────────
                 "session" => {
-                    let payload = serde_json::json!({});
-                    match api.post_memory_retrieve_json(tok, &payload).await {
-                        Ok(r) if r.status().is_success() => {
-                            let text = r.text().await.unwrap_or_default();
-                            // Response may be JSON {"content":"..."} or plain markdown
-                            let body =
-                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-                                    val.get("content")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or(&text)
-                                        .to_string()
-                                } else {
-                                    text
-                                };
+                    let Some(session_id) = state.session_id.as_deref() else {
+                        eprintln!("  {}", "No active session yet.".yellow());
+                        return Ok(());
+                    };
+                    match load_current_session_memory(api, tok, session_id).await {
+                        Ok(record) => {
+                            let body = record.map(|memory| memory.body).unwrap_or_default();
                             eprintln!("{}", format_session_memory_display(&body));
                         }
-                        Ok(r) => eprintln!(
-                            "{}",
-                            format!("  ✗ Memory retrieve failed ({})", r.status()).red()
-                        ),
-                        Err(e) => {
-                            eprintln!("{}", format!("  ✗ Memoria unreachable: {e}").red())
-                        }
+                        Err(e) => eprintln!("{}", format!("  ✗ Session memory failed: {e}").red()),
                     }
                 }
                 // ─── Edit a session memory section ───────────────
@@ -450,28 +364,22 @@ pub(super) async fn handle_memory_domain_command(
                         return Ok(());
                     }
                     let section = sub_arg;
-                    // 1. Retrieve current session memory
-                    let current_body = match api
-                        .post_memory_retrieve_json(tok, &serde_json::json!({}))
-                        .await
-                    {
-                        Ok(r) if r.status().is_success() => {
-                            let text = r.text().await.unwrap_or_default();
-                            decode_memory_body(&text)
-                        }
-                        Ok(r) => {
-                            eprintln!(
-                                "  {} Memory retrieve failed ({})",
-                                theme::icon_err(),
-                                r.status()
-                            );
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            eprintln!("  {} Memoria unreachable: {e}", theme::icon_err());
-                            return Ok(());
-                        }
+                    let Some(session_id) = state.session_id.as_deref() else {
+                        eprintln!("  {}", "No active session yet.".yellow());
+                        return Ok(());
                     };
+                    // 1. Retrieve current session memory
+                    let current_record =
+                        match load_current_session_memory(api, tok, session_id).await {
+                            Ok(record) => record,
+                            Err(e) => {
+                                eprintln!("  {} {e}", theme::icon_err());
+                                return Ok(());
+                            }
+                        };
+                    let (current_memory_id, current_body) = current_record
+                        .map(|record| (Some(record.memory_id), record.body))
+                        .unwrap_or((None, String::new()));
                     // 2. Open $EDITOR with current section content
                     let current_section =
                         extract_md_section(&current_body, section).unwrap_or_default();
@@ -523,15 +431,19 @@ pub(super) async fn handle_memory_domain_command(
                         return Ok(());
                     }
                     let updated = replace_md_section(&current_body, section, &new_content);
-                    match api
-                        .post_memory_store_json(tok, &serde_json::json!({ "content": updated }))
-                        .await
+                    match store_current_session_memory(
+                        api,
+                        tok,
+                        session_id,
+                        current_memory_id.as_deref(),
+                        &updated,
+                    )
+                    .await
                     {
-                        Ok(r) if r.status().is_success() => {
+                        Ok(()) => {
                             eprintln!("  {} Section {section:?} updated.", theme::icon_ok())
                         }
-                        Ok(r) => eprintln!("  {} Store failed ({})", theme::icon_err(), r.status()),
-                        Err(e) => eprintln!("  {} Memoria unreachable: {e}", theme::icon_err()),
+                        Err(e) => eprintln!("  {} {e}", theme::icon_err()),
                     }
                 }
 
@@ -626,6 +538,110 @@ pub(crate) fn format_session_memory_display(body: &str) -> String {
     out
 }
 
+fn select_session_memory_record(
+    payload: &serde_json::Value,
+    session_id: &str,
+) -> Option<SessionMemoryRecord> {
+    payload
+        .get("memories")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| payload.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            serde_json::from_value::<astra_runtime::turn::cloud::memoria_compact::MemoriaMemory>(
+                entry.clone(),
+            )
+            .ok()
+        })
+        .find_map(|memory| {
+            astra_runtime::session_memory::runner::decode_session_memory_entry(
+                &memory.content,
+                session_id,
+            )
+            .map(|body| SessionMemoryRecord {
+                memory_id: memory.memory_id,
+                body,
+            })
+        })
+}
+
+async fn load_current_session_memory(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    session_id: &str,
+) -> Result<Option<SessionMemoryRecord>, String> {
+    let payload = serde_json::json!({
+        "query": astra_runtime::session_memory::runner::SESSION_MEMORY_PREFIX,
+        "top_k": 8,
+        "session_id": session_id,
+        "session_scope": "only",
+    });
+    let response = api
+        .post_memory_retrieve_json(token, &payload)
+        .await
+        .map_err(|error| format!("memory retrieve failed: {error}"))?;
+    let status = response.status();
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("memory retrieve parse failed: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("memory retrieve failed ({status})"));
+    }
+    Ok(select_session_memory_record(&payload, session_id))
+}
+
+pub(super) async fn load_current_session_memory_body_with_profile(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    session_id: &str,
+) -> Option<String> {
+    let token = session_runtime::fresh_access_token(api, profile).await?;
+    load_current_session_memory(api, &token, session_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|record| record.body)
+}
+
+async fn store_current_session_memory(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    session_id: &str,
+    memory_id: Option<&str>,
+    body: &str,
+) -> Result<(), String> {
+    let encoded =
+        astra_runtime::session_memory::runner::encode_session_memory_entry(session_id, body);
+    if let Some(memory_id) = memory_id {
+        let path = format!("/memory/{memory_id}/correct");
+        let payload = serde_json::json!({
+            "new_content": encoded,
+            "reason": "manual /memory edit",
+        });
+        api.put_bearer_path_json_text(token, &path, &payload)
+            .await
+            .map_err(|error| format!("memory update failed: {error}"))?;
+        return Ok(());
+    }
+
+    let payload = serde_json::json!({
+        "content": encoded,
+        "memory_type": "working",
+        "session_id": session_id,
+    });
+    let response = api
+        .post_memory_store_json(token, &payload)
+        .await
+        .map_err(|error| format!("memory store failed: {error}"))?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("memory store failed ({})", response.status()))
+    }
+}
+
 /// Extract a `## SectionName` block from a markdown string.
 /// Returns content between the header and the next `##` header (exclusive).
 fn extract_md_section(md: &str, section_name: &str) -> Option<String> {
@@ -653,17 +669,6 @@ pub(crate) fn replace_md_section(md: &str, section_name: &str, new_content: &str
             "\n"
         };
         format!("{}{}## {section_name}\n{}", md, sep, normalized)
-    }
-}
-
-fn decode_memory_body(text: &str) -> String {
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
-        val.get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or(text)
-            .to_string()
-    } else {
-        text.to_string()
     }
 }
 
@@ -787,6 +792,32 @@ mod tests {
             !result.contains("📋 Context (L2)"),
             "spurious L2 block, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn select_session_memory_record_decodes_protocol_entry() {
+        let payload = serde_json::json!({
+            "memories": [
+                {
+                    "memory_id": "mem-1",
+                    "content": astra_runtime::session_memory::runner::encode_session_memory_entry(
+                        "sess-1",
+                        "## Active Goals\n- Fix memory\n"
+                    ),
+                    "memory_type": "working",
+                    "session_id": "sess-1"
+                },
+                {
+                    "memory_id": "mem-2",
+                    "content": "unrelated",
+                    "memory_type": "working",
+                    "session_id": "sess-1"
+                }
+            ]
+        });
+        let record = select_session_memory_record(&payload, "sess-1").expect("session memory");
+        assert_eq!(record.memory_id, "mem-1");
+        assert!(record.body.contains("Fix memory"));
     }
 
     // ── /memory subcommand contracts ──

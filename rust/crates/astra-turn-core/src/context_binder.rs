@@ -424,6 +424,7 @@ mod tests {
                 session_id: "test-session".into(),
                 run_id: "test-run".into(),
                 model_id: "test-model".into(),
+                provider_name: "anthropic".into(),
                 model_limit: 100_000,
                 provider_policy: ProviderCachePolicy::default(),
                 provider_strategy: ProviderCacheStrategy::default(),

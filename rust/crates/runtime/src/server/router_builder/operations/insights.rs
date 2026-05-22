@@ -55,10 +55,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(evaluation::training_data_export_handler),
         )
         .route(
-            "/introspection/memory",
-            get(introspection::get_memory_introspection_handler),
-        )
-        .route(
             "/introspection/decision-trace",
             get(introspection::get_decision_trace_handler),
         )
@@ -85,10 +81,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/introspection/context/retrieval_quality",
             get(introspection::get_retrieval_quality_handler),
-        )
-        .route(
-            "/introspection/memory/recall",
-            get(introspection::get_memory_recall_handler),
         )
         .route(
             "/platform/snapshot",

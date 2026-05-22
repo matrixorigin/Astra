@@ -189,6 +189,7 @@ mod tests {
             session_id: "s1".into(),
             run_id: "r1".into(),
             model_id: "m1".into(),
+            provider_name: "anthropic".into(),
             model_limit: 100_000,
             provider_policy: ProviderCachePolicy::default(),
             provider_strategy: ProviderCacheStrategy::default(),

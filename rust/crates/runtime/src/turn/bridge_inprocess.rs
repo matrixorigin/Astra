@@ -38,6 +38,7 @@ use std::{
 };
 
 use astra_core::SharedPool;
+use astra_services::SessionArtifactStore;
 use astra_services::session_journal::{
     JournalWriter, LlmRoundRecord, ToolCallRecord, TurnEventBuffer,
 };
@@ -222,6 +223,187 @@ fn count_inprocess_persisted_events(
         } else {
             0
         }
+}
+
+#[derive(Debug, Default)]
+struct BridgePipelineBaseline {
+    next_turn: u32,
+    stats: astra_turn_core::pipeline_stats::PipelineStats,
+    cache_detector: astra_turn_core::cache_diagnostics::CacheBreakDetector,
+}
+
+const BRIDGE_CACHE_SOURCE: &str = "bridge_inprocess";
+
+fn event_source(event: &astra_services::session_journal::JournalEvent) -> Option<&str> {
+    event.metadata.as_ref()?.get("source")?.as_str()
+}
+
+fn event_matches_bridge_cache_source(
+    event: &astra_services::session_journal::JournalEvent,
+) -> bool {
+    event_source(event).is_none_or(|source| source == BRIDGE_CACHE_SOURCE)
+}
+
+fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
+    if session_id.is_empty() {
+        return BridgePipelineBaseline {
+            next_turn: 1,
+            ..Default::default()
+        };
+    }
+    let mut cache_detector = astra_turn_core::cache_diagnostics::CacheBreakDetector::new();
+    if let Ok(session_dir) = astra_services::local_session_artifact_store().session_dir(session_id)
+    {
+        cache_detector.set_diff_dir(session_dir.join("prompt-cache-diffs"));
+    }
+    let Ok(events) = astra_services::session_journal::read_journal_tail(session_id, 500) else {
+        return BridgePipelineBaseline {
+            next_turn: 1,
+            cache_detector,
+            ..Default::default()
+        };
+    };
+
+    let mut feedback_ratios = Vec::new();
+    let mut raw_ratios = Vec::new();
+    let mut response_count = 0u32;
+    let mut max_turn = 0u32;
+    let mut pending_request_snapshot = None;
+
+    for event in events {
+        max_turn = max_turn.max(event.turn.unwrap_or(0));
+        match event.event_type {
+            astra_services::session_journal::JournalEventType::PipelineFeedback => {
+                if let Some(ratio) = event
+                    .metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get("cache_hit_ratio"))
+                    .and_then(Value::as_f64)
+                {
+                    feedback_ratios.push(ratio);
+                }
+            }
+            astra_services::session_journal::JournalEventType::LlmRequestFull
+                if event_matches_bridge_cache_source(&event) =>
+            {
+                pending_request_snapshot = bridge_prompt_snapshot_from_journal_event(&event);
+            }
+            astra_services::session_journal::JournalEventType::LlmResponseFull => {
+                if !event_matches_bridge_cache_source(&event) {
+                    continue;
+                }
+                response_count = response_count.saturating_add(1);
+                let usage = bridge_usage_from_response_event(&event);
+                if let Some(usage) = usage.as_ref() {
+                    let total_input = usage
+                        .input_tokens
+                        .saturating_add(usage.cached_input_tokens)
+                        .saturating_add(usage.cache_creation_tokens);
+                    if total_input > 0 {
+                        raw_ratios.push(usage.cached_input_tokens as f64 / total_input as f64);
+                    }
+                }
+                if let Some(snapshot) = pending_request_snapshot.take() {
+                    let _ = cache_detector.record_turn_for_source(
+                        BRIDGE_CACHE_SOURCE,
+                        snapshot,
+                        usage.as_ref().map(|u| u.cached_input_tokens),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let ratios = if feedback_ratios.is_empty() {
+        raw_ratios
+    } else {
+        feedback_ratios
+    };
+    let avg_cache_hit_ratio = if ratios.is_empty() {
+        0.0
+    } else {
+        ratios.iter().sum::<f64>() / ratios.len() as f64
+    };
+
+    BridgePipelineBaseline {
+        next_turn: max_turn.max(response_count).saturating_add(1),
+        stats: astra_turn_core::pipeline_stats::PipelineStats {
+            turns_executed: ratios.len() as u32,
+            avg_cache_hit_ratio,
+            ..Default::default()
+        },
+        cache_detector,
+    }
+}
+
+fn bridge_usage_from_response_event(
+    event: &astra_services::session_journal::JournalEvent,
+) -> Option<crate::turn::token_usage::TokenUsage> {
+    let usage = event
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("response"))
+        .and_then(|response| response.get("response"))
+        .and_then(|response| response.get("usage"))
+        .and_then(Value::as_object)?;
+    let canonical = crate::turn::token_usage::TokenUsage::from_json_map(usage);
+    if !canonical.is_empty() {
+        return Some(canonical);
+    }
+    let provider = event
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("provider"))
+        .and_then(Value::as_str)
+        .unwrap_or("openai");
+    crate::turn::token_usage::extract_usage(
+        crate::turn::token_usage::UsageDialect::for_provider(provider),
+        usage,
+    )
+}
+
+fn bridge_prompt_snapshot_from_journal_event(
+    event: &astra_services::session_journal::JournalEvent,
+) -> Option<astra_turn_core::cache_diagnostics::PromptStateSnapshot> {
+    let metadata = event.metadata.as_ref()?;
+    let request = metadata.get("request")?.as_object()?;
+    let tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let model = metadata
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let provider = metadata.get("provider").and_then(Value::as_str)?;
+    bridge_prompt_snapshot_from_messages(&messages, &tools, model, provider)
+}
+
+fn bridge_prompt_snapshot_from_messages(
+    messages: &[Value],
+    tools: &[Value],
+    model: &str,
+    provider: &str,
+) -> Option<astra_turn_core::cache_diagnostics::PromptStateSnapshot> {
+    let system_prompt_text =
+        astra_turn_core::cache_diagnostics::prompt_snapshot_system_text_from_messages(messages);
+    let tools_json = serde_json::to_string(tools).ok()?;
+    let cache_eligible_tokens = prompts::estimate_str_tokens(&system_prompt_text)
+        + prompts::estimate_str_tokens(&tools_json);
+    astra_turn_core::cache_diagnostics::prompt_snapshot_from_messages(
+        messages,
+        tools,
+        provider,
+        model,
+        cache_eligible_tokens,
+    )
 }
 
 // ── SSE helpers — delegated to turn::bridge_sse_helpers ───────────────────────
@@ -639,7 +821,7 @@ use super::bridge_observability::{
 };
 
 // ── LLM streaming — delegated to turn::bridge_llm_stream ─────────────────────
-use super::bridge_llm_stream::call_llm_stream;
+use super::bridge_llm_stream::call_llm_stream_with_request_overrides;
 use super::bridge_llm_stream::rate_limit_cooldown;
 use astra_turn_core::bridge_rate_limit_cooldown::{
     FallbackOutcome, RateLimitAction, try_resolve_fallback,
@@ -1107,13 +1289,14 @@ impl InProcessChatTurnBridge {
             // Resolve LLM model (skipped when `test_llm_rounds` drives the turn — feature `bridge-e2e-hooks`).
             // Also capture fallback_chain for rate-limit-triggered fallback.
             let pool_ref = shared_pool.as_ref().map(SharedPool::get);
-            let (mut model_name, mut wire_model_name, mut api_key, mut base_url, mut provider, fallback_chain) = if use_e2e_llm {
+            let (mut model_name, mut wire_model_name, mut api_key, mut base_url, mut provider, mut request_body_overrides, fallback_chain) = if use_e2e_llm {
                 (
                     "bridge-e2e-mock".to_string(),
                     None::<String>,
                     "unused".to_string(),
                     "http://127.0.0.1:1".to_string(),
                     "openai".to_string(),
+                    None,
                     Vec::<String>::new(),
                 )
             } else {
@@ -1131,6 +1314,7 @@ impl InProcessChatTurnBridge {
                         m.api_key,
                         m.base_url,
                         m.provider,
+                        m.request_body_overrides,
                         m.fallback_chain,
                     ),
                     Err(e) => {
@@ -1196,6 +1380,7 @@ impl InProcessChatTurnBridge {
                             api_key = fb.api_key;
                             base_url = fb.base_url;
                             provider = fb.provider;
+                            request_body_overrides = fb.request_body_overrides;
                         }
                         FallbackOutcome::NoFallbackConfigured => {
                             astra_core::agent_warn!(
@@ -1259,9 +1444,6 @@ impl InProcessChatTurnBridge {
             let mut memory_preview: Vec<String> = Vec::new();
 
             // System prompt — tells LLM about available tools and how to use them
-            let tool_names: Vec<&str> = edge_tools.iter()
-                .filter_map(|t| t.get("function").and_then(|f| f.get("name")).and_then(Value::as_str))
-                .collect();
             // Environment context is split by cache volatility:
             //
             // * `environment_static`  (Platform, Shell, CWD, Home) →
@@ -1812,8 +1994,7 @@ impl InProcessChatTurnBridge {
             let pipeline_outcome = crate::turn::llm_context::assemble_bridge_context(
                 crate::turn::llm_context::BridgeContextAssemblyInput {
                     tool_surface:
-                        crate::turn::llm_context::BridgeToolSurfacePlan::from_visible_tools(
-                            &tool_names,
+                        crate::turn::llm_context::ToolSurfacePlan::from_visible_tools(
                             &edge_tools,
                             &bridge_restricted_snapshot,
                         )
@@ -1977,7 +2158,7 @@ impl InProcessChatTurnBridge {
                 }
             }
 
-            crate::turn::llm_context::finalize_bridge_wire_messages(
+            let bridge_tail_is_synthetic = crate::turn::llm_context::finalize_bridge_wire_messages(
                 &mut llm_messages,
                 bridge_volatile_text.take(),
                 &provider,
@@ -2002,7 +2183,7 @@ impl InProcessChatTurnBridge {
             let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
             let mut last_measured_prompt: Option<u64> = None;
-            let mut cache_detector = astra_turn_core::cloud_cache_diagnostics::CacheBreakDetector::new();
+            let mut bridge_pipeline_baseline = load_bridge_pipeline_baseline(&session_id);
 
 
             // Single LLM call per HTTP request (no multi-round tool loop).
@@ -2020,8 +2201,6 @@ impl InProcessChatTurnBridge {
                 // output is already the authoritative set.
                 let round_edge_tools =
                     filter_round_edge_tools(&edge_tools, &HashSet::new());
-                let round_tools_fingerprint_str =
-                    serde_json::to_string(&round_edge_tools).unwrap_or_default();
                 // `pipeline_tier` is the authoritative tier; the per-round
                 // tier refinement (based on `last_measured_prompt`) used to
                 // live here but produced tier drift between planner and
@@ -2148,11 +2327,13 @@ impl InProcessChatTurnBridge {
                     // even though the request shape sent to the real API
                     // would be post-mutation. Traces from E2E tests must be
                     // comparable to traces from real runs.
-                    crate::turn::llm_context::apply_message_cache_metadata(
-                        &mut llm_messages,
-                        &cache_cfg,
-                        &session_id,
-                    );
+                    if !bridge_tail_is_synthetic {
+                        crate::turn::llm_context::apply_message_cache_metadata(
+                            &mut llm_messages,
+                            &cache_cfg,
+                            &session_id,
+                        );
+                    }
                     crate::turn::llm_context::augment_manifest_trace_with_wire(
                         &mut bridge_manifest_trace_json,
                         &llm_messages,
@@ -2226,11 +2407,13 @@ impl InProcessChatTurnBridge {
                     }
                 } else {
                     // Add Anthropic protocol-level prompt-cache metadata on the request clone.
-                    crate::turn::llm_context::apply_message_cache_metadata(
-                        &mut llm_messages,
-                        &cache_cfg,
-                        &session_id,
-                    );
+                    if !bridge_tail_is_synthetic {
+                        crate::turn::llm_context::apply_message_cache_metadata(
+                            &mut llm_messages,
+                            &cache_cfg,
+                            &session_id,
+                        );
+                    }
                     crate::turn::llm_context::augment_manifest_trace_with_wire(
                         &mut bridge_manifest_trace_json,
                         &llm_messages,
@@ -2399,7 +2582,7 @@ impl InProcessChatTurnBridge {
                     {
                         futures_util::stream::iter(blocks.into_iter().map(Bytes::from)).boxed()
                     } else {
-                        match call_llm_stream(
+                        match call_llm_stream_with_request_overrides(
                             &llm_messages,
                             &pruned_tools,
                             &model_name,
@@ -2411,6 +2594,7 @@ impl InProcessChatTurnBridge {
                             has_fallback,
                             cc.clone(),
                             &thinking_config,
+                            request_body_overrides.as_ref(),
                         )
                         .await
                         {
@@ -2575,7 +2759,7 @@ impl InProcessChatTurnBridge {
                             }
 
                             // Retry LLM call
-                            match call_llm_stream(
+                            match call_llm_stream_with_request_overrides(
                                 &llm_messages,
                                 &pruned_tools,
                                 &model_name,
@@ -2587,6 +2771,7 @@ impl InProcessChatTurnBridge {
                                 has_fallback,
                                 cc.clone(),
                                 &thinking_config,
+                                request_body_overrides.as_ref(),
                             )
                             .await
                             {
@@ -3327,26 +3512,74 @@ impl InProcessChatTurnBridge {
                     });
                 }
 
-                // ── Cache break detection ──
-                {
-                    let sys_content = llm_messages.first()
-                        .and_then(|m| m.get("content"));
-                    let sys_prompt_str = match sys_content {
-                        Some(Value::String(s)) => s.clone(),
-                        Some(v) => serde_json::to_string(v).unwrap_or_default(),
-                        None => String::new(),
-                    };
-                    let fp = astra_turn_core::cloud_cache_diagnostics::CacheFingerprint::new(
-                        &sys_prompt_str,
-                        &round_tools_fingerprint_str,
-                        &model_name,
-                        &provider,
+                // ── Formal pipeline feedback / alerts ──
+                if let Some(buf) = turn_event_buffer.as_mut() {
+                    let current_turn = bridge_pipeline_baseline.next_turn.max(1);
+                    let mut feedback = astra_turn_core::context_feedback::ContextFeedback::from_usage(
+                        usage_snapshot.input_tokens,
+                        usage_snapshot.cached_input_tokens,
+                        usage_snapshot.cache_creation_tokens,
+                        usage_snapshot.output_tokens,
+                        false,
                     );
-                    let cache_read = usage_snapshot.cached_input_tokens;
-                    if let Some(event) = cache_detector.detect_break(&fp, cache_read) {
-                        let causes: Vec<String> = event.causes.iter().map(|c| c.to_string()).collect();
-                        eprintln!("[cache_diagnostics] cache break: {} | {}",
-                            causes.join(", "), cache_detector.stats_summary());
+                    if let Some(current_snapshot) = bridge_prompt_snapshot_from_messages(
+                        &llm_messages,
+                        &pruned_tools,
+                        capture_model,
+                        &provider,
+                    ) {
+                        if let Some(event) = bridge_pipeline_baseline
+                            .cache_detector
+                            .record_turn_for_source(
+                                BRIDGE_CACHE_SOURCE,
+                                current_snapshot,
+                                Some(usage_snapshot.cached_input_tokens),
+                            )
+                        {
+                            feedback.attribute_cache_break(event.reason);
+                        }
+                    }
+                    bridge_pipeline_baseline.stats.record(
+                        capture_model,
+                        BRIDGE_CACHE_SOURCE,
+                        &feedback,
+                    );
+
+                    let feedback_evt =
+                        astra_turn_core::pipeline_journal::PipelineJournalEvent::from_feedback(
+                            current_turn,
+                            capture_model,
+                            &feedback,
+                        );
+                    if let Ok(payload) = serde_json::to_value(&feedback_evt) {
+                        buf.record(
+                            astra_services::session_journal::JournalEvent::pipeline_feedback(
+                                (!session_id.is_empty()).then_some(session_id.as_str()),
+                                current_turn,
+                                payload,
+                            ),
+                        );
+                    }
+
+                    for alert in astra_turn_core::trace_alert::evaluate_alerts(
+                        current_turn,
+                        &feedback,
+                        &bridge_pipeline_baseline.stats,
+                        &astra_turn_core::recovery_state::RecoveryState::default(),
+                    ) {
+                        let alert_evt =
+                            astra_turn_core::pipeline_journal::PipelineJournalEvent::from_alert(
+                                &alert,
+                            );
+                        if let Ok(payload) = serde_json::to_value(&alert_evt) {
+                            buf.record(
+                                astra_services::session_journal::JournalEvent::pipeline_alert(
+                                    (!session_id.is_empty()).then_some(session_id.as_str()),
+                                    current_turn,
+                                    payload,
+                                ),
+                            );
+                        }
                     }
                 }
 
@@ -3610,7 +3843,7 @@ impl InProcessChatTurnBridge {
                 });
             }
 
-            // Hook side effects: decision audit, skill selection, implicit feedback, reflection
+            // Hook side effects: decision audit, skill selection, reflection
             {
                 let mut hook_payload = astra_turn_core::tail_persist::build_turn_hook_args(
                     &user_id,
@@ -3627,7 +3860,6 @@ impl InProcessChatTurnBridge {
                     None, // session_start
                     false, // run_hook_db_writes = false → triggers persist
                     false, // run_observer = false → triggers observer
-                    false, // run_implicit_feedback = false → triggers feedback
                     false, // run_reflection_learning = false → triggers reflection
                 );
                 if is_correction_turn {
@@ -4059,6 +4291,7 @@ pub mod bridge_inprocess_test_helpers {
 mod tests {
     use super::*;
     use crate::turn::bridge_sse_helpers::apply_forward_llm_sse_event;
+    use astra_services::SessionArtifactStore;
     use astra_services::{
         SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact,
     };
@@ -4422,6 +4655,61 @@ mod tests {
                 "empty input must yield empty output for {prov}/{model}",
             );
         }
+    }
+
+    #[test]
+    fn bridge_snapshot_skips_legacy_journal_event_without_provider() {
+        let mut event = astra_services::session_journal::JournalEvent::base_public(
+            astra_services::session_journal::JournalEventType::LlmRound,
+            Some("sess"),
+        );
+        event.metadata = Some(json!({
+            "model": "gpt-4o",
+            "request": {
+                "messages": [
+                    {"role": "system", "content": "stable"},
+                    {"role": "user", "content": "hello"}
+                ],
+                "tools": []
+            }
+        }));
+
+        assert!(bridge_prompt_snapshot_from_journal_event(&event).is_none());
+    }
+
+    #[test]
+    fn bridge_skips_cache_metadata_when_synthetic_tail_is_still_last_message() {
+        let mut llm_messages = vec![
+            json!({"role": "system", "content": [{"type": "text", "text": "stable"}]}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": "tool output", "tool_call_id": "c1"}),
+        ];
+        let cache_cfg = crate::turn::prompt_cache::PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+
+        let bridge_tail_is_synthetic = crate::turn::llm_context::finalize_bridge_wire_messages(
+            &mut llm_messages,
+            Some("volatile".to_string()),
+            "anthropic",
+            "claude-sonnet-4",
+        );
+        if !bridge_tail_is_synthetic {
+            crate::turn::llm_context::apply_message_cache_metadata(
+                &mut llm_messages,
+                &cache_cfg,
+                "sess",
+            );
+        }
+
+        assert!(bridge_tail_is_synthetic);
+        assert!(
+            llm_messages
+                .iter()
+                .all(|message| message.get("cache_control").is_none()),
+            "synthetic tail should stay unannotated so bridge and server cache boundaries match",
+        );
     }
 
     #[test]
@@ -5836,6 +6124,263 @@ mod tests {
         let m = u.to_json_map();
         let estimated_tokens = m.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as usize;
         assert_eq!(estimated_tokens, 45000);
+    }
+
+    #[test]
+    fn load_bridge_pipeline_baseline_reconstructs_detector_state_from_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "00000000-0000-0000-0000-000000000188";
+        let writer = astra_services::session_journal::JournalWriter::new(session_id)
+            .expect("journal writer");
+
+        let request_metadata = |system_text: &str| {
+            json!({
+                "model": "test-model",
+                "provider": "openai",
+                "request": {
+                    "messages": [
+                        {"role": "system", "content": system_text},
+                        {"role": "user", "content": "ping"}
+                    ],
+                    "tools": []
+                }
+            })
+        };
+        let response_metadata = |cached_input_tokens: u64| {
+            json!({
+                "provider": "openai",
+                "response": {
+                    "response": {
+                        "usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": cached_input_tokens,
+                            "cache_creation_tokens": 0,
+                            "output_tokens": 12
+                        }
+                    }
+                }
+            })
+        };
+
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::llm_request_full(
+                    Some(session_id),
+                    1,
+                    0,
+                    request_metadata("stable prompt"),
+                ),
+            )
+            .unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::llm_response_full(
+                    Some(session_id),
+                    1,
+                    0,
+                    response_metadata(0),
+                ),
+            )
+            .unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::llm_request_full(
+                    Some(session_id),
+                    2,
+                    0,
+                    request_metadata("stable prompt"),
+                ),
+            )
+            .unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::llm_response_full(
+                    Some(session_id),
+                    2,
+                    0,
+                    response_metadata(500),
+                ),
+            )
+            .unwrap();
+
+        let mut baseline = load_bridge_pipeline_baseline(session_id);
+        assert_eq!(baseline.next_turn, 3);
+        assert!(
+            baseline
+                .cache_detector
+                .snapshot_for_source(BRIDGE_CACHE_SOURCE)
+                .is_some(),
+            "baseline should warm the bridge cache detector from prior request/response pairs"
+        );
+
+        let current = bridge_prompt_snapshot_from_messages(
+            &[
+                json!({"role": "system", "content": "stable prompt"}),
+                json!({"role": "user", "content": "continue"}),
+            ],
+            &[],
+            "test-model",
+            "openai",
+        )
+        .expect("current prompt snapshot");
+        assert!(
+            baseline
+                .cache_detector
+                .record_turn_for_source(BRIDGE_CACHE_SOURCE, current, Some(500))
+                .is_none(),
+            "reconstructed detector state should treat the next stable turn as a hit"
+        );
+    }
+
+    #[test]
+    fn load_bridge_pipeline_baseline_enables_prompt_cache_diff_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "00000000-0000-0000-0000-000000000190";
+        let writer = astra_services::session_journal::JournalWriter::new(session_id)
+            .expect("journal writer");
+
+        let request_metadata = |system_prompt: &str| {
+            json!({
+                "provider": "openai",
+                "model": "test-model",
+                "request": {
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": "continue"}
+                    ],
+                    "tools": []
+                }
+            })
+        };
+        let response_metadata = |cached_input_tokens: u64| {
+            json!({
+                "provider": "openai",
+                "response": {
+                    "response": {
+                        "usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": cached_input_tokens,
+                            "cache_creation_tokens": 0,
+                            "output_tokens": 12
+                        }
+                    }
+                }
+            })
+        };
+
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::llm_request_full(
+                    Some(session_id),
+                    1,
+                    0,
+                    request_metadata("stable prompt"),
+                ),
+            )
+            .unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::llm_response_full(
+                    Some(session_id),
+                    1,
+                    0,
+                    response_metadata(50),
+                ),
+            )
+            .unwrap();
+
+        let mut baseline = load_bridge_pipeline_baseline(session_id);
+        let changed = bridge_prompt_snapshot_from_messages(
+            &[
+                json!({"role": "system", "content": "changed prompt"}),
+                json!({"role": "user", "content": "continue"}),
+            ],
+            &[],
+            "test-model",
+            "openai",
+        )
+        .expect("changed prompt snapshot");
+        let event =
+            baseline
+                .cache_detector
+                .record_turn_for_source(BRIDGE_CACHE_SOURCE, changed, Some(0));
+        assert!(
+            event.is_some(),
+            "changed prompt should trip the bridge cache detector"
+        );
+
+        let diff_dir = astra_services::local_session_artifact_store()
+            .session_dir(session_id)
+            .expect("session dir")
+            .join("prompt-cache-diffs");
+        let entries = (0..50)
+            .find_map(|_| match std::fs::read_dir(&diff_dir) {
+                Ok(read_dir) => {
+                    let count = read_dir.count();
+                    if count > 0 {
+                        Some(count)
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        None
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    None
+                }
+                Err(error) => panic!("prompt-cache diff dir: {error}"),
+            })
+            .unwrap_or(0);
+        assert!(
+            entries > 0,
+            "bridge baseline should emit prompt-cache diff artifacts into the session dir"
+        );
+    }
+
+    #[test]
+    fn load_bridge_pipeline_baseline_preserves_absolute_turn_when_tail_truncated() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "00000000-0000-0000-0000-000000000189";
+        let writer = astra_services::session_journal::JournalWriter::new(session_id)
+            .expect("journal writer");
+
+        let response_metadata = |cached_input_tokens: u64| {
+            json!({
+                "provider": "openai",
+                "response": {
+                    "response": {
+                        "usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": cached_input_tokens,
+                            "cache_creation_tokens": 0,
+                            "output_tokens": 12
+                        }
+                    }
+                }
+            })
+        };
+
+        for turn in 1..=520 {
+            writer
+                .append(
+                    &astra_services::session_journal::JournalEvent::llm_response_full(
+                        Some(session_id),
+                        turn,
+                        0,
+                        response_metadata(0),
+                    ),
+                )
+                .unwrap();
+        }
+
+        let baseline = load_bridge_pipeline_baseline(session_id);
+        assert_eq!(
+            baseline.next_turn, 521,
+            "tail-based reconstruction must preserve the absolute turn number"
+        );
     }
 
     #[cfg(feature = "bridge-e2e-hooks")]
