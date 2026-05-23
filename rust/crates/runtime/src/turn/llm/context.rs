@@ -1007,7 +1007,6 @@ pub(crate) fn apply_bridge_message_cache_metadata(
     cache_cfg: &PromptCacheConfig,
     session_id: &str,
 ) {
-    let debug_bridge_cache = std::env::var("ASTRA_DEBUG_BRIDGE_CACHE").is_ok();
     let before = messages
         .iter()
         .filter(|message| astra_turn_core::context_serializer::message_has_cache_control(message))
@@ -1025,16 +1024,6 @@ pub(crate) fn apply_bridge_message_cache_metadata(
         .iter()
         .filter(|message| astra_turn_core::context_serializer::message_has_cache_control(message))
         .count();
-    if debug_bridge_cache {
-        let target_role = synthetic_tail_prefix_end
-            .and_then(|prefix_end| prefix_end.checked_sub(1))
-            .and_then(|idx| messages.get(idx))
-            .and_then(|message| message.get("role"))
-            .and_then(Value::as_str);
-        eprintln!(
-            "[bridge-cache] prefix_end={synthetic_tail_prefix_end:?} before={before} after={after} target_role={target_role:?}"
-        );
-    }
     if synthetic_tail_prefix_end.is_some() && after == before {
         tracing::warn!(
             target: "astra::cache",
