@@ -503,6 +503,14 @@ pub struct StallTrackingState {
     /// successful task-completion signal (for example a successful git commit).
     /// One-shot per turn; advisory only, tools remain available.
     pub forced_completion_soft_stop: bool,
+    /// Whether the unfinished-task-board mid-loop gate already injected its
+    /// corrective this turn. Without this one-shot, a model that responds
+    /// with text-only completions while the task board still has unfinished
+    /// work would keep re-triggering the gate every BreakLoop round —
+    /// burning the global round budget instead of letting the terminal
+    /// guard rewrite the answer with a structured interruption record.
+    /// One-shot per turn; reset in `reset_per_turn_corrective_state`.
+    pub forced_task_board_completion_gate: bool,
     /// Whether the redundant-reads mid-loop corrective injected a guidance
     /// message this loop. Fires when the model has re-read overlapping line
     /// ranges of the same file enough times to cross

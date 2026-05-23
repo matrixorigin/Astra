@@ -1216,7 +1216,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 return Ok(TurnExecutionControl::ContinueLoop);
             }
 
-            if let Some(snapshot) = unfinished_task_board_snapshot(state).cloned() {
+            if !state.stall.forced_task_board_completion_gate
+                && let Some(snapshot) = unfinished_task_board_snapshot(state).cloned()
+            {
+                state.stall.forced_task_board_completion_gate = true;
                 state.final_text.clear();
                 state.final_text_streamed = false;
                 state.push_volatile(
@@ -3490,6 +3493,130 @@ mod tests {
         assert_eq!(host.current_turn, 2);
         assert_eq!(state.final_text, "All task-board work is now complete.");
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+    }
+
+    /// Stub host whose `execute_turn` keeps returning text-only results AND
+    /// never clears the task-board snapshot — the same shape we'd see if the
+    /// model ignored the runtime's "unfinished tasks remain" corrective and
+    /// kept replying "Done." without making task-board progress.
+    struct StubbornTextOnlyHost {
+        turn_results: Vec<HostTurnResult>,
+        current_turn: usize,
+        emitted_lines: Vec<String>,
+        rendered_final_text: Vec<String>,
+        valid_tools: HashSet<String>,
+    }
+
+    impl StubbornTextOnlyHost {
+        fn new(turn_results: Vec<HostTurnResult>) -> Self {
+            Self {
+                turn_results,
+                current_turn: 0,
+                emitted_lines: Vec::new(),
+                rendered_final_text: Vec::new(),
+                valid_tools: HashSet::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgenticLoopHost for StubbornTextOnlyHost {
+        async fn execute_turn(
+            &mut self,
+            _state: &mut AgenticLoopState,
+        ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
+            if self.turn_results.is_empty() {
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::BudgetExhausted,
+                    "no more turns",
+                ));
+            }
+            self.current_turn += 1;
+            Ok(self.turn_results.remove(0))
+        }
+
+        fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
+            self.emitted_lines.push(line);
+        }
+
+        fn is_quiet(&self) -> bool {
+            true
+        }
+
+        fn turn_interaction_mode(&self) -> TurnInteractionMode {
+            TurnInteractionMode::NonInteractive
+        }
+
+        fn valid_tool_names(&self) -> &HashSet<String> {
+            &self.valid_tools
+        }
+
+        fn inject_tool_schema(&mut self, _schema: serde_json::Value) {}
+
+        fn render_final_text(&mut self, text: &str) {
+            self.rendered_final_text.push(text.to_string());
+        }
+    }
+
+    /// Regression: the unfinished-task-board mid-loop gate must be one-shot
+    /// per turn so a model that ignores the corrective doesn't churn the
+    /// global round budget. After the gate fires once, the next text-only
+    /// completion should fall through to terminal rendering, where
+    /// `ensure_terminal_text` rewrites the answer with structured stop +
+    /// remaining-task context (covered by the finalization tests).
+    #[tokio::test]
+    async fn unfinished_task_board_gate_is_one_shot_per_turn() {
+        let mut host = StubbornTextOnlyHost::new(vec![
+            text_result("Done.", 10, 5, Some(20)),
+            text_result("Still done.", 10, 5, Some(20)),
+        ]);
+        let mut state = make_state();
+        state.hooks.task_board_snapshot =
+            TaskBoardSnapshot::from_active_tasks(&[astra_tools::task_mgmt::SessionTask {
+                id: "task-1".to_string(),
+                title: "finish validation".to_string(),
+                description: None,
+                status: "in_progress".to_string(),
+                subtasks: Vec::new(),
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                updated_at: "2025-01-01T00:00:00Z".to_string(),
+                active_form: None,
+                owner: None,
+                metadata: None,
+                blocks: Vec::new(),
+                blocked_by: Vec::new(),
+            }]);
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_ok(), "loop must terminate even when the model ignores the corrective");
+        assert_eq!(
+            host.current_turn, 2,
+            "exactly two turns should run: one before the gate, one after the corrective"
+        );
+        assert!(
+            state.final_text.contains("task-board work remains open"),
+            "terminal text should surface the unfinished-work record, got: {}",
+            state.final_text
+        );
+        let unfinished_notices = host
+            .emitted_lines
+            .iter()
+            .filter(|line| line.contains("Unfinished tasks remain"))
+            .count();
+        // Even though the loop's quiet flag suppresses these in
+        // `unfinished_task_board_guard_forces_another_round`, that test runs
+        // the same code path; here `host.is_quiet()` returns true so the
+        // gate's headless line is suppressed too — the meaningful proof
+        // that the gate is one-shot is `current_turn == 2` (no third turn).
+        assert!(
+            unfinished_notices <= 1,
+            "the gate's stderr notice must fire at most once, got {unfinished_notices}"
+        );
+        // `forced_task_board_completion_gate` is reset by
+        // `finalize_and_render` on terminal exit, so we don't assert on it
+        // here. The structural proof is in the turn count plus the rewritten
+        // terminal text.
     }
 
     #[test]

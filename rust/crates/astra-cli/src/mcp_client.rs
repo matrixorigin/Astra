@@ -27,12 +27,11 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::theme;
 use crossterm::style::Stylize;
 use rmcp::{
     ClientHandler, Peer, RoleClient,
@@ -763,7 +762,8 @@ pub struct McpConnection {
     /// Error message from the most recent failed call, if any.
     pub last_error: RwLock<Option<String>>,
     /// Ring buffer of recent call log entries (max CALL_LOG_MAX_ENTRIES).
-    pub call_log: RwLock<Vec<CallLogEntry>>,
+    /// `VecDeque` so eviction at capacity is O(1) instead of O(n).
+    pub call_log: RwLock<VecDeque<CallLogEntry>>,
     /// Keep-alive handle for the background MCP service task.
     /// Stored to prevent transport closure when `RunningService` is dropped.
     keepalive_handle: Option<tokio::task::JoinHandle<()>>,
@@ -1021,9 +1021,9 @@ impl McpConnection {
         {
             let mut log = self.call_log.write().await;
             if log.len() >= CALL_LOG_MAX_ENTRIES {
-                log.remove(0);
+                log.pop_front();
             }
-            log.push(CallLogEntry {
+            log.push_back(CallLogEntry {
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 tool: name.to_string(),
                 server: self.name.clone(),
@@ -1466,9 +1466,11 @@ impl McpClientManager {
                 .unwrap_or("")
                 .to_string();
             if let Some(prev_server) = seen.get(&name) {
-                eprintln!(
-                    "[WARN] MCP tool name collision: '{name}' from server '{server}' \
-                     conflicts with server '{prev_server}' — skipping duplicate"
+                tracing::warn!(
+                    tool = %name,
+                    server = %server,
+                    prev_server = %prev_server,
+                    "MCP tool name collision; skipping duplicate"
                 );
                 collision_count += 1;
                 continue;
@@ -1477,9 +1479,9 @@ impl McpClientManager {
             schemas.push(schema);
         }
         if collision_count > 0 {
-            eprintln!(
-                "[WARN] {collision_count} MCP tool(s) skipped due to name collisions \
-                 — check server configurations for duplicate tool names"
+            tracing::warn!(
+                skipped = collision_count,
+                "MCP tools skipped due to name collisions — check server configurations for duplicate tool names"
             );
         }
         schemas
@@ -1497,10 +1499,10 @@ impl McpClientManager {
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "  {} {}",
-                        theme::icon_warn(),
-                        format!("Failed to list prompts from {name}: {e}").dim()
+                    tracing::warn!(
+                        server = %name,
+                        error = %e,
+                        "MCP: failed to list prompts"
                     );
                 }
             }
@@ -1520,10 +1522,10 @@ impl McpClientManager {
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "  {} {}",
-                        theme::icon_warn(),
-                        format!("Failed to list resources from {name}: {e}").dim()
+                    tracing::warn!(
+                        server = %name,
+                        error = %e,
+                        "MCP: failed to list resources"
                     );
                 }
             }
@@ -2065,7 +2067,7 @@ async fn connect_stdio(
         error_count: AtomicU64::new(0),
         last_latency: RwLock::new(None),
         last_error: RwLock::new(None),
-        call_log: RwLock::new(Vec::new()),
+        call_log: RwLock::new(VecDeque::with_capacity(CALL_LOG_MAX_ENTRIES)),
         keepalive_handle: Some(keepalive),
     })
 }
@@ -2163,7 +2165,7 @@ async fn connect_sse(
                 error_count: AtomicU64::new(0),
                 last_latency: RwLock::new(None),
                 last_error: RwLock::new(None),
-                call_log: RwLock::new(Vec::new()),
+                call_log: RwLock::new(VecDeque::with_capacity(CALL_LOG_MAX_ENTRIES)),
                 keepalive_handle: Some(keepalive),
             })
         }
@@ -2236,7 +2238,7 @@ async fn connect_stateless_http(
         error_count: AtomicU64::new(0),
         last_latency: RwLock::new(None),
         last_error: RwLock::new(None),
-        call_log: RwLock::new(Vec::new()),
+        call_log: RwLock::new(VecDeque::with_capacity(CALL_LOG_MAX_ENTRIES)),
         keepalive_handle: None,
     })
 }
@@ -2323,7 +2325,7 @@ async fn probe_stateless_http_connection(
         error_count: AtomicU64::new(0),
         last_latency: RwLock::new(None),
         last_error: RwLock::new(None),
-        call_log: RwLock::new(Vec::new()),
+        call_log: RwLock::new(VecDeque::with_capacity(CALL_LOG_MAX_ENTRIES)),
         keepalive_handle: None,
     }))
 }
@@ -2488,7 +2490,7 @@ async fn connect_ws(
         error_count: AtomicU64::new(0),
         last_latency: RwLock::new(None),
         last_error: RwLock::new(None),
-        call_log: RwLock::new(Vec::new()),
+        call_log: RwLock::new(VecDeque::with_capacity(CALL_LOG_MAX_ENTRIES)),
         keepalive_handle: Some(keepalive),
     })
 }
@@ -2680,8 +2682,10 @@ pub fn extract_result_text_with_limit(result: &CallToolResult, max_len: usize) -
 
     let joined = parts.join("\n");
     if total_len >= max_len {
-        eprintln!(
-            "[WARN] MCP tool result truncated: {total_len} chars exceeded {max_len} char limit"
+        tracing::warn!(
+            chars = total_len,
+            limit = max_len,
+            "MCP: tool result truncated"
         );
         format!(
             "{}\n\n[OUTPUT TRUNCATED - exceeded {} char limit]",

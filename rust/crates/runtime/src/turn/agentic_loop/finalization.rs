@@ -679,6 +679,7 @@ fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
     state.stall.forced_round_budget_phase1 = false;
     state.stall.forced_round_budget_phase2 = false;
     state.stall.forced_completion_soft_stop = false;
+    state.stall.forced_task_board_completion_gate = false;
     state.stall.forced_redundant_reads_corrective = false;
     state.stall.forced_cache_waste_corrective = false;
     state.stall.forced_exploration_family_corrective = false;
