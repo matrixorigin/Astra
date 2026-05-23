@@ -13,12 +13,12 @@ use std::collections::{BTreeSet, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::chat_turn_heuristics::TaskExecutionProfile;
-use crate::cloud_approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS;
+use crate::cloud::approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS;
 use crate::error_recovery::{self, EscalationLevel, SessionErrorSummary};
 use crate::result_quality::{self, ResultQuality};
 use crate::stall::{self, DivergenceStatus, StallReflection};
-use crate::tool_call_shape::tool_call_name;
-use crate::tool_health::{self, ToolHealthTracker};
+use crate::tool::args::shape::tool_call_name;
+use crate::tool::health::ToolHealthTracker;
 
 /// Actionable verdict for the current turn.
 #[derive(Debug, Clone)]
@@ -117,7 +117,7 @@ pub struct TurnGuard {
 /// Check if a tool is read-only and must never be restricted.
 /// Delegates to the central [`crate::tool_categories`] registry.
 pub fn is_read_only_never_restrict(tool: &str) -> bool {
-    crate::tool_categories::registry().is_never_restrict(tool)
+    crate::tool::categories::registry().is_never_restrict(tool)
 }
 
 /// Insert deprioritized tool names from [`TurnGuard`] into the selector
@@ -127,7 +127,7 @@ pub fn merge_deprioritized_tools_into_restricted(
     turn_guard: &TurnGuard,
     restricted: &mut HashSet<String>,
 ) {
-    let reg = crate::tool_categories::registry();
+    let reg = crate::tool::categories::registry();
     for t in turn_guard.health.deprioritized_tools() {
         if reg.is_never_restrict(t) {
             continue;
@@ -302,7 +302,9 @@ impl TurnGuard {
         };
         self.health.record_outcome(
             sig,
-            tool_health::ToolOutcome::with_category(success, latency_ms, result_str, category),
+            crate::tool::health::ToolOutcome::with_category(
+                success, latency_ms, result_str, category,
+            ),
         );
     }
 
@@ -1589,7 +1591,7 @@ mod tests {
         // Drive far past CONSECUTIVE_FAILURE_THRESHOLD for every read-only tool.
         // Use the live registry so any newly added never-restrict tools are
         // automatically covered — no static copy to drift from.
-        let reg = crate::tool_categories::registry();
+        let reg = crate::tool::categories::registry();
         let never_restrict_tools: Vec<&'static str> = reg
             .read_only_names()
             .into_iter()

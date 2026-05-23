@@ -325,7 +325,7 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
     let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
     let tracker =
-        std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
+        std::sync::Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
     let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
     let spawner = std::sync::Arc::new(astra_runtime::orchestration::DynamicAgentSpawner::new(
         router.clone(),
@@ -433,7 +433,7 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
     let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
     let tracker =
-        std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
+        std::sync::Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
     let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
     let spawner = std::sync::Arc::new(astra_runtime::orchestration::DynamicAgentSpawner::new(
         router.clone(),
@@ -517,7 +517,7 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
 async fn drain_root_mailbox_into_idle_queue_collects_pending_messages() {
     let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
     let tracker =
-        std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
+        std::sync::Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
     let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
     let root_addr = astra_messaging::AgentAddress::new("root-run", "main");
     let worker_addr = astra_messaging::AgentAddress::new("worker-run", "worker");

@@ -7,7 +7,7 @@ use tokio::sync::oneshot;
 
 use super::button_row::ButtonRow;
 use crate::chat_stream::ApprovalResponse;
-use astra_turn_core::permission_scope::AllowScope;
+use astra_turn_core::permission::scope::AllowScope;
 
 /// Monotonic id assigned by the queue. Stable across the session so the
 /// reducer and tool cells can refer to a pending approval without owning
@@ -49,7 +49,7 @@ pub(crate) struct PendingApproval {
     /// openWorldHint). The TUI uses this to render a precise
     /// risk badge and to decide whether to disable persistent
     /// scopes for unknown-capability tools.
-    pub mcp_capability: Option<astra_turn_core::permission_engine::ToolCapabilityMetadata>,
+    pub mcp_capability: Option<astra_turn_core::permission::engine::ToolCapabilityMetadata>,
     /// Issue #326 P3 / scenario #39: when the agent runs against a
     /// remote host (SSH session, dev container, sandbox VM), this
     /// records the host label so the UI can prefix paths with
@@ -62,7 +62,7 @@ pub(crate) struct PendingApproval {
     /// computed by the engine. Empty means "no specific risk
     /// tags emitted by the engine"; the UI falls back to the
     /// existing reason text.
-    pub risk_tags: Vec<astra_turn_core::permission_engine::RiskTag>,
+    pub risk_tags: Vec<astra_turn_core::permission::engine::RiskTag>,
     /// Human-readable preview of what pressing Always will remember.
     /// This must not expose permission-rule DSL.
     pub remember_preview: Option<String>,
@@ -112,9 +112,9 @@ pub(crate) struct PendingApproval {
 #[derive(Default, Debug, Clone)]
 pub(crate) struct ApprovalMetadata {
     pub source_agent: Option<String>,
-    pub mcp_capability: Option<astra_turn_core::permission_engine::ToolCapabilityMetadata>,
+    pub mcp_capability: Option<astra_turn_core::permission::engine::ToolCapabilityMetadata>,
     pub host: Option<String>,
-    pub risk_tags: Vec<astra_turn_core::permission_engine::RiskTag>,
+    pub risk_tags: Vec<astra_turn_core::permission::engine::RiskTag>,
     pub remember_preview: Option<String>,
     pub workspace_untrusted: bool,
     pub is_compound_command: bool,
@@ -146,7 +146,7 @@ impl ApprovalMetadata {
     #[must_use]
     pub fn with_risk_tags(
         mut self,
-        tags: Vec<astra_turn_core::permission_engine::RiskTag>,
+        tags: Vec<astra_turn_core::permission::engine::RiskTag>,
     ) -> Self {
         self.risk_tags = tags;
         self
@@ -180,7 +180,7 @@ impl ApprovalMetadata {
     #[must_use]
     pub fn with_mcp_capability(
         mut self,
-        meta: astra_turn_core::permission_engine::ToolCapabilityMetadata,
+        meta: astra_turn_core::permission::engine::ToolCapabilityMetadata,
     ) -> Self {
         self.mcp_capability = Some(meta);
         self
@@ -302,8 +302,8 @@ impl From<&PendingApproval> for ApprovalView {
 }
 
 impl PendingApproval {
-    fn scope_context(&self) -> astra_turn_core::permission_scope::ScopeAvailabilityContext {
-        astra_turn_core::permission_scope::ScopeAvailabilityContext {
+    fn scope_context(&self) -> astra_turn_core::permission::scope::ScopeAvailabilityContext {
+        astra_turn_core::permission::scope::ScopeAvailabilityContext {
             risk_tags: self.risk_tags.clone(),
             source_agent_present: self.source_agent.is_some(),
             mcp_unknown_capability: self
@@ -312,7 +312,7 @@ impl PendingApproval {
                 .is_some_and(|meta| !meta.is_known())
                 || self
                     .risk_tags
-                    .contains(&astra_turn_core::permission_engine::RiskTag::MCPUnknownCapability),
+                    .contains(&astra_turn_core::permission::engine::RiskTag::MCPUnknownCapability),
             workspace_untrusted: self.workspace_untrusted,
             is_compound_command: self.is_compound_command,
             has_dynamic_eval: self.has_dynamic_eval,
@@ -320,14 +320,14 @@ impl PendingApproval {
         }
     }
 
-    fn scope_available(&self, scope: astra_turn_core::permission_scope::AllowScope) -> bool {
-        astra_turn_core::permission_scope::permitted_scopes(&self.scope_context())
+    fn scope_available(&self, scope: astra_turn_core::permission::scope::AllowScope) -> bool {
+        astra_turn_core::permission::scope::permitted_scopes(&self.scope_context())
             .into_iter()
             .any(|entry| entry.scope == scope && entry.available)
     }
 
     fn always_action_disabled(&self) -> bool {
-        use astra_turn_core::permission_engine::RiskTag;
+        use astra_turn_core::permission::engine::RiskTag;
 
         if self.source_agent.is_some()
             || self.is_compound_command
@@ -764,7 +764,7 @@ mod tests {
 
     #[test]
     fn push_with_metadata_carries_mcp_capability() {
-        use astra_turn_core::permission_engine::ToolCapabilityMetadata;
+        use astra_turn_core::permission::engine::ToolCapabilityMetadata;
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
         let meta = ToolCapabilityMetadata {
@@ -809,7 +809,7 @@ mod tests {
     fn push_with_metadata_carries_risk_tags_and_remember_preview() {
         // Risk tags and the human-readable remember preview must
         // reach the view layer.
-        use astra_turn_core::permission_engine::RiskTag;
+        use astra_turn_core::permission::engine::RiskTag;
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
         q.push_with_metadata(

@@ -25,7 +25,9 @@ pub use astra_turn_core::orchestration_spawn_tool::{
     SpawnAgentInput, SpawnAgentOutput, spawn_agent_schema,
 };
 pub use astra_turn_core::orchestration_team_config::{AgentRegistry, AgentTypeConfig};
-pub use astra_turn_core::permission_sync;
+pub mod permission_sync {
+    pub use astra_turn_core::permission::sync::*;
+}
 pub use fork_cache_probe::{ForkCacheProbeState, maybe_emit_fork_cache_probe};
 pub use permission_sync::{
     InheritedPermissions, PermissionAction, PermissionCallback, PermissionDecision, PermissionMode,

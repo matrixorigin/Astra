@@ -411,8 +411,8 @@ impl BottomPane {
         &mut self,
         new_mode: crate::permission_manager::PermissionMode,
     ) -> usize {
-        use astra_turn_core::permission_engine::{HardDecision, evaluate_permission};
-        use astra_turn_core::permission_types::{InheritedPermissions, PermissionSyncContext};
+        use astra_turn_core::permission::engine::{HardDecision, evaluate_permission};
+        use astra_turn_core::permission::types::{InheritedPermissions, PermissionSyncContext};
 
         let ctx = PermissionSyncContext::new(InheritedPermissions::new(new_mode));
         let released = self.approval_queue.drain_now_allowed(|entry| {

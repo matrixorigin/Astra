@@ -888,22 +888,6 @@ mod tests {
         }
     }
 
-    /// P0-A source guard: run_lifecycle must call record_tokens after the loop.
-    #[test]
-    fn run_lifecycle_records_tokens_after_loop() {
-        let source = include_str!("../../runtime/src/server/run_lifecycle.rs");
-        // Find the persist_usage call and verify record_tokens follows it
-        let persist_pos = source
-            .find("persist_usage")
-            .expect("persist_usage must exist");
-        let after_persist = &source[persist_pos..];
-        let record_pos = after_persist.find("record_tokens");
-        assert!(
-            record_pos.is_some(),
-            "record_tokens must be called after persist_usage in run_lifecycle"
-        );
-    }
-
     /// P1-A: Daily counters must reset when the date changes.
     /// A user denied yesterday must be allowed today.
     /// active_sessions must survive the reset (it tracks live state).

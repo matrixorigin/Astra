@@ -21,8 +21,8 @@ use astra_runtime::{
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
     tool_registry::ToolRegistry,
-    turn::agentic_loop_finalization::run_agentic_loop_with_host,
-    turn::agentic_loop_host::{
+    turn::agentic_loop::finalization::run_agentic_loop_with_host,
+    turn::agentic_loop::host::{
         AgenticLoopState, CancellationState, ErrorRecoveryState, MessagingState, SkillState,
         StallTrackingState, StopHookState, TelemetryState,
     },
@@ -135,7 +135,7 @@ async fn finalize_root_mailbox(
 
 fn extend_restricted_with_blocked_tools(
     _restricted: &mut HashSet<String>,
-    _observability_hub: Option<&Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    _observability_hub: Option<&Arc<astra_runtime::observability::ObservabilityHub>>,
 ) {
     // Pattern-library / evolution-driven tool blocking was removed along with
     // the self-evolution subsystem. The function is retained as a no-op so
@@ -370,7 +370,7 @@ pub(crate) async fn stream_chat_sse(
     // for it — so resolve_pinned skips it and tfidf can't score it,
     // leaving spawn_agent invisible to the LLM even when calls to it
     // would succeed. Mirrors the lifecycle-level delegate injection
-    // pattern (`agentic_loop_lifecycle.rs:279`) but gated on the CLI
+    // pattern in `runtime::turn::agentic_loop::lifecycle` but gated on the CLI
     // side because the spawner is a CLI-level dependency.
     maybe_pin_spawn_agent_schema(&mut registry, p.agent_spawner.is_some());
     let pinned_schema_tokens = registry.total_pinned_token_cost() as u64;
@@ -667,7 +667,7 @@ pub(crate) async fn stream_chat_sse(
             circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
                 circuit_breaker_config,
             ),
-            guardrail_tuner: astra_runtime::guardrail_tuning::GuardrailTuner::default(),
+            guardrail_tuner: astra_runtime::config_admin::guardrail::GuardrailTuner::default(),
             guardrail_tuner_records_cursor: 0,
             forced_completion_soft_stop: false,
         },
@@ -748,7 +748,7 @@ pub(crate) async fn stream_chat_sse(
         message: p.message.to_string(),
         recent_tools: p.recent_tools.to_vec(),
         task_profile,
-        last_turn_policy: astra_runtime::turn::agentic_loop_host::TurnInteractionPolicy::default(),
+        last_turn_policy: astra_runtime::turn::agentic_loop::host::TurnInteractionPolicy::default(),
         api: p.api.clone(),
         api_token: p.token.to_string(),
         delegation_engine: p.delegation_engine,
@@ -1041,7 +1041,7 @@ mod tests {
     use super::detect_turn_hook_sets;
     use super::extend_restricted_with_blocked_tools;
     use super::normalize_turn_model;
-    use astra_runtime::observability_integration::ObservabilityHub;
+    use astra_runtime::observability::ObservabilityHub;
     use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
     use std::collections::HashSet;
     use std::path::Path;

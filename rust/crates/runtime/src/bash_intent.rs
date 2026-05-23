@@ -429,11 +429,11 @@ mod tests {
 
     #[test]
     fn sed_n_script_is_not_counted_as_path() {
-        let r = intent("sed -n '80,140p' rust/crates/runtime/src/turn/agentic_loop_lifecycle.rs");
+        let r = intent("sed -n '80,140p' rust/crates/runtime/src/turn/agentic_loop/lifecycle.rs");
         assert!(!r.mutating);
         assert_eq!(
             r.read_targets,
-            vec!["rust/crates/runtime/src/turn/agentic_loop_lifecycle.rs"]
+            vec!["rust/crates/runtime/src/turn/agentic_loop/lifecycle.rs"]
         );
     }
 

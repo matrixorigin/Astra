@@ -12,16 +12,18 @@ use crate::theme;
 use crossterm::style::Stylize;
 
 fn build_fallback_delegation_engine()
--> std::sync::Arc<astra_runtime::server::delegation_engine::DelegationEngine> {
+-> std::sync::Arc<astra_runtime::server::delegation::engine::DelegationEngine> {
     let mut registry = astra_services::AgentProfileRegistry::new();
     super::delegate_subrun::register_default_agents(&mut registry);
     let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
     let run_store = std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
-    let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
+    let engine = astra_runtime::server::delegation::engine::DelegationEngine::with_executor(
         registry,
-        std::sync::Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store)),
-        std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new()),
-        std::sync::Arc::new(astra_runtime::server::delegation_engine::StubSubRunExecutor),
+        std::sync::Arc::new(astra_runtime::server::run::engine::RunEngine::new(
+            run_store,
+        )),
+        std::sync::Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new()),
+        std::sync::Arc::new(astra_runtime::server::delegation::engine::StubSubRunExecutor),
     );
     std::sync::Arc::new(engine)
 }
@@ -247,8 +249,7 @@ mod tests {
         state.set_session_id("sess-plan".to_string());
         state.turn = 7;
 
-        let hub =
-            std::sync::Arc::new(astra_runtime::observability_integration::ObservabilityHub::new());
+        let hub = std::sync::Arc::new(astra_runtime::observability::ObservabilityHub::new());
         let session = hub.start_session("user-1", "sess-plan");
         state.observability_hub = Some(hub.clone());
         state.observability_session = Some(session.clone());

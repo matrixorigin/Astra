@@ -118,7 +118,9 @@ mod tests {
         let mut state = super::SessionState::default();
         let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
             std::sync::Arc::new(astra_messaging::InProcessTransport::new()),
-            std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new()),
+            std::sync::Arc::new(
+                astra_runtime::server::delegation::engine::DelegationTracker::new(),
+            ),
         ));
         let root_addr = astra_messaging::AgentAddress::new("run-root", "root");
         state.root_mailbox = Some(router.register(root_addr.clone(), None).await.unwrap());
@@ -149,17 +151,17 @@ mod tests {
     async fn clear_auth_runtime_drops_multi_agent_runtime() {
         let mut state = super::SessionState::default();
         state.delegation_engine = Some(std::sync::Arc::new(
-            astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
+            astra_runtime::server::delegation::engine::DelegationEngine::with_executor(
                 std::sync::Arc::new(tokio::sync::RwLock::new(
                     astra_services::AgentProfileRegistry::new(),
                 )),
-                std::sync::Arc::new(astra_runtime::server::run_engine::RunEngine::new(
+                std::sync::Arc::new(astra_runtime::server::run::engine::RunEngine::new(
                     std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default()),
                 )),
                 std::sync::Arc::new(
-                    astra_runtime::server::delegation_engine::DelegationTracker::new(),
+                    astra_runtime::server::delegation::engine::DelegationTracker::new(),
                 ),
-                std::sync::Arc::new(astra_runtime::server::delegation_engine::StubSubRunExecutor),
+                std::sync::Arc::new(astra_runtime::server::delegation::engine::StubSubRunExecutor),
             ),
         ));
         state.agent_spawner = Some(std::sync::Arc::new(
@@ -167,14 +169,16 @@ mod tests {
                 astra_messaging::AgentMailboxRouter::new(
                     std::sync::Arc::new(astra_messaging::InProcessTransport::new()),
                     std::sync::Arc::new(
-                        astra_runtime::server::delegation_engine::DelegationTracker::new(),
+                        astra_runtime::server::delegation::engine::DelegationTracker::new(),
                     ),
                 ),
             )),
         ));
         let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
             std::sync::Arc::new(astra_messaging::InProcessTransport::new()),
-            std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new()),
+            std::sync::Arc::new(
+                astra_runtime::server::delegation::engine::DelegationTracker::new(),
+            ),
         ));
         let root_addr = astra_messaging::AgentAddress::new("run-root", "root");
         state.root_mailbox = Some(router.register(root_addr.clone(), None).await.unwrap());
@@ -216,17 +220,17 @@ mod tests {
 
         let mut state = super::SessionState::default();
         state.delegation_engine = Some(std::sync::Arc::new(
-            astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
+            astra_runtime::server::delegation::engine::DelegationEngine::with_executor(
                 std::sync::Arc::new(tokio::sync::RwLock::new(
                     astra_services::AgentProfileRegistry::new(),
                 )),
-                std::sync::Arc::new(astra_runtime::server::run_engine::RunEngine::new(
+                std::sync::Arc::new(astra_runtime::server::run::engine::RunEngine::new(
                     std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default()),
                 )),
                 std::sync::Arc::new(
-                    astra_runtime::server::delegation_engine::DelegationTracker::new(),
+                    astra_runtime::server::delegation::engine::DelegationTracker::new(),
                 ),
-                std::sync::Arc::new(astra_runtime::server::delegation_engine::StubSubRunExecutor),
+                std::sync::Arc::new(astra_runtime::server::delegation::engine::StubSubRunExecutor),
             ),
         ));
         state.agent_spawner = Some(std::sync::Arc::new(
@@ -234,7 +238,7 @@ mod tests {
                 astra_messaging::AgentMailboxRouter::new(
                     std::sync::Arc::new(astra_messaging::InProcessTransport::new()),
                     std::sync::Arc::new(
-                        astra_runtime::server::delegation_engine::DelegationTracker::new(),
+                        astra_runtime::server::delegation::engine::DelegationTracker::new(),
                     ),
                 ),
             )),

@@ -23,7 +23,7 @@
 use std::sync::{Arc, Mutex};
 
 use astra_runtime::server::server_loop_host::{CapturedLlmRequest, ServerAgenticLoopHostBuilder};
-use astra_runtime::turn::agentic_loop_host::make_test_loop_state;
+use astra_runtime::turn::agentic_loop::host::make_test_loop_state;
 use astra_runtime::{FernetTokenEncryptor, MatrixOneSettings};
 use serde_json::{Value, json};
 

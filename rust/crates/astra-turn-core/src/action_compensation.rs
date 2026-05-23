@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::cloud_approval_policy::{
+use super::cloud::approval_policy::{
     CloudGatedToolKind, bash_command_is_read_only, cloud_gated_tool_kind_with_args,
 };
-use super::tool_result_semantics::is_resource_limit_output;
+use crate::tool::result::semantics::is_resource_limit_output;
 use astra_sandbox::{CommandRisk, analyze_command_risks};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1335,7 +1335,7 @@ mod tests {
             }
         }
 
-        for &tool_name in crate::cloud_approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS.iter() {
+        for &tool_name in crate::cloud::approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS.iter() {
             let profile = tool_action_profile(tool_name, &sample_args(tool_name));
             assert_ne!(
                 profile.category,

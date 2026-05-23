@@ -13,8 +13,8 @@ use astra_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
-    turn::agentic_loop_finalization::run_agentic_loop_with_host,
-    turn::agentic_loop_host::{
+    turn::agentic_loop::finalization::run_agentic_loop_with_host,
+    turn::agentic_loop::host::{
         AgenticLoopOutcome, AgenticLoopState, CancellationState, MessagingState, SkillState,
         StopHookState,
     },
@@ -270,7 +270,7 @@ fn stream_event_to_agent_live_kind(
         }
         StreamEvent::StatusLine(text) => Some(AgentLiveEventKind::Status(text)),
         StreamEvent::PermissionAutoApproved { tool, reason } => Some(AgentLiveEventKind::Status(
-            astra_turn_core::permission_notice::format_auto_approved_permission(&tool, &reason)
+            astra_turn_core::permission::notice::format_auto_approved_permission(&tool, &reason)
                 .trim()
                 .to_string(),
         )),
@@ -676,7 +676,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             recent_tools: Vec::new(),
             task_profile,
             last_turn_policy:
-                astra_runtime::turn::agentic_loop_host::TurnInteractionPolicy::default(),
+                astra_runtime::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             api: self.api.clone(),
             api_token: token.clone(),
             delegation_engine: None,

@@ -19,7 +19,7 @@ use astra_runtime::messaging::{
     AckConfig, AgentAddress, AgentMailboxRouter, AgentMessage, DeadLetterQueue, DeadLetterReason,
     InProcessTransport, MessagePayload, MessageTarget, PendingAckTracker,
 };
-use astra_runtime::server::delegation_engine::DelegationTracker;
+use astra_runtime::server::delegation::engine::DelegationTracker;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -140,7 +140,7 @@ fn bench_inprocess_transport(c: &mut Criterion) {
             for i in 0..10 {
                 let child_addr = addr(&format!("r-child-{i}"), &format!("agent-{i}"));
                 let delegation_id = "del-bench";
-                dt.record_sub_run(astra_runtime::server::delegation_engine::SubRunRecord {
+                dt.record_sub_run(astra_runtime::server::delegation::engine::SubRunRecord {
                     run_id: format!("r-child-{i}"),
                     parent_run_id: "r1".into(),
                     delegation_id: delegation_id.into(),

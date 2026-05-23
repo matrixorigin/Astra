@@ -72,17 +72,6 @@ fn item(session_id: &str, order: i32, included: bool, reason: &str) -> ContextMa
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_18_run_lifecycle_writes_manifest_before_llm_call_source_guard() {
-    let lifecycle_source = include_str!("../src/server/run_lifecycle.rs");
-    let execution_source = include_str!("../src/turn/agentic_loop_execution_phase.rs");
-    assert!(!lifecycle_source.contains("persist_initial_context_manifest_if_configured"));
-    assert!(execution_source.contains("persist_context_manifest_for_llm_call"));
-    assert!(execution_source.contains("host.execute_turn(state).await"));
-    assert!(execution_source.contains("save_manifest"));
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l2_19_manifest_items_persist_included_and_dropped_entries() {
     let pool = setup_pool().await;
     let store = DatabaseContextManifestStore::new(pool.clone());

@@ -1,6 +1,6 @@
 use super::*;
-use astra_runtime::observability_integration::TurnTiming;
-use astra_runtime::observability_integration::{FuzzyMatchEvent, FuzzyMatchOutcome};
+use astra_runtime::observability::TurnTiming;
+use astra_runtime::observability::{FuzzyMatchEvent, FuzzyMatchOutcome};
 use astra_turn_core::context_assembly_trace::*;
 use serde_json::json;
 
@@ -114,8 +114,7 @@ fn make_executor_with_session(
     let dir = tempfile::tempdir().unwrap();
     let mut executor = ToolExecutor::new(dir.path());
 
-    let session =
-        astra_runtime::observability_integration::ObservabilitySession::new_simple("test-session");
+    let session = astra_runtime::observability::ObservabilitySession::new_simple("test-session");
 
     let session_arc = std::sync::Arc::new(std::sync::RwLock::new(session));
     {
@@ -136,8 +135,7 @@ fn make_executor_with_session_and_fuzzy(
     let dir = tempfile::tempdir().unwrap();
     let mut executor = ToolExecutor::new(dir.path());
 
-    let session =
-        astra_runtime::observability_integration::ObservabilitySession::new_simple("test-session");
+    let session = astra_runtime::observability::ObservabilitySession::new_simple("test-session");
 
     let session_arc = std::sync::Arc::new(std::sync::RwLock::new(session));
     {

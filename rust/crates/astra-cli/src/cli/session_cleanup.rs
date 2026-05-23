@@ -164,25 +164,26 @@ pub(super) async fn finalize_session(state: &mut SessionState) {
             .as_ref()
             .and_then(|arc| arc.read().ok())
         {
-            Some(guard) => astra_runtime::lesson_extractor::summarise_from_runtime(
+            Some(guard) => astra_runtime::learning::extractor::summarise_from_runtime(
                 &state.tool_health_entries,
                 Some(&*guard),
             ),
-            None => astra_runtime::lesson_extractor::summarise_from_runtime(
+            None => astra_runtime::learning::extractor::summarise_from_runtime(
                 &state.tool_health_entries,
                 None,
             ),
         };
-        let signal_lessons = astra_runtime::lesson_extractor::extract_lessons(
+        let signal_lessons = astra_runtime::learning::extractor::extract_lessons(
             &summary,
             state.ingestion_user_id.as_deref().unwrap_or("unknown"),
             "generic",
             None,
         );
-        let mut all_lessons: Vec<astra_runtime::lesson_synthesizer::ExtractedLesson> = Vec::new();
+        let mut all_lessons: Vec<astra_runtime::learning::synthesizer::ExtractedLesson> =
+            Vec::new();
         for cl in signal_lessons {
-            if astra_runtime::lesson_synthesizer::is_synthesized_lesson_acceptable(&cl.action) {
-                all_lessons.push(astra_runtime::lesson_synthesizer::ExtractedLesson {
+            if astra_runtime::learning::synthesizer::is_synthesized_lesson_acceptable(&cl.action) {
+                all_lessons.push(astra_runtime::learning::synthesizer::ExtractedLesson {
                     memory_type: "semantic",
                     content: format!("💡 LESSON: {}", cl.action),
                     trust_tier: "T3",

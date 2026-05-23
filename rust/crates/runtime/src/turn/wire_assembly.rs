@@ -310,7 +310,7 @@ fn is_completion_signal(content: &str) -> bool {
 pub(crate) fn assemble_llm_messages(
     system_messages: Vec<Value>,
     volatile_preamble: Vec<Value>,
-    drained_volatile: Vec<crate::turn::agentic_loop_host::VolatileInjection>,
+    drained_volatile: Vec<crate::turn::agentic_loop::host::VolatileInjection>,
     compacted_messages: Vec<Value>,
     attachments: &PostCompactAttachments<'_>,
     session_id: &str,
@@ -477,7 +477,7 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
 /// function preserves insertion order so if multiple kinds were queued
 /// they come out in the order they were produced.
 pub(crate) fn render_drained_volatile(
-    drained: &[crate::turn::agentic_loop_host::VolatileInjection],
+    drained: &[crate::turn::agentic_loop::host::VolatileInjection],
 ) -> String {
     let mut out = String::new();
     for inj in drained {

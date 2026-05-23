@@ -609,7 +609,7 @@ pub(crate) fn initialize_session_state(
         .join(".astra")
         .join("observability");
     state.observability_hub = Some(std::sync::Arc::new(
-        astra_runtime::observability_integration::ObservabilityHub::with_storage(obs_path),
+        astra_runtime::observability::ObservabilityHub::with_storage(obs_path),
     ));
 
     // Create an early observability session so the very first turn can record

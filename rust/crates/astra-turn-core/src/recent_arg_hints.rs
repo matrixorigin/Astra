@@ -14,7 +14,7 @@
 
 use serde_json::Value;
 
-use crate::tool_argument_hints::{
+use crate::tool::args::hints::{
     command_hint_from_args, normalize_llm_function_arguments, path_hint_from_args,
 };
 

@@ -13,8 +13,8 @@ use std::time::Instant;
 
 use astra_runtime::{
     tool_registry::ToolRegistry,
-    turn::agentic_headless_round::HeadlessStderrStyle,
-    turn::agentic_loop_host::{
+    turn::agentic::headless_round::HeadlessStderrStyle,
+    turn::agentic_loop::host::{
         AgenticLoopHost, AgenticLoopState, HostTurnResult, TurnInteractionMode,
         interaction_scoped_tool_restrictions,
     },
@@ -286,7 +286,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 "plan_approval_overlay",
             );
             state.push_volatile(
-                astra_runtime::turn::agentic_loop_host::VolatileKind::PlanModeMarker,
+                astra_runtime::turn::agentic_loop::host::VolatileKind::PlanModeMarker,
                 format!(
                     "[mode={new_mode}] User approved the plan; you are now executing in `{new_mode}` permission mode. Mutating tools are available — proceed to implement the plan."
                 ),
@@ -311,7 +311,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 "mid_turn_ui",
             );
             state.push_volatile(
-                astra_runtime::turn::agentic_loop_host::VolatileKind::PlanModeMarker,
+                astra_runtime::turn::agentic_loop::host::VolatileKind::PlanModeMarker,
                 format!(
                     "[mode={mode_after}] User pressed Shift+Tab; permission mode is now `{mode_after}`. Adjust your tool selection accordingly."
                 ),
@@ -337,7 +337,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // runtime nudges by the call below.
         if self.perm_manager.mode() == crate::permission_manager::PermissionMode::Plan {
             state.push_volatile(
-                astra_runtime::turn::agentic_loop_host::VolatileKind::PlanModeMarker,
+                astra_runtime::turn::agentic_loop::host::VolatileKind::PlanModeMarker,
                 "[mode=plan] You are in read-only plan mode. Investigate with read-only tools (read_file, grep, glob, web_fetch, …); mutating tools are intentionally absent from the schema. When the plan is ready call `exit_plan_mode(plan=\"<markdown>\")` so the user can approve and choose an execution mode. Do not attempt edits or shell mutations in this mode.",
             );
 
@@ -349,7 +349,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             // and submits via the tool, or asks the user a question.
             if let Some(reminder) = plan_mode_missed_exit_reminder(&state.messages) {
                 state.push_volatile(
-                    astra_runtime::turn::agentic_loop_host::VolatileKind::Corrective,
+                    astra_runtime::turn::agentic_loop::host::VolatileKind::Corrective,
                     reminder,
                 );
             }
@@ -580,10 +580,10 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             let bridge_fps = turn_result.core.bridge_injection_fingerprints.as_ref();
             if let Ok(mut session) = session_lock.write() {
                 session.observe_bridge_injections_partial(
-                    astra_runtime::observability_integration::BridgeInjectionTexts {
+                    astra_runtime::observability::BridgeInjectionTexts {
                         lessons: &lessons_text,
                         self_awareness: &self_awareness_text,
-                        ..astra_runtime::observability_integration::BridgeInjectionTexts::EMPTY
+                        ..astra_runtime::observability::BridgeInjectionTexts::EMPTY
                     },
                     bridge_fps,
                 );
@@ -706,7 +706,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // Forward to stream event channel (even in suppress mode)
         if let Some(tx) = &self.stream_event_tx {
             if let Some((tool, reason)) =
-                astra_turn_core::permission_notice::parse_auto_approved_permission(&line)
+                astra_turn_core::permission::notice::parse_auto_approved_permission(&line)
             {
                 let _ = tx.send(super::super::StreamEvent::PermissionAutoApproved { tool, reason });
             } else {
@@ -822,7 +822,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 
     fn on_turn_completed(
         &mut self,
-        state: &astra_runtime::turn::agentic_loop_host::AgenticLoopState,
+        state: &astra_runtime::turn::agentic_loop::host::AgenticLoopState,
     ) {
         // Drop the per-turn ask_user channel so a stale sender from
         // this turn doesn't leak into background sub-runs that share

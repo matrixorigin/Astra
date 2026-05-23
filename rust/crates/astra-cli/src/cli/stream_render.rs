@@ -133,7 +133,7 @@ fn approval_stale_revalidation_error(
 fn approval_batch_group_key(
     tool: &str,
     args: &Value,
-    risk_tags: &[astra_turn_core::permission_engine::RiskTag],
+    risk_tags: &[astra_turn_core::permission::engine::RiskTag],
 ) -> astra_turn_core::approval_batch_group::ApprovalBatchGroupKey {
     let side_effect_label =
         match astra_turn_core::cloud_approval_policy::cloud_gated_tool_kind_with_args(
@@ -153,8 +153,8 @@ fn approval_batch_group_key(
 }
 
 fn push_risk_tag(
-    tags: &mut Vec<astra_turn_core::permission_engine::RiskTag>,
-    tag: astra_turn_core::permission_engine::RiskTag,
+    tags: &mut Vec<astra_turn_core::permission::engine::RiskTag>,
+    tag: astra_turn_core::permission::engine::RiskTag,
 ) {
     if !tags.contains(&tag) {
         tags.push(tag);
@@ -181,13 +181,13 @@ fn approval_scope_context_for_tool(
     args: &Value,
     source_agent_present: bool,
     workspace_untrusted: bool,
-) -> astra_turn_core::permission_scope::ScopeAvailabilityContext {
-    use astra_turn_core::permission_engine::RiskTag;
-    use astra_turn_core::permission_memory_profile::{
+) -> astra_turn_core::permission::scope::ScopeAvailabilityContext {
+    use astra_turn_core::permission::engine::RiskTag;
+    use astra_turn_core::permission::memory_profile::{
         PersistentMemoryBlock, permission_memory_profile,
     };
 
-    let mut ctx = astra_turn_core::permission_scope::ScopeAvailabilityContext {
+    let mut ctx = astra_turn_core::permission::scope::ScopeAvailabilityContext {
         source_agent_present,
         workspace_untrusted,
         ..Default::default()
@@ -214,7 +214,7 @@ fn approval_scope_context_for_tool(
     push_risk_tag(&mut ctx.risk_tags, base_tag);
 
     if let Some(path) = args.get("path").and_then(|v| v.as_str())
-        && astra_turn_core::permission_redact::matches_sensitive_path(path)
+        && astra_turn_core::permission::redact::matches_sensitive_path(path)
     {
         push_risk_tag(&mut ctx.risk_tags, RiskTag::WritesSensitiveFile);
     }
@@ -249,14 +249,14 @@ fn approval_scope_context_for_tool(
 }
 
 fn approval_has_stable_memory_target(tool: &str, args: &Value) -> bool {
-    astra_turn_core::permission_memory_profile::permission_memory_profile(tool, args)
+    astra_turn_core::permission::memory_profile::permission_memory_profile(tool, args)
         .has_stable_target
 }
 
 fn approval_default_always_scope(
-    ctx: &astra_turn_core::permission_scope::ScopeAvailabilityContext,
-) -> astra_turn_core::permission_scope::AllowScope {
-    use astra_turn_core::permission_scope::{AllowScope, permitted_scopes};
+    ctx: &astra_turn_core::permission::scope::ScopeAvailabilityContext,
+) -> astra_turn_core::permission::scope::AllowScope {
+    use astra_turn_core::permission::scope::{AllowScope, permitted_scopes};
 
     let scopes = permitted_scopes(ctx);
     let is_available = |target| {
@@ -283,27 +283,27 @@ fn approval_memory_preview(tool: &str, args: &Value, scope_label: Option<&str>) 
         .map(|label| format!("under `{label}/`"))
         .unwrap_or_else(|| "in this workspace".to_string());
 
-    astra_turn_core::permission_match_target::remember_preview(tool, args, &location)
+    astra_turn_core::permission::match_target::remember_preview(tool, args, &location)
 }
 
 fn audit_scope_for_always(
-    scope: astra_turn_core::permission_scope::AllowScope,
-) -> astra_turn_core::permission_audit::AllowScope {
+    scope: astra_turn_core::permission::scope::AllowScope,
+) -> astra_turn_core::permission::audit::AllowScope {
     match scope {
-        astra_turn_core::permission_scope::AllowScope::OnceThisCall => {
-            astra_turn_core::permission_audit::AllowScope::OnceThisCall
+        astra_turn_core::permission::scope::AllowScope::OnceThisCall => {
+            astra_turn_core::permission::audit::AllowScope::OnceThisCall
         }
-        astra_turn_core::permission_scope::AllowScope::RestOfTurn => {
-            astra_turn_core::permission_audit::AllowScope::RestOfTurn
+        astra_turn_core::permission::scope::AllowScope::RestOfTurn => {
+            astra_turn_core::permission::audit::AllowScope::RestOfTurn
         }
-        astra_turn_core::permission_scope::AllowScope::RestOfSession => {
-            astra_turn_core::permission_audit::AllowScope::RestOfSession
+        astra_turn_core::permission::scope::AllowScope::RestOfSession => {
+            astra_turn_core::permission::audit::AllowScope::RestOfSession
         }
-        astra_turn_core::permission_scope::AllowScope::Project => {
-            astra_turn_core::permission_audit::AllowScope::Project
+        astra_turn_core::permission::scope::AllowScope::Project => {
+            astra_turn_core::permission::audit::AllowScope::Project
         }
-        astra_turn_core::permission_scope::AllowScope::User => {
-            astra_turn_core::permission_audit::AllowScope::User
+        astra_turn_core::permission::scope::AllowScope::User => {
+            astra_turn_core::permission::audit::AllowScope::User
         }
     }
 }
@@ -320,11 +320,11 @@ enum ApprovalMemoryAction {
 
 fn approval_memory_action(
     response: &super::chat_stream::ApprovalResponse,
-    always_scope: astra_turn_core::permission_scope::AllowScope,
+    always_scope: astra_turn_core::permission::scope::AllowScope,
     stale_revalidation_passed: bool,
 ) -> ApprovalMemoryAction {
     use super::chat_stream::ApprovalResponse;
-    use astra_turn_core::permission_scope::AllowScope;
+    use astra_turn_core::permission::scope::AllowScope;
 
     if response.is_approved() && !stale_revalidation_passed {
         return ApprovalMemoryAction::RecordDenySession;
@@ -348,20 +348,21 @@ fn approval_memory_action(
 
 fn persist_scoped_allow_rule(
     pm: &mut crate::permission_manager::PermissionManager,
-    target: astra_turn_core::permission_audit::PersistTarget,
+    target: astra_turn_core::permission::audit::PersistTarget,
     tool: &str,
     args: &Value,
-    match_target: Option<&astra_turn_core::permission_match_target::AllowMatchTarget>,
+    match_target: Option<&astra_turn_core::permission::match_target::AllowMatchTarget>,
     save_warning_tx: Option<&super::chat_stream::StreamEventTx>,
 ) {
-    let default_target = astra_turn_core::permission_match_target::default_match_target(tool, args);
+    let default_target =
+        astra_turn_core::permission::match_target::default_match_target(tool, args);
     let match_target = match_target.unwrap_or(&default_target);
     let location = match target {
-        astra_turn_core::permission_audit::PersistTarget::Project => "in this workspace",
-        astra_turn_core::permission_audit::PersistTarget::User => "for this user",
+        astra_turn_core::permission::audit::PersistTarget::Project => "in this workspace",
+        astra_turn_core::permission::audit::PersistTarget::User => "for this user",
     };
     let remember_preview =
-        astra_turn_core::permission_match_target::remember_preview(tool, args, location);
+        astra_turn_core::permission::match_target::remember_preview(tool, args, location);
     pm.record_approval_with_match_target(tool, args, match_target, true);
     let rule = crate::permission_manager::PermissionManager::make_allow_rule_with_match_target(
         tool,
@@ -369,13 +370,13 @@ fn persist_scoped_allow_rule(
         match_target,
     );
     match target {
-        astra_turn_core::permission_audit::PersistTarget::Project => pm.add_allow_rule(&rule),
-        astra_turn_core::permission_audit::PersistTarget::User => pm.add_user_allow_rule(&rule),
+        astra_turn_core::permission::audit::PersistTarget::Project => pm.add_allow_rule(&rule),
+        astra_turn_core::permission::audit::PersistTarget::User => pm.add_user_allow_rule(&rule),
     }
     if let Some(err) = pm.take_last_save_error() {
         let target_label = match target {
-            astra_turn_core::permission_audit::PersistTarget::Project => ".kiro/permissions.json",
-            astra_turn_core::permission_audit::PersistTarget::User => "~/.astra/permissions.json",
+            astra_turn_core::permission::audit::PersistTarget::Project => ".kiro/permissions.json",
+            astra_turn_core::permission::audit::PersistTarget::User => "~/.astra/permissions.json",
         };
         astra_core::agent_warn!(
             "permission",
@@ -394,10 +395,11 @@ fn apply_approval_memory_action(
     action: ApprovalMemoryAction,
     tool: &str,
     args: &Value,
-    match_target: Option<&astra_turn_core::permission_match_target::AllowMatchTarget>,
+    match_target: Option<&astra_turn_core::permission::match_target::AllowMatchTarget>,
     save_warning_tx: Option<&super::chat_stream::StreamEventTx>,
 ) {
-    let default_target = astra_turn_core::permission_match_target::default_match_target(tool, args);
+    let default_target =
+        astra_turn_core::permission::match_target::default_match_target(tool, args);
     let match_target = match_target.unwrap_or(&default_target);
     match action {
         ApprovalMemoryAction::None => {}
@@ -413,7 +415,7 @@ fn apply_approval_memory_action(
         ApprovalMemoryAction::PersistProjectRule => {
             persist_scoped_allow_rule(
                 pm,
-                astra_turn_core::permission_audit::PersistTarget::Project,
+                astra_turn_core::permission::audit::PersistTarget::Project,
                 tool,
                 args,
                 Some(match_target),
@@ -423,7 +425,7 @@ fn apply_approval_memory_action(
         ApprovalMemoryAction::PersistUserRule => {
             persist_scoped_allow_rule(
                 pm,
-                astra_turn_core::permission_audit::PersistTarget::User,
+                astra_turn_core::permission::audit::PersistTarget::User,
                 tool,
                 args,
                 Some(match_target),
@@ -589,8 +591,7 @@ pub(super) struct EdgeSseContext<'a> {
     /// (see `AutoTuningEngine::should_disable_streaming_speculation`). `None`
     /// for tests and non-observable contexts; production supplies it from
     /// `CliAgenticLoopHost`.
-    pub observability_hub:
-        Option<std::sync::Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    pub observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
 }
 
 // ─── CLI SSE stream host ─────────────────────────────────────────────────────
@@ -668,8 +669,7 @@ struct CliSseStreamHost<'a> {
     streaming_tool_exec:
         Option<std::sync::Arc<astra_turn_core::streaming_tool_exec::StreamingToolExecutor>>,
     /// Optional ObservabilityHub for streaming-speculation metric reporting.
-    observability_hub:
-        Option<std::sync::Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
     /// Set when posting edge-side tool or approval results receives 401.
     auth_failure: bool,
 }
@@ -2643,12 +2643,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     // language. The persisted rule remains an internal
                     // detail; the UI must not leak `Bash(...:*)` or
                     // other permissions.json DSL.
-                    if always_scope == astra_turn_core::permission_scope::AllowScope::Project {
+                    if always_scope == astra_turn_core::permission::scope::AllowScope::Project {
                         // Include the package root when available so
                         // the user understands the memory boundary.
                         let cwd = std::env::current_dir().unwrap_or_default();
                         let scope_label =
-                            astra_turn_core::permission_cwd_root::nearest_package_root(&cwd, None)
+                            astra_turn_core::permission::cwd_root::nearest_package_root(&cwd, None)
                                 .as_deref()
                                 .map(|p| {
                                     cwd.strip_prefix(p)
@@ -2687,21 +2687,21 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     if t == "bash" {
                         if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
                             if let Some(script_path) =
-                                astra_turn_core::permission_script_preview::looks_like_local_script(
+                                astra_turn_core::permission::script_preview::looks_like_local_script(
                                     cmd,
                                 )
                             {
                                 let cwd = std::env::current_dir()
                                     .unwrap_or_else(|_| std::path::PathBuf::from("."));
                                 if let Ok(preview) =
-                                    astra_turn_core::permission_script_preview::build_script_preview(
+                                    astra_turn_core::permission::script_preview::build_script_preview(
                                         &script_path,
                                         &cwd,
                                     )
                                 {
                                     if preview.has_destructive_hit
                                         && !metadata.risk_tags.contains(
-                                            &astra_turn_core::permission_engine::RiskTag::BashExecute,
+                                            &astra_turn_core::permission::engine::RiskTag::BashExecute,
                                         )
                                     {
                                         // Already pushed above
@@ -2836,14 +2836,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             .map(audit_scope_for_always);
                         let match_target = response.match_target().cloned().or_else(|| {
                             response.always_scope(always_scope).map(|_| {
-                                astra_turn_core::permission_match_target::default_match_target(
+                                astra_turn_core::permission::match_target::default_match_target(
                                     &t, args,
                                 )
                             })
                         });
-                        astra_turn_core::permission_audit::record_resolved_for_session(
+                        astra_turn_core::permission::audit::record_resolved_for_session(
                             self.executor.active_session_id().as_deref(),
-                            astra_turn_core::permission_audit::ApprovalResolvedEvent {
+                            astra_turn_core::permission::audit::ApprovalResolvedEvent {
                                 timestamp_ms,
                                 correlation_id,
                                 request_key,
@@ -2945,7 +2945,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 } else {
                     "Error: skill resolver not available".to_string()
                 }
-            } else if tool == astra_runtime::turn::agentic_loop_host::DELEGATE_TOOL_NAME {
+            } else if tool == astra_runtime::turn::agentic_loop::host::DELEGATE_TOOL_NAME {
                 // Delegate calls are intercepted at Step 3b of the agentic loop
                 // (partition_and_execute_delegations) where the delegation engine
                 // runs sub-agents. Return a deferred acknowledgment so the server
@@ -3020,15 +3020,15 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         resp_rx.await.unwrap_or(ApprovalResponse::Deny)
                                     };
                                     let selected_scope = response.always_scope(
-                                        astra_turn_core::permission_scope::AllowScope::Project,
+                                        astra_turn_core::permission::scope::AllowScope::Project,
                                     );
                                     match selected_scope {
-                                        Some(astra_turn_core::permission_scope::AllowScope::Project) => {
+                                        Some(astra_turn_core::permission::scope::AllowScope::Project) => {
                                             // Persistent: writes a tool-level allow
                                             // rule to settings for future sessions.
                                             let rule = crate::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
                                             let remember_preview =
-                                                astra_turn_core::permission_match_target::remember_preview(
+                                                astra_turn_core::permission::match_target::remember_preview(
                                                     &sandbox_tool_key,
                                                     &guard_args,
                                                     "in this workspace",
@@ -3050,16 +3050,16 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                             pm.trust_sandbox_root_from_reason(sandbox_msg);
                                         }
                                         Some(
-                                            astra_turn_core::permission_scope::AllowScope::RestOfSession,
+                                            astra_turn_core::permission::scope::AllowScope::RestOfSession,
                                         ) => {
                                             pm.trust_sandbox_root_from_reason(sandbox_msg);
                                         }
                                         Some(
-                                            astra_turn_core::permission_scope::AllowScope::User,
+                                            astra_turn_core::permission::scope::AllowScope::User,
                                         ) => {
                                             let rule = crate::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
                                             let remember_preview =
-                                                astra_turn_core::permission_match_target::remember_preview(
+                                                astra_turn_core::permission::match_target::remember_preview(
                                                     &sandbox_tool_key,
                                                     &guard_args,
                                                     "for this user",
@@ -3081,17 +3081,17 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                             pm.trust_sandbox_root_from_reason(sandbox_msg);
                                         }
                                         Some(
-                                            astra_turn_core::permission_scope::AllowScope::OnceThisCall
-                                            | astra_turn_core::permission_scope::AllowScope::RestOfTurn,
+                                            astra_turn_core::permission::scope::AllowScope::OnceThisCall
+                                            | astra_turn_core::permission::scope::AllowScope::RestOfTurn,
                                         )
                                         | None => {}
                                     }
                                     if matches!(
                                         selected_scope,
                                         Some(
-                                            astra_turn_core::permission_scope::AllowScope::Project
-                                                | astra_turn_core::permission_scope::AllowScope::RestOfSession
-                                                | astra_turn_core::permission_scope::AllowScope::User
+                                            astra_turn_core::permission::scope::AllowScope::Project
+                                                | astra_turn_core::permission::scope::AllowScope::RestOfSession
+                                                | astra_turn_core::permission::scope::AllowScope::User
                                         )
                                     ) {
                                         pm.record_approval(&sandbox_tool_key, Some(args), true);
@@ -6728,7 +6728,7 @@ mod tests {
 
     #[test]
     fn approval_batch_group_key_carries_risk_tags_for_accept_all_gate() {
-        use astra_turn_core::permission_engine::RiskTag;
+        use astra_turn_core::permission::engine::RiskTag;
 
         let safe = approval_batch_group_key(
             "read_file",
@@ -6750,18 +6750,18 @@ mod tests {
 
     #[test]
     fn approval_default_always_scope_prefers_project_for_benign_request() {
-        let ctx = astra_turn_core::permission_scope::ScopeAvailabilityContext::default();
+        let ctx = astra_turn_core::permission::scope::ScopeAvailabilityContext::default();
 
         assert_eq!(
             approval_default_always_scope(&ctx),
-            astra_turn_core::permission_scope::AllowScope::Project
+            astra_turn_core::permission::scope::AllowScope::Project
         );
     }
 
     #[test]
     fn approval_default_always_scope_uses_session_for_non_persistent_risks() {
-        use astra_turn_core::permission_engine::RiskTag;
-        use astra_turn_core::permission_scope::{AllowScope, ScopeAvailabilityContext};
+        use astra_turn_core::permission::engine::RiskTag;
+        use astra_turn_core::permission::scope::{AllowScope, ScopeAvailabilityContext};
 
         let sensitive = ScopeAvailabilityContext {
             risk_tags: vec![RiskTag::WritesSensitiveFile],
@@ -6794,8 +6794,8 @@ mod tests {
 
     #[test]
     fn approval_scope_context_tags_git_safety_as_non_persistent_risk() {
-        use astra_turn_core::permission_engine::RiskTag;
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::engine::RiskTag;
+        use astra_turn_core::permission::scope::AllowScope;
 
         let ctx = approval_scope_context_for_tool(
             "bash",
@@ -6813,7 +6813,7 @@ mod tests {
 
     #[test]
     fn approval_scope_context_allows_always_for_cd_wrapped_single_command() {
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::scope::AllowScope;
 
         let ctx = approval_scope_context_for_tool(
             "bash",
@@ -6831,7 +6831,7 @@ mod tests {
 
     #[test]
     fn approval_scope_context_allows_always_for_cd_wrapped_cargo_build() {
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::scope::AllowScope;
 
         let ctx = approval_scope_context_for_tool(
             "bash",
@@ -6849,7 +6849,7 @@ mod tests {
 
     #[test]
     fn approval_scope_context_allows_always_for_cd_wrapped_cargo_test() {
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::scope::AllowScope;
 
         let ctx = approval_scope_context_for_tool(
             "bash",
@@ -6867,7 +6867,7 @@ mod tests {
 
     #[test]
     fn approval_scope_context_allows_always_for_read_only_pipe_chain() {
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::scope::AllowScope;
 
         let ctx = approval_scope_context_for_tool(
             "bash",
@@ -6885,7 +6885,7 @@ mod tests {
 
     #[test]
     fn approval_scope_context_allows_always_for_quoted_grep_regex() {
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::scope::AllowScope;
 
         let ctx = approval_scope_context_for_tool(
             "bash",
@@ -6933,7 +6933,7 @@ mod tests {
 
     #[test]
     fn approval_scope_context_blocks_persistent_memory_without_command_shape() {
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::scope::AllowScope;
 
         let ctx = approval_scope_context_for_tool("bash", &serde_json::json!({}), false, false);
 
@@ -6943,7 +6943,7 @@ mod tests {
 
     #[test]
     fn approval_scope_context_allows_exact_memory_for_interpreter_command() {
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::scope::AllowScope;
 
         let ctx = approval_scope_context_for_tool(
             "bash",
@@ -6966,7 +6966,7 @@ mod tests {
 
     #[test]
     fn approval_default_always_scope_uses_turn_for_unsound_rule_shapes() {
-        use astra_turn_core::permission_scope::{AllowScope, ScopeAvailabilityContext};
+        use astra_turn_core::permission::scope::{AllowScope, ScopeAvailabilityContext};
 
         let compound = ScopeAvailabilityContext {
             is_compound_command: true,
@@ -6990,7 +6990,7 @@ mod tests {
     #[test]
     fn approval_memory_action_does_not_remember_allow_once() {
         use super::chat_stream::ApprovalResponse;
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::scope::AllowScope;
 
         assert_eq!(
             approval_memory_action(&ApprovalResponse::AllowOnce, AllowScope::Project, true),
@@ -7001,7 +7001,7 @@ mod tests {
     #[test]
     fn approval_memory_action_maps_always_scope_to_storage_effect() {
         use super::chat_stream::ApprovalResponse;
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::scope::AllowScope;
 
         assert_eq!(
             approval_memory_action(&ApprovalResponse::AlwaysAllow, AllowScope::Project, true),

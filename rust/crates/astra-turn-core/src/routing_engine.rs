@@ -26,7 +26,7 @@
 //! ```
 
 use crate::routing_metrics::{DisambiguationAction, IntentDisambiguation};
-use crate::tool_registry_state::ConversationState;
+use crate::tool::registry::state::ConversationState;
 
 // Re-export core types from astra-pipeline
 pub use astra_pipeline::routing::{

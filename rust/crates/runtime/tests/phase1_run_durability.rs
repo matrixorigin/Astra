@@ -8,7 +8,7 @@ use astra_runtime::{
     AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo,
     SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
     SessionRecord, SessionService, SessionUpdateRequestData, build_app,
-    server::run_engine::RunEngine,
+    server::run::engine::RunEngine,
 };
 use astra_services::runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DatabaseRunStateStore,

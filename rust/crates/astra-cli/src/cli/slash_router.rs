@@ -443,7 +443,7 @@ pub(crate) async fn handle_slash_command(
                     ),
                 },
                 "trace" => {
-                    for line in astra_turn_core::permission_audit::format_snapshot_lines(50) {
+                    for line in astra_turn_core::permission::audit::format_snapshot_lines(50) {
                         eprintln!("{line}");
                     }
                 }
@@ -453,7 +453,7 @@ pub(crate) async fn handle_slash_command(
                         eprintln!("  {} Missing export path", theme::icon_warn());
                     } else {
                         let lines =
-                            astra_turn_core::permission_audit::snapshot_redacted_jsonl_lines();
+                            astra_turn_core::permission::audit::snapshot_redacted_jsonl_lines();
                         let body = if lines.is_empty() {
                             String::new()
                         } else {

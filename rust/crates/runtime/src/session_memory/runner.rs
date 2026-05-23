@@ -10,9 +10,9 @@ use astra_turn_core::cloud_session_memory_extract::{
     SESSION_MEMORY_TEMPLATE, build_extraction_prompt,
 };
 
-use crate::memory_relevance::LlmConnParams;
+use crate::memory_hooks::relevance::LlmConnParams;
 use crate::turn::cloud::memoria_compact::MemoriaClient;
-use crate::turn::llm_client::{
+use crate::turn::llm::client::{
     apply_provider_auth, build_provider_request_body, llm_request_url_for_provider,
     parse_nonstream_response_for_provider,
 };

@@ -12,7 +12,7 @@ use astra_services::{
 };
 use astra_turn_core::thinking_config::ThinkingConfig;
 
-use crate::turn::llm_client::{LlmCancel, call_llm_and_collect};
+use crate::turn::llm::client::{LlmCancel, call_llm_and_collect};
 
 const SKILLIFY_EXTRACTION_OUTPUT_TOKENS: usize = 5000;
 const SKILLIFY_SYNTHESIS_OUTPUT_TOKENS: usize = 7000;

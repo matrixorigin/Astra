@@ -20,7 +20,7 @@ use astra_runtime::prompts::{CacheScope, PromptSection};
 /// to call. Production call site: `bridge_inprocess.rs:~1590`.
 ///
 /// This function does not yet exist — that's the red.
-use astra_runtime::turn::bridge_inprocess::skill_listing_section_for_edge_profile;
+use astra_runtime::turn::bridge::inprocess::skill_listing_section_for_edge_profile;
 
 #[test]
 fn non_empty_skill_listing_yields_session_scope_section() {

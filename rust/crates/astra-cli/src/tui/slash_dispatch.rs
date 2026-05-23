@@ -338,7 +338,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 }
                 "trace" => {
                     use crate::tui::bottom_pane::info_view::InfoView;
-                    let lines = astra_turn_core::permission_audit::format_snapshot_lines(50);
+                    let lines = astra_turn_core::permission::audit::format_snapshot_lines(50);
                     ctx.bottom_pane
                         .push_view(Box::new(InfoView::from_plain("Permission Trace", lines)));
                     SlashResult::Handled
@@ -349,7 +349,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                         ctx.show_error("Missing export path".to_string());
                         return SlashResult::Handled;
                     }
-                    let lines = astra_turn_core::permission_audit::snapshot_redacted_jsonl_lines();
+                    let lines = astra_turn_core::permission::audit::snapshot_redacted_jsonl_lines();
                     let body = if lines.is_empty() {
                         String::new()
                     } else {
@@ -1371,7 +1371,7 @@ pub(crate) fn handle_view_result(
         }
         "Trace" => {
             use crate::tui::bottom_pane::info_view::InfoView;
-            let lines = astra_turn_core::permission_audit::format_snapshot_lines(50);
+            let lines = astra_turn_core::permission::audit::format_snapshot_lines(50);
             bottom_pane.push_view(Box::new(
                 InfoView::from_plain("Permission Trace", lines).with_reopen("/allow trace"),
             ));

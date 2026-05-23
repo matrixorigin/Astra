@@ -1,6 +1,6 @@
 use super::*;
 use crate::is_session_not_found_error;
-use astra_runtime::server::team_orchestrator::ExecutionPhase;
+use astra_runtime::server::team::orchestrator::ExecutionPhase;
 #[allow(unused_imports)]
 use astra_services::team_persistence::{TeamPersistenceService, WorktreeMode};
 use std::collections::HashMap;
@@ -957,29 +957,31 @@ pub(super) async fn handle_team_command(
             let _ = super::agent_loader::load_and_merge(&project_root, &mut profile_registry);
             let profile_registry = Arc::new(tokio::sync::RwLock::new(profile_registry));
             let run_store = Arc::new(astra_services::runs::InMemoryRunStateStore::default());
-            let run_engine = Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store));
+            let run_engine = Arc::new(astra_runtime::server::run::engine::RunEngine::new(
+                run_store,
+            ));
             let tracker =
-                Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
+                Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
             let transport = Arc::new(astra_messaging::InProcessTransport::new());
             let mailbox_router = Arc::new(astra_messaging::AgentMailboxRouter::new(
                 transport,
                 tracker.clone(),
             ));
             let delegation_engine = Arc::new(
-                astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
+                astra_runtime::server::delegation::engine::DelegationEngine::with_executor(
                     profile_registry.clone(),
                     run_engine.clone(),
                     tracker.clone(),
                     Arc::new(executor),
                 )
                 .with_gate(Arc::new(
-                    astra_runtime::server::delegation_engine::DefaultQualityGate::default(),
+                    astra_runtime::server::delegation::engine::DefaultQualityGate::default(),
                 ))
                 .with_mailbox_router(mailbox_router),
             );
 
             // Wire live progress callback for phase updates
-            let progress: astra_runtime::server::team_orchestrator::ProgressCallback =
+            let progress: astra_runtime::server::team::orchestrator::ProgressCallback =
                 Arc::new(move |phase: ExecutionPhase| match phase {
                     ExecutionPhase::Preparing {
                         team_name,
@@ -1045,7 +1047,7 @@ pub(super) async fn handle_team_command(
                     }
                 });
 
-            let config = astra_runtime::server::team_orchestrator::OrchestratorConfig {
+            let config = astra_runtime::server::team::orchestrator::OrchestratorConfig {
                 user_id: user_id.clone(),
                 session_id,
                 // Must match the profile registered by register_default_agents()
@@ -1054,7 +1056,7 @@ pub(super) async fn handle_team_command(
             };
 
             let orchestrator =
-                astra_runtime::server::team_orchestrator::TeamExecutionOrchestrator::new(
+                astra_runtime::server::team::orchestrator::TeamExecutionOrchestrator::new(
                     team_store,
                     delegation_engine.clone(),
                     tracker.clone(),
@@ -1085,7 +1087,7 @@ pub(super) async fn handle_team_command(
             let render_cancel = cancel_token.clone();
             let member_count = cli_team.members.len();
             let progress_renderer = tokio::spawn(async move {
-                use astra_runtime::turn::agentic_headless_round::HeadlessStderrStyle;
+                use astra_runtime::turn::agentic::headless_round::HeadlessStderrStyle;
                 use std::collections::HashMap as ProgressMap;
 
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
@@ -1209,14 +1211,14 @@ pub(super) async fn handle_team_command(
             // Display report header with status
             eprintln!();
             match report.status {
-                astra_runtime::server::team_orchestrator::TeamExecutionStatus::Completed => {
+                astra_runtime::server::team::orchestrator::TeamExecutionStatus::Completed => {
                     eprintln!(
                         "  ✅ Team '{}' completed successfully {}",
                         team_name.green().bold(),
                         format!("({})", format_duration(elapsed)).dim()
                     );
                 }
-                astra_runtime::server::team_orchestrator::TeamExecutionStatus::Partial => {
+                astra_runtime::server::team::orchestrator::TeamExecutionStatus::Partial => {
                     eprintln!(
                         "  ⚠️  Team '{}' completed partially {}",
                         team_name.yellow().bold(),
@@ -1226,7 +1228,7 @@ pub(super) async fn handle_team_command(
                         eprintln!("    {} {}", theme::icon_warn(), err.as_str().yellow());
                     }
                 }
-                astra_runtime::server::team_orchestrator::TeamExecutionStatus::CompletedWithConflicts => {
+                astra_runtime::server::team::orchestrator::TeamExecutionStatus::CompletedWithConflicts => {
                     eprintln!(
                         "  {}  Team '{}' completed with merge conflicts {}",
                         theme::icon_warn(), team_name.yellow().bold(),
@@ -1236,7 +1238,7 @@ pub(super) async fn handle_team_command(
                         eprintln!("    {} {}", theme::icon_warn(), err.as_str().yellow());
                     }
                 }
-                astra_runtime::server::team_orchestrator::TeamExecutionStatus::CompletedOverBudget => {
+                astra_runtime::server::team::orchestrator::TeamExecutionStatus::CompletedOverBudget => {
                     eprintln!(
                         "  {}  Team '{}' completed over budget {}",
                         theme::icon_warn(), team_name.yellow().bold(),
@@ -1246,7 +1248,7 @@ pub(super) async fn handle_team_command(
                         eprintln!("    {} {}", theme::icon_warn(), err.as_str().yellow());
                     }
                 }
-                astra_runtime::server::team_orchestrator::TeamExecutionStatus::Failed => {
+                astra_runtime::server::team::orchestrator::TeamExecutionStatus::Failed => {
                     eprintln!(
                         "  {} Team '{}' execution failed {}",
                         theme::icon_err(), team_name.red().bold(),

@@ -100,7 +100,7 @@ impl LlmConflictResolver {
     ) -> Result<ResolvedFile, String> {
         let messages = Self::build_prompt(task_context, agent_id, conflict);
 
-        let result = crate::turn::llm_client::call_llm_and_collect(
+        let result = crate::turn::llm::client::call_llm_and_collect(
             &messages,
             &[], // no tools
             &self.model,
@@ -113,7 +113,7 @@ impl LlmConflictResolver {
             &self.provider,
             Some(8192),
             false,
-            crate::turn::llm_client::LlmCancel::None,
+            crate::turn::llm::client::LlmCancel::None,
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await

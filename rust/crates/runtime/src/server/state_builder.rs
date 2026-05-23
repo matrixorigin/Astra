@@ -1,4 +1,5 @@
 use super::*;
+use crate::server::run::lifecycle::AgenticRunLifecycleService;
 
 mod bridge;
 mod core;
@@ -6,9 +7,9 @@ mod runtime;
 
 struct RuntimeWiring {
     matrix_rt: Arc<crate::matrix_cloud_runtime::MatrixCloudRuntime>,
-    run_lifecycle: super::run_lifecycle::AgenticRunLifecycleService,
+    run_lifecycle: AgenticRunLifecycleService,
     profile_registry: Arc<astra_services::AgentProfileRegistry>,
-    delegation_engine: Arc<crate::server::delegation_engine::DelegationEngine>,
+    delegation_engine: Arc<crate::server::delegation::engine::DelegationEngine>,
     team_store: Arc<dyn astra_services::team_persistence::TeamPersistenceService>,
     resource_governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>,
 }

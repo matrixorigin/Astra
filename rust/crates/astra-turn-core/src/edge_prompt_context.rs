@@ -10,7 +10,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use crate::tool_argument_hints::{command_hint_from_args, path_hint_from_args};
+use crate::tool::args::hints::{command_hint_from_args, path_hint_from_args};
 
 /// Build a compact workspace context object for the LLM / server (`edge_profile.workspace`).
 /// Detects project type, key files, and top-level directory structure. Capped implicitly by listing limits.

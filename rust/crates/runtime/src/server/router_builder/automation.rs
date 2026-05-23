@@ -14,19 +14,21 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/events",
-            post(events::create_event_handler).get(events::list_events_handler),
+            post(crate::service_handlers::events::create_event_handler)
+                .get(crate::service_handlers::events::list_events_handler),
         )
         .route(
             "/events/{event_id}",
-            get(events::get_event_handler).delete(events::delete_event_handler),
+            get(crate::service_handlers::events::get_event_handler)
+                .delete(crate::service_handlers::events::delete_event_handler),
         )
         .route(
             "/events/causal-chain/{causal_chain_id}",
-            get(events::get_causal_chain_handler),
+            get(crate::service_handlers::events::get_causal_chain_handler),
         )
         .route(
             "/events/session/{session_id}",
-            get(events::get_session_events_handler),
+            get(crate::service_handlers::events::get_session_events_handler),
         )
         .route(
             "/context",
@@ -38,76 +40,97 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/decisions",
-            post(decisions::record_decision_handler).get(decisions::list_decisions_handler),
+            post(crate::service_handlers::decisions::record_decision_handler)
+                .get(crate::service_handlers::decisions::list_decisions_handler),
         )
         .route(
             "/decisions/{decision_id}",
-            get(decisions::get_decision_handler),
+            get(crate::service_handlers::decisions::get_decision_handler),
         )
         .route(
             "/decisions/{decision_id}/audit",
-            get(decisions::audit_decision_handler),
+            get(crate::service_handlers::decisions::audit_decision_handler),
         )
-        .route("/jobs", post(jobs::submit_job_handler))
-        .route("/jobs/webhook", post(jobs::job_webhook_handler))
+        .route(
+            "/jobs",
+            post(crate::service_handlers::jobs::submit_job_handler),
+        )
+        .route(
+            "/jobs/webhook",
+            post(crate::service_handlers::jobs::job_webhook_handler),
+        )
         .route(
             "/jobs/{job_id}",
-            get(jobs::get_job_handler).delete(jobs::cancel_job_handler),
+            get(crate::service_handlers::jobs::get_job_handler)
+                .delete(crate::service_handlers::jobs::cancel_job_handler),
         )
         .route(
             "/triggers",
-            post(triggers::create_trigger_handler).get(triggers::list_triggers_handler),
+            post(crate::service_handlers::triggers::create_trigger_handler)
+                .get(crate::service_handlers::triggers::list_triggers_handler),
         )
         .route(
             "/triggers/{trigger_id}",
-            delete(triggers::delete_trigger_handler),
+            delete(crate::service_handlers::triggers::delete_trigger_handler),
         )
         .route(
             "/triggers/{trigger_id}/fire",
-            post(triggers::fire_webhook_handler),
+            post(crate::service_handlers::triggers::fire_webhook_handler),
         )
-        .route("/workflows", get(workflows::list_workflows_handler))
+        .route(
+            "/workflows",
+            get(crate::service_handlers::workflows::list_workflows_handler),
+        )
         .route(
             "/sandbox",
-            post(sandbox::create_sandbox_handler).get(sandbox::list_sandboxes_handler),
+            post(crate::service_handlers::sandbox::create_sandbox_handler)
+                .get(crate::service_handlers::sandbox::list_sandboxes_handler),
         )
         .route(
             "/sandbox/{name}",
-            get(sandbox::get_sandbox_handler).delete(sandbox::delete_sandbox_handler),
+            get(crate::service_handlers::sandbox::get_sandbox_handler)
+                .delete(crate::service_handlers::sandbox::delete_sandbox_handler),
         )
         .route(
             "/branches",
-            post(branches::create_branch_handler).delete(branches::delete_branch_handler),
+            post(crate::service_handlers::branches::create_branch_handler)
+                .delete(crate::service_handlers::branches::delete_branch_handler),
         )
-        .route("/branches/diff", post(branches::diff_branch_handler))
-        .route("/branches/merge", post(branches::merge_branch_handler))
+        .route(
+            "/branches/diff",
+            post(crate::service_handlers::branches::diff_branch_handler),
+        )
+        .route(
+            "/branches/merge",
+            post(crate::service_handlers::branches::merge_branch_handler),
+        )
         .route(
             "/branches/cost-estimate",
-            post(branches::estimate_cost_handler),
+            post(crate::service_handlers::branches::estimate_cost_handler),
         )
         .route(
             "/data-versioning/checkpoints",
-            post(data_versioning::create_checkpoint_handler)
-                .get(data_versioning::list_checkpoints_handler),
+            post(data_layer::versioning::create_checkpoint_handler)
+                .get(data_layer::versioning::list_checkpoints_handler),
         )
         .route(
             "/data-versioning/checkpoints/{name}/events",
-            get(data_versioning::get_events_at_checkpoint_handler),
+            get(data_layer::versioning::get_events_at_checkpoint_handler),
         )
         .route(
             "/data-versioning/lineage/{event_id}/chain",
-            get(data_versioning::get_causal_chain_handler),
+            get(data_layer::versioning::get_causal_chain_handler),
         )
         .route(
             "/data-versioning/lineage/{event_id}/upstream",
-            get(data_versioning::trace_upstream_handler),
+            get(data_layer::versioning::trace_upstream_handler),
         )
         .route(
             "/data-versioning/sandbox/{name}/checkpoint",
-            post(data_versioning::sandbox_checkpoint_handler),
+            post(data_layer::versioning::sandbox_checkpoint_handler),
         )
         .route(
             "/data-versioning/sandbox/{name}/restore",
-            post(data_versioning::sandbox_restore_handler),
+            post(data_layer::versioning::sandbox_restore_handler),
         )
 }

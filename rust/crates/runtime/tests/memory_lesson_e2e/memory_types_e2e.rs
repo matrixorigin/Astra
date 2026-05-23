@@ -228,7 +228,7 @@ fn none_mode_prompt_is_empty() {
 
 #[test]
 fn quality_gate_filters_extraction_output() {
-    use astra_runtime::lesson_synthesizer::is_high_quality_lesson;
+    use astra_runtime::learning::synthesizer::is_high_quality_lesson;
 
     // These should PASS the gate (10+ chars, no hedging)
     assert!(is_high_quality_lesson(

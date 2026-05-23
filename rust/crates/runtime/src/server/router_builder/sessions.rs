@@ -4,86 +4,86 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
     router
         .route(
             "/sessions",
-            post(session_handlers::create_session_handler)
-                .get(session_handlers::list_sessions_handler),
+            post(session::session_handlers::create_session_handler)
+                .get(session::session_handlers::list_sessions_handler),
         )
         .route(
             "/sessions/{session_id}",
-            get(session_handlers::get_session_handler)
-                .put(session_handlers::update_session_handler)
-                .delete(session_handlers::delete_session_handler),
+            get(session::session_handlers::get_session_handler)
+                .put(session::session_handlers::update_session_handler)
+                .delete(session::session_handlers::delete_session_handler),
         )
         .route(
             "/sessions/{session_id}/state",
-            get(session_handlers::get_session_state_handler),
+            get(session::session_handlers::get_session_state_handler),
         )
         .route(
             "/sessions/{session_id}/transcript",
-            get(session_handlers::get_session_transcript_handler),
+            get(session::session_handlers::get_session_transcript_handler),
         )
         .route(
             "/sessions/{session_id}/turns/{turn_id}/trace",
-            get(session_trace::get_session_turn_trace_handler),
+            get(session::session_trace::get_session_turn_trace_handler),
         )
         .route(
             "/sessions/{session_id}/devices",
-            get(session_handlers::list_session_devices_handler),
+            get(session::session_handlers::list_session_devices_handler),
         )
         .route(
             "/sessions/{session_id}/device/revoke",
-            post(session_handlers::revoke_session_device_handler),
+            post(session::session_handlers::revoke_session_device_handler),
         )
         .route(
             "/sessions/{session_id}/device/trust",
-            post(session_handlers::trust_session_device_handler),
+            post(session::session_handlers::trust_session_device_handler),
         )
         .route(
             "/sessions/{session_id}/device/events",
-            get(session_handlers::session_device_events_handler),
+            get(session::session_handlers::session_device_events_handler),
         )
         .route(
             "/sessions/{session_id}/close",
-            post(session_handlers::close_session_handler),
+            post(session::session_handlers::close_session_handler),
         )
         .route(
             "/sessions/{session_id}/resume",
-            post(session_handlers::resume_session_handler),
+            post(session::session_handlers::resume_session_handler),
         )
         .route(
             "/sessions/{session_id}/todos:execute",
-            post(session_todo_handlers::execute_todo_handler),
+            post(session::session_todo_handlers::execute_todo_handler),
         )
         .route(
             "/sessions/{session_id}/todos",
-            get(session_todo_handlers::load_todos_handler),
+            get(session::session_todo_handlers::load_todos_handler),
         )
         .route(
             "/users/me/todos",
-            get(session_todo_handlers::list_user_todos_handler),
+            get(session::session_todo_handlers::list_user_todos_handler),
         )
         .route(
             "/sessions/{session_id}/cancel",
-            post(session_handlers::cancel_session_handler),
+            post(session::session_handlers::cancel_session_handler),
         )
         .route(
             "/sessions/{session_id}/activity",
-            get(session_handlers::session_activity_handler),
+            get(session::session_handlers::session_activity_handler),
         )
         .route(
             "/sessions/{session_id}/artifacts",
-            get(session_handlers::list_session_artifacts_handler),
+            get(session::session_handlers::list_session_artifacts_handler),
         )
         .route(
             "/sessions/{session_id}/artifacts/latest/{artifact_kind}",
-            get(session_handlers::get_latest_session_artifact_handler),
+            get(session::session_handlers::get_latest_session_artifact_handler),
         )
         .route(
             "/sessions/{session_id}/artifacts/{artifact_id}",
-            get(session_handlers::get_session_artifact_handler),
+            get(session::session_handlers::get_session_artifact_handler),
         )
         .route(
             "/sessions/{session_id}/artifacts/{artifact_id}/download",
-            get(session_handlers::download_session_artifact_handler),
+            get(session::session_handlers::download_session_artifact_handler),
         )
         .nest(
             "/sessions/{session_id}/harness",
@@ -91,11 +91,11 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
         )
         .route(
             "/sessions/{session_id}/replay",
-            post(replay::replay_session_handler),
+            post(crate::service_handlers::replay::replay_session_handler),
         )
         .route(
             "/sessions/{session_id}/replay/compare",
-            get(replay::compare_replay_handler),
+            get(crate::service_handlers::replay::compare_replay_handler),
         )
         .route(
             "/sessions/{session_id}/audit/summary",
@@ -147,10 +147,22 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
 fn harness_routes(state: AppState) -> Router<AppState> {
     use axum::routing::get;
     Router::new()
-        .route("/snapshot", get(harness_handlers::get_harness_snapshot))
-        .route("/history", get(harness_handlers::get_harness_history))
-        .route("/diff", get(harness_handlers::get_harness_diff))
-        .route("/stream", get(harness_handlers::stream_harness_snapshots))
+        .route(
+            "/snapshot",
+            get(crate::server::harness::handlers::get_harness_snapshot),
+        )
+        .route(
+            "/history",
+            get(crate::server::harness::handlers::get_harness_history),
+        )
+        .route(
+            "/diff",
+            get(crate::server::harness::handlers::get_harness_diff),
+        )
+        .route(
+            "/stream",
+            get(crate::server::harness::handlers::stream_harness_snapshots),
+        )
         .with_state(state)
 }
 

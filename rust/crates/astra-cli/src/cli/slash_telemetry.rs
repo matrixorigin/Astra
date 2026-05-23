@@ -57,13 +57,11 @@ pub(super) fn handle_telemetry_command(arg: &str, state: &SessionState) {
 }
 
 fn show_summary(
-    hub: &std::sync::Arc<astra_runtime::observability_integration::ObservabilityHub>,
-    session: &std::sync::Arc<
-        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-    >,
+    hub: &std::sync::Arc<astra_runtime::observability::ObservabilityHub>,
+    session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     state: &SessionState,
 ) {
-    use astra_runtime::observability_integration::FuzzyMatchOutcome;
+    use astra_runtime::observability::FuzzyMatchOutcome;
 
     let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
 
@@ -245,9 +243,7 @@ fn show_summary(
 }
 
 fn show_turn_timings(
-    session: &std::sync::Arc<
-        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-    >,
+    session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
 ) {
     let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
 
@@ -299,9 +295,7 @@ fn show_turn_timings(
 }
 
 fn show_drift_analysis(
-    session: &std::sync::Arc<
-        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-    >,
+    session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     _state: &SessionState,
 ) {
     let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
@@ -343,9 +337,7 @@ fn show_drift_analysis(
 }
 
 fn show_decisions(
-    session: &std::sync::Arc<
-        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-    >,
+    session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
 ) {
     let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
 
@@ -440,7 +432,7 @@ fn show_decisions(
 }
 
 fn show_user_profile(
-    hub: &std::sync::Arc<astra_runtime::observability_integration::ObservabilityHub>,
+    hub: &std::sync::Arc<astra_runtime::observability::ObservabilityHub>,
     state: &SessionState,
 ) {
     let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
@@ -578,9 +570,7 @@ fn show_help() {
 // ─── Deep Trace: Context Assembly ────────────────────────────────────────────
 
 fn show_context_trace(
-    session: &std::sync::Arc<
-        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-    >,
+    session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     arg: &str,
 ) {
     let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
@@ -840,9 +830,7 @@ fn show_context_trace(
 // ─── Deep Trace: Tool Selection ──────────────────────────────────────────────
 
 fn show_tool_trace(
-    session: &std::sync::Arc<
-        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-    >,
+    session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     arg: &str,
 ) {
     let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
@@ -968,9 +956,7 @@ fn show_tool_trace(
 // ─── Deep Trace: History Compression ─────────────────────────────────────────
 
 fn show_compression_trace(
-    session: &std::sync::Arc<
-        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-    >,
+    session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     arg: &str,
 ) {
     let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
@@ -1117,9 +1103,7 @@ fn show_compression_trace(
 // ─── Deep Trace: Token Budget Evolution ──────────────────────────────────────
 
 fn show_budget_evolution(
-    session: &std::sync::Arc<
-        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-    >,
+    session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
 ) {
     let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
     let traces = &session_guard.context_traces;
@@ -1227,9 +1211,7 @@ fn show_budget_evolution(
 // ─── Deep Trace: Context Detail (Hierarchical Proportional) ──────────────────
 
 fn show_context_detail(
-    session: &std::sync::Arc<
-        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-    >,
+    session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     arg: &str,
 ) {
     let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
@@ -1572,9 +1554,7 @@ fn show_context_detail(
 // ─── Session-Level Analysis ──────────────────────────────────────────────────
 
 fn show_session_analysis(
-    session: &std::sync::Arc<
-        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-    >,
+    session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
 ) {
     use astra_turn_core::context_assembly_trace::TraceAggregation;
 

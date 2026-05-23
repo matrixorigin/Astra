@@ -761,7 +761,7 @@ async fn l3_11b_real_run_engine_populates_projection() {
     let delegation_id = format!("delegation-{}", Uuid::new_v4());
     let projection_store = Arc::new(DatabaseStateProjectionStore::new(pool.clone()));
     let run_store = Arc::new(DatabaseRunStateStore::new(pool.clone()));
-    let run_engine = astra_runtime::server::run_engine::RunEngine::new(run_store)
+    let run_engine = astra_runtime::server::run::engine::RunEngine::new(run_store)
         .with_projection_store(projection_store);
 
     run_engine

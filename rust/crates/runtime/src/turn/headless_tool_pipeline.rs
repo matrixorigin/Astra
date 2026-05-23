@@ -5,7 +5,7 @@ use astra_services::session_journal::ToolCallRecord;
 use astra_thin_client::ThinClient;
 use serde_json::{Map, Value};
 
-use super::agentic_headless_round::{HeadlessRoundTerminal, PermissionSyncHandle};
+use super::agentic::headless_round::{HeadlessRoundTerminal, PermissionSyncHandle};
 use astra_pipeline::step_protocol::{IdempotencyKey, InMemoryIdempotencyCache};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
@@ -386,7 +386,7 @@ mod tests {
     use serde_json::json;
 
     use crate::skills::hooks::{HookAction, ToolEventHook, ToolEventHookRegistry, ToolEventKind};
-    use crate::turn::agentic_headless_round::NoopHeadlessTerminal;
+    use crate::turn::agentic::headless_round::NoopHeadlessTerminal;
     use astra_pipeline::step_protocol::CachedToolResult;
     use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 

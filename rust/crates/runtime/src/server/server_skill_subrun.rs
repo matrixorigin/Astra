@@ -20,7 +20,7 @@ use astra_services::LlmTokenServiceConfig;
 
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
-use crate::turn::agentic_loop_host::{
+use crate::turn::agentic_loop::host::{
     AgenticLoopHost as _, AgenticLoopState, CancellationState, RequestConstraints, SkillState,
     StopHookState, TurnInteractionPolicy, run_agentic_loop_with_host,
 };

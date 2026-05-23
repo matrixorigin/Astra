@@ -16,9 +16,9 @@ use astra_runtime::{
     pipeline::step_recorder::StepRecorder,
     prompts,
     semantic_dedup::SemanticDedup,
-    turn::agentic_headless_round::HeadlessStderrStyle,
-    turn::agentic_loop_finalization::run_agentic_loop_with_host,
-    turn::agentic_loop_host::{
+    turn::agentic::headless_round::HeadlessStderrStyle,
+    turn::agentic_loop::finalization::run_agentic_loop_with_host,
+    turn::agentic_loop::host::{
         AgenticLoopHost, AgenticLoopState, CancellationState, HostTurnResult, SkillState,
         StopHookState, TurnInteractionMode, TurnInteractionPolicy,
         interaction_scoped_tool_restrictions,
@@ -798,7 +798,7 @@ fn resolve_subrun_schemas(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_runtime::turn::agentic_loop_host::ASK_USER_TOOL_NAME;
+    use astra_runtime::turn::agentic_loop::host::ASK_USER_TOOL_NAME;
 
     fn schema(name: &str) -> Value {
         json!({

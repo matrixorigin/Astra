@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 
-use astra_runtime::observability_integration::ObservabilitySessionRollbackSnapshot;
+use astra_runtime::observability::ObservabilitySessionRollbackSnapshot;
 use serde_json::Value;
 
 use super::{ToolExecutor, task_mgmt::TaskManagerSnapshot};

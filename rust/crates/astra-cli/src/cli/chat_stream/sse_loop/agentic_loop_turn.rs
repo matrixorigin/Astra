@@ -16,7 +16,7 @@ use astra_runtime::{
     pipeline::step_recorder::StepRecorder,
     prompts,
     tool_registry::{self, ToolRegistry},
-    turn::agentic_loop_host::{TurnInteractionMode, TurnInteractionPolicy},
+    turn::agentic_loop::host::{TurnInteractionMode, TurnInteractionPolicy},
     turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools,
     turn::agentic_turn_telemetry::{
         capture_first_selection_report_if_empty, record_first_latency_ms_since,
@@ -313,7 +313,7 @@ struct PrepareChatTurnRequest<'a> {
     recent_rejections: Vec<(String, String)>,
     /// Optional shared observability hub, forwarded from the SSE fetch request
     /// so the per-turn SelfModel ingest can read `hub.tuning().recent_signals()`.
-    observability_hub: Option<&'a Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    observability_hub: Option<&'a Arc<astra_runtime::observability::ObservabilityHub>>,
     append_system_prompt: Option<&'a str>,
     /// Whether the current permission mode is `Plan`. When true the schema-
     /// preparation step adds every mutating tool to `restricted_tools` so the
@@ -479,7 +479,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                     &ranked,
                 );
                 memoria_insights_text =
-                    astra_runtime::memoria_insights::render_digest(&memory_contents);
+                    astra_runtime::memory_hooks::insights::render_digest(&memory_contents);
                 // Send "useful" feedback for retrieved memories (fire-and-forget)
                 let feedback_ids: Vec<String> = memory_hits
                     .iter()
@@ -821,7 +821,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         let user_message_tokens = prompts::estimate_str_tokens(ctx.message) as u32;
 
         // System prompt tokens: the system prompt is assembled by the runtime
-        // (bridge_inprocess.rs) and sent back via `context_meta` SSE event.
+        // (`bridge/inprocess.rs`) and sent back via `context_meta` SSE event.
         // Use 0 here as placeholder — runtime will overwrite via record_token_budget.
         let system_prompt_tokens = 0u32;
 
@@ -1010,8 +1010,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     /// window when publishing SelfModel inputs. Threaded through so the
     /// per-turn ingest can attach `recent_signals` to the session without
     /// needing a global singleton.
-    pub observability_hub:
-        Option<&'a Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    pub observability_hub: Option<&'a Arc<astra_runtime::observability::ObservabilityHub>>,
     pub append_system_prompt: Option<&'a str>,
 }
 struct ChatTurnSseFetchUi {
@@ -1270,7 +1269,7 @@ pub(crate) async fn fetch_chat_turn_sse(
 
 #[cfg(test)]
 mod tests {
-    use astra_runtime::turn::agentic_loop_host::{ASK_USER_TOOL_NAME, TurnInteractionMode};
+    use astra_runtime::turn::agentic_loop::host::{ASK_USER_TOOL_NAME, TurnInteractionMode};
     use astra_turn_core::chat_history_openai::merge_skill_names_track;
     use serde_json::json;
 

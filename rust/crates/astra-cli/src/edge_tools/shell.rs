@@ -2889,7 +2889,7 @@ fn sigkill_process_group(child: &mut std::process::Child) {
 /// Extracted as a pure function so the behaviour can be regression-
 /// tested without spawning a real `cargo`/`pytest` subprocess.
 pub(crate) fn apply_build_test_outcome_to_session(
-    session: &mut astra_runtime::observability_integration::ObservabilitySession,
+    session: &mut astra_runtime::observability::ObservabilitySession,
     parsed: &astra_tools::build_test::BuildTestResult,
 ) {
     if parsed.tests_failed > 0 || !parsed.error_messages.is_empty() {

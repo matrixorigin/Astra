@@ -44,7 +44,7 @@ pub(crate) async fn build_one_shot_spawner(
     let skill_resolver = build_turn_skill_resolver(unified_skill_registry).await;
 
     let tracker =
-        std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
+        std::sync::Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
     let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
     let mailbox_router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
         transport,
@@ -131,7 +131,7 @@ pub(crate) async fn initialize_multi_agent_runtime(
 
     let run_store = std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
     let tracker =
-        std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
+        std::sync::Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
     let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
     let mailbox_router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
         transport,
@@ -183,9 +183,11 @@ pub(crate) async fn initialize_multi_agent_runtime(
     let prefix_store: std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink> =
         std::sync::Arc::new(astra_turn_core::fork_prefix_store::InMemoryPrefixStore::new());
 
-    let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
+    let engine = astra_runtime::server::delegation::engine::DelegationEngine::with_executor(
         registry,
-        std::sync::Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store)),
+        std::sync::Arc::new(astra_runtime::server::run::engine::RunEngine::new(
+            run_store,
+        )),
         tracker,
         std::sync::Arc::new(delegate_executor),
     )

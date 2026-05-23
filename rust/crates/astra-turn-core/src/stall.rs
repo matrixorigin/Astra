@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::tool_call_shape::{tool_call_arguments_value, tool_call_name};
-use crate::tool_categories::registry;
+use crate::tool::args::shape::{tool_call_arguments_value, tool_call_name};
+use crate::tool::categories::registry;
 
 /// Errors from stall / divergence / reward-hacking heuristics (invalid configuration or inputs).
 #[derive(Debug, Clone, Error, PartialEq)]
@@ -835,7 +835,7 @@ pub fn detect_intent_drift(
 #[allow(deprecated)]
 mod tests {
     use super::*;
-    use crate::tool_registry_state::word_boundary_match;
+    use crate::tool::registry::state::word_boundary_match;
 
     fn make_sigs(rounds: &[&[&str]]) -> Vec<BTreeSet<String>> {
         rounds

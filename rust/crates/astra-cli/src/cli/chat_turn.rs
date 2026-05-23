@@ -611,11 +611,11 @@ fn maybe_checkpoint_lessons(state: &mut SessionState) {
         .as_ref()
         .and_then(|arc| arc.read().ok())
     {
-        Some(guard) => astra_runtime::lesson_extractor::summarise_from_runtime(
+        Some(guard) => astra_runtime::learning::extractor::summarise_from_runtime(
             &state.tool_health_entries,
             Some(&*guard),
         ),
-        None => astra_runtime::lesson_extractor::summarise_from_runtime(
+        None => astra_runtime::learning::extractor::summarise_from_runtime(
             &state.tool_health_entries,
             None,
         ),
@@ -637,10 +637,10 @@ fn maybe_checkpoint_lessons(state: &mut SessionState) {
     // Basic quality gate (hedging + length). Template blocklist NOT applied
     // here — these are deterministic template lessons, not LLM output.
     // Promoted to semantic T3 at session end via final checkpoint flush.
-    let memoria_lessons: Vec<astra_runtime::lesson_synthesizer::ExtractedLesson> = delta
+    let memoria_lessons: Vec<astra_runtime::learning::synthesizer::ExtractedLesson> = delta
         .into_iter()
-        .filter(|l| astra_runtime::lesson_synthesizer::is_high_quality_lesson(&l.action))
-        .map(|l| astra_runtime::lesson_synthesizer::ExtractedLesson {
+        .filter(|l| astra_runtime::learning::synthesizer::is_high_quality_lesson(&l.action))
+        .map(|l| astra_runtime::learning::synthesizer::ExtractedLesson {
             memory_type: "working",
             content: format!("💡 LESSON: {}", l.action),
             trust_tier: "T4",
@@ -660,7 +660,7 @@ fn maybe_checkpoint_lessons(state: &mut SessionState) {
 async fn filter_lessons_by_relevance(
     user_message: &str,
     lessons: Vec<astra_runtime::self_model::LessonHint>,
-    params: Option<&astra_runtime::memory_relevance::LlmConnParams>,
+    params: Option<&astra_runtime::memory_hooks::relevance::LlmConnParams>,
 ) -> Vec<astra_runtime::self_model::LessonHint> {
     let Some(params) = params else {
         return lessons;
@@ -668,7 +668,8 @@ async fn filter_lessons_by_relevance(
 
     let texts: Vec<String> = lessons.iter().map(|l| l.action.clone()).collect();
     let filtered =
-        astra_runtime::memory_relevance::filter_memories(&params, user_message, &texts).await;
+        astra_runtime::memory_hooks::relevance::filter_memories(&params, user_message, &texts)
+            .await;
 
     if filtered.len() == texts.len() {
         return lessons;
@@ -709,12 +710,13 @@ async fn maybe_load_memory_model_params(
     };
     match serde_json::from_str::<MemoryModelWire>(&body) {
         Ok(response) => {
-            state.memory_model_params = Some(astra_runtime::memory_relevance::LlmConnParams {
-                base_url: format!("{}/v1", ctx.api.api_origin()),
-                api_key: token.to_string(),
-                model_name: response.model_name,
-                provider: "openai".to_string(),
-            });
+            state.memory_model_params =
+                Some(astra_runtime::memory_hooks::relevance::LlmConnParams {
+                    base_url: format!("{}/v1", ctx.api.api_origin()),
+                    api_key: token.to_string(),
+                    model_name: response.model_name,
+                    provider: "openai".to_string(),
+                });
         }
         Err(error) => {
             tracing::warn!("memory model decode failed: {error}");
@@ -3223,7 +3225,7 @@ fn initialize_journal(state: &mut SessionState, session_id: &str) {
     // This enables TurnTraceCollector creation in the agentic loop.
     if state.observability_session.is_none() {
         state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(
-            astra_runtime::observability_integration::ObservabilitySession::new_simple(session_id),
+            astra_runtime::observability::ObservabilitySession::new_simple(session_id),
         )));
         apply_pending_adaptive_state(state);
     }
@@ -3691,7 +3693,7 @@ fn latest_context_trace_signal(state: &SessionState) -> Option<ContextTraceSigna
     }
     let obs = state.observability_session.as_ref()?;
     let guard = obs.read().ok()?;
-    astra_runtime::observability_integration::latest_context_trace_signal(&guard)
+    astra_runtime::observability::latest_context_trace_signal(&guard)
 }
 
 fn sync_context_trace_to_workspace(
@@ -3981,11 +3983,9 @@ mod tests {
 
     fn poisoned_observability_session(
         session_id: &str,
-    ) -> std::sync::Arc<
-        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-    > {
+    ) -> std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>> {
         let session = std::sync::Arc::new(std::sync::RwLock::new(
-            astra_runtime::observability_integration::ObservabilitySession::new_simple(session_id),
+            astra_runtime::observability::ObservabilitySession::new_simple(session_id),
         ));
         let poisoned = session.clone();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4278,8 +4278,7 @@ mod tests {
     #[test]
     fn sync_context_trace_copies_latest_trace_into_workspace() {
         let mut state = SessionState::default();
-        let mut obs =
-            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-trace");
+        let mut obs = astra_runtime::observability::ObservabilitySession::new_simple("sid-trace");
         obs.context_traces
             .push(astra_turn_core::context_assembly_trace::ContextAssemblyTrace {
                 turn_id: "turn-3".into(),
@@ -7433,9 +7432,7 @@ mod tests {
         // state.latest_skill_diagnosis for the next turn.
         let mut state = SessionState::default();
         let session = std::sync::Arc::new(std::sync::RwLock::new(
-            astra_runtime::observability_integration::ObservabilitySession::new_simple(
-                "p8-turn-end",
-            ),
+            astra_runtime::observability::ObservabilitySession::new_simple("p8-turn-end"),
         ));
         {
             let mut g = session.write().unwrap();
@@ -7467,9 +7464,7 @@ mod tests {
         // the cooldown state would be lost.
         let mut state = SessionState::default();
         let session = std::sync::Arc::new(std::sync::RwLock::new(
-            astra_runtime::observability_integration::ObservabilitySession::new_simple(
-                "p8-cooldown",
-            ),
+            astra_runtime::observability::ObservabilitySession::new_simple("p8-cooldown"),
         ));
         {
             let mut g = session.write().unwrap();
@@ -7504,9 +7499,7 @@ mod tests {
         // staying flat (criterion "session_stalls_delta <= 0" satisfied).
         let mut state = SessionState::default();
         let session = std::sync::Arc::new(std::sync::RwLock::new(
-            astra_runtime::observability_integration::ObservabilitySession::new_simple(
-                "r1-tracker",
-            ),
+            astra_runtime::observability::ObservabilitySession::new_simple("r1-tracker"),
         ));
         {
             let mut g = session.write().unwrap();

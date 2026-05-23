@@ -24,14 +24,14 @@ use serde_json::{Map, Value, json};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::turn::agentic_headless_round::HeadlessStderrStyle;
-use crate::turn::agentic_loop_host::{
+use crate::turn::agentic::headless_round::HeadlessStderrStyle;
+use crate::turn::agentic_loop::host::{
     AgenticLoopHost, AgenticLoopState, HostTurnResult, TurnInteractionMode, TurnInteractionPolicy,
     interaction_scoped_tool_restrictions,
 };
-use crate::turn::agentic_loop_tool_support::edge_tool_status_exit_code;
-use crate::turn::bridge_llm_stream::rate_limit_cooldown;
-use crate::turn::llm_client::{
+use crate::turn::agentic_loop::tool_support::edge_tool_status_exit_code;
+use crate::turn::bridge::llm_stream::rate_limit_cooldown;
+use crate::turn::llm::client::{
     LlmCallResult, LlmCancel, LlmStreamUpdate, call_llm_and_collect_with_request_overrides,
     call_llm_and_collect_with_request_overrides_and_stream_callback,
     call_llm_nonstream_fallback_with_request_overrides, llm_connect_timeout, llm_fallback_timeout,
@@ -115,7 +115,7 @@ fn record_full_llm_request_event(
             max_output_tokens,
         })
         .ok();
-    let trace = crate::turn::llm_exchange_capture::CaptureTrace {
+    let trace = crate::turn::llm::exchange_capture::CaptureTrace {
         session_turn_source: Some("state"),
         turn_chain_id: None,
         user_query_event_id: None,
@@ -136,7 +136,7 @@ fn record_full_llm_request_event(
                 "turn_chain_id": trace.turn_chain_id,
                 "user_query_event_id": trace.user_query_event_id,
             },
-            "request": crate::turn::llm_exchange_capture::build_capture_request_json(
+            "request": crate::turn::llm::exchange_capture::build_capture_request_json(
                 messages,
                 tools,
                 max_output_tokens,
@@ -146,7 +146,7 @@ fn record_full_llm_request_event(
             "request_summary": prompt_request_plan
                 .as_ref()
                 .map(|plan| plan.summary_json.clone())
-                .unwrap_or_else(|| crate::turn::llm_exchange_capture::build_capture_request_summary_json(
+                .unwrap_or_else(|| crate::turn::llm::exchange_capture::build_capture_request_summary_json(
                     messages,
                     tools,
                     max_output_tokens,
@@ -175,7 +175,7 @@ fn record_full_llm_response_event(
         return;
     };
     let round = buf.current_round();
-    let trace = crate::turn::llm_exchange_capture::CaptureTrace {
+    let trace = crate::turn::llm::exchange_capture::CaptureTrace {
         session_turn_source: Some("state"),
         turn_chain_id: None,
         user_query_event_id: None,
@@ -196,7 +196,7 @@ fn record_full_llm_response_event(
                 "turn_chain_id": trace.turn_chain_id,
                 "user_query_event_id": trace.user_query_event_id,
             },
-            "response": crate::turn::llm_exchange_capture::build_capture_response_json(
+            "response": crate::turn::llm::exchange_capture::build_capture_response_json(
                 outcome,
                 response,
             ),
@@ -278,7 +278,7 @@ struct ResolvedTurnLlmConfig {
     request_timeout: Option<Duration>,
 }
 
-type PipelineTurnOutcome = crate::turn::llm_context::LlmContextAssemblyOutput;
+type PipelineTurnOutcome = crate::turn::llm::context::LlmContextAssemblyOutput;
 
 #[derive(Debug, Clone)]
 struct RequestAwareSummaryClient {
@@ -374,7 +374,7 @@ async fn resolve_llm_model_for_turn(
         api_key: resolved.api_key,
         base_url: resolved.base_url,
         provider: resolved.provider,
-        cache_capability: crate::turn::llm_context::cache_capability_from_model_metadata(
+        cache_capability: crate::turn::llm::context::cache_capability_from_model_metadata(
             resolved.prompt_cache_capability,
         ),
         fallback_chain: resolved.fallback_chain,
@@ -1413,7 +1413,10 @@ impl ServerAgenticLoopHost {
         // stitcher the real path uses so matrix tests see the output of
         // volatile-preamble folding and `consolidate_mid_history_volatile_injections`.
         let mut annotated_tools = mock_pipeline.tool_schemas;
-        crate::turn::llm_context::annotate_tool_schemas_for_cache(&mut annotated_tools, &cache_cfg);
+        crate::turn::llm::context::annotate_tool_schemas_for_cache(
+            &mut annotated_tools,
+            &cache_cfg,
+        );
         let (provider, model) = self
             .mock_provider
             .clone()
@@ -1440,7 +1443,7 @@ impl ServerAgenticLoopHost {
             &cache_cfg,
         );
         if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
-            crate::turn::llm_context::augment_manifest_trace_with_wire(
+            crate::turn::llm::context::augment_manifest_trace_with_wire(
                 trace,
                 &wire_messages,
                 &annotated_tools,
@@ -1494,7 +1497,7 @@ impl ServerAgenticLoopHost {
                 } else {
                     "error"
                 };
-                crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
+                crate::turn::llm::exchange_capture::persist_configured_capture_or_log(
                     "server_loop_host mock error capture",
                     self.full_llm_capture,
                     Some(&artifact_store),
@@ -1511,7 +1514,7 @@ impl ServerAgenticLoopHost {
                     None,
                     outcome,
                     llm_capture_error_response(&error),
-                    Some(crate::turn::llm_exchange_capture::CaptureTrace {
+                    Some(crate::turn::llm::exchange_capture::CaptureTrace {
                         session_turn_source: Some("state"),
                         turn_chain_id: None,
                         user_query_event_id: None,
@@ -1644,7 +1647,7 @@ impl ServerAgenticLoopHost {
             if let Some(pool) = self.shared_pool.clone() {
                 artifact_store = artifact_store.with_pool(pool);
             }
-            crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
+            crate::turn::llm::exchange_capture::persist_configured_capture_or_log(
                 "server_loop_host mock success capture",
                 self.full_llm_capture,
                 Some(&artifact_store),
@@ -1673,7 +1676,7 @@ impl ServerAgenticLoopHost {
                         "total_tokens": u.total_tokens(),
                     },
                 }),
-                Some(crate::turn::llm_exchange_capture::CaptureTrace {
+                Some(crate::turn::llm::exchange_capture::CaptureTrace {
                     session_turn_source: Some("state"),
                     turn_chain_id: None,
                     user_query_event_id: None,
@@ -1962,7 +1965,7 @@ impl ServerAgenticLoopHost {
         breakdown: &astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
         manifest_trace: Option<&Value>,
     ) {
-        self.emit_event(crate::turn::llm_context::context_meta_event(
+        self.emit_event(crate::turn::llm::context::context_meta_event(
             breakdown,
             manifest_trace,
         ));
@@ -2114,16 +2117,16 @@ impl ServerAgenticLoopHost {
         }));
         let cache_cfg =
             PromptCacheConfig::from_cache_capability(cache_capability, provider, model_name);
-        crate::turn::llm_context::assemble_context_pipeline(
-            crate::turn::llm_context::LlmContextAssemblyInput {
+        crate::turn::llm::context::assemble_context_pipeline(
+            crate::turn::llm::context::LlmContextAssemblyInput {
                 state,
                 session_id: &self.session_id,
-                tool_surface: crate::turn::llm_context::ToolSurfacePlan::from_visible_tools(
+                tool_surface: crate::turn::llm::context::ToolSurfacePlan::from_visible_tools(
                     visible_tools,
                     &restricted_snapshot,
                 )
                 .with_selection_trace(selection_trace),
-                runtime_signals: crate::turn::llm_context::RuntimeSignals::new(
+                runtime_signals: crate::turn::llm::context::RuntimeSignals::new(
                     &self.edge_profile,
                     plan_hint,
                     self.selection_confidence,
@@ -2208,8 +2211,8 @@ impl ServerAgenticLoopHost {
         // pipeline as an `extra_dynamic_sections` entry (RuntimeVolatile,
         // None scope). See `context_pipeline_adapter` — post-hoc injection
         // here would double up the content on the wire.
-        crate::turn::llm_context::assemble_wire_messages(
-            crate::turn::llm_context::LlmWireAssemblyInput {
+        crate::turn::llm::context::assemble_wire_messages(
+            crate::turn::llm::context::LlmWireAssemblyInput {
                 system_messages,
                 volatile_preamble,
                 compacted_messages,
@@ -2536,7 +2539,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &llm_cfg.provider,
                 &llm_cfg.model_name,
             );
-        let mut final_tools = crate::turn::llm_context::stabilize_tool_schemas_for_cache(
+        let mut final_tools = crate::turn::llm::context::stabilize_tool_schemas_for_cache(
             &pipeline_tool_schemas,
             &state.sticky_tool_schemas,
             &visible_tools,
@@ -2545,9 +2548,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         );
         state.sticky_tool_schemas = final_tools.clone();
         // Annotate tool schemas with cache_control for Anthropic.
-        crate::turn::llm_context::annotate_tool_schemas_for_cache(&mut final_tools, &cache_cfg);
+        crate::turn::llm::context::annotate_tool_schemas_for_cache(&mut final_tools, &cache_cfg);
         if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
-            crate::turn::llm_context::augment_manifest_trace_with_wire(
+            crate::turn::llm::context::augment_manifest_trace_with_wire(
                 trace,
                 &llm_messages,
                 &final_tools,
@@ -2598,7 +2601,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 Some(effective_max_output),
             );
             if let Some(prompt_request_plan) = prompt_request_plan.as_ref() {
-                crate::turn::llm_exchange_capture::persist_prompt_request_plan_or_log(
+                crate::turn::llm::exchange_capture::persist_prompt_request_plan_or_log(
                     "server_loop_host",
                     self.shared_pool.as_ref(),
                     astra_services::PromptRequestPersistInput {
@@ -2729,7 +2732,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                 "server_loop_host context window dump persist failed: {error}"
                             );
                         }
-                        crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
+                        crate::turn::llm::exchange_capture::persist_configured_capture_or_log(
                             "server_loop_host context window capture",
                             self.full_llm_capture,
                             Some(&artifact_store),
@@ -2746,7 +2749,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             Some(effective_max_output),
                             "context_window_error",
                             llm_capture_error_response(e),
-                            Some(crate::turn::llm_exchange_capture::CaptureTrace {
+                            Some(crate::turn::llm::exchange_capture::CaptureTrace {
                                 session_turn_source: Some("state"),
                                 turn_chain_id: None,
                                 user_query_event_id: None,
@@ -2808,7 +2811,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                 "server_loop_host error dump persist failed: {error}"
                             );
                         }
-                        crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
+                        crate::turn::llm::exchange_capture::persist_configured_capture_or_log(
                             "server_loop_host error capture",
                             self.full_llm_capture,
                             Some(&artifact_store),
@@ -2825,7 +2828,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             Some(effective_max_output),
                             "error",
                             llm_capture_error_response(&e),
-                            Some(crate::turn::llm_exchange_capture::CaptureTrace {
+                            Some(crate::turn::llm::exchange_capture::CaptureTrace {
                                 session_turn_source: Some("state"),
                                 turn_chain_id: None,
                                 user_query_event_id: None,
@@ -2896,7 +2899,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             if let Some(pool) = self.shared_pool.clone() {
                 artifact_store = artifact_store.with_pool(pool);
             }
-            crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
+            crate::turn::llm::exchange_capture::persist_configured_capture_or_log(
                 "server_loop_host success capture",
                 self.full_llm_capture,
                 Some(&artifact_store),
@@ -2919,7 +2922,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     "tool_calls": result.tool_calls.clone(),
                     "usage": result.usage.clone(),
                 }),
-                Some(crate::turn::llm_exchange_capture::CaptureTrace {
+                Some(crate::turn::llm::exchange_capture::CaptureTrace {
                     session_turn_source: Some("state"),
                     turn_chain_id: None,
                     user_query_event_id: None,
@@ -3024,7 +3027,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
     async fn maybe_pre_turn_compact(
         &mut self,
-        state: &mut crate::turn::agentic_loop_host::AgenticLoopState,
+        state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
         pressure: f64,
         quiet: bool,
     ) {
@@ -3094,7 +3097,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             let mut spill_count = old_count - keep_recent;
             // Snap to a safe role boundary so we never split an assistant/tool pair.
             spill_count =
-                crate::turn::agentic_loop_execution_phase::adjust_spill_boundary_for_tool_pairs(
+                crate::turn::agentic_loop::execution_phase::adjust_spill_boundary_for_tool_pairs(
                     &state.messages,
                     spill_count,
                 );
@@ -3161,7 +3164,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         self.capabilities.clone()
     }
 
-    fn on_turn_completed(&mut self, state: &crate::turn::agentic_loop_host::AgenticLoopState) {
+    fn on_turn_completed(&mut self, state: &crate::turn::agentic_loop::host::AgenticLoopState) {
         // G2: server-side parent capture. Mirrors the CLI host's
         // `on_turn_completed`, so delegate / spawn_agent sub-runs
         // routed through the server DelegationEngine can inherit the
@@ -3436,8 +3439,8 @@ fn normalize_usage_to_canonical(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::turn::agentic_loop_host::ASK_USER_TOOL_NAME;
-    use crate::turn::agentic_loop_host::run_agentic_loop_with_host;
+    use crate::turn::agentic_loop::host::ASK_USER_TOOL_NAME;
+    use crate::turn::agentic_loop::host::run_agentic_loop_with_host;
     #[cfg(feature = "bridge-e2e-hooks")]
     use astra_services::SessionArtifactStore;
     use astra_turn_core::cloud_summary::SummaryLlmClient;
@@ -3578,7 +3581,7 @@ mod tests {
             "server host must route final wire assembly through the shared helper"
         );
 
-        let llm_context_src = include_str!("../turn/llm_context.rs");
+        let llm_context_src = include_str!("../turn/llm/context.rs");
         let llm_context_tests_start = llm_context_src
             .find("\n#[cfg(test)]\nmod ")
             .expect("llm_context cfg(test) + mod marker");
@@ -3810,7 +3813,7 @@ mod tests {
             .expect("cfg(test) + mod tests marker");
         let production = &source[..tests_start];
         assert!(
-            production.contains("use crate::turn::bridge_llm_stream::rate_limit_cooldown;"),
+            production.contains("use crate::turn::bridge::llm_stream::rate_limit_cooldown;"),
             "server-loop should reuse the shared llm_client/bridge rate-limit cooldown singleton"
         );
         assert!(
@@ -3845,7 +3848,7 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools())
         .build();
-        let mut state = crate::turn::agentic_loop_host::tests::make_state();
+        let mut state = crate::turn::agentic_loop::host::tests::make_state();
         state.current_session_id = Some("sid-abort".into());
         state.max_turn_input_tokens = 100_000;
         state.turn_event_buffer = Some(
@@ -4889,7 +4892,7 @@ mod tests {
             message: "test query".to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
-            last_turn_policy: crate::turn::agentic_loop_host::TurnInteractionPolicy::default(),
+            last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: "test-token".to_string(),
             delegation_engine: None,
@@ -5294,7 +5297,7 @@ mod tests {
         assert!(!host.valid_tool_names().contains("delegate"));
         let initial_count = host.edge_tools.len();
 
-        use crate::turn::agentic_loop_host::delegate_tool_schema;
+        use crate::turn::agentic_loop::host::delegate_tool_schema;
         host.inject_tool_schema(delegate_tool_schema());
 
         assert!(host.valid_tool_names().contains("delegate"));
@@ -5314,7 +5317,7 @@ mod tests {
         .with_edge_tools(sample_edge_tools())
         .build();
 
-        use crate::turn::agentic_loop_host::delegate_tool_schema;
+        use crate::turn::agentic_loop::host::delegate_tool_schema;
         let initial_count = host.edge_tools.len();
 
         host.inject_tool_schema(delegate_tool_schema());
@@ -5607,7 +5610,7 @@ mod tests {
     async fn execute_turn_persists_full_journal_error_response_when_session_capture_enabled() {
         // Collapse llm_client's 1s/2s/4s exponential backoff so the retry
         // loop behind a 500 upstream completes in tens of ms instead of 7s.
-        let _backoff = crate::turn::llm_client::set_test_retry_backoff_ms(0);
+        let _backoff = crate::turn::llm::client::set_test_retry_backoff_ms(0);
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "00000000-0000-0000-0000-000000000127";
@@ -5962,7 +5965,7 @@ mod tests {
                 .push(json!({"role": "assistant", "content": format!("answer {i}")}));
         }
 
-        <ServerAgenticLoopHost as crate::turn::agentic_loop_host::AgenticLoopHost>::maybe_pre_turn_compact(
+        <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::maybe_pre_turn_compact(
             &mut host,
             &mut state,
             0.95,
@@ -6455,7 +6458,7 @@ mod tests {
         use std::sync::Arc;
 
         fn state_with_run(run_id: &str) -> AgenticLoopState {
-            let mut state = crate::turn::agentic_loop_host::tests::make_state();
+            let mut state = crate::turn::agentic_loop::host::tests::make_state();
             state.current_run_id = Some(run_id.to_string());
             state.messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
             state

@@ -265,7 +265,7 @@ pub(super) async fn prepare_chat_turn_bridge_body(
             (
                 Some(session_id),
                 normalize_session_created_at_for_bridge(&session.created_at),
-                crate::turn::llm_exchange_capture::session_full_llm_capture_enabled(Some(
+                crate::turn::llm::exchange_capture::session_full_llm_capture_enabled(Some(
                     &session.metadata,
                 )),
             )
@@ -280,7 +280,7 @@ pub(super) async fn prepare_chat_turn_bridge_body(
                     serde_json::Value::String(agent_id.clone()),
                 )])
             });
-            let session = super::session_quota::create_session_with_resource_quota(
+            let session = super::session::session_quota::create_session_with_resource_quota(
                 state,
                 user.user_id.clone(),
                 SessionCreateRequestData {
@@ -298,7 +298,7 @@ pub(super) async fn prepare_chat_turn_bridge_body(
             (
                 Some(created_session_id),
                 created_session_created_at,
-                crate::turn::llm_exchange_capture::session_full_llm_capture_enabled(Some(
+                crate::turn::llm::exchange_capture::session_full_llm_capture_enabled(Some(
                     &session.metadata,
                 )),
             )
@@ -699,7 +699,7 @@ mod tests {
                 agent_id: request.agent_id,
                 title: Some("Created".to_string()),
                 metadata: serde_json::Map::from_iter([(
-                    crate::turn::llm_exchange_capture::FULL_LLM_CAPTURE_METADATA_KEY.to_string(),
+                    crate::turn::llm::exchange_capture::FULL_LLM_CAPTURE_METADATA_KEY.to_string(),
                     json!(true),
                 )]),
                 status: "active".to_string(),
@@ -728,7 +728,7 @@ mod tests {
                 agent_id: None,
                 title: Some("Existing".to_string()),
                 metadata: serde_json::Map::from_iter([(
-                    crate::turn::llm_exchange_capture::FULL_LLM_CAPTURE_METADATA_KEY.to_string(),
+                    crate::turn::llm::exchange_capture::FULL_LLM_CAPTURE_METADATA_KEY.to_string(),
                     json!(true),
                 )]),
                 status: "active".to_string(),

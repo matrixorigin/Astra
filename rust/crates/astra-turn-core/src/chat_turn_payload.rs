@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::chat_turn_edge_profile::build_base_edge_profile_value;
 use crate::chat_turn_explain_wire::chat_turn_explain_field_json;
 use crate::edge_prompt_context::detect_workspace_context;
-use crate::tool_schema_prune::filter_tool_schemas_by_excluded_names;
+use crate::tool::schema::prune::filter_tool_schemas_by_excluded_names;
 
 /// Inputs for [`chat_turn_base_payload`] (keeps the arity aligned with the JSON body without a 9-arg function).
 pub struct ChatTurnBasePayloadInput<'a> {

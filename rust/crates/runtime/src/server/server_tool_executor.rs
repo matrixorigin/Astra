@@ -301,11 +301,11 @@ enum SessionStateRollbackAction {
     ConfigOverride {
         path: String,
         old_value: Value,
-        snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
+        snapshot: crate::observability::ObservabilitySessionRollbackSnapshot,
     },
     Compression {
         turn: u32,
-        snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
+        snapshot: crate::observability::ObservabilitySessionRollbackSnapshot,
     },
     TaskState {
         snapshot: TaskManagerSnapshot,
@@ -887,7 +887,7 @@ pub struct ServerToolExecutor {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     /// Optional observability session for self-mod and rollback-backed session state.
     observability_session:
-        Option<Arc<std::sync::RwLock<crate::observability_integration::ObservabilitySession>>>,
+        Option<Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>>,
     /// Self-modification pinned tool preferences.
     self_mod_pinned_tools: Mutex<Vec<String>>,
     /// Self-modification deprioritized tool preferences.
@@ -1711,7 +1711,7 @@ impl ServerToolExecutor {
     /// Set the observability session for rollback-backed session-state tools.
     pub fn set_observability_session(
         &mut self,
-        session: Arc<std::sync::RwLock<crate::observability_integration::ObservabilitySession>>,
+        session: Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>,
     ) {
         self.observability_session = Some(session);
     }
@@ -2012,7 +2012,7 @@ impl ServerToolExecutor {
             // ── Consolidated agent tool ────────────────────────────────
             "agent" => {
                 // Mirrors the CLI executor: `agent(action='delegate')` was
-                // never intercepted by `agentic_delegate_interception` (which
+                // never intercepted by `agentic::delegate_interception` (which
                 // matches on tool NAME == "delegate", not action="delegate").
                 // It silently returned a fake-success acknowledgement.
                 // Removed in favor of the consolidated agent spawn action. The standalone `delegate`
@@ -2722,7 +2722,7 @@ impl ServerToolExecutor {
         &self,
         path: impl Into<String>,
         old_value: Value,
-        snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
+        snapshot: crate::observability::ObservabilitySessionRollbackSnapshot,
     ) {
         let path = path.into();
         self.record_session_state_rollback(
@@ -2738,7 +2738,7 @@ impl ServerToolExecutor {
     fn record_compression_rollback(
         &self,
         turn: u32,
-        snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
+        snapshot: crate::observability::ObservabilitySessionRollbackSnapshot,
     ) {
         self.record_session_state_rollback(
             format!("compress_context:turn-{turn}"),
@@ -2796,7 +2796,7 @@ impl ServerToolExecutor {
 
     fn restore_observability_snapshot(
         &self,
-        snapshot: &crate::observability_integration::ObservabilitySessionRollbackSnapshot,
+        snapshot: &crate::observability::ObservabilitySessionRollbackSnapshot,
     ) -> Result<(), String> {
         let Some(observability_session) = self.observability_session.as_ref() else {
             return Err("No observability session available".to_string());
@@ -4958,7 +4958,7 @@ esac
         ServerToolExecutor,
         TempDir,
         String,
-        std::sync::Arc<std::sync::RwLock<crate::observability_integration::ObservabilitySession>>,
+        std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>,
     ) {
         let dir = TempDir::new().unwrap();
         let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
@@ -4975,7 +4975,7 @@ esac
             None,
         );
         let session = std::sync::Arc::new(std::sync::RwLock::new(
-            crate::observability_integration::ObservabilitySession::new_simple(&session_id),
+            crate::observability::ObservabilitySession::new_simple(&session_id),
         ));
         session.write().unwrap().turn_number = turn_index;
         exec.set_observability_session(session.clone());

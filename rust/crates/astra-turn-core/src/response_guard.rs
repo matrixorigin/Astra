@@ -1,4 +1,4 @@
-use super::tool_call_shape::tool_call_name;
+use crate::tool::args::shape::tool_call_name;
 
 // ── Fallback messages when guards fire ──────────────────────────────
 /// Replacement text when the LLM leaks the system prompt.

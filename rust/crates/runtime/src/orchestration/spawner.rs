@@ -1677,7 +1677,7 @@ pub enum SpawnError {
 /// "reconstruct failed" event here; currently the failure is silent
 /// because no sink is wired through at this layer.
 ///
-/// Visibility: `pub(crate)` so `server::delegation_engine` can
+/// Visibility: `pub(crate)` so `server::delegation::engine` can
 /// share the same helper — delegate path wires fork-prefix exactly
 /// the same way the spawner does (Bug B step 2).
 pub(crate) fn build_inherited_child_prefix(
@@ -1801,7 +1801,7 @@ fn create_agent_worktree(parent_dir: &std::path::Path, run_id: &str) -> Result<P
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::delegation_engine::DelegationTracker;
+    use crate::server::delegation::engine::DelegationTracker;
     use astra_messaging::in_process::InProcessTransport;
     use astra_messaging::router::AgentMailboxRouter;
     use astra_messaging::types::{AgentMessage, MessagePayload, MessageTarget};

@@ -21,10 +21,10 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use astra_runtime::server::delegation_engine::{
+use astra_runtime::server::delegation::engine::{
     DelegationEngine, DelegationTracker, SubRunConfig, SubRunExecutor,
 };
-use astra_runtime::server::run_engine::RunEngine;
+use astra_runtime::server::run::engine::RunEngine;
 use astra_services::coordination::{
     AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, AggregationStrategy,
     CoordinationPattern, DelegationRequest,

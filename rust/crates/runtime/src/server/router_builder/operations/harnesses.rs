@@ -4,50 +4,50 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
             "/harnesses/templates",
-            get(product_harness_handlers::list_harness_templates_handler),
+            get(crate::server::product_harness_handlers::list_harness_templates_handler),
         )
         .route(
             "/harnesses/node-catalog",
-            get(product_harness_handlers::list_harness_node_catalog_handler),
+            get(crate::server::product_harness_handlers::list_harness_node_catalog_handler),
         )
         .route(
             "/harnesses/skillify/runs",
-            post(product_harness_handlers::create_skillify_harness_run_handler),
+            post(crate::server::product_harness_handlers::create_skillify_harness_run_handler),
         )
         .route(
             "/harnesses/runs/{harness_run_id}",
-            get(product_harness_handlers::get_harness_run_handler),
+            get(crate::server::product_harness_handlers::get_harness_run_handler),
         )
         .route(
             "/harnesses/runs/{harness_run_id}/items",
-            get(product_harness_handlers::list_harness_run_items_handler),
+            get(crate::server::product_harness_handlers::list_harness_run_items_handler),
         )
         .route(
             "/harnesses/runs/{harness_run_id}/items/{item_id}/decision",
-            post(product_harness_handlers::decide_harness_item_handler),
+            post(crate::server::product_harness_handlers::decide_harness_item_handler),
         )
         .route(
             "/harnesses/runs/{harness_run_id}/skill-drafts",
-            get(product_harness_handlers::list_skill_drafts_handler),
+            get(crate::server::product_harness_handlers::list_skill_drafts_handler),
         )
         .route(
             "/harnesses/runs/{harness_run_id}/skill-drafts/{skill_draft_id}",
-            get(product_harness_handlers::get_skill_draft_handler),
+            get(crate::server::product_harness_handlers::get_skill_draft_handler),
         )
         .route(
             "/harnesses/runs/{harness_run_id}/skill-drafts/{skill_draft_id}/decision",
-            post(product_harness_handlers::decide_skill_draft_handler),
+            post(crate::server::product_harness_handlers::decide_skill_draft_handler),
         )
         .route(
             "/harnesses/runs/{harness_run_id}/skill-drafts/{skill_draft_id}/rules/{skill_rule_id}/decision",
-            post(product_harness_handlers::decide_skill_rule_handler),
+            post(crate::server::product_harness_handlers::decide_skill_rule_handler),
         )
         .route(
             "/harnesses/runs/{harness_run_id}/skill-drafts/{skill_draft_id}/publish",
-            post(product_harness_handlers::publish_skill_draft_handler),
+            post(crate::server::product_harness_handlers::publish_skill_draft_handler),
         )
         .route(
             "/harnesses/runs/{harness_run_id}/skillify/draft",
-            post(product_harness_handlers::create_skillify_draft_handler),
+            post(crate::server::product_harness_handlers::create_skillify_draft_handler),
         )
 }

@@ -8,7 +8,7 @@
 //! — same path as the pre-existing bridge write, now the only path.
 //!
 //! Read-side consumers (compaction injection,
-//! `run_lifecycle::session_end_governance`, `session_cleanup`) all
+//! `crate::server::run::lifecycle::session_end_governance`, `session_cleanup`) all
 //! read from Memoria by prefix, so there's exactly one storage and one
 //! schema.
 //!
@@ -39,7 +39,7 @@ use astra_services::session_journal::{
 };
 use astra_turn_core::cloud_session_memory_extract::SessionMemoryState;
 
-use crate::memory_relevance::LlmConnParams;
+use crate::memory_hooks::relevance::LlmConnParams;
 use crate::turn::cloud::memoria_compact::MemoriaClient;
 
 use super::activity::{BackgroundActivity, BackgroundActivityBroker};
@@ -164,7 +164,7 @@ impl SelectorParamsResolver for ConstSelectorResolver {
 
 /// Per-process background extraction coordinator. Build once at
 /// server/CLI boot, hold an [`Arc`] on
-/// [`crate::turn::agentic_loop_host::AgenticLoopState`].
+/// [`crate::turn::agentic_loop::host::AgenticLoopState`].
 pub struct MemoryExtractionService {
     selector_resolver: Arc<dyn SelectorParamsResolver>,
     memoria_client: Arc<dyn MemoriaClient>,

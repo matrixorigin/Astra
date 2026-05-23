@@ -49,7 +49,7 @@
 use std::sync::{Arc, Mutex};
 
 use astra_runtime::server::server_loop_host::{CapturedLlmRequest, ServerAgenticLoopHostBuilder};
-use astra_runtime::turn::agentic_loop_host::make_test_loop_state;
+use astra_runtime::turn::agentic_loop::host::make_test_loop_state;
 use astra_runtime::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
 use serde_json::{Value, json};
@@ -176,7 +176,7 @@ fn cache_capability_for(case: ProviderCase) -> CacheCapability {
 /// message removed, reply appended).
 async fn run_user_turn(
     host: &mut astra_runtime::server::server_loop_host::ServerAgenticLoopHost,
-    state: &mut astra_runtime::turn::agentic_loop_host::AgenticLoopState,
+    state: &mut astra_runtime::turn::agentic_loop::host::AgenticLoopState,
     user_text: &str,
     reply_text: &str,
 ) {
@@ -616,7 +616,7 @@ async fn matrix_trailing_system_msg_does_not_capture_cache_marker() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
 async fn matrix_volatile_lane_keeps_history_clean() {
-    use astra_runtime::turn::agentic_loop_host::VolatileKind;
+    use astra_runtime::turn::agentic_loop::host::VolatileKind;
 
     for case in PROVIDER_MATRIX.iter().copied() {
         let suppresses_volatile = matches!(

@@ -14,12 +14,10 @@ fn parse_task_json(response: &str) -> Value {
 
 fn executor_with_session() -> (
     ToolExecutor,
-    std::sync::Arc<
-        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-    >,
+    std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
 ) {
     let session = std::sync::Arc::new(std::sync::RwLock::new(
-        astra_runtime::observability_integration::ObservabilitySession::new_simple("test-session"),
+        astra_runtime::observability::ObservabilitySession::new_simple("test-session"),
     ));
     let exe = ToolExecutor::new(std::env::temp_dir()).with_observability_session(session.clone());
     (exe, session)
@@ -29,9 +27,7 @@ fn executor_with_persisted_session() -> (
     tempfile::TempDir,
     JournalDirGuard,
     ToolExecutor,
-    std::sync::Arc<
-        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-    >,
+    std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     String,
 ) {
     let tmp = tempfile::tempdir().unwrap();
@@ -45,7 +41,7 @@ fn executor_with_persisted_session() -> (
     );
     session_workspace::write_workspace(&ws).unwrap();
     let session = std::sync::Arc::new(std::sync::RwLock::new(
-        astra_runtime::observability_integration::ObservabilitySession::new_simple("test-session"),
+        astra_runtime::observability::ObservabilitySession::new_simple("test-session"),
     ));
     let exe = ToolExecutor::new(tmp.path())
         .with_active_session_id(session_id.clone())
@@ -162,7 +158,7 @@ async fn prioritize_tool_preserves_existing_state_when_persist_fails() {
     session_workspace::write_workspace(&ws).unwrap();
 
     let session = std::sync::Arc::new(std::sync::RwLock::new(
-        astra_runtime::observability_integration::ObservabilitySession::new_simple("test-session"),
+        astra_runtime::observability::ObservabilitySession::new_simple("test-session"),
     ));
     let exe = ToolExecutor::new(tmp.path())
         .with_active_session_id(session_id.clone())
@@ -209,7 +205,7 @@ async fn deprioritize_tool_preserves_existing_state_when_persist_fails() {
     session_workspace::write_workspace(&ws).unwrap();
 
     let session = std::sync::Arc::new(std::sync::RwLock::new(
-        astra_runtime::observability_integration::ObservabilitySession::new_simple("test-session"),
+        astra_runtime::observability::ObservabilitySession::new_simple("test-session"),
     ));
     let exe = ToolExecutor::new(tmp.path())
         .with_active_session_id(session_id.clone())

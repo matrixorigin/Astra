@@ -2,7 +2,7 @@ use serde_json::{Map, Value};
 
 use astra_thin_client::ApprovalKind;
 
-use crate::tool_args_repair::try_repair_tool_args;
+use crate::tool::args::repair::try_repair_tool_args;
 
 pub fn build_stream_error_event(message: &str, code: &str, retryable: bool) -> Map<String, Value> {
     Map::from_iter([

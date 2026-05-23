@@ -18,12 +18,12 @@ mod tests {
         InheritedPermissions, PermissionMode, PermissionRequest, PermissionRequestMessaging,
         PermissionResponse, PermissionResponseMessaging, PermissionSyncContext,
     };
-    use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
-    use crate::turn::agentic_headless_round::{
+    use crate::server::delegation::engine::{DelegationTracker, SubRunRecord, SubRunState};
+    use crate::turn::agentic::headless_round::{
         HeadlessStderrStyle, HeadlessToolRoundCtx, NoopHeadlessTerminal,
         run_agentic_headless_tool_round,
     };
-    use crate::turn::agentic_loop_host::{
+    use crate::turn::agentic_loop::host::{
         AgenticLoopHost, AgenticLoopState, HostTurnResult, run_agentic_loop_with_host,
     };
     use astra_messaging::in_process::InProcessTransport;
@@ -196,7 +196,7 @@ mod tests {
             message: "test query".to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
-            last_turn_policy: crate::turn::agentic_loop_host::TurnInteractionPolicy::default(),
+            last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
             delegation_engine: None,

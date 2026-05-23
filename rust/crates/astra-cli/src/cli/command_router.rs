@@ -380,10 +380,12 @@ fn maybe_wire_delegation_engine(
     let _ = agent_loader::load_and_merge(&project_root, &mut registry);
     let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
     let run_store = std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
-    let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
+    let engine = astra_runtime::server::delegation::engine::DelegationEngine::with_executor(
         registry,
-        std::sync::Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store)),
-        std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new()),
+        std::sync::Arc::new(astra_runtime::server::run::engine::RunEngine::new(
+            run_store,
+        )),
+        std::sync::Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new()),
         std::sync::Arc::new(executor),
     );
     state.delegation_engine = Some(std::sync::Arc::new(engine));
@@ -1758,7 +1760,7 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
             ),
         },
         "trace" => {
-            for line in astra_turn_core::permission_audit::format_snapshot_lines(50) {
+            for line in astra_turn_core::permission::audit::format_snapshot_lines(50) {
                 eprintln!("{line}");
             }
         }
@@ -1768,7 +1770,7 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
                 eprintln!("  {} Missing export path", theme::icon_warn());
                 return;
             }
-            let lines = astra_turn_core::permission_audit::snapshot_redacted_jsonl_lines();
+            let lines = astra_turn_core::permission::audit::snapshot_redacted_jsonl_lines();
             let body = if lines.is_empty() {
                 String::new()
             } else {

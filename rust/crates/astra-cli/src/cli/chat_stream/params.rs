@@ -181,8 +181,8 @@ impl ApprovalResponse {
 
     pub fn always_scope(
         &self,
-        default_scope: astra_turn_core::permission_scope::AllowScope,
-    ) -> Option<astra_turn_core::permission_scope::AllowScope> {
+        default_scope: astra_turn_core::permission::scope::AllowScope,
+    ) -> Option<astra_turn_core::permission::scope::AllowScope> {
         match self {
             Self::AlwaysAllow => Some(default_scope),
             _ => None,
@@ -191,7 +191,7 @@ impl ApprovalResponse {
 
     pub fn match_target(
         &self,
-    ) -> Option<&astra_turn_core::permission_match_target::AllowMatchTarget> {
+    ) -> Option<&astra_turn_core::permission::match_target::AllowMatchTarget> {
         None
     }
 }
@@ -340,7 +340,7 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) plan_subtask_id: Option<&'a str>,
     /// Optional delegation engine for multi-agent coordination with verification gates.
     pub(crate) delegation_engine:
-        Option<Arc<astra_runtime::server::delegation_engine::DelegationEngine>>,
+        Option<Arc<astra_runtime::server::delegation::engine::DelegationEngine>>,
     /// Optional cancellation token for interrupting SSE streaming mid-flight.
     pub(crate) cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     /// Plan-only: set to `true` after HTTP 200 so the payload-phase stderr line spinner can exit
@@ -384,12 +384,10 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Optional persistent top-level mailbox slot for cross-turn reply handling.
     pub(crate) root_mailbox_slot: Option<&'a mut Option<astra_messaging::router::AgentMailbox>>,
     /// Optional observability hub for M1-M6 integration (profiles, experiments, auto-tuning).
-    pub(crate) observability_hub:
-        Option<Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    pub(crate) observability_hub: Option<Arc<astra_runtime::observability::ObservabilityHub>>,
     /// Optional observability session for per-session tracking.
-    pub(crate) observability_session: Option<
-        Arc<std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>>,
-    >,
+    pub(crate) observability_session:
+        Option<Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>>,
     /// Session-scoped file edit journal — shared with ToolExecutors for undo support.
     pub(crate) file_journal: Option<
         std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>>,

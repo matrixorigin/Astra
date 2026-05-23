@@ -41,7 +41,7 @@ struct CliSessionMemorySelectorResolver {
 
 #[async_trait::async_trait]
 impl astra_runtime::session_memory::SelectorParamsResolver for CliSessionMemorySelectorResolver {
-    async fn resolve(&self) -> Option<astra_runtime::memory_relevance::LlmConnParams> {
+    async fn resolve(&self) -> Option<astra_runtime::memory_hooks::relevance::LlmConnParams> {
         #[derive(serde::Deserialize)]
         struct MemoryModelWire {
             model_name: String,
@@ -54,7 +54,7 @@ impl astra_runtime::session_memory::SelectorParamsResolver for CliSessionMemoryS
             .await
             .ok()?;
         let response = serde_json::from_str::<MemoryModelWire>(&body).ok()?;
-        Some(astra_runtime::memory_relevance::LlmConnParams {
+        Some(astra_runtime::memory_hooks::relevance::LlmConnParams {
             base_url: format!("{}/v1", self.api.api_origin()),
             api_key: token,
             model_name: response.model_name,

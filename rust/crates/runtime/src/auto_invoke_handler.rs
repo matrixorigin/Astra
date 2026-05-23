@@ -340,7 +340,7 @@ fn compare(lhs: f64, op: DiagnosisOperator, rhs: f64) -> bool {
 /// decide whether to fire.
 #[must_use]
 pub fn compute_session_signals(
-    obs: Option<&crate::observability_integration::ObservabilitySession>,
+    obs: Option<&crate::observability::ObservabilitySession>,
 ) -> SessionSignals {
     let Some(session) = obs else {
         return SessionSignals::default();
@@ -601,7 +601,7 @@ mod tests {
 
     #[test]
     fn compute_signals_reads_cumulative_stall_count() {
-        use crate::observability_integration::ObservabilitySession;
+        use crate::observability::ObservabilitySession;
         let mut obs = ObservabilitySession::new_simple("s-p7b");
         obs.record_stall_event();
         obs.record_stall_event();
@@ -613,7 +613,7 @@ mod tests {
 
     #[test]
     fn compute_signals_reads_user_corrections_length() {
-        use crate::observability_integration::ObservabilitySession;
+        use crate::observability::ObservabilitySession;
         let mut obs = ObservabilitySession::new_simple("s-p7b");
         obs.user_corrections = vec![1, 2, 5, 7];
 
@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn compute_signals_budget_pressure_defaults_to_zero_without_traces() {
-        use crate::observability_integration::ObservabilitySession;
+        use crate::observability::ObservabilitySession;
         let obs = ObservabilitySession::new_simple("s-p7b");
         let s = compute_session_signals(Some(&obs));
         assert_eq!(s.budget_pressure, 0.0);
@@ -794,7 +794,7 @@ mod tests {
         // handler to fire analyze_session + evaluate_session (budget
         // pressure requires a ContextAssemblyTrace, which is verified in
         // its own unit test above).
-        use crate::observability_integration::ObservabilitySession;
+        use crate::observability::ObservabilitySession;
         let mut obs = ObservabilitySession::new_simple("s-p7b-e2e");
         for _ in 0..5 {
             obs.record_stall_event();

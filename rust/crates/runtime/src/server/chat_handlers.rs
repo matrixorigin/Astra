@@ -1,7 +1,7 @@
 use super::bridge_prep::normalize_chat_turn_session_error;
 use super::header_utils::collect_forward_headers;
-use super::run_handlers::transform_stream_run_events_for_client;
 use super::*;
+use crate::server::run::handlers::transform_stream_run_events_for_client;
 
 /// Safely convert a string to a HeaderValue, returning an SSE error response on failure.
 #[allow(clippy::result_large_err)]
@@ -62,7 +62,7 @@ pub(super) async fn resolve_or_create_chat_session(
                 Ok(session) => Ok(ResolvedChatSession {
                     session_id: Some(session_id),
                     full_llm_capture:
-                        crate::turn::llm_exchange_capture::session_full_llm_capture_enabled(Some(
+                        crate::turn::llm::exchange_capture::session_full_llm_capture_enabled(Some(
                             &session.metadata,
                         )),
                 }),
@@ -83,7 +83,7 @@ pub(super) async fn resolve_or_create_chat_session(
                 )])
             });
 
-            match super::session_quota::create_session_with_resource_quota(
+            match super::session::session_quota::create_session_with_resource_quota(
                 state,
                 user.user_id.clone(),
                 SessionCreateRequestData {
@@ -97,7 +97,7 @@ pub(super) async fn resolve_or_create_chat_session(
                 Ok(session) => Ok(ResolvedChatSession {
                     session_id: Some(session.session_id),
                     full_llm_capture:
-                        crate::turn::llm_exchange_capture::session_full_llm_capture_enabled(Some(
+                        crate::turn::llm::exchange_capture::session_full_llm_capture_enabled(Some(
                             &session.metadata,
                         )),
                 }),
@@ -1100,7 +1100,7 @@ mod chat_stream_bridge_fallback_tests {
                 agent_id: request.agent_id,
                 title: Some("Created".to_string()),
                 metadata: serde_json::Map::from_iter([(
-                    crate::turn::llm_exchange_capture::FULL_LLM_CAPTURE_METADATA_KEY.to_string(),
+                    crate::turn::llm::exchange_capture::FULL_LLM_CAPTURE_METADATA_KEY.to_string(),
                     serde_json::json!(true),
                 )]),
                 status: "active".to_string(),
@@ -1134,7 +1134,7 @@ mod chat_stream_bridge_fallback_tests {
                 agent_id: None,
                 title: Some("Existing".to_string()),
                 metadata: serde_json::Map::from_iter([(
-                    crate::turn::llm_exchange_capture::FULL_LLM_CAPTURE_METADATA_KEY.to_string(),
+                    crate::turn::llm::exchange_capture::FULL_LLM_CAPTURE_METADATA_KEY.to_string(),
                     serde_json::json!(true),
                 )]),
                 status: "active".to_string(),

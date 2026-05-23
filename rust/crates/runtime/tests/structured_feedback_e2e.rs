@@ -243,7 +243,7 @@ fn malformed_llm_response_produces_nothing() {
 #[test]
 fn bridge_feedback_store_is_shared_across_clones() {
     use astra_runtime::FernetTokenEncryptor;
-    use astra_runtime::turn::bridge_inprocess::InProcessChatTurnBridge;
+    use astra_runtime::turn::bridge::inprocess::InProcessChatTurnBridge;
 
     let encryptor = std::sync::Arc::new(
         FernetTokenEncryptor::new("dGVzdGtleXRlc3RrZXl0ZXN0a2V5dGVzdGtleTE=").unwrap(),

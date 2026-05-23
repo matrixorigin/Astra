@@ -16,11 +16,11 @@ use astra_services::team_persistence::{
     WorktreeMode,
 };
 
-use astra_runtime::server::delegation_engine::{
+use astra_runtime::server::delegation::engine::{
     DelegationEngine, DelegationTracker, StubSubRunExecutor, SubRunConfig, SubRunExecutor,
 };
-use astra_runtime::server::run_engine::RunEngine;
-use astra_runtime::server::team_orchestrator::{
+use astra_runtime::server::run::engine::RunEngine;
+use astra_runtime::server::team::orchestrator::{
     OrchestratorConfig, TeamExecutionOrchestrator, TeamExecutionStatus,
 };
 

@@ -297,7 +297,7 @@ impl ToolCallMaps {
 const PERSISTED_TAG: &str = "<persisted-output>";
 
 fn is_compactable_tool_name(name: &str) -> bool {
-    crate::tool_categories::registry().is_compactable(name)
+    crate::tool::categories::registry().is_compactable(name)
 }
 
 /// How many recent compactable tool results to keep intact.
@@ -452,7 +452,7 @@ pub fn compact_tool_results_adaptive_with_persistence_protected_prefix(
 pub fn compact_tool_results_state_aware(
     messages: &mut [Value],
     pressure: f64,
-    facts: &crate::cloud_session_facts::SessionFacts,
+    facts: &crate::cloud::session_facts::SessionFacts,
     pin_turns: u32,
     strategy: CompactStrategy,
 ) -> CompactStats {
@@ -465,7 +465,7 @@ pub fn compact_tool_results_state_aware(
 pub fn compact_tool_results_state_aware_with_persistence(
     messages: &mut [Value],
     pressure: f64,
-    facts: &crate::cloud_session_facts::SessionFacts,
+    facts: &crate::cloud::session_facts::SessionFacts,
     pin_turns: u32,
     strategy: CompactStrategy,
     session_dir: Option<&std::path::Path>,
@@ -484,7 +484,7 @@ pub fn compact_tool_results_state_aware_with_persistence(
 pub fn compact_tool_results_state_aware_with_persistence_protected_prefix(
     messages: &mut [Value],
     pressure: f64,
-    facts: &crate::cloud_session_facts::SessionFacts,
+    facts: &crate::cloud::session_facts::SessionFacts,
     pin_turns: u32,
     strategy: CompactStrategy,
     session_dir: Option<&std::path::Path>,
@@ -506,7 +506,7 @@ pub fn compact_tool_results_state_aware_with_persistence_protected_prefix(
 fn compact_tool_results_with_pin_list(
     messages: &mut [Value],
     config: &AdaptiveCompactConfig,
-    facts: &crate::cloud_session_facts::SessionFacts,
+    facts: &crate::cloud::session_facts::SessionFacts,
     pin_turns: u32,
     strategy: CompactStrategy,
     session_dir: Option<&std::path::Path>,
@@ -588,9 +588,10 @@ fn compact_tool_results_with_pin_list(
                     .or_else(|| messages[idx].get("name").and_then(Value::as_str))
                     .unwrap_or("unknown")
                     .to_string();
-                let persisted = crate::tool_result_storage::maybe_persist_tool_result_unconditional(
-                    dir, &call_id, &tool_name, &content,
-                );
+                let persisted =
+                    crate::tool::result::storage::maybe_persist_tool_result_unconditional(
+                        dir, &call_id, &tool_name, &content,
+                    );
                 if !persisted {
                     // Disk write failed — do not clear; keep the content in memory.
                     continue;
@@ -804,9 +805,10 @@ fn compact_tool_results_with_persistence(
                     .or_else(|| messages[idx].get("name").and_then(Value::as_str))
                     .unwrap_or("unknown")
                     .to_string();
-                let persisted = crate::tool_result_storage::maybe_persist_tool_result_unconditional(
-                    dir, &call_id, &tool_name, &content,
-                );
+                let persisted =
+                    crate::tool::result::storage::maybe_persist_tool_result_unconditional(
+                        dir, &call_id, &tool_name, &content,
+                    );
                 if !persisted {
                     continue;
                 }
@@ -2045,7 +2047,7 @@ mod tests {
 
     #[test]
     fn state_aware_pins_active_files() {
-        use crate::cloud_session_facts::{FileEntry, SessionFacts};
+        use crate::cloud::session_facts::{FileEntry, SessionFacts};
         let mut facts = SessionFacts {
             turn: 10,
             ..Default::default()
@@ -2138,7 +2140,7 @@ mod tests {
 
     #[test]
     fn state_aware_with_empty_facts_behaves_like_normal() {
-        use crate::cloud_session_facts::SessionFacts;
+        use crate::cloud::session_facts::SessionFacts;
         let facts = SessionFacts::default(); // no active files
 
         let mut msgs: Vec<Value> = Vec::new();
@@ -2318,7 +2320,7 @@ mod tests {
             tool_result("c2", &big),
         ];
 
-        let facts = crate::cloud_session_facts::SessionFacts::default();
+        let facts = crate::cloud::session_facts::SessionFacts::default();
         // pressure 0.95 → keep=1, so c1 gets compacted
         compact_tool_results_state_aware(&mut messages, 0.95, &facts, 5, Default::default());
 
@@ -2616,7 +2618,7 @@ mod tests {
                 continue;
             }
             let call_id = msg["tool_call_id"].as_str().unwrap();
-            let recovered = crate::tool_result_storage::read_persisted_result(&dir, call_id);
+            let recovered = crate::tool::result::storage::read_persisted_result(&dir, call_id);
             assert!(
                 recovered.is_some(),
                 "cleared result for {call_id} must have been persisted to disk"

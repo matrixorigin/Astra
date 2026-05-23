@@ -8,7 +8,7 @@ use astra_sandbox::{CommandRisk, analyze_command_risks};
 
 const DESTRUCTIVE_KEYWORDS: &[&str] = &["DROP", "DELETE", "TRUNCATE", "ALTER", "GRANT", "REVOKE"];
 fn is_shell_execution_tool(name: &str) -> bool {
-    crate::tool_categories::registry().is_shell(name)
+    crate::tool::categories::registry().is_shell(name)
 }
 
 /// Safe commands that can be used inside command substitution `$(...)`.

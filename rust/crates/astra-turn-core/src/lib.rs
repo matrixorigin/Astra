@@ -11,11 +11,13 @@
     clippy::unnecessary_map_or
 )]
 
+pub mod action_compensation;
+pub mod activity;
 pub mod agent_live_event;
 pub mod agent_tree_state;
-pub mod agentic_recursion_guard;
-pub mod agentic_verdict_audit;
+pub mod agentic;
 pub mod alert_dispatcher;
+pub mod approval;
 pub mod boost_domain_hints;
 pub mod cache;
 pub mod cache_diagnostics;
@@ -24,25 +26,21 @@ mod canonical_json;
 pub mod capability;
 pub mod chat_history_openai;
 pub mod chat_turn_api_error;
+pub mod chat_turn_edge_profile;
 pub mod chat_turn_explain_wire;
 pub mod chat_turn_heuristics;
 pub mod chat_turn_payload;
+pub mod chat_turn_sse_dispatch;
+pub mod chat_turn_step_plan;
+pub mod cloud;
 pub mod compaction_types;
 pub mod compression_types;
 pub mod concurrency_safety;
 pub mod confidence_contract;
-pub mod context_assembly_trace;
-pub mod context_binder;
-pub mod context_budget;
-pub mod context_feedback;
-pub mod context_optimizer;
-pub mod context_pipeline;
-pub mod context_planner;
-pub mod context_pressure;
-pub mod context_serializer;
-pub mod context_sources;
+pub mod context;
 pub mod conversation_log;
-pub mod edge_executor_id;
+pub mod edge_ledger;
+pub mod edge_prompt_context;
 pub mod emergent_context;
 pub mod error_recovery;
 pub mod evaluation;
@@ -51,182 +49,189 @@ pub mod explain;
 pub mod explain_report_lines;
 pub mod file_edit_journal;
 pub mod followup_suggestion;
-pub mod fork_cache_event;
-pub mod fork_capture;
-pub mod fork_prefix;
-pub mod fork_prefix_store;
-pub mod fork_reconstruct;
-pub mod fork_resolve;
-pub mod headless_tool_assembly;
-pub mod headless_tool_status_display;
-pub mod headless_tool_stderr_lines;
+pub mod fork;
+pub mod headless;
 pub mod history;
 pub mod hook_plans;
 pub mod injection_tracking;
 pub mod interaction_types;
 pub mod interruption;
 pub mod introspect;
+pub mod lru_map;
 pub mod microcompact;
 pub mod observer;
 pub mod optimize_limits;
+pub mod orchestration;
 pub mod parallel_tool_exec;
-pub mod permission_notice;
-pub mod pipeline_config;
-pub mod pipeline_journal;
-pub mod pipeline_metrics;
-pub mod pipeline_session;
-pub mod pipeline_session_serde;
-pub mod pipeline_stats;
+pub mod permission;
+pub mod pipeline;
 pub mod prepare_turn_explain_text;
 pub mod recent_arg_hints;
 pub mod recovery_state;
 pub mod response_guard;
 pub mod routing;
+pub mod routing_engine;
+pub mod routing_metrics;
 pub mod safety_middleware;
 pub mod section_types;
 pub mod session_latches;
 pub mod shadow_diff;
 pub mod spill_backend;
-pub mod sse_blocks;
-pub mod sse_edge_stderr_lines;
+pub mod sse;
+pub mod stall;
 pub mod state;
 pub mod stop_hooks;
-pub mod stop_hooks_yaml;
 pub mod streaming_tool_exec;
 pub mod tail_persist;
 pub mod task;
 pub mod task_context;
 pub mod thinking_config;
 pub mod token_accounting;
-pub mod tool_args_repair;
-pub mod tool_call_shape;
-pub mod tool_health;
-pub mod tool_health_persistence;
-pub mod tool_hooks;
-pub mod tool_policy;
-pub mod tool_preview;
-pub mod tool_result_compression;
-pub mod tool_result_dedup;
-pub mod tool_result_sanitize;
-pub mod tool_result_semantics;
-pub mod tool_result_storage;
-pub mod tool_schema_prune;
-pub mod tool_selection;
-pub mod tool_surface;
+pub mod tool;
 pub mod trace_alert;
-pub mod trace_event;
-pub mod unified_timeline;
-pub mod view;
+pub mod turn_metrics;
 pub mod working_memory;
 pub mod xml_tool_call_fallback;
 
-// Phase 15: turn leaf modules + cloud session modules
-pub mod action_compensation;
-pub mod approval_base_digest;
-pub mod approval_batch_group;
-pub mod approval_fingerprint;
-pub mod approval_request_key;
-pub mod approval_sink;
-pub mod approval_ux_layer;
-pub mod chat_turn_sse_dispatch;
-pub mod cloud_approval_policy;
-pub mod cloud_attachments;
-pub mod cloud_cache_diagnostics;
-pub mod cloud_grouping;
-pub mod cloud_session_facts;
-pub mod cloud_session_memory_extract;
-pub mod counter;
-pub mod delegation_tree;
-pub mod headless_tool_journal;
-pub mod orchestration_types;
-pub mod permission_audit;
-pub mod permission_compound_command;
-pub mod permission_cwd_root;
-pub mod permission_engine;
-pub mod permission_match_target;
-pub mod permission_memory_profile;
-pub mod permission_path_glob;
-pub mod permission_redact;
-pub mod permission_rule_grammar;
-pub mod permission_scope;
-pub mod permission_script_preview;
-pub mod permission_sync;
-pub mod permission_types;
-pub mod persist;
-pub mod quality;
-pub mod routing_metrics;
-pub mod tool_registry_chain;
-pub mod tool_registry_meta;
-pub mod tool_registry_report;
-
-// Orchestration + liquid modules
-pub mod liquid_step_signals;
-pub mod liquid_tactical;
-pub mod orchestration_builtin_agents;
-pub mod orchestration_context_cache;
-pub mod orchestration_progress;
-pub mod orchestration_spawn_tool;
-pub mod orchestration_team_config;
-pub mod stream_events;
-pub mod tool_argument_hints;
-
-// Phase 16: bridge, edge, stall
-pub mod bridge_circuit_breaker;
-pub mod bridge_rate_limit_cooldown;
-pub mod bridge_sse_events;
-pub mod complete;
-pub mod edge_prompt_context;
-pub mod hydrate_reflect;
-pub mod loop_circuit_breaker;
-mod lru_map;
-pub mod stall;
-pub mod tool_registry_state;
-
-// Phase 17: telemetry, replay, edge profile
-pub mod activity;
-pub mod agentic_turn_telemetry;
-pub mod chat_turn_edge_profile;
-pub mod cloud_compact_prompt;
-pub mod cloud_summary;
-pub mod sse_data_lines;
-
-// Phase 18: contracts, session cache, trace collector
+pub mod bridge;
 pub mod contracts;
-pub mod turn_trace_collector;
-
-// Phase 19: e2e hooks, llm dump, history apply, edge ledger
-pub mod bridge_e2e_hooks;
-pub mod edge_ledger;
-pub mod llm_request_dump;
-
-// Phase 20: decision explainer, cloud tool delivery, sse stream host
-pub mod cloud_tool_delivery;
-pub mod decision_explainer;
-pub mod sse_stream_host;
-
-// Phase 21: retrieval
-pub mod retrieval;
-
-// Phase 24: interaction types, chat_turn_heuristics, result_quality, turn_guard, stall preflight, turn flow, stop_hooks_yaml
-// + agentic_turn_ingest, agentic_post_tool_policy, headless_tool_postprocess, headless_types
-pub mod agentic_post_tool_policy;
-pub mod agentic_stall_preflight;
-pub mod agentic_turn_flow;
-pub mod agentic_turn_ingest;
-pub mod chat_turn_step_plan;
-pub mod headless_tool_body_preview;
-pub mod headless_tool_postprocess;
-pub mod headless_types;
-pub mod result_quality {
-    pub use astra_turn_types::{ResultQuality, classify_result, quality_feedback};
-}
-pub mod agentic_prepare_payload;
-pub mod hallucination_tripwire;
-pub mod routing_engine;
-pub mod tool_categories;
-pub mod tool_registry_plugin;
-pub mod tool_registry_selection_edge_hints;
-pub mod tool_workaround;
+pub mod stream_events;
 pub mod turn_guard;
 pub mod ws_approval_gate;
 pub mod ws_user_prompt_gate;
+
+// Re-export result_quality (types from astra_turn_types)
+pub mod result_quality {
+    pub use astra_turn_types::{ResultQuality, classify_result, quality_feedback};
+}
+
+// Existing modules restored (files still on disk)
+pub mod complete;
+pub mod hydrate_reflect;
+pub mod loop_circuit_breaker;
+pub mod persist;
+pub mod retrieval;
+pub mod trace_event;
+pub mod turn_trace_collector;
+pub mod unified_timeline;
+pub mod view;
+
+// Re-exports: old flat module names → new directory paths
+pub mod decision_explainer;
+pub mod delegation_tree;
+pub mod hallucination_tripwire;
+pub mod liquid_step_signals;
+pub mod liquid_tactical;
+pub mod llm_request_dump;
+
+pub use cloud::approval_policy as cloud_approval_policy;
+pub use cloud::attachments as cloud_attachments;
+pub use cloud::cache_diagnostics as cloud_cache_diagnostics;
+pub use cloud::session_facts as cloud_session_facts;
+pub use cloud::session_memory_extract as cloud_session_memory_extract;
+pub use cloud::summary as cloud_summary;
+pub use cloud::tool_delivery as cloud_tool_delivery;
+pub use tool::args::hints as tool_argument_hints;
+pub use tool::args::repair as tool_args_repair;
+pub use tool::args::shape as tool_call_shape;
+pub use tool::categories as tool_categories;
+pub use tool::categories::surface as tool_surface;
+pub use tool::categories::workaround as tool_workaround;
+pub use tool::health as tool_health;
+pub use tool::health::persistence as tool_health_persistence;
+pub use tool::policy as tool_policy;
+pub use tool::policy::hooks as tool_hooks;
+pub use tool::policy::preview as tool_preview;
+pub use tool::registry::chain as tool_registry_chain;
+pub use tool::registry::meta as tool_registry_meta;
+pub use tool::registry::plugin as tool_registry_plugin;
+pub use tool::registry::report as tool_registry_report;
+pub use tool::registry::selection_edge_hints as tool_registry_selection_edge_hints;
+pub use tool::registry::state as tool_registry_state;
+pub use tool::result::compression as tool_result_compression;
+pub use tool::result::dedup as tool_result_dedup;
+pub use tool::result::sanitize as tool_result_sanitize;
+pub use tool::result::semantics as tool_result_semantics;
+pub use tool::result::storage as tool_result_storage;
+pub use tool::schema::prune as tool_schema_prune;
+pub use tool::schema::selection as tool_selection;
+
+// Re-exports: context_* → context::*
+pub use context::assembly_trace as context_assembly_trace;
+pub use context::binder as context_binder;
+pub use context::budget as context_budget;
+pub use context::feedback as context_feedback;
+pub use context::optimizer as context_optimizer;
+pub use context::pipeline as context_pipeline;
+pub use context::planner as context_planner;
+pub use context::pressure as context_pressure;
+pub use context::serializer as context_serializer;
+pub use context::sources as context_sources;
+
+// Re-exports: headless_* → headless::*
+pub use headless::assembly as headless_tool_assembly;
+pub use headless::body_preview as headless_tool_body_preview;
+pub use headless::journal as headless_tool_journal;
+pub use headless::postprocess as headless_tool_postprocess;
+pub use headless::status_display as headless_tool_status_display;
+pub use headless::stderr_lines as headless_tool_stderr_lines;
+
+// Re-exports: agentic_* → agentic::*
+pub use agentic::post_tool_policy as agentic_post_tool_policy;
+pub use agentic::prepare_payload as agentic_prepare_payload;
+pub use agentic::recursion_guard as agentic_recursion_guard;
+pub use agentic::stall_preflight as agentic_stall_preflight;
+pub use agentic::turn_flow as agentic_turn_flow;
+pub use agentic::turn_ingest as agentic_turn_ingest;
+pub use agentic::turn_telemetry as agentic_turn_telemetry;
+pub use agentic::verdict_audit as agentic_verdict_audit;
+
+// Re-exports: approval_* → approval::*
+pub use approval::base_digest as approval_base_digest;
+pub use approval::batch_group as approval_batch_group;
+pub use approval::fingerprint as approval_fingerprint;
+pub use approval::request_key as approval_request_key;
+pub use approval::sink as approval_sink;
+pub use approval::ux_layer as approval_ux_layer;
+
+// Re-exports: permission_* → permission::*
+pub use permission::types as permission_types;
+
+// Re-exports: orchestration_* → orchestration::*
+pub use orchestration::builtin_agents as orchestration_builtin_agents;
+pub use orchestration::context_cache as orchestration_context_cache;
+pub use orchestration::progress as orchestration_progress;
+pub use orchestration::spawn_tool as orchestration_spawn_tool;
+pub use orchestration::team_config as orchestration_team_config;
+pub use orchestration::types as orchestration_types;
+
+// Re-exports: pipeline_* → pipeline::*
+pub use pipeline::config as pipeline_config;
+pub use pipeline::journal as pipeline_journal;
+pub use pipeline::metrics as pipeline_metrics;
+pub use pipeline::session as pipeline_session;
+pub use pipeline::session_serde as pipeline_session_serde;
+pub use pipeline::stats as pipeline_stats;
+
+// Re-exports: fork_* → fork::*
+pub use fork::cache_event as fork_cache_event;
+pub use fork::capture as fork_capture;
+pub use fork::prefix as fork_prefix;
+pub use fork::prefix_store as fork_prefix_store;
+pub use fork::reconstruct as fork_reconstruct;
+pub use fork::resolve as fork_resolve;
+
+// Re-exports: sse_* → sse::*
+pub use sse::blocks as sse_blocks;
+pub use sse::data_lines as sse_data_lines;
+pub use sse::edge_stderr_lines as sse_edge_stderr_lines;
+pub use sse::stream_host as sse_stream_host;
+
+// Re-exports: bridge_* → bridge::*
+pub use bridge::circuit_breaker as bridge_circuit_breaker;
+pub use bridge::e2e_hooks as bridge_e2e_hooks;
+pub use bridge::rate_limit_cooldown as bridge_rate_limit_cooldown;
+pub use bridge::sse_events as bridge_sse_events;
+
+// Re-exports: stop_hooks_* → stop_hooks::*
+pub use stop_hooks::stop_hooks_yaml;

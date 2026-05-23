@@ -108,7 +108,7 @@ fn render_history_batch_lines(
 fn surface_status_line_system_cell(event: &TuiAppEvent, chat_widget: &mut chat_widget::ChatWidget) {
     if let TuiAppEvent::PermissionAutoApproved { tool, reason } = event {
         chat_widget.commit_system(history_cell::system::SystemCell::info(
-            astra_turn_core::permission_notice::format_auto_approved_permission(tool, reason)
+            astra_turn_core::permission::notice::format_auto_approved_permission(tool, reason)
                 .trim()
                 .to_string(),
         ));

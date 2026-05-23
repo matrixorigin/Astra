@@ -1879,7 +1879,7 @@ mod tests {
     use astra_runtime::orchestration::{
         SpawnAgentInput, SpawnContext, SpawnedAgentInfo, SpawnedAgentMetrics,
     };
-    use astra_runtime::server::delegation_engine::DelegationTracker;
+    use astra_runtime::server::delegation::engine::DelegationTracker;
     use astra_services::session_journal::JournalEvent;
     use std::path::PathBuf;
     use std::sync::Arc;

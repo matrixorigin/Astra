@@ -557,7 +557,7 @@ pub(crate) fn default_pinned_tool_names() -> std::collections::HashSet<String> {
         .map(|t| t.name.to_string())
         .collect();
     // Auto-injected via ToolRegistry::upsert_schema (see sse_loop mod.rs +
-    // agentic_loop_lifecycle.rs). These aren't in TOOL_CATALOG but are
+    // agentic_loop::lifecycle.rs). These aren't in TOOL_CATALOG but are
     // structurally part of the static lib — include them so the cache
     // marker sits at the real static-prefix boundary.
     //
@@ -1673,7 +1673,7 @@ mod tests {
 #[cfg(test)]
 mod cache_stability_regression {
     use super::*;
-    use crate::turn::llm_client::build_provider_request_body;
+    use crate::turn::llm::client::build_provider_request_body;
     use astra_turn_core::thinking_config::ThinkingConfig;
     use serde_json::json;
     use std::collections::HashSet;
@@ -1943,7 +1943,7 @@ mod cache_stability_regression {
             let mut tools = pinned_prefix_fixture();
             tools.extend(dynamic_tail);
             annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
-            crate::turn::llm_client::build_provider_request_body(
+            crate::turn::llm::client::build_provider_request_body(
                 &[system_msg.clone(), user_msg.clone()],
                 &tools,
                 "anthropic.claude-sonnet-4-20250514-v1:0",
@@ -1997,7 +1997,7 @@ mod cache_stability_regression {
             let mut tools = pinned_prefix_fixture();
             tools.extend(tail);
             annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
-            crate::turn::llm_client::build_provider_request_body(
+            crate::turn::llm::client::build_provider_request_body(
                 &[system_msg.clone(), user_msg.clone()],
                 &tools,
                 "claude-sonnet-4-5-20250929",
@@ -2040,7 +2040,7 @@ mod cache_stability_regression {
             let mut tools = pinned_prefix_fixture();
             tools.extend(tail);
             annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
-            crate::turn::llm_client::build_provider_request_body(
+            crate::turn::llm::client::build_provider_request_body(
                 &[system_msg.clone(), user_msg.clone()],
                 &tools,
                 "deepseek-chat",

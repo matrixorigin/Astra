@@ -737,7 +737,7 @@ fn display_plan_updates_live(
                         }
                         eprintln!(
                             "    {}",
-                            astra_turn_core::permission_notice::format_auto_approved_permission(
+                            astra_turn_core::permission::notice::format_auto_approved_permission(
                                 &tool, &reason
                             )
                         );

@@ -616,9 +616,7 @@ pub struct ToolExecutor {
     /// Provides access to per-turn context assembly traces, timing data,
     /// drift detection, and decision explanations.
     pub observability_session: Option<
-        std::sync::Arc<
-            std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-        >,
+        std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     >,
     /// Budget-adaptive introspection snapshot, updated each turn by the
     /// execution phase. The `introspect` tool reads this to return runtime
@@ -871,7 +869,7 @@ impl ToolExecutor {
     pub fn with_observability_session(
         mut self,
         session: std::sync::Arc<
-            std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
+            std::sync::RwLock<astra_runtime::observability::ObservabilitySession>,
         >,
     ) -> Self {
         self.observability_session = Some(session);
@@ -3684,7 +3682,7 @@ impl ToolExecutor {
                 }
                 "share_context" => self.share_context(args),
                 "query_context" => self.query_context(args),
-                astra_runtime::turn::agentic_loop_host::DELEGATE_TOOL_NAME => {
+                astra_runtime::turn::agentic_loop::host::DELEGATE_TOOL_NAME => {
                     "Delegation request acknowledged. The delegation engine will execute \
                 this request and provide results in the next round."
                         .to_string()

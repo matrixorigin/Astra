@@ -1,6 +1,6 @@
 //! Background session-memory (`session-memory.md`) extraction.
 //!
-//! Fires from [`crate::turn::agentic_loop_finalization::finalize_and_render`]
+//! Fires from [`crate::turn::agentic_loop::finalization::finalize_and_render`]
 //! as fire-and-forget background work. See [`service::MemoryExtractionService`]
 //! for the coordinator and [`runner::run_extraction`] for the worker
 //! body.

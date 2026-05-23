@@ -17,7 +17,7 @@ use astra_turn_core::microcompact::ProviderCacheStrategy;
 use astra_turn_core::recovery_state::RecoveryState;
 use astra_turn_core::token_accounting::TokenAccounting;
 
-use super::agentic_loop_host::AgenticLoopState;
+use super::agentic_loop::host::AgenticLoopState;
 
 /// Build ExternalSources from the Host's edge_profile + state.
 ///
@@ -396,7 +396,7 @@ pub(crate) fn build_session_context(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::turn::agentic_loop_host::tests::make_state;
+    use crate::turn::agentic_loop::host::tests::make_state;
 
     #[test]
     fn turn_state_uses_real_remaining_turns_not_hardcoded_20() {
