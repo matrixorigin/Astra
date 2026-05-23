@@ -28,9 +28,10 @@
 //!      2-round warm-up actually measures.
 //!   2. **Volatile slot placement**: for marker-isolated providers
 //!      (Anthropic/Bedrock), CacheScope::None sections do NOT leak into
-//!      the system content array (b551c04f). For prefix-only providers
-//!      (OpenAI/MiniMax), volatile rides the tail of the last user
-//!      message, not the primary system message.
+//!      the system content array (b551c04f). For tail-suffix providers
+//!      (e.g. OpenAI-gpt), volatile rides the tail of the last user
+//!      message, not the primary system message. For strict-history
+//!      providers (e.g. MiniMax), volatile is suppressed entirely.
 //!   3. **No volatile-cc-marker on trailing system msgs**: if runtime
 //!      pushes `role=system [working-set:v1]` at history tail, the cache
 //!      breakpoint MUST land on the last non-system message; the
@@ -50,6 +51,7 @@ use std::sync::{Arc, Mutex};
 use astra_runtime::server::server_loop_host::{CapturedLlmRequest, ServerAgenticLoopHostBuilder};
 use astra_runtime::turn::agentic_loop_host::make_test_loop_state;
 use astra_runtime::{FernetTokenEncryptor, MatrixOneSettings};
+use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
 use serde_json::{Value, json};
 
 const VALID_FERNET_KEY: &str = "cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=";
@@ -163,6 +165,10 @@ fn build_host_for(
     .with_llm_request_capture(capture)
     .with_mock_provider(case.provider, case.model)
     .build()
+}
+
+fn cache_capability_for(case: ProviderCase) -> CacheCapability {
+    CacheCapability::for_provider_and_model(case.provider, case.model)
 }
 
 /// Run a single "user → reply" turn through the mock host. Leaves
@@ -613,6 +619,10 @@ async fn matrix_volatile_lane_keeps_history_clean() {
     use astra_runtime::turn::agentic_loop_host::VolatileKind;
 
     for case in PROVIDER_MATRIX.iter().copied() {
+        let suppresses_volatile = matches!(
+            cache_capability_for(case).volatile_placement,
+            VolatilePlacement::CurrentUserOnly
+        );
         let capture = Arc::new(Mutex::new(Vec::new()));
         let mut host = build_host_for(case, vec![scripted_round("r1")], capture.clone());
         let mut state = make_test_loop_state();
@@ -688,8 +698,11 @@ async fn matrix_volatile_lane_keeps_history_clean() {
             if c.is_empty() {
                 continue;
             }
-            // The LAST msg legitimately carries the folded preamble.
-            if i == cap.messages.len() - 1 {
+            // Tail-suffix / marker-isolated providers legitimately fold the
+            // volatile lane into the last user message. Strict-history
+            // providers must suppress volatile entirely, so the last message
+            // must stay clean too.
+            if !suppresses_volatile && i == cap.messages.len() - 1 {
                 continue;
             }
             assert!(
@@ -714,22 +727,33 @@ async fn matrix_volatile_lane_keeps_history_clean() {
             );
         }
 
-        // And at least one of the lane contents should appear in the
-        // final user message's prefix.
         let last_text = cap.messages.last().map(flatten_content).unwrap_or_default();
-        assert!(
-            last_text.contains("[working-set:v1]")
-                || last_text.contains("## Already Fetched")
-                || last_text.contains("⚠ REFLECTION")
-                || last_text.contains("✓ 2 tools executed"),
-            "[{label}] last user msg must carry the lane's folded preamble; got {last_text:?}",
-            label = case.label,
-        );
         assert!(
             last_text.contains("real question"),
             "[{label}] last user msg must preserve real question; got {last_text:?}",
             label = case.label,
         );
+        if suppresses_volatile {
+            assert!(
+                !last_text.contains("[working-set:v1]")
+                    && !last_text.contains("## Already Fetched")
+                    && !last_text.contains("⚠ REFLECTION")
+                    && !last_text.contains("✓ 2 tools executed"),
+                "[{label}] strict-history providers must suppress volatile injections entirely; got {last_text:?}",
+                label = case.label,
+            );
+        } else {
+            // And at least one of the lane contents should appear in the
+            // final user message's prefix.
+            assert!(
+                last_text.contains("[working-set:v1]")
+                    || last_text.contains("## Already Fetched")
+                    || last_text.contains("⚠ REFLECTION")
+                    || last_text.contains("✓ 2 tools executed"),
+                "[{label}] last user msg must carry the lane's folded preamble; got {last_text:?}",
+                label = case.label,
+            );
+        }
     }
 }
 
@@ -753,6 +777,10 @@ async fn matrix_volatile_lane_keeps_history_clean() {
 #[serial_test::serial(prompt_cache_env)]
 async fn matrix_mid_history_runtime_injections_consolidated() {
     for case in PROVIDER_MATRIX.iter().copied() {
+        let suppresses_volatile = matches!(
+            cache_capability_for(case).volatile_placement,
+            VolatilePlacement::CurrentUserOnly
+        );
         let capture = Arc::new(Mutex::new(Vec::new()));
         let mut host = build_host_for(case, vec![scripted_round("r1")], capture.clone());
         let mut state = make_test_loop_state();
@@ -838,8 +866,6 @@ async fn matrix_mid_history_runtime_injections_consolidated() {
              (5d48887e).",
             label = case.label,
         );
-        // Also: the LAST msg should be the user's real question with the
-        // consolidated preamble folded in.
         let last_text = cap
             .messages
             .last()
@@ -852,18 +878,29 @@ async fn matrix_mid_history_runtime_injections_consolidated() {
             last_text,
             label = case.label,
         );
-        // At least one of the consolidated volatile patterns should be
-        // folded into the last user msg (proves consolidation happened,
-        // not that nothing was injected).
-        assert!(
-            last_text.contains("⚠ The following tools have failed")
-                || last_text.contains("[working-set:v1]")
-                || last_text.contains("## Already Fetched"),
-            "[{label}] at least one consolidated volatile must be folded into \
-             the last user msg; got {:?}",
-            last_text,
-            label = case.label,
-        );
+        if suppresses_volatile {
+            assert!(
+                !last_text.contains("⚠ The following tools have failed")
+                    && !last_text.contains("[working-set:v1]")
+                    && !last_text.contains("## Already Fetched"),
+                "[{label}] strict-history providers must suppress consolidated volatile injections entirely; got {:?}",
+                last_text,
+                label = case.label,
+            );
+        } else {
+            // At least one of the consolidated volatile patterns should be
+            // folded into the last user msg (proves consolidation happened,
+            // not that nothing was injected).
+            assert!(
+                last_text.contains("⚠ The following tools have failed")
+                    || last_text.contains("[working-set:v1]")
+                    || last_text.contains("## Already Fetched"),
+                "[{label}] at least one consolidated volatile must be folded into \
+                 the last user msg; got {:?}",
+                last_text,
+                label = case.label,
+            );
+        }
     }
 }
 
