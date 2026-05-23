@@ -1001,13 +1001,48 @@ pub(crate) fn stabilize_tool_schemas_for_cache(
     }
 }
 
-/// Apply provider-specific message cache metadata.
-pub(crate) fn apply_message_cache_metadata(
-    messages: &mut [Value],
+pub(crate) fn apply_bridge_message_cache_metadata(
+    messages: &mut Vec<Value>,
+    synthetic_tail_prefix_end: Option<usize>,
     cache_cfg: &PromptCacheConfig,
     session_id: &str,
 ) {
-    crate::turn::prompt_cache::apply_anthropic_cache_metadata(messages, cache_cfg, session_id);
+    let debug_bridge_cache = std::env::var("ASTRA_DEBUG_BRIDGE_CACHE").is_ok();
+    let before = messages
+        .iter()
+        .filter(|message| astra_turn_core::context_serializer::message_has_cache_control(message))
+        .count();
+    if let Some(prefix_end) = synthetic_tail_prefix_end {
+        crate::turn::prompt_cache::apply_anthropic_cache_metadata(
+            &mut messages[..prefix_end],
+            cache_cfg,
+            session_id,
+        );
+    } else {
+        crate::turn::prompt_cache::apply_anthropic_cache_metadata(messages, cache_cfg, session_id);
+    }
+    let after = messages
+        .iter()
+        .filter(|message| astra_turn_core::context_serializer::message_has_cache_control(message))
+        .count();
+    if debug_bridge_cache {
+        let target_role = synthetic_tail_prefix_end
+            .and_then(|prefix_end| prefix_end.checked_sub(1))
+            .and_then(|idx| messages.get(idx))
+            .and_then(|message| message.get("role"))
+            .and_then(Value::as_str);
+        eprintln!(
+            "[bridge-cache] prefix_end={synthetic_tail_prefix_end:?} before={before} after={after} target_role={target_role:?}"
+        );
+    }
+    if synthetic_tail_prefix_end.is_some() && after == before {
+        tracing::warn!(
+            target: "astra::cache",
+            synthetic_tail_prefix_end,
+            message_count = messages.len(),
+            "bridge synthetic-tail cache annotation added no message-level marker"
+        );
+    }
 }
 
 /// Finalize bridge wire messages after bridge-specific compaction and context
@@ -1023,7 +1058,7 @@ pub(crate) fn finalize_bridge_wire_messages(
     provider: &str,
     model_name: &str,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
-) -> bool {
+) -> Option<usize> {
     astra_turn_core::edge_ledger::strip_stale_reasoning(llm_messages, provider, model_name);
     let cache_cap =
         astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider_model(
@@ -1031,7 +1066,7 @@ pub(crate) fn finalize_bridge_wire_messages(
             provider,
             model_name,
         );
-    let mut appended_synthetic_tail = false;
+    let mut synthetic_tail_prefix_end = None;
     if let Some(text) = volatile_text
         && !text.is_empty()
     {
@@ -1039,7 +1074,7 @@ pub(crate) fn finalize_bridge_wire_messages(
             cache_cap.volatile_placement,
             astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
         ) {
-            return false;
+            return None;
         }
         let wrapped = format!("<system-reminder>\n{text}</system-reminder>");
         let tail_role = llm_messages
@@ -1055,18 +1090,18 @@ pub(crate) fn finalize_bridge_wire_messages(
                 .unwrap_or("");
             last_user["content"] = Value::String(format!("{wrapped}\n\n{existing}"));
         } else if tail_role == Some("tool") {
+            synthetic_tail_prefix_end = Some(llm_messages.len());
             llm_messages.push(serde_json::json!({
                 "role": "assistant",
                 "content": "Understood.",
             }));
             llm_messages.push(serde_json::json!({"role": "user", "content": wrapped}));
-            appended_synthetic_tail = true;
         } else {
+            synthetic_tail_prefix_end = Some(llm_messages.len());
             llm_messages.push(serde_json::json!({"role": "user", "content": wrapped}));
-            appended_synthetic_tail = true;
         }
     }
-    appended_synthetic_tail
+    synthetic_tail_prefix_end
 }
 
 pub(crate) fn augment_manifest_trace_with_wire(
@@ -1285,6 +1320,49 @@ mod context_cache_contract_tests {
     }
 
     #[test]
+    fn bridge_cache_annotation_handles_live_tool_loop_shape() {
+        let mut messages = vec![
+            json!({"role": "system", "content": [{"type": "text", "text": "stable"}]}),
+            json!({"role": "user", "content": "Analyze the journal"}),
+            json!({"role": "assistant", "content": Value::Null}),
+            json!({
+                "role": "tool",
+                "content": "tool output",
+                "tool_call_id": "tooluse_QN9FlElvUeRXS3lbPNtp08",
+                "_tool_name": "read_file",
+                "_round_index": 0
+            }),
+        ];
+        let cache_cfg = crate::turn::prompt_cache::PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+        let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
+            &mut messages,
+            Some("volatile".to_string()),
+            "bedrock",
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            None,
+        );
+        apply_bridge_message_cache_metadata(
+            &mut messages,
+            synthetic_tail_prefix_end,
+            &cache_cfg,
+            "sess",
+        );
+
+        assert_eq!(synthetic_tail_prefix_end, Some(4));
+        assert!(
+            astra_turn_core::context_serializer::message_has_cache_control(&messages[3]),
+            "live tool-loop shape must mark the last real tool result before the synthetic suffix",
+        );
+        assert!(
+            !astra_turn_core::context_serializer::message_has_cache_control(&messages[5]),
+            "synthetic reminder tail must remain unannotated",
+        );
+    }
+
+    #[test]
     fn finalize_bridge_wire_messages_prepends_to_tail_user_when_available() {
         let mut messages = vec![json!({"role": "user", "content": "original user"})];
 
@@ -1307,7 +1385,7 @@ mod context_cache_contract_tests {
     fn finalize_bridge_wire_messages_skips_current_user_only_models() {
         let mut messages = vec![json!({"role": "user", "content": "original user"})];
 
-        let appended = finalize_bridge_wire_messages(
+        let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
             &mut messages,
             Some("volatile".to_string()),
             "openai",
@@ -1315,7 +1393,7 @@ mod context_cache_contract_tests {
             None,
         );
 
-        assert!(!appended);
+        assert!(synthetic_tail_prefix_end.is_none());
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["content"], "original user");
     }
@@ -1330,7 +1408,7 @@ mod context_cache_contract_tests {
             reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
         };
 
-        let appended = finalize_bridge_wire_messages(
+        let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
             &mut messages,
             Some("volatile".to_string()),
             "openai",
@@ -1338,7 +1416,7 @@ mod context_cache_contract_tests {
             Some(explicit),
         );
 
-        assert!(!appended);
+        assert!(synthetic_tail_prefix_end.is_none());
         assert_eq!(messages[0]["content"], "original user");
     }
 }

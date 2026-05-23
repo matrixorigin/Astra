@@ -2205,7 +2205,8 @@ impl InProcessChatTurnBridge {
                 }
             }
 
-            let bridge_tail_is_synthetic = crate::turn::llm::context::finalize_bridge_wire_messages(
+            let bridge_synthetic_tail_prefix_end =
+                crate::turn::llm::context::finalize_bridge_wire_messages(
                 &mut llm_messages,
                 bridge_volatile_text.take(),
                 &provider,
@@ -2382,13 +2383,12 @@ impl InProcessChatTurnBridge {
                     // even though the request shape sent to the real API
                     // would be post-mutation. Traces from E2E tests must be
                     // comparable to traces from real runs.
-                    if !bridge_tail_is_synthetic {
-                        crate::turn::llm::context::apply_message_cache_metadata(
-                            &mut llm_messages,
-                            &cache_cfg,
-                            &session_id,
-                        );
-                    }
+                    crate::turn::llm::context::apply_bridge_message_cache_metadata(
+                        &mut llm_messages,
+                        bridge_synthetic_tail_prefix_end,
+                        &cache_cfg,
+                        &session_id,
+                    );
                     crate::turn::llm::context::augment_manifest_trace_with_wire(
                         &mut bridge_manifest_trace_json,
                         &llm_messages,
@@ -2462,13 +2462,12 @@ impl InProcessChatTurnBridge {
                     }
                 } else {
                     // Add Anthropic protocol-level prompt-cache metadata on the request clone.
-                    if !bridge_tail_is_synthetic {
-                        crate::turn::llm::context::apply_message_cache_metadata(
-                            &mut llm_messages,
-                            &cache_cfg,
-                            &session_id,
-                        );
-                    }
+                    crate::turn::llm::context::apply_bridge_message_cache_metadata(
+                        &mut llm_messages,
+                        bridge_synthetic_tail_prefix_end,
+                        &cache_cfg,
+                        &session_id,
+                    );
                     crate::turn::llm::context::augment_manifest_trace_with_wire(
                         &mut bridge_manifest_trace_json,
                         &llm_messages,
@@ -4758,7 +4757,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_skips_cache_metadata_when_synthetic_tail_is_still_last_message() {
+    fn bridge_marks_last_real_message_before_synthetic_tail() {
         let mut llm_messages = vec![
             json!({"role": "system", "content": [{"type": "text", "text": "stable"}]}),
             json!({"role": "assistant", "content": ""}),
@@ -4769,27 +4768,29 @@ mod tests {
             is_anthropic: true,
         };
 
-        let bridge_tail_is_synthetic = crate::turn::llm::context::finalize_bridge_wire_messages(
+        let bridge_synthetic_tail_prefix_end =
+            crate::turn::llm::context::finalize_bridge_wire_messages(
             &mut llm_messages,
             Some("volatile".to_string()),
             "anthropic",
             "claude-sonnet-4",
             None,
         );
-        if !bridge_tail_is_synthetic {
-            crate::turn::llm::context::apply_message_cache_metadata(
-                &mut llm_messages,
-                &cache_cfg,
-                "sess",
-            );
-        }
+        crate::turn::llm::context::apply_bridge_message_cache_metadata(
+            &mut llm_messages,
+            bridge_synthetic_tail_prefix_end,
+            &cache_cfg,
+            "sess",
+        );
 
-        assert!(bridge_tail_is_synthetic);
+        assert_eq!(bridge_synthetic_tail_prefix_end, Some(3));
         assert!(
-            llm_messages
-                .iter()
-                .all(|message| message.get("cache_control").is_none()),
-            "synthetic tail should stay unannotated so bridge and server cache boundaries match",
+            astra_turn_core::context_serializer::message_has_cache_control(&llm_messages[2]),
+            "bridge should mark the last real tool result before the synthetic suffix",
+        );
+        assert!(
+            !astra_turn_core::context_serializer::message_has_cache_control(&llm_messages[4]),
+            "synthetic tail user must stay unannotated",
         );
     }
 
