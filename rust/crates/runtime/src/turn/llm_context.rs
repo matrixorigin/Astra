@@ -342,6 +342,7 @@ impl<'a> BridgeRuntimeSignals<'a> {
 
 pub(crate) struct BridgeSessionContextInput<'a> {
     pub cache_cfg: &'a PromptCacheConfig,
+    pub cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     pub session_id: &'a str,
     pub model_id: &'a str,
     pub provider: &'a str,
@@ -355,6 +356,7 @@ impl<'a> BridgeSessionContextInput<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         cache_cfg: &'a PromptCacheConfig,
+        cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
         session_id: &'a str,
         model_id: &'a str,
         provider: &'a str,
@@ -364,6 +366,7 @@ impl<'a> BridgeSessionContextInput<'a> {
     ) -> Self {
         Self {
             cache_cfg,
+            cache_capability,
             session_id,
             model_id,
             provider,
@@ -609,6 +612,7 @@ pub(crate) fn assemble_bridge_context(
         input.runtime_signals.selection_confidence,
         input.runtime_signals.task_type,
         input.session.cache_cfg,
+        input.session.cache_capability,
         input.session.session_id,
         input.session.model_id,
         input.session.provider,

@@ -2055,6 +2055,7 @@ impl InProcessChatTurnBridge {
                     ),
                     session: crate::turn::llm_context::BridgeSessionContextInput::new(
                         &cache_cfg,
+                        cache_capability,
                         &session_id,
                         &model_name,
                         &provider,

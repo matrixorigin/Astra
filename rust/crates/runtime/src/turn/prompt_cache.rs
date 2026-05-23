@@ -160,6 +160,7 @@ pub(crate) fn assemble_system_message_via_pipeline(
         confidence,
         task_type,
         cache_cfg,
+        None,
         session_id,
         model_id,
         provider,
@@ -207,6 +208,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     confidence: f64,
     task_type: Option<&str>,
     cache_cfg: &PromptCacheConfig,
+    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     session_id: &str,
     model_id: &str,
     provider: &str,
@@ -282,20 +284,12 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         extra_dynamic_sections: volatile,
     };
 
-    let provider_policy = if cache_cfg.is_anthropic {
-        ProviderCachePolicy::anthropic()
-    } else {
-        ProviderCachePolicy::openai_compatible()
-    };
-    let provider_strategy = if cache_cfg.is_anthropic {
-        ProviderCacheStrategy {
-            prompt_cache_protocol: PromptCacheProtocol::AnthropicCacheControl,
-            compact_strategy: astra_turn_core::microcompact::CompactStrategy::Minimal,
-            supports_cache_control: true,
-        }
-    } else {
-        ProviderCacheStrategy::default()
-    };
+    let provider_policy = provider_cache_policy_for(cache_capability, provider, model_id);
+    let provider_strategy = ProviderCacheStrategy::from_explicit_or_provider_model(
+        cache_capability,
+        Some(provider),
+        Some(model_id),
+    );
     let session_ctx = SessionContext {
         session_id: session_id.to_string(),
         run_id: String::new(),
@@ -373,7 +367,9 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         }
     };
 
-    let is_anthropic = cache_cfg.is_anthropic;
+    let uses_anthropic_protocol =
+        provider_strategy.prompt_cache_protocol == PromptCacheProtocol::AnthropicCacheControl;
+    let should_annotate_cache_controls = cache_cfg.cache_enabled && uses_anthropic_protocol;
     // Build the trace-facing `Vec<PromptSection>` from original inputs
     // rather than reverse-engineering the pipeline's compacted output.
     // The pipeline may join/truncate sections in `optimized.sections`, so a
@@ -390,7 +386,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     let tier = output.plan.compact_tier;
     let pruned_tool_schemas = output.optimized.tool_schemas.clone();
 
-    let (primary_system, dynamic_system) = if is_anthropic {
+    let (primary_system, dynamic_system) = if uses_anthropic_protocol {
         // Anthropic-protocol path: emit STABLE blocks (non-None scope)
         // as multi-block content with cache_control markers; promote
         // volatile (CacheScope::None) blocks into the `dynamic_system`
@@ -417,9 +413,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
                 dynamic_text.push_str(&block.text);
             } else {
                 let mut b = json!({"type": "text", "text": block.text});
-                if cache_cfg.should_annotate()
-                    && let Some(ref cc) = block.cache_control
-                {
+                if should_annotate_cache_controls && let Some(ref cc) = block.cache_control {
                     b["cache_control"] = cc.clone();
                 }
                 stable_blocks.push(b);
@@ -851,6 +845,7 @@ mod tests {
             0.8,
             None,
             &cache_cfg,
+            None,
             "sid-bridge",
             "gpt-4o",
             "openai",
@@ -905,6 +900,7 @@ mod tests {
             0.8,
             None,
             &cache_cfg,
+            None,
             "sid-memory",
             "gpt-4o",
             "openai",
@@ -949,6 +945,7 @@ mod tests {
             0.8,
             None,
             &cache_cfg,
+            None,
             "sid-deferred-tools",
             "gpt-4o",
             "openai",
@@ -993,6 +990,7 @@ mod tests {
             0.1,
             None,
             &cache_cfg,
+            None,
             "sid-low-confidence",
             "gpt-4o",
             "openai",
@@ -1509,6 +1507,53 @@ mod tests {
         );
         assert!(policy.max_markers > 0);
         assert!(policy.supports_global_scope);
+    }
+
+    #[test]
+    fn bridge_pipeline_outcome_prefers_explicit_capability_over_provider_hint() {
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: false,
+        };
+        let outcome = assemble_bridge_pipeline_outcome(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            0.8,
+            None,
+            &cache_cfg,
+            Some(astra_turn_core::cache_placement::CacheCapability {
+                protocol: astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit,
+                volatile_placement:
+                    astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                reuse_scope: Some(
+                    astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
+                ),
+            }),
+            "sid-explicit-capability",
+            "proxy-claude",
+            "openai",
+            None,
+            None,
+            None,
+            "",
+            "",
+        );
+
+        assert!(
+            outcome.dynamic_system.is_none(),
+            "marker-explicit capability should keep sections in the single Anthropic-style system lane"
+        );
+        assert!(
+            outcome
+                .primary_system
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some(),
+            "explicit marker capability on bridge path must produce multi-block cache-control system content"
+        );
     }
 
     #[test]
