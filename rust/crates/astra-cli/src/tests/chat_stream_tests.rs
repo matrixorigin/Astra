@@ -17,6 +17,10 @@ pub(super) fn sse_text_response(text: &str, session_id: &str) -> String {
     )
 }
 
+fn mock_mcp_server_binary() -> std::path::PathBuf {
+    crate::mcp_client::ensure_mock_mcp_server_binary()
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_id() {
     let temp = tempfile::tempdir().unwrap();
@@ -1037,5 +1041,154 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
     assert_eq!(
         payloads[0]["user_query_event_id"],
         payloads[1]["user_query_event_id"]
+    );
+}
+
+// ── Phase 3C: Chat stream MCP integration tests ──────────────────────────────
+
+#[tokio::test]
+async fn stream_chat_sse_dispatches_mcp_tool_call() {
+    let mock_server_bin = mock_mcp_server_binary();
+
+    // Connect McpClientManager to mock server via stdio
+    let mut manager = crate::mcp_client::McpClientManager::new();
+    let config = crate::mcp_client::McpServerConfig {
+        name: "mock".to_string(),
+        transport: crate::mcp_client::Transport::Stdio {
+            command: vec![mock_server_bin.to_string_lossy().to_string()],
+            args: vec![],
+            env: std::collections::HashMap::new(),
+        },
+        description: String::new(),
+        enabled: true,
+        retry: crate::mcp_client::RetryConfig::default(),
+    };
+    manager
+        .connect_for_test(config)
+        .await
+        .expect("connect to mock MCP server");
+
+    // Verify tools were discovered (echo, add, get_time)
+    let tools = manager.all_tools();
+    assert!(!tools.is_empty(), "mock MCP server should expose tools");
+    let tool_names: Vec<String> = tools.iter().map(|t| t.1.name.to_string()).collect();
+    assert!(
+        tool_names.iter().any(|n| n.contains("echo")),
+        "expected echo tool, got: {:?}",
+        tool_names
+    );
+
+    // Tool name as it will appear in SSE: mcp_{server}_{tool}
+    let mcp_tool_name = crate::mcp_client::sanitize_tool_name("mcp_mock_echo");
+
+    // HTTP mock: first call returns MCP tool_call, second returns text
+    let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let cc = call_count.clone();
+    let tool_name_clone = mcp_tool_name.clone();
+    let app = axum::Router::new().route(
+        "/chat/turn",
+        axum::routing::post(move || {
+            let cc = cc.clone();
+            let tn = tool_name_clone.clone();
+            async move {
+                let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = if n == 0 {
+                    format!(
+                        "data: {{\"type\":\"session_info\",\"session_id\":\"sess-mcp\"}}\n\n\
+                         data: {{\"type\":\"tool_call\",\"id\":\"mcp-1\",\"name\":\"{}\",\"arguments\":{{\"message\":\"hello from test\"}}}}\n\n\
+                         data: {{\"type\":\"turn_complete\",\"has_tool_calls\":true}}\n\n\
+                         data: [DONE]\n\n",
+                        tn
+                    )
+                } else {
+                    sse_text_response("MCP done!", "sess-mcp")
+                };
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    body,
+                )
+            }
+        }),
+    );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+
+    let mcp_arc = std::sync::Arc::new(tokio::sync::RwLock::new(manager));
+    let mut pm = PermissionManager::new(true);
+    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
+    let skill_search = astra_core::SkillSearchSettings::default();
+
+    let result = stream_chat_sse(ChatTurnParams {
+        api: &api,
+        token: "fake-token",
+        auth_profile: None,
+        message: "call echo",
+        session_id: None,
+        model: None,
+        provider: None,
+        explain: ExplainMode::Off,
+        render_md: false,
+        history: &[],
+        perm_manager: &mut pm,
+        verbose_mode: false,
+        render_policy: crate::stream_render::RenderPolicy::Silent,
+        recent_tools: &[],
+        tool_health_entries: &[],
+        session_lessons: &[],
+        latest_skill_diagnosis: None,
+        latest_turn_quality_feedback: None,
+        unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
+        is_plan_subtask: false,
+        plan_subtask_id: None,
+        delegation_engine: None,
+        cancel_token: None,
+        plan_assemble_line_release: None,
+        stream_event_tx: None,
+        agent_live_event_sink: None,
+        approval_request_tx: None,
+        ask_user_request_tx: None,
+        plan_review_request_tx: None,
+        mcp_manager: Some(mcp_arc),
+        skill_search: &skill_search,
+        skill_quality_tracker: &mut skill_qt,
+        discovered_skills: None,
+        messaging_metrics: None,
+        agent_spawner: None,
+        root_agent_id: None,
+        root_mailbox_slot: None,
+        observability_hub: None,
+        observability_session: None,
+        file_journal: None,
+        file_state: None,
+        database_snapshot_journal: None,
+        git_stash_journal: None,
+        git_commit_journal: None,
+        git_worktree_journal: None,
+        session_state_journal: None,
+        task_manager: None,
+        task_notify_tx: None,
+        bg_task_commands: None,
+        bash_detach_slot: None,
+        turn_index: 0,
+        pipeline_state: None,
+        pre_loaded_messages: None,
+        append_system_prompt: None,
+        session_memory_extractor: None,
+        #[cfg(feature = "harness")]
+        harness_sink: None,
+        #[cfg(feature = "harness")]
+        harness_trace: None,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.full_text, "MCP done!");
+    assert!(
+        result.tool_calls_count > 0,
+        "expected at least one MCP tool call"
+    );
+    assert!(
+        call_count.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "expected at least 2 HTTP rounds (tool_call + final text)"
     );
 }

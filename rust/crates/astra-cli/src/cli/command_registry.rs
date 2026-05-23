@@ -212,20 +212,25 @@ const SKILL_SUBCOMMANDS: &[(&str, &str)] = &[
 ];
 
 const MCP_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("help", "Quick MCP help and examples"),
+    ("list", "Overview of servers, tools, prompts, and resources"),
+    ("tools", "List callable tools: /mcp tools [server]"),
+    ("inspect", "Tool details: /mcp inspect <server>:<tool>"),
+    ("prompts", "List available MCP prompts"),
+    ("resources", "List readable MCP resources"),
+    ("read", "Read a resource: /mcp read <server>:<uri>"),
+    ("ping", "Ping: /mcp ping [server]"),
     ("add", "Add: /mcp add <name> <command> [args…]"),
+    ("prompt", "Invoke: /mcp prompt <server>:<name> [args]"),
+    ("remove", "Remove: /mcp remove <name>"),
+    ("history", "Recent MCP tool-call history"),
+    ("servers", "Show server details and tools"),
+    ("status", "Alias for /mcp list"),
     (
         "complete",
         "Completions: /mcp complete <server>:prompt:<name> <arg> [value]",
     ),
     ("log-level", "Set level: /mcp log-level <server> <level>"),
-    ("ping", "Ping: /mcp ping [server]"),
-    ("prompt", "Invoke: /mcp prompt <server>:<name> [args]"),
-    ("prompts", "List available MCP prompts"),
-    ("remove", "Remove: /mcp remove <name>"),
-    ("resource", "Read: /mcp resource <server>:<uri>"),
-    ("resources", "List available MCP resources"),
-    ("servers", "Show server details and tools"),
-    ("status", "Show connection status table"),
     ("subscribe", "Subscribe: /mcp subscribe <server>:<uri>"),
     (
         "unsubscribe",
@@ -684,11 +689,11 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── MCP ───────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/mcp",
-        "MCP: status|servers|prompts|resources|add|remove|ping|complete|…",
+        "MCP: help|list|tools|inspect|prompts|resources|read|ping|…",
         CommandGroup::Mcp,
     )
     .with_subcommands(MCP_SUBCOMMANDS)
-    .with_arg_hint("[status|servers|prompts|resources|add|remove|ping|…]")
+    .with_arg_hint("[help|list|tools|inspect|prompts|resources|read|ping|…]")
     .with_tui_handler(TuiHandler::Fallback),
     // ── Team & account ───────────────────────────────────────────────────
     CommandMeta::new(

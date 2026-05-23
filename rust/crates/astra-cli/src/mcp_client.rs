@@ -713,6 +713,26 @@ async fn do_elicitation(
 /// these are lock-free and safe for concurrent access. For WebSocket
 /// connections, the bridge `JoinHandle`s are stored so task failures can be
 /// detected instead of silently degrading the connection.
+/// A logged MCP tool call entry.
+#[derive(Debug, Clone, Serialize)]
+pub struct CallLogEntry {
+    /// When the call was made.
+    pub timestamp: String,
+    /// Tool name used in the call.
+    pub tool: String,
+    /// Server this call was routed to.
+    pub server: String,
+    /// Whether the call succeeded.
+    pub success: bool,
+    /// Call latency.
+    pub latency_ms: u64,
+    /// Error message if the call failed.
+    pub error: Option<String>,
+}
+
+/// Maximum number of call log entries kept per connection.
+const CALL_LOG_MAX_ENTRIES: usize = 100;
+
 pub struct McpConnection {
     /// Server name.
     pub name: String,
@@ -734,6 +754,19 @@ pub struct McpConnection {
     /// Stored so that task panics or unexpected exits are detectable instead of
     /// silently degrading the connection.
     ws_bridge_handles: Option<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)>,
+    /// Total number of tool calls made through this connection.
+    pub call_count: AtomicU64,
+    /// Number of failed tool calls.
+    pub error_count: AtomicU64,
+    /// Latency of the most recent tool call.
+    pub last_latency: RwLock<Option<std::time::Duration>>,
+    /// Error message from the most recent failed call, if any.
+    pub last_error: RwLock<Option<String>>,
+    /// Ring buffer of recent call log entries (max CALL_LOG_MAX_ENTRIES).
+    pub call_log: RwLock<Vec<CallLogEntry>>,
+    /// Keep-alive handle for the background MCP service task.
+    /// Stored to prevent transport closure when `RunningService` is dropped.
+    keepalive_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for McpConnection {
@@ -746,6 +779,9 @@ impl Drop for McpConnection {
         if let Some((read_handle, write_handle)) = self.ws_bridge_handles.take() {
             read_handle.abort();
             write_handle.abort();
+        }
+        if let Some(keepalive) = self.keepalive_handle.take() {
+            keepalive.abort();
         }
     }
 }
@@ -913,6 +949,9 @@ impl McpConnection {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<CallToolResult, ServiceError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+        let start = Instant::now();
+
         let arguments = match arguments {
             serde_json::Value::Object(map) => Some(map),
             serde_json::Value::Null => None,
@@ -926,19 +965,18 @@ impl McpConnection {
         } else {
             CallToolRequestParams::new(name.to_string())
         };
-        match &self.backend {
+        let result = match &self.backend {
             McpConnectionBackend::Stateful(peer) => tokio::time::timeout(
                 std::time::Duration::from_secs(MCP_TOOL_CALL_TIMEOUT_SECS),
                 peer.call_tool(params),
             )
             .await
             .map_err(|_| {
-                eprintln!(
-                    "  {} MCP tool '{}' on server '{}' timed out after {}s",
-                    "✗".red(),
-                    name.magenta(),
-                    self.name.as_str().magenta(),
-                    MCP_TOOL_CALL_TIMEOUT_SECS
+                tracing::warn!(
+                    server = %self.name,
+                    tool = name,
+                    timeout_secs = MCP_TOOL_CALL_TIMEOUT_SECS,
+                    "MCP: tool call timed out"
                 );
                 ServiceError::Timeout {
                     timeout: std::time::Duration::from_secs(MCP_TOOL_CALL_TIMEOUT_SECS),
@@ -960,7 +998,42 @@ impl McpConnection {
                     )
                     .await
             }
+        };
+
+        let latency = start.elapsed();
+        let latency_ms = latency.as_millis() as u64;
+        *self.last_latency.write().await = Some(latency);
+
+        let mut success = true;
+        let mut error_msg: Option<String> = None;
+        match &result {
+            Ok(_) => {}
+            Err(e) => {
+                self.error_count.fetch_add(1, Ordering::Relaxed);
+                let err_str = e.to_string();
+                *self.last_error.write().await = Some(err_str.clone());
+                success = false;
+                error_msg = Some(err_str);
+            }
         }
+
+        // Push to call log ring buffer (oldest evicted when full).
+        {
+            let mut log = self.call_log.write().await;
+            if log.len() >= CALL_LOG_MAX_ENTRIES {
+                log.remove(0);
+            }
+            log.push(CallLogEntry {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                tool: name.to_string(),
+                server: self.name.clone(),
+                success,
+                latency_ms,
+                error: error_msg,
+            });
+        }
+
+        result
     }
 
     /// Check if this server has a specific tool.
@@ -1216,6 +1289,16 @@ impl McpClientManager {
         self.sampling.is_some()
     }
 
+    /// Get a reference to a connection by server name.
+    pub fn get_connection(&self, server: &str) -> Option<&Arc<McpConnection>> {
+        self.connections.get(server)
+    }
+
+    /// Return all active server names.
+    pub fn server_names(&self) -> Vec<&str> {
+        self.connections.keys().map(|s| s.as_str()).collect()
+    }
+
     /// Low-level connect (no skill discovery). Use `connect_and_discover_skills`
     /// for production code paths that should register `skill://` resources.
     async fn connect_internal(&mut self, config: McpServerConfig) -> Result<(), McpError> {
@@ -1224,19 +1307,44 @@ impl McpClientManager {
         }
 
         let name = config.name.clone();
+        tracing::info!(
+            server = %name,
+            transport = ?config.transport,
+            "MCP: connecting to server"
+        );
         self.states
             .insert(name.clone(), ConnectionState::Connecting);
         match connect_to_server(config, self.sampling.clone(), self.roots.clone()).await {
             Ok(connection) => {
+                let tool_count = connection.tools.len();
+                tracing::info!(
+                    server = %name,
+                    tools = tool_count,
+                    "MCP: connected to server"
+                );
                 self.states.insert(name.clone(), ConnectionState::Connected);
                 self.connections.insert(name, Arc::new(connection));
                 Ok(())
             }
             Err(e) => {
+                tracing::error!(
+                    server = %name,
+                    error = %e,
+                    "MCP: failed to connect to server"
+                );
                 self.states.insert(name, ConnectionState::Failed);
                 Err(e)
             }
         }
+    }
+
+    /// Test-only helper: connect to an MCP server without skill discovery.
+    #[cfg(test)]
+    pub(crate) async fn connect_for_test(
+        &mut self,
+        config: McpServerConfig,
+    ) -> Result<(), McpError> {
+        self.connect_internal(config).await
     }
 
     /// Connect to an MCP server and register any `skill://` resources into the
@@ -1264,13 +1372,20 @@ impl McpClientManager {
             {
                 Ok(_) => registered += 1,
                 Err(e) => {
-                    eprintln!(
-                        "  {} {}",
-                        theme::icon_warn(),
-                        format!("Failed to register MCP skill from {server_name}: {e}").dim()
+                    tracing::warn!(
+                        server = %server_name,
+                        error = %e,
+                        "MCP: failed to register skill"
                     );
                 }
             }
+        }
+        if registered > 0 {
+            tracing::info!(
+                server = %server_name,
+                skills = registered,
+                "MCP: registered skills from server"
+            );
         }
         Ok(registered)
     }
@@ -1285,13 +1400,14 @@ impl McpClientManager {
     ) -> bool {
         let removed = self.connections.remove(name).is_some();
         if removed {
+            tracing::info!(server = name, "MCP: disconnecting from server");
             self.states
                 .insert(name.to_string(), ConnectionState::Disconnected);
             if let Err(e) = skill_registry.remove_mcp_server_skills(name).await {
-                astra_core::agent_warn!(
-                    "mcp",
-                    "failed to remove skills for server '{}': {e}",
-                    name
+                tracing::warn!(
+                    server = name,
+                    error = %e,
+                    "MCP: failed to remove skills for server"
                 );
             }
         }
@@ -1303,6 +1419,10 @@ impl McpClientManager {
     pub fn disconnect(&mut self, name: &str) -> bool {
         let removed = self.connections.remove(name).is_some();
         if removed {
+            tracing::info!(
+                server = name,
+                "MCP: disconnected server (no registry cleanup)"
+            );
             self.states
                 .insert(name.to_string(), ConnectionState::Disconnected);
         }
@@ -1463,14 +1583,37 @@ impl McpClientManager {
             .find_tool(tool_name)
             .ok_or_else(|| McpError::ToolNotFound(tool_name.to_string()))?;
 
+        tracing::debug!(
+            server = server_name,
+            tool = tool_name,
+            "MCP: dispatching tool call"
+        );
+
         let conn = self
             .connections
             .get(server_name)
             .ok_or_else(|| McpError::ServerNotConnected(server_name.to_string()))?;
 
-        conn.call_tool(tool_name, arguments)
+        let result = conn
+            .call_tool(tool_name, arguments)
             .await
-            .map_err(McpError::Service)
+            .map_err(McpError::Service);
+
+        match &result {
+            Ok(_) => tracing::debug!(
+                server = server_name,
+                tool = tool_name,
+                "MCP: tool call succeeded"
+            ),
+            Err(e) => tracing::warn!(
+                server = server_name,
+                tool = tool_name,
+                error = %e,
+                "MCP: tool call failed"
+            ),
+        }
+
+        result
     }
     /// Request argument completions from a specific server.
     pub async fn complete(
@@ -1501,8 +1644,21 @@ impl McpClientManager {
             .ok_or_else(|| McpError::ServerNotConnected(server.to_string()))?;
         let start = Instant::now();
         match conn.ping().await {
-            Ok(()) => Ok(start.elapsed()),
+            Ok(()) => {
+                let latency = start.elapsed();
+                tracing::debug!(
+                    server = server,
+                    latency_ms = latency.as_millis() as u64,
+                    "MCP: ping succeeded"
+                );
+                Ok(latency)
+            }
             Err(e) if service_error_requires_reconnect(&e) => {
+                tracing::warn!(
+                    server = server,
+                    error = %e,
+                    "MCP: ping failed, attempting reconnect"
+                );
                 self.reconnect(server).await?;
                 let conn = self
                     .connections
@@ -1510,9 +1666,22 @@ impl McpClientManager {
                     .ok_or_else(|| McpError::ServerNotConnected(server.to_string()))?;
                 let retry_start = Instant::now();
                 conn.ping().await.map_err(McpError::Service)?;
-                Ok(retry_start.elapsed())
+                let latency = retry_start.elapsed();
+                tracing::info!(
+                    server = server,
+                    latency_ms = latency.as_millis() as u64,
+                    "MCP: ping succeeded after reconnect"
+                );
+                Ok(latency)
             }
-            Err(e) => Err(McpError::Service(e)),
+            Err(e) => {
+                tracing::warn!(
+                    server = server,
+                    error = %e,
+                    "MCP: ping failed"
+                );
+                Err(McpError::Service(e))
+            }
         }
     }
 
@@ -1542,6 +1711,7 @@ impl McpClientManager {
     /// Reconnect a server using its stored config.
     /// Replaces the existing connection. Returns new tool count on success.
     pub async fn reconnect(&mut self, name: &str) -> Result<usize, McpError> {
+        tracing::info!(server = name, "MCP: reconnecting to server");
         let config = match self.connections.get(name) {
             Some(conn) => conn.config.clone(),
             None => return Err(McpError::ServerNotConnected(name.to_string())),
@@ -1555,6 +1725,11 @@ impl McpClientManager {
         match connect_to_server(config, self.sampling.clone(), self.roots.clone()).await {
             Ok(connection) => {
                 let tool_count = connection.tools.len();
+                tracing::info!(
+                    server = name,
+                    tools = tool_count,
+                    "MCP: reconnected to server"
+                );
                 self.states
                     .insert(name.to_string(), ConnectionState::Connected);
                 self.connections
@@ -1562,6 +1737,11 @@ impl McpClientManager {
                 Ok(tool_count)
             }
             Err(e) => {
+                tracing::error!(
+                    server = name,
+                    error = %e,
+                    "MCP: reconnect failed"
+                );
                 self.states
                     .insert(name.to_string(), ConnectionState::Failed);
                 Err(e)
@@ -1576,23 +1756,23 @@ impl McpClientManager {
             if conn.has_pending_tool_change() {
                 if let Some(inner) = Arc::get_mut(conn) {
                     match inner.refresh_tools_if_changed().await {
-                        Ok(true) => refreshed.push(name.clone()),
+                        Ok(true) => {
+                            tracing::info!(
+                                server = name.as_str(),
+                                tools = inner.tools.len(),
+                                "MCP: refreshed tool list"
+                            );
+                            refreshed.push(name.clone());
+                        }
                         Ok(false) => {}
-                        Err(e) => eprintln!(
-                            "  {} {}",
-                            theme::icon_warn(),
-                            format!("Failed to refresh tools for {name}: {e}").dim()
+                        Err(e) => tracing::warn!(
+                            server = name.as_str(),
+                            error = %e,
+                            "MCP: failed to refresh tools"
                         ),
                     }
                 }
             }
-        }
-        if !refreshed.is_empty() {
-            eprintln!(
-                "  {} Refreshed tool lists for: {}",
-                "↻".magenta(),
-                refreshed.join(", ")
-            );
         }
         refreshed
     }
@@ -1694,9 +1874,12 @@ async fn connect_to_server(
                 retry.initial_delay_ms * 2u64.saturating_pow(attempt - 1),
                 retry.max_delay_ms,
             );
-            eprintln!(
-                "  ↻ Retrying {name} (attempt {attempt}/{max}, backoff {delay_ms}ms)",
+            tracing::warn!(
+                server = name.as_str(),
+                attempt,
                 max = retry.max_retries,
+                delay_ms,
+                "MCP: retrying connection"
             );
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
@@ -1706,19 +1889,37 @@ async fn connect_to_server(
             Err(e) => {
                 // Don't retry config errors — they won't resolve themselves.
                 if matches!(e, McpError::InvalidConfig(_)) {
+                    tracing::error!(
+                        server = name.as_str(),
+                        error = %e,
+                        "MCP: invalid config, not retrying"
+                    );
                     return Err(e);
                 }
+                tracing::warn!(
+                    server = name.as_str(),
+                    attempt,
+                    error = %e,
+                    "MCP: connection attempt failed"
+                );
                 last_error = Some(e);
             }
         }
     }
 
-    Err(last_error.unwrap_or_else(|| {
+    let final_error = last_error.unwrap_or_else(|| {
         McpError::Initialize(format!(
             "{name}: all {n} retries exhausted",
             n = retry.max_retries
         ))
-    }))
+    });
+    tracing::error!(
+        server = name.as_str(),
+        retries = retry.max_retries,
+        error = %final_error,
+        "MCP: all connection attempts exhausted"
+    );
+    Err(final_error)
 }
 
 /// Single connection attempt (no retry).
@@ -1791,6 +1992,12 @@ async fn connect_stdio(
         ));
     }
 
+    tracing::info!(
+        server = name,
+        command = command.join(" ").as_str(),
+        "MCP: connecting via stdio"
+    );
+
     // Build the command using tokio::process::Command
     let mut cmd = tokio::process::Command::new(&command[0]);
     if command.len() > 1 {
@@ -1801,11 +2008,10 @@ async fn connect_stdio(
     // escalation or library injection attacks.
     for (key, value) in env {
         if is_dangerous_env_var(key) {
-            eprintln!(
-                "  {} MCP server '{}': blocked dangerous env var '{}'",
-                theme::icon_warn(),
-                name.magenta(),
-                key.as_str().yellow()
+            tracing::warn!(
+                server = name,
+                var = key.as_str(),
+                "MCP: blocked dangerous env var"
             );
             continue;
         }
@@ -1833,8 +2039,17 @@ async fn connect_stdio(
     .map_err(|e| McpError::Initialize(e.to_string()))?;
 
     let peer = running.peer().clone();
+    let keepalive = tokio::spawn(async move {
+        let _ = running.waiting().await;
+    });
 
     let tools = fetch_tools_with_timeout(&peer, name).await?;
+
+    tracing::info!(
+        server = name,
+        tools = tools.len(),
+        "MCP: stdio connection established"
+    );
 
     Ok(McpConnection {
         name: name.to_string(),
@@ -1846,6 +2061,12 @@ async fn connect_stdio(
         prompts_changed,
         resources_changed,
         ws_bridge_handles: None,
+        call_count: AtomicU64::new(0),
+        error_count: AtomicU64::new(0),
+        last_latency: RwLock::new(None),
+        last_error: RwLock::new(None),
+        call_log: RwLock::new(Vec::new()),
+        keepalive_handle: Some(keepalive),
     })
 }
 
@@ -1866,6 +2087,8 @@ async fn connect_sse(
     if url.is_empty() {
         return Err(McpError::InvalidConfig("url cannot be empty".to_string()));
     }
+
+    tracing::info!(server = name, url, "MCP: connecting via SSE");
 
     if let Some(connection) =
         probe_stateless_http_connection(name, url, auth_token, headers, config.clone()).await?
@@ -1903,9 +2126,25 @@ async fn connect_sse(
     match serve_client(handler, transport).await {
         Ok(running) => {
             let peer = running.peer().clone();
+            let keepalive = tokio::spawn(async move {
+                let _ = running.waiting().await;
+            });
             let tools = match fetch_tools_with_timeout(&peer, name).await {
-                Ok(tools) => tools,
+                Ok(tools) => {
+                    tracing::info!(
+                        server = name,
+                        tools = tools.len(),
+                        "MCP: SSE connection established"
+                    );
+                    tools
+                }
                 Err(err) if mcp_error_supports_stateless_fallback(&err) => {
+                    tracing::info!(
+                        server = name,
+                        url,
+                        error = %err,
+                        "MCP: SSE connect failed, falling back to stateless HTTP"
+                    );
                     return connect_stateless_http(name, url, auth_token, headers, config).await;
                 }
                 Err(err) => return Err(err),
@@ -1920,6 +2159,12 @@ async fn connect_sse(
                 prompts_changed,
                 resources_changed,
                 ws_bridge_handles: None,
+                call_count: AtomicU64::new(0),
+                error_count: AtomicU64::new(0),
+                last_latency: RwLock::new(None),
+                last_error: RwLock::new(None),
+                call_log: RwLock::new(Vec::new()),
+                keepalive_handle: Some(keepalive),
             })
         }
         Err(e) => {
@@ -1939,6 +2184,7 @@ async fn connect_stateless_http(
     headers: &HashMap<String, String>,
     config: McpServerConfig,
 ) -> Result<McpConnection, McpError> {
+    tracing::info!(server = name, url, "MCP: connecting via stateless HTTP");
     let client = StatelessHttpMcpClient::new(url, auth_token, headers)?;
     let _: serde_json::Value = client
         .request(
@@ -1986,6 +2232,12 @@ async fn connect_stateless_http(
         prompts_changed,
         resources_changed,
         ws_bridge_handles: None,
+        call_count: AtomicU64::new(0),
+        error_count: AtomicU64::new(0),
+        last_latency: RwLock::new(None),
+        last_error: RwLock::new(None),
+        call_log: RwLock::new(Vec::new()),
+        keepalive_handle: None,
     })
 }
 
@@ -2067,6 +2319,12 @@ async fn probe_stateless_http_connection(
         prompts_changed,
         resources_changed,
         ws_bridge_handles: None,
+        call_count: AtomicU64::new(0),
+        error_count: AtomicU64::new(0),
+        last_latency: RwLock::new(None),
+        last_error: RwLock::new(None),
+        call_log: RwLock::new(Vec::new()),
+        keepalive_handle: None,
     }))
 }
 
@@ -2099,6 +2357,8 @@ async fn connect_ws(
     if url.is_empty() {
         return Err(McpError::InvalidConfig("url cannot be empty".to_string()));
     }
+
+    tracing::info!(server = name, url, "MCP: connecting via WebSocket");
 
     // Build WebSocket request with optional auth and custom headers
     let mut request = tungstenite::http::Request::builder()
@@ -2149,10 +2409,10 @@ async fn connect_ws(
                 Some(Ok(tungstenite::Message::Close(_))) => break,
                 Some(Ok(_)) => {} // ignore binary, ping, pong
                 Some(Err(e)) => {
-                    eprintln!(
-                        "  {} {}",
-                        theme::icon_warn(),
-                        format!("MCP WebSocket read error [{reader_name}]: {e}").dim()
+                    tracing::warn!(
+                        server = reader_name.as_str(),
+                        error = %e,
+                        "MCP: WebSocket read error"
                     );
                     break;
                 }
@@ -2184,10 +2444,10 @@ async fn connect_ws(
                     line.clear();
                 }
                 Err(e) => {
-                    eprintln!(
-                        "  {} {}",
-                        theme::icon_warn(),
-                        format!("MCP WebSocket write-bridge error [{writer_name}]: {e}").dim()
+                    tracing::warn!(
+                        server = writer_name.as_str(),
+                        error = %e,
+                        "MCP: WebSocket write-bridge error"
                     );
                     break;
                 }
@@ -2203,7 +2463,16 @@ async fn connect_ws(
         .map_err(|e| McpError::Initialize(format!("MCP init over WebSocket {url}: {e}")))?;
 
     let peer = running.peer().clone();
+    let keepalive = tokio::spawn(async move {
+        let _ = running.waiting().await;
+    });
     let tools = fetch_tools_with_timeout(&peer, name).await?;
+
+    tracing::info!(
+        server = name,
+        tools = tools.len(),
+        "MCP: WebSocket connection established"
+    );
 
     Ok(McpConnection {
         name: name.to_string(),
@@ -2215,6 +2484,12 @@ async fn connect_ws(
         prompts_changed,
         resources_changed,
         ws_bridge_handles: Some((ws_read_handle, ws_write_handle)),
+        call_count: AtomicU64::new(0),
+        error_count: AtomicU64::new(0),
+        last_latency: RwLock::new(None),
+        last_error: RwLock::new(None),
+        call_log: RwLock::new(Vec::new()),
+        keepalive_handle: Some(keepalive),
     })
 }
 
@@ -2415,6 +2690,51 @@ pub fn extract_result_text_with_limit(result: &CallToolResult, max_len: usize) -
     } else {
         joined
     }
+}
+
+#[cfg(test)]
+pub(crate) fn ensure_mock_mcp_server_binary() -> std::path::PathBuf {
+    static BINARY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+    BINARY
+        .get_or_init(|| {
+            let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let profile = if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            };
+            let binary_name = format!("mock_mcp_server{}", std::env::consts::EXE_SUFFIX);
+            let binary = manifest_dir
+                .join("../..")
+                .join("target")
+                .join(profile)
+                .join("examples")
+                .join(binary_name);
+
+            if binary.exists() {
+                return binary;
+            }
+
+            let status = std::process::Command::new("cargo")
+                .args(["build", "-p", "astra-cli", "--example", "mock_mcp_server"])
+                .current_dir(manifest_dir.join("../.."))
+                .status()
+                .unwrap_or_else(|e| panic!("failed to build mock_mcp_server example: {e}"));
+
+            assert!(
+                status.success(),
+                "cargo build -p astra-cli --example mock_mcp_server failed with status {status}"
+            );
+            assert!(
+                binary.exists(),
+                "mock_mcp_server binary missing after build at {:?}",
+                binary
+            );
+
+            binary
+        })
+        .clone()
 }
 
 #[cfg(test)]
@@ -4088,5 +4408,527 @@ mcp_servers:
         let text = extract_result_text_with_limit(&result, 100);
         assert!(text.contains("[OUTPUT TRUNCATED"));
         assert!(text.len() < 500);
+    }
+
+    // ── extract_result_text: non-text content handling ─────────────────────
+
+    #[test]
+    fn extract_result_text_skips_image_content() {
+        use rmcp::model::{Content, RawContent};
+        let result = CallToolResult::success(vec![
+            Content::new(RawContent::text("text output"), None),
+            Content::new(
+                RawContent::Image(rmcp::model::RawImageContent {
+                    mime_type: "image/png".into(),
+                    data: "base64data".into(),
+                    meta: None,
+                }),
+                None,
+            ),
+        ]);
+        let text = extract_result_text(&result);
+        // Image content should be skipped; only text is returned
+        assert_eq!(text, "text output");
+    }
+
+    #[test]
+    fn extract_result_text_image_only_returns_empty() {
+        use rmcp::model::{Content, RawContent, RawImageContent};
+        let result = CallToolResult::success(vec![Content::new(
+            RawContent::Image(RawImageContent {
+                mime_type: "image/png".into(),
+                data: "base64data".into(),
+                meta: None,
+            }),
+            None,
+        )]);
+        let text = extract_result_text(&result);
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn extract_result_text_mixed_audio_content_skipped() {
+        use rmcp::model::{Content, RawContent};
+        // Audio content should also be skipped (non-text)
+        let result = CallToolResult::success(vec![
+            Content::new(RawContent::text("line 1"), None),
+            Content::new(
+                RawContent::Audio(rmcp::model::RawAudioContent {
+                    mime_type: "audio/wav".into(),
+                    data: "audio-data".into(),
+                }),
+                None,
+            ),
+            Content::new(RawContent::text("line 2"), None),
+        ]);
+        let text = extract_result_text(&result);
+        assert_eq!(text, "line 1\nline 2");
+    }
+
+    #[test]
+    fn extract_result_text_embedded_resource_skipped() {
+        use rmcp::model::{Content, RawContent, RawEmbeddedResource, ResourceContents};
+        let result = CallToolResult::success(vec![
+            Content::new(RawContent::text("before"), None),
+            Content::new(
+                RawContent::Resource(RawEmbeddedResource {
+                    meta: None,
+                    resource: ResourceContents::TextResourceContents {
+                        uri: "file:///data.txt".into(),
+                        mime_type: Some("text/plain".into()),
+                        text: "embedded data".into(),
+                        meta: None,
+                    },
+                }),
+                None,
+            ),
+            Content::new(RawContent::text("after"), None),
+        ]);
+        let text = extract_result_text(&result);
+        assert_eq!(text, "before\nafter");
+    }
+
+    #[test]
+    fn extract_result_text_with_limit_skips_non_text() {
+        use rmcp::model::{Content, RawContent};
+        let result = CallToolResult::success(vec![
+            Content::new(RawContent::text("a"), None),
+            Content::new(
+                RawContent::Image(rmcp::model::RawImageContent {
+                    mime_type: "image/png".into(),
+                    data: "x".repeat(1000),
+                    meta: None,
+                }),
+                None,
+            ),
+            Content::new(RawContent::text("b"), None),
+        ]);
+        let text = extract_result_text_with_limit(&result, 100);
+        // Image skipped, only text a\nb should appear
+        assert_eq!(text, "a\nb");
+        assert!(!text.contains("[OUTPUT TRUNCATED"));
+    }
+
+    // ── WebSocket transport with headers ───────────────────────────────────
+
+    #[test]
+    fn ws_transport_with_custom_headers() {
+        let yaml = r#"
+name: ws-headers
+transport:
+  type: ws
+  url: "wss://api.example.com/mcp"
+  auth_token: "bearer-token"
+  headers:
+    X-Custom-1: "val1"
+    X-Custom-2: "val2"
+"#;
+        let config: McpServerConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        match &config.transport {
+            Transport::Ws {
+                url,
+                auth_token,
+                headers,
+            } => {
+                assert_eq!(url, "wss://api.example.com/mcp");
+                assert_eq!(auth_token.as_deref(), Some("bearer-token"));
+                assert_eq!(headers.get("X-Custom-1"), Some(&"val1".to_string()));
+                assert_eq!(headers.get("X-Custom-2"), Some(&"val2".to_string()));
+            }
+            _ => panic!("expected Ws transport"),
+        }
+    }
+
+    #[test]
+    fn ws_transport_wss_alias() {
+        // "wss" is NOT a valid alias — only "ws" and "websocket" are accepted.
+        // Verify that "wss" URLs must use type: ws instead.
+        let yaml = r#"
+name: wss-test
+transport:
+  type: ws
+  url: "wss://secure.example.com/mcp"
+"#;
+        let config: McpServerConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        match &config.transport {
+            Transport::Ws { url, .. } => {
+                assert_eq!(url, "wss://secure.example.com/mcp");
+            }
+            _ => panic!("expected Ws transport for 'ws' type with wss:// URL"),
+        }
+    }
+
+    // ── McpClientManager tool lookup with populated state ─────────────────
+
+    #[test]
+    fn find_tool_by_mcp_name_exact_match() {
+        // We can't inject tools without a real connection, but we can verify
+        // the sanitized-name resolution logic directly.
+        let server = "my-server";
+        let tool_name = "read file";
+        let sanitized = sanitize_tool_name(&format!("mcp_{}_{}", server, tool_name));
+        assert_eq!(sanitized, "mcp_my-server_read_file");
+    }
+
+    #[test]
+    fn find_tool_by_mcp_name_special_chars_in_server() {
+        let server = "api.example.com";
+        let tool_name = "getData";
+        let sanitized = sanitize_tool_name(&format!("mcp_{}_{}", server, tool_name));
+        // Dots in server name become underscores
+        assert_eq!(sanitized, "mcp_api_example_com_getData");
+    }
+
+    // ── McpClientManager sampling config ──────────────────────────────────
+
+    #[test]
+    fn manager_has_sampling_returns_false_by_default() {
+        let manager = McpClientManager::new();
+        assert!(!manager.has_sampling());
+    }
+
+    #[test]
+    fn manager_has_sampling_returns_true_after_set() {
+        let mut manager = McpClientManager::new();
+        let config = SamplingConfig {
+            api: Arc::new(
+                astra_thin_client::ThinClient::new("http://localhost:8000", None).unwrap(),
+            ),
+            token: "tok".to_string(),
+            model: "m".to_string(),
+            max_tokens_cap: DEFAULT_SAMPLING_MAX_TOKENS_CAP,
+        };
+        manager.set_sampling_config(Some(config));
+        assert!(manager.has_sampling());
+    }
+
+    #[test]
+    fn manager_has_sampling_returns_false_after_clear() {
+        let mut manager = McpClientManager::new();
+        let config = SamplingConfig {
+            api: Arc::new(
+                astra_thin_client::ThinClient::new("http://localhost:8000", None).unwrap(),
+            ),
+            token: "tok".to_string(),
+            model: "m".to_string(),
+            max_tokens_cap: DEFAULT_SAMPLING_MAX_TOKENS_CAP,
+        };
+        manager.set_sampling_config(Some(config));
+        manager.set_sampling_config(None);
+        assert!(!manager.has_sampling());
+    }
+
+    // ── McpError conversion from ServiceError ──────────────────────────────
+
+    #[test]
+    fn mcp_error_from_service_error() {
+        let svc_err = ServiceError::TransportClosed;
+        let mcp_err = McpError::from(svc_err);
+        assert!(matches!(mcp_err, McpError::Service(_)));
+    }
+
+    #[test]
+    fn mcp_error_from_service_error_mcp_error() {
+        let svc_err = ServiceError::McpError(rmcp::model::ErrorData::new(
+            rmcp::model::ErrorCode::INTERNAL_ERROR,
+            "internal failure",
+            None,
+        ));
+        let mcp_err = McpError::from(svc_err);
+        assert!(mcp_err.to_string().contains("internal failure"));
+    }
+
+    // ── Transport enum round-trip ──────────────────────────────────────────
+
+    #[test]
+    fn transport_stdio_roundtrip_yaml() {
+        let transport = Transport::Stdio {
+            command: vec!["node".into(), "server.js".into()],
+            args: vec!["--debug".into()],
+            env: [("NODE_ENV".into(), "production".into())].into(),
+        };
+        let yaml = serde_yaml_ng::to_string(&transport).unwrap();
+        let back: Transport = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert!(matches!(back, Transport::Stdio { .. }));
+    }
+
+    #[test]
+    fn transport_sse_roundtrip_yaml() {
+        let transport = Transport::Sse {
+            url: "https://api.example.com/mcp".into(),
+            auth_token: Some("secret".into()),
+            headers: [("X-Key".into(), "val".into())].into(),
+        };
+        let yaml = serde_yaml_ng::to_string(&transport).unwrap();
+        let back: Transport = serde_yaml_ng::from_str(&yaml).unwrap();
+        match back {
+            Transport::Sse {
+                url,
+                auth_token,
+                headers,
+            } => {
+                assert_eq!(url, "https://api.example.com/mcp");
+                assert_eq!(auth_token, Some("secret".into()));
+                assert_eq!(headers.get("X-Key"), Some(&"val".into()));
+            }
+            _ => panic!("expected Sse"),
+        }
+    }
+
+    #[test]
+    fn transport_ws_roundtrip_yaml() {
+        let transport = Transport::Ws {
+            url: "wss://api.example.com/ws".into(),
+            auth_token: Some("token".into()),
+            headers: Default::default(),
+        };
+        let yaml = serde_yaml_ng::to_string(&transport).unwrap();
+        let back: Transport = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert!(matches!(back, Transport::Ws { .. }));
+    }
+
+    // ── ConnectionState Copy + Eq verification ────────────────────────────
+
+    #[test]
+    fn connection_state_is_copy() {
+        // Verify ConnectionState implements Copy (compile-time check)
+        let state = ConnectionState::Connected;
+        let copied = state;
+        assert_eq!(state, copied);
+    }
+
+    #[test]
+    fn connection_state_eq() {
+        assert_eq!(ConnectionState::Connected, ConnectionState::Connected);
+        assert_ne!(ConnectionState::Connected, ConnectionState::Disconnected);
+        assert_eq!(ConnectionState::Failed, ConnectionState::Failed);
+        assert_ne!(ConnectionState::Connecting, ConnectionState::Reconnecting);
+    }
+
+    // ── McpServerConfig defaults ──────────────────────────────────────────
+
+    #[test]
+    fn mcp_server_config_defaults() {
+        let config = McpServerConfig {
+            name: "test".into(),
+            transport: Transport::Stdio {
+                command: vec!["echo".into()],
+                args: vec![],
+                env: Default::default(),
+            },
+            description: Default::default(),
+            enabled: true,
+            retry: Default::default(),
+        };
+        assert!(config.enabled);
+        assert_eq!(config.retry.max_retries, 5);
+        assert_eq!(config.retry.initial_delay_ms, 1000);
+        assert_eq!(config.retry.max_delay_ms, 30_000);
+    }
+
+    #[test]
+    fn mcp_server_config_disabled_server() {
+        let config = McpServerConfig {
+            name: "off".into(),
+            transport: Transport::Stdio {
+                command: vec!["echo".into()],
+                args: vec![],
+                env: Default::default(),
+            },
+            description: Default::default(),
+            enabled: false,
+            retry: Default::default(),
+        };
+        assert!(!config.enabled);
+    }
+
+    // ── Max constants sanity ──────────────────────────────────────────────
+
+    #[test]
+    fn max_description_length_reasonable() {
+        const { assert!(MAX_DESCRIPTION_LENGTH > 0) };
+        const { assert!(MAX_DESCRIPTION_LENGTH <= 4096) };
+    }
+
+    #[test]
+    fn max_result_content_length_reasonable() {
+        const { assert!(MAX_RESULT_CONTENT_LENGTH > 0) };
+        const { assert!(MAX_RESULT_CONTENT_LENGTH <= 1_000_000) };
+    }
+
+    // ── Integration tests with mock MCP server (stdio) ──────────────────
+
+    /// Locate the mock MCP server Rust binary (workspace example).
+    fn mock_server_binary() -> std::path::PathBuf {
+        ensure_mock_mcp_server_binary()
+    }
+
+    /// Build a McpServerConfig for the mock server with zero retries
+    /// (tests should not hang on retries when the process fails to start).
+    fn mock_server_config() -> McpServerConfig {
+        McpServerConfig {
+            name: "mock-server".to_string(),
+            description: "Integration test mock MCP server".to_string(),
+            transport: Transport::Stdio {
+                command: vec![mock_server_binary().to_string_lossy().to_string()],
+                args: vec![],
+                env: Default::default(),
+            },
+            enabled: true,
+            retry: RetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Connect to the mock MCP server via stdio.
+    async fn connect_mock_server() -> McpConnection {
+        let config = mock_server_config();
+        connect_to_server(config, None, Arc::new(RwLock::new(Vec::new())))
+            .await
+            .expect("Failed to connect to mock MCP server")
+    }
+
+    #[tokio::test]
+    async fn integration_mock_server_list_tools() {
+        let conn = connect_mock_server().await;
+        let tool_names: Vec<&str> = conn.tools.iter().map(|t| t.name.as_ref()).collect();
+        assert!(tool_names.contains(&"echo"), "expected 'echo' tool");
+        assert!(tool_names.contains(&"add"), "expected 'add' tool");
+        assert!(tool_names.contains(&"get_time"), "expected 'get_time' tool");
+        assert_eq!(
+            tool_names.len(),
+            3,
+            "mock server should expose exactly 3 tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_mock_server_call_echo() {
+        let conn = connect_mock_server().await;
+        let result = conn
+            .call_tool("echo", serde_json::json!({"message": "hello-mcp"}))
+            .await
+            .expect("echo call failed");
+        let text = extract_result_text(&result);
+        assert_eq!(text, "hello-mcp");
+    }
+
+    #[tokio::test]
+    async fn integration_mock_server_call_add() {
+        let conn = connect_mock_server().await;
+        let result = conn
+            .call_tool("add", serde_json::json!({"a": 7, "b": 3}))
+            .await
+            .expect("add call failed");
+        let text = extract_result_text(&result);
+        assert_eq!(text, "10");
+    }
+
+    #[tokio::test]
+    async fn integration_mock_server_call_get_time() {
+        let conn = connect_mock_server().await;
+        let result = conn
+            .call_tool("get_time", serde_json::json!({}))
+            .await
+            .expect("get_time call failed");
+        let text = extract_result_text(&result);
+        // Should be an ISO 8601 datetime string
+        assert!(
+            !text.is_empty(),
+            "get_time should return a non-empty string"
+        );
+        assert!(
+            text.contains("T"),
+            "get_time should return ISO 8601, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_mock_server_call_unknown_tool() {
+        let conn = connect_mock_server().await;
+        let result = conn
+            .call_tool("nonexistent_tool", serde_json::json!({}))
+            .await;
+        assert!(result.is_err(), "calling unknown tool should return error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("nonexistent_tool") || err_msg.contains("not found"),
+            "error should mention tool name, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_mock_server_ping() {
+        let conn = connect_mock_server().await;
+        conn.ping().await.expect("ping should succeed");
+    }
+
+    #[tokio::test]
+    async fn integration_mock_server_call_count_increments() {
+        let conn = connect_mock_server().await;
+        let before = conn.call_count.load(Ordering::Relaxed);
+        conn.call_tool("echo", serde_json::json!({"message": "x"}))
+            .await
+            .unwrap();
+        conn.call_tool("add", serde_json::json!({"a": 1, "b": 2}))
+            .await
+            .unwrap();
+        let after = conn.call_count.load(Ordering::Relaxed);
+        assert_eq!(after - before, 2, "call_count should increment by 2");
+    }
+
+    #[tokio::test]
+    async fn integration_mock_server_error_count_stays_zero_on_success() {
+        let conn = connect_mock_server().await;
+        conn.call_tool("echo", serde_json::json!({"message": "ok"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            conn.error_count.load(Ordering::Relaxed),
+            0,
+            "error_count should be 0 after successful calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_mock_server_last_latency_updated() {
+        let conn = connect_mock_server().await;
+        conn.call_tool("echo", serde_json::json!({"message": "lat"}))
+            .await
+            .unwrap();
+        let latency = conn.last_latency.read().await;
+        assert!(
+            latency.is_some(),
+            "last_latency should be set after a tool call"
+        );
+        assert!(
+            latency.unwrap() > std::time::Duration::ZERO,
+            "last_latency should be positive"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_mock_server_call_log_appended() {
+        let conn = connect_mock_server().await;
+        conn.call_tool("echo", serde_json::json!({"message": "log-me"}))
+            .await
+            .unwrap();
+        let log = conn.call_log.read().await;
+        assert_eq!(log.len(), 1, "call_log should have 1 entry");
+        assert_eq!(log[0].tool, "echo");
+        assert!(log[0].success, "echo call should be successful");
+    }
+
+    #[tokio::test]
+    async fn integration_mock_server_discover_skill_resources() {
+        let conn = connect_mock_server().await;
+        let skills = conn.discover_skill_resources().await;
+        // Mock server doesn't expose skill:// resources — should be empty.
+        assert!(
+            skills.is_empty(),
+            "mock server should not have skill resources, got {skills:?}"
+        );
     }
 }

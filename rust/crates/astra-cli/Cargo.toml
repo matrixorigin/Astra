@@ -97,3 +97,6 @@ serial_test = "3"
 temp-env = "0.3"
 wiremock = "0.6"
 insta.workspace = true
+# rmcp server features for mock MCP server example (integration tests)
+rmcp = { version = "1.3", default-features = false, features = ["server", "macros", "schemars", "transport-io"] }
+schemars = "1"

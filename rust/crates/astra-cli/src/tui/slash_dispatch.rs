@@ -160,6 +160,8 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
         }
 
+        "/mcp" => handle_mcp_dispatch(args, ctx).await,
+
         "/plan" => {
             let trimmed = args.trim();
             if !trimmed.is_empty() {
@@ -1700,6 +1702,607 @@ fn split_sub(text: &str) -> (&str, &str) {
     }
 }
 
+async fn handle_mcp_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashResult {
+    use crate::slash_mcp::ParsedMcpCommand as Cmd;
+
+    match crate::slash_mcp::parse_mcp_command(args) {
+        Cmd::Help => {
+            ctx.show_response(mcp_help_text(ctx.state).await);
+            SlashResult::Handled
+        }
+        Cmd::Overview => {
+            ctx.show_response(mcp_overview_text(ctx.state).await);
+            SlashResult::Handled
+        }
+        Cmd::Servers => {
+            ctx.show_response(mcp_servers_text(ctx.state).await);
+            SlashResult::Handled
+        }
+        Cmd::Tools(server) => {
+            ctx.show_response(mcp_tools_text(ctx.state, server).await);
+            SlashResult::Handled
+        }
+        Cmd::Prompts => {
+            ctx.show_response(mcp_prompts_text(ctx.state).await);
+            SlashResult::Handled
+        }
+        Cmd::Resources => {
+            ctx.show_response(mcp_resources_text(ctx.state).await);
+            SlashResult::Handled
+        }
+        Cmd::Read(Some(spec)) => {
+            ctx.show_response(mcp_read_text(ctx.state, spec).await);
+            SlashResult::Handled
+        }
+        Cmd::Read(None) => {
+            ctx.show_error("Usage: /mcp read <server>:<uri>".into());
+            SlashResult::Handled
+        }
+        Cmd::History => {
+            ctx.show_response(mcp_history_text(ctx.state).await);
+            SlashResult::Handled
+        }
+        Cmd::Inspect(Some(query)) => {
+            ctx.show_response(mcp_inspect_text(ctx.state, query).await);
+            SlashResult::Handled
+        }
+        Cmd::Inspect(None) => {
+            ctx.show_error(
+                "Usage: /mcp inspect <server>:<tool>  ·  try `/mcp tools` first.".into(),
+            );
+            SlashResult::Handled
+        }
+        Cmd::Ping(server) => {
+            ctx.show_response(mcp_ping_text(ctx.state, server).await);
+            SlashResult::Handled
+        }
+        Cmd::Add(Some(_)) => mcp_fallback_notice(ctx, "add"),
+        Cmd::Add(None) => {
+            ctx.show_error("Usage: /mcp add <name> <command> [args…]".into());
+            SlashResult::Handled
+        }
+        Cmd::Remove(Some(_)) => mcp_fallback_notice(ctx, "remove"),
+        Cmd::Remove(None) => {
+            ctx.show_error("Usage: /mcp remove <name>".into());
+            SlashResult::Handled
+        }
+        Cmd::Subscribe(Some(_)) => mcp_fallback_notice(ctx, "subscribe"),
+        Cmd::Subscribe(None) => {
+            ctx.show_error("Usage: /mcp subscribe <server>:<uri>".into());
+            SlashResult::Handled
+        }
+        Cmd::Unsubscribe(Some(_)) => mcp_fallback_notice(ctx, "unsubscribe"),
+        Cmd::Unsubscribe(None) => {
+            ctx.show_error("Usage: /mcp unsubscribe <server>:<uri>".into());
+            SlashResult::Handled
+        }
+        Cmd::LogLevel(Some(_)) => mcp_fallback_notice(ctx, "log-level"),
+        Cmd::LogLevel(None) => {
+            ctx.show_error("Usage: /mcp log-level <server> <level>".into());
+            SlashResult::Handled
+        }
+        Cmd::Prompt(Some(_)) => mcp_fallback_notice(ctx, "prompt"),
+        Cmd::Prompt(None) => {
+            ctx.show_error("Usage: /mcp prompt <server>:<name> [args…]".into());
+            SlashResult::Handled
+        }
+        Cmd::Complete(Some(_)) => mcp_fallback_notice(ctx, "complete"),
+        Cmd::Complete(None) => {
+            ctx.show_error("Usage: /mcp complete <server>:<prompt|resource> <arg> [value]".into());
+            SlashResult::Handled
+        }
+        Cmd::Unknown(sub) => {
+            ctx.show_error(format!(
+                "Unknown `/mcp` subcommand: `{sub}`. Try `/mcp help`."
+            ));
+            SlashResult::Handled
+        }
+    }
+}
+
+fn mcp_fallback_notice(ctx: &mut DispatchContext<'_>, subcommand: &str) -> SlashResult {
+    ctx.show_info(format!(
+        "`/mcp {subcommand}` still uses terminal fallback. Core discovery commands (`/mcp list`, `/mcp tools`, `/mcp prompts`, `/mcp resources`, `/mcp read`, `/mcp inspect`, `/mcp ping`) are native in TUI."
+    ));
+    SlashResult::Fallback
+}
+
+async fn mcp_help_text(state: &SessionState) -> String {
+    let count = state.mcp_manager.read().await.connection_count();
+    let mut lines = vec!["MCP commands".to_string()];
+    if count == 0 {
+        lines.push("No MCP servers connected yet.".into());
+        lines.push("Add one with: /mcp add <name> <command> [args…]".into());
+    } else {
+        lines.push(format!(
+            "{count} server(s) connected. Start with `/mcp list`."
+        ));
+    }
+    lines.push("/mcp list                 overview of connected servers".into());
+    lines.push("/mcp tools [server]       list callable tools".into());
+    lines.push("/mcp inspect <server>:<tool>  show tool parameters".into());
+    lines.push("/mcp prompts              list prompt templates".into());
+    lines.push("/mcp resources            list readable resources".into());
+    lines.push("/mcp read <server>:<uri>  read one resource".into());
+    lines.push("/mcp ping [server]        connectivity check".into());
+    lines.push(
+        "Advanced: /mcp add, remove, prompt, complete, log-level, subscribe, unsubscribe, history"
+            .into(),
+    );
+    lines.join("\n")
+}
+
+fn mcp_no_servers_text() -> String {
+    "No MCP servers connected.\nAdd one with: /mcp add <name> <command> [args…]\nThen use `/mcp list` or `/mcp tools`.".into()
+}
+
+fn mcp_format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+fn mcp_state_text(state: crate::mcp_client::ConnectionState) -> &'static str {
+    match state {
+        crate::mcp_client::ConnectionState::Connected => "connected",
+        crate::mcp_client::ConnectionState::Connecting => "connecting",
+        crate::mcp_client::ConnectionState::Reconnecting => "reconnecting",
+        crate::mcp_client::ConnectionState::Disconnected => "disconnected",
+        crate::mcp_client::ConnectionState::Failed => "failed",
+    }
+}
+
+fn mcp_trim_text(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let end = text
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+    format!("{}…", &text[..end])
+}
+
+fn mcp_truncate_block(text: &str, max_lines: usize, max_chars_per_line: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = lines
+        .iter()
+        .take(max_lines)
+        .map(|line| mcp_trim_text(line, max_chars_per_line))
+        .collect::<Vec<_>>();
+    if lines.len() > max_lines {
+        out.push(format!("… (+{} more lines)", lines.len() - max_lines));
+    }
+    out.join("\n")
+}
+
+async fn mcp_overview_text(state: &SessionState) -> String {
+    let manager = state.mcp_manager.read().await;
+    let count = manager.connection_count();
+    if count == 0 {
+        return mcp_no_servers_text();
+    }
+
+    let tools = manager.all_tools().len();
+    let prompts = manager.all_prompts().await.len();
+    let resources = manager.all_resources().await.len();
+    let mut capabilities = vec!["elicitation"];
+    if manager.has_sampling() {
+        capabilities.insert(0, "sampling");
+    }
+
+    let mut lines = vec![
+        "MCP overview".into(),
+        format!("Servers: {count} connected"),
+        format!("Capabilities: {}", capabilities.join(", ")),
+        format!("Tools: {tools}  ·  Prompts: {prompts}  ·  Resources: {resources}"),
+    ];
+
+    let roots = manager.roots().read().await;
+    if !roots.is_empty() {
+        let names = roots
+            .iter()
+            .map(|root| root.name.clone().unwrap_or_else(|| root.uri.clone()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("Roots: {names}"));
+    }
+    drop(roots);
+
+    lines.push(String::new());
+    lines.push("Servers".into());
+
+    let mut servers = manager.connected_servers();
+    servers.sort_unstable();
+    for name in servers {
+        if let Some(conn) = manager.get(name) {
+            let state_text = mcp_state_text(
+                manager
+                    .server_state(name)
+                    .unwrap_or(crate::mcp_client::ConnectionState::Connected),
+            );
+            let uptime = conn
+                .uptime()
+                .map(mcp_format_duration)
+                .unwrap_or_else(|| "n/a".into());
+            lines.push(format!(
+                "- {name} — {state_text} · {} tools · uptime {uptime}",
+                conn.tools().len()
+            ));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Next: /mcp tools [server] · /mcp prompts · /mcp resources".into());
+    lines.join("\n")
+}
+
+async fn mcp_servers_text(state: &SessionState) -> String {
+    let manager = state.mcp_manager.read().await;
+    if manager.connection_count() == 0 {
+        return mcp_no_servers_text();
+    }
+
+    let mut lines = vec!["MCP servers".into()];
+    let mut servers = manager.connected_servers();
+    servers.sort_unstable();
+    for name in servers {
+        if let Some(conn) = manager.get(name) {
+            let state_text = mcp_state_text(
+                manager
+                    .server_state(name)
+                    .unwrap_or(crate::mcp_client::ConnectionState::Connected),
+            );
+            let uptime = conn
+                .uptime()
+                .map(mcp_format_duration)
+                .unwrap_or_else(|| "n/a".into());
+            let preview = conn
+                .tools()
+                .iter()
+                .take(4)
+                .map(|tool| tool.name.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!(
+                "- {name} — {state_text} · {} tools · uptime {uptime}",
+                conn.tools().len()
+            ));
+            if !preview.is_empty() {
+                let more = conn.tools().len().saturating_sub(4);
+                if more > 0 {
+                    lines.push(format!("  tools: {preview}, … (+{more} more)"));
+                } else {
+                    lines.push(format!("  tools: {preview}"));
+                }
+            }
+        }
+    }
+    lines.push(String::new());
+    lines.push("Inspect one server's tools: /mcp tools <server>".into());
+    lines.join("\n")
+}
+
+async fn mcp_tools_text(state: &SessionState, server: Option<&str>) -> String {
+    let manager = state.mcp_manager.read().await;
+    if manager.connection_count() == 0 {
+        return mcp_no_servers_text();
+    }
+
+    let mut lines = Vec::new();
+    match server.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(server_name) => {
+            let Some(conn) = manager.get(server_name) else {
+                return format!(
+                    "Server '{server_name}' not found.\nTry `/mcp list` or `/mcp servers`."
+                );
+            };
+            lines.push(format!(
+                "MCP tools from {server_name} ({})",
+                conn.tools().len()
+            ));
+            for tool in conn.tools() {
+                let desc = tool.description.as_deref().unwrap_or("(no description)");
+                lines.push(format!("- {} — {}", tool.name, mcp_trim_text(desc, 90)));
+            }
+            lines.push(String::new());
+            lines.push(format!("Inspect one: /mcp inspect {server_name}:<tool>"));
+        }
+        None => {
+            let mut tools = manager
+                .all_tools()
+                .into_iter()
+                .map(|(server_name, tool)| {
+                    (
+                        server_name.to_string(),
+                        tool.name.to_string(),
+                        tool.description
+                            .as_deref()
+                            .map(|text| mcp_trim_text(text, 90))
+                            .unwrap_or_else(|| "(no description)".into()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            tools.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            lines.push(format!("MCP tools ({})", tools.len()));
+            for (server_name, tool_name, desc) in tools {
+                lines.push(format!("- {server_name}:{tool_name} — {desc}"));
+            }
+            lines.push(String::new());
+            lines.push("Inspect one: /mcp inspect <server>:<tool>".into());
+        }
+    }
+    lines.join("\n")
+}
+
+async fn mcp_prompts_text(state: &SessionState) -> String {
+    let manager = state.mcp_manager.read().await;
+    if manager.connection_count() == 0 {
+        return mcp_no_servers_text();
+    }
+
+    let mut prompts = manager.all_prompts().await;
+    if prompts.is_empty() {
+        return "No MCP prompts available from connected servers.".into();
+    }
+    prompts.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.name.cmp(&b.1.name)));
+
+    let mut lines = vec![format!("MCP prompts ({})", prompts.len())];
+    for (server_name, prompt) in prompts {
+        let args = prompt
+            .arguments
+            .as_ref()
+            .map(|args| {
+                args.iter()
+                    .map(|arg| {
+                        if arg.required.unwrap_or(false) {
+                            format!("<{}>", arg.name)
+                        } else {
+                            format!("[{}]", arg.name)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        let desc = prompt
+            .description
+            .as_deref()
+            .map(|text| mcp_trim_text(text, 90))
+            .unwrap_or_else(|| "(no description)".into());
+        if args.is_empty() {
+            lines.push(format!("- {server_name}:{} — {desc}", prompt.name));
+        } else {
+            lines.push(format!("- {server_name}:{} {args} — {desc}", prompt.name));
+        }
+    }
+    lines.push(String::new());
+    lines.push("Run one: /mcp prompt <server>:<name> [args…]".into());
+    lines.join("\n")
+}
+
+async fn mcp_resources_text(state: &SessionState) -> String {
+    let manager = state.mcp_manager.read().await;
+    if manager.connection_count() == 0 {
+        return mcp_no_servers_text();
+    }
+
+    let mut resources = manager.all_resources().await;
+    if resources.is_empty() {
+        return "No MCP resources available from connected servers.".into();
+    }
+    resources.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.raw.uri.cmp(&b.1.raw.uri)));
+
+    let mut lines = vec![format!("MCP resources ({})", resources.len())];
+    for (server_name, resource) in resources {
+        let mime = resource.raw.mime_type.as_deref().unwrap_or("unknown");
+        let desc = resource
+            .description
+            .as_deref()
+            .map(|text| mcp_trim_text(text, 80))
+            .unwrap_or_default();
+        if desc.is_empty() {
+            lines.push(format!("- {server_name}:{} [{mime}]", resource.raw.uri));
+        } else {
+            lines.push(format!(
+                "- {server_name}:{} [{mime}] — {desc}",
+                resource.raw.uri
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.push("Read one: /mcp read <server>:<uri>".into());
+    lines.join("\n")
+}
+
+async fn mcp_read_text(state: &SessionState, spec: &str) -> String {
+    let spec = spec.trim();
+    let (server_name, uri) = match spec.split_once(':') {
+        Some((server_name, uri)) if !server_name.is_empty() && !uri.is_empty() => {
+            (server_name, uri)
+        }
+        _ => return "Usage: /mcp read <server>:<uri>".into(),
+    };
+
+    let conn = {
+        let manager = state.mcp_manager.read().await;
+        if manager.connection_count() == 0 {
+            return mcp_no_servers_text();
+        }
+        match manager.get(server_name) {
+            Some(conn) => conn,
+            None => {
+                return format!(
+                    "Server '{server_name}' not found.\nTry `/mcp list` or `/mcp servers`."
+                );
+            }
+        }
+    };
+
+    match conn.read_resource(uri).await {
+        Ok(content) if content.trim().is_empty() => {
+            format!("{server_name}:{uri}\n(empty resource)")
+        }
+        Ok(content) => format!(
+            "{server_name}:{uri}\n\n{}",
+            mcp_truncate_block(&content, 40, 140)
+        ),
+        Err(error) => format!("Failed to read '{uri}' from '{server_name}': {error}"),
+    }
+}
+
+async fn mcp_history_text(state: &SessionState) -> String {
+    let manager = state.mcp_manager.read().await;
+    if manager.connection_count() == 0 {
+        return mcp_no_servers_text();
+    }
+
+    let mut entries = Vec::new();
+    for name in manager.server_names() {
+        if let Some(conn) = manager.get_connection(name) {
+            let log = conn.call_log.read().await;
+            entries.extend(log.iter().cloned());
+        }
+    }
+    if entries.is_empty() {
+        return "No MCP tool calls recorded yet.\nUse an MCP tool, then run `/mcp history` again."
+            .into();
+    }
+    entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    let mut lines = vec![format!("MCP call history ({})", entries.len())];
+    for entry in entries.into_iter().take(20) {
+        let status = if entry.success { "ok" } else { "fail" };
+        lines.push(format!(
+            "- {} · {}:{} · {}ms · {status}",
+            entry.timestamp, entry.server, entry.tool, entry.latency_ms
+        ));
+        if let Some(error) = entry.error {
+            lines.push(format!("  error: {}", mcp_trim_text(&error, 120)));
+        }
+    }
+    lines.join("\n")
+}
+
+fn mcp_protocol_tool_text(server: &str, tool: &rmcp::model::Tool) -> String {
+    let mut lines = vec![
+        format!("Tool: {server}:{}", tool.name),
+        format!(
+            "Description: {}",
+            tool.description.as_deref().unwrap_or("(no description)")
+        ),
+    ];
+    let schema = &*tool.input_schema;
+    if let Some(props) = schema.get("properties").and_then(|value| value.as_object()) {
+        let required = schema
+            .get("required")
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if props.is_empty() {
+            lines.push("Parameters: none".into());
+        } else {
+            lines.push("Parameters:".into());
+            for (name, param_schema) in props {
+                let required_marker = if required.contains(&name.as_str()) {
+                    "required"
+                } else {
+                    "optional"
+                };
+                let param_type = param_schema
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("any");
+                let desc = param_schema
+                    .get("description")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                if desc.is_empty() {
+                    lines.push(format!("- {name}: {param_type} ({required_marker})"));
+                } else {
+                    lines.push(format!(
+                        "- {name}: {param_type} ({required_marker}) — {}",
+                        mcp_trim_text(desc, 100)
+                    ));
+                }
+            }
+        }
+    } else {
+        lines.push("Parameters: none".into());
+    }
+    lines.join("\n")
+}
+
+fn mcp_builtin_tool_text(meta: &astra_turn_core::tool::registry::meta::ToolMeta) -> String {
+    [
+        format!("Tool: {}", meta.name),
+        format!("Description: {}", meta.description),
+        format!("Scope: {:?}", meta.scope),
+        format!("Intents: {:?}", meta.intents),
+        format!("Schema tokens: {}", meta.schema_tokens),
+    ]
+    .join("\n")
+}
+
+async fn mcp_inspect_text(state: &SessionState, query: &str) -> String {
+    let manager = state.mcp_manager.read().await;
+    match crate::slash_mcp::resolve_protocol_tool_query(&manager, query) {
+        Ok((server, tool)) => mcp_protocol_tool_text(server, tool),
+        Err(protocol_error) => {
+            for meta in astra_turn_core::tool::registry::meta::TOOL_CATALOG {
+                if meta.name == query
+                    || format!("mcp_{}", meta.name) == query
+                    || format!("mcp_memoria_{}", meta.name) == query
+                {
+                    return mcp_builtin_tool_text(meta);
+                }
+            }
+            protocol_error
+        }
+    }
+}
+
+async fn mcp_ping_text(state: &SessionState, server: Option<&str>) -> String {
+    let mut manager = state.mcp_manager.write().await;
+    if manager.connection_count() == 0 {
+        return mcp_no_servers_text();
+    }
+
+    match server.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => match manager.ping(name).await {
+            Ok(duration) => format!("✓ {name}: {:.1}ms", duration.as_secs_f64() * 1000.0),
+            Err(error) => format!("✗ {name}: {error}"),
+        },
+        None => {
+            let mut results = manager.ping_all().await;
+            if results.is_empty() {
+                return "No MCP servers connected.".into();
+            }
+            results.sort_by(|a, b| a.0.cmp(&b.0));
+            results
+                .into_iter()
+                .map(|(name, result)| match result {
+                    Ok(duration) => format!("✓ {name}: {:.1}ms", duration.as_secs_f64() * 1000.0),
+                    Err(error) => format!("✗ {name}: {error}"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigCommandRoute {
     Panel,
@@ -2765,6 +3368,31 @@ mod routing_tests {
             CONTEXT_USAGE_MESSAGE,
             "Usage: /context — open the context panel\n       /context dump [path] — write a JSON snapshot."
         );
+    }
+}
+
+#[cfg(test)]
+mod mcp_ux_tests {
+    use super::{mcp_help_text, mcp_no_servers_text};
+
+    #[tokio::test]
+    async fn mcp_help_mentions_core_commands() {
+        let state = crate::session_state::SessionState::default();
+        let text = mcp_help_text(&state).await;
+        assert!(text.contains("/mcp list"), "missing list help: {text}");
+        assert!(text.contains("/mcp tools"), "missing tools help: {text}");
+        assert!(text.contains("/mcp read"), "missing read help: {text}");
+        assert!(
+            text.contains("/mcp inspect"),
+            "missing inspect help: {text}"
+        );
+    }
+
+    #[test]
+    fn mcp_no_servers_text_guides_user_to_add_then_list() {
+        let text = mcp_no_servers_text();
+        assert!(text.contains("/mcp add"), "missing add guidance: {text}");
+        assert!(text.contains("/mcp list"), "missing list guidance: {text}");
     }
 }
 

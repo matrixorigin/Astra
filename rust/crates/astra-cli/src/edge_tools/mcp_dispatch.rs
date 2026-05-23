@@ -92,3 +92,45 @@ impl ToolExecutor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    /// Create a bare ToolExecutor with mcp_manager = None.
+    fn executor_no_mcp() -> ToolExecutor {
+        ToolExecutor::new("/tmp")
+    }
+
+    /// Create a ToolExecutor with an empty McpClientManager (no tools, no servers).
+    fn executor_empty_mcp() -> ToolExecutor {
+        let manager = Arc::new(RwLock::new(crate::mcp_client::McpClientManager::new()));
+        ToolExecutor::new("/tmp").with_mcp_manager(manager)
+    }
+
+    // ── Error path: MCP not available ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn dispatch_no_mcp_manager() {
+        let executor = executor_no_mcp();
+        let result = executor
+            .execute_mcp_tool("mcp_test_tool", &serde_json::Value::Null)
+            .await;
+        assert!(result.contains("MCP not available"));
+        assert!(result.contains("mcp_test_tool"));
+    }
+
+    // ── Error path: tool not found ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dispatch_tool_not_found() {
+        let executor = executor_empty_mcp();
+        let result = executor
+            .execute_mcp_tool("mcp_nonexistent_tool", &serde_json::Value::Null)
+            .await;
+        assert!(result.contains("not found on any connected server"));
+        assert!(result.contains("mcp_nonexistent_tool"));
+    }
+}
