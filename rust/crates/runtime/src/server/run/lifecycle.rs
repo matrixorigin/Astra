@@ -5102,16 +5102,34 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         if let Err(error) = append_result {
-            if let Some(run) = self.runs.write().await.get_mut(&run_id) {
-                run.status = RunStatus::Running;
-                run.pause_flag.store(false, Ordering::SeqCst);
-                run.waiting_for = None;
-                run.events.pop();
-            }
-            let _ = self
+            let rollback_result = self
                 .run_engine
                 .persist_status(&run_id, STATUS_RUNNING, None, None)
                 .await;
+            let rollback_succeeded = rollback_result.is_ok();
+            if let Some(run) = self.runs.write().await.get_mut(&run_id) {
+                run.status = if rollback_succeeded {
+                    RunStatus::Running
+                } else {
+                    RunStatus::Paused
+                };
+                run.pause_flag.store(!rollback_succeeded, Ordering::SeqCst);
+                run.waiting_for = if rollback_succeeded {
+                    None
+                } else {
+                    Some("user_resume".to_string())
+                };
+                run.events.pop();
+            }
+            // If rollback persistence also fails, keep memory aligned with the
+            // durable PAUSED state that actually survived.
+            if let Err(rollback_err) = rollback_result {
+                tracing::error!(
+                    %run_id,
+                    error = %rollback_err,
+                    "pause-event append failed and rollback persist_status(RUNNING) also failed; durable status may diverge from memory",
+                );
+            }
             return Err(Self::durable_persist_error("pause event", error));
         }
         if let Some(de) = &self.delegation_engine {
@@ -5187,16 +5205,34 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         if let Err(error) = append_result {
-            if let Some(run) = self.runs.write().await.get_mut(&run_id) {
-                run.status = RunStatus::Paused;
-                run.pause_flag.store(true, Ordering::SeqCst);
-                run.waiting_for = Some("user_resume".to_string());
-                run.events.pop();
-            }
-            let _ = self
+            let rollback_result = self
                 .run_engine
                 .persist_status(&run_id, STATUS_PAUSED, Some("user_resume"), None)
                 .await;
+            let rollback_succeeded = rollback_result.is_ok();
+            if let Some(run) = self.runs.write().await.get_mut(&run_id) {
+                run.status = if rollback_succeeded {
+                    RunStatus::Paused
+                } else {
+                    RunStatus::Running
+                };
+                run.pause_flag.store(rollback_succeeded, Ordering::SeqCst);
+                run.waiting_for = if rollback_succeeded {
+                    Some("user_resume".to_string())
+                } else {
+                    None
+                };
+                run.events.pop();
+            }
+            // Mirror of the pause branch above: keep memory aligned with the
+            // durable RUNNING state if the rollback write never lands.
+            if let Err(rollback_err) = rollback_result {
+                tracing::error!(
+                    %run_id,
+                    error = %rollback_err,
+                    "resume-event append failed and rollback persist_status(PAUSED) also failed; durable status may diverge from memory",
+                );
+            }
             return Err(Self::durable_persist_error("resume event", error));
         }
         if let Some(de) = &self.delegation_engine {
@@ -6078,9 +6114,16 @@ impl SubRunExecutor for ServerSubRunExecutor {
 mod tests {
     use super::*;
     use crate::DatabaseTurnHookDbWriter;
+    use astra_services::runs::{
+        DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord, DurableRunRecord,
+        InMemoryRunStateStore, RunStateStore,
+    };
     use astra_services::session_journal::{JournalEventType, ToolCallRecord};
+    use async_trait::async_trait;
     use serde_json::json;
     use sqlx::Row;
+    use std::collections::HashSet;
+    use std::sync::Mutex as StdMutex;
     use uuid::Uuid;
 
     // ── extract_prev_assistant_text + implicit feedback wiring ──
@@ -6523,10 +6566,164 @@ mod tests {
         Arc::new(FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=").unwrap())
     }
 
-    fn test_service() -> AgenticRunLifecycleService {
-        use astra_services::runs::InMemoryRunStateStore;
+    #[derive(Default)]
+    struct FaultInjectedRunStoreCounters {
+        status_calls: usize,
+        append_calls: usize,
+    }
 
+    struct FaultInjectedRunStateStore {
+        inner: InMemoryRunStateStore,
+        fail_status_calls: HashSet<usize>,
+        fail_append_calls: HashSet<usize>,
+        counters: StdMutex<FaultInjectedRunStoreCounters>,
+    }
+
+    impl FaultInjectedRunStateStore {
+        fn new(fail_status_calls: &[usize], fail_append_calls: &[usize]) -> Self {
+            Self {
+                inner: InMemoryRunStateStore::new(),
+                fail_status_calls: fail_status_calls.iter().copied().collect(),
+                fail_append_calls: fail_append_calls.iter().copied().collect(),
+                counters: StdMutex::new(FaultInjectedRunStoreCounters::default()),
+            }
+        }
+
+        fn next_status_call(&self) -> usize {
+            let mut counters = self.counters.lock().expect("status counter lock");
+            counters.status_calls += 1;
+            counters.status_calls
+        }
+
+        fn next_append_call(&self) -> usize {
+            let mut counters = self.counters.lock().expect("append counter lock");
+            counters.append_calls += 1;
+            counters.append_calls
+        }
+    }
+
+    #[async_trait]
+    impl RunStateStore for FaultInjectedRunStateStore {
+        async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
+            self.inner.insert_run(record).await
+        }
+
+        async fn load_run(&self, run_id: &str) -> Result<Option<DurableRunRecord>, String> {
+            self.inner.load_run(run_id).await
+        }
+
+        async fn update_run_status(
+            &self,
+            run_id: &str,
+            status: &str,
+            waiting_for: Option<&str>,
+            error_message: Option<&str>,
+        ) -> Result<bool, String> {
+            let call = self.next_status_call();
+            if self.fail_status_calls.contains(&call) {
+                return Err(format!("injected update_run_status failure on call {call}"));
+            }
+            self.inner
+                .update_run_status(run_id, status, waiting_for, error_message)
+                .await
+        }
+
+        async fn update_run_usage(
+            &self,
+            run_id: &str,
+            prompt_tokens: u64,
+            completion_tokens: u64,
+            tool_calls: u32,
+        ) -> Result<bool, String> {
+            self.inner
+                .update_run_usage(run_id, prompt_tokens, completion_tokens, tool_calls)
+                .await
+        }
+
+        async fn save_checkpoint(
+            &self,
+            run_id: &str,
+            checkpoint_json: &str,
+        ) -> Result<bool, String> {
+            self.inner.save_checkpoint(run_id, checkpoint_json).await
+        }
+
+        async fn load_latest_checkpoint(
+            &self,
+            run_id: &str,
+            checkpoint_kind: Option<&str>,
+        ) -> Result<Option<DurableRunCheckpointRecord>, String> {
+            self.inner
+                .load_latest_checkpoint(run_id, checkpoint_kind)
+                .await
+        }
+
+        async fn load_run_projection(
+            &self,
+            run_id: &str,
+        ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
+            self.inner.load_run_projection(run_id).await
+        }
+
+        async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String> {
+            let call = self.next_append_call();
+            if self.fail_append_calls.contains(&call) {
+                return Err(format!("injected append_event failure on call {call}"));
+            }
+            self.inner.append_event(run_id, event).await
+        }
+
+        async fn list_user_runs(
+            &self,
+            user_id: &str,
+            limit: u32,
+            offset: u32,
+        ) -> Result<(Vec<DurableRunRecord>, i64), String> {
+            self.inner.list_user_runs(user_id, limit, offset).await
+        }
+
+        async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+            self.inner.find_waiting_runs().await
+        }
+
+        async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+            self.inner.find_running_runs().await
+        }
+
+        async fn find_blocking_session_run(
+            &self,
+            user_id: &str,
+            session_id: &str,
+        ) -> Result<Option<DurableRunRecord>, String> {
+            self.inner
+                .find_blocking_session_run(user_id, session_id)
+                .await
+        }
+
+        async fn find_sub_runs(
+            &self,
+            delegation_id: &str,
+        ) -> Result<Vec<DurableRunRecord>, String> {
+            self.inner.find_sub_runs(delegation_id).await
+        }
+
+        async fn update_retry_count(&self, run_id: &str, retry_count: u32) -> Result<bool, String> {
+            self.inner.update_retry_count(run_id, retry_count).await
+        }
+    }
+
+    fn test_service() -> AgenticRunLifecycleService {
         let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        AgenticRunLifecycleService::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
+        )
+    }
+
+    fn test_service_with_store(store: Arc<dyn RunStateStore>) -> AgenticRunLifecycleService {
+        let engine = RunEngine::new(store);
         AgenticRunLifecycleService::new(
             test_settings(),
             test_encryptor(),
@@ -7921,6 +8118,59 @@ mod tests {
         let e = err(svc.resume_run("run-1".into(), "user-1".into()).await);
         assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(e.1.0.detail, "Run control state unavailable for resume");
+    }
+
+    #[tokio::test]
+    async fn pause_run_append_failure_with_failed_rollback_keeps_memory_aligned_with_durable_pause()
+    {
+        let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[2], &[1]));
+        let svc = test_service_with_store(store);
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+
+        let e = err(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
+        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(e.1.0.detail.contains("pause event"));
+
+        let durable = svc.run_engine.load_run(&run.run_id).await.unwrap().unwrap();
+        assert_eq!(durable.status, STATUS_PAUSED);
+        assert_eq!(durable.waiting_for.as_deref(), Some("user_resume"));
+        assert_eq!(durable.events.len(), 1);
+        assert_eq!(durable.events[0]["event_type"], "run_started");
+
+        let runs = svc.runs.read().await;
+        let live = runs.get(&run.run_id).expect("live run state");
+        assert_eq!(live.status, RunStatus::Paused);
+        assert_eq!(live.waiting_for.as_deref(), Some("user_resume"));
+        assert!(live.pause_flag.load(Ordering::SeqCst));
+        assert_eq!(live.events.len(), 1);
+        assert_eq!(live.events[0]["event_type"], "run_started");
+    }
+
+    #[tokio::test]
+    async fn resume_run_append_failure_with_failed_rollback_keeps_memory_aligned_with_durable_running()
+     {
+        let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[3], &[2]));
+        let svc = test_service_with_store(store);
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
+
+        let e = err(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
+        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(e.1.0.detail.contains("resume event"));
+
+        let durable = svc.run_engine.load_run(&run.run_id).await.unwrap().unwrap();
+        assert_eq!(durable.status, STATUS_RUNNING);
+        assert!(durable.waiting_for.is_none());
+        assert_eq!(durable.events.len(), 2);
+        assert_eq!(durable.events[1]["event_type"], "run_paused");
+
+        let runs = svc.runs.read().await;
+        let live = runs.get(&run.run_id).expect("live run state");
+        assert_eq!(live.status, RunStatus::Running);
+        assert!(live.waiting_for.is_none());
+        assert!(!live.pause_flag.load(Ordering::SeqCst));
+        assert_eq!(live.events.len(), 2);
+        assert_eq!(live.events[1]["event_type"], "run_paused");
     }
 
     #[tokio::test]

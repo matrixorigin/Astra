@@ -479,7 +479,7 @@ mod tests {
     /// "Cross-Session Project Context" header wrapper so the wire payload
     /// matches the legacy runtime-injected version (pre-Phase-4 this was
     /// pushed as a raw `role: system` message with the same header from
-    /// `agentic_loop_lifecycle.rs`).
+    /// `agentic_loop/lifecycle.rs`).
     #[test]
     fn bind_project_context_wraps_in_cross_session_header() {
         let mut fixture = test_sources();

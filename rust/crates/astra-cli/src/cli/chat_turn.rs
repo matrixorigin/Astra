@@ -1271,7 +1271,7 @@ async fn run_chat_turn(
         // future so partial text reaches the success/failure pipeline.
         //
         // Drain budget: 10s. Cancel handling at round boundaries is fast
-        // (25ms poll loop in agentic_loop_lifecycle.rs:434-462), but
+        // (25ms poll loop in runtime::turn::agentic_loop::lifecycle), but
         // try_write_heavy_checkpoint serialises full state to disk —
         // hundreds of KB on long sessions, several seeks under fsync
         // pressure. 10s leaves headroom without freezing the REPL.
@@ -4038,7 +4038,7 @@ mod tests {
         // (which triggers a model retry) and NOT to is_auth_error (which would
         // wrongly send the user to /login).
         // Upstream emit sites:
-        //   - rust/crates/runtime/src/turn/llm_client.rs (~L2485): the literal
+        //   - rust/crates/runtime/src/turn/llm/client.rs (~L2485): the literal
         //     "LLM provider authentication failed" classified-error message.
         //   - "[auth] LLM provider" prefix used by upstream agent_warn! emits.
         let provider_msg = "LLM provider authentication failed";

@@ -736,6 +736,20 @@ pub struct McpConnection {
     ws_bridge_handles: Option<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)>,
 }
 
+impl Drop for McpConnection {
+    fn drop(&mut self) {
+        // Abort the WebSocket reader/writer bridge tasks so they don't keep
+        // running against a duplex pair whose owner has gone away. Without
+        // this, `McpClientManager::reconnect()` (which calls `remove(name)`)
+        // leaves the previous connection's tasks alive until the peer
+        // half-closes — a slow leak that compounds across reconnects.
+        if let Some((read_handle, write_handle)) = self.ws_bridge_handles.take() {
+            read_handle.abort();
+            write_handle.abort();
+        }
+    }
+}
+
 enum McpConnectionBackend {
     Stateful(Peer<RoleClient>),
     StatelessHttp(StatelessHttpMcpClient),
@@ -791,6 +805,19 @@ impl StatelessHttpMcpClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<T, ServiceError> {
+        self.request_with_timeout(method, params, None).await
+    }
+
+    /// Per-call variant of `request` that lets the caller override the
+    /// reqwest client's default timeout (currently `MCP_CONNECT_TIMEOUT_SECS`).
+    /// Use this for tool calls — tools can legitimately run longer than the
+    /// connect-budget without being a stall.
+    async fn request_with_timeout<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<T, ServiceError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let payload = JsonRpcRequest {
             jsonrpc: "2.0",
@@ -808,6 +835,9 @@ impl StatelessHttpMcpClient {
         }
         for (k, v) in &self.headers {
             req = req.header(k, v);
+        }
+        if let Some(t) = timeout {
+            req = req.timeout(t);
         }
         let response = req
             .json(&payload)
@@ -915,13 +945,18 @@ impl McpConnection {
                 }
             })?,
             McpConnectionBackend::StatelessHttp(client) => {
+                // Match the stateful 120s tool budget. The reqwest client's
+                // default timeout (`MCP_CONNECT_TIMEOUT_SECS`, 30s) is too
+                // short for legitimate long-running tools; without this
+                // override a slow tool would stall the entire turn.
                 client
-                    .request(
+                    .request_with_timeout(
                         "tools/call",
                         serde_json::json!({
                             "name": params.name,
                             "arguments": params.arguments,
                         }),
+                        Some(std::time::Duration::from_secs(MCP_TOOL_CALL_TIMEOUT_SECS)),
                     )
                     .await
             }
@@ -1919,10 +1954,22 @@ async fn connect_stateless_http(
         )
         .await
         .map_err(|e| McpError::Initialize(format!("stateless HTTP initialize {url}: {e}")))?;
-    let _: serde_json::Value = client
-        .request("notifications/initialized", serde_json::json!({}))
+    // `notifications/initialized` is a JSON-RPC notification per spec; we
+    // still send it as a request and ignore the value, but a server-side
+    // protocol error is worth surfacing — otherwise the next `tools/list`
+    // can fail with a misleading message instead of pointing at the real
+    // (initialization) cause.
+    if let Err(e) = client
+        .request::<serde_json::Value>("notifications/initialized", serde_json::json!({}))
         .await
-        .unwrap_or(serde_json::Value::Null);
+    {
+        tracing::warn!(
+            server = name,
+            url,
+            error = %e,
+            "stateless HTTP MCP: notifications/initialized failed; continuing optimistically"
+        );
+    }
     let tools = client
         .request::<rmcp::model::ListToolsResult>("tools/list", serde_json::json!({}))
         .await
@@ -1993,10 +2040,17 @@ async fn probe_stateless_http_connection(
             error.message
         )));
     }
-    let _: serde_json::Value = client
-        .request("notifications/initialized", serde_json::json!({}))
+    if let Err(e) = client
+        .request::<serde_json::Value>("notifications/initialized", serde_json::json!({}))
         .await
-        .unwrap_or(serde_json::Value::Null);
+    {
+        tracing::warn!(
+            server = name,
+            url,
+            error = %e,
+            "probe stateless HTTP MCP: notifications/initialized failed; continuing optimistically"
+        );
+    }
     let tools = client
         .request::<rmcp::model::ListToolsResult>("tools/list", serde_json::json!({}))
         .await

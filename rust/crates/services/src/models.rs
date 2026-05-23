@@ -157,7 +157,7 @@ struct ModelsYamlPromptCacheQuirks {
     prompt_cache_capability: Option<PromptCacheCapabilityData>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ModelCreateRequestData {
     pub name: String,
     pub provider: String,
@@ -175,7 +175,28 @@ pub struct ModelCreateRequestData {
     pub quirks: Option<QuirksData>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+impl std::fmt::Debug for ModelCreateRequestData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelCreateRequestData")
+            .field("name", &self.name)
+            .field("provider", &self.provider)
+            .field("api_key", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("description", &self.description)
+            .field("context_window", &self.context_window)
+            .field("max_completion_tokens", &self.max_completion_tokens)
+            .field("input_modalities", &self.input_modalities)
+            .field("output_modalities", &self.output_modalities)
+            .field("supported_parameters", &self.supported_parameters)
+            .field("pricing", &self.pricing)
+            .field("architecture", &self.architecture)
+            .field("tags", &self.tags)
+            .field("quirks", &self.quirks)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub struct ModelUpdateRequestData {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
@@ -191,6 +212,27 @@ pub struct ModelUpdateRequestData {
     pub tags: Option<Vec<String>>,
     pub is_active: Option<bool>,
     pub quirks: Option<QuirksData>,
+}
+
+impl std::fmt::Debug for ModelUpdateRequestData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelUpdateRequestData")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("base_url", &self.base_url)
+            .field("provider", &self.provider)
+            .field("description", &self.description)
+            .field("context_window", &self.context_window)
+            .field("max_completion_tokens", &self.max_completion_tokens)
+            .field("input_modalities", &self.input_modalities)
+            .field("output_modalities", &self.output_modalities)
+            .field("supported_parameters", &self.supported_parameters)
+            .field("pricing", &self.pricing)
+            .field("architecture", &self.architecture)
+            .field("tags", &self.tags)
+            .field("is_active", &self.is_active)
+            .field("quirks", &self.quirks)
+            .finish()
+    }
 }
 
 /// Thinking capability of a model, determined by provider-aware probe.
@@ -290,7 +332,10 @@ pub struct ModelListItem {
 }
 
 /// Decrypted credentials for the active (or preferred) row in `infra_llm_models`.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `Debug` is implemented manually to keep `api_key` out of any log line —
+/// any future `tracing::debug!(?model)` would otherwise leak the raw key.
+#[derive(Clone, PartialEq)]
 pub struct ResolvedActiveLlmModel {
     /// Local model name used for routing, telemetry, fallback_chain lookups,
     /// and capture-file labels. Unique per row.
@@ -311,6 +356,23 @@ pub struct ResolvedActiveLlmModel {
     pub prompt_cache_capability: Option<PromptCacheCapabilityData>,
     /// Probe-determined thinking capability. NULL if unprobed.
     pub thinking_capability: Option<ThinkingCapability>,
+}
+
+impl std::fmt::Debug for ResolvedActiveLlmModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedActiveLlmModel")
+            .field("model_name", &self.model_name)
+            .field("wire_model_name", &self.wire_model_name)
+            .field("api_key", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("provider", &self.provider)
+            .field("fallback_chain", &self.fallback_chain)
+            .field("tags", &self.tags)
+            .field("request_body_overrides", &self.request_body_overrides)
+            .field("prompt_cache_capability", &self.prompt_cache_capability)
+            .field("thinking_capability", &self.thinking_capability)
+            .finish()
+    }
 }
 
 impl ResolvedActiveLlmModel {
@@ -2332,6 +2394,13 @@ mod tests {
         // mixed-case registered form.
         let hit = resolve_model_alias("minimax-m2.7", &active).unwrap();
         assert_eq!(hit, "MiniMax-M2.7");
+    }
+
+    #[test]
+    fn alias_exact_match_beats_deepseek_alias_substring_overlap() {
+        let active = names(&["deepseek-v4-flash", "deepseek-v4-flash-anthropic"]);
+        let hit = resolve_model_alias("deepseek-v4-flash", &active).unwrap();
+        assert_eq!(hit, "deepseek-v4-flash");
     }
 
     #[test]

@@ -189,7 +189,7 @@ fn find_cache_breakpoint_targets(messages: &[Value]) -> Vec<usize> {
         // Walk back through any trailing `role=system` msgs. The runtime
         // appends `Already Fetched`, stall nudges etc.
         // as `role=system` entries at the end of `state.messages`
-        // (agentic_loop_lifecycle.rs:787). Their content changes every
+        // (agentic_loop/lifecycle.rs:~787). Their content changes every
         // round, so putting a cache_control marker on one of them creates
         // an unstable cache boundary: the marker "wins" as the deepest
         // boundary (Anthropic merges role=system into the top-level
@@ -674,7 +674,7 @@ mod tests {
     #[test]
     fn cache_breakpoint_tool_loop_skips_trailing_system_msgs() {
         // Shape after 2 tool rounds inside a user turn, THEN a trailing
-        // volatile system msg appended by agentic_loop_lifecycle:
+        // volatile system msg appended by agentic_loop/lifecycle:
         //   [user, a(tc), tool, a(tc), tool, system(volatile)]
         let mut msgs = vec![
             json!({"role": "user", "content": "q1"}),
