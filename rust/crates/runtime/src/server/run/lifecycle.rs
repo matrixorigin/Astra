@@ -78,6 +78,19 @@ use crate::server::{server_skill_subrun, server_tool_executor};
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 const LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE: &str = "runtime_llm_trusted_domains";
 
+/// Wire a freshly-constructed [`server_tool_executor::ServerToolExecutor`]
+/// into the agentic loop state: Arc-wrap it, attach the task-board monitor,
+/// and set the tool-executor handle.  This small helper deduplicates the
+/// same three-line pattern repeated at every executor construction site.
+fn wire_executor_into_state(
+    executor: server_tool_executor::ServerToolExecutor,
+    state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
+) {
+    let executor = std::sync::Arc::new(executor);
+    state.hooks.task_board_monitor = Some(executor.task_manager());
+    state.server_tool_executor = Some(executor);
+}
+
 fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
@@ -4067,9 +4080,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 .await
                 .insert(run_id.clone(), progress_rx);
 
-            let executor = std::sync::Arc::new(executor);
-            loop_state.hooks.task_board_monitor = Some(executor.task_manager());
-            loop_state.server_tool_executor = Some(executor);
+            wire_executor_into_state(executor, &mut loop_state);
         }
 
         // Clone handles we need inside the spawned task.
@@ -4520,9 +4531,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 state.harness.sink.clone(),
             )
             .await;
-            let executor = std::sync::Arc::new(executor);
-            state.hooks.task_board_monitor = Some(executor.task_manager());
-            state.server_tool_executor = Some(executor);
+            wire_executor_into_state(executor, &mut state);
         }
 
         // Clone handles for the background task.
@@ -5967,9 +5976,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             if let Some(obs) = loop_state.telemetry.observability_session.clone() {
                 executor.set_observability_session(obs);
             }
-            let executor = std::sync::Arc::new(executor);
-            loop_state.hooks.task_board_monitor = Some(executor.task_manager());
-            loop_state.server_tool_executor = Some(executor);
+            wire_executor_into_state(executor, &mut loop_state);
         }
 
         configure_runtime_controllers(

@@ -579,6 +579,10 @@ pub struct MessagingState {
 pub struct TaskBoardSnapshot {
     pub pending_count: usize,
     pub in_progress_count: usize,
+    /// Count of active (pending/in_progress) tasks that have at least one
+    /// blocker in their `blocked_by` list.  This counts tasks waiting on
+    /// dependencies, *not* tasks whose status is literally "blocked"
+    /// (there is no such status — the field reflects dependency edges).
     pub blocked_count: usize,
     pub active_tasks: Vec<String>,
 }
@@ -1234,20 +1238,34 @@ impl AgenticLoopState {
     /// TaskManager, when one is attached. Call this before any terminal
     /// completion decision so tool calls in the just-finished round are
     /// reflected before the loop decides whether unfinished work remains.
+    ///
+    /// The DB call is guarded by a 5-second timeout to prevent a stalled
+    /// store from holding up loop finalisation indefinitely.
     pub async fn refresh_task_board_snapshot(&mut self) {
         let Some(task_manager) = self.hooks.task_board_monitor.clone() else {
             return;
         };
-        match task_manager.load_active_tasks().await {
-            Ok(tasks) => {
+        let load = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            task_manager.load_active_tasks(),
+        );
+        match load.await {
+            Ok(Ok(tasks)) => {
                 self.hooks.task_board_snapshot = TaskBoardSnapshot::from_active_tasks(&tasks);
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 tracing::warn!(
                     target: "astra::loop_guard",
                     session_id = self.current_session_id.as_deref().unwrap_or_default(),
                     error = %error,
                     "failed to refresh active task-board snapshot; preserving previous snapshot"
+                );
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "astra::loop_guard",
+                    session_id = self.current_session_id.as_deref().unwrap_or_default(),
+                    "timed out refreshing active task-board snapshot; preserving previous snapshot"
                 );
             }
         }

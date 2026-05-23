@@ -3589,7 +3589,10 @@ mod tests {
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        assert!(outcome.is_ok(), "loop must terminate even when the model ignores the corrective");
+        assert!(
+            outcome.is_ok(),
+            "loop must terminate even when the model ignores the corrective"
+        );
         assert_eq!(
             host.current_turn, 2,
             "exactly two turns should run: one before the gate, one after the corrective"
