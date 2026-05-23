@@ -19,7 +19,7 @@ use astra_runtime::{
     MatrixOneSettings, ServiceInfo, SessionActivityRecord, SessionCreateRequestData,
     SessionListFilter, SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
     TurnToolEventPersistPlan, TurnToolEventWriter, build_app,
-    turn::bridge_inprocess::InProcessChatTurnBridge,
+    turn::bridge::inprocess::InProcessChatTurnBridge,
 };
 use async_trait::async_trait;
 use axum::{
