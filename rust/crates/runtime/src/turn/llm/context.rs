@@ -1012,7 +1012,7 @@ pub(crate) fn stabilize_tool_schemas_for_cache(
 }
 
 pub(crate) fn apply_bridge_message_cache_metadata(
-    messages: &mut Vec<Value>,
+    messages: &mut [Value],
     synthetic_tail_prefix_end: Option<usize>,
     cache_cfg: &PromptCacheConfig,
     session_id: &str,
