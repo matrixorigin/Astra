@@ -187,6 +187,9 @@ pub struct ExternalSources {
     /// Memory entries already retrieved by the runtime before entering the
     /// pure core pipeline. Core does not perform Memoria I/O.
     pub memory_entries: Vec<MemoryEntry>,
+    /// Current-session recovery state, carried as a dedicated typed source
+    /// instead of being flattened into synthetic compacted-history messages.
+    pub session_memory_entry: Option<MemoryEntry>,
     pub spill_dir: Option<PathBuf>,
     /// Optional spill backend for offloading oversized sections to disk.
     /// When set, the optimizer will persist section content and replace it

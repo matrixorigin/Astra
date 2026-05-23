@@ -157,6 +157,7 @@ pub(crate) fn assemble_system_message_via_pipeline(
         &[], // legacy wrapper: no stable sections — tests pre-date the split
         extra_dynamic_sections,
         &[],
+        None,
         confidence,
         task_type,
         cache_cfg,
@@ -205,6 +206,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     extra_stable_sections: &[prompts::PromptSection],
     extra_volatile_sections: &[prompts::PromptSection],
     memory_entries: &[astra_turn_core::context_sources::MemoryEntry],
+    session_memory_entry: Option<&astra_turn_core::context_sources::MemoryEntry>,
     confidence: f64,
     task_type: Option<&str>,
     cache_cfg: &PromptCacheConfig,
@@ -273,6 +275,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
 
     let external = ExternalSources {
         memory_entries: memory_entries.to_vec(),
+        session_memory_entry: session_memory_entry.cloned(),
         spill_dir: None,
         spill_backend: None,
 
@@ -842,6 +845,7 @@ mod tests {
             &[], // stable
             &[], // volatile
             &[],
+            None,
             0.8,
             None,
             &cache_cfg,
@@ -897,6 +901,7 @@ mod tests {
             &[],
             &[],
             &memory_entries,
+            None,
             0.8,
             None,
             &cache_cfg,
@@ -928,6 +933,65 @@ mod tests {
     }
 
     #[test]
+    fn bridge_pipeline_outcome_routes_session_memory_through_runtime_volatile() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        remove_test_env("ASTRA_OUTPUT_STYLE");
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let session_memory = astra_turn_core::context_sources::MemoryEntry::new(
+            "## Session State\nLatest state: keep refactoring the session-memory pipeline",
+        );
+
+        let outcome = assemble_bridge_pipeline_outcome(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            &[],
+            Some(&session_memory),
+            0.8,
+            None,
+            &cache_cfg,
+            None,
+            "sid-session-memory",
+            "gpt-4o",
+            "openai",
+            None,
+            None,
+            None,
+            "",
+            "",
+        );
+
+        let primary_text = outcome
+            .primary_system
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let dynamic_text = outcome
+            .dynamic_system
+            .as_ref()
+            .and_then(|msg| msg.get("content"))
+            .and_then(Value::as_str)
+            .expect("session memory is None-scoped and should be in dynamic system");
+
+        assert!(
+            dynamic_text.contains("## Session State"),
+            "session memory must reach runtime volatile output: {dynamic_text}"
+        );
+        assert!(
+            dynamic_text.contains("session-memory pipeline"),
+            "session memory content must survive bridge assembly: {dynamic_text}"
+        );
+        assert!(
+            !primary_text.contains("## Session State"),
+            "session memory must stay out of the stable session prefix: {primary_text}"
+        );
+    }
+
+    #[test]
     fn bridge_pipeline_outcome_keeps_deferred_tools_block_in_session_prefix() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         remove_test_env("ASTRA_OUTPUT_STYLE");
@@ -942,6 +1006,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             0.8,
             None,
             &cache_cfg,
@@ -987,6 +1052,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             0.1,
             None,
             &cache_cfg,
@@ -1521,6 +1587,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             0.8,
             None,
             &cache_cfg,

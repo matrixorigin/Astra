@@ -27,6 +27,21 @@ use crate::turn::cloud::memoria_compact::{
 };
 use crate::turn::prompt_cache::{PromptCacheConfig, apply_anthropic_cache_metadata};
 
+pub(crate) fn session_memory_entry_for_pipeline(
+    content: Option<&str>,
+    turn_number: u32,
+) -> Option<astra_turn_core::context_sources::MemoryEntry> {
+    let content = content?.trim();
+    if content.is_empty() {
+        return None;
+    }
+    Some(
+        astra_turn_core::context_sources::MemoryEntry::new(content)
+            .with_source("session_memory.compaction")
+            .with_freshness_turn(turn_number),
+    )
+}
+
 /// Session-level context that Memoria compaction needs. Bundled into one
 /// struct so callers don't pass a long list of positional arguments — each
 /// field is named and independently testable.

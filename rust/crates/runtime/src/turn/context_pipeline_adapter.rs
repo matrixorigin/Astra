@@ -203,6 +203,7 @@ pub(crate) fn build_external_sources(
 
     ExternalSources {
         memory_entries,
+        session_memory_entry: None,
         spill_dir: None,
         spill_backend,
 

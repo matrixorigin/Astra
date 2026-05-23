@@ -3824,6 +3824,7 @@ fn build_shutdown_extraction_request(
         crate::session_memory::ExtractionRequest {
             session_id: session_id.clone(),
             messages: state.messages.clone(),
+            session_facts: state.session_facts.clone(),
             current_tokens: state
                 .total_prompt
                 .saturating_add(state.total_cache_read)

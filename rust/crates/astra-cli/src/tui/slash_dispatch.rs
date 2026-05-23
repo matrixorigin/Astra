@@ -3619,7 +3619,7 @@ mod view_result_tests {
         let mut chat_widget = ChatWidget::new("");
 
         handle_view_result(
-            "[working] [@session/memory] foo",
+            "[working] [@session/active] foo",
             &mut state,
             &mut bottom_pane,
             &mut chat_widget,

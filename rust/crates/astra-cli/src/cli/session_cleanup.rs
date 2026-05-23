@@ -106,6 +106,7 @@ pub(super) async fn finalize_session(state: &mut SessionState) {
             let _ = svc.maybe_spawn_shutdown_flush(astra_runtime::session_memory::ExtractionRequest {
                 session_id: session_id.to_string(),
                 messages: super::chat_turn::history_as_messages(&state.history),
+                session_facts: shutdown_session_facts(state),
                 current_tokens: state
                     .total_prompt_tokens
                     .saturating_add(state.total_cache_read_tokens)
@@ -255,6 +256,78 @@ pub(super) async fn finalize_session(state: &mut SessionState) {
     }
     // 5. Clear panic guard
     clear_panic_guard();
+}
+
+fn shutdown_session_facts(state: &SessionState) -> astra_runtime::SessionFacts {
+    let estimated_tokens = state
+        .total_prompt_tokens
+        .saturating_add(state.total_cache_read_tokens)
+        .saturating_add(state.total_cache_creation_tokens);
+    let last_error = state
+        .last_turn_event
+        .as_ref()
+        .and_then(|event| event.error.as_ref())
+        .cloned();
+    let active_files = state
+        .file_journal
+        .lock()
+        .map(|journal| {
+            let mut seen = std::collections::HashSet::new();
+            let entries: Vec<_> = journal.entries().collect();
+            entries
+                .into_iter()
+                .rev()
+                .filter_map(|entry| {
+                    let path = entry.path.to_string_lossy().to_string();
+                    seen.insert(path.clone())
+                        .then_some(astra_runtime::FileEntry {
+                            path,
+                            last_action: match entry.edit_type {
+                                astra_turn_core::file_edit_journal::EditType::Create => "create",
+                                astra_turn_core::file_edit_journal::EditType::Delete
+                                | astra_turn_core::file_edit_journal::EditType::Overwrite
+                                | astra_turn_core::file_edit_journal::EditType::Patch => "write",
+                            }
+                            .to_string(),
+                            turn: entry.turn_index,
+                        })
+                })
+                .take(20)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    // recent_tools is per-turn (reassigned from result.tools_used each turn),
+    // so `turn: state.turn` and `ok: true` are accurate: every entry is a tool
+    // that was invoked during the current turn.
+    let recent_tool_calls = state
+        .recent_tools
+        .iter()
+        .rev()
+        .take(10)
+        .cloned()
+        .map(|name| astra_runtime::ToolFact {
+            name,
+            ok: true,
+            turn: state.turn,
+        })
+        .collect();
+    let accumulated_tool_errors: u32 = state
+        .tool_health_entries
+        .iter()
+        .map(|entry| u32::try_from(entry.total_failures).unwrap_or(u32::MAX))
+        .sum();
+    astra_runtime::SessionFacts {
+        turn: state.turn,
+        estimated_tokens,
+        active_files,
+        recent_tool_calls,
+        error_state: astra_runtime::ErrorFact {
+            total_errors: accumulated_tool_errors.saturating_add(u32::from(last_error.is_some())),
+            last_error_turn: last_error.as_ref().map(|_| state.turn),
+            last_error,
+        },
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]

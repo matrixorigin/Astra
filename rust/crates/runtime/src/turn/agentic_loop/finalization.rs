@@ -770,6 +770,7 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
     let req = crate::session_memory::ExtractionRequest {
         session_id,
         messages: state.messages.clone(),
+        session_facts: state.session_facts.clone(),
         current_tokens,
         current_tool_calls: state.total_tool_calls as usize,
         had_error,

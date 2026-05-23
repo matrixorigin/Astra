@@ -719,6 +719,7 @@ impl MemoryExtractionService {
             turn as usize,
             req.current_tokens,
             &current_memory,
+            &req.session_facts,
             effective_selector.as_ref(),
             LLM_TIMEOUT,
             EXTRACTION_MAX_OUTPUT_TOKENS,
@@ -809,7 +810,7 @@ impl MemoryExtractionService {
                     duration_ms,
                     &bc,
                 );
-                let (sections, preview) = summarize_persisted_content(&content);
+                let preview = summarize_persisted_content(&content);
                 self.record_extraction_outcome(
                     &session_id,
                     turn,
@@ -823,7 +824,7 @@ impl MemoryExtractionService {
                         bytes_written,
                         store_attempt,
                     },
-                    sections,
+                    Vec::new(),
                     preview,
                     latency,
                 );
@@ -860,7 +861,7 @@ impl MemoryExtractionService {
                     source: SessionMemoryExtractionSource::RuleFallback,
                     duration_ms,
                 });
-                let (sections, preview) = summarize_persisted_content(&content);
+                let preview = summarize_persisted_content(&content);
                 self.record_extraction_outcome(
                     &session_id,
                     turn,
@@ -871,7 +872,7 @@ impl MemoryExtractionService {
                         bytes_written,
                         store_attempt,
                     },
-                    sections,
+                    Vec::new(),
                     preview,
                     latency,
                 );
@@ -998,9 +999,11 @@ fn skip_reason_label(reason: SessionMemoryExtractionSkipReason) -> &'static str 
     }
 }
 
-/// Stub narrative summary — L1 protocol is gone, so no sections are available.
-fn summarize_persisted_content(content: &str) -> (Vec<String>, String) {
-    (Vec::new(), clip_preview(content))
+fn summarize_persisted_content(content: &str) -> String {
+    astra_prompts::memory_proto::MemoryEntry::parse(content)
+        .filter(|entry| entry.ns == astra_prompts::memory_proto::NS_SESSION)
+        .map(|entry| clip_preview(&entry.overview_view()))
+        .unwrap_or_else(|| clip_preview(content))
 }
 
 impl MemoryExtractionService {
@@ -1248,6 +1251,7 @@ mod tests {
         ExtractionRequest {
             session_id: session_id.to_string(),
             messages: vec![json!({"role": "user", "content": "hello world"})],
+            session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             current_tokens: tokens,
             current_tool_calls: 0,
             had_error,
@@ -1263,6 +1267,7 @@ mod tests {
                 json!({"role": "user", "content": "Need a cache-safe session memory design that still captures shutdown summaries for short sessions and resumed work."}),
                 json!({"role": "assistant", "content": "I removed the legacy extractor, fixed the model poisoning bug, and am wiring a final shutdown flush plus resume recap next."}),
             ],
+            session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             current_tokens: tokens,
             current_tool_calls: 0,
             had_error: false,
@@ -1355,6 +1360,7 @@ mod tests {
                 json!({"role": "user", "content": "hi"}),
                 json!({"role": "assistant", "content": "hello"}),
             ],
+            session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             current_tokens: 12,
             current_tool_calls: 0,
             had_error: false,
@@ -2030,6 +2036,7 @@ mod tests {
         let req = ExtractionRequest {
             session_id: sid,
             messages: vec![json!({"role": "user", "content": "x"})],
+            session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             current_tokens: 1_000,
             current_tool_calls: 0,
             had_error: false,

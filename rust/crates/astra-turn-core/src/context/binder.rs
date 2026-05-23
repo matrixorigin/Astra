@@ -321,6 +321,11 @@ fn bind_runtime_volatile(sources: &ContextSources<'_>) -> String {
     if let Some(ref text) = ext.tool_guidance {
         parts.push(text.clone());
     }
+    if let Some(ref session_memory) = ext.session_memory_entry {
+        if !session_memory.content.is_empty() {
+            parts.push(session_memory.content.clone());
+        }
+    }
 
     // Bridge escape hatch: pre-built per-turn dynamic sections (session
     // anchor, feedback rules, memoria insights, etc.). Appended verbatim
@@ -647,6 +652,32 @@ mod tests {
         assert!(
             !stable.contains("Session Anchor"),
             "extras must stay out of session-stable identity — would break cache"
+        );
+    }
+
+    #[test]
+    fn bind_runtime_volatile_includes_session_memory_entry() {
+        let mut fixture = test_sources();
+        fixture.external.session_memory_entry = Some(MemoryEntry::new(
+            "## Session State\nLatest state: implement pipeline-native session memory",
+        ));
+
+        let sources = fixture.context();
+        let content = bind_runtime_volatile(&sources);
+
+        assert!(
+            content.contains("## Session State"),
+            "session memory must be routed through runtime volatile: {content}"
+        );
+        assert!(
+            content.contains("pipeline-native session memory"),
+            "session memory content must survive binding: {content}"
+        );
+
+        let stable = bind_runtime_identity(&sources);
+        assert!(
+            !stable.contains("## Session State"),
+            "session memory must stay out of session-stable identity: {stable}"
         );
     }
 

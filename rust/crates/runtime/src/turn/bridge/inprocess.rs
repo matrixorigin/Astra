@@ -2045,11 +2045,12 @@ impl InProcessChatTurnBridge {
                             &bridge_restricted_snapshot,
                         )
                         .with_deferred_tools_block(&deferred_block_str)
-                        .with_selection_trace(bridge_selection_trace),
+                        .with_selection_trace(bridge_selection_trace.clone()),
                     runtime_signals: crate::turn::llm::context::BridgeRuntimeSignals::new(
                         &stable_sections,
                         &effective_dynamic_sections,
                         &memoria_prefetch_entries,
+                        None,
                         selection_confidence,
                         task_type,
                     ),
@@ -2066,15 +2067,15 @@ impl InProcessChatTurnBridge {
                     .with_skill_listing_block(skill_listing_hint_text.as_deref().unwrap_or("")),
                 },
             );
-            let system_msg = pipeline_outcome.primary_system;
-            let dynamic_msg = pipeline_outcome.dynamic_system;
-            let prompt_sections = pipeline_outcome.prompt_sections;
+            let mut system_msg = pipeline_outcome.primary_system;
+            let mut dynamic_msg = pipeline_outcome.dynamic_system;
+            let mut prompt_sections = pipeline_outcome.prompt_sections;
             // Pipeline decision is the only source of truth for tier + pruning.
             // Cache the outputs so the round-level block below uses them
             // instead of re-deriving a tier.
             let pipeline_tier = pipeline_outcome.tier;
-            let pipeline_tool_schemas = pipeline_outcome.tool_schemas;
-            let bridge_manifest_trace = pipeline_outcome.manifest_trace;
+            let mut pipeline_tool_schemas = pipeline_outcome.tool_schemas;
+            let mut bridge_manifest_trace = pipeline_outcome.manifest_trace;
             let mut bridge_manifest_trace_json = bridge_manifest_trace.to_json();
             // Debug: dump system prompt for cache analysis (env-gated).
             // Enable with ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT=1. Writes to
@@ -2159,6 +2160,61 @@ impl InProcessChatTurnBridge {
                 };
 
                 let compact_result = ctx.compact(&raw, &llm_messages, &edge_tools).await;
+
+                if let Some(session_memory_entry) =
+                    crate::turn::wire_assembly::session_memory_entry_for_pipeline(
+                        compact_result.session_memory_context.as_deref(),
+                        trace_turn,
+                    )
+                {
+                    let rerun = crate::turn::llm::context::assemble_bridge_context(
+                        crate::turn::llm::context::BridgeContextAssemblyInput {
+                            tool_surface:
+                                crate::turn::llm::context::ToolSurfacePlan::from_visible_tools(
+                                    &edge_tools,
+                                    &bridge_restricted_snapshot,
+                                )
+                                .with_deferred_tools_block(&deferred_block_str)
+                                .with_selection_trace(bridge_selection_trace.clone()),
+                            runtime_signals:
+                                crate::turn::llm::context::BridgeRuntimeSignals::new(
+                                    &stable_sections,
+                                    &effective_dynamic_sections,
+                                    &memoria_prefetch_entries,
+                                    Some(session_memory_entry),
+                                    selection_confidence,
+                                    task_type,
+                                ),
+                            session: crate::turn::llm::context::BridgeSessionContextInput::new(
+                                &cache_cfg,
+                                cache_capability,
+                                &session_id,
+                                &model_name,
+                                &provider,
+                                edge_profile.get("cwd").and_then(Value::as_str),
+                                edge_profile.get("git_branch").and_then(Value::as_str),
+                                project_context,
+                            )
+                            .with_skill_listing_block(
+                                skill_listing_hint_text.as_deref().unwrap_or(""),
+                            ),
+                        },
+                    );
+                    debug_assert_eq!(rerun.tier, pipeline_tier);
+                    system_msg = rerun.primary_system;
+                    dynamic_msg = rerun.dynamic_system;
+                    prompt_sections = rerun.prompt_sections;
+                    pipeline_tool_schemas = rerun.tool_schemas;
+                    bridge_manifest_trace = rerun.manifest_trace;
+                    bridge_manifest_trace_json = bridge_manifest_trace.to_json();
+                    llm_messages.clear();
+                    llm_messages.push(system_msg.clone());
+                    bridge_volatile_text = dynamic_msg
+                        .as_ref()
+                        .and_then(|dyn_msg| dyn_msg.get("content"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
 
                 let mut msgs = compact_result.messages;
                 crate::turn::wire_assembly::maybe_append_continuation_prompt(

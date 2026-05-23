@@ -2121,11 +2121,12 @@ impl ServerAgenticLoopHost {
         model_name: &str,
         user_content: &str,
     ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
-        self.run_turn_pipeline_with_cache_capability(
+        self.run_turn_pipeline_with_cache_capability_and_session_memory(
             state,
             visible_tools,
             provider,
             model_name,
+            None,
             None,
             user_content,
         )
@@ -2138,6 +2139,27 @@ impl ServerAgenticLoopHost {
         provider: &str,
         model_name: &str,
         cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+        user_content: &str,
+    ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
+        self.run_turn_pipeline_with_cache_capability_and_session_memory(
+            state,
+            visible_tools,
+            provider,
+            model_name,
+            cache_capability,
+            None,
+            user_content,
+        )
+    }
+
+    fn run_turn_pipeline_with_cache_capability_and_session_memory(
+        &mut self,
+        state: &mut AgenticLoopState,
+        visible_tools: &[Value],
+        provider: &str,
+        model_name: &str,
+        cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+        session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
         user_content: &str,
     ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
         let plan_hint = self.read_plan_resume_hint();
@@ -2182,7 +2204,8 @@ impl ServerAgenticLoopHost {
                     plan_hint,
                     self.selection_confidence,
                 )
-                .with_extra_sections(&[], &lifecycle_sections),
+                .with_extra_sections(&[], &lifecycle_sections)
+                .with_session_memory_entry(session_memory_entry),
                 cache_cfg: &cache_cfg,
                 provider,
                 model_name,
@@ -2545,6 +2568,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             tool_schemas: pipeline_tool_schemas,
             manifest_trace,
         } = turn_pipeline;
+        let mut final_system_messages = system_messages;
+        let mut final_volatile_preamble = volatile_preamble;
+        let mut final_system_prompt_breakdown = system_prompt_breakdown;
+        let mut final_pipeline_tool_schemas = pipeline_tool_schemas;
+        let mut final_manifest_trace = manifest_trace;
 
         // Debug: dump system prompt for cache analysis (env-gated, zero cost when off).
         if std::env::var("ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT").is_ok() {
@@ -2554,15 +2582,44 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             ));
             let _ = std::fs::write(&dump_path, &system_prompt_plain);
         }
-        state.last_llm_context_manifest_trace = Some(manifest_trace.to_json());
+        state.last_llm_context_manifest_trace = Some(final_manifest_trace.to_json());
 
         // Phase 3: Memoria compaction is now a named async step, separate
         // from the pure assembly step. `execute_turn` orchestrates both so
         // the wire-building flow is readable and each phase is individually
         // testable / replaceable.
         let compact_result = self
-            .compact_messages_via_memoria(state, &system_messages, &visible_tools, tier, &llm_cfg)
+            .compact_messages_via_memoria(
+                state,
+                &final_system_messages,
+                &visible_tools,
+                tier,
+                &llm_cfg,
+            )
             .await;
+        if let Some(session_memory_entry) =
+            crate::turn::wire_assembly::session_memory_entry_for_pipeline(
+                compact_result.session_memory_context.as_deref(),
+                state.session_turn,
+            )
+        {
+            let rerun = self.run_turn_pipeline_with_cache_capability_and_session_memory(
+                state,
+                &visible_tools,
+                &llm_cfg.provider,
+                &llm_cfg.model_name,
+                llm_cfg.cache_capability,
+                Some(session_memory_entry),
+                &user_content,
+            )?;
+            debug_assert_eq!(rerun.tier, tier);
+            final_system_messages = rerun.system_messages;
+            final_volatile_preamble = rerun.volatile_preamble;
+            final_system_prompt_breakdown = rerun.breakdown;
+            final_pipeline_tool_schemas = rerun.tool_schemas;
+            final_manifest_trace = rerun.manifest_trace;
+            state.last_llm_context_manifest_trace = Some(final_manifest_trace.to_json());
+        }
         // Parity with the bridge path: when Memoria returned a boundary, the
         // conversation was trimmed mid-task, so nudge the model to resume
         // instead of asking the user a follow-up question.
@@ -2572,8 +2629,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             compact_result.boundary.is_some(),
         );
         let llm_messages = self.assemble_llm_messages(
-            system_messages,
-            volatile_preamble,
+            final_system_messages,
+            final_volatile_preamble,
             compacted_messages,
             state,
             &llm_cfg,
@@ -2591,7 +2648,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &llm_cfg.model_name,
             );
         let mut final_tools = crate::turn::llm::context::stabilize_tool_schemas_for_cache(
-            &pipeline_tool_schemas,
+            &final_pipeline_tool_schemas,
             &state.sticky_tool_schemas,
             &visible_tools,
             cache_cap,
@@ -2608,7 +2665,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             );
         }
         self.emit_context_meta(
-            &system_prompt_breakdown,
+            &final_system_prompt_breakdown,
             state.last_llm_context_manifest_trace.as_ref(),
         );
         state.pinned_tool_schema_tokens = estimate_tool_schema_tokens(&final_tools);
@@ -2810,9 +2867,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     }
                     let accum = ChatTurnSseAccum {
                         error_message: Some(e.message.clone()),
-                        system_prompt_tokens: Some(system_prompt_breakdown.total_tokens),
-                        system_prompt_breakdown: serde_json::to_value(&system_prompt_breakdown)
-                            .ok(),
+                        system_prompt_tokens: Some(final_system_prompt_breakdown.total_tokens),
+                        system_prompt_breakdown: serde_json::to_value(
+                            &final_system_prompt_breakdown,
+                        )
+                        .ok(),
                         context_manifest_trace: state.last_llm_context_manifest_trace.clone(),
                         ..Default::default()
                     };
@@ -3053,8 +3112,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // ── 6. Build turn result ────────────────────────────────────────
         let ttft_ms = Some(turn_started.elapsed().as_millis() as u64);
         let mut accum = Self::result_to_accum(&result);
-        accum.system_prompt_tokens = Some(system_prompt_breakdown.total_tokens);
-        accum.system_prompt_breakdown = serde_json::to_value(&system_prompt_breakdown).ok();
+        accum.system_prompt_tokens = Some(final_system_prompt_breakdown.total_tokens);
+        accum.system_prompt_breakdown = serde_json::to_value(&final_system_prompt_breakdown).ok();
         accum.context_manifest_trace = state.last_llm_context_manifest_trace.clone();
 
         Ok(HostTurnResult {

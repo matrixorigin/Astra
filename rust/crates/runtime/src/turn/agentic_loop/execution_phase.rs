@@ -511,13 +511,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             }
             astra_turn_core::loop_circuit_breaker::BreakerAction::Abort => {
                 state.stall.forced_round_budget_phase2 = true;
+                let diagnosis = interruption_diagnosis_summary(state);
                 let mut abort_msg = format!(
                     "[Circuit breaker abort at round {}. The agent did not recover \
                      after correction — stall or regression persists. Any progress \
                      and tool results from earlier rounds are preserved above.]",
                     state.llm_rounds_completed,
                 );
-                if let Some(diagnosis) = interruption_diagnosis_summary(state) {
+                if let Some(diagnosis) = diagnosis.as_deref() {
                     abort_msg.push_str(&format!(
                         "\nLikely cause: {diagnosis}. Resume by reusing existing evidence and only fetching one genuinely new fact if still needed."
                     ));
@@ -543,10 +544,17 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 if !prep.quiet {
                     host.emit_headless_line(
                         HeadlessStderrStyle::Yellow,
-                        format!(
-                            "⛔ Circuit breaker abort at round {}; agent did not recover after correction.",
-                            state.llm_rounds_completed
-                        ),
+                        if let Some(diagnosis) = diagnosis.as_deref() {
+                            format!(
+                                "⛔ Circuit breaker abort at round {}; likely cause: {}.",
+                                state.llm_rounds_completed, diagnosis
+                            )
+                        } else {
+                            format!(
+                                "⛔ Circuit breaker abort at round {}; agent did not recover after correction.",
+                                state.llm_rounds_completed
+                            )
+                        },
                     );
                 }
                 state.step_recorder.end_turn(false);

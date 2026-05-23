@@ -174,6 +174,7 @@ pub const NS_INSIGHT: &str = "insight";
 pub const NS_KNOWLEDGE: &str = "knowledge";
 pub const NS_LESSON: &str = "lesson";
 pub const NS_FEEDBACK: &str = "feedback";
+pub const NS_SESSION: &str = "session";
 
 // ── Status values ────────────────────────────────────────────────
 pub const ST_PENDING: &str = "pending";
@@ -197,6 +198,7 @@ pub fn ns_to_memory_type(ns: &str) -> &'static str {
         NS_KNOWLEDGE => memory_ns::to_memory_type(memory_ns::KNOWLEDGE),
         NS_LESSON => "semantic",
         NS_FEEDBACK => "semantic",
+        NS_SESSION => "working",
         _ => "semantic",
     }
 }
@@ -626,6 +628,7 @@ pub fn format_for_llm(contents: &[&str]) -> String {
         (NS_TASK, "Tasks"),
         (NS_INSIGHT, "Insights"),
         (NS_EPISODE, "Recent Context"),
+        (NS_SESSION, "Session State"),
         (NS_SWAP, "Archived Context"),
     ];
 
@@ -687,6 +690,7 @@ mod tests {
         assert_eq!(ns_to_memory_type(NS_KNOWLEDGE), "semantic");
         assert_eq!(ns_to_memory_type(NS_LESSON), "semantic");
         assert_eq!(ns_to_memory_type(NS_FEEDBACK), "semantic");
+        assert_eq!(ns_to_memory_type(NS_SESSION), "working");
     }
 
     #[test]

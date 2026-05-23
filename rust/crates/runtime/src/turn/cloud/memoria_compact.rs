@@ -974,16 +974,30 @@ fn build_memory_context(memories: &[MemoriaMemory], max_tokens: usize) -> String
 
     let mut parts = Vec::new();
     let mut total_tokens = 0;
+    let mut seen_keys = std::collections::HashSet::new();
+    let mut seen_session_summaries = std::collections::HashSet::new();
 
     for mem in memories {
-        let rendered = mem
-            .session_id
-            .as_deref()
-            .and_then(|session_id| {
-                crate::session_memory::runner::decode_session_memory_entry(&mem.content, session_id)
-            })
-            .map(|body| format!("Session memory summary:\n{body}"))
-            .unwrap_or_else(|| mem.content.clone());
+        let rendered = if let Some(session_id) = mem.session_id.as_deref() {
+            if crate::session_memory::runner::decode_session_memory_entry(&mem.content, session_id)
+                .is_some()
+            {
+                if !seen_session_summaries.insert(session_id.to_string()) {
+                    continue;
+                }
+                continue;
+            }
+            mem.content.trim().to_string()
+        } else {
+            mem.content.trim().to_string()
+        };
+        if !is_memory_context_worthy(&rendered) {
+            continue;
+        }
+        let dedup_key = memory_context_dedup_key(&rendered);
+        if !seen_keys.insert(dedup_key) {
+            continue;
+        }
         let mem_tokens = crate::prompts::estimate_str_tokens(&rendered);
         if total_tokens + mem_tokens > max_tokens {
             break;
@@ -1000,6 +1014,65 @@ fn build_memory_context(memories: &[MemoriaMemory], max_tokens: usize) -> String
         "[Session Context from Memory]\n{}\n[End Context]",
         parts.join("\n")
     )
+}
+
+fn build_session_memory_context(
+    memories: &[MemoriaMemory],
+    session_id: &str,
+    tier: CompactionTier,
+    facts_override: Option<&astra_turn_types::session_facts::SessionFacts>,
+) -> Option<String> {
+    let include_overview = matches!(tier, CompactionTier::AggressivePrune);
+    memories.iter().find_map(|memory| {
+        crate::session_memory::runner::decode_session_memory_prompt(
+            &memory.content,
+            session_id,
+            facts_override,
+            include_overview,
+        )
+    })
+}
+
+fn is_memory_context_worthy(rendered: &str) -> bool {
+    let trimmed = rendered.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with("[session-memory:")
+        || trimmed.starts_with("[attention:")
+        || trimmed.starts_with("[session:")
+        || trimmed.starts_with("[compaction:")
+        || trimmed.starts_with("[session-knowledge:")
+        || trimmed.starts_with(crate::session_memory::runner::SESSION_MEMORY_PREFIX)
+        || trimmed.starts_with("[@session/memory]")
+    {
+        return false;
+    }
+    if ["None", "(none)", "Tools used: none", "🔄 In progress"].contains(&trimmed) {
+        return false;
+    }
+    for prefix in astra_turn_types::SCAFFOLDING_BODY_PREFIXES {
+        if trimmed.starts_with(prefix) {
+            return false;
+        }
+    }
+    let word_count = trimmed
+        .split(|c: char| c.is_whitespace() || "，。！？,.!?".contains(c))
+        .filter(|w| !w.is_empty())
+        .count();
+    if word_count < 3 && trimmed.chars().count() < 20 {
+        return false;
+    }
+    true
+}
+
+fn memory_context_dedup_key(rendered: &str) -> String {
+    rendered
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches(['.', '!', '?', ';', ':', ',', ' '])
+        .to_lowercase()
 }
 
 /// Build a working memory summary from recent messages.
@@ -1406,6 +1479,13 @@ pub async fn compact_with_memoria(
         config.max_memory_tokens,
     );
 
+    let session_memory_context =
+        build_session_memory_context(&memories, sid, params.tier, params.session_facts.as_ref());
+    let session_memory_chars = session_memory_context
+        .as_ref()
+        .map(|text| text.chars().count())
+        .unwrap_or(0);
+
     // Step 2: Build context summary from retrieved Memoria memories.
     // After wip-3 the runtime no longer injects a session anchor /
     // facts-first narrative — the compacted message stream speaks for
@@ -1414,8 +1494,11 @@ pub async fn compact_with_memoria(
     let has_memory_context = !memory_context.is_empty();
     let memory_chars = memory_context.chars().count();
 
-    let adjusted_budget_chars =
-        adjusted_message_budget_chars(params.budget_chars, memory_chars, summary_reserve_chars);
+    let adjusted_budget_chars = adjusted_message_budget_chars(
+        params.budget_chars,
+        memory_chars.saturating_add(session_memory_chars),
+        summary_reserve_chars,
+    );
 
     // Step 3: Apply truncation against budget that leaves room for injections
     let mut result = compact_tiered_with_result(
@@ -1458,6 +1541,8 @@ pub async fn compact_with_memoria(
             crate::prompts::estimate_str_tokens(&memory_context)
         );
     }
+
+    result.session_memory_context = session_memory_context;
 
     // Step 5: Optionally store updated working memory (even on cold start)
     if config.store_on_compact {
@@ -1765,9 +1850,17 @@ mod tests {
             ..Default::default()
         }];
         let ctx = build_memory_context(&memories, 1000);
-        assert!(ctx.contains("Session memory summary"));
-        assert!(ctx.contains("Fix memory"));
-        assert!(!ctx.contains(crate::session_memory::runner::SESSION_MEMORY_PREFIX));
+        assert!(
+            ctx.is_empty(),
+            "session memory should route through dedicated source"
+        );
+
+        let session_ctx =
+            build_session_memory_context(&memories, "sess-1", CompactionTier::CompactHistory, None)
+                .expect("session memory context");
+        assert!(session_ctx.contains("## Session State"));
+        assert!(session_ctx.contains("Fix memory"));
+        assert!(!session_ctx.contains(crate::session_memory::runner::SESSION_MEMORY_PREFIX));
     }
 
     #[test]
@@ -1792,6 +1885,108 @@ mod tests {
         let ctx = build_memory_context(&memories, 30);
         assert!(ctx.contains(&"A".repeat(100)));
         assert!(!ctx.contains(&"B".repeat(100)));
+    }
+
+    #[test]
+    fn build_memory_context_keeps_only_one_session_summary_per_session() {
+        let memories = vec![
+            MemoriaMemory {
+                memory_id: "m1".to_string(),
+                content: crate::session_memory::runner::encode_session_memory_entry(
+                    "sess-1",
+                    "## Active Goals\n- Fix memory\n",
+                ),
+                memory_type: "working".to_string(),
+                session_id: Some("sess-1".to_string()),
+                retrieval_score: Some(0.9),
+                ..Default::default()
+            },
+            MemoriaMemory {
+                memory_id: "m2".to_string(),
+                content: crate::session_memory::runner::encode_session_memory_entry(
+                    "sess-1",
+                    "## Active Goals\n- Stale duplicate\n",
+                ),
+                memory_type: "working".to_string(),
+                session_id: Some("sess-1".to_string()),
+                retrieval_score: Some(0.8),
+                ..Default::default()
+            },
+        ];
+        let ctx = build_memory_context(&memories, 1000);
+        assert!(
+            ctx.is_empty(),
+            "session memory should not be emitted as generic memory context"
+        );
+
+        let session_ctx =
+            build_session_memory_context(&memories, "sess-1", CompactionTier::CompactHistory, None)
+                .expect("session memory context");
+        assert!(session_ctx.contains("Fix memory"));
+        assert!(!session_ctx.contains("Stale duplicate"));
+    }
+
+    #[test]
+    fn build_session_memory_context_uses_overview_only_for_aggressive_prune() {
+        let memories = vec![MemoriaMemory {
+            memory_id: "m1".to_string(),
+            content: crate::session_memory::runner::encode_session_memory_entry(
+                "sess-1",
+                "## Current State\n- implementing pipeline source\n\n## Pending Todos\n- rerun binder\n",
+            ),
+            memory_type: "working".to_string(),
+            session_id: Some("sess-1".to_string()),
+            ..Default::default()
+        }];
+
+        let compact =
+            build_session_memory_context(&memories, "sess-1", CompactionTier::CompactHistory, None)
+                .expect("compact session memory");
+        assert!(compact.contains("Latest state"));
+        assert!(
+            !compact.contains("Open loops:"),
+            "compact mode should avoid overview text"
+        );
+
+        let overview = build_session_memory_context(
+            &memories,
+            "sess-1",
+            CompactionTier::AggressivePrune,
+            None,
+        )
+        .expect("overview session memory");
+        assert!(
+            overview.contains("Open loops:"),
+            "aggressive prune should carry overview"
+        );
+    }
+
+    #[test]
+    fn build_memory_context_filters_low_signal_and_scaffolding_entries() {
+        let memories = vec![
+            MemoriaMemory {
+                memory_id: "m1".to_string(),
+                content: "hi".to_string(),
+                memory_type: "working".to_string(),
+                ..Default::default()
+            },
+            MemoriaMemory {
+                memory_id: "m2".to_string(),
+                content: "## ⚠ Sequential Tool Calls Detected".to_string(),
+                memory_type: "working".to_string(),
+                ..Default::default()
+            },
+            MemoriaMemory {
+                memory_id: "m3".to_string(),
+                content: "User prefers Rust for runtime changes".to_string(),
+                memory_type: "working".to_string(),
+                ..Default::default()
+            },
+        ];
+        let ctx = build_memory_context(&memories, 1000);
+        assert!(ctx.contains("User prefers Rust for runtime changes"));
+        assert!(!ctx.contains("## ⚠ Sequential Tool Calls Detected"));
+        assert!(!ctx.contains("• hi"));
     }
 
     #[tokio::test]

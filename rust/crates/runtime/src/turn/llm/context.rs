@@ -146,6 +146,7 @@ pub(crate) struct RuntimeSignals<'a> {
     pub selection_confidence: f64,
     pub extra_stable_sections: &'a [crate::prompts::PromptSection],
     pub extra_volatile_sections: &'a [crate::prompts::PromptSection],
+    pub session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
 }
 
 impl<'a> RuntimeSignals<'a> {
@@ -160,6 +161,7 @@ impl<'a> RuntimeSignals<'a> {
             selection_confidence,
             extra_stable_sections: &[],
             extra_volatile_sections: &[],
+            session_memory_entry: None,
         }
     }
 
@@ -170,6 +172,14 @@ impl<'a> RuntimeSignals<'a> {
     ) -> Self {
         self.extra_stable_sections = stable;
         self.extra_volatile_sections = volatile;
+        self
+    }
+
+    pub(crate) fn with_session_memory_entry(
+        mut self,
+        session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
+    ) -> Self {
+        self.session_memory_entry = session_memory_entry;
         self
     }
 }
@@ -318,6 +328,7 @@ pub(crate) struct BridgeRuntimeSignals<'a> {
     pub extra_stable_sections: &'a [crate::prompts::PromptSection],
     pub extra_volatile_sections: &'a [crate::prompts::PromptSection],
     pub memory_entries: &'a [astra_turn_core::context_sources::MemoryEntry],
+    pub session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
     pub selection_confidence: f64,
     pub task_type: Option<&'a str>,
 }
@@ -327,6 +338,7 @@ impl<'a> BridgeRuntimeSignals<'a> {
         extra_stable_sections: &'a [crate::prompts::PromptSection],
         extra_volatile_sections: &'a [crate::prompts::PromptSection],
         memory_entries: &'a [astra_turn_core::context_sources::MemoryEntry],
+        session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
         selection_confidence: f64,
         task_type: Option<&'a str>,
     ) -> Self {
@@ -334,6 +346,7 @@ impl<'a> BridgeRuntimeSignals<'a> {
             extra_stable_sections,
             extra_volatile_sections,
             memory_entries,
+            session_memory_entry,
             selection_confidence,
             task_type,
         }
@@ -609,6 +622,7 @@ pub(crate) fn assemble_bridge_context(
         input.runtime_signals.extra_stable_sections,
         input.runtime_signals.extra_volatile_sections,
         input.runtime_signals.memory_entries,
+        input.runtime_signals.session_memory_entry.as_ref(),
         input.runtime_signals.selection_confidence,
         input.runtime_signals.task_type,
         input.session.cache_cfg,
@@ -710,6 +724,7 @@ pub(crate) fn assemble_context_pipeline(
             .iter()
             .cloned(),
     );
+    external.session_memory_entry = input.runtime_signals.session_memory_entry.clone();
     let turn_state = build_turn_state(state, input.user_content);
     // `AgenticLoopState::max_turn_input_tokens` is an input-budget/wind-down
     // cap, and `0` is its legacy "unlimited" sentinel. The pipeline's
