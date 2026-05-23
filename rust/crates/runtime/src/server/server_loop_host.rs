@@ -426,11 +426,9 @@ pub struct CapturedLlmRequest {
     /// `cache_control` marker anywhere in their content. Order matches the
     /// message order. Empty for non-Anthropic providers.
     ///
-    /// Used by tests to assert the rolling-breakpoint invariant across
-    /// consecutive rounds: the historical marker from round N must still
-    /// be present at the same message index in round N+1 so that Anthropic
-    /// can hit the cached prefix through the message history — not just
-    /// through `system` + `tools`.
+    /// Used by tests to assert Claude Code-style message-marker behavior:
+    /// exactly one marker on the last non-system message for
+    /// Anthropic/Bedrock-compatible requests.
     pub message_cache_control_indices: Vec<usize>,
     /// For each message in `messages`, the SHA-256 hex of that message's
     /// canonical JSON serialization (sort_keys). Tests compare slices of
@@ -499,20 +497,73 @@ fn cacheable_prefix_text(system_primary: &Value, is_anthropic: bool) -> String {
 /// derivation. Removes `cache_control` attributes everywhere (they are
 /// request-layer directives, not tokens) and upgrades `content: "text"`
 /// strings to the canonical `content: [{type:"text", text:"..."}]`
-/// array form so that the "marker placed → content promoted to array"
-/// shape flip produced by `apply_cache_control_to_message` does not
-/// spuriously break byte-level prefix comparisons in tests.
+/// array form. Tool-role messages are also canonicalized to the same
+/// `tool_result` block shape the Anthropic adapter sends on the wire, so
+/// "tail marker moved from old tool_result to new tool_result" does not
+/// spuriously look like historical-byte churn in the capture hashes.
 #[cfg(feature = "bridge-e2e-hooks")]
 fn normalize_message_for_cache_hash(m: &Value) -> Value {
     let mut out = m.clone();
-    if let Some(obj) = out.as_object_mut()
-        && let Some(content) = obj.get("content").cloned()
-        && let Some(s) = content.as_str()
-    {
-        obj.insert(
-            "content".into(),
-            serde_json::json!([{ "type": "text", "text": s }]),
-        );
+    if let Some(obj) = out.as_object_mut() {
+        let role = obj.get("role").and_then(Value::as_str);
+        match role {
+            Some("tool") => {
+                let tool_use_id = obj
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let normalized = match obj.get("content").cloned() {
+                    Some(Value::Array(mut blocks))
+                        if blocks.iter().any(|b| {
+                            b.get("type").and_then(Value::as_str) == Some("tool_result")
+                        }) =>
+                    {
+                        for block in blocks.iter_mut() {
+                            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                                continue;
+                            }
+                            if let Some(map) = block.as_object_mut()
+                                && !map.contains_key("tool_use_id")
+                                && !tool_use_id.is_empty()
+                            {
+                                map.insert(
+                                    "tool_use_id".into(),
+                                    Value::String(tool_use_id.clone()),
+                                );
+                            }
+                        }
+                        Value::Array(blocks)
+                    }
+                    Some(Value::String(text)) => serde_json::json!([{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": text,
+                    }]),
+                    Some(Value::Null) | None => serde_json::json!([{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": "",
+                    }]),
+                    Some(other) => serde_json::json!([{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": other.to_string(),
+                    }]),
+                };
+                obj.insert("content".into(), normalized);
+            }
+            _ => {
+                if let Some(content) = obj.get("content").cloned()
+                    && let Some(s) = content.as_str()
+                {
+                    obj.insert(
+                        "content".into(),
+                        serde_json::json!([{ "type": "text", "text": s }]),
+                    );
+                }
+            }
+        }
     }
     strip_cache_control(&mut out);
     out

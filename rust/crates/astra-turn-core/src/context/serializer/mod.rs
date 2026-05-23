@@ -222,15 +222,11 @@ fn block_index_for_marker(
 /// Places a single `cache_control` marker on the last Session-scoped
 /// block (falling back to the last Global block if no Session block
 /// exists). We intentionally emit at most one marker here to leave the
-/// remaining breakpoint budget for the rolling `[historical, tail]` pair
-/// in `annotate_last_message_cache_breakpoint`, which is what lets
-/// message-history bytes stay stable across rounds. Anthropic caps
-/// requests at 4 `cache_control` entries (1 system + 1 tool + 2 messages
-/// = 4), and the rolling message pair is load-bearing: without it,
-/// `cache_read` collapses to `system + tools` size (~10 K tokens) even
-/// in a 50-round conversation. See the
-/// `mock_llm_prompt_cache_e2e::rolling_breakpoint_*` tests for the
-/// byte-identity invariant we're protecting.
+/// remaining breakpoint budget for the tool marker plus Claude Code's
+/// single tail marker in `annotate_last_message_cache_breakpoint`.
+/// Anthropic caps requests at 4 `cache_control` entries (system + tool +
+/// message comfortably fit), and the message marker must always remain
+/// available for the current tail.
 ///
 /// The last Session block is preferred over the last Global block
 /// because it extends the cached prefix further (blocks are emitted in

@@ -381,7 +381,8 @@ async fn matrix_marker_isolated_system_has_no_volatile_patterns() {
 // For marker-isolated providers, the primary system content array must
 // carry at least one cache_control block (that's how the provider knows
 // where to cut the prefix). For prefix-only providers, system_primary
-// is a string and has no cache_control at all.
+// is a string and has no cache_control at all. Claude Code semantics also
+// require exactly one message-level marker on the last non-system message.
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
@@ -410,6 +411,29 @@ async fn matrix_cache_control_marker_placement_matches_provider() {
                  with cache_control",
                 label = case.label,
             );
+            assert_eq!(
+                cap.message_cache_control_indices.len(),
+                1,
+                "[{label}] marker-isolated provider must emit exactly one \
+                 message-level cache marker, got {:?}",
+                cap.message_cache_control_indices,
+                label = case.label,
+            );
+            let expected_tail = cap
+                .messages
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(idx, message)| {
+                    (message.get("role").and_then(Value::as_str) != Some("system")).then_some(idx)
+                })
+                .expect("captured request must contain a non-system message");
+            assert_eq!(
+                cap.message_cache_control_indices,
+                vec![expected_tail],
+                "[{label}] message marker must sit on the last non-system message",
+                label = case.label,
+            );
         } else {
             assert_eq!(
                 cap.system_cache_control_count,
@@ -425,6 +449,11 @@ async fn matrix_cache_control_marker_placement_matches_provider() {
                  cache_control",
                 label = case.label,
             );
+            assert!(
+                cap.message_cache_control_indices.is_empty(),
+                "[{label}] prefix-only provider must NOT emit message cache markers",
+                label = case.label,
+            );
         }
     }
 }
@@ -432,11 +461,9 @@ async fn matrix_cache_control_marker_placement_matches_provider() {
 // ── Invariant 4: tool-loop growth preserves historical byte stability ────
 //
 // Session d0640d3d regression: agentic tool loops append (assistant_tc,
-// tool_result) pairs within the same user-turn and the rolling cache
-// breakpoints must ensure round N's tail-marker index equals round
-// N+1's historical-marker index (same bytes, same cc marker). The
-// cacheable prefix up to and including that historical marker must be
-// byte-identical across rounds.
+// tool_result) pairs within the same user-turn. Under Claude Code semantics
+// the sole message marker must move to the newest tail message, while the
+// already-sent history stays byte-identical across rounds.
 //
 // Here we simulate a two-round tool loop by mocking two turns where the
 // second turn has one extra (assistant_tc, tool) pair appended and
@@ -516,6 +543,22 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
                  r2 hashes={:?}",
                 r1.message_sha256,
                 r2.message_sha256,
+                label = case.label,
+            );
+        }
+        if case.is_marker_isolated {
+            assert_eq!(
+                r1.message_cache_control_indices,
+                vec![2],
+                "[{label}] tool-loop round 1 must mark the last real tool result, \
+                 not skip message annotation because of the synthetic suffix",
+                label = case.label,
+            );
+            assert_eq!(
+                r2.message_cache_control_indices,
+                vec![4],
+                "[{label}] tool-loop round 2 must advance the marker to the new \
+                 tool result while preserving earlier bytes",
                 label = case.label,
             );
         }
@@ -822,6 +865,22 @@ async fn matrix_mid_history_runtime_injections_consolidated() {
 
         let guard = capture.lock().unwrap();
         let cap = &guard[0];
+        let content_text = |message: &Value| -> String {
+            match message.get("content") {
+                Some(Value::String(text)) => text.clone(),
+                Some(Value::Array(blocks)) => blocks
+                    .iter()
+                    .filter_map(|block| {
+                        block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .or_else(|| block.get("content").and_then(Value::as_str))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+                _ => String::new(),
+            }
+        };
 
         // `consolidate_mid_history_volatile_injections` folds the volatile
         // injections INTO the last user message's prefix (that's how
@@ -837,10 +896,7 @@ async fn matrix_mid_history_runtime_injections_consolidated() {
                 .filter(|(i, m)| {
                     // Skip the last message — consolidation legitimately
                     // prepends volatile there.
-                    *i != last_idx
-                        && m.get("content")
-                            .and_then(Value::as_str)
-                            .is_some_and(|s| s.starts_with(starts_with))
+                    *i != last_idx && content_text(m).starts_with(starts_with)
                 })
                 .count()
         };
@@ -866,12 +922,7 @@ async fn matrix_mid_history_runtime_injections_consolidated() {
              (5d48887e).",
             label = case.label,
         );
-        let last_text = cap
-            .messages
-            .last()
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let last_text = cap.messages.last().map(content_text).unwrap_or_default();
         assert!(
             last_text.contains("latest question"),
             "[{label}] last user msg must end with the real question; got {:?}",

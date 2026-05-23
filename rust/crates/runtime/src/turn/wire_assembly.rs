@@ -393,6 +393,7 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
     // Attach volatile content only at the true tail. Rewriting a historical
     // user message while assistant/tool messages trail it mutates mid-history
     // bytes and can zero prefix-cache hits on multi-round tool loops.
+    let mut synthetic_tail_start: Option<usize> = None;
     let mut synthetic_tail_end: Option<usize> = None;
     if !volatile_preamble.is_empty() {
         let volatile_text: String = volatile_preamble
@@ -415,6 +416,7 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
                     .unwrap_or("");
                 last_user["content"] = Value::String(format!("{volatile_text}\n\n{existing}"));
             } else if tail_role == Some("tool") {
+                synthetic_tail_start = Some(llm_messages.len());
                 llm_messages.push(serde_json::json!({
                     "role": "assistant",
                     "content": "Understood.",
@@ -427,6 +429,7 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
             } else {
                 // No tail user available — append one synthetic tail reminder
                 // instead of rewriting a historical user message.
+                synthetic_tail_start = Some(llm_messages.len());
                 llm_messages.push(serde_json::json!({"role": "user", "content": volatile_text}));
                 synthetic_tail_end = Some(llm_messages.len());
             }
@@ -454,12 +457,24 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
         llm_messages.extend(file_messages);
     }
 
-    // Skip annotation only when the tail is still the synthetic reminder
-    // (no real attachment landed after it). When attachments extend the
-    // message list past the synthetic tail, the real tail can be annotated.
-    let last_is_synthetic_tail = synthetic_tail_end.is_some_and(|end| end == llm_messages.len());
-    if cache_cfg.should_annotate() && !last_is_synthetic_tail {
-        apply_anthropic_cache_metadata(&mut llm_messages, cache_cfg, session_id);
+    // When the synthetic tail is still the final suffix (no attachments landed
+    // after it), place the message-level cache marker on the last REAL message
+    // before the synthetic assistant/user reminder pair. Otherwise the
+    // synthesized reminder would consume the only message marker and we'd fall
+    // back to caching just system+tools on every tool-loop round.
+    let synthetic_tail_is_final = synthetic_tail_end.is_some_and(|end| end == llm_messages.len());
+    if cache_cfg.should_annotate() {
+        if synthetic_tail_is_final {
+            if let Some(prefix_end) = synthetic_tail_start {
+                apply_anthropic_cache_metadata(
+                    &mut llm_messages[..prefix_end],
+                    cache_cfg,
+                    session_id,
+                );
+            }
+        } else {
+            apply_anthropic_cache_metadata(&mut llm_messages, cache_cfg, session_id);
+        }
     }
     llm_messages
 }
@@ -618,6 +633,10 @@ mod tests {
 
     fn cache_cfg() -> PromptCacheConfig {
         PromptCacheConfig::latch("openai", "gpt-4")
+    }
+
+    fn anthropic_cache_cfg() -> PromptCacheConfig {
+        PromptCacheConfig::latch("anthropic", "claude-sonnet-4")
     }
 
     #[test]
@@ -1168,6 +1187,41 @@ mod tests {
         assert!(
             tail_user.starts_with("<system-reminder>volatile</system-reminder>"),
             "volatile reminder should be appended as the true tail user"
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_tail_marks_last_real_message_before_synthetic_suffix() {
+        let system = vec![json!({"role": "system", "content": "sys"})];
+        let preamble = vec![
+            json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
+            json!({"role": "assistant", "content": "Understood."}),
+        ];
+        let compacted = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": "tool output", "tool_call_id": "c1"}),
+        ];
+        let msgs = assemble_llm_messages(
+            system,
+            preamble,
+            Vec::new(),
+            compacted,
+            &PostCompactAttachments::default(),
+            "sid",
+            "anthropic",
+            "claude-sonnet-4",
+            &anthropic_cache_cfg(),
+        );
+
+        assert_eq!(msgs[3]["role"], "tool");
+        assert!(
+            astra_turn_core::context_serializer::message_has_cache_control(&msgs[3]),
+            "last real tool result must carry the message-level cache marker",
+        );
+        assert!(
+            !astra_turn_core::context_serializer::message_has_cache_control(&msgs[5]),
+            "synthetic tail user must stay unannotated",
         );
     }
 

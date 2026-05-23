@@ -16,9 +16,8 @@
 //!   (4-marker budget, long-history budget fit, model-id passthrough).
 //! - **this file** — core wire invariants that don't need the whole matrix:
 //!   tool-schema churn invalidates the prefix, cache-disabled env kills all
-//!   annotations, usage-token passthrough, rolling-breakpoint invariants
-//!   (count + position + byte identity), SSE event order, empty-history
-//!   no-panic, cross-session prefix stability.
+//!   annotations, usage-token passthrough, single-tail-breakpoint invariants,
+//!   SSE event order, empty-history no-panic, cross-session prefix stability.
 //!
 //! Each test attaches an `Arc<Mutex<Vec<CapturedLlmRequest>>>` via
 //! `with_llm_request_capture(...)` and asserts on the structure of the
@@ -518,27 +517,17 @@ async fn interleaved_tool_and_text_rounds_preserve_event_order_and_history() {
     assert!(g[1].messages.len() < g[2].messages.len());
 }
 
-// ── pc-rolling-breakpoint: message-history cache stability across rounds ────
+// ── pc-single-tail-breakpoint: Claude Code message marker semantics ─────────
 //
 // Captured production traffic (~/.astra/sessions/<sid>/llm_capture_*.json)
 // showed `cache_read` pinned at ~10 688 tokens for ~60 consecutive rounds —
 // the exact size of `system + tools`. Message history contributed zero cache
 // hits despite conversations spanning tens of thousands of tokens.
 //
-// Root cause: `annotate_last_message_cache_breakpoint` rebuilt from scratch
-// each round. Round N placed `cache_control` on `messages[k]`. Round N+1
-// started from clean state and placed the marker on `messages[k']` where
-// k' > k, so `messages[k]` in round N+1 no longer carried the marker and
-// therefore had different bytes than in round N. Anthropic's prefix cache
-// can only reuse a byte-identical prefix, so it fell back to the
-// `system + tools` boundary — exactly what we observed.
-//
-// The fix: a **rolling** breakpoint scheme that places TWO cache_control
-// markers inside the message history each round:
-//   - historical: the breakpoint inherited from the previous round's tail
-//   - tail:       the new breakpoint for this round's last completed turn
-// Critically, the historical index in round N+1 MUST equal the tail index
-// from round N. That invariant is what the consolidated test below enforces.
+// Claude Code's Anthropic/Bedrock contract is stricter: exactly one
+// message-level `cache_control` marker on the last non-system message.
+// Historical messages must remain byte-stable across rounds because they
+// are never rewritten to carry an older marker.
 
 fn assistant_reply(text: &str) -> Value {
     json!({ "role": "assistant", "content": text })
@@ -557,20 +546,16 @@ fn advance_turn(
     state.messages.push(user_msg(next_q));
 }
 
-/// The full rolling-breakpoint contract in one test: count, position, and
-/// byte-identity all hang off the same 4-round fixture and share state,
-/// so running them separately would just triplicate the setup.
+/// The full single-tail-breakpoint contract in one test: count, position, and
+/// byte-identity all hang off the same 4-round fixture and share state.
 ///
-///   * count:         rounds ≥3 carry exactly 2 message markers (historical
-///                    + tail); round 2 may collapse to 1 marker.
-///   * position:      round N+1's historical index equals round N's tail.
-///   * byte identity: messages[0..=prev_tail] are bit-for-bit stable across
-///                    adjacent rounds (Anthropic hashes raw bytes, not
-///                    semantics — drop the cc attribute and the prefix
-///                    diverges).
+///   * count:         every round carries exactly 1 message marker.
+///   * position:      the marker sits on the last non-system message.
+///   * byte identity: historical messages remain bit-for-bit stable across
+///                    adjacent rounds because no older round is rewritten.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
-async fn rolling_breakpoint_count_position_and_bytes_invariants() {
+async fn single_tail_breakpoint_count_position_and_bytes_invariants() {
     let capture = Arc::new(Mutex::new(Vec::new()));
     let rounds = vec![
         scripted_round("r1 reply"),
@@ -598,78 +583,45 @@ async fn rolling_breakpoint_count_position_and_bytes_invariants() {
     let g = capture.lock().unwrap();
     assert_eq!(g.len(), 4);
 
-    // ── count ──
-    assert!(
-        g[0].message_cache_control_indices.len() <= 1,
-        "round 1 has at most 1 message marker (no previous turn), got {:?}",
-        g[0].message_cache_control_indices
-    );
-    assert!(
-        !g[1].message_cache_control_indices.is_empty(),
-        "round 2 must emit at least a tail marker, got {:?}",
-        g[1].message_cache_control_indices
-    );
-    assert_eq!(
-        g[2].message_cache_control_indices.len(),
-        2,
-        "round 3 MUST carry 2 message cache_control markers (historical + tail), \
-         got {:?}",
-        g[2].message_cache_control_indices
-    );
-    assert_eq!(
-        g[3].message_cache_control_indices.len(),
-        2,
-        "round 4 MUST carry 2 message cache_control markers (historical + tail), \
-         got {:?}",
-        g[3].message_cache_control_indices
-    );
-
-    // ── position: round N's tail == round N+1's historical ──
-    assert_eq!(
-        *g[1].message_cache_control_indices.last().unwrap(),
-        g[2].message_cache_control_indices[0],
-        "round 3's historical marker must sit at the same index as round 2's tail \
-         (r2 indices {:?}, r3 indices {:?})",
-        g[1].message_cache_control_indices,
-        g[2].message_cache_control_indices,
-    );
-    assert_eq!(
-        g[2].message_cache_control_indices[1], g[3].message_cache_control_indices[0],
-        "round 4's historical marker must sit at the same index as round 3's tail \
-         (r3 indices {:?}, r4 indices {:?})",
-        g[2].message_cache_control_indices, g[3].message_cache_control_indices,
-    );
-
-    // ── byte identity: messages[0..=prev_tail] bit-for-bit stable ──
-    let r2_tail = *g[1].message_cache_control_indices.last().unwrap();
-    for i in 0..=r2_tail {
+    let expected = [vec![0], vec![2], vec![4], vec![6]];
+    for (round, (captured, expected_idx)) in g.iter().zip(expected.iter()).enumerate() {
         assert_eq!(
-            g[1].message_sha256[i], g[2].message_sha256[i],
-            "round 3 message[{i}] bytes must equal round 2 — cache_control dropped? \
-             r2={:?}, r3={:?}",
-            g[1].message_cache_control_indices, g[2].message_cache_control_indices,
+            captured.message_cache_control_indices,
+            *expected_idx,
+            "round {} must emit exactly one marker on the latest user tail",
+            round + 1,
+        );
+        assert!(
+            captured.last_message_has_cache_control,
+            "round {} last non-system message must carry cache_control",
+            round + 1,
         );
     }
-    let r3_tail = *g[2].message_cache_control_indices.last().unwrap();
-    for i in 0..=r3_tail {
+
+    // ── byte identity: historical messages stay bit-for-bit stable ──
+    for i in 0..g[1].message_cache_control_indices[0] {
+        assert_eq!(
+            g[1].message_sha256[i], g[2].message_sha256[i],
+            "round 3 historical message[{i}] bytes must equal round 2",
+        );
+    }
+    for i in 0..g[2].message_cache_control_indices[0] {
         assert_eq!(
             g[2].message_sha256[i], g[3].message_sha256[i],
-            "round 4 message[{i}] bytes must equal round 3 — cache_control dropped? \
-             r3={:?}, r4={:?}",
-            g[2].message_cache_control_indices, g[3].message_cache_control_indices,
+            "round 4 historical message[{i}] bytes must equal round 3",
         );
     }
 }
 
 // ── pc-provider-neutral-noop ───────────────────────────────────────────────
 //
-// Rolling breakpoints are Anthropic-only. For OpenAI-compatible providers
+// Message-level cache breakpoints are Anthropic-only. For OpenAI-compatible providers
 // (OpenAI, MiniMax, Qwen, DeepSeek, etc.) no cache_control may leak into
 // the serialized messages — those providers reject or silently ignore the
 // field, and byte-stability is achieved by keeping messages untouched.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
-async fn rolling_breakpoint_noop_for_openai_compatible_providers() {
+async fn message_breakpoint_noop_for_openai_compatible_providers() {
     for (provider, model) in [
         ("openai", "gpt-4o-mini"),
         ("minimax", "MiniMax-M2.7"),
