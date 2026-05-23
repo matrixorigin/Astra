@@ -61,6 +61,7 @@ use serde_json::Value;
 use astra_pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
+use astra_tools::task_mgmt::{SessionTask, TaskManager};
 use astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent;
 use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
@@ -565,6 +566,78 @@ pub struct MessagingState {
     pub progress_emitter: Option<crate::orchestration::AgentProgressEmitter>,
 }
 
+/// Point-in-time summary of the active session task board.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskBoardSnapshot {
+    pub pending_count: usize,
+    pub in_progress_count: usize,
+    pub blocked_count: usize,
+    pub active_tasks: Vec<String>,
+}
+
+impl TaskBoardSnapshot {
+    #[must_use]
+    pub fn from_active_tasks(tasks: &[SessionTask]) -> Self {
+        let mut snapshot = Self::default();
+        for task in tasks {
+            match task.status.as_str() {
+                "pending" => snapshot.pending_count += 1,
+                "in_progress" => snapshot.in_progress_count += 1,
+                _ => continue,
+            }
+            if !task.blocked_by.is_empty() {
+                snapshot.blocked_count += 1;
+            }
+            if snapshot.active_tasks.len() < 3 {
+                snapshot
+                    .active_tasks
+                    .push(format!("{} {} [{}]", task.id, task.title, task.status));
+            }
+        }
+        snapshot
+    }
+
+    #[must_use]
+    pub fn has_unfinished_tasks(&self) -> bool {
+        self.pending_count > 0 || self.in_progress_count > 0
+    }
+
+    #[must_use]
+    pub fn short_summary(&self) -> String {
+        let parts = self.status_count_parts();
+        if parts.is_empty() {
+            return "no active tasks remain".to_string();
+        }
+        let mut summary = format!("{} task(s) remain", parts.join(", "));
+        if !self.active_tasks.is_empty() {
+            summary.push_str(": ");
+            summary.push_str(&self.active_tasks.join("; "));
+        }
+        summary
+    }
+
+    #[must_use]
+    pub fn status_count_summary(&self) -> String {
+        let parts = self.status_count_parts();
+        if parts.is_empty() {
+            "no active tasks remain".to_string()
+        } else {
+            format!("{} task(s) remain", parts.join(", "))
+        }
+    }
+
+    fn status_count_parts(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if self.in_progress_count > 0 {
+            parts.push(format!("{} in_progress", self.in_progress_count));
+        }
+        if self.pending_count > 0 {
+            parts.push(format!("{} pending", self.pending_count));
+        }
+        parts
+    }
+}
+
 /// Stop-hook and teammate-idle-hook state for the agentic loop.
 #[derive(Default)]
 pub struct StopHookState {
@@ -586,6 +659,10 @@ pub struct StopHookState {
     pub forward_headers: HashMap<String, String>,
     /// Request-scoped LLM token service config propagated to nested sub-runs.
     pub llm_token_service: Option<astra_services::LlmTokenServiceConfig>,
+    /// Shared session task board handle, when available.
+    pub task_board_monitor: Option<Arc<TaskManager>>,
+    /// Cached view of unfinished task-board work for completion gating.
+    pub task_board_snapshot: TaskBoardSnapshot,
 }
 
 /// Cancellation state for the agentic loop.
@@ -725,6 +802,10 @@ pub enum VolatileKind {
     /// tool call actually produced. See
     /// [`astra_turn_core::hallucination_tripwire`] for the detector.
     HallucinationTripwire,
+    /// Task-board completion gate. Singleton and count-only on the wire so
+    /// repeated corrections replace each other instead of accumulating
+    /// dynamic task titles in the volatile prompt suffix.
+    TaskBoardCompletionGate,
     /// Plan-mode marker: a single short reminder that the current
     /// turn is read-only investigation and the model must surface
     /// its plan via `exit_plan_mode(plan="…")` for user approval.
@@ -751,6 +832,7 @@ impl VolatileKind {
                 | Self::ExplorationBudget
                 | Self::Mailbox
                 | Self::CompactResume
+                | Self::TaskBoardCompletionGate
                 | Self::PlanModeMarker,
         )
     }
@@ -771,6 +853,7 @@ impl VolatileKind {
             | Self::CircuitBreaker
             | Self::BudgetAdvisory
             | Self::CompactResume
+            | Self::TaskBoardCompletionGate
             | Self::ExecutionRetry
             | Self::ExplorationBudget
             | Self::BudgetReview => "user",
@@ -1139,6 +1222,29 @@ pub struct AgenticLoopState {
 }
 
 impl AgenticLoopState {
+    /// Refresh the cached active task-board snapshot from the shared
+    /// TaskManager, when one is attached. Call this before any terminal
+    /// completion decision so tool calls in the just-finished round are
+    /// reflected before the loop decides whether unfinished work remains.
+    pub async fn refresh_task_board_snapshot(&mut self) {
+        let Some(task_manager) = self.hooks.task_board_monitor.clone() else {
+            return;
+        };
+        match task_manager.load_active_tasks().await {
+            Ok(tasks) => {
+                self.hooks.task_board_snapshot = TaskBoardSnapshot::from_active_tasks(&tasks);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra::loop_guard",
+                    session_id = self.current_session_id.as_deref().unwrap_or_default(),
+                    error = %error,
+                    "failed to refresh active task-board snapshot; preserving previous snapshot"
+                );
+            }
+        }
+    }
+
     /// Queue a runtime-produced volatile injection for the next LLM call.
     ///
     /// Prefer this over `state.messages.push(...)` for any content that
@@ -2250,6 +2356,72 @@ pub(crate) mod tests {
             turn_event_buffer: None,
             harness: crate::turn::harness_adapter::HarnessSlot::empty(),
         }
+    }
+
+    #[test]
+    fn task_board_snapshot_summarizes_active_tasks_stably() {
+        let snapshot = TaskBoardSnapshot::from_active_tasks(&[
+            SessionTask {
+                id: "task-2".to_string(),
+                title: "add runtime tests".to_string(),
+                description: None,
+                status: "pending".to_string(),
+                subtasks: Vec::new(),
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                updated_at: "2025-01-01T00:00:00Z".to_string(),
+                active_form: None,
+                owner: None,
+                metadata: None,
+                blocks: Vec::new(),
+                blocked_by: vec!["task-1".to_string()],
+            },
+            SessionTask {
+                id: "task-1".to_string(),
+                title: "wire completion guard".to_string(),
+                description: None,
+                status: "in_progress".to_string(),
+                subtasks: Vec::new(),
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                updated_at: "2025-01-01T00:00:00Z".to_string(),
+                active_form: None,
+                owner: None,
+                metadata: None,
+                blocks: Vec::new(),
+                blocked_by: Vec::new(),
+            },
+            SessionTask {
+                id: "task-3".to_string(),
+                title: "already done".to_string(),
+                description: None,
+                status: "completed".to_string(),
+                subtasks: Vec::new(),
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                updated_at: "2025-01-01T00:00:00Z".to_string(),
+                active_form: None,
+                owner: None,
+                metadata: None,
+                blocks: Vec::new(),
+                blocked_by: Vec::new(),
+            },
+        ]);
+
+        assert_eq!(snapshot.pending_count, 1);
+        assert_eq!(snapshot.in_progress_count, 1);
+        assert_eq!(snapshot.blocked_count, 1);
+        assert_eq!(
+            snapshot.active_tasks,
+            vec![
+                "task-2 add runtime tests [pending]".to_string(),
+                "task-1 wire completion guard [in_progress]".to_string(),
+            ]
+        );
+        assert!(snapshot.has_unfinished_tasks());
+        assert!(snapshot.short_summary().contains("task(s) remain"));
+        assert_eq!(
+            snapshot.status_count_summary(),
+            "1 in_progress, 1 pending task(s) remain"
+        );
+        assert!(VolatileKind::TaskBoardCompletionGate.is_singleton());
     }
 
     // ── Original tests ──────────────────────────────────────────────────────
@@ -5065,6 +5237,16 @@ pub(crate) mod tests {
             state.interruption.as_ref().unwrap().kind,
             astra_turn_core::interruption::InterruptionKind::TokenBudgetExceeded,
             "abort interruption must be TokenBudgetExceeded"
+        );
+        assert!(
+            state.final_text.contains("Why stopped:"),
+            "terminal output should explain why the runtime aborted the wrapup path"
+        );
+        assert!(
+            state
+                .final_text
+                .contains("ignored both the wrap-up advisory and the restricted-tools lockout"),
+            "terminal output should include the concrete abort reason"
         );
     }
 

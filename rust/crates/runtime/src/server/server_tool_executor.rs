@@ -1029,6 +1029,10 @@ impl ServerToolExecutor {
         }
     }
 
+    pub fn task_manager(&self) -> Arc<TaskManager> {
+        Arc::clone(&self.task_manager)
+    }
+
     pub async fn close_pending_memory_feedback_at_turn_end(
         &self,
         context_prefix: &str,

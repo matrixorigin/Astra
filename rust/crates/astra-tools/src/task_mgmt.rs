@@ -670,6 +670,12 @@ impl TaskManager {
         self.store.load(&self.sid()).await.unwrap_or_default()
     }
 
+    /// Load only active tasks and surface backend errors to callers that need
+    /// completion-critical task-board state.
+    pub async fn load_active_tasks(&self) -> Result<Vec<SessionTask>, String> {
+        self.store.load_active(&self.sid()).await
+    }
+
     /// Capture a full rollback snapshot (tasks + next id).
     pub async fn snapshot_state(&self) -> TaskManagerSnapshot {
         let tasks = self.snapshot().await;

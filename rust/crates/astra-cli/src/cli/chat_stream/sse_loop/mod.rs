@@ -713,6 +713,8 @@ pub(crate) async fn stream_chat_sse(
             workspace_root_hint: Some(project_root.to_string_lossy().into_owned()),
             forward_headers: std::collections::HashMap::new(),
             llm_token_service: None,
+            task_board_monitor: p.task_manager.clone(),
+            task_board_snapshot: Default::default(),
         },
         messaging: MessagingState {
             mailbox: root_mailbox,

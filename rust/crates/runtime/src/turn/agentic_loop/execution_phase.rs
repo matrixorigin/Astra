@@ -2,8 +2,8 @@ use std::time::Instant;
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::host::{
-    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, HostTurnResult, finalize_and_render,
-    finalize_turn_trace, try_write_heavy_checkpoint,
+    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, HostTurnResult, TaskBoardSnapshot,
+    finalize_and_render, finalize_turn_trace, try_write_heavy_checkpoint,
 };
 use super::lifecycle::{
     TurnIterationPrep, current_agentic_step, interruption_diagnosis_summary,
@@ -104,6 +104,44 @@ fn record_early_exit_llm_round(
             ..Default::default()
         });
     }
+}
+
+fn unfinished_task_board_snapshot(state: &AgenticLoopState) -> Option<&TaskBoardSnapshot> {
+    state
+        .hooks
+        .task_board_snapshot
+        .has_unfinished_tasks()
+        .then_some(&state.hooks.task_board_snapshot)
+}
+
+fn unfinished_task_board_corrective_message(
+    snapshot: &TaskBoardSnapshot,
+    original_query: &str,
+) -> String {
+    format!(
+        "[unfinished-task-board:v1]\n\
+         Runtime correction: the session task board still has unfinished work. {}.\n\n\
+         REQUIRED next-step behavior:\n\
+         - Continue executing the remaining task-board work before reporting completion.\n\
+         - If a listed task is no longer needed, explicitly update/cancel/close it instead of ignoring it.\n\
+         - Do NOT give a success-shaped final answer while these tasks remain open.\n\n\
+         Original user query: {original_query}",
+        snapshot.status_count_summary(),
+    )
+}
+
+fn circuit_breaker_abort_detail(state: &AgenticLoopState) -> String {
+    let mut detail = format!(
+        "The circuit breaker stopped this turn after round {} because the model kept calling tools after the runtime injected a finalization correction.",
+        state.llm_rounds_completed
+    );
+    if let Some(diagnosis) = interruption_diagnosis_summary(state) {
+        detail.push_str(&format!(" Likely cause: {diagnosis}."));
+    }
+    detail.push_str(
+        " Progress from earlier rounds is preserved. Resume by synthesizing verified evidence before calling more tools.",
+    );
+    detail
 }
 
 pub(crate) struct TurnExecutionPhase {
@@ -287,6 +325,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // Observed in session 3b7ac18f: ~10 nudge injections across 15
     // turns in Auto mode, user complaint "不停的被打断,不一气呵成".
     let suppress_nudges = host.turn_interaction_mode().suppresses_loop_nudges();
+    state.refresh_task_board_snapshot().await;
 
     // Inject round budget guidance so the model knows to batch or synthesize.
     // Use llm_rounds_completed (actual LLM call count) not turn_index (step
@@ -1177,6 +1216,40 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 return Ok(TurnExecutionControl::ContinueLoop);
             }
 
+            if let Some(snapshot) = unfinished_task_board_snapshot(state).cloned() {
+                state.final_text.clear();
+                state.final_text_streamed = false;
+                state.push_volatile(
+                    super::host::VolatileKind::TaskBoardCompletionGate,
+                    unfinished_task_board_corrective_message(&snapshot, &state.message),
+                );
+                tracing::info!(
+                    target: "astra::loop_guard",
+                    tier = "unfinished_task_board",
+                    round = state.llm_rounds_completed,
+                    summary = %snapshot.short_summary(),
+                    "unfinished task-board work blocked loop completion"
+                );
+                if !prep.quiet {
+                    host.emit_headless_line(
+                        HeadlessStderrStyle::Yellow,
+                        format!(
+                            "↻ Unfinished tasks remain; continuing ({})",
+                            snapshot.short_summary()
+                        ),
+                    );
+                }
+                record_early_exit_llm_round(
+                    state,
+                    &turn_result,
+                    prep.turn_start_time,
+                    Some("unfinished_tasks"),
+                );
+                state.step_recorder.end_turn(false);
+                try_write_heavy_checkpoint(state);
+                return Ok(TurnExecutionControl::ContinueLoop);
+            }
+
             if state.hooks.stop_hook_runs == 0
                 && let Some(prompt) =
                     astra_turn_core::stop_hooks::build_stop_hook_prompt(&state.hooks.stop_hooks)
@@ -1240,28 +1313,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // model ignored it → abort.
     if state.stall.forced_round_budget_phase1 && !state.stall.forced_round_budget_phase2 {
         state.stall.forced_round_budget_phase2 = true;
-        let mut abort_msg = format!(
-            "[Circuit breaker abort at round {}. The runtime injected a \
-             finalization corrective but the model continued to call tools. \
-             Any progress from earlier rounds is preserved above.]",
-            state.llm_rounds_completed,
-        );
-        if let Some(diagnosis) = interruption_diagnosis_summary(state) {
-            abort_msg.push_str(&format!(
-                "\nLikely cause: {diagnosis}. Resume by synthesizing the evidence already gathered before attempting more tools."
-            ));
-        }
-        if state.final_text.trim().is_empty() {
-            state.final_text = abort_msg.clone();
-        } else {
-            state.final_text.push_str("\n\n");
-            state.final_text.push_str(&abort_msg);
-        }
+        let abort_detail = circuit_breaker_abort_detail(state);
+        state.final_text.clear();
         state.final_text_streamed = false;
         state.interruption = Some(InterruptionRecord::new(
             InterruptionKind::BudgetExhausted,
             ResumeAction::ContinueImmediately,
-            interruption_state_summary(state, Some(abort_msg)),
+            interruption_state_summary(state, Some(abort_detail)),
         ));
         tracing::warn!(
             target: "astra::loop_guard",
@@ -1972,9 +2030,10 @@ fn build_circuit_breaker_signal(
             .take(state.max_tools_per_turn as usize)
             .any(tool_record_is_workspace_mutation)
     };
-    let task_completed = latest_round_records
-        .iter()
-        .any(|record| record.ok && record.name == "git_commit");
+    let task_completed = !state.hooks.task_board_snapshot.has_unfinished_tasks()
+        && latest_round_records
+            .iter()
+            .any(|record| record.ok && record.name == "git_commit");
 
     RoundSignal {
         tool_signatures,
@@ -2412,6 +2471,8 @@ fn emit_subrun_text_preview<H: AgenticLoopHost>(
     }
 }
 
+const MAX_REACTIVE_BUDGET_COMPACTION_ATTEMPTS: u32 = 3;
+
 async fn handle_token_budget<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -2469,7 +2530,9 @@ async fn handle_token_budget<H: AgenticLoopHost>(
     // Only if both fail do we inject the stop directive.
     // Skip tier-1 mechanical compression if pre-turn LLM compact already ran,
     // but still allow tier-2 spill-to-disk as an independent recovery path.
-    if !state.budget_wrapup_injected {
+    if !state.budget_wrapup_injected
+        && state.compaction_effectiveness.attempt_count < MAX_REACTIVE_BUDGET_COMPACTION_ATTEMPTS
+    {
         let budget = super::super::context_compression::TokenBudget {
             max_prompt_tokens: state.max_turn_input_tokens,
             last_measured_tokens: measured,
@@ -2535,7 +2598,6 @@ async fn handle_token_budget<H: AgenticLoopHost>(
                 super::host::VolatileKind::CompactResume,
                 super::super::budget_messaging::COMPACT_RESUME_DIRECTIVE,
             );
-            state.budget_wrapup_injected = true;
             try_write_heavy_checkpoint(state);
             return Some(TurnExecutionControl::ContinueLoop);
         }
@@ -2667,15 +2729,82 @@ fn record_tool_selection(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Duration;
 
     use astra_services::session_journal::ToolCallRecord;
+    use async_trait::async_trait;
 
     use super::*;
     use crate::observability::ObservabilityHub;
     use crate::turn::agentic_loop::host::tests::{MockHost, make_state, text_result};
+    use crate::turn::agentic_loop::host::{
+        AgenticLoopHost, AgenticLoopState, VolatileKind, run_agentic_loop_with_host,
+    };
     use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
+
+    struct SnapshotClearingHost {
+        turn_results: Vec<HostTurnResult>,
+        current_turn: usize,
+        emitted_lines: Vec<String>,
+        rendered_final_text: Vec<String>,
+        valid_tools: HashSet<String>,
+    }
+
+    impl SnapshotClearingHost {
+        fn new(turn_results: Vec<HostTurnResult>) -> Self {
+            Self {
+                turn_results,
+                current_turn: 0,
+                emitted_lines: Vec::new(),
+                rendered_final_text: Vec::new(),
+                valid_tools: HashSet::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgenticLoopHost for SnapshotClearingHost {
+        async fn execute_turn(
+            &mut self,
+            state: &mut AgenticLoopState,
+        ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
+            if self.turn_results.is_empty() {
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::BudgetExhausted,
+                    "no more turns",
+                ));
+            }
+            if self.current_turn == 1 {
+                state.hooks.task_board_snapshot = TaskBoardSnapshot::default();
+            }
+            self.current_turn += 1;
+            Ok(self.turn_results.remove(0))
+        }
+
+        fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
+            self.emitted_lines.push(line);
+        }
+
+        fn is_quiet(&self) -> bool {
+            true
+        }
+
+        fn turn_interaction_mode(&self) -> TurnInteractionMode {
+            TurnInteractionMode::NonInteractive
+        }
+
+        fn valid_tool_names(&self) -> &HashSet<String> {
+            &self.valid_tools
+        }
+
+        fn inject_tool_schema(&mut self, _schema: serde_json::Value) {}
+
+        fn render_final_text(&mut self, text: &str) {
+            self.rendered_final_text.push(text.to_string());
+        }
+    }
 
     #[test]
     fn circuit_breaker_introspection_message_uses_actual_read_only_streak() {
@@ -3291,6 +3420,79 @@ mod tests {
     }
 
     #[test]
+    fn circuit_breaker_signal_does_not_mark_completion_when_tasks_remain() {
+        let mut state = make_state();
+        state.llm_rounds_completed = 4;
+        state.hooks.task_board_snapshot =
+            crate::turn::agentic_loop::host::TaskBoardSnapshot::from_active_tasks(&[
+                astra_tools::task_mgmt::SessionTask {
+                    id: "task-1".to_string(),
+                    title: "finish validation".to_string(),
+                    description: None,
+                    status: "pending".to_string(),
+                    subtasks: Vec::new(),
+                    created_at: "2025-01-01T00:00:00Z".to_string(),
+                    updated_at: "2025-01-01T00:00:00Z".to_string(),
+                    active_form: None,
+                    owner: None,
+                    metadata: None,
+                    blocks: Vec::new(),
+                    blocked_by: Vec::new(),
+                },
+            ]);
+        state.stall.turn_sigs.push(
+            ["git_commit:{\"message\":\"finish\"}".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "git_commit".into(),
+            ok: true,
+            round: Some(3),
+            ..Default::default()
+        });
+
+        let signal = build_circuit_breaker_signal(&state);
+
+        assert!(
+            !signal.task_completed,
+            "unfinished task-board work must suppress completion soft-stop"
+        );
+        assert!(signal.produced_mutation);
+    }
+
+    #[tokio::test]
+    async fn unfinished_task_board_guard_forces_another_round() {
+        let mut host = SnapshotClearingHost::new(vec![
+            text_result("Done.", 10, 5, Some(20)),
+            text_result("All task-board work is now complete.", 10, 5, Some(20)),
+        ]);
+        let mut state = make_state();
+        state.hooks.task_board_snapshot =
+            TaskBoardSnapshot::from_active_tasks(&[astra_tools::task_mgmt::SessionTask {
+                id: "task-1".to_string(),
+                title: "finish validation".to_string(),
+                description: None,
+                status: "in_progress".to_string(),
+                subtasks: Vec::new(),
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                updated_at: "2025-01-01T00:00:00Z".to_string(),
+                active_form: None,
+                owner: None,
+                metadata: None,
+                blocks: Vec::new(),
+                blocked_by: Vec::new(),
+            }]);
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_ok(), "loop should continue until tasks clear");
+        assert_eq!(host.current_turn, 2);
+        assert_eq!(state.final_text, "All task-board work is now complete.");
+        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+    }
+
+    #[test]
     fn circuit_breaker_signal_does_not_reuse_stale_git_commit_completion() {
         let mut state = make_state();
         state.llm_rounds_completed = 5;
@@ -3334,6 +3536,187 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("Stop now and provide the final answer")
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_abort_detail_explains_reason_and_resume_path() {
+        let mut state = make_state();
+        state.llm_rounds_completed = 6;
+        let detail = circuit_breaker_abort_detail(&state);
+
+        assert!(detail.contains("circuit breaker stopped this turn"));
+        assert!(detail.contains("Progress from earlier rounds is preserved"));
+        assert!(detail.contains("Resume by synthesizing verified evidence"));
+    }
+
+    #[test]
+    fn task_board_corrective_uses_cache_stable_counts_only() {
+        let snapshot =
+            TaskBoardSnapshot::from_active_tasks(&[astra_tools::task_mgmt::SessionTask {
+                id: "task-1".to_string(),
+                title: "very specific changing task title".to_string(),
+                description: None,
+                status: "in_progress".to_string(),
+                subtasks: Vec::new(),
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                updated_at: "2025-01-01T00:00:00Z".to_string(),
+                active_form: None,
+                owner: None,
+                metadata: None,
+                blocks: Vec::new(),
+                blocked_by: Vec::new(),
+            }]);
+
+        let msg = unfinished_task_board_corrective_message(&snapshot, "finish the task");
+
+        assert!(msg.contains("1 in_progress task(s) remain"));
+        assert!(!msg.contains("task-1"));
+        assert!(!msg.contains("very specific changing task title"));
+    }
+
+    #[tokio::test]
+    async fn reactive_compaction_does_not_arm_wrapup_after_success() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.max_turn_input_tokens = 80_000;
+        state.last_measured_prompt_tokens = Some(90_000);
+        state
+            .messages
+            .push(serde_json::json!({"role": "user", "content": "diagnose and fix the issue"}));
+        for i in 0..16 {
+            state.messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": format!("step {i}: {}", "x".repeat(240)),
+            }));
+            state.messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!("follow-up {i}: {}", "y".repeat(220)),
+            }));
+        }
+
+        let control = handle_token_budget(
+            &mut host,
+            &mut state,
+            0,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+            &text_result("working", 90_000, 300, Some(20)),
+        )
+        .await;
+
+        assert!(matches!(control, Some(TurnExecutionControl::ContinueLoop)));
+        assert!(
+            !state.budget_wrapup_injected,
+            "successful reactive compaction should continue the turn without arming wrapup"
+        );
+        assert!(
+            state
+                .volatile_pending
+                .iter()
+                .any(|entry| entry.kind == VolatileKind::CompactResume),
+            "successful reactive compaction should inject the continue-after-compact directive"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_budget_pressure_retries_compaction_before_wrapup() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.max_turn_input_tokens = 80_000;
+        state
+            .messages
+            .push(serde_json::json!({"role": "user", "content": "diagnose and fix the issue"}));
+        for i in 0..24 {
+            state.messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": format!("step {i}: {}", "x".repeat(240)),
+            }));
+            state.messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!("follow-up {i}: {}", "y".repeat(220)),
+            }));
+        }
+
+        state.last_measured_prompt_tokens = Some(90_000);
+        let first = handle_token_budget(
+            &mut host,
+            &mut state,
+            0,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+            &text_result("working", 90_000, 300, Some(20)),
+        )
+        .await;
+        assert!(matches!(first, Some(TurnExecutionControl::ContinueLoop)));
+
+        state.last_measured_prompt_tokens = Some(88_000);
+        let second = handle_token_budget(
+            &mut host,
+            &mut state,
+            1,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+            &text_result("still working", 88_000, 320, Some(20)),
+        )
+        .await;
+
+        assert!(
+            matches!(second, Some(TurnExecutionControl::ContinueLoop)),
+            "continued context pressure should retry compaction before forcing wrapup"
+        );
+        assert!(
+            !state.budget_wrapup_injected,
+            "repeat pressure after a successful compact should not flip straight into wrapup mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn reactive_compaction_attempt_cap_forces_wrapup() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.max_turn_input_tokens = 80_000;
+        state.last_measured_prompt_tokens = Some(90_000);
+        state.compaction_effectiveness.attempt_count = MAX_REACTIVE_BUDGET_COMPACTION_ATTEMPTS;
+        state
+            .messages
+            .push(serde_json::json!({"role": "user", "content": "diagnose and fix the issue"}));
+        for i in 0..16 {
+            state.messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": format!("step {i}: {}", "x".repeat(240)),
+            }));
+        }
+
+        let control = handle_token_budget(
+            &mut host,
+            &mut state,
+            0,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+            &text_result("working", 90_000, 300, Some(20)),
+        )
+        .await;
+
+        assert!(matches!(control, Some(TurnExecutionControl::ContinueLoop)));
+        assert!(
+            state.budget_wrapup_injected,
+            "after bounded compaction attempts, token pressure must transition to wrapup"
+        );
+        assert!(
+            state
+                .volatile_pending
+                .iter()
+                .any(|entry| entry.kind == VolatileKind::BudgetAdvisory),
+            "attempt cap should inject the normal budget wrapup advisory"
         );
     }
 

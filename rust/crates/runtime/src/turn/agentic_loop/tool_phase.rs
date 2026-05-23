@@ -848,11 +848,9 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             astra_turn_core::interruption::ResumeAction::ContinueImmediately,
             super::lifecycle::interruption_state_summary(
                 state,
-                Some(
-                    "LLM ignored wrapup instruction and restricted-tools lockout; \
-                     attempted tool calls on two consecutive rounds"
-                        .to_string(),
-                ),
+                Some(format!(
+                    "The runtime stopped this turn because token pressure stayed high and the model ignored both the wrap-up advisory and the restricted-tools lockout, attempting {dropped_count} more tool call(s). Progress from earlier rounds is preserved. Resume by summarizing verified work first and only call more tools if one concrete fact is still missing."
+                )),
             ),
         ));
         tracing::warn!(

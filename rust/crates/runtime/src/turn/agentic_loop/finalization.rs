@@ -575,6 +575,7 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
         .messages
         .retain(|m| !super::execution_phase::is_execution_corrective_message(m));
     reset_per_turn_corrective_state(state);
+    state.refresh_task_board_snapshot().await;
     ensure_terminal_text(state);
     try_write_heavy_checkpoint(state);
     if !state.final_text.is_empty() && !state.final_text_streamed {
@@ -584,6 +585,25 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
 }
 
 fn ensure_terminal_text(state: &mut AgenticLoopState) {
+    if state.hooks.task_board_snapshot.has_unfinished_tasks() {
+        let detail = format!(
+            "agentic loop reached terminal state while unfinished task-board work remained: {}",
+            state.hooks.task_board_snapshot.short_summary()
+        );
+        if state.interruption.is_none() {
+            state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+                astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
+                astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+                interruption_state_summary(state, Some(detail)),
+            ));
+        }
+        state.final_text = task_board_terminal_message(
+            &state.hooks.task_board_snapshot,
+            state.interruption.as_ref(),
+        );
+        state.final_text_streamed = false;
+        return;
+    }
     if !state.final_text.trim().is_empty() {
         return;
     }
@@ -598,8 +618,55 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
         ));
     }
     if let Some(interruption) = state.interruption.as_ref() {
-        state.final_text = interruption.user_message.clone();
+        state.final_text = interruption_terminal_message(interruption);
         state.final_text_streamed = false;
+    }
+}
+
+fn interruption_terminal_message(
+    interruption: &astra_turn_core::interruption::InterruptionRecord,
+) -> String {
+    let mut message = interruption.user_message.clone();
+    append_interruption_detail(&mut message, interruption);
+    message
+}
+
+fn task_board_terminal_message(
+    snapshot: &crate::turn::agentic_loop::host::TaskBoardSnapshot,
+    interruption: Option<&astra_turn_core::interruption::InterruptionRecord>,
+) -> String {
+    let mut message =
+        "The turn stopped before completion, and task-board work remains open.".to_string();
+    if let Some(interruption) = interruption {
+        message.push_str("\n\nStop reason: ");
+        message.push_str(interruption.user_message.trim());
+        append_interruption_detail(&mut message, interruption);
+    }
+    message.push_str("\n\nRemaining task-board work: ");
+    message.push_str(&snapshot.short_summary());
+    message.push_str(
+        ". Resume and finish or explicitly close these tasks before reporting completion.",
+    );
+    message
+}
+
+fn append_interruption_detail(
+    message: &mut String,
+    interruption: &astra_turn_core::interruption::InterruptionRecord,
+) {
+    if matches!(
+        interruption.kind,
+        astra_turn_core::interruption::InterruptionKind::BudgetExhausted
+            | astra_turn_core::interruption::InterruptionKind::TokenBudgetExceeded
+            | astra_turn_core::interruption::InterruptionKind::CumulativeBudgetExceeded
+    ) && let Some(detail) = interruption
+        .error_detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+    {
+        message.push_str("\n\nWhy stopped: ");
+        message.push_str(detail);
     }
 }
 
@@ -1055,6 +1122,187 @@ mod tests {
             astra_turn_core::interruption::InterruptionKind::EmptyCompletion
         );
         assert!(state.final_text.contains("without a final answer"));
+        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_does_not_leave_success_text_when_tasks_remain() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.final_text = "Done.".into();
+        state.hooks.task_board_snapshot =
+            crate::turn::agentic_loop::host::TaskBoardSnapshot::from_active_tasks(&[
+                astra_tools::task_mgmt::SessionTask {
+                    id: "task-1".to_string(),
+                    title: "finish validation".to_string(),
+                    description: None,
+                    status: "in_progress".to_string(),
+                    subtasks: Vec::new(),
+                    created_at: "2025-01-01T00:00:00Z".to_string(),
+                    updated_at: "2025-01-01T00:00:00Z".to_string(),
+                    active_form: None,
+                    owner: None,
+                    metadata: None,
+                    blocks: Vec::new(),
+                    blocked_by: Vec::new(),
+                },
+            ]);
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        assert_ne!(
+            state.final_text, "Done.",
+            "unfinished task-board work must not leave a success-shaped terminal answer"
+        );
+        assert!(
+            state.final_text.contains("task-1") || state.final_text.contains("finish validation"),
+            "terminal output should surface unfinished task context"
+        );
+        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_refreshes_task_board_before_terminal_gate() {
+        let manager = std::sync::Arc::new(astra_tools::task_mgmt::TaskManager::in_memory());
+        manager
+            .create(&serde_json::json!({"title": "finish validation"}))
+            .await;
+        manager
+            .update(&serde_json::json!({
+                "task_id": "task-1",
+                "new_status": "completed"
+            }))
+            .await;
+
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.final_text = "Done.".into();
+        state.hooks.task_board_monitor = Some(manager);
+        state.hooks.task_board_snapshot =
+            crate::turn::agentic_loop::host::TaskBoardSnapshot::from_active_tasks(&[
+                astra_tools::task_mgmt::SessionTask {
+                    id: "task-1".to_string(),
+                    title: "finish validation".to_string(),
+                    description: None,
+                    status: "in_progress".to_string(),
+                    subtasks: Vec::new(),
+                    created_at: "2025-01-01T00:00:00Z".to_string(),
+                    updated_at: "2025-01-01T00:00:00Z".to_string(),
+                    active_form: None,
+                    owner: None,
+                    metadata: None,
+                    blocks: Vec::new(),
+                    blocked_by: Vec::new(),
+                },
+            ]);
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        assert_eq!(
+            state.final_text, "Done.",
+            "finalization must refresh active tasks so completed tool-round work does not get falsely blocked"
+        );
+        assert!(
+            !state.hooks.task_board_snapshot.has_unfinished_tasks(),
+            "refreshed snapshot should observe that the task board has no active tasks"
+        );
+        assert_eq!(host.rendered_final_text, vec!["Done.".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_surfaces_budget_interruption_detail() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.final_text.clear();
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+            astra_turn_core::interruption::InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 5,
+                turns_completed: 7,
+                remaining_turns: 0,
+                error_detail: Some(
+                    "The circuit breaker stopped the turn after the model ignored the finalization correction. Resume by synthesizing verified evidence before calling more tools.".to_string(),
+                ),
+                stall_signal: Some("single_tool_streak=9".to_string()),
+            },
+        ));
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        assert!(
+            state
+                .final_text
+                .contains("circuit breaker stopped the turn"),
+            "terminal interruption text should include the specific budget-stop reason"
+        );
+        assert!(
+            state.final_text.contains("verified evidence"),
+            "terminal interruption text should include next-step guidance"
+        );
+        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_separates_stop_reason_from_remaining_tasks() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.final_text.clear();
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+            astra_turn_core::interruption::InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 5,
+                turns_completed: 7,
+                remaining_turns: 0,
+                error_detail: Some(
+                    "The circuit breaker stopped the turn after the model ignored the finalization correction.".to_string(),
+                ),
+                stall_signal: Some("single_tool_streak=9".to_string()),
+            },
+        ));
+        state.hooks.task_board_snapshot =
+            crate::turn::agentic_loop::host::TaskBoardSnapshot::from_active_tasks(&[
+                astra_tools::task_mgmt::SessionTask {
+                    id: "task-1".to_string(),
+                    title: "finish validation".to_string(),
+                    description: None,
+                    status: "in_progress".to_string(),
+                    subtasks: Vec::new(),
+                    created_at: "2025-01-01T00:00:00Z".to_string(),
+                    updated_at: "2025-01-01T00:00:00Z".to_string(),
+                    active_form: None,
+                    owner: None,
+                    metadata: None,
+                    blocks: Vec::new(),
+                    blocked_by: Vec::new(),
+                },
+            ]);
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        assert!(
+            state.final_text.starts_with(
+                "The turn stopped before completion, and task-board work remains open."
+            ),
+            "terminal text should lead with the combined unfinished-work status"
+        );
+        assert!(
+            state.final_text.contains("\n\nStop reason: "),
+            "terminal text should label the runtime stop cause explicitly"
+        );
+        assert!(
+            state.final_text.contains("\n\nRemaining task-board work: "),
+            "terminal text should label remaining task-board work separately"
+        );
+        assert!(
+            !state
+                .final_text
+                .contains("\n\nThe interruption condition was reached before a final answer could be produced.\n\nUnfinished task-board work remains:"),
+            "terminal text should not concatenate unrelated interruption and task messages without labels"
+        );
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }
 

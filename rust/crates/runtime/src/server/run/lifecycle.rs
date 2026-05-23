@@ -4067,7 +4067,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 .await
                 .insert(run_id.clone(), progress_rx);
 
-            loop_state.server_tool_executor = Some(std::sync::Arc::new(executor));
+            let executor = std::sync::Arc::new(executor);
+            loop_state.hooks.task_board_monitor = Some(executor.task_manager());
+            loop_state.server_tool_executor = Some(executor);
         }
 
         // Clone handles we need inside the spawned task.
@@ -4518,7 +4520,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 state.harness.sink.clone(),
             )
             .await;
-            state.server_tool_executor = Some(std::sync::Arc::new(executor));
+            let executor = std::sync::Arc::new(executor);
+            state.hooks.task_board_monitor = Some(executor.task_manager());
+            state.server_tool_executor = Some(executor);
         }
 
         // Clone handles for the background task.
@@ -5963,7 +5967,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
             if let Some(obs) = loop_state.telemetry.observability_session.clone() {
                 executor.set_observability_session(obs);
             }
-            loop_state.server_tool_executor = Some(std::sync::Arc::new(executor));
+            let executor = std::sync::Arc::new(executor);
+            loop_state.hooks.task_board_monitor = Some(executor.task_manager());
+            loop_state.server_tool_executor = Some(executor);
         }
 
         configure_runtime_controllers(
