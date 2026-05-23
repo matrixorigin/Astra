@@ -335,7 +335,7 @@ pub(crate) fn assemble_llm_messages(
 pub(crate) fn assemble_llm_messages_with_cache_capability(
     system_messages: Vec<Value>,
     volatile_preamble: Vec<Value>,
-    drained_volatile: Vec<crate::turn::agentic_loop_host::VolatileInjection>,
+    drained_volatile: Vec<crate::turn::agentic_loop::host::VolatileInjection>,
     compacted_messages: Vec<Value>,
     attachments: &PostCompactAttachments<'_>,
     session_id: &str,
@@ -1178,8 +1178,8 @@ mod tests {
             json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
             json!({"role": "assistant", "content": "Understood."}),
         ];
-        let drained = vec![crate::turn::agentic_loop_host::VolatileInjection {
-            kind: crate::turn::agentic_loop_host::VolatileKind::AlreadyFetched,
+        let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::AlreadyFetched,
             content: "## Already Fetched (do NOT re-read/re-grep these)\nFiles: foo.rs".into(),
             round_index: 1,
         }];
