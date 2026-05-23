@@ -862,13 +862,23 @@ fn volatile_preamble_from_text(text: String, inject: bool) -> Vec<Value> {
     vec![
         json!({
             "role": "user",
-            "content": format!("<system-reminder>\n{text}</system-reminder>"),
+            "content": ensure_system_reminder_wrapper(&text),
         }),
         json!({
             "role": "assistant",
             "content": "Understood.",
         }),
     ]
+}
+
+fn ensure_system_reminder_wrapper(text: &str) -> String {
+    const SYSTEM_REMINDER_PREFIX: &str = "<system-reminder>";
+    const SYSTEM_REMINDER_SUFFIX: &str = "</system-reminder>";
+    if text.starts_with(SYSTEM_REMINDER_PREFIX) && text.ends_with(SYSTEM_REMINDER_SUFFIX) {
+        text.to_string()
+    } else {
+        format!("{SYSTEM_REMINDER_PREFIX}\n{text}{SYSTEM_REMINDER_SUFFIX}")
+    }
 }
 
 fn record_pipeline_abort(
@@ -1007,10 +1017,6 @@ pub(crate) fn apply_bridge_message_cache_metadata(
     cache_cfg: &PromptCacheConfig,
     session_id: &str,
 ) {
-    let before = messages
-        .iter()
-        .filter(|message| astra_turn_core::context_serializer::message_has_cache_control(message))
-        .count();
     if let Some(prefix_end) = synthetic_tail_prefix_end {
         crate::turn::prompt_cache::apply_anthropic_cache_metadata(
             &mut messages[..prefix_end],
@@ -1019,18 +1025,6 @@ pub(crate) fn apply_bridge_message_cache_metadata(
         );
     } else {
         crate::turn::prompt_cache::apply_anthropic_cache_metadata(messages, cache_cfg, session_id);
-    }
-    let after = messages
-        .iter()
-        .filter(|message| astra_turn_core::context_serializer::message_has_cache_control(message))
-        .count();
-    if synthetic_tail_prefix_end.is_some() && after == before {
-        tracing::warn!(
-            target: "astra::cache",
-            synthetic_tail_prefix_end,
-            message_count = messages.len(),
-            "bridge synthetic-tail cache annotation added no message-level marker"
-        );
     }
 }
 
@@ -1065,7 +1059,7 @@ pub(crate) fn finalize_bridge_wire_messages(
         ) {
             return None;
         }
-        let wrapped = format!("<system-reminder>\n{text}</system-reminder>");
+        let wrapped = ensure_system_reminder_wrapper(&text);
         let tail_role = llm_messages
             .last()
             .and_then(|m| m.get("role").and_then(Value::as_str));
@@ -1367,6 +1361,39 @@ mod context_cache_contract_tests {
         assert_eq!(
             messages[0]["content"],
             "<system-reminder>\nvolatile</system-reminder>\n\noriginal user"
+        );
+    }
+
+    #[test]
+    fn finalize_bridge_wire_messages_preserves_existing_system_reminder_wrapper() {
+        let mut messages = vec![json!({"role": "user", "content": "original user"})];
+
+        finalize_bridge_wire_messages(
+            &mut messages,
+            Some("<system-reminder>\nvolatile</system-reminder>".to_string()),
+            "openai",
+            "gpt-4",
+            None,
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0]["content"],
+            "<system-reminder>\nvolatile</system-reminder>\n\noriginal user"
+        );
+    }
+
+    #[test]
+    fn finalize_bridge_wire_messages_noops_when_volatile_text_is_absent() {
+        let mut messages = vec![json!({"role": "assistant", "content": "stable"})];
+
+        let synthetic_tail_prefix_end =
+            finalize_bridge_wire_messages(&mut messages, None, "openai", "gpt-4", None);
+
+        assert!(synthetic_tail_prefix_end.is_none());
+        assert_eq!(
+            messages,
+            vec![json!({"role": "assistant", "content": "stable"})]
         );
     }
 

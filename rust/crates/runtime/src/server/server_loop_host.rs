@@ -6246,6 +6246,45 @@ mod tests {
         assert_eq!(captured.turn_index, 0);
     }
 
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[test]
+    fn normalize_message_for_cache_hash_canonicalizes_tool_content_shapes() {
+        let string_tool = json!({
+            "role": "tool",
+            "tool_call_id": "tooluse_123",
+            "content": "tool output",
+            "cache_control": { "type": "ephemeral" }
+        });
+        let normalized_string = super::normalize_message_for_cache_hash(&string_tool);
+        assert_eq!(
+            normalized_string["content"],
+            json!([{
+                "type": "tool_result",
+                "tool_use_id": "tooluse_123",
+                "content": "tool output"
+            }])
+        );
+
+        let array_tool = json!({
+            "role": "tool",
+            "tool_call_id": "tooluse_456",
+            "content": [{
+                "type": "tool_result",
+                "content": "tool output",
+                "cache_control": { "type": "ephemeral" }
+            }]
+        });
+        let normalized_array = super::normalize_message_for_cache_hash(&array_tool);
+        assert_eq!(
+            normalized_array["content"],
+            json!([{
+                "type": "tool_result",
+                "tool_use_id": "tooluse_456",
+                "content": "tool output"
+            }])
+        );
+    }
+
     // ── Additive skill allowed_tools tests ─────────────────────────────────
 
     fn sample_edge_tools_full() -> Vec<Value> {

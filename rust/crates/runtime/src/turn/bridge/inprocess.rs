@@ -4770,12 +4770,12 @@ mod tests {
 
         let bridge_synthetic_tail_prefix_end =
             crate::turn::llm::context::finalize_bridge_wire_messages(
-            &mut llm_messages,
-            Some("volatile".to_string()),
-            "anthropic",
-            "claude-sonnet-4",
-            None,
-        );
+                &mut llm_messages,
+                Some("volatile".to_string()),
+                "anthropic",
+                "claude-sonnet-4",
+                None,
+            );
         crate::turn::llm::context::apply_bridge_message_cache_metadata(
             &mut llm_messages,
             bridge_synthetic_tail_prefix_end,

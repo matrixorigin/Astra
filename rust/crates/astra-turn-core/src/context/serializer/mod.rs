@@ -171,13 +171,11 @@ fn remap_cache_markers_to_blocks(
 
     // Anthropic caps a single request at 4 `cache_control` markers. The
     // runtime's budget is:
-    //   1 × system  +  1 × tools  +  2 × messages (rolling historical+tail)
-    // Leaving the remaining 2 slots free for the rolling message-history
-    // pair is what gives cross-round prefix reuse — see the rolling
-    // breakpoint tests in `mock_llm_prompt_cache_e2e.rs`. So we collapse
-    // all system-level markers onto a single block (the latest one the
-    // planner requested), matching the single-marker policy applied on
-    // the legacy path in `apply_cache_policy_to_blocks`.
+    //   1 × system  +  1 × tools  +  1 × messages
+    // So we collapse all system-level markers onto a single block (the
+    // latest one the planner requested), matching the single-marker
+    // policy applied on the legacy path in `apply_cache_policy_to_blocks`
+    // and leaving one spare slot rather than overcommitting the request.
     let mut chosen_block: Option<usize> = None;
     let mut chosen_marker: Option<CacheMarker> = None;
     for marker in markers {

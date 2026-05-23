@@ -104,6 +104,13 @@ fn last_pinned_tool_index(
 ///     last non-system message before them.
 pub fn annotate_last_message_cache_breakpoint(messages: &mut [Value]) {
     let Some(idx) = find_message_cache_breakpoint_target(messages) else {
+        if !messages.is_empty() {
+            tracing::warn!(
+                target: "astra::cache",
+                message_count = messages.len(),
+                "annotate_last_message_cache_breakpoint: no non-system message found — skipping cache_control marker"
+            );
+        }
         return;
     };
     apply_cache_control_to_message(&mut messages[idx]);
@@ -136,8 +143,23 @@ fn find_message_cache_breakpoint_target(messages: &[Value]) -> Option<usize> {
 /// block carrying `cache_control` inside content. Anthropic's API does
 /// **not** accept message-level `cache_control` on tool messages, so we
 /// always lift the marker into the content block.
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 fn apply_cache_control_to_message(msg: &mut Value) {
-    let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
+    let role = msg
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     if role == "tool" {
         // Tool messages: wrap string content into a tool_result block with
         // content-level cache_control. If content is already an array, just
@@ -149,6 +171,12 @@ fn apply_cache_control_to_message(msg: &mut Value) {
         if let Some(arr) = msg.get_mut("content").and_then(Value::as_array_mut) {
             if let Some(last_block) = arr.last_mut() {
                 last_block["cache_control"] = anthropic_ephemeral_cache_control();
+            } else {
+                tracing::warn!(
+                    target: "astra::cache",
+                    "apply_cache_control_to_message: tool message has empty content array — \
+                     skipping cache_control"
+                );
             }
             return;
         }
@@ -177,7 +205,14 @@ fn apply_cache_control_to_message(msg: &mut Value) {
                 "content": text,
                 "cache_control": anthropic_ephemeral_cache_control(),
             }]);
+            return;
         }
+        tracing::warn!(
+            target: "astra::cache",
+            content_kind = msg.get("content").map(value_kind).unwrap_or("missing"),
+            "apply_cache_control_to_message: tool message has unsupported content shape — \
+             skipping cache_control"
+        );
         return;
     }
     if msg.get("content").is_some_and(Value::is_string) {
@@ -190,7 +225,20 @@ fn apply_cache_control_to_message(msg: &mut Value) {
     } else if let Some(arr) = msg.get_mut("content").and_then(Value::as_array_mut) {
         if let Some(last_block) = arr.last_mut() {
             last_block["cache_control"] = anthropic_ephemeral_cache_control();
+        } else {
+            tracing::warn!(
+                target: "astra::cache",
+                role = role.as_str(),
+                "apply_cache_control_to_message: message has empty content array — skipping cache_control"
+            );
         }
+    } else {
+        tracing::warn!(
+            target: "astra::cache",
+            role = role.as_str(),
+            content_kind = msg.get("content").map(value_kind).unwrap_or("missing"),
+            "apply_cache_control_to_message: message has unsupported content shape — skipping cache_control"
+        );
     }
 }
 
@@ -478,10 +526,55 @@ mod tests {
     }
 
     #[test]
+    fn cache_breakpoint_marks_last_block_of_tool_array_content() {
+        let mut msgs = vec![json!({
+            "role": "tool",
+            "tool_call_id": "tooluse_123",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "tooluse_123", "content": "first"},
+                {"type": "tool_result", "tool_use_id": "tooluse_123", "content": "second"},
+            ]
+        })];
+        annotate_last_message_cache_breakpoint(&mut msgs);
+        let arr = msgs[0]["content"].as_array().unwrap();
+        assert!(arr[0]["cache_control"].is_null());
+        assert_eq!(arr[1]["cache_control"], json!({"type": "ephemeral"}));
+    }
+
+    #[test]
     fn cache_breakpoint_noop_on_system_only() {
         let mut msgs = vec![json!({"role": "system", "content": "sys"})];
         annotate_last_message_cache_breakpoint(&mut msgs);
         assert_eq!(msgs[0]["content"], "sys");
+    }
+
+    #[test]
+    fn cache_breakpoint_tool_string_without_tool_call_id_stays_unmarked() {
+        let mut msgs = vec![json!({
+            "role": "tool",
+            "content": "tool output"
+        })];
+        annotate_last_message_cache_breakpoint(&mut msgs);
+        assert!(
+            !message_has_cache_control(&msgs[0]),
+            "tool messages without tool_call_id must stay unmarked rather than emit invalid tool_use_id"
+        );
+        assert_eq!(msgs[0]["content"], "tool output");
+    }
+
+    #[test]
+    fn cache_breakpoint_tool_object_content_stays_unmarked() {
+        let mut msgs = vec![json!({
+            "role": "tool",
+            "tool_call_id": "tooluse_123",
+            "content": {"structured": true}
+        })];
+        annotate_last_message_cache_breakpoint(&mut msgs);
+        assert!(
+            !message_has_cache_control(&msgs[0]),
+            "unsupported tool content shapes must stay unmarked instead of silently mutating"
+        );
+        assert_eq!(msgs[0]["content"], json!({"structured": true}));
     }
 
     /// Session c0905eab regression: runtime appends volatile signals

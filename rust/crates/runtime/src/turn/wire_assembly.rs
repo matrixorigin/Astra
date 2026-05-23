@@ -1191,6 +1191,39 @@ mod tests {
     }
 
     #[test]
+    fn volatile_preamble_appends_tail_user_when_no_tail_user_exists() {
+        let system = vec![json!({"role": "system", "content": "sys"})];
+        let preamble = vec![
+            json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
+            json!({"role": "assistant", "content": "Understood."}),
+        ];
+        let compacted = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "tail assistant"}),
+        ];
+        let msgs = assemble_llm_messages(
+            system,
+            preamble,
+            Vec::new(),
+            compacted,
+            &PostCompactAttachments::default(),
+            "sid",
+            "openai",
+            "gpt-4",
+            &cache_cfg(),
+        );
+
+        assert_eq!(msgs[1]["content"], "hi");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["content"], "tail assistant");
+        assert_eq!(msgs[3]["role"], "user");
+        assert_eq!(
+            msgs[3]["content"], "<system-reminder>volatile</system-reminder>",
+            "non-tool tails should append a single synthetic reminder user without an extra assistant ack"
+        );
+    }
+
+    #[test]
     fn anthropic_tool_tail_marks_last_real_message_before_synthetic_suffix() {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let preamble = vec![
