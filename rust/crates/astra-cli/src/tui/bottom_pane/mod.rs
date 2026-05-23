@@ -125,6 +125,20 @@ impl BottomPane {
         self.slash_items = items;
     }
 
+    /// Refresh the dynamic completions injected into the `/mcp` slash item.
+    ///
+    /// Called whenever MCP servers connect or their tool lists change so that
+    /// tab-completing `/mcp inspect`, `/mcp tools`, `/mcp ping`, etc. shows
+    /// the live server and tool names.
+    pub fn update_mcp_completions(&mut self, extras: Vec<(String, String)>) {
+        if let Some(item) = self.slash_items.iter_mut().find(|i| i.name == "/mcp") {
+            item.extra_subcommands = extras;
+            // Drop any open menu so it re-builds with the new completions
+            // next time the user types.
+            self.slash_menu = None;
+        }
+    }
+
     /// Inject the [`FileProvider`] used by the `@`-mention menu.
     pub fn set_file_provider(&mut self, provider: Arc<dyn FileProvider>) {
         self.file_provider = Some(provider);

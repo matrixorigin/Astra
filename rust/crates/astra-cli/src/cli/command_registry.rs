@@ -212,26 +212,35 @@ const SKILL_SUBCOMMANDS: &[(&str, &str)] = &[
 ];
 
 const MCP_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("help", "Quick MCP help and examples"),
-    ("list", "Overview of servers, tools, prompts, and resources"),
-    ("tools", "List callable tools: /mcp tools [server]"),
-    ("inspect", "Tool details: /mcp inspect <server>:<tool>"),
-    ("prompts", "List available MCP prompts"),
+    ("help", "Show MCP commands with examples"),
+    ("list", "Overview: servers, tools, prompts, resources"),
+    ("servers", "Server details and tool counts"),
+    ("status", "Alias for /mcp list"),
+    ("tools", "All callable tools (or: tools <server>)"),
+    ("inspect", "Tool schema: /mcp inspect <server>:<tool>"),
+    ("prompts", "List prompt templates from MCP servers"),
     ("resources", "List readable MCP resources"),
     ("read", "Read a resource: /mcp read <server>:<uri>"),
     ("ping", "Ping: /mcp ping [server]"),
-    ("add", "Add: /mcp add <name> <command> [args…]"),
-    ("prompt", "Invoke: /mcp prompt <server>:<name> [args]"),
-    ("remove", "Remove: /mcp remove <name>"),
     ("history", "Recent MCP tool-call history"),
-    ("servers", "Show server details and tools"),
-    ("status", "Alias for /mcp list"),
+    ("add", "Add server: /mcp add <name> <command> [args…]"),
+    ("remove", "Remove server: /mcp remove <name>"),
+    (
+        "prompt",
+        "Invoke prompt: /mcp prompt <server>:<name> [args]",
+    ),
     (
         "complete",
-        "Completions: /mcp complete <server>:prompt:<name> <arg> [value]",
+        "Arg completions: /mcp complete <server>:prompt:<name> <arg> [value]",
     ),
-    ("log-level", "Set level: /mcp log-level <server> <level>"),
-    ("subscribe", "Subscribe: /mcp subscribe <server>:<uri>"),
+    (
+        "log-level",
+        "Set log level: /mcp log-level <server> <level>",
+    ),
+    (
+        "subscribe",
+        "Subscribe to resource: /mcp subscribe <server>:<uri>",
+    ),
     (
         "unsubscribe",
         "Unsubscribe: /mcp unsubscribe <server>:<uri>",
@@ -689,11 +698,21 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── MCP ───────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/mcp",
-        "MCP: help|list|tools|inspect|prompts|resources|read|ping|…",
+        "MCP: list|tools|inspect|prompts|resources|read|ping|add|remove|…",
         CommandGroup::Mcp,
     )
     .with_subcommands(MCP_SUBCOMMANDS)
-    .with_arg_hint("[help|list|tools|inspect|prompts|resources|read|ping|…]")
+    .with_arg_hint("[subcommand]  e.g. tools, inspect <server>:<tool>")
+    .with_usage_examples(&[
+        "mcp list",
+        "mcp tools",
+        "mcp tools <server>",
+        "mcp inspect <server>:<tool>",
+        "mcp read <server>:<uri>",
+        "mcp ping [server]",
+        "mcp add <name> <command> [args…]",
+        "mcp remove <name>",
+    ])
     .with_tui_handler(TuiHandler::Fallback),
     // ── Team & account ───────────────────────────────────────────────────
     CommandMeta::new(

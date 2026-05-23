@@ -683,6 +683,14 @@ pub(crate) async fn run_tui_session(
             })
             .collect();
         bottom_pane.set_slash_items(slash_items);
+
+        // Seed dynamic MCP completions from any servers already connected at
+        // startup (e.g. from a resumed session or fast-connecting transports).
+        let mcp_extras = {
+            let mgr = state.mcp_manager.read().await;
+            crate::slash_mcp::build_mcp_extra_subcommands(&mgr)
+        };
+        bottom_pane.update_mcp_completions(mcp_extras);
     }
 
     // Install a filesystem-backed file provider for the `@`-mention menu,
@@ -1306,6 +1314,17 @@ pub(crate) async fn run_tui_session(
                                         board_user_pin = None;
                                     }
                                     refresh_footer_from_state(&mut bottom_pane, &state);
+                                    // After any /mcp command refresh the dynamic
+                                    // server/tool completions so that a freshly
+                                    // added or removed server is immediately
+                                    // visible in the tab-completion menu.
+                                    if text.starts_with("/mcp") {
+                                        let mcp_extras = {
+                                            let mgr = state.mcp_manager.read().await;
+                                            crate::slash_mcp::build_mcp_extra_subcommands(&mgr)
+                                        };
+                                        bottom_pane.update_mcp_completions(mcp_extras);
+                                    }
                                     if let Some(before) = pre_plan_snapshot.as_ref() {
                                         commit_plan_transition_notice(
                                             &mut chat_widget,

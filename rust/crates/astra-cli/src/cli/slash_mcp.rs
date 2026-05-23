@@ -94,6 +94,49 @@ pub(crate) fn parse_mcp_command(arg: &str) -> ParsedMcpCommand<'_> {
     }
 }
 
+/// Build dynamic subcommand completions for `/mcp` from the live MCP manager.
+///
+/// Returns `(subcommand_suffix, description)` pairs that are injected into the
+/// slash menu's `extra_subcommands` so the user gets real server/tool names
+/// when they type `/mcp ` and press Tab. For example:
+///
+///   `("inspect github:list_prs",  "github · list_prs")`
+///   `("tools github",             "Tools on github")`
+///   `("ping github",              "Ping github")`
+///   `("remove github",            "Remove github server")`
+pub(crate) fn build_mcp_extra_subcommands(manager: &McpClientManager) -> Vec<(String, String)> {
+    let mut items: Vec<(String, String)> = Vec::new();
+
+    let servers: Vec<&str> = manager.connected_servers();
+    if servers.is_empty() {
+        return items;
+    }
+
+    // Per-server: tools <server>, ping <server>, remove <server>
+    for server in &servers {
+        items.push((format!("tools {server}"), format!("Tools on {server}")));
+        items.push((format!("ping {server}"), format!("Ping {server}")));
+        items.push((
+            format!("remove {server}"),
+            format!("Remove {server} server"),
+        ));
+        items.push((
+            format!("log-level {server}"),
+            format!("Set log level for {server}"),
+        ));
+    }
+
+    // Per tool: inspect <server>:<tool>
+    for (server, tool) in manager.all_tools() {
+        items.push((
+            format!("inspect {server}:{}", tool.name),
+            format!("{server} · {}", tool.name),
+        ));
+    }
+
+    items
+}
+
 pub(crate) fn resolve_protocol_tool_query<'a>(
     manager: &'a McpClientManager,
     query: &str,

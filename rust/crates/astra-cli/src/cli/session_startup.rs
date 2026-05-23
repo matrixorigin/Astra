@@ -376,7 +376,7 @@ pub(crate) async fn complete_session_startup(
     if state.perm_manager.mode() == permission_manager::PermissionMode::Auto {
         eprintln!(
             "{}",
-            "  ⚠ Auto-approve mode: all tool calls will execute without confirmation.".yellow()
+            "  🔓 Auto-approve is ON — tools execute without confirmation.".dim()
         );
     }
 
@@ -398,21 +398,8 @@ pub(crate) async fn complete_session_startup(
     {
         const SESSION_TTL_DAYS: u64 = 30;
         const JOURNAL_COMPRESS_DAYS: u64 = 7;
-        let maint =
+        let _maint =
             session_journal::run_session_maintenance(SESSION_TTL_DAYS, JOURNAL_COMPRESS_DAYS);
-        if maint.sessions_deleted > 0 || maint.journals_compressed > 0 {
-            let mut parts = Vec::new();
-            if maint.sessions_deleted > 0 {
-                parts.push(format!(
-                    "{} expired sessions removed",
-                    maint.sessions_deleted
-                ));
-            }
-            if maint.journals_compressed > 0 {
-                parts.push(format!("{} journals compressed", maint.journals_compressed));
-            }
-            eprintln!("  {} {}", theme::icon_ok(), parts.join(", ").dim());
-        }
     }
 
     // Load persisted skill quality data from previous sessions
@@ -445,14 +432,6 @@ pub(crate) async fn complete_session_startup(
         let mut tracker = tool_registry::ToolQualityTracker::new();
         if !persisted_quality.is_empty() {
             tracker.merge(&persisted_quality);
-            eprintln!(
-                "{}",
-                format!(
-                    "  ✓ Restored tool quality ({} tools tracked)",
-                    persisted_quality.len()
-                )
-                .dim()
-            );
         }
         std::sync::Arc::new(std::sync::Mutex::new(tracker))
     };
@@ -471,16 +450,6 @@ pub(crate) async fn complete_session_startup(
             astra_turn_core::tool_health_persistence::load_tool_health(profile_name);
         state.synced_tool_health_entries =
             astra_turn_core::tool_health_persistence::load_synced_tool_health(profile_name);
-        if !cross_session_health_entries.is_empty() {
-            eprintln!(
-                "{}",
-                format!(
-                    "  ✓ Restored tool health ({} tools tracked)",
-                    cross_session_health_entries.len()
-                )
-                .dim()
-            );
-        }
         let cloud_pull_result = try_cloud_pull(profile_name).await;
         let pref_keys = try_cloud_pull_preferences(state).await;
         (cross_session_health_entries, cloud_pull_result, pref_keys)
