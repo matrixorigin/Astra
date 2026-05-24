@@ -676,6 +676,7 @@ test-ignored-integration:
 
 # Online (MatrixOne): opt-in #[ignore] integration binaries (see test-ignored-integration).
 # @astra/sdk remote E2E is opt-in (ASTRA_SDK_ONLINE_E2E=1) so CI make test-online has no API on :8000.
+# Args for test-online's helper `run_mysql_ddl`: $$1 = SQL to execute; remaining args = optional mysql flags.
 .PHONY: test-online
 test-online:
 	@if [ ! -f .env ]; then \
@@ -691,7 +692,6 @@ test-online:
 	DB_USER=$${MATRIXONE_USER:-root}; \
 	DB_PASS=$${MATRIXONE_PASSWORD:-111}; \
 	echo "Recreating test databases $$RUNTIME_IGNORED_DB and $$INTEGRATION_DB ..."; \
-	# Args: $$1 = SQL to execute, $$2 (optional) = extra mysql flags (e.g. SSL disable).
 	run_mysql_ddl() { _sql=$$1; shift; mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$_sql"; }; \
 	mysql_ssl_disable_arg() { \
 		if mysql --no-defaults --skip-ssl --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --skip-ssl --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--skip-ssl"; \
