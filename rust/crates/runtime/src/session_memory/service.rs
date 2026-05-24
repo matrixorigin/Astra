@@ -146,7 +146,7 @@ fn should_force_shutdown_refresh(messages: &[Value], current_tokens: usize) -> b
 pub trait SelectorParamsResolver: Send + Sync + std::fmt::Debug {
     async fn resolve(&self) -> Option<LlmConnParams>;
 
-    async fn resolve_ordered(&self) -> Vec<LlmConnParams> {
+    async fn resolve_candidates(&self) -> Vec<LlmConnParams> {
         self.resolve().await.into_iter().collect()
     }
 }
@@ -668,13 +668,35 @@ impl MemoryExtractionService {
             );
         }
 
-        let selector_candidates = self.selector_resolver.resolve_ordered().await;
+        let selector_candidates = self.selector_resolver.resolve_candidates().await;
         let resolved_selector_model = selector_candidates
             .first()
             .map(|candidate| candidate.model_name.clone());
         let effective_selector = selector_candidates
             .into_iter()
             .find(|candidate| self.health.is_healthy(&candidate.model_name));
+        if resolved_selector_model.is_some() && effective_selector.is_none() {
+            let cooldown_breadcrumbs = SessionMemoryExtractionBreadcrumbs {
+                messages_count: Some(messages_count),
+                selector_model: resolved_selector_model.clone(),
+                attempt: None,
+                llm_reason: None,
+                llm_detail: None,
+            };
+            self.emit_skip_event(
+                Some(&session_id),
+                turn,
+                SessionMemoryExtractionSkipReason::SelectorCooldown,
+                &cooldown_breadcrumbs,
+            );
+            self.record_skipped(
+                Some(&session_id),
+                turn,
+                trigger,
+                skip_reason_label(SessionMemoryExtractionSkipReason::SelectorCooldown),
+                resolved_selector_model.clone(),
+            );
+        }
         if effective_selector.is_some() {
             self.broker.emit(BackgroundActivity::Started {
                 session_id: session_id.clone(),
@@ -819,7 +841,7 @@ impl MemoryExtractionService {
                 content,
             } => {
                 if let Some(name) = attempted_selector_model.as_deref() {
-                    self.health.mark_failed(name);
+                    self.record_selector_failure(name, error_detail.as_deref());
                 }
                 // Memoria persist still succeeded on this branch, so
                 // the circuit breaker resets. Only the LLM selector
@@ -883,7 +905,7 @@ impl MemoryExtractionService {
                 if llm_error_reason.is_some()
                     && let Some(name) = attempted_selector_model.as_deref()
                 {
-                    self.health.mark_failed(name);
+                    self.record_selector_failure(name, llm_error_detail.as_deref());
                 }
                 // Memoria persist failed → breaker counts it. Enough
                 // consecutive failures trip the breaker and skip
@@ -1007,7 +1029,25 @@ fn summarize_persisted_content(content: &str) -> String {
         .unwrap_or_else(|| clip_preview(content))
 }
 
+fn is_terminal_selector_failure(detail: Option<&str>) -> bool {
+    let Some(detail) = detail else {
+        return false;
+    };
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("access to anthropic models is not allowed")
+        || lower.contains("unsupported countries, regions, or territories")
+        || lower.contains("unsupported countries")
+}
+
 impl MemoryExtractionService {
+    fn record_selector_failure(&self, model_name: &str, detail: Option<&str>) {
+        if is_terminal_selector_failure(detail) {
+            self.health.mark_terminal_failure(model_name);
+        } else {
+            self.health.mark_failed(model_name);
+        }
+    }
+
     async fn load_current_memory(&self, session_id: &str) -> String {
         let query = format!(
             "{} {} session memory",
@@ -1543,7 +1583,7 @@ mod tests {
             self.0.first().cloned()
         }
 
-        async fn resolve_ordered(&self) -> Vec<LlmConnParams> {
+        async fn resolve_candidates(&self) -> Vec<LlmConnParams> {
             self.0.clone()
         }
     }
@@ -1642,13 +1682,20 @@ mod tests {
         assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
 
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_cooldown_skip = false;
         let mut saw_fallback_extract = false;
-        while Instant::now() < deadline && !saw_fallback_extract {
+        while Instant::now() < deadline && !(saw_cooldown_skip && saw_fallback_extract) {
             while let Ok(evt) = rx.try_recv() {
                 if evt.event_type != "session_memory_extraction" {
                     continue;
                 }
                 let m = evt.metadata.as_ref().unwrap();
+                if m["outcome"] == "skipped"
+                    && m["reason"] == "selector_cooldown"
+                    && m["selector_model"] == selector_params.model_name
+                {
+                    saw_cooldown_skip = true;
+                }
                 if m["outcome"] == "extracted"
                     && m["source"] == "rule_fallback"
                     && m["selector_model"] == selector_params.model_name
@@ -1656,10 +1703,14 @@ mod tests {
                     saw_fallback_extract = true;
                 }
             }
-            if !saw_fallback_extract {
+            if !(saw_cooldown_skip && saw_fallback_extract) {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
+        assert!(
+            saw_cooldown_skip,
+            "unhealthy selector must still emit skipped{{reason=selector_cooldown}}"
+        );
         assert!(
             saw_fallback_extract,
             "unhealthy selector must degrade to extracted{{source=rule_fallback}}"
@@ -1718,6 +1769,16 @@ mod tests {
             attempted_second,
             "service should skip the cooled-down selector and attempt the next healthy candidate"
         );
+    }
+
+    #[test]
+    fn unsupported_region_errors_are_terminal_selector_failures() {
+        let detail = r#"http 502: {"detail":"Upstream LLM HTTP 400 Bad Request: {\"message\":\"Access to Anthropic models is not allowed from unsupported countries, regions, or territories.\"}"}"#;
+        assert!(is_terminal_selector_failure(Some(detail)));
+        assert!(!is_terminal_selector_failure(Some(
+            "http 502: upstream timeout"
+        )));
+        assert!(!is_terminal_selector_failure(None));
     }
 
     // ── concurrency / edge cases ─────────────────────────────────────

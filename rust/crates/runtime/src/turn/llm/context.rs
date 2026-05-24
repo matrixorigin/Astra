@@ -65,7 +65,29 @@ pub(crate) fn cache_capability_from_model_metadata(
 }
 
 fn estimate_json_tokens(value: &Value) -> u32 {
-    (value.to_string().len() as u32 / 4).saturating_add(1)
+    (estimate_json_chars(value) as u32 / 4).saturating_add(1)
+}
+
+fn estimate_json_chars(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Number(number) => number.to_string().len(),
+        Value::String(text) => text.len().saturating_add(2),
+        Value::Array(items) => {
+            let commas = items.len().saturating_sub(1);
+            2 + commas + items.iter().map(estimate_json_chars).sum::<usize>()
+        }
+        Value::Object(map) => {
+            let commas = map.len().saturating_sub(1);
+            2 + commas
+                + map
+                    .iter()
+                    .map(|(key, value)| key.len().saturating_add(3) + estimate_json_chars(value))
+                    .sum::<usize>()
+        }
+    }
 }
 
 /// Input for the shared context-pipeline assembly phase.

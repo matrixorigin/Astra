@@ -42,6 +42,14 @@ pub(crate) fn session_memory_entry_for_pipeline(
     )
 }
 
+pub(crate) fn rerun_with_session_memory_entry<T>(
+    content: Option<&str>,
+    turn_number: u32,
+    rerun: impl FnOnce(astra_turn_core::context_sources::MemoryEntry) -> T,
+) -> Option<T> {
+    session_memory_entry_for_pipeline(content, turn_number).map(rerun)
+}
+
 /// Session-level context that Memoria compaction needs. Bundled into one
 /// struct so callers don't pass a long list of positional arguments — each
 /// field is named and independently testable.
@@ -150,9 +158,11 @@ impl<'a> MemoriaContext<'a> {
                     .unwrap_or(50)
             })
             .sum();
-        let mut all_msgs = system_messages.to_vec();
-        all_msgs.extend(messages.iter().cloned());
-        let cache_est = crate::prompts::estimate_tokens_cache_aware(&all_msgs, tool_schema_tokens);
+        let cache_est = crate::prompts::estimate_tokens_cache_aware_split(
+            system_messages,
+            messages,
+            tool_schema_tokens,
+        );
 
         let resolved = overrides.apply(ResolvedBudget {
             budget_chars: budget.effective_input_limit() * 4,

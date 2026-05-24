@@ -16,8 +16,8 @@ use astra_turn_types::session_facts::SessionFacts;
 use crate::memory_hooks::relevance::LlmConnParams;
 use crate::turn::cloud::memoria_compact::MemoriaClient;
 use crate::turn::llm::client::{
-    apply_provider_auth, build_provider_request_body_with_overrides, llm_request_url_for_provider,
-    parse_nonstream_response_for_provider,
+    apply_provider_auth, build_provider_request_body_with_overrides, global_llm_client,
+    llm_request_url_for_provider, parse_nonstream_response_for_provider,
 };
 
 pub const SESSION_MEMORY_PREFIX: &str = "[@session/active]";
@@ -597,15 +597,10 @@ async fn update_memory_with_llm(
         &params.model_name,
         false,
     );
-    let client = reqwest::Client::builder()
-        .no_proxy()
+    let request = global_llm_client()
+        .post(url)
         .timeout(llm_timeout)
-        .build()
-        .map_err(|error| LlmExtractionFailure {
-            reason: SessionMemoryExtractionErrorReason::LlmError,
-            detail: Some(summarize_llm_detail(&error.to_string())),
-        })?;
-    let request = client.post(url).header("content-type", "application/json");
+        .header("content-type", "application/json");
     let request = apply_provider_auth(request, &params.provider, &params.api_key, None).json(&body);
 
     let response = match tokio::time::timeout(llm_timeout, request.send()).await {

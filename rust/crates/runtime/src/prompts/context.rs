@@ -133,6 +133,34 @@ pub struct CacheAwareEstimate {
     pub volatile_tokens: usize,
 }
 
+fn estimate_message_batch_tokens(messages: &[serde_json::Value]) -> usize {
+    const PER_MESSAGE_OVERHEAD: usize = 4;
+    messages
+        .iter()
+        .map(|m| estimate_single_message_tokens(m) + PER_MESSAGE_OVERHEAD)
+        .sum()
+}
+
+/// Estimate tokens with cache-awareness when the caller already has separate
+/// stable-prefix and volatile-tail slices and wants to avoid cloning them into
+/// one temporary vector.
+pub fn estimate_tokens_cache_aware_split(
+    stable_messages: &[serde_json::Value],
+    volatile_messages: &[serde_json::Value],
+    tool_schema_tokens: usize,
+) -> CacheAwareEstimate {
+    let stable_tokens = estimate_message_batch_tokens(stable_messages);
+    let volatile_tokens = estimate_message_batch_tokens(volatile_messages);
+    let cache_eligible = stable_tokens + tool_schema_tokens;
+    let total = cache_eligible + volatile_tokens;
+
+    CacheAwareEstimate {
+        total_tokens: total,
+        cache_eligible_tokens: cache_eligible,
+        volatile_tokens,
+    }
+}
+
 /// Estimate tokens with cache-awareness, separating stable prefix from
 /// volatile conversation tokens.
 ///
@@ -146,26 +174,14 @@ pub fn estimate_tokens_cache_aware(
     messages: &[serde_json::Value],
     tool_schema_tokens: usize,
 ) -> CacheAwareEstimate {
-    const PER_MESSAGE_OVERHEAD: usize = 4;
-
-    let (system_tokens, volatile_tokens) = if messages.is_empty() {
-        (0, 0)
+    if let Some((system_message, volatile_messages)) = messages.split_first() {
+        estimate_tokens_cache_aware_split(
+            std::slice::from_ref(system_message),
+            volatile_messages,
+            tool_schema_tokens,
+        )
     } else {
-        let sys = estimate_single_message_tokens(&messages[0]) + PER_MESSAGE_OVERHEAD;
-        let vol: usize = messages[1..]
-            .iter()
-            .map(|m| estimate_single_message_tokens(m) + PER_MESSAGE_OVERHEAD)
-            .sum();
-        (sys, vol)
-    };
-
-    let cache_eligible = system_tokens + tool_schema_tokens;
-    let total = cache_eligible + volatile_tokens;
-
-    CacheAwareEstimate {
-        total_tokens: total,
-        cache_eligible_tokens: cache_eligible,
-        volatile_tokens,
+        estimate_tokens_cache_aware_split(&[], &[], tool_schema_tokens)
     }
 }
 
@@ -496,6 +512,25 @@ mod tests {
         ];
         let est = estimate_tokens_cache_aware(&messages, 0);
         assert_eq!(est.volatile_tokens, 49);
+    }
+
+    #[test]
+    fn cache_aware_split_matches_joined_estimate() {
+        let stable = vec![msg(&"s".repeat(320))];
+        let volatile = vec![msg(&"u".repeat(180)), msg(&"a".repeat(96))];
+        let mut joined = stable.clone();
+        joined.extend(volatile.clone());
+        let schema_tokens = 123;
+
+        let split = estimate_tokens_cache_aware_split(&stable, &volatile, schema_tokens);
+        let joined_est = estimate_tokens_cache_aware(&joined, schema_tokens);
+
+        assert_eq!(split.total_tokens, joined_est.total_tokens);
+        assert_eq!(
+            split.cache_eligible_tokens,
+            joined_est.cache_eligible_tokens
+        );
+        assert_eq!(split.volatile_tokens, joined_est.volatile_tokens);
     }
 
     // ---------------------------------------------------------------

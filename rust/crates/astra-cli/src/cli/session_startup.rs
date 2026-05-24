@@ -42,10 +42,12 @@ struct CliSessionMemorySelectorResolver {
 #[async_trait::async_trait]
 impl astra_runtime::session_memory::SelectorParamsResolver for CliSessionMemorySelectorResolver {
     async fn resolve(&self) -> Option<astra_runtime::memory_hooks::relevance::LlmConnParams> {
-        self.resolve_ordered().await.into_iter().next()
+        self.resolve_candidates().await.into_iter().next()
     }
 
-    async fn resolve_ordered(&self) -> Vec<astra_runtime::memory_hooks::relevance::LlmConnParams> {
+    async fn resolve_candidates(
+        &self,
+    ) -> Vec<astra_runtime::memory_hooks::relevance::LlmConnParams> {
         #[derive(serde::Deserialize)]
         struct MemoryModelWire {
             model_name: String,

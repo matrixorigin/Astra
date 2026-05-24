@@ -64,10 +64,10 @@ impl std::fmt::Debug for PoolSelectorResolver {
 #[async_trait::async_trait]
 impl crate::session_memory::SelectorParamsResolver for PoolSelectorResolver {
     async fn resolve(&self) -> Option<crate::memory_hooks::relevance::LlmConnParams> {
-        self.resolve_ordered().await.into_iter().next()
+        self.resolve_candidates().await.into_iter().next()
     }
 
-    async fn resolve_ordered(&self) -> Vec<crate::memory_hooks::relevance::LlmConnParams> {
+    async fn resolve_candidates(&self) -> Vec<crate::memory_hooks::relevance::LlmConnParams> {
         let settings = self.pool.settings();
         let pool = self.pool.get();
         let resolved =

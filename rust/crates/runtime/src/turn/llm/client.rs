@@ -17,6 +17,7 @@
 //! Re-exported as [`apply_env_proxy`] for in-crate call sites.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
@@ -124,7 +125,7 @@ pub(crate) fn provider_uses_dashscope_thinking(provider: &str) -> bool {
 }
 
 /// Global HTTP client for LLM requests (connection pooling, reuse).
-fn global_llm_client() -> &'static reqwest::Client {
+pub(crate) fn global_llm_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         let connect = llm_connect_timeout();
@@ -149,20 +150,31 @@ fn global_llm_client() -> &'static reqwest::Client {
                     error = %e,
                     "failed to build global LLM HTTP client; retrying without pool_max_idle_per_host"
                 );
-                match reqwest::Client::builder()
-                    .no_proxy()
+                let mut fallback_builder = reqwest::Client::builder()
                     .connect_timeout(connect)
-                    .timeout(total)
-                    .build()
-                {
+                    .timeout(total);
+                fallback_builder = apply_env_proxy(fallback_builder);
+                match fallback_builder.build() {
                     Ok(client) => client,
                     Err(e2) => {
                         tracing::error!(
                             target: "astra_runtime::llm_client",
                             error = %e2,
-                            "failed to build minimal global LLM HTTP client; using reqwest::Client::new() without explicit timeouts"
+                            "failed to build minimal global LLM HTTP client; retrying with proxy-aware reqwest::Client::new() equivalent"
                         );
-                        reqwest::Client::new()
+                        let mut last_chance_builder = reqwest::Client::builder();
+                        last_chance_builder = apply_env_proxy(last_chance_builder);
+                        match last_chance_builder.build() {
+                            Ok(client) => client,
+                            Err(e3) => {
+                                tracing::error!(
+                                    target: "astra_runtime::llm_client",
+                                    error = %e3,
+                                    "failed to build last-chance proxy-aware LLM HTTP client; using reqwest::Client::new()"
+                                );
+                                reqwest::Client::new()
+                            }
+                        }
                     }
                 }
             }
@@ -1554,7 +1566,12 @@ pub(crate) fn build_provider_request_body_with_overrides(
             if thinking.is_enabled() {
                 assert_bedrock_thinking_signature_contract(&bedrock_messages);
             }
-            apply_request_body_overrides(&mut body, sanitized_overrides.as_ref());
+            apply_request_body_overrides(
+                &mut body,
+                sanitized_overrides
+                    .as_ref()
+                    .map(|overrides| overrides.as_ref()),
+            );
             body
         }
         LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::OpenAiCompatible => {
@@ -1582,7 +1599,12 @@ pub(crate) fn build_provider_request_body_with_overrides(
                     body["tool_choice"] = json!({"type": "auto"});
                 }
                 thinking.apply_anthropic(&mut body);
-                apply_request_body_overrides(&mut body, sanitized_overrides.as_ref());
+                apply_request_body_overrides(
+                    &mut body,
+                    sanitized_overrides
+                        .as_ref()
+                        .map(|overrides| overrides.as_ref()),
+                );
                 return body;
             }
             let normalized_messages = normalize_openai_tool_message_content(messages);
@@ -1658,7 +1680,7 @@ pub(crate) fn build_provider_request_body_with_overrides(
             } else {
                 thinking.apply_openai(&mut body);
             }
-            apply_request_body_overrides(&mut body, sanitized_overrides.as_ref());
+            apply_request_body_overrides(&mut body, sanitized_overrides.as_deref());
             body
         }
     }
@@ -1676,39 +1698,36 @@ fn apply_request_body_overrides(
     merge_json_object(body, overrides);
 }
 
-fn sanitize_request_body_overrides_for_thinking(
+fn sanitize_request_body_overrides_for_thinking<'a>(
     thinking: &ThinkingConfig,
-    request_body_overrides: Option<&Map<String, Value>>,
-) -> Option<Map<String, Value>> {
+    request_body_overrides: Option<&'a Map<String, Value>>,
+) -> Option<Cow<'a, Map<String, Value>>> {
     let overrides = request_body_overrides?;
     if !thinking.is_off() {
-        return Some(overrides.clone());
+        return Some(Cow::Borrowed(overrides));
     }
     let mut sanitized = overrides.clone();
-    strip_override_path(&mut sanitized, &["reasoning_effort"]);
-    strip_override_path(&mut sanitized, &["enable_thinking"]);
-    strip_override_path(&mut sanitized, &["thinking"]);
-    strip_override_path(&mut sanitized, &["reasoning"]);
-    strip_override_path(&mut sanitized, &["output_config", "effort"]);
-    strip_override_path(&mut sanitized, &["output_config", "reasoning_effort"]);
-    strip_override_path(
-        &mut sanitized,
-        &["additionalModelRequestFields", "thinking"],
-    );
-    strip_override_path(
-        &mut sanitized,
-        &["additionalModelRequestFields", "reasoning"],
-    );
-    strip_override_path(
-        &mut sanitized,
-        &["additionalModelRequestFields", "output_config", "effort"],
-    );
+    for path in THINKING_OVERRIDE_STRIP_PATHS {
+        strip_override_path(&mut sanitized, path);
+    }
     if sanitized.is_empty() {
         None
     } else {
-        Some(sanitized)
+        Some(Cow::Owned(sanitized))
     }
 }
+
+const THINKING_OVERRIDE_STRIP_PATHS: &[&[&str]] = &[
+    &["reasoning_effort"],
+    &["enable_thinking"],
+    &["thinking"],
+    &["reasoning"],
+    &["output_config", "effort"],
+    &["output_config", "reasoning_effort"],
+    &["additionalModelRequestFields", "thinking"],
+    &["additionalModelRequestFields", "reasoning"],
+    &["additionalModelRequestFields", "output_config", "effort"],
+];
 
 fn strip_override_path(target: &mut Map<String, Value>, path: &[&str]) {
     let Some((head, tail)) = path.split_first() else {
@@ -8094,6 +8113,22 @@ mod tests {
         );
     }
 
+    /// Regression: external LLM traffic must keep honoring env proxy policy even
+    /// on fallback builds; silently downgrading to `.no_proxy()` makes
+    /// region-gated upstreams flap between working and unsupported-region 400s.
+    #[test]
+    fn global_llm_client_fallback_does_not_force_no_proxy() {
+        let source = include_str!("client.rs");
+        let fn_start = source
+            .find("fn global_llm_client()")
+            .expect("global_llm_client must exist");
+        let body = &source[fn_start..(fn_start + 1400).min(source.len())];
+        assert!(
+            !body.contains(".no_proxy()"),
+            "global_llm_client fallback must preserve apply_env_proxy rather than forcing no_proxy"
+        );
+    }
+
     /// P1-E: llm_client must NOT define its own rate_limit_cooldown singleton.
     /// There must be exactly one PerModelCooldown singleton shared across all
     /// LLM call paths, otherwise a 429 recorded by one path is invisible to
@@ -9544,5 +9579,22 @@ mod tests {
                 .get("effort")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn sanitize_request_body_overrides_borrows_when_thinking_not_off() {
+        let overrides = Map::from_iter([("reasoningMode".to_string(), json!("compact"))]);
+        let sanitized = sanitize_request_body_overrides_for_thinking(
+            &ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+            Some(&overrides),
+        );
+        match sanitized {
+            Some(Cow::Borrowed(borrowed)) => {
+                assert!(std::ptr::eq(borrowed, &overrides));
+            }
+            other => panic!("expected borrowed overrides, got {other:?}"),
+        }
     }
 }

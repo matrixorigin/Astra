@@ -18,10 +18,14 @@ pub const FAILURE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 #[derive(Debug, Clone, Copy, Default)]
 struct FailureRecord {
     at: Option<Instant>,
+    terminal: bool,
 }
 
 impl FailureRecord {
-    fn in_cooldown(&self, now: Instant, ttl: Duration) -> bool {
+    fn is_unhealthy(&self, now: Instant, ttl: Duration) -> bool {
+        if self.terminal {
+            return true;
+        }
         match self.at {
             Some(when) => now.duration_since(when) < ttl,
             None => false,
@@ -56,7 +60,7 @@ impl SelectorHealth {
         !map.get(model_name)
             .copied()
             .unwrap_or_default()
-            .in_cooldown(Instant::now(), self.ttl)
+            .is_unhealthy(Instant::now(), self.ttl)
     }
 
     pub fn mark_failed(&self, model_name: &str) {
@@ -65,6 +69,19 @@ impl SelectorHealth {
                 model_name.to_string(),
                 FailureRecord {
                     at: Some(Instant::now()),
+                    terminal: false,
+                },
+            );
+        }
+    }
+
+    pub fn mark_terminal_failure(&self, model_name: &str) {
+        if let Ok(mut map) = self.map.lock() {
+            map.insert(
+                model_name.to_string(),
+                FailureRecord {
+                    at: Some(Instant::now()),
+                    terminal: true,
                 },
             );
         }
@@ -380,6 +397,18 @@ mod tests {
         assert!(!h.is_healthy("m"));
         std::thread::sleep(Duration::from_millis(20));
         assert!(h.is_healthy("m"));
+    }
+
+    #[test]
+    fn terminal_failure_does_not_expire_after_ttl() {
+        let h = SelectorHealth::with_ttl(Duration::from_millis(10));
+        h.mark_terminal_failure("m");
+        assert!(!h.is_healthy("m"));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !h.is_healthy("m"),
+            "terminal selector failures must stay unhealthy past the ordinary cooldown"
+        );
     }
 
     // ── MemoriaHealth ────────────────────────────────────────────────

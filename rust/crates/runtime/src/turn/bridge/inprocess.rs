@@ -2161,45 +2161,46 @@ impl InProcessChatTurnBridge {
 
                 let compact_result = ctx.compact(&raw, &llm_messages, &edge_tools).await;
 
-                if let Some(session_memory_entry) =
-                    crate::turn::wire_assembly::session_memory_entry_for_pipeline(
-                        compact_result.session_memory_context.as_deref(),
-                        trace_turn,
-                    )
-                {
-                    let rerun = crate::turn::llm::context::assemble_bridge_context(
-                        crate::turn::llm::context::BridgeContextAssemblyInput {
-                            tool_surface:
-                                crate::turn::llm::context::ToolSurfacePlan::from_visible_tools(
-                                    &edge_tools,
-                                    &bridge_restricted_snapshot,
-                                )
-                                .with_deferred_tools_block(&deferred_block_str)
-                                .with_selection_trace(bridge_selection_trace.clone()),
-                            runtime_signals:
-                                crate::turn::llm::context::BridgeRuntimeSignals::new(
-                                    &stable_sections,
-                                    &effective_dynamic_sections,
-                                    &memoria_prefetch_entries,
-                                    Some(session_memory_entry),
-                                    selection_confidence,
-                                    task_type,
-                                ),
-                            session: crate::turn::llm::context::BridgeSessionContextInput::new(
-                                &cache_cfg,
-                                cache_capability,
-                                &session_id,
-                                &model_name,
-                                &provider,
-                                edge_profile.get("cwd").and_then(Value::as_str),
-                                edge_profile.get("git_branch").and_then(Value::as_str),
-                                project_context,
-                            )
-                            .with_skill_listing_block(
-                                skill_listing_hint_text.as_deref().unwrap_or(""),
-                            ),
-                        },
-                    );
+                if let Some(rerun) = crate::turn::wire_assembly::rerun_with_session_memory_entry(
+                    compact_result.session_memory_context.as_deref(),
+                    trace_turn,
+                    |session_memory_entry| {
+                        crate::turn::llm::context::assemble_bridge_context(
+                            crate::turn::llm::context::BridgeContextAssemblyInput {
+                                tool_surface:
+                                    crate::turn::llm::context::ToolSurfacePlan::from_visible_tools(
+                                        &edge_tools,
+                                        &bridge_restricted_snapshot,
+                                    )
+                                    .with_deferred_tools_block(&deferred_block_str)
+                                    .with_selection_trace(bridge_selection_trace.clone()),
+                                runtime_signals:
+                                    crate::turn::llm::context::BridgeRuntimeSignals::new(
+                                        &stable_sections,
+                                        &effective_dynamic_sections,
+                                        &memoria_prefetch_entries,
+                                        Some(session_memory_entry),
+                                        selection_confidence,
+                                        task_type,
+                                    ),
+                                session:
+                                    crate::turn::llm::context::BridgeSessionContextInput::new(
+                                        &cache_cfg,
+                                        cache_capability,
+                                        &session_id,
+                                        &model_name,
+                                        &provider,
+                                        edge_profile.get("cwd").and_then(Value::as_str),
+                                        edge_profile.get("git_branch").and_then(Value::as_str),
+                                        project_context,
+                                    )
+                                    .with_skill_listing_block(
+                                        skill_listing_hint_text.as_deref().unwrap_or(""),
+                                    ),
+                            },
+                        )
+                    },
+                ) {
                     debug_assert_eq!(rerun.tier, pipeline_tier);
                     system_msg = rerun.primary_system;
                     dynamic_msg = rerun.dynamic_system;
