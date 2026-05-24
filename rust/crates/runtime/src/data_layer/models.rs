@@ -2,11 +2,11 @@ use astra_services::models::*;
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use astra_core::{ErrorResponse, error_response};
+use astra_core::{error_response, ErrorResponse};
 use axum::{
-    Json,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
+    Json,
 };
 
 pub async fn create_model_handler(
@@ -89,10 +89,14 @@ pub async fn get_memory_model_handler(
                 format!("Memory model resolution failed: {e}"),
             )
         })?;
-    let candidate_model_names = resolved
+    let candidate_model_names: Vec<String> = resolved
         .iter()
         .map(|model| model.model_name.clone())
-        .collect::<Vec<_>>();
+        .collect();
+    let candidate_thinking_capabilities: Vec<Option<String>> = resolved
+        .iter()
+        .map(|model| model.thinking_capability.map(|c| c.as_db_str().to_string()))
+        .collect();
     let model_name = candidate_model_names.first().cloned().ok_or_else(|| {
         error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -102,6 +106,7 @@ pub async fn get_memory_model_handler(
     Ok(Json(MemoryModelResponse {
         model_name,
         candidate_model_names,
+        candidate_thinking_capabilities,
     }))
 }
 
@@ -110,6 +115,8 @@ pub struct MemoryModelResponse {
     pub model_name: String,
     #[serde(default)]
     pub candidate_model_names: Vec<String>,
+    #[serde(default)]
+    pub candidate_thinking_capabilities: Vec<Option<String>>,
 }
 
 pub async fn update_model_handler(
