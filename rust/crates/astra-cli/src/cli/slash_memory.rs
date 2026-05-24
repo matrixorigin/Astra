@@ -46,14 +46,14 @@ fn parse_memory_forget_args(input: &str) -> Result<(String, String), String> {
     let mut parts = input.splitn(2, "--reason");
     let memory_id = parts.next().unwrap_or("").trim().to_string();
     if memory_id.is_empty() {
-        return Err("usage: /memory forget <memory_id> --reason TEXT".to_string());
+        return Err("usage: /memory forget <memory_id> [--reason TEXT]".to_string());
     }
     let reason = parts
         .next()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| "Error: /memory forget requires --reason for audit trail".to_string())?;
+        .unwrap_or_else(|| "user requested /memory forget".to_string());
     Ok((memory_id, reason))
 }
 
@@ -123,6 +123,42 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
                 "dismiss" if !sub_arg.is_empty() => {
+                    // If arg looks like a memory ID, dismiss directly.
+                    // Otherwise search and confirm interactively.
+                    if sub_arg.contains("mem-")
+                        || (sub_arg.len() < 64 && sub_arg.contains('-') && !sub_arg.contains(' '))
+                    {
+                        let memory_id = sub_arg.trim().to_string();
+                        eprintln!(
+                            "  {} Dismissing {}",
+                            "⋯".dim(),
+                            prefix_chars(&memory_id, 8).dim()
+                        );
+                        match super::edge_tools::memoria::memoria_feedback(
+                            &memory_id,
+                            "irrelevant",
+                            Some("user /memory dismiss"),
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                eprintln!(
+                                    "  {} dismissed: {}",
+                                    theme::icon_ok(),
+                                    prefix_chars(&memory_id, 8).dim()
+                                );
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "  {} failed to dismiss {}: {error}",
+                                    theme::icon_err(),
+                                    prefix_chars(&memory_id, 8).dim()
+                                );
+                            }
+                        }
+                        return Ok(());
+                    }
+                    // Search-based dismiss with interactive confirmation
                     let payload = serde_json::json!({
                         "query": sub_arg,
                         "top_k": MEMORY_DISMISS_TOP_K,
@@ -226,8 +262,8 @@ pub(super) async fn handle_memory_domain_command(
                         Err(e) => eprintln!("{}", format!("  ✗ Unreachable: {e}").red()),
                     }
                 }
-                // ─── Inspect one memory by id ──────────────────────
-                "show" | "inspect" if !sub_arg.is_empty() => {
+                // ─── Show one memory by id ──────────────────────
+                "show" if !sub_arg.is_empty() => {
                     let memory_id = sub_arg.trim();
                     match super::edge_tools::memoria::memoria_show(memory_id).await {
                         Ok(body) => print_memory_detail(&body),
@@ -477,7 +513,7 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
 
-                "stats" | "count" => {
+                "stats" => {
                     let payload = serde_json::json!({
                         "query": MEMORY_BROWSE_QUERY,
                         "top_k": MEMORY_STATS_TOP_K,
@@ -517,7 +553,7 @@ pub(super) async fn handle_memory_domain_command(
 fn print_memory_usage() {
     eprintln!("  {} /memory <subcommand>", "Usage:".dim());
     eprintln!();
-    eprintln!("  {}", "Browse".dim());
+    eprintln!("  {}", "View & Search".dim());
     eprintln!(
         "  {}",
         "    list                  List memories grouped by type".dim()
@@ -527,14 +563,9 @@ fn print_memory_usage() {
         "  {}",
         "    show <id>             Inspect one memory in detail".dim()
     );
-    eprintln!("  {}", "    inspect <id>          Alias for show".dim());
     eprintln!(
         "  {}",
         "    stats                 Count memories by type".dim()
-    );
-    eprintln!(
-        "  {}",
-        "    dismiss <query>       Mark memories as irrelevant".dim()
     );
     eprintln!("  {}", "    help                  Show this help".dim());
     eprintln!();
@@ -548,11 +579,17 @@ fn print_memory_usage() {
         "    edit <section>        Edit a session memory section".dim()
     );
     eprintln!();
-    eprintln!("  {}", "Manage".dim());
+    eprintln!("  {}", "Clean up".dim());
     eprintln!(
         "  {}",
-        "    forget <id> --reason  Permanently delete a memory".dim()
+        "    forget <id> [--reason] Permanently delete a memory".dim()
     );
+    eprintln!(
+        "  {}",
+        "    dismiss <id|query>    Mark memories as irrelevant".dim()
+    );
+    eprintln!();
+    eprintln!("  {}", "Snapshots".dim());
     eprintln!(
         "  {}",
         "    snapshot [name]       Create a memory checkpoint".dim()
@@ -1588,7 +1625,6 @@ mod tests {
             "list",
             "session",
             "edit",
-            "inspect",
             "help",
         ] {
             assert!(
@@ -1613,7 +1649,6 @@ mod tests {
             "reflect",
             "health",
             "session",
-            "inspect",
             "dismiss",
             "help",
         ] {
@@ -1673,9 +1708,17 @@ mod tests {
     }
 
     #[test]
-    fn memory_forget_requires_non_empty_reason() {
-        assert!(parse_memory_forget_args("mem-1").is_err());
-        assert!(parse_memory_forget_args("mem-1 --reason   ").is_err());
+    fn memory_forget_requires_non_empty_id() {
+        assert!(parse_memory_forget_args("").is_err());
+        // --reason is now optional; defaults to "user requested /memory forget"
+        let parsed = parse_memory_forget_args("mem-1").unwrap();
+        assert_eq!(parsed.0, "mem-1");
+        assert_eq!(parsed.1, "user requested /memory forget");
+        // empty --reason still uses default
+        let parsed = parse_memory_forget_args("mem-1 --reason   ").unwrap();
+        assert_eq!(parsed.0, "mem-1");
+        assert_eq!(parsed.1, "user requested /memory forget");
+        // explicit reason works
         let parsed = parse_memory_forget_args("mem-1 --reason duplicate stale memory").unwrap();
         assert_eq!(parsed.0, "mem-1");
         assert_eq!(parsed.1, "duplicate stale memory");
