@@ -605,9 +605,10 @@ fn normalize_goal_placeholder(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn is_empty_active_goal(value: &str) -> bool {
+pub fn is_effectively_empty_active_goal(value: &str) -> bool {
+    let normalized = normalize_goal_placeholder(value);
     matches!(
-        normalize_goal_placeholder(value).as_str(),
+        normalized.as_str(),
         "" | "none"
             | "n/a"
             | "na"
@@ -616,7 +617,9 @@ fn is_empty_active_goal(value: &str) -> bool {
             | "no explicit goals"
             | "no active goals"
             | "no explicit active goals captured"
-    )
+    ) || normalized.starts_with("none remaining")
+        || normalized == "task completed"
+        || normalized == "task complete"
 }
 
 fn seed_active_goal(narrative: &SessionNarrative) -> Option<String> {
@@ -626,13 +629,13 @@ fn seed_active_goal(narrative: &SessionNarrative) -> Option<String> {
     ]
     .into_iter()
     .map(single_line)
-    .find(|candidate| !candidate.is_empty() && !is_empty_active_goal(candidate))
+    .find(|candidate| !candidate.is_empty() && !is_effectively_empty_active_goal(candidate))
 }
 
 fn normalize_narrative(narrative: &mut SessionNarrative) {
     narrative
         .active_goals
-        .retain(|goal| !is_empty_active_goal(goal));
+        .retain(|goal| !is_effectively_empty_active_goal(goal));
     dedup_preserve_order(&mut narrative.active_goals);
     if narrative.active_goals.is_empty()
         && let Some(goal) = seed_active_goal(narrative)
@@ -2252,6 +2255,14 @@ review uncommitted changes
             snapshot.narrative.active_goals,
             vec!["review uncommitted changes".to_string()]
         );
+    }
+
+    #[test]
+    fn empty_active_goal_helper_treats_terminal_phrase_as_empty() {
+        assert!(is_effectively_empty_active_goal(
+            "None remaining; task completed."
+        ));
+        assert!(is_effectively_empty_active_goal("task completed"));
     }
 
     #[test]

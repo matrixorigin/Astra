@@ -534,10 +534,6 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
 
-                "help" if sub_arg.is_empty() => {
-                    print_memory_usage();
-                }
-
                 _ => {
                     print_memory_usage();
                 }
@@ -567,7 +563,6 @@ fn print_memory_usage() {
         "  {}",
         "    stats                 Count memories by type".dim()
     );
-    eprintln!("  {}", "    help                  Show this help".dim());
     eprintln!();
     eprintln!("  {}", "Session".dim());
     eprintln!(
@@ -892,7 +887,7 @@ async fn store_current_session_memory(
 /// Returns content between the header and the next `##` header (exclusive).
 fn extract_md_section(md: &str, section_name: &str) -> Option<String> {
     let (_, content_start, section_end) = find_md_section_bounds(md, section_name)?;
-    sanitize_md_section_content(&md[content_start..section_end])
+    sanitize_md_section_content(section_name, &md[content_start..section_end])
 }
 
 /// Replace (or append) a `## SectionName` block in a markdown string.
@@ -926,7 +921,7 @@ fn normalize_section_content(content: &str) -> String {
     }
 }
 
-fn sanitize_md_section_content(content: &str) -> Option<String> {
+fn sanitize_md_section_content(section_name: &str, content: &str) -> Option<String> {
     let section_body = content.trim();
     if section_body.is_empty()
         || (section_body.starts_with("<!--")
@@ -943,6 +938,21 @@ fn sanitize_md_section_content(content: &str) -> Option<String> {
     } else {
         section_body
     };
+    if section_name == "Active Goals" {
+        let lines: Vec<&str> = stripped
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .filter(|line| {
+                let semantic = line
+                    .trim_start_matches("- ")
+                    .trim_start_matches("* ")
+                    .trim();
+                !astra_runtime::session_memory::runner::is_effectively_empty_active_goal(semantic)
+            })
+            .collect();
+        return (!lines.is_empty()).then(|| lines.join("\n"));
+    }
     (!stripped.is_empty()).then(|| stripped.to_string())
 }
 
@@ -1564,6 +1574,17 @@ mod tests {
     }
 
     #[test]
+    fn format_session_memory_display_hides_completed_terminal_active_goal() {
+        let body =
+            "## Active Goals\n- None remaining; task completed.\n\n## Completed\n- Finished work\n";
+        let result = strip_ansi(&format_session_memory_display(body, None, None));
+        assert!(!result.contains("🎯 Active Goals"));
+        assert!(!result.contains("None remaining; task completed."));
+        assert!(result.contains("✅ Completed"));
+        assert!(result.contains("Finished work"));
+    }
+
+    #[test]
     fn select_session_memory_record_decodes_protocol_entry() {
         let payload = serde_json::json!({
             "memories": [
@@ -1625,7 +1646,6 @@ mod tests {
             "list",
             "session",
             "edit",
-            "help",
         ] {
             assert!(
                 prod.contains(&format!("\"{cmd}\"")),
@@ -1650,7 +1670,6 @@ mod tests {
             "health",
             "session",
             "dismiss",
-            "help",
         ] {
             assert!(
                 src.contains(&format!("  {cmd}")),
@@ -1762,6 +1781,13 @@ mod tests {
         let body = "## Active Goals\n<!-- Current goals explicitly stated by the user or assistant. Do NOT invent goals. -->\n- real goal\n\n## Pending Todos\n- real todo\n";
         let result = extract_md_section(body, "Active Goals").expect("section exists");
         assert_eq!(result, "- real goal");
+    }
+
+    #[test]
+    fn extract_md_section_treats_terminal_active_goal_phrase_as_empty() {
+        let body =
+            "## Active Goals\n- None remaining; task completed.\n\n## Completed\n- Finished work\n";
+        assert!(extract_md_section(body, "Active Goals").is_none());
     }
 
     #[test]
