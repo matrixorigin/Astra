@@ -135,6 +135,20 @@ pub(super) async fn handle_memory_domain_command(
                                 } else {
                                     use std::io::{IsTerminal, Write};
 
+                                    // Bail out *before* rendering candidates so
+                                    // scripted/CI runs don't see a misleading
+                                    // "we're about to dismiss these" preview
+                                    // followed by a refusal at the bottom.
+                                    if !std::io::stdin().is_terminal() {
+                                        eprintln!(
+                                            "  {} {}",
+                                            theme::icon_warn(),
+                                            "Cannot confirm /memory dismiss in non-interactive mode."
+                                                .yellow()
+                                        );
+                                        return Ok(());
+                                    }
+
                                     eprintln!();
                                     eprintln!(
                                         "  {} Dismiss the following memor{}?",
@@ -147,15 +161,6 @@ pub(super) async fn handle_memory_domain_command(
                                             candidate.preview,
                                             prefix_chars(&candidate.memory_id, 8).dim()
                                         );
-                                    }
-                                    if !std::io::stdin().is_terminal() {
-                                        eprintln!(
-                                            "  {} {}",
-                                            theme::icon_warn(),
-                                            "Cannot confirm /memory dismiss in non-interactive mode."
-                                                .yellow()
-                                        );
-                                        return Ok(());
                                     }
                                     eprint!("  Confirm [y/N]: ");
                                     let _ = std::io::stderr().flush();

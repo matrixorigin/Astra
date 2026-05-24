@@ -121,17 +121,58 @@ pub fn annotate_last_message_cache_breakpoint(messages: &mut [Value]) {
 /// Trailing `role=system` messages are intentionally skipped because their
 /// content changes every round (`Already Fetched`, working-set inventories,
 /// coaching pings) and would otherwise churn the deepest cache boundary.
+///
+/// Unmarkable tail messages are also skipped: `apply_cache_control_to_message`
+/// silently no-ops on tool messages with empty/object content or missing
+/// `tool_call_id`, which would leave the request with **zero** message-level
+/// markers. Walking back to the previous markable message preserves the
+/// breakpoint budget instead.
 fn find_message_cache_breakpoint_target(messages: &[Value]) -> Option<usize> {
     messages
         .iter()
         .enumerate()
         .rev()
         .find(|(_, m)| {
-            m.get("role")
+            let role_ok = m
+                .get("role")
                 .and_then(Value::as_str)
-                .is_some_and(|role| role != "system")
+                .is_some_and(|role| role != "system");
+            role_ok && is_markable(m)
         })
         .map(|(idx, _)| idx)
+}
+
+/// Whether `apply_cache_control_to_message` will actually attach a marker
+/// to this message. Mirrors the runtime checks in that function so we never
+/// pick a tail index that silently no-ops downstream.
+fn is_markable(msg: &Value) -> bool {
+    let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
+    let content = msg.get("content");
+    if role == "tool" {
+        // Array form is safe — we attach to the last block when present.
+        if let Some(arr) = content.and_then(Value::as_array) {
+            return !arr.is_empty();
+        }
+        // String form requires a non-empty tool_call_id to synthesize a
+        // tool_result block; without one we'd skip annotation.
+        if content.is_some_and(Value::is_string) {
+            return msg
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty());
+        }
+        // Any other shape (object, number, bool, null, missing) is dropped.
+        return false;
+    }
+    // user/assistant: string content always works (we upgrade to a text
+    // block); array content is fine if non-empty; anything else no-ops.
+    if content.is_some_and(Value::is_string) {
+        return true;
+    }
+    if let Some(arr) = content.and_then(Value::as_array) {
+        return !arr.is_empty();
+    }
+    false
 }
 
 /// Apply `cache_control: ephemeral` to a single message.
@@ -575,6 +616,29 @@ mod tests {
             "unsupported tool content shapes must stay unmarked instead of silently mutating"
         );
         assert_eq!(msgs[0]["content"], json!({"structured": true}));
+    }
+
+    #[test]
+    fn cache_breakpoint_walks_back_past_unmarkable_tail() {
+        // Tail is a tool message missing tool_call_id (unmarkable). The
+        // marker must land on the previous markable message instead of
+        // silently emitting zero markers — we still owe Anthropic exactly
+        // one message-level breakpoint.
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "q"}),
+            json!({"role": "assistant", "content": "a"}),
+            json!({"role": "tool", "content": "result"}),
+        ];
+        annotate_last_message_cache_breakpoint(&mut msgs);
+        assert!(
+            !message_has_cache_control(&msgs[3]),
+            "unmarkable tail stays untouched"
+        );
+        let arr = msgs[2]["content"]
+            .as_array()
+            .expect("assistant content upgraded to block array");
+        assert_eq!(arr[0]["cache_control"], json!({"type": "ephemeral"}));
     }
 
     /// Session c0905eab regression: runtime appends volatile signals

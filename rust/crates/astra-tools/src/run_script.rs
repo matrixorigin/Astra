@@ -510,7 +510,8 @@ def _call(tool_name, args):
     result = json.loads(raw)
     if result.get("error"):
         raise RuntimeError(result["error"])
-    return str(result.get("output") or "")
+    output = result.get("output")
+    return "" if output is None else str(output)
 
 "#,
     );
@@ -1821,7 +1822,11 @@ mod tests {
         let enabled: HashSet<String> = ["bash"].iter().map(|s| s.to_string()).collect();
         let stub = generate_python_stub(&enabled);
         assert!(!stub.contains("class ToolOutput("));
-        assert!(stub.contains("return str(result.get(\"output\") or \"\")"));
+        // Use an explicit None check so falsy non-None outputs (0, False,
+        // empty list/string) are preserved as their str() form instead of
+        // collapsing to "".
+        assert!(stub.contains("output = result.get(\"output\")"));
+        assert!(stub.contains("return \"\" if output is None else str(output)"));
     }
 
     #[test]

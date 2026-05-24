@@ -744,38 +744,71 @@ async fn purge_prior_session_memory_entries(
     memoria: &Arc<dyn MemoriaClient>,
     session_id: &str,
 ) -> Result<(), SessionMemoryExtractionErrorReason> {
-    let mut memories = memoria
-        .retrieve_ext(
-            &format!("{SESSION_MEMORY_PREFIX} {session_id} session memory"),
-            Some(session_id),
-            16,
-            true,
-        )
-        .await
-        .map_err(|_| SessionMemoryExtractionErrorReason::PurgeFailed)?;
-    let legacy_memories = memoria
-        .retrieve_ext(
-            &format!("{LEGACY_SESSION_MEMORY_PREFIX} {session_id} session memory"),
-            Some(session_id),
-            16,
-            true,
-        )
-        .await
-        .map_err(|_| SessionMemoryExtractionErrorReason::PurgeFailed)?;
-    memories.extend(legacy_memories);
+    // Loop until no decodable session-memory entries remain. A single
+    // top_k=16 query can leave duplicates behind when retries or scoring
+    // edge-cases push extras past the page boundary; the next write would
+    // see them rank ahead of the fresh entry. Cap iterations to avoid an
+    // infinite loop if `delete` is silently a no-op upstream.
+    const PAGE_SIZE: usize = 16;
+    const MAX_PAGES: usize = 8;
     let mut seen_memory_ids = std::collections::HashSet::new();
-    for memory_id in memories.iter().filter_map(|memory| {
-        (decode_session_memory_snapshot(&memory.content, session_id).is_some()
-            || decode_legacy_session_memory_entry(&memory.content, session_id).is_some())
-        .then_some(memory.memory_id.as_str())
-        .filter(|id| !id.is_empty() && seen_memory_ids.insert((*id).to_string()))
-    }) {
-        memoria
-            .delete(memory_id)
+    for _ in 0..MAX_PAGES {
+        let mut memories = memoria
+            .retrieve_ext(
+                &format!("{SESSION_MEMORY_PREFIX} {session_id} session memory"),
+                Some(session_id),
+                PAGE_SIZE,
+                true,
+            )
             .await
             .map_err(|_| SessionMemoryExtractionErrorReason::PurgeFailed)?;
+        let legacy_memories = memoria
+            .retrieve_ext(
+                &format!("{LEGACY_SESSION_MEMORY_PREFIX} {session_id} session memory"),
+                Some(session_id),
+                PAGE_SIZE,
+                true,
+            )
+            .await
+            .map_err(|_| SessionMemoryExtractionErrorReason::PurgeFailed)?;
+        memories.extend(legacy_memories);
+
+        let to_delete: Vec<String> = memories
+            .iter()
+            .filter(|memory| {
+                decode_session_memory_snapshot(&memory.content, session_id).is_some()
+                    || decode_legacy_session_memory_entry(&memory.content, session_id).is_some()
+            })
+            .filter_map(|memory| {
+                let id = memory.memory_id.as_str();
+                if id.is_empty() {
+                    return None;
+                }
+                if !seen_memory_ids.insert(id.to_string()) {
+                    return None;
+                }
+                Some(id.to_string())
+            })
+            .collect();
+
+        if to_delete.is_empty() {
+            return Ok(());
+        }
+        for id in &to_delete {
+            memoria
+                .delete(id)
+                .await
+                .map_err(|_| SessionMemoryExtractionErrorReason::PurgeFailed)?;
+        }
     }
-    Ok(())
+    tracing::warn!(
+        session_id = %session_id,
+        page_size = PAGE_SIZE,
+        max_pages = MAX_PAGES,
+        unique_candidates = seen_memory_ids.len(),
+        "session memory purge hit page cap before exhausting prior entries"
+    );
+    Err(SessionMemoryExtractionErrorReason::PurgeFailed)
 }
 
 fn build_rule_fallback_memory(
@@ -985,6 +1018,10 @@ mod tests {
         retrieve_results: Vec<MemoriaMemory>,
     }
 
+    struct OverflowingMemoria {
+        next_id: Mutex<usize>,
+    }
+
     #[async_trait::async_trait]
     impl MemoriaClient for CapturingMemoria {
         async fn retrieve_ext(
@@ -1081,6 +1118,52 @@ mod tests {
 
         async fn delete(&self, _memory_id: &str) -> Result<(), String> {
             Err("delete failed".to_string())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MemoriaClient for OverflowingMemoria {
+        async fn retrieve_ext(
+            &self,
+            query: &str,
+            _session_id: Option<&str>,
+            _top_k: usize,
+            _filter_session: bool,
+        ) -> Result<Vec<MemoriaMemory>, String> {
+            if query.starts_with(LEGACY_SESSION_MEMORY_PREFIX) {
+                return Ok(Vec::new());
+            }
+            let mut next_id = self.next_id.lock().unwrap();
+            let memory = MemoriaMemory {
+                memory_id: format!("mem-overflow-{}", *next_id),
+                content: encode_session_memory_entry(
+                    "sess-overflow",
+                    "# Session Memory\n\noverflow",
+                ),
+                memory_type: "working".to_string(),
+                session_id: Some("sess-overflow".to_string()),
+                ..Default::default()
+            };
+            *next_id += 1;
+            Ok(vec![memory])
+        }
+
+        async fn store(
+            &self,
+            _content: &str,
+            _memory_type: &str,
+            _session_id: Option<&str>,
+            _trust_tier: Option<&str>,
+        ) -> Result<String, String> {
+            Ok("mem-new".to_string())
+        }
+
+        async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
+            Ok(0)
+        }
+
+        async fn delete(&self, _memory_id: &str) -> Result<(), String> {
+            Ok(())
         }
     }
 
@@ -1509,6 +1592,42 @@ mod tests {
                 assert_eq!(llm_error_detail, None);
             }
             _ => panic!("expected purge failure"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_extraction_returns_purge_failed_when_prior_entries_exceed_page_cap() {
+        let memoria = Arc::new(OverflowingMemoria {
+            next_id: Mutex::new(0),
+        }) as Arc<dyn MemoriaClient>;
+        let artifacts = run_extraction(
+            &memoria,
+            "sess-overflow",
+            &sample_messages(),
+            3,
+            12_345,
+            "",
+            &SessionFacts::default(),
+            None,
+            Duration::from_secs(3),
+            256,
+        )
+        .await;
+
+        match artifacts {
+            ExtractionArtifacts::PersistFailed {
+                error_reason,
+                llm_error_reason,
+                llm_error_detail,
+            } => {
+                assert_eq!(
+                    error_reason,
+                    SessionMemoryExtractionErrorReason::PurgeFailed
+                );
+                assert_eq!(llm_error_reason, None);
+                assert_eq!(llm_error_detail, None);
+            }
+            _ => panic!("expected purge failure when page cap is exceeded"),
         }
     }
 

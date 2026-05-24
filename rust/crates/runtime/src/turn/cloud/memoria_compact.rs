@@ -975,22 +975,19 @@ fn build_memory_context(memories: &[MemoriaMemory], max_tokens: usize) -> String
     let mut parts = Vec::new();
     let mut total_tokens = 0;
     let mut seen_keys = std::collections::HashSet::new();
-    let mut seen_session_summaries = std::collections::HashSet::new();
 
     for mem in memories {
-        let rendered = if let Some(session_id) = mem.session_id.as_deref() {
+        // Session-memory entries are routed through the dedicated
+        // build_session_memory_context pipeline; skip them here so they
+        // don't double-render as historical memory context.
+        if let Some(session_id) = mem.session_id.as_deref() {
             if crate::session_memory::runner::decode_session_memory_entry(&mem.content, session_id)
                 .is_some()
             {
-                if !seen_session_summaries.insert(session_id.to_string()) {
-                    continue;
-                }
                 continue;
             }
-            mem.content.trim().to_string()
-        } else {
-            mem.content.trim().to_string()
-        };
+        }
+        let rendered = mem.content.trim().to_string();
         if !is_memory_context_worthy(&rendered) {
             continue;
         }

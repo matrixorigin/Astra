@@ -691,7 +691,8 @@ test-online:
 	DB_USER=$${MATRIXONE_USER:-root}; \
 	DB_PASS=$${MATRIXONE_PASSWORD:-111}; \
 	echo "Recreating test databases $$RUNTIME_IGNORED_DB and $$INTEGRATION_DB ..."; \
-	run_mysql_ddl() { mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$1"; }; \
+	# Args: $$1 = SQL to execute, $$2 (optional) = extra mysql flags (e.g. SSL disable).
+	run_mysql_ddl() { _sql=$$1; shift; mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$_sql"; }; \
 	mysql_ssl_disable_arg() { \
 		if mysql --no-defaults --skip-ssl --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --skip-ssl --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--skip-ssl"; \
 		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl=0 --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl=0"; \

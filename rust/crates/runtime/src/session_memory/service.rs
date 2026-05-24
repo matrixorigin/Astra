@@ -786,6 +786,15 @@ impl MemoryExtractionService {
                 if let Some(g) = probe_guard.take() {
                     g.record_success();
                 }
+                // LLM source proved this selector model is reachable; lift
+                // any sticky failure (including a terminal flag) so an
+                // operator who restored access mid-process doesn't have
+                // to restart to recover.
+                if matches!(source, SessionMemoryExtractionSource::Llm)
+                    && let Some(name) = attempted_selector_model.as_deref()
+                {
+                    self.health.clear(name);
+                }
                 self.broker.emit(BackgroundActivity::Finished {
                     session_id: session_id.clone(),
                     turn,
@@ -1034,8 +1043,9 @@ fn is_terminal_selector_failure(detail: Option<&str>) -> bool {
         return false;
     };
     let lower = detail.to_ascii_lowercase();
+    // "unsupported countries, regions, or territories" is a strict superset
+    // of "unsupported countries"; one substring suffices for both phrasings.
     lower.contains("access to anthropic models is not allowed")
-        || lower.contains("unsupported countries, regions, or territories")
         || lower.contains("unsupported countries")
 }
 

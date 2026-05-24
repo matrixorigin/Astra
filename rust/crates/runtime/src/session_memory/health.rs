@@ -86,6 +86,17 @@ impl SelectorHealth {
             );
         }
     }
+
+    /// Clear any prior failure (including terminal) for `model_name`. Call
+    /// this whenever the model has just produced a successful response so
+    /// operators can recover from a sticky terminal flag (e.g., region was
+    /// changed, account access was restored) without restarting the
+    /// process.
+    pub fn clear(&self, model_name: &str) {
+        if let Ok(mut map) = self.map.lock() {
+            map.remove(model_name);
+        }
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -408,6 +419,18 @@ mod tests {
         assert!(
             !h.is_healthy("m"),
             "terminal selector failures must stay unhealthy past the ordinary cooldown"
+        );
+    }
+
+    #[test]
+    fn clear_removes_terminal_flag() {
+        let h = SelectorHealth::new();
+        h.mark_terminal_failure("m");
+        assert!(!h.is_healthy("m"));
+        h.clear("m");
+        assert!(
+            h.is_healthy("m"),
+            "clear() must let a terminal model recover without process restart"
         );
     }
 
