@@ -11,8 +11,9 @@
 //!   (small turns) invisible — UX stays quiet when nothing interesting
 //!   happened.
 //! * `Finished{source=Llm}` events with `duration_ms > 500` print a
-//!   success line. `Finished{source=RuleFallback}` stays silent — the
-//!   fast path should never get a UI.
+//!   success line. `Finished{source=RuleFallback}` stays quiet for the
+//!   pure fast path, but if the LLM failed first we surface that the
+//!   fallback healed the session memory instead of leaving it stale.
 //! * `Errored` events always surface (memory is stale — user should
 //!   know). Sent through the existing `StatusLine` channel, which the
 //!   render policy draws below the prompt area.
@@ -31,6 +32,7 @@
 //! scope they want the bridge alive — typically one `stream_chat_sse`
 //! invocation.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -73,6 +75,7 @@ impl SessionMemoryUxBridge {
             // the matching "finished" event should also surface.
             let mut showed_started: bool = false;
             let mut started_deadline: Option<tokio::time::Instant> = None;
+            let mut errored_extractions: HashSet<(String, u32)> = HashSet::new();
 
             loop {
                 tokio::select! {
@@ -84,6 +87,7 @@ impl SessionMemoryUxBridge {
                                 &tx,
                                 &mut showed_started,
                                 &mut started_deadline,
+                                &mut errored_extractions,
                             ),
                             // Dropped events due to slow consumer. Keep
                             // the bridge alive — subsequent events still
@@ -100,6 +104,7 @@ impl SessionMemoryUxBridge {
                                 // Started events can still surface.
                                 showed_started = false;
                                 started_deadline = None;
+                                errored_extractions.clear();
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
@@ -143,19 +148,24 @@ fn handle_event(
     tx: &StreamEventTx,
     showed_started: &mut bool,
     started_deadline: &mut Option<tokio::time::Instant>,
+    errored_extractions: &mut HashSet<(String, u32)>,
 ) {
     match event {
-        BackgroundActivity::Started { .. } => {
+        BackgroundActivity::Started { session_id, turn } => {
             *showed_started = false;
             *started_deadline = Some(tokio::time::Instant::now() + STARTED_DEBOUNCE);
+            errored_extractions.remove(&(session_id, turn));
         }
         BackgroundActivity::Finished {
+            session_id,
+            turn,
             source,
             duration_ms,
             ..
         } => {
             // Cancel pending debounce: extraction is done.
             *started_deadline = None;
+            let key = (session_id, turn);
             match source {
                 SessionMemoryExtractionSource::Llm if duration_ms >= FINISHED_MIN_DURATION_MS => {
                     let _ = tx.send(StreamEvent::StatusLine(format!(
@@ -168,12 +178,20 @@ fn handle_event(
                     // showed Started. Stay quiet.
                 }
                 SessionMemoryExtractionSource::RuleFallback => {
-                    // Fast path; quiet.
+                    if errored_extractions.remove(&key) {
+                        let _ = tx.send(StreamEvent::StatusLine(format!(
+                            "💭 Session memory recovered via fallback ({}ms)",
+                            duration_ms
+                        )));
+                    }
                 }
             }
             *showed_started = false;
+            errored_extractions.remove(&key);
         }
         BackgroundActivity::Errored {
+            session_id,
+            turn,
             reason,
             duration_ms,
             ..
@@ -184,6 +202,7 @@ fn handle_event(
                 reason, duration_ms
             )));
             *showed_started = false;
+            errored_extractions.insert((session_id, turn));
         }
     }
 }
@@ -270,6 +289,73 @@ mod tests {
             lines.is_empty(),
             "rule-based finish should not surface a status line, got: {lines:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn llm_error_followed_by_fallback_surfaces_recovery() {
+        let (svc, broker) = build_service();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _bridge = SessionMemoryUxBridge::spawn(Some(&svc), Some(tx));
+
+        broker.emit(BackgroundActivity::Errored {
+            session_id: "s".into(),
+            turn: 1,
+            reason: SessionMemoryExtractionErrorReason::LlmError,
+            duration_ms: 1200,
+        });
+        broker.emit(BackgroundActivity::Finished {
+            session_id: "s".into(),
+            turn: 1,
+            source: SessionMemoryExtractionSource::RuleFallback,
+            duration_ms: 1210,
+        });
+
+        let lines = drain_status_lines(&mut rx).await;
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected error + recovery lines, got: {lines:?}"
+        );
+        assert!(lines[0].contains("failed") && lines[0].contains("LlmError"));
+        assert!(lines[1].contains("recovered via fallback"), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn fallback_recovery_state_is_isolated_per_session_and_turn() {
+        let (svc, broker) = build_service();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _bridge = SessionMemoryUxBridge::spawn(Some(&svc), Some(tx));
+
+        broker.emit(BackgroundActivity::Errored {
+            session_id: "session-a".into(),
+            turn: 1,
+            reason: SessionMemoryExtractionErrorReason::LlmError,
+            duration_ms: 1200,
+        });
+        broker.emit(BackgroundActivity::Finished {
+            session_id: "session-b".into(),
+            turn: 1,
+            source: SessionMemoryExtractionSource::RuleFallback,
+            duration_ms: 1210,
+        });
+        broker.emit(BackgroundActivity::Finished {
+            session_id: "session-a".into(),
+            turn: 1,
+            source: SessionMemoryExtractionSource::RuleFallback,
+            duration_ms: 1220,
+        });
+
+        let lines = drain_status_lines(&mut rx).await;
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected error + matching recovery only, got: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("failed") && lines[0].contains("LlmError"),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("recovered via fallback"), "{lines:?}");
     }
 
     #[tokio::test]

@@ -2889,24 +2889,33 @@ impl ToolExecutor {
                     .and_then(|m| m.get("reason"))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("-");
+                let source = meta
+                    .and_then(|m| m.get("source"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("-");
                 let model = meta
                     .and_then(|m| m.get("selector_model"))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("-");
+                let llm_reason = meta
+                    .and_then(|m| m.get("llm_reason"))
+                    .and_then(serde_json::Value::as_str);
                 let messages = meta
                     .and_then(|m| m.get("messages_count"))
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0);
-                writeln!(
-                    out,
-                    "- t{} {} reason={} model={} messages={}",
-                    event.turn.unwrap_or(0),
-                    outcome,
-                    reason,
-                    model,
-                    messages
-                )
-                .ok();
+                let mut line = format!("- t{} {}", event.turn.unwrap_or(0), outcome,);
+                if source != "-" {
+                    line.push_str(&format!(" source={source}"));
+                }
+                if reason != "-" {
+                    line.push_str(&format!(" reason={reason}"));
+                }
+                if let Some(llm_reason) = llm_reason {
+                    line.push_str(&format!(" llm_reason={llm_reason}"));
+                }
+                line.push_str(&format!(" model={model} messages={messages}"));
+                writeln!(out, "{line}").ok();
             }
             if extractions.len() > 8 {
                 writeln!(out, "… ({} older records elided)", extractions.len() - 8).ok();
@@ -5347,6 +5356,40 @@ mod tests {
             out.contains("last_turn_error: t2 [cancelled] user_interrupted"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn introspect_session_memory_journal_shows_fallback_recovery_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = "sess-introspect-fallback";
+        let writer = astra_services::session_journal::JournalWriter::new(session_id).unwrap();
+        let breadcrumbs = astra_services::session_journal::SessionMemoryExtractionBreadcrumbs {
+            messages_count: Some(7),
+            selector_model: Some("haiku".to_string()),
+            attempt: Some(1),
+            llm_reason: Some(
+                astra_services::session_journal::SessionMemoryExtractionErrorReason::LlmError,
+            ),
+        };
+        writer
+            .append(&astra_services::session_journal::JournalEvent::session_memory_extraction(
+                Some(session_id),
+                3,
+                180,
+                astra_services::session_journal::SessionMemoryExtractionOutcome::Extracted {
+                    source: astra_services::session_journal::SessionMemoryExtractionSource::RuleFallback,
+                    bytes_written: 42,
+                },
+                &breadcrumbs,
+            ))
+            .unwrap();
+
+        let executor = test_executor().with_active_session_id(session_id);
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        assert!(out.contains("extracted source=rule_fallback"), "{out}");
+        assert!(out.contains("llm_reason=llm_error"), "{out}");
+        assert!(out.contains("model=haiku"), "{out}");
     }
 
     #[test]

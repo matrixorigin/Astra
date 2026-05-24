@@ -664,35 +664,11 @@ impl MemoryExtractionService {
         }
 
         let selector_params = self.selector_resolver.resolve().await;
+        let resolved_selector_model = selector_params.as_ref().map(|p| p.model_name.clone());
         let selector_healthy = match selector_params.as_ref() {
             Some(p) => self.health.is_healthy(&p.model_name),
             None => false,
         };
-
-        if selector_params.is_some() && !selector_healthy {
-            let model_name = selector_params.as_ref().map(|p| p.model_name.clone());
-            let bc = SessionMemoryExtractionBreadcrumbs {
-                messages_count: Some(messages_count),
-                selector_model: model_name.clone(),
-                attempt: None,
-                llm_reason: None,
-            };
-            self.emit_skip_event(
-                Some(&session_id),
-                turn,
-                SessionMemoryExtractionSkipReason::SelectorCooldown,
-                &bc,
-            );
-            self.record_skipped(
-                Some(&session_id),
-                turn,
-                trigger,
-                "selector_cooldown",
-                model_name,
-            );
-            return;
-        }
-
         if selector_healthy && selector_params.is_some() {
             self.broker.emit(BackgroundActivity::Started {
                 session_id: session_id.clone(),
@@ -705,7 +681,7 @@ impl MemoryExtractionService {
         } else {
             None
         };
-        let params_for_health = effective_selector.as_ref().map(|p| p.model_name.clone());
+        let attempted_selector_model = effective_selector.as_ref().map(|p| p.model_name.clone());
 
         // Fetch current L1 so the extraction prompt can build on it.
         // Any retrieve failure (Memoria offline, auth) → treat as no
@@ -773,7 +749,7 @@ impl MemoryExtractionService {
         // Model name surfaced in events is what the worker actually
         // attempted — not what the resolver gave us, since LLM-path
         // source==Llm means the selector was both resolved and healthy.
-        let selector_model_used = params_for_health.clone();
+        let selector_model_used = attempted_selector_model.clone();
 
         match artifacts {
             ExtractionArtifacts::Persisted {
@@ -797,7 +773,9 @@ impl MemoryExtractionService {
                     messages_count: Some(messages_count),
                     selector_model: match source {
                         SessionMemoryExtractionSource::Llm => selector_model_used.clone(),
-                        SessionMemoryExtractionSource::RuleFallback => None,
+                        SessionMemoryExtractionSource::RuleFallback => {
+                            resolved_selector_model.clone()
+                        }
                     },
                     attempt: Some(store_attempt),
                     llm_reason: None,
@@ -817,7 +795,9 @@ impl MemoryExtractionService {
                     trigger,
                     match source {
                         SessionMemoryExtractionSource::Llm => selector_model_used.clone(),
-                        SessionMemoryExtractionSource::RuleFallback => None,
+                        SessionMemoryExtractionSource::RuleFallback => {
+                            resolved_selector_model.clone()
+                        }
                     },
                     ObsExtractionOutcome::Persisted {
                         source: source.into(),
@@ -835,7 +815,7 @@ impl MemoryExtractionService {
                 store_attempt,
                 content,
             } => {
-                if let Some(name) = params_for_health.as_deref() {
+                if let Some(name) = attempted_selector_model.as_deref() {
                     self.health.mark_failed(name);
                 }
                 // Memoria persist still succeeded on this branch, so
@@ -844,17 +824,30 @@ impl MemoryExtractionService {
                 if let Some(g) = probe_guard.take() {
                     g.record_success();
                 }
-                // LLM failed but rule-based content did land. Record
-                // both the error (for observability) and the write (so
-                // the broker reflects that memory is up-to-date, just
-                // via fallback).
+                // LLM failed but rule-based content did land. Surface
+                // the error live, but record the journal outcome as a
+                // successful fallback write so postmortems stop reading
+                // this branch as "nothing was persisted".
                 let bc = SessionMemoryExtractionBreadcrumbs {
                     messages_count: Some(messages_count),
                     selector_model: selector_model_used.clone(),
                     attempt: Some(store_attempt),
-                    llm_reason: None,
+                    llm_reason: Some(error_reason),
                 };
-                self.emit_error_event(Some(&session_id), turn, error_reason, duration_ms, &bc);
+                self.emit_success_event(
+                    Some(&session_id),
+                    turn,
+                    SessionMemoryExtractionSource::RuleFallback,
+                    bytes_written,
+                    duration_ms,
+                    &bc,
+                );
+                self.broker.emit(BackgroundActivity::Errored {
+                    session_id: session_id.clone(),
+                    turn,
+                    reason: error_reason,
+                    duration_ms,
+                });
                 self.broker.emit(BackgroundActivity::Finished {
                     session_id: session_id.clone(),
                     turn,
@@ -882,7 +875,7 @@ impl MemoryExtractionService {
                 llm_error_reason,
             } => {
                 if llm_error_reason.is_some()
-                    && let Some(name) = params_for_health.as_deref()
+                    && let Some(name) = attempted_selector_model.as_deref()
                 {
                     self.health.mark_failed(name);
                 }
@@ -1581,13 +1574,9 @@ mod tests {
 
     #[tokio::test]
     async fn selector_cooldown_fires_after_llm_failure() {
-        // This test exercises the health-map side of the service:
-        // after the runner reports an LLM error, `selector_healthy`
-        // should flip the next attempt into SelectorCooldown.
-        // Because we can't easily mock an LLM failure inline (runner
-        // hits real http), directly mark the selector unhealthy on the
-        // service's health map and verify maybe_spawn's next run emits
-        // the cooldown skip event.
+        // An unhealthy selector should no longer leave session memory
+        // empty. We degrade to the deterministic rule-fallback path and
+        // persist a working snapshot instead of skipping the whole run.
         let selector_params = LlmConnParams {
             base_url: "https://nope.invalid".to_string(),
             api_key: "k".to_string(),
@@ -1609,28 +1598,31 @@ mod tests {
         assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut saw_cooldown = false;
-        while Instant::now() < deadline && !saw_cooldown {
+        let mut saw_fallback_extract = false;
+        while Instant::now() < deadline && !saw_fallback_extract {
             while let Ok(evt) = rx.try_recv() {
                 if evt.event_type != "session_memory_extraction" {
                     continue;
                 }
                 let m = evt.metadata.as_ref().unwrap();
-                if m["outcome"] == "skipped" && m["reason"] == "selector_cooldown" {
-                    saw_cooldown = true;
+                if m["outcome"] == "extracted"
+                    && m["source"] == "rule_fallback"
+                    && m["selector_model"] == selector_params.model_name
+                {
+                    saw_fallback_extract = true;
                 }
             }
-            if !saw_cooldown {
+            if !saw_fallback_extract {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
         assert!(
-            saw_cooldown,
-            "unhealthy selector must emit skipped{{selector_cooldown}} event"
+            saw_fallback_extract,
+            "unhealthy selector must degrade to extracted{{source=rule_fallback}}"
         );
         assert!(
-            memoria.stored.lock().unwrap().is_empty(),
-            "cooldown must prevent any store"
+            !memoria.stored.lock().unwrap().is_empty(),
+            "cooldown must still persist fallback memory"
         );
     }
 
@@ -1866,19 +1858,13 @@ mod tests {
         );
     }
 
-    /// Regression for the probe-slot leak on the `selector_cooldown`
-    /// early-return inside `run_one`: if `admit()` returned
-    /// `HalfOpenProbe` (so `probe_in_flight = true`) and the worker
-    /// then bails because the LLM selector is cooling down, the
-    /// breaker must still release its probe slot so the next
-    /// eligible caller can perform the real recovery probe.
-    ///
-    /// Before the `ProbeGuard` RAII fix, the worker called only
-    /// `release_in_flight` on that branch — `probe_in_flight` stayed
-    /// true forever, `admit()` returned `Open` until process
-    /// restart.
+    /// Regression for the old `selector_cooldown` early-return inside
+    /// `run_one`: once the Memoria breaker admitted a half-open probe,
+    /// the degraded fallback path must still settle that probe
+    /// cleanly. A successful fallback write should close the breaker,
+    /// not leak the probe slot or leave it tripped.
     #[tokio::test]
-    async fn half_open_probe_released_when_run_one_bails_on_selector_cooldown() {
+    async fn half_open_probe_closes_when_selector_cooldown_falls_back() {
         // A successful-Memoria client so the trip below is exclusively
         // driven by `record_failure` we call directly (no network in
         // the test).
@@ -1913,8 +1899,8 @@ mod tests {
             "fixture pre-condition: breaker must be tripped"
         );
 
-        // 2. Mark the selector unhealthy so `run_one` will hit the
-        //    `selector_cooldown` branch.
+        // 2. Mark the selector unhealthy so `run_one` will degrade to
+        //    the rule-fallback path instead of attempting the LLM.
         svc.health.mark_failed(&selector_params.model_name);
 
         // 3. Wait past cooldown so the next `admit()` returns
@@ -1922,20 +1908,20 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(70)).await;
 
         // 4. Fire maybe_spawn. The sync path admits (HalfOpenProbe),
-        //    spawns run_one; run_one hits selector_cooldown early
-        //    return. ProbeGuard::drop must release the probe slot.
+        //    spawns run_one; run_one stores fallback memory and records
+        //    success, which should close the breaker.
         let sid = format!("probe-leak-{}", nanos());
         let req = sample_req(&sid, 20_000, false);
         assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
         svc.wait_for_pending(Duration::from_secs(2)).await;
 
-        // 5. Assertion: the breaker must be back to admitting a
-        //    probe — the slot was released, not consumed.
+        // 5. Assertion: the breaker must now be closed because the
+        //    fallback path succeeded through Memoria.
         let admit_after = svc.memoria_health.admit();
         assert_eq!(
             admit_after,
-            crate::session_memory::health::MemoriaAdmit::HalfOpenProbe,
-            "probe slot must be released after selector_cooldown early-return; got {admit_after:?}"
+            crate::session_memory::health::MemoriaAdmit::Closed,
+            "successful fallback during selector cooldown should close the breaker; got {admit_after:?}"
         );
     }
 

@@ -973,8 +973,9 @@ pub struct SessionMemoryExtractionBreadcrumbs {
     /// "why does this session have no L1" (possibly 0 messages).
     pub messages_count: Option<u32>,
     /// Selector model that was actually used (or would have been, if
-    /// the call failed before dispatch). Absent on pure-gate skips
-    /// and on rule-based fallbacks.
+    /// the call failed before dispatch). Absent on pure-gate skips and
+    /// on pure rule-based runs with no selector. Present on degraded
+    /// fallback writes when a selector existed but was unhealthy.
     pub selector_model: Option<String>,
     /// Final attempt count (1 = succeeded first try, 2 = recovered
     /// after one retry). Absent when no persist attempt occurred.
