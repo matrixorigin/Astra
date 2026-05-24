@@ -32,12 +32,14 @@ pub(crate) struct ListSelectionView {
 }
 
 impl ListSelectionView {
+    const DEFAULT_FOOTER_HINT: &str = "Type to filter | Enter to confirm | Esc to go back";
+
     pub fn new(items: Vec<SelectionItem>, header: Option<String>) -> Self {
         let initial_sel = items.iter().position(|i| i.is_current).unwrap_or(0);
         Self {
             items,
             header,
-            footer_hint: Some("Press enter to confirm or esc to go back".into()),
+            footer_hint: Some(Self::DEFAULT_FOOTER_HINT.into()),
             selected: initial_sel,
             filter: String::new(),
             completed: false,
@@ -248,5 +250,54 @@ impl BottomPaneView for ListSelectionView {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ListSelectionView, SelectionItem};
+    use crate::tui::bottom_pane::view::BottomPaneView;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn default_footer_explains_filtering() {
+        let view = ListSelectionView::new(vec![], Some("Pick one".into()));
+        assert_eq!(
+            view.footer_hint.as_deref(),
+            Some(ListSelectionView::DEFAULT_FOOTER_HINT)
+        );
+    }
+
+    #[test]
+    fn character_input_filters_candidates_before_accepting() {
+        let mut view = ListSelectionView::new(
+            vec![
+                SelectionItem {
+                    name: "deepseek-v4-flash".into(),
+                    description: None,
+                    is_current: false,
+                },
+                SelectionItem {
+                    name: "deepseek-v4-flash-anthropic".into(),
+                    description: None,
+                    is_current: false,
+                },
+            ],
+            Some("Select model".into()),
+        );
+
+        for ch in "-anthropic".chars() {
+            view.handle_key(key(KeyCode::Char(ch)));
+        }
+        view.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            view.accepted_name.as_deref(),
+            Some("deepseek-v4-flash-anthropic")
+        );
     }
 }

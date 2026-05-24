@@ -1,5 +1,10 @@
 use super::*;
 
+pub(crate) const MEMORY_BROWSE_QUERY: &str = "memory knowledge fact preference plan task note";
+pub(crate) const MEMORY_BROWSE_TOP_K: usize = 50;
+pub(crate) const MEMORY_STATS_TOP_K: usize = 200;
+const MEMORY_DISMISS_TOP_K: usize = 3;
+
 const SECTION_NAMES: &[&str] = &[
     "Active Goals",
     "Pending Todos",
@@ -24,6 +29,12 @@ const SECTION_DISPLAY_NAMES: &[(&str, &str)] = &[
 struct SessionMemoryRecord {
     memory_id: String,
     body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DismissCandidate {
+    memory_id: String,
+    preview: String,
 }
 
 fn parse_memory_forget_args(input: &str) -> Result<(String, String), String> {
@@ -86,8 +97,8 @@ pub(super) async fn handle_memory_domain_command(
                 }
                 _ if sub_arg.is_empty() && (subcmd == "list" || subcmd == "ls") => {
                     let payload = serde_json::json!({
-                        "query": "memory knowledge fact preference plan task note",
-                        "top_k": 50,
+                        "query": MEMORY_BROWSE_QUERY,
+                        "top_k": MEMORY_BROWSE_TOP_K,
                     });
                     match api.post_memory_search_json(tok, &payload).await {
                         Ok(r) if r.status().is_success() => {
@@ -107,42 +118,95 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
                 "dismiss" if !sub_arg.is_empty() => {
-                    // Search for matching memories, then send "irrelevant" feedback.
                     let payload = serde_json::json!({
                         "query": sub_arg,
-                        "top_k": 3,
+                        "top_k": MEMORY_DISMISS_TOP_K,
                     });
                     match api.post_memory_search_json(tok, &payload).await {
                         Ok(r) if r.status().is_success() => {
                             let body = r.text().await.unwrap_or_default();
                             if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&body) {
-                                if arr.is_empty() {
-                                    eprintln!("  {}", "No matching memories to dismiss.".dim());
+                                let candidates = collect_dismiss_candidates(&arr);
+                                if candidates.is_empty() {
+                                    eprintln!(
+                                        "  {}",
+                                        "No matching non-session memories to dismiss.".dim()
+                                    );
                                 } else {
+                                    use std::io::{IsTerminal, Write};
+
+                                    eprintln!();
+                                    eprintln!(
+                                        "  {} Dismiss the following memor{}?",
+                                        theme::icon_warn(),
+                                        if candidates.len() == 1 { "y" } else { "ies" }
+                                    );
+                                    for candidate in &candidates {
+                                        eprintln!(
+                                            "    • {}  {}",
+                                            candidate.preview,
+                                            prefix_chars(&candidate.memory_id, 8).dim()
+                                        );
+                                    }
+                                    if !std::io::stdin().is_terminal() {
+                                        eprintln!(
+                                            "  {} {}",
+                                            theme::icon_warn(),
+                                            "Cannot confirm /memory dismiss in non-interactive mode."
+                                                .yellow()
+                                        );
+                                        return Ok(());
+                                    }
+                                    eprint!("  Confirm [y/N]: ");
+                                    let _ = std::io::stderr().flush();
+                                    let mut answer = String::new();
+                                    if std::io::stdin().read_line(&mut answer).is_err()
+                                        || !answer.trim().eq_ignore_ascii_case("y")
+                                    {
+                                        eprintln!("  {}", "Cancelled.".dim());
+                                        return Ok(());
+                                    }
                                     let mut dismissed = 0u32;
-                                    for m in &arr {
-                                        let Some(mid) = m.get("memory_id").and_then(|v| v.as_str())
-                                        else {
-                                            continue;
-                                        };
-                                        let content = m
-                                            .get("content")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("?");
-                                        let preview: String = content.chars().take(60).collect();
-                                        let _ = super::edge_tools::memoria::memoria_feedback(
-                                            mid,
+                                    let mut failed = 0u32;
+                                    for candidate in candidates {
+                                        match super::edge_tools::memoria::memoria_feedback(
+                                            &candidate.memory_id,
                                             "irrelevant",
                                             Some("user /memory dismiss"),
                                         )
-                                        .await;
-                                        eprintln!("  {} dismissed: {preview}", theme::icon_err());
-                                        dismissed += 1;
+                                        .await
+                                        {
+                                            Ok(_) => {
+                                                eprintln!(
+                                                    "  {} dismissed: {}",
+                                                    theme::icon_ok(),
+                                                    candidate.preview
+                                                );
+                                                dismissed += 1;
+                                            }
+                                            Err(error) => {
+                                                eprintln!(
+                                                    "  {} failed to dismiss {}: {error}",
+                                                    theme::icon_err(),
+                                                    candidate.preview
+                                                );
+                                                failed += 1;
+                                            }
+                                        }
                                     }
-                                    eprintln!(
-                                        "  {} memories dismissed (retrieval score lowered)",
-                                        dismissed.to_string().magenta()
-                                    );
+                                    if dismissed > 0 {
+                                        eprintln!(
+                                            "  {} memories dismissed (retrieval score lowered)",
+                                            dismissed.to_string().magenta()
+                                        );
+                                    }
+                                    if failed > 0 {
+                                        eprintln!(
+                                            "  {} dismiss operation{} failed",
+                                            failed.to_string().yellow(),
+                                            if failed == 1 { "" } else { "s" }
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -166,7 +230,10 @@ pub(super) async fn handle_memory_domain_command(
                     let (memory_id, reason) = match parse_memory_forget_args(sub_arg) {
                         Ok(parsed) => parsed,
                         Err(msg) => {
-                            eprintln!("  {}", msg.yellow());
+                            eprintln!(
+                                "  {}",
+                                format!("Could not parse {sub_arg:?}. {msg}").yellow()
+                            );
                             return Ok(());
                         }
                     };
@@ -390,8 +457,8 @@ pub(super) async fn handle_memory_domain_command(
 
                 "stats" | "count" => {
                     let payload = serde_json::json!({
-                        "query": "memory knowledge fact preference plan task note",
-                        "top_k": 200,
+                        "query": MEMORY_BROWSE_QUERY,
+                        "top_k": MEMORY_STATS_TOP_K,
                     });
                     match api.post_memory_search_json(tok, &payload).await {
                         Ok(r) if r.status().is_success() => {
@@ -409,82 +476,12 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
 
+                "help" if sub_arg.is_empty() => {
+                    print_memory_usage();
+                }
+
                 _ => {
-                    eprintln!("  {} /memory <subcommand>", "Usage:".dim());
-                    eprintln!();
-                    eprintln!("  {}", "Browse".dim());
-                    eprintln!(
-                        "  {}",
-                        "    list                  List memories grouped by type".dim()
-                    );
-                    eprintln!("  {}", "    search <query>        Search by content".dim());
-                    eprintln!(
-                        "  {}",
-                        "    show <id>             Inspect one memory in detail".dim()
-                    );
-                    eprintln!("  {}", "    inspect <id>          Alias for show".dim());
-                    eprintln!(
-                        "  {}",
-                        "    stats                 Count memories by type".dim()
-                    );
-                    eprintln!(
-                        "  {}",
-                        "    dismiss <query>       Mark memories as irrelevant".dim()
-                    );
-                    eprintln!();
-                    eprintln!("  {}", "Session".dim());
-                    eprintln!(
-                        "  {}",
-                        "    session               Show current session memory".dim()
-                    );
-                    eprintln!(
-                        "  {}",
-                        "    edit <section>        Edit a session memory section".dim()
-                    );
-                    eprintln!();
-                    eprintln!("  {}", "Manage".dim());
-                    eprintln!(
-                        "  {}",
-                        "    forget <id> --reason  Permanently delete a memory".dim()
-                    );
-                    eprintln!(
-                        "  {}",
-                        "    snapshot [name]       Create a memory checkpoint".dim()
-                    );
-                    eprintln!(
-                        "  {}",
-                        "    rollback <name>       Restore to a checkpoint".dim()
-                    );
-                    eprintln!(
-                        "  {}",
-                        "    snapshots             List all checkpoints".dim()
-                    );
-                    eprintln!();
-                    eprintln!("  {}", "Branches".dim());
-                    eprintln!(
-                        "  {}",
-                        "    branch <name>         Create experiment branch".dim()
-                    );
-                    eprintln!("  {}", "    checkout <name>       Switch to a branch".dim());
-                    eprintln!(
-                        "  {}",
-                        "    merge <name>          Merge branch back into main".dim()
-                    );
-                    eprintln!(
-                        "  {}",
-                        "    diff <name>           Preview branch changes".dim()
-                    );
-                    eprintln!("  {}", "    branches              List all branches".dim());
-                    eprintln!();
-                    eprintln!("  {}", "Analysis".dim());
-                    eprintln!(
-                        "  {}",
-                        "    reflect               Analyze memory patterns".dim()
-                    );
-                    eprintln!(
-                        "  {}",
-                        "    health                Memory hygiene status".dim()
-                    );
+                    print_memory_usage();
                 }
             }
         }
@@ -495,14 +492,93 @@ pub(super) async fn handle_memory_domain_command(
     Ok(())
 }
 
+fn print_memory_usage() {
+    eprintln!("  {} /memory <subcommand>", "Usage:".dim());
+    eprintln!();
+    eprintln!("  {}", "Browse".dim());
+    eprintln!(
+        "  {}",
+        "    list                  List memories grouped by type".dim()
+    );
+    eprintln!("  {}", "    search <query>        Search by content".dim());
+    eprintln!(
+        "  {}",
+        "    show <id>             Inspect one memory in detail".dim()
+    );
+    eprintln!("  {}", "    inspect <id>          Alias for show".dim());
+    eprintln!(
+        "  {}",
+        "    stats                 Count memories by type".dim()
+    );
+    eprintln!(
+        "  {}",
+        "    dismiss <query>       Mark memories as irrelevant".dim()
+    );
+    eprintln!("  {}", "    help                  Show this help".dim());
+    eprintln!();
+    eprintln!("  {}", "Session".dim());
+    eprintln!(
+        "  {}",
+        "    session               Show current session memory".dim()
+    );
+    eprintln!(
+        "  {}",
+        "    edit <section>        Edit a session memory section".dim()
+    );
+    eprintln!();
+    eprintln!("  {}", "Manage".dim());
+    eprintln!(
+        "  {}",
+        "    forget <id> --reason  Permanently delete a memory".dim()
+    );
+    eprintln!(
+        "  {}",
+        "    snapshot [name]       Create a memory checkpoint".dim()
+    );
+    eprintln!(
+        "  {}",
+        "    rollback <name>       Restore to a checkpoint".dim()
+    );
+    eprintln!(
+        "  {}",
+        "    snapshots             List all checkpoints".dim()
+    );
+    eprintln!();
+    eprintln!("  {}", "Branches".dim());
+    eprintln!(
+        "  {}",
+        "    branch <name>         Create experiment branch".dim()
+    );
+    eprintln!("  {}", "    checkout <name>       Switch to a branch".dim());
+    eprintln!(
+        "  {}",
+        "    merge <name>          Merge branch back into main".dim()
+    );
+    eprintln!(
+        "  {}",
+        "    diff <name>           Preview branch changes".dim()
+    );
+    eprintln!("  {}", "    branches              List all branches".dim());
+    eprintln!();
+    eprintln!("  {}", "Analysis".dim());
+    eprintln!(
+        "  {}",
+        "    reflect               Analyze memory patterns".dim()
+    );
+    eprintln!(
+        "  {}",
+        "    health                Memory hygiene status".dim()
+    );
+}
+
 /// Format the session memory markdown body for human-readable terminal display.
 /// Pure function — no I/O, no API calls. Testable in isolation.
 pub(crate) fn format_session_memory_display(body: &str, session_id: Option<&str>) -> String {
     if body.trim().is_empty() {
         return format!(
             "  {}\n  {}\n",
-            "No session memory extracted yet.".dim(),
-            "Tip: /save triggers early extraction.".dim()
+            "No session memory yet.".dim(),
+            "Memory is captured automatically during the conversation. Use /save to capture the current context immediately.".dim()
         );
     }
 
@@ -749,6 +825,13 @@ pub(crate) fn is_session_proto(content: &str) -> bool {
     trimmed.starts_with("[@session/memory]") || trimmed.starts_with("[@session/active]")
 }
 
+pub(crate) fn memory_result_id(m: &serde_json::Value) -> Option<&str> {
+    m.get("id")
+        .or_else(|| m.get("memory_id"))
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.trim().is_empty())
+}
+
 /// Build a short one-line display string for a raw memory JSON object.
 pub(crate) fn format_memory_entry_line(m: &serde_json::Value) -> String {
     let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("?");
@@ -818,11 +901,7 @@ fn render_memory_list(arr: &[serde_json::Value]) {
             .dim()
         );
         for m in bucket {
-            let id = m
-                .get("id")
-                .or_else(|| m.get("memory_id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let id = memory_result_id(m).unwrap_or("");
             let short_id = prefix_chars(id, 8);
             eprintln!(
                 "  {}. {}  {}",
@@ -859,11 +938,7 @@ fn render_memory_search_results(arr: &[serde_json::Value], query: &str) {
         eprintln!("  {}", format!("No results for {query:?}").dim());
     } else {
         for (i, m) in visible.iter().enumerate() {
-            let id = m
-                .get("id")
-                .or_else(|| m.get("memory_id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let id = memory_result_id(m).unwrap_or("");
             let short_id = prefix_chars(id, 8);
             eprintln!(
                 "  {}. {}  {}",
@@ -884,11 +959,7 @@ fn render_memory_search_results(arr: &[serde_json::Value], query: &str) {
 /// Pretty-print a single memory for `/memory show`.
 fn print_memory_detail(body: &str) {
     if let Ok(m) = serde_json::from_str::<serde_json::Value>(body) {
-        let id = m
-            .get("memory_id")
-            .or_else(|| m.get("id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
+        let id = memory_result_id(&m).unwrap_or("?");
         let mtype = m.get("memory_type").and_then(|v| v.as_str()).unwrap_or("?");
         let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("?");
         let created = m.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
@@ -1210,6 +1281,21 @@ pub(crate) fn memory_stats_lines(arr: &[serde_json::Value]) -> Vec<String> {
     lines
 }
 
+fn collect_dismiss_candidates(arr: &[serde_json::Value]) -> Vec<DismissCandidate> {
+    arr.iter()
+        .filter_map(|memory| {
+            let content = memory.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if is_session_proto(content) {
+                return None;
+            }
+            Some(DismissCandidate {
+                memory_id: memory_result_id(memory)?.to_string(),
+                preview: format_memory_entry_line(memory),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1326,6 +1412,7 @@ mod tests {
             "session",
             "edit",
             "inspect",
+            "help",
         ] {
             assert!(
                 prod.contains(&format!("\"{cmd}\"")),
@@ -1350,6 +1437,8 @@ mod tests {
             "health",
             "session",
             "inspect",
+            "dismiss",
+            "help",
         ] {
             assert!(
                 src.contains(&format!("  {cmd}")),
@@ -1367,6 +1456,43 @@ mod tests {
         assert!(is_session_proto("[@session/memory] session_id=sess-1"));
         assert!(is_session_proto("[@session/active] Active session state"));
         assert!(!is_session_proto("[@fact/semantic] user prefers rust"));
+    }
+
+    #[test]
+    fn memory_result_id_accepts_id_and_memory_id_shapes() {
+        assert_eq!(
+            memory_result_id(&serde_json::json!({"id": "mem-1"})),
+            Some("mem-1")
+        );
+        assert_eq!(
+            memory_result_id(&serde_json::json!({"memory_id": "mem-2"})),
+            Some("mem-2")
+        );
+        assert_eq!(memory_result_id(&serde_json::json!({"id": ""})), None);
+    }
+
+    #[test]
+    fn collect_dismiss_candidates_skips_session_entries_and_keeps_search_ids() {
+        let arr = vec![
+            serde_json::json!({
+                "id": "mem-1",
+                "memory_type": "semantic",
+                "content": "Remember the auth cleanup plan"
+            }),
+            serde_json::json!({
+                "memory_id": "mem-2",
+                "memory_type": "working",
+                "content": "[@session/active] session state"
+            }),
+        ];
+        let candidates = collect_dismiss_candidates(&arr);
+        assert_eq!(
+            candidates,
+            vec![DismissCandidate {
+                memory_id: "mem-1".to_string(),
+                preview: "[semantic] Remember the auth cleanup plan".to_string(),
+            }]
+        );
     }
 
     #[test]

@@ -35,8 +35,8 @@ expression: "build_panels_cheat_sheet_lines().join(\"\\n\")"
       type to filter · Enter select · Esc close
 
   /memory [list|search <q>|show <id>|session|help]
-      browse memories in-panel; show/session/stats/edit fall back to the full command
-      ↑↓ navigate · Enter select · Esc close · other subcommands stay text-first
+      browse/search/stats in-panel; other subcommands stay text-first
+      ↑↓ navigate · Enter select · Esc close
 
   /session
       list, fork, history, analyze, or export sessions

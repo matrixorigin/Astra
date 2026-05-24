@@ -953,13 +953,13 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             let (query, top_k, stats_view) = match route {
                 MemoryCommandRoute::Search(query) => (query, 20, false),
                 MemoryCommandRoute::List => (
-                    "user preferences knowledge plans tasks".to_string(),
-                    20,
+                    crate::slash_memory::MEMORY_BROWSE_QUERY.to_string(),
+                    crate::slash_memory::MEMORY_BROWSE_TOP_K,
                     false,
                 ),
                 MemoryCommandRoute::Stats => (
-                    "memory knowledge fact preference plan task note".to_string(),
-                    200,
+                    crate::slash_memory::MEMORY_BROWSE_QUERY.to_string(),
+                    crate::slash_memory::MEMORY_STATS_TOP_K,
                     true,
                 ),
                 MemoryCommandRoute::Fallback => return SlashResult::Fallback,
@@ -1214,8 +1214,8 @@ pub(crate) fn build_panels_cheat_sheet_lines() -> Vec<String> {
         ),
         (
             "/memory [list|search <q>|show <id>|session|help]",
-            "browse memories in-panel; show/session/stats/edit fall back to the full command",
-            "↑↓ navigate · Enter select · Esc close · other subcommands stay text-first",
+            "browse/search/stats in-panel; other subcommands stay text-first",
+            "↑↓ navigate · Enter select · Esc close",
         ),
         (
             "/session",
@@ -2432,11 +2432,15 @@ pub(crate) const FORK_PICK_SENTINEL: &str = "__fork__\n";
 /// thinking modes.  Kept public(crate) so the mod.rs arm can
 /// strip it symmetrically with the other sentinels.
 pub(crate) const MODEL_PICK_SENTINEL: &str = "__model_pick__\n";
+pub(crate) const MODEL_PICKER_FOOTER_HINT: &str =
+    "Type to filter | Enter to choose | Some models then ask for thinking mode | Esc to go back";
 /// Sentinel prefix for the thinking-mode picker. Payload format is
 /// `__model_thinking__\n<base_model>\n<thinking_label>`.  The
 /// handler composes `base + thinking_suffix_for(label)` and sets
 /// `state.model`.
 pub(crate) const MODEL_THINKING_SENTINEL: &str = "__model_thinking__\n";
+pub(crate) const MODEL_THINKING_PICKER_FOOTER_HINT: &str =
+    "Type to filter | Enter to finish model selection | Esc to go back";
 
 /// `/model` with no args (or `list`) — fetch the catalog and push
 /// the picker.  The picker emits `MODEL_PICK_SENTINEL + <name>`; the
@@ -2476,6 +2480,7 @@ fn push_model_picker(ctx: &mut DispatchContext<'_>, models: Vec<String>) -> bool
         false
     } else {
         let view = ListSelectionView::new(items, Some("Select model:".into()))
+            .with_footer_hint(MODEL_PICKER_FOOTER_HINT)
             .with_result_prefix(MODEL_PICK_SENTINEL);
         ctx.bottom_pane.push_view(Box::new(view));
         true
@@ -3361,7 +3366,8 @@ mod panels_tests {
 #[cfg(test)]
 mod routing_tests {
     use super::{
-        CONTEXT_USAGE_MESSAGE, ConfigCommandRoute, MemoryCommandRoute, config_command_route,
+        CONTEXT_USAGE_MESSAGE, ConfigCommandRoute, MODEL_PICKER_FOOTER_HINT,
+        MODEL_THINKING_PICKER_FOOTER_HINT, MemoryCommandRoute, config_command_route,
         inspect_command_supported, memory_command_route,
     };
 
@@ -3387,6 +3393,12 @@ mod routing_tests {
     fn config_route_opens_panel_for_edit_forms() {
         assert_eq!(config_command_route(""), Ok(ConfigCommandRoute::Panel));
         assert_eq!(config_command_route("edit"), Ok(ConfigCommandRoute::Panel));
+    }
+
+    #[test]
+    fn model_picker_footer_warns_about_thinking_follow_up() {
+        assert!(MODEL_PICKER_FOOTER_HINT.contains("thinking mode"));
+        assert!(MODEL_THINKING_PICKER_FOOTER_HINT.contains("finish model selection"));
     }
 
     #[test]

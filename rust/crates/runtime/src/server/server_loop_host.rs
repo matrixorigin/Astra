@@ -2544,7 +2544,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &llm_cfg.provider,
             &llm_cfg.model_name,
             llm_cfg.cache_capability,
-            initial_session_memory_entry,
+            initial_session_memory_entry.clone(),
             &user_content,
         )?;
         let PipelineTurnOutcome {
@@ -2585,8 +2585,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &llm_cfg,
             )
             .await;
-        if let Some(rerun) = crate::turn::wire_assembly::rerun_with_session_memory_entry(
+        if let Some(rerun) = crate::turn::wire_assembly::rerun_with_distinct_session_memory_entry(
             compact_result.session_memory_context.as_deref(),
+            initial_session_memory_entry.as_ref(),
             state.session_turn,
             |session_memory_entry| {
                 self.run_turn_pipeline_with_cache_capability_and_session_memory(

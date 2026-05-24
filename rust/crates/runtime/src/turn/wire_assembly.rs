@@ -42,12 +42,19 @@ pub(crate) fn session_memory_entry_for_pipeline(
     )
 }
 
-pub(crate) fn rerun_with_session_memory_entry<T>(
+pub(crate) fn rerun_with_distinct_session_memory_entry<T>(
     content: Option<&str>,
+    existing: Option<&astra_turn_core::context_sources::MemoryEntry>,
     turn_number: u32,
     rerun: impl FnOnce(astra_turn_core::context_sources::MemoryEntry) -> T,
 ) -> Option<T> {
-    session_memory_entry_for_pipeline(content, turn_number).map(rerun)
+    let entry = session_memory_entry_for_pipeline(content, turn_number)?;
+    if existing.is_some_and(|current| {
+        current.content_hash == entry.content_hash && current.content == entry.content
+    }) {
+        return None;
+    }
+    Some(rerun(entry))
 }
 
 /// Session-level context that Memoria compaction needs. Bundled into one
@@ -702,6 +709,36 @@ mod tests {
         assert_eq!(merged.keep_recent_turns, 4);
         assert_eq!(merged.current_tokens, 8_888);
         assert_eq!(merged.tier, CompactionTier::AggressivePrune);
+    }
+
+    #[test]
+    fn rerun_with_distinct_session_memory_entry_skips_identical_content() {
+        let current = session_memory_entry_for_pipeline(Some("same memory"), 7)
+            .expect("current session memory entry");
+        let rerun = rerun_with_distinct_session_memory_entry(
+            Some("same memory"),
+            Some(&current),
+            7,
+            |_| panic!("identical content should not rerun"),
+        );
+        assert!(rerun.is_none());
+    }
+
+    #[test]
+    fn rerun_with_distinct_session_memory_entry_keeps_changed_content() {
+        let current = session_memory_entry_for_pipeline(Some("old memory"), 7)
+            .expect("current session memory entry");
+        let rerun = rerun_with_distinct_session_memory_entry(
+            Some("new memory"),
+            Some(&current),
+            7,
+            |entry| entry,
+        )
+        .expect("changed session memory should rerun");
+        assert_eq!(
+            rerun,
+            session_memory_entry_for_pipeline(Some("new memory"), 7).expect("rerun entry")
+        );
     }
 
     #[test]

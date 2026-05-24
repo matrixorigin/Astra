@@ -180,7 +180,7 @@ fn handle_event(
                 SessionMemoryExtractionSource::RuleFallback => {
                     if errored_extractions.remove(&key) {
                         let _ = tx.send(StreamEvent::StatusLine(format!(
-                            "💭 Session memory recovered via fallback ({}ms)",
+                            "💭 Session memory recovered after extraction failure ({}ms)",
                             duration_ms
                         )));
                     }

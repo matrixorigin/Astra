@@ -2674,6 +2674,9 @@ pub(crate) async fn run_tui_session(
                                                 items,
                                                 Some(format!("Select thinking mode for {base_model}:")),
                                             )
+                                            .with_footer_hint(
+                                                slash_dispatch::MODEL_THINKING_PICKER_FOOTER_HINT,
+                                            )
                                             .with_result_prefix(prefix);
                                             bottom_pane.push_view(Box::new(view));
                                         }

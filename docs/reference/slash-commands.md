@@ -196,7 +196,7 @@ Show the last delivery report from plan execution.
 
 ### `/memory [subcommand]`
 
-Memoria memory operations. In the TUI, `list` and `search` open the memory panel; richer subcommands stay text-first.
+Memoria memory operations. In the TUI, `list`, `search`, and `stats` open panels; `health` opens a read-only info pane; richer subcommands stay text-first.
 
 | Subcommand     | Description                          |
 | -------------- | ------------------------------------ |
@@ -205,12 +205,16 @@ Memoria memory operations. In the TUI, `list` and `search` open the memory panel
 | `show <id>`    | Inspect specific memory              |
 | `inspect <id>` | Alias for `show <id>`                |
 | `stats`        | Count memories by type               |
+| `dismiss <q>`  | Lower retrieval score for matches    |
+| `forget <id> --reason <text>` | Permanently delete a memory |
 | `session`      | Show current session memory          |
+| `health`       | Show memory hygiene status           |
 | `help`         | Show the full `/memory` help surface |
 
 ```
 /memory list                     # List all
 /memory search "auth pattern"    # Search memories
+/memory stats                    # Count memories by type
 /memory show mem_abc123          # Inspect by ID
 /memory session                  # Show current session memory
 ```
