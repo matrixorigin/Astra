@@ -440,6 +440,7 @@ mod tests {
                 content_preview: "prefers concise code".into(),
             }],
             total_tokens: 9100,
+            ..Default::default()
         };
         collector.record_system_prompt(breakdown);
         let trace = collector.finalize();

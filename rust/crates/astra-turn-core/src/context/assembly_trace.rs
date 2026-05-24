@@ -89,6 +89,9 @@ pub struct SystemPromptBreakdown {
     pub environment_tokens: u32,
     /// Repository memories injected.
     pub repository_memories: Vec<MemoryInjection>,
+    /// Current-session memory injected through the dedicated pipeline lane.
+    #[serde(default)]
+    pub session_memory_injected: Option<MemoryInjection>,
     /// User preferences/settings tokens.
     pub user_preferences_tokens: u32,
     /// Structured dynamic context signals present in the prompt.

@@ -90,6 +90,25 @@ fn estimate_json_chars(value: &Value) -> usize {
     }
 }
 
+fn session_memory_injection(
+    entry: Option<&astra_turn_core::context_sources::MemoryEntry>,
+) -> Option<astra_turn_core::context_assembly_trace::MemoryInjection> {
+    let entry = entry?;
+    if entry.content.trim().is_empty() {
+        return None;
+    }
+    Some(astra_turn_core::context_assembly_trace::MemoryInjection {
+        memory_id: "session-memory".into(),
+        memory_type: entry
+            .source
+            .clone()
+            .unwrap_or_else(|| "session_memory".into()),
+        tokens: (entry.content.chars().count() as u32 / 4).saturating_add(1),
+        relevance_score: 1.0,
+        content_preview: entry.content.chars().take(100).collect(),
+    })
+}
+
 /// Input for the shared context-pipeline assembly phase.
 ///
 /// This is intentionally still close to the current server/web host state so
@@ -811,6 +830,9 @@ pub(crate) fn assemble_context_pipeline(
     );
     let breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown {
         total_tokens: pipeline_output.metrics.sections,
+        session_memory_injected: session_memory_injection(
+            input.runtime_signals.session_memory_entry.as_ref(),
+        ),
         ..Default::default()
     };
 

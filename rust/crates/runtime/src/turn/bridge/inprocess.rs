@@ -2443,8 +2443,24 @@ impl InProcessChatTurnBridge {
                             }
                         })
                         .collect();
-                let breakdown =
-                    prompts::build_system_prompt_trace(&prompt_sections, skill_injections, memory_injections);
+                let session_memory_injection = initial_session_memory_entry.as_ref().map(|entry| {
+                    astra_turn_core::context_assembly_trace::MemoryInjection {
+                        memory_id: "session-memory".into(),
+                        memory_type: entry
+                            .source
+                            .clone()
+                            .unwrap_or_else(|| "session_memory".into()),
+                        tokens: prompts::estimate_str_tokens(&entry.content) as u32,
+                        relevance_score: 1.0,
+                        content_preview: entry.content.chars().take(100).collect(),
+                    }
+                });
+                let breakdown = prompts::build_system_prompt_trace(
+                    &prompt_sections,
+                    skill_injections,
+                    memory_injections,
+                    session_memory_injection,
+                );
 
                 if let Some(round_val) = e2e_round {
                     // E2E fixture path: apply cache annotations first so the
@@ -5024,7 +5040,7 @@ mod tests {
                 None,
                 None,
             );
-        let breakdown = prompts::build_system_prompt_trace(&prompt_sections, vec![], vec![]);
+        let breakdown = prompts::build_system_prompt_trace(&prompt_sections, vec![], vec![], None);
 
         assert!(breakdown.context_signals.active_output_skills);
         assert!(
@@ -5065,7 +5081,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let breakdown = prompts::build_system_prompt_trace(&[section], vec![], vec![]);
+        let breakdown = prompts::build_system_prompt_trace(&[section], vec![], vec![], None);
         assert!(!breakdown.context_signals.active_output_skills);
         assert!(breakdown.guidance_signals.round_budget_warning);
         assert!(breakdown.guidance_signals.synthesize_or_batch);

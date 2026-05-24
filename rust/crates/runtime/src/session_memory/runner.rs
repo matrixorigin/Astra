@@ -231,12 +231,14 @@ impl SessionMemorySnapshot {
 }
 
 /// What the worker produced.
-pub enum ExtractionArtifacts {
+pub(crate) enum ExtractionArtifacts {
     Persisted {
         source: SessionMemoryExtractionSource,
         bytes_written: u64,
         store_attempt: u32,
         content: String,
+        selector_model: Option<String>,
+        failed_candidates: Vec<LlmCandidateFailure>,
     },
     LlmFailedPersistedFallback {
         error_reason: SessionMemoryExtractionErrorReason,
@@ -244,11 +246,15 @@ pub enum ExtractionArtifacts {
         bytes_written: u64,
         store_attempt: u32,
         content: String,
+        selector_model: Option<String>,
+        failed_candidates: Vec<LlmCandidateFailure>,
     },
     PersistFailed {
         error_reason: SessionMemoryExtractionErrorReason,
         llm_error_reason: Option<SessionMemoryExtractionErrorReason>,
         llm_error_detail: Option<String>,
+        selector_model: Option<String>,
+        failed_candidates: Vec<LlmCandidateFailure>,
     },
 }
 
@@ -258,8 +264,15 @@ struct LlmExtractionFailure {
     detail: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LlmCandidateFailure {
+    pub(crate) model_name: String,
+    pub(crate) reason: SessionMemoryExtractionErrorReason,
+    pub(crate) detail: Option<String>,
+}
+
 #[allow(clippy::too_many_arguments)]
-pub async fn run_extraction(
+pub(crate) async fn run_extraction(
     memoria: &Arc<dyn MemoriaClient>,
     session_id: &str,
     messages: &[Value],
@@ -267,7 +280,7 @@ pub async fn run_extraction(
     current_tokens: usize,
     current_memory: &str,
     session_facts: &SessionFacts,
-    memory_model_params: Option<&LlmConnParams>,
+    memory_model_params: &[LlmConnParams],
     llm_timeout: Duration,
     max_output_tokens: usize,
 ) -> ExtractionArtifacts {
@@ -278,7 +291,7 @@ pub async fn run_extraction(
     };
     let fallback = build_rule_fallback_memory(&base_memory, messages, turn_number, current_tokens);
 
-    let Some(params) = memory_model_params else {
+    if memory_model_params.is_empty() {
         return match store_session_memory(
             memoria,
             session_id,
@@ -293,66 +306,93 @@ pub async fn run_extraction(
                 bytes_written,
                 store_attempt,
                 content: fallback,
+                selector_model: None,
+                failed_candidates: Vec::new(),
             },
             Err(error_reason) => ExtractionArtifacts::PersistFailed {
                 error_reason,
                 llm_error_reason: None,
                 llm_error_detail: None,
+                selector_model: None,
+                failed_candidates: Vec::new(),
             },
         };
-    };
+    }
 
-    match update_memory_with_llm(
-        &base_memory,
-        messages,
-        params,
-        llm_timeout,
-        max_output_tokens,
+    let mut failed_candidates = Vec::new();
+    for params in memory_model_params {
+        match update_memory_with_llm(
+            &base_memory,
+            messages,
+            params,
+            llm_timeout,
+            max_output_tokens,
+        )
+        .await
+        {
+            Ok(updated) => match store_session_memory(
+                memoria,
+                session_id,
+                turn_number as u32,
+                session_facts,
+                &updated,
+            )
+            .await
+            {
+                Ok((bytes_written, store_attempt)) => {
+                    return ExtractionArtifacts::Persisted {
+                        source: SessionMemoryExtractionSource::Llm,
+                        bytes_written,
+                        store_attempt,
+                        content: updated,
+                        selector_model: Some(params.model_name.clone()),
+                        failed_candidates,
+                    };
+                }
+                Err(error_reason) => {
+                    return ExtractionArtifacts::PersistFailed {
+                        error_reason,
+                        llm_error_reason: None,
+                        llm_error_detail: None,
+                        selector_model: Some(params.model_name.clone()),
+                        failed_candidates,
+                    };
+                }
+            },
+            Err(error) => failed_candidates.push(LlmCandidateFailure {
+                model_name: params.model_name.clone(),
+                reason: error.reason,
+                detail: error.detail,
+            }),
+        }
+    }
+
+    let last_failure = failed_candidates.last();
+    match store_session_memory(
+        memoria,
+        session_id,
+        turn_number as u32,
+        session_facts,
+        &fallback,
     )
     .await
     {
-        Ok(updated) => match store_session_memory(
-            memoria,
-            session_id,
-            turn_number as u32,
-            session_facts,
-            &updated,
-        )
-        .await
-        {
-            Ok((bytes_written, store_attempt)) => ExtractionArtifacts::Persisted {
-                source: SessionMemoryExtractionSource::Llm,
-                bytes_written,
-                store_attempt,
-                content: updated,
-            },
-            Err(error_reason) => ExtractionArtifacts::PersistFailed {
-                error_reason,
-                llm_error_reason: None,
-                llm_error_detail: None,
-            },
+        Ok((bytes_written, store_attempt)) => ExtractionArtifacts::LlmFailedPersistedFallback {
+            error_reason: last_failure
+                .map_or(SessionMemoryExtractionErrorReason::LlmError, |f| f.reason),
+            error_detail: last_failure.and_then(|f| f.detail.clone()),
+            bytes_written,
+            store_attempt,
+            content: fallback,
+            selector_model: last_failure.map(|f| f.model_name.clone()),
+            failed_candidates,
         },
-        Err(error_reason) => match store_session_memory(
-            memoria,
-            session_id,
-            turn_number as u32,
-            session_facts,
-            &fallback,
-        )
-        .await
-        {
-            Ok((bytes_written, store_attempt)) => ExtractionArtifacts::LlmFailedPersistedFallback {
-                error_reason: error_reason.reason,
-                error_detail: error_reason.detail,
-                bytes_written,
-                store_attempt,
-                content: fallback,
-            },
-            Err(store_error) => ExtractionArtifacts::PersistFailed {
-                error_reason: store_error,
-                llm_error_reason: Some(error_reason.reason),
-                llm_error_detail: error_reason.detail,
-            },
+        Err(store_error) => ExtractionArtifacts::PersistFailed {
+            error_reason: store_error,
+            llm_error_reason: last_failure.map(|f| f.reason),
+            llm_error_detail: last_failure.and_then(|f| f.detail.clone()),
+            selector_model: last_failure.map(|f| f.model_name.clone()),
+            failed_candidates,
         },
     }
 }
@@ -597,11 +637,15 @@ async fn update_memory_with_llm(
     llm_timeout: Duration,
     max_output_tokens: usize,
 ) -> Result<String, LlmExtractionFailure> {
+    let upstream_model_name = params
+        .wire_model_name
+        .as_deref()
+        .unwrap_or(&params.model_name);
     let prompt = build_extraction_prompt(current_memory, messages);
     let body = build_provider_request_body_with_overrides(
         &prompt,
         &[],
-        &params.model_name,
+        upstream_model_name,
         &params.provider,
         Some(max_output_tokens),
         Some(0.0),
@@ -612,7 +656,7 @@ async fn update_memory_with_llm(
     let url = llm_request_url_for_provider(
         &params.base_url,
         &params.provider,
-        &params.model_name,
+        upstream_model_name,
         false,
     );
     let request = global_llm_client()
@@ -839,8 +883,42 @@ fn build_rule_fallback_memory(
     let last_assistant =
         last_assistant_message(messages).unwrap_or_else(|| "No assistant summary yet.".to_string());
     let errors = collect_error_lines(messages);
+    let prior_snapshot = SessionMemorySnapshot::from_markdown(
+        "__fallback__",
+        current_memory,
+        0,
+        SessionFacts::default(),
+    );
+    let mut active_goals = prior_snapshot.narrative.active_goals;
+    active_goals.extend(recent_user_messages(messages, 3, 240));
+    dedup_preserve_order(&mut active_goals);
+    let mut pending_todos = prior_snapshot.narrative.pending_todos;
+    if pending_todos.is_empty() {
+        pending_todos.push(format!("Continue: {}", truncate(last_user, 180)));
+    }
+    let mut completed = prior_snapshot.narrative.completed;
+    if completed.is_empty() {
+        completed.push("Persisted a deterministic session-memory fallback snapshot.".to_string());
+    }
+    let mut current_state = prior_snapshot.narrative.current_state;
+    current_state.push(format!("Turn {turn_number}"));
+    current_state.push(format!("Approximate context size: {current_tokens} tokens"));
+    current_state.push(format!("Latest user focus: {}", truncate(last_user, 200)));
+    current_state.push(format!(
+        "Latest assistant state: {}",
+        truncate(&last_assistant, 200)
+    ));
+    dedup_preserve_order(&mut current_state);
     format!(
-        "# Session Memory\n\n## Session Title\n{first_user}\n\n## Active Goals\n- {last_user}\n\n## Pending Todos\n- Continue the current session task.\n\n## Completed\n- Session memory updated through rule fallback.\n\n## Current State\n- Turn {turn_number}\n- Approximate context size: {current_tokens} tokens\n- Latest assistant state: {last_assistant}\n\n## Task Specification\n{first_user}\n\n## Files and Functions\n{files}\n\n## Workflow\n{workflow}\n\n## Errors & Corrections\n{errors}\n\n## Learnings\n- Keep session memory synchronized when the session grows.\n\n## Worklog\n{worklog}",
+        "# Session Memory\n\n## Session Title\n{first_user}\n\n## Active Goals\n{active_goals}\n\n## Pending Todos\n{pending_todos}\n\n## Completed\n{completed}\n\n## Current State\n{current_state}\n\n## Task Specification\n{task_spec}\n\n## Files and Functions\n{files}\n\n## Workflow\n{workflow}\n\n## Errors & Corrections\n{errors}\n\n## Learnings\n{learnings}\n\n## Worklog\n{worklog}",
+        active_goals = render_list(&active_goals, &format!("- {}", truncate(last_user, 180))),
+        pending_todos = render_list(&pending_todos, "- Continue the current session task."),
+        completed = render_list(
+            &completed,
+            "- Persisted a deterministic session-memory fallback snapshot."
+        ),
+        current_state = render_list(&current_state, "- No current state recorded."),
+        task_spec = render_scalar(&prior_snapshot.narrative.task_spec, first_user),
         files = detect_file_mentions(messages),
         workflow = if recent.is_empty() {
             "- No recent conversation captured.".to_string()
@@ -860,6 +938,10 @@ fn build_rule_fallback_memory(
                 .collect::<Vec<_>>()
                 .join("\n")
         },
+        learnings = render_list(
+            &prior_snapshot.narrative.learnings,
+            "- Keep session memory synchronized when the session grows."
+        ),
         worklog = if current_memory.trim().is_empty() {
             "- Initialized session memory document.".to_string()
         } else {
@@ -909,6 +991,23 @@ fn last_user_message(messages: &[Value]) -> Option<&str> {
             .then(|| message_text(msg))
             .flatten()
     })
+}
+
+fn recent_user_messages(messages: &[Value], take: usize, max_len: usize) -> Vec<String> {
+    messages
+        .iter()
+        .rev()
+        .filter_map(|msg| {
+            (msg.get("role").and_then(Value::as_str) == Some("user"))
+                .then(|| message_text(msg))
+                .flatten()
+                .map(|text| truncate(text, max_len).to_string())
+        })
+        .take(take)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
 }
 
 fn last_assistant_message(messages: &[Value]) -> Option<String> {
@@ -1289,7 +1388,7 @@ mod tests {
             12_345,
             "",
             &SessionFacts::default(),
-            None,
+            &[],
             Duration::from_secs(3),
             256,
         )
@@ -1328,6 +1427,7 @@ mod tests {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
+            wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
             thinking_capability: None,
@@ -1340,7 +1440,7 @@ mod tests {
             20_000,
             "",
             &SessionFacts::default(),
-            Some(&params),
+            std::slice::from_ref(&params),
             Duration::from_secs(3),
             512,
         )
@@ -1365,6 +1465,7 @@ mod tests {
                 assert!(request.starts_with("POST /v1/messages HTTP/1.1"));
                 assert!(request.contains("x-api-key: anthropic-key"));
                 assert!(request.contains("anthropic-version: 2023-06-01"));
+                assert!(request.contains("\"model\":\"deepseek-v4-flash\""));
             }),
             json!({
                 "content": [
@@ -1378,7 +1479,8 @@ mod tests {
         let params = LlmConnParams {
             base_url: server_url,
             api_key: "anthropic-key".to_string(),
-            model_name: "selector-anthropic".to_string(),
+            model_name: "deepseek-v4-flash-anthropic".to_string(),
+            wire_model_name: Some("deepseek-v4-flash".to_string()),
             provider: "anthropic".to_string(),
             request_body_overrides: None,
             thinking_capability: None,
@@ -1391,7 +1493,7 @@ mod tests {
             20_000,
             "",
             &SessionFacts::default(),
-            Some(&params),
+            std::slice::from_ref(&params),
             Duration::from_secs(3),
             512,
         )
@@ -1430,6 +1532,7 @@ mod tests {
             base_url: server_url,
             api_key: "bedrock-key".to_string(),
             model_name: "anthropic.claude".to_string(),
+            wire_model_name: None,
             provider: "bedrock".to_string(),
             request_body_overrides: None,
             thinking_capability: None,
@@ -1442,7 +1545,7 @@ mod tests {
             20_000,
             "",
             &SessionFacts::default(),
-            Some(&params),
+            std::slice::from_ref(&params),
             Duration::from_secs(3),
             512,
         )
@@ -1478,6 +1581,7 @@ mod tests {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
+            wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
             thinking_capability: None,
@@ -1490,7 +1594,7 @@ mod tests {
             20_000,
             "",
             &SessionFacts::default(),
-            Some(&params),
+            std::slice::from_ref(&params),
             Duration::from_secs(3),
             512,
         )
@@ -1501,6 +1605,7 @@ mod tests {
                 error_reason,
                 llm_error_reason,
                 llm_error_detail,
+                ..
             } => {
                 assert_eq!(
                     error_reason,
@@ -1538,6 +1643,7 @@ mod tests {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
+            wire_model_name: None,
             provider: "openai".to_string(),
             request_body_overrides: None,
             thinking_capability: None,
@@ -1550,7 +1656,7 @@ mod tests {
             20_000,
             "",
             &SessionFacts::default(),
-            Some(&params),
+            std::slice::from_ref(&params),
             Duration::from_secs(3),
             512,
         )
@@ -1571,6 +1677,92 @@ mod tests {
             _ => panic!("expected llm-failed fallback persistence"),
         }
         server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_extraction_retries_later_selector_candidate_after_llm_failure() {
+        let (failing_url, failing_handle) = spawn_json_server_with_status(
+            Arc::new(|request: &str| {
+                assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+            }),
+            502,
+            "Bad Gateway",
+            json!({
+                "error": {
+                    "message": "selector one timed out"
+                }
+            }),
+        )
+        .await;
+        let (success_url, success_handle) = spawn_json_server(
+            Arc::new(|request: &str| {
+                assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+            }),
+            json!({
+                "choices": [{
+                    "message": {
+                        "content": "# Session Memory\n\n## Session Title\nRecovered on candidate two"
+                    }
+                }]
+            }),
+        )
+        .await;
+
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>;
+        let first = LlmConnParams {
+            base_url: format!("{failing_url}/v1"),
+            api_key: "test-key".to_string(),
+            model_name: "selector-openai-1".to_string(),
+            wire_model_name: None,
+            provider: "openai".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
+        };
+        let second = LlmConnParams {
+            base_url: format!("{success_url}/v1"),
+            api_key: "test-key".to_string(),
+            model_name: "selector-openai-2".to_string(),
+            wire_model_name: None,
+            provider: "openai".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
+        };
+        let artifacts = run_extraction(
+            &memoria,
+            "sess-retry",
+            &sample_messages(),
+            1,
+            20_000,
+            "",
+            &SessionFacts::default(),
+            &[first.clone(), second.clone()],
+            Duration::from_secs(3),
+            512,
+        )
+        .await;
+
+        match artifacts {
+            ExtractionArtifacts::Persisted {
+                source,
+                content,
+                selector_model,
+                failed_candidates,
+                ..
+            } => {
+                assert_eq!(source, SessionMemoryExtractionSource::Llm);
+                assert_eq!(selector_model.as_deref(), Some(second.model_name.as_str()));
+                assert!(content.contains("Recovered on candidate two"));
+                assert_eq!(failed_candidates.len(), 1);
+                assert_eq!(failed_candidates[0].model_name, first.model_name);
+                assert_eq!(
+                    failed_candidates[0].reason,
+                    SessionMemoryExtractionErrorReason::LlmError
+                );
+            }
+            _ => panic!("expected second selector candidate to recover"),
+        }
+        failing_handle.await.unwrap();
+        success_handle.await.unwrap();
     }
 
     #[tokio::test]
@@ -1602,7 +1794,7 @@ mod tests {
             12_345,
             "",
             &SessionFacts::default(),
-            None,
+            &[],
             Duration::from_secs(3),
             256,
         )
@@ -1643,7 +1835,7 @@ mod tests {
             12_345,
             "",
             &SessionFacts::default(),
-            None,
+            &[],
             Duration::from_secs(3),
             256,
         )
@@ -1654,6 +1846,7 @@ mod tests {
                 error_reason,
                 llm_error_reason,
                 llm_error_detail,
+                ..
             } => {
                 assert_eq!(
                     error_reason,
@@ -1679,7 +1872,7 @@ mod tests {
             12_345,
             "",
             &SessionFacts::default(),
-            None,
+            &[],
             Duration::from_secs(3),
             256,
         )
@@ -1690,6 +1883,7 @@ mod tests {
                 error_reason,
                 llm_error_reason,
                 llm_error_detail,
+                ..
             } => {
                 assert_eq!(
                     error_reason,
@@ -1717,7 +1911,7 @@ mod tests {
             12_345,
             "",
             &SessionFacts::default(),
-            None,
+            &[],
             Duration::from_secs(3),
             256,
         )

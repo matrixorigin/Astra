@@ -717,6 +717,7 @@ async fn maybe_load_memory_model_params(
                     base_url: format!("{}/v1", ctx.api.api_origin()),
                     api_key: token.to_string(),
                     model_name: response.model_name,
+                    wire_model_name: None,
                     provider: "openai".to_string(),
                     request_body_overrides: None,
                     thinking_capability: response

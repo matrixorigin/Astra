@@ -92,6 +92,7 @@ impl astra_runtime::session_memory::SelectorParamsResolver for CliSessionMemoryS
                     base_url: format!("{}/v1", self.api.api_origin()),
                     api_key: token.clone(),
                     model_name,
+                    wire_model_name: None,
                     provider: "openai".to_string(),
                     request_body_overrides: None,
                     thinking_capability: thinking_cap_str

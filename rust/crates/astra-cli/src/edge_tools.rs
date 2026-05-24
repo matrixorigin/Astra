@@ -2663,6 +2663,11 @@ impl ToolExecutor {
         use std::fmt::Write as _;
 
         let journal_fallback = self.render_session_memory_journal_fallback();
+        let journal_pipeline = self
+            .active_session_id()
+            .filter(|sid| !sid.is_empty())
+            .and_then(|sid| astra_services::session_journal::read_journal(&sid).ok())
+            .and_then(|events| Self::render_session_memory_pipeline_traces(&events));
         let Some(obs) = self.session_memory_observatory.as_ref() else {
             return journal_fallback.unwrap_or_else(|| {
                 "# session-memory observatory\n\n\
@@ -2779,6 +2784,10 @@ impl ToolExecutor {
             if inj.len() > 4 {
                 writeln!(out, "… ({} older records elided)", inj.len() - 4).ok();
             }
+        }
+
+        if let Some(pipeline) = journal_pipeline {
+            writeln!(out, "\n{pipeline}").ok();
         }
 
         out
@@ -2952,7 +2961,78 @@ impl ToolExecutor {
                 "\nnote: session_end is missing, so any shutdown-time session-memory flush did not run.\n",
             );
         }
+        if let Some(pipeline) = Self::render_session_memory_pipeline_traces(&events) {
+            writeln!(out, "\n{pipeline}").ok();
+        }
         Some(out)
+    }
+
+    fn render_session_memory_pipeline_traces(
+        events: &[astra_services::session_journal::JournalEvent],
+    ) -> Option<String> {
+        use std::fmt::Write as _;
+
+        let traces: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.event_type
+                    == astra_services::session_journal::JournalEventType::ContextAssemblyRecorded
+            })
+            .filter_map(Self::render_session_memory_pipeline_trace_line)
+            .collect();
+        if traces.is_empty() {
+            return None;
+        }
+
+        let mut out = String::from("## turn-pipeline session memory (newest last)\n");
+        let tail = traces.iter().rev().take(6).collect::<Vec<_>>();
+        for line in tail.into_iter().rev() {
+            writeln!(out, "{line}").ok();
+        }
+        if traces.len() > 6 {
+            writeln!(out, "… ({} older records elided)", traces.len() - 6).ok();
+        }
+        Some(out)
+    }
+
+    fn render_session_memory_pipeline_trace_line(
+        event: &astra_services::session_journal::JournalEvent,
+    ) -> Option<String> {
+        let trace = event.context_assembly_trace.as_ref()?;
+        let system_prompt = trace.get("system_prompt")?;
+        let session_memory = system_prompt.get("session_memory_injected");
+        let selected = trace
+            .get("memory")
+            .and_then(|memory| memory.get("memories_selected"))
+            .and_then(serde_json::Value::as_array)
+            .map(|entries| entries.len())
+            .unwrap_or(0);
+        let turn = event.turn.unwrap_or(0);
+
+        let Some(session_memory) = session_memory.filter(|value| !value.is_null()) else {
+            return Some(format!(
+                "- t{turn} session_memory=absent retrieved_memories={selected}"
+            ));
+        };
+
+        let source = session_memory
+            .get("memory_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        let tokens = session_memory
+            .get("tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let preview = session_memory
+            .get("content_preview")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .replace('\n', " ⏎ ");
+        let preview: String = preview.chars().take(80).collect();
+
+        Some(format!(
+            "- t{turn} session_memory=present source={source} tokens={tokens} retrieved_memories={selected} preview=\"{preview}\""
+        ))
     }
 
     /// `introspect(subtopic="cache")` — scan recent `llm_capture_*.json`
@@ -5402,6 +5482,49 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("model=haiku"), "{out}");
+    }
+
+    #[test]
+    fn introspect_session_memory_journal_surfaces_turn_pipeline_injection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = "sess-introspect-pipeline";
+        let writer = astra_services::session_journal::JournalWriter::new(session_id).unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::context_assembly_recorded(
+                    Some(session_id),
+                    4,
+                    serde_json::json!({
+                        "system_prompt": {
+                            "session_memory_injected": {
+                                "memory_id": "session-memory",
+                                "memory_type": "session_memory_llm",
+                                "tokens": 27,
+                                "relevance_score": 1.0,
+                                "content_preview": "Session memory injected into current turn"
+                            }
+                        },
+                        "memory": {
+                            "memories_selected": [
+                                {"memory_id": "old-1"},
+                                {"memory_id": "old-2"}
+                            ]
+                        }
+                    }),
+                ),
+            )
+            .unwrap();
+
+        let executor = test_executor().with_active_session_id(session_id);
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        assert!(out.contains("## turn-pipeline session memory"), "{out}");
+        assert!(
+            out.contains(
+                "t4 session_memory=present source=session_memory_llm tokens=27 retrieved_memories=2"
+            ),
+            "{out}"
+        );
     }
 
     #[test]

@@ -1237,6 +1237,7 @@ pub fn build_system_prompt_trace(
     sections: &[PromptSection],
     skills_injected: Vec<SkillInjection>,
     repository_memories: Vec<MemoryInjection>,
+    session_memory_injected: Option<MemoryInjection>,
 ) -> SystemPromptBreakdown {
     let mut base_persona_tokens = 0u32;
     let mut environment_tokens = 0u32;
@@ -1286,13 +1287,18 @@ pub fn build_system_prompt_trace(
 
     // Add memory tokens
     let memory_tokens: u32 = repository_memories.iter().map(|m| m.tokens).sum();
-    total_tokens += memory_tokens;
+    total_tokens += memory_tokens
+        + session_memory_injected
+            .as_ref()
+            .map(|memory| memory.tokens)
+            .unwrap_or(0);
 
     SystemPromptBreakdown {
         base_persona_tokens,
         skills_injected,
         environment_tokens,
         repository_memories,
+        session_memory_injected,
         user_preferences_tokens,
         context_signals,
         guidance_signals,
@@ -2836,7 +2842,7 @@ mod tests {
             relevance_score: 0.95,
             content_preview: "user prefers rust".into(),
         }];
-        let bd = build_system_prompt_trace(&sections, skills, memories);
+        let bd = build_system_prompt_trace(&sections, skills, memories, None);
 
         assert!(
             bd.base_persona_tokens > 0,
@@ -2854,7 +2860,7 @@ mod tests {
     #[test]
     fn build_system_prompt_trace_empty_skills_and_memories() {
         let sections = build_system_prompt_sections(&["bash"], "", 0.5, None);
-        let bd = build_system_prompt_trace(&sections, vec![], vec![]);
+        let bd = build_system_prompt_trace(&sections, vec![], vec![], None);
 
         assert!(bd.base_persona_tokens > 0);
         assert!(bd.skills_injected.is_empty());
@@ -2866,10 +2872,39 @@ mod tests {
     }
 
     #[test]
+    fn build_system_prompt_trace_records_session_memory_injection() {
+        let sections = build_system_prompt_sections(&["bash"], "", 0.5, None);
+        let injected = MemoryInjection {
+            memory_id: "session-memory".into(),
+            memory_type: "session_memory_llm".into(),
+            tokens: 37,
+            relevance_score: 1.0,
+            content_preview: "Current session is debugging session memory".into(),
+        };
+
+        let bd = build_system_prompt_trace(&sections, vec![], vec![], Some(injected.clone()));
+
+        let recorded = bd
+            .session_memory_injected
+            .as_ref()
+            .expect("session memory should be recorded");
+        assert_eq!(recorded.memory_id, injected.memory_id);
+        assert_eq!(recorded.memory_type, injected.memory_type);
+        assert_eq!(recorded.tokens, injected.tokens);
+        assert!(
+            bd.total_tokens
+                >= bd.base_persona_tokens
+                    + bd.environment_tokens
+                    + bd.user_preferences_tokens
+                    + injected.tokens
+        );
+    }
+
+    #[test]
     fn default_persona_budget_stays_bounded() {
         let sections =
             build_system_prompt_sections(&["bash", "glob", "grep", "read_file"], "", 0.5, None);
-        let bd = build_system_prompt_trace(&sections, vec![], vec![]);
+        let bd = build_system_prompt_trace(&sections, vec![], vec![], None);
 
         assert!(
             bd.base_persona_tokens <= 3600,
@@ -2954,7 +2989,7 @@ mod tests {
             ),
         ];
 
-        let breakdown = build_system_prompt_trace(&sections, vec![], vec![]);
+        let breakdown = build_system_prompt_trace(&sections, vec![], vec![], None);
         // Budget signals are always false now (circuit breaker replaces them).
         assert!(!breakdown.guidance_signals.round_budget_warning);
         assert!(!breakdown.guidance_signals.synthesize_or_batch);
@@ -3070,7 +3105,7 @@ mod tests {
             }),
         ];
 
-        let breakdown = build_system_prompt_trace(&sections, vec![], vec![]);
+        let breakdown = build_system_prompt_trace(&sections, vec![], vec![], None);
         assert!(breakdown.context_signals.active_output_skills);
         assert!(breakdown.context_signals.memory_signal_detected);
         assert!(!breakdown.context_signals.system_prompt_override);
@@ -3095,7 +3130,7 @@ mod tests {
             ),
         ];
 
-        let breakdown = build_system_prompt_trace(&sections, vec![], vec![]);
+        let breakdown = build_system_prompt_trace(&sections, vec![], vec![], None);
 
         assert_eq!(
             breakdown.base_persona_tokens,
@@ -3121,6 +3156,7 @@ mod tests {
             )],
             vec![],
             vec![],
+            None,
         );
 
         assert!(!breakdown.context_signals.system_prompt_override);
@@ -3145,6 +3181,7 @@ mod tests {
             ],
             vec![],
             vec![],
+            None,
         );
 
         assert!(breakdown.context_signals.system_prompt_override);

@@ -30,6 +30,7 @@ fn sample_trace(turn: &str, total_used: u32, history: u32, pressure: f64) -> Con
                 content_preview: "Use JWT for auth".to_string(),
             }],
             total_tokens: 1250,
+            ..Default::default()
         },
         history: HistorySelectionTrace {
             total_turns_available: 5,

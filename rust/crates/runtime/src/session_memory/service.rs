@@ -445,7 +445,7 @@ impl MemoryExtractionService {
         // both evaluate a stale pre-extraction state and the second can
         // spawn after the first worker has already completed.
         let admission = {
-            let mut map = match self.session_states.lock() {
+            let map = match self.session_states.lock() {
                 Ok(m) => m,
                 Err(p) => p.into_inner(),
             };
@@ -518,8 +518,6 @@ impl MemoryExtractionService {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if set.insert(req.session_id.clone()) {
-                            let entry = map.entry(req.session_id.clone()).or_default();
-                            entry.mark_extracted(req.current_tokens, req.current_tool_calls);
                             Admission::Spawn {
                                 trigger: trig,
                                 memoria_admit,
@@ -672,10 +670,11 @@ impl MemoryExtractionService {
         let resolved_selector_model = selector_candidates
             .first()
             .map(|candidate| candidate.model_name.clone());
-        let effective_selector = selector_candidates
+        let effective_selectors: Vec<LlmConnParams> = selector_candidates
             .into_iter()
-            .find(|candidate| self.health.is_healthy(&candidate.model_name));
-        if resolved_selector_model.is_some() && effective_selector.is_none() {
+            .filter(|candidate| self.health.is_healthy(&candidate.model_name))
+            .collect();
+        if resolved_selector_model.is_some() && effective_selectors.is_empty() {
             let cooldown_breadcrumbs = SessionMemoryExtractionBreadcrumbs {
                 messages_count: Some(messages_count),
                 selector_model: resolved_selector_model.clone(),
@@ -697,13 +696,12 @@ impl MemoryExtractionService {
                 resolved_selector_model.clone(),
             );
         }
-        if effective_selector.is_some() {
+        if !effective_selectors.is_empty() {
             self.broker.emit(BackgroundActivity::Started {
                 session_id: session_id.clone(),
                 turn,
             });
         }
-        let attempted_selector_model = effective_selector.as_ref().map(|p| p.model_name.clone());
 
         // Fetch current L1 so the extraction prompt can build on it.
         // Any retrieve failure (Memoria offline, auth) → treat as no
@@ -718,7 +716,7 @@ impl MemoryExtractionService {
             req.current_tokens,
             &current_memory,
             &req.session_facts,
-            effective_selector.as_ref(),
+            &effective_selectors,
             LLM_TIMEOUT,
             EXTRACTION_MAX_OUTPUT_TOKENS,
         )
@@ -769,18 +767,16 @@ impl MemoryExtractionService {
             );
         }
 
-        // Model name surfaced in events is what the worker actually
-        // attempted — not what the resolver gave us, since LLM-path
-        // source==Llm means the selector was both resolved and healthy.
-        let selector_model_used = attempted_selector_model.clone();
-
         match artifacts {
             ExtractionArtifacts::Persisted {
                 source,
                 bytes_written,
                 store_attempt,
                 content,
+                selector_model,
+                failed_candidates,
             } => {
+                self.record_selector_failures(&failed_candidates);
                 // Memoria accepted a write → breaker closes (or stays
                 // closed) and the consecutive-failure counter resets.
                 if let Some(g) = probe_guard.take() {
@@ -791,10 +787,15 @@ impl MemoryExtractionService {
                 // operator who restored access mid-process doesn't have
                 // to restart to recover.
                 if matches!(source, SessionMemoryExtractionSource::Llm)
-                    && let Some(name) = attempted_selector_model.as_deref()
+                    && let Some(name) = selector_model.as_deref()
                 {
                     self.health.clear(name);
                 }
+                self.mark_session_extracted(
+                    &session_id,
+                    req.current_tokens,
+                    req.current_tool_calls,
+                );
                 self.broker.emit(BackgroundActivity::Finished {
                     session_id: session_id.clone(),
                     turn,
@@ -804,10 +805,10 @@ impl MemoryExtractionService {
                 let bc = SessionMemoryExtractionBreadcrumbs {
                     messages_count: Some(messages_count),
                     selector_model: match source {
-                        SessionMemoryExtractionSource::Llm => selector_model_used.clone(),
-                        SessionMemoryExtractionSource::RuleFallback => {
-                            resolved_selector_model.clone()
-                        }
+                        SessionMemoryExtractionSource::Llm => selector_model.clone(),
+                        SessionMemoryExtractionSource::RuleFallback => selector_model
+                            .clone()
+                            .or_else(|| resolved_selector_model.clone()),
                     },
                     attempt: Some(store_attempt),
                     llm_reason: None,
@@ -827,10 +828,10 @@ impl MemoryExtractionService {
                     turn,
                     trigger,
                     match source {
-                        SessionMemoryExtractionSource::Llm => selector_model_used.clone(),
-                        SessionMemoryExtractionSource::RuleFallback => {
-                            resolved_selector_model.clone()
-                        }
+                        SessionMemoryExtractionSource::Llm => selector_model.clone(),
+                        SessionMemoryExtractionSource::RuleFallback => selector_model
+                            .clone()
+                            .or_else(|| resolved_selector_model.clone()),
                     },
                     ObsExtractionOutcome::Persisted {
                         source: source.into(),
@@ -848,23 +849,28 @@ impl MemoryExtractionService {
                 bytes_written,
                 store_attempt,
                 content,
+                selector_model,
+                failed_candidates,
             } => {
-                if let Some(name) = attempted_selector_model.as_deref() {
-                    self.record_selector_failure(name, error_detail.as_deref());
-                }
+                self.record_selector_failures(&failed_candidates);
                 // Memoria persist still succeeded on this branch, so
                 // the circuit breaker resets. Only the LLM selector
                 // model is marked unhealthy.
                 if let Some(g) = probe_guard.take() {
                     g.record_success();
                 }
+                self.mark_session_extracted(
+                    &session_id,
+                    req.current_tokens,
+                    req.current_tool_calls,
+                );
                 // LLM failed but rule-based content did land. Surface
                 // the error live, but record the journal outcome as a
                 // successful fallback write so postmortems stop reading
                 // this branch as "nothing was persisted".
                 let bc = SessionMemoryExtractionBreadcrumbs {
                     messages_count: Some(messages_count),
-                    selector_model: selector_model_used.clone(),
+                    selector_model: selector_model.clone(),
                     attempt: Some(store_attempt),
                     llm_reason: Some(error_reason),
                     llm_detail: error_detail.clone(),
@@ -895,7 +901,7 @@ impl MemoryExtractionService {
                     &session_id,
                     turn,
                     trigger,
-                    selector_model_used.clone(),
+                    selector_model.clone(),
                     ObsExtractionOutcome::LlmFailedFallbackPersisted {
                         reason: error_reason.into(),
                         bytes_written,
@@ -910,12 +916,10 @@ impl MemoryExtractionService {
                 error_reason,
                 llm_error_reason,
                 llm_error_detail,
+                selector_model,
+                failed_candidates,
             } => {
-                if llm_error_reason.is_some()
-                    && let Some(name) = attempted_selector_model.as_deref()
-                {
-                    self.record_selector_failure(name, llm_error_detail.as_deref());
-                }
+                self.record_selector_failures(&failed_candidates);
                 // Memoria persist failed → breaker counts it. Enough
                 // consecutive failures trip the breaker and skip
                 // future `maybe_spawn` until the cooldown elapses.
@@ -924,7 +928,7 @@ impl MemoryExtractionService {
                 }
                 let bc = SessionMemoryExtractionBreadcrumbs {
                     messages_count: Some(messages_count),
-                    selector_model: selector_model_used.clone(),
+                    selector_model: selector_model.clone(),
                     // `attempt` is unavailable on PersistFailed since
                     // run_extraction doesn't surface partial-attempt
                     // counts when nothing landed; use None so the
@@ -945,7 +949,7 @@ impl MemoryExtractionService {
                     &session_id,
                     turn,
                     trigger,
-                    selector_model_used.clone(),
+                    selector_model.clone(),
                     ObsExtractionOutcome::PersistFailed {
                         reason: error_reason.into(),
                         llm_reason: llm_error_reason.map(Into::into),
@@ -1067,6 +1071,27 @@ impl MemoryExtractionService {
         } else {
             self.health.mark_failed(model_name);
         }
+    }
+
+    fn record_selector_failures(&self, failures: &[super::runner::LlmCandidateFailure]) {
+        for failure in failures {
+            self.record_selector_failure(&failure.model_name, failure.detail.as_deref());
+        }
+    }
+
+    fn mark_session_extracted(
+        &self,
+        session_id: &str,
+        current_tokens: usize,
+        current_tool_calls: usize,
+    ) {
+        let mut map = self
+            .session_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.entry(session_id.to_string())
+            .or_default()
+            .mark_extracted(current_tokens, current_tool_calls);
     }
 
     async fn load_current_memory(&self, session_id: &str) -> String {
@@ -1646,6 +1671,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persist_failure_does_not_advance_debounce_state() {
+        let memoria = Arc::new(ScriptedMemoria {
+            store_fail_permanently: true,
+            ..ScriptedMemoria::new()
+        });
+        let (svc, _rx, _broker) =
+            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
+        let sid = format!("retry-after-fail-{}", nanos());
+        let req = sample_req(&sid, 50_000, false);
+
+        assert_eq!(svc.maybe_spawn(req.clone()), SpawnDecision::Spawned);
+        svc.wait_for_pending(Duration::from_secs(5)).await;
+
+        assert!(
+            svc.peek_state(&sid).is_none(),
+            "failed persistence must not mark the session as freshly extracted"
+        );
+        assert_eq!(
+            svc.maybe_spawn(req),
+            SpawnDecision::Spawned,
+            "same counters should remain retryable after a failed attempt"
+        );
+    }
+
+    #[tokio::test]
     async fn wait_for_pending_returns_zero_immediately_when_nothing_spawned() {
         let (svc, _rx, _broker) = build_ctx_with_memoria(
             None,
@@ -1669,6 +1719,7 @@ mod tests {
             base_url: "https://nope.invalid".to_string(),
             api_key: "k".to_string(),
             model_name: "cheap-selector".to_string(),
+            wire_model_name: None,
             provider: "test".to_string(),
             request_body_overrides: None,
             thinking_capability: None,
@@ -1733,6 +1784,7 @@ mod tests {
             base_url: "https://nope.invalid".to_string(),
             api_key: "k".to_string(),
             model_name: "selector-first".to_string(),
+            wire_model_name: None,
             provider: "test".to_string(),
             request_body_overrides: None,
             thinking_capability: None,
@@ -2034,6 +2086,7 @@ mod tests {
             base_url: "https://nope.invalid".to_string(),
             api_key: "k".to_string(),
             model_name: "cheap-selector-leak".to_string(),
+            wire_model_name: None,
             provider: "test".to_string(),
             request_body_overrides: None,
             thinking_capability: None,
