@@ -322,7 +322,10 @@ mod tests {
             "expected error + recovery lines, got: {lines:?}"
         );
         assert!(lines[0].contains("failed") && lines[0].contains("LlmError"));
-        assert!(lines[1].contains("recovered via fallback"), "{lines:?}");
+        assert!(
+            lines[1].contains("recovered after extraction failure"),
+            "{lines:?}"
+        );
     }
 
     #[tokio::test]
@@ -361,7 +364,10 @@ mod tests {
             lines[0].contains("failed") && lines[0].contains("LlmError"),
             "{lines:?}"
         );
-        assert!(lines[1].contains("recovered via fallback"), "{lines:?}");
+        assert!(
+            lines[1].contains("recovered after extraction failure"),
+            "{lines:?}"
+        );
     }
 
     #[tokio::test]
