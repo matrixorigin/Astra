@@ -1,4 +1,5 @@
 use super::*;
+use astra_services::session_artifact_store::SessionArtifactStore;
 
 pub(crate) const MEMORY_BROWSE_QUERY: &str = "memory knowledge fact preference plan task note";
 pub(crate) const MEMORY_BROWSE_TOP_K: usize = 50;
@@ -25,15 +26,29 @@ const SECTION_DISPLAY_NAMES: &[(&str, &str)] = &[
     ("L2 Contextual", "📋 Context (L2)"),
 ];
 
+/// When the primary `SECTION_DISPLAY_NAMES` yield at least one populated
+/// section, these are skipped — fallback sections only appear when the body
+/// has *no* primary-section content at all. This keeps the compact TUI view
+/// focused on actionable state while still showing context when that's the
+/// only available information.
+const FALLBACK_SECTION_DISPLAY_NAMES: &[(&str, &str)] = &[
+    ("Task Specification", "🧭 Task Specification"),
+    ("Current State", "📍 Current State"),
+    ("Workflow", "🛠 Workflow"),
+    ("Files and Functions", "📂 Files & Functions"),
+    ("Errors & Corrections", "⚠ Errors & Corrections"),
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionMemoryRecord {
-    memory_id: String,
-    body: String,
+pub(crate) struct SessionMemoryRecord {
+    pub(crate) memory_id: String,
+    pub(crate) summary: Option<String>,
+    pub(crate) body: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionMemoryStatusHint {
-    summary: String,
+pub(crate) struct SessionMemoryStatusHint {
+    pub(crate) summary: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +89,33 @@ pub(super) async fn handle_memory_domain_command(
             let subcmd = arg.split_whitespace().next().unwrap_or("list");
             let sub_arg = arg.strip_prefix(subcmd).unwrap_or("").trim();
             match subcmd {
+                "session" => {
+                    let Some(session_id) = state.session_id.as_deref() else {
+                        eprintln!("  {}", "No active session yet.".yellow());
+                        return Ok(());
+                    };
+                    match load_current_session_memory(api, tok, session_id).await {
+                        Ok(record) => {
+                            let body = record
+                                .as_ref()
+                                .map(|memory| memory.body.as_str())
+                                .unwrap_or_default();
+                            let summary =
+                                record.as_ref().and_then(|memory| memory.summary.as_deref());
+                            let hint = latest_session_memory_status_hint(session_id);
+                            let out = format_session_memory_response(
+                                summary,
+                                body,
+                                Some(session_id),
+                                hint.as_ref().map(|h| h.summary.as_str()),
+                            );
+                            println!("{out}");
+                        }
+                        Err(error) => {
+                            eprintln!("  {} {}", theme::icon_err(), error.red());
+                        }
+                    }
+                }
                 "search" if !sub_arg.is_empty() => {
                     let top_k = state.runtime_config.memory.retrieval_top_k;
                     let payload = serde_json::json!({
@@ -396,32 +438,6 @@ pub(super) async fn handle_memory_domain_command(
                     Ok(body) => print_health_status(&body),
                     Err(e) => eprintln!("  {} {e}", theme::icon_err()),
                 },
-                // ─── Current session memory ───────────────────────
-                "session" => {
-                    let Some(session_id) = state.session_id.as_deref() else {
-                        eprintln!("  {}", "No active session yet.".yellow());
-                        return Ok(());
-                    };
-                    match load_current_session_memory(api, tok, session_id).await {
-                        Ok(record) => {
-                            let body = record.map(|memory| memory.body).unwrap_or_default();
-                            let hint = if body.trim().is_empty() {
-                                latest_session_memory_status_hint(session_id)
-                            } else {
-                                None
-                            };
-                            eprintln!(
-                                "{}",
-                                format_session_memory_display(
-                                    &body,
-                                    Some(session_id),
-                                    hint.as_ref().map(|hint| hint.summary.as_str())
-                                )
-                            );
-                        }
-                        Err(e) => eprintln!("{}", format!("  ✗ Session memory failed: {e}").red()),
-                    }
-                }
                 // ─── Edit a session memory section ───────────────
                 "edit" => {
                     if sub_arg.is_empty() || !SECTION_NAMES.contains(&sub_arg) {
@@ -549,6 +565,20 @@ pub(super) async fn handle_memory_domain_command(
 fn print_memory_usage() {
     eprintln!("  {} /memory <subcommand>", "Usage:".dim());
     eprintln!();
+    eprintln!("  {}", "Mental model".dim());
+    eprintln!(
+        "  {}",
+        "    session      Current conversation state; auto-extracted and short-lived".dim()
+    );
+    eprintln!(
+        "  {}",
+        "    repository   Durable cross-session memories shown by list/search".dim()
+    );
+    eprintln!(
+        "  {}",
+        "    retrieved    Memories selected for the current prompt; inspect in /context".dim()
+    );
+    eprintln!();
     eprintln!("  {}", "View & Search".dim());
     eprintln!(
         "  {}",
@@ -658,23 +688,28 @@ pub(crate) fn format_session_memory_display(
     // Priority-ordered sections: actionable state first, then background
     const PER_SECTION_LIMIT: usize = 12;
     let mut sections_shown = 0usize;
-    for (section_name, label) in SECTION_DISPLAY_NAMES {
-        if let Some(content) = extract_md_section(body, section_name) {
-            let trimmed = content.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            sections_shown += 1;
-            out.push_str(&format!("\n  {}\n", label.bold()));
-            let lines: Vec<&str> = trimmed.lines().collect();
-            for line in lines.iter().take(PER_SECTION_LIMIT) {
-                out.push_str(&format!("    {line}\n"));
-            }
-            if lines.len() > PER_SECTION_LIMIT {
-                out.push_str(&format!(
-                    "    {}\n",
-                    format!("… {} more lines", lines.len() - PER_SECTION_LIMIT).dim()
-                ));
+    for sections in [SECTION_DISPLAY_NAMES, FALLBACK_SECTION_DISPLAY_NAMES] {
+        if sections_shown > 0 {
+            break;
+        }
+        for (section_name, label) in sections {
+            if let Some(content) = extract_md_section(body, section_name) {
+                let trimmed = content.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                sections_shown += 1;
+                out.push_str(&format!("\n  {}\n", label.bold()));
+                let lines: Vec<&str> = trimmed.lines().collect();
+                for line in lines.iter().take(PER_SECTION_LIMIT) {
+                    out.push_str(&format!("    {line}\n"));
+                }
+                if lines.len() > PER_SECTION_LIMIT {
+                    out.push_str(&format!(
+                        "    {}\n",
+                        format!("… {} more lines", lines.len() - PER_SECTION_LIMIT).dim()
+                    ));
+                }
             }
         }
     }
@@ -687,6 +722,41 @@ pub(crate) fn format_session_memory_display(
         "\n  {}\n",
         "───────────────────────────────────────────────────────".dim()
     ));
+    out
+}
+
+pub(crate) fn format_session_memory_response(
+    summary: Option<&str>,
+    body: &str,
+    session_id: Option<&str>,
+    status_hint: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    let headline = summary
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| session_memory_headline_from_body(body))
+        .unwrap_or_else(|| "Session memory".to_string());
+    out.push_str(&headline);
+
+    if let Some(sid) = session_id.filter(|sid| !sid.trim().is_empty()) {
+        out.push_str(&format!("\nsession: {sid}"));
+    }
+
+    if body.trim().is_empty() {
+        if let Some(hint) = status_hint.filter(|hint| !hint.trim().is_empty()) {
+            out.push_str(&format!("\n{hint}"));
+        } else {
+            out.push_str("\nNo session memory yet.");
+        }
+        return out;
+    }
+
+    append_section_block(&mut out, body, SECTION_DISPLAY_NAMES, 8);
+    if !has_any_section(body, SECTION_DISPLAY_NAMES) {
+        append_section_block(&mut out, body, FALLBACK_SECTION_DISPLAY_NAMES, 8);
+    }
     out
 }
 
@@ -707,12 +777,16 @@ fn select_session_memory_record(
             .ok()
         })
         .find_map(|memory| {
+            let summary = prompts::memory_proto::MemoryEntry::parse(&memory.content)
+                .map(|entry| entry.compact_view().trim().to_string())
+                .filter(|summary| !summary.is_empty());
             astra_runtime::session_memory::runner::decode_session_memory_entry(
                 &memory.content,
                 session_id,
             )
             .map(|body| SessionMemoryRecord {
                 memory_id: memory.memory_id,
+                summary,
                 body,
             })
         })
@@ -721,8 +795,7 @@ fn select_session_memory_record(
 fn parse_session_memory_status_hint_from_journal_text(
     journal_text: &str,
 ) -> Option<SessionMemoryStatusHint> {
-    let mut latest_error: Option<SessionMemoryStatusHint> = None;
-    let mut latest_skip: Option<SessionMemoryStatusHint> = None;
+    let mut latest: Option<SessionMemoryStatusHint> = None;
 
     for line in journal_text.lines() {
         let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -745,6 +818,18 @@ fn parse_session_memory_status_hint_from_journal_text(
             .map(|turn| format!("turn {turn}"))
             .unwrap_or_else(|| "recent turn".to_string());
         match outcome {
+            "extracted" => {
+                let source = metadata
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("background");
+                latest = Some(SessionMemoryStatusHint {
+                    summary: format!(
+                        "Latest extraction completed on {turn} via {}. If this view is still empty, the snapshot may still be loading.",
+                        humanize_session_memory_source(source)
+                    ),
+                });
+            }
             "errored" => {
                 let reason = metadata
                     .get("reason")
@@ -755,37 +840,84 @@ fn parse_session_memory_status_hint_from_journal_text(
                     .or_else(|| metadata.get("llm_detail"))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
-                let summary = if detail.is_empty() {
-                    format!("Latest extraction failed on {turn}: {reason}.")
-                } else {
-                    format!("Latest extraction failed on {turn}: {reason} — {detail}.")
-                };
-                latest_error = Some(SessionMemoryStatusHint { summary });
+                latest = Some(SessionMemoryStatusHint {
+                    summary: humanize_session_memory_error(turn.as_str(), reason, detail),
+                });
             }
             "skipped" => {
                 let reason = metadata
                     .get("reason")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown_skip");
-                latest_skip = Some(SessionMemoryStatusHint {
-                    summary: format!("Latest extraction was skipped on {turn}: {reason}."),
+                latest = Some(SessionMemoryStatusHint {
+                    summary: humanize_session_memory_skip(turn.as_str(), reason),
                 });
             }
             _ => {}
         }
     }
 
-    latest_error.or(latest_skip)
+    latest
 }
 
-fn latest_session_memory_status_hint(session_id: &str) -> Option<SessionMemoryStatusHint> {
+fn humanize_session_memory_source(source: &str) -> &'static str {
+    match source {
+        "llm" => "the background extractor",
+        "rule_fallback" => "the fallback extractor",
+        _ => "the extractor",
+    }
+}
+
+fn humanize_session_memory_error(turn: &str, reason: &str, detail: &str) -> String {
+    let reason_text = match reason {
+        "llm_timeout" => "timed out while generating session memory",
+        "llm_error" => "hit a model error while generating session memory",
+        "empty_response" => "returned an empty session-memory update",
+        "purge_failed" => "could not replace the previous session-memory snapshot",
+        "write_failed" => "could not store the new session-memory snapshot",
+        _ => "failed while updating session memory",
+    };
+    if detail.is_empty() {
+        format!("Latest extraction on {turn} {reason_text}.")
+    } else {
+        format!("Latest extraction on {turn} {reason_text}: {detail}.")
+    }
+}
+
+fn humanize_session_memory_skip(turn: &str, reason: &str) -> String {
+    match reason {
+        "in_flight" => format!(
+            "Session memory extraction was already running before {turn}, so this turn did not start a duplicate job."
+        ),
+        "below_init_gate" => format!(
+            "Session memory has not started yet because the conversation had not accumulated enough meaningful context by {turn}."
+        ),
+        "no_growth" => format!(
+            "Session memory was not refreshed on {turn} because the conversation had not changed enough since the last snapshot."
+        ),
+        "selector_cooldown" => format!(
+            "Session memory was not refreshed on {turn} because the extractor model is cooling down after a recent failure."
+        ),
+        "memoria_unhealthy" => format!(
+            "Session memory was not refreshed on {turn} because the memory backend is temporarily unhealthy."
+        ),
+        "no_session_id" => {
+            format!("Session memory could not start on {turn} because no session id was available.")
+        }
+        _ => format!("Session memory was skipped on {turn}."),
+    }
+}
+
+pub(crate) fn latest_session_memory_status_hint(
+    session_id: &str,
+) -> Option<SessionMemoryStatusHint> {
     let writer = astra_services::session_journal::JournalWriter::new(session_id).ok()?;
     let path = writer.path().clone();
     let journal = std::fs::read_to_string(path).ok()?;
     parse_session_memory_status_hint_from_journal_text(&journal)
 }
 
-async fn load_current_session_memory(
+pub(crate) async fn load_current_session_memory(
     api: &astra_thin_client::ThinClient,
     token: &str,
     session_id: &str,
@@ -816,19 +948,101 @@ async fn load_current_session_memory(
         "session_id": session_id,
         "session_scope": "only",
     });
-    let response = api
+    let response = match api
         .post_memory_retrieve_json(token, &fallback_payload)
         .await
-        .map_err(|error| format!("memory retrieve failed: {error}"))?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            if let Some(record) = load_local_session_memory(session_id) {
+                return Ok(Some(record));
+            }
+            return Err(format!("memory retrieve failed: {error}"));
+        }
+    };
     let status = response.status();
     let payload: serde_json::Value = response
         .json()
         .await
         .map_err(|error| format!("memory retrieve parse failed: {error}"))?;
     if !status.is_success() {
+        if let Some(record) = load_local_session_memory(session_id) {
+            return Ok(Some(record));
+        }
         return Err(format!("memory retrieve failed ({status})"));
     }
-    Ok(select_session_memory_record(&payload, session_id))
+    Ok(select_session_memory_record(&payload, session_id)
+        .or_else(|| load_local_session_memory(session_id)))
+}
+
+fn load_local_session_memory(session_id: &str) -> Option<SessionMemoryRecord> {
+    let path = astra_services::local_session_artifact_store()
+        .session_path(session_id, "session-memory.md")
+        .ok()?;
+    let body = std::fs::read_to_string(path).ok()?;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(SessionMemoryRecord {
+        memory_id: "local-session-memory".to_string(),
+        summary: session_memory_headline_from_body(trimmed),
+        body: trimmed.to_string(),
+    })
+}
+
+fn session_memory_headline_from_body(body: &str) -> Option<String> {
+    [
+        "Current State",
+        "Active Goals",
+        "Task Specification",
+        "Session Title",
+    ]
+    .into_iter()
+    .find_map(|section| {
+        extract_md_section(body, section).and_then(|content| {
+            content
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .map(str::trim)
+                .map(str::to_string)
+        })
+    })
+}
+
+fn has_any_section(body: &str, sections: &[(&str, &str)]) -> bool {
+    sections.iter().any(|(section_name, _)| {
+        extract_md_section(body, section_name)
+            .map(|content| !content.trim().is_empty())
+            .unwrap_or(false)
+    })
+}
+
+fn append_section_block(
+    out: &mut String,
+    body: &str,
+    sections: &[(&str, &str)],
+    per_section_limit: usize,
+) {
+    for (section_name, label) in sections {
+        if let Some(content) = extract_md_section(body, section_name) {
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("\n\n{label}"));
+            let lines: Vec<&str> = trimmed.lines().collect();
+            for line in lines.iter().take(per_section_limit) {
+                out.push_str(&format!("\n{line}"));
+            }
+            if lines.len() > per_section_limit {
+                out.push_str(&format!(
+                    "\n… {} more lines",
+                    lines.len() - per_section_limit
+                ));
+            }
+        }
+    }
 }
 
 pub(super) async fn load_current_session_memory_body_with_profile(
@@ -1585,6 +1799,42 @@ mod tests {
     }
 
     #[test]
+    fn format_session_memory_display_falls_back_to_context_sections() {
+        let body = "## Task Specification\nClean up /memory subcommands\n\n## Current State\nSession memory extracted after a long /memory cleanup turn.\n\n## Workflow\n- Reviewed slash_memory routing\n- Reworked help text\n";
+        let result = strip_ansi(&format_session_memory_display(body, None, None));
+        assert!(result.contains("🧭 Task Specification"));
+        assert!(result.contains("Clean up /memory subcommands"));
+        assert!(result.contains("📍 Current State"));
+        assert!(result.contains("🛠 Workflow"));
+    }
+
+    #[test]
+    fn format_session_memory_response_uses_summary_first() {
+        let body =
+            "## Active Goals\n- Ship the fix\n\n## Completed\n- Root-caused the regression\n";
+        let result =
+            format_session_memory_response(Some("Task complete"), body, Some("sess-1"), None);
+        assert!(result.starts_with("Task complete"));
+        assert!(result.contains("session: sess-1"));
+        assert!(result.contains("🎯 Active Goals"));
+        assert!(result.contains("✅ Completed"));
+    }
+
+    #[test]
+    fn format_session_memory_response_uses_hint_when_body_empty() {
+        let result = format_session_memory_response(
+            None,
+            "",
+            Some("sess-1"),
+            Some("Latest extraction on turn 3 could not store the new session-memory snapshot."),
+        );
+        assert!(result.contains("Session memory"));
+        assert!(result.contains("session: sess-1"));
+        assert!(!result.contains("No session memory extracted yet."));
+        assert!(result.contains("could not store the new session-memory snapshot"));
+    }
+
+    #[test]
     fn select_session_memory_record_decodes_protocol_entry() {
         let payload = serde_json::json!({
             "memories": [
@@ -1607,6 +1857,12 @@ mod tests {
         });
         let record = select_session_memory_record(&payload, "sess-1").expect("session memory");
         assert_eq!(record.memory_id, "mem-1");
+        assert!(
+            record
+                .summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("Fix memory"))
+        );
         assert!(record.body.contains("Fix memory"));
     }
 
@@ -1619,8 +1875,70 @@ mod tests {
         let hint =
             parse_session_memory_status_hint_from_journal_text(journal).expect("status hint");
         assert!(hint.summary.contains("turn 15"));
-        assert!(hint.summary.contains("write_failed"));
+        assert!(
+            hint.summary
+                .contains("could not store the new session-memory snapshot")
+        );
         assert!(hint.summary.contains("500 Internal Server Error"));
+    }
+
+    #[test]
+    fn parse_session_memory_status_hint_humanizes_in_flight_skip() {
+        let journal = r#"
+{"type":"session_memory_extraction","turn":8,"metadata":{"outcome":"skipped","reason":"in_flight"}}
+"#;
+        let hint =
+            parse_session_memory_status_hint_from_journal_text(journal).expect("status hint");
+        assert!(hint.summary.contains("already running before turn 8"));
+        assert!(hint.summary.contains("did not start a duplicate job"));
+        assert!(!hint.summary.contains("in_flight"));
+    }
+
+    #[test]
+    fn parse_session_memory_status_hint_uses_latest_success_over_earlier_skip() {
+        let journal = r#"
+{"type":"session_memory_extraction","turn":8,"metadata":{"outcome":"skipped","reason":"in_flight"}}
+{"type":"session_memory_extraction","turn":8,"metadata":{"outcome":"extracted","source":"llm","bytes_written":1769}}
+"#;
+        let hint =
+            parse_session_memory_status_hint_from_journal_text(journal).expect("status hint");
+        assert!(
+            hint.summary
+                .contains("Latest extraction completed on turn 8")
+        );
+        assert!(hint.summary.contains("background extractor"));
+        assert!(!hint.summary.contains("duplicate job"));
+    }
+
+    #[test]
+    fn load_local_session_memory_reads_session_memory_md() {
+        let session_id = format!(
+            "sess-local-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let path = astra_services::local_session_artifact_store()
+            .session_path(&session_id, "session-memory.md")
+            .expect("session path");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create session dir");
+        }
+        std::fs::write(
+            &path,
+            "# Session Memory\n\n## Current State\nSummarized locally before remote persistence.\n",
+        )
+        .expect("write session memory");
+
+        let record = load_local_session_memory(&session_id).expect("local session memory");
+        assert_eq!(record.memory_id, "local-session-memory");
+        assert!(record.summary.as_deref().is_some_and(|summary| {
+            summary.contains("Summarized locally before remote persistence.")
+        }));
+        assert!(record.body.contains("# Session Memory"));
+
+        std::fs::remove_file(&path).expect("remove session memory");
     }
 
     // ── /memory subcommand contracts ──
@@ -1657,6 +1975,13 @@ mod tests {
     #[test]
     fn memory_usage_text_covers_all_subcommands() {
         let src = include_str!("slash_memory.rs");
+        assert!(
+            src.contains("Mental model")
+                && src.contains("Current conversation state")
+                && src.contains("Durable cross-session memories")
+                && src.contains("inspect in /context"),
+            "/memory usage must explain session/repository/retrieved scopes"
+        );
         for cmd in &[
             "snapshot",
             "rollback",

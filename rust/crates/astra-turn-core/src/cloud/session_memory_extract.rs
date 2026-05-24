@@ -2,7 +2,7 @@
 //!
 //! Periodically extracts key information from conversation into a structured
 //! markdown file (edge) and Memoria working memory (cloud), triggered by
-//! dual thresholds: token growth AND tool call count.
+//! token growth, tool-call growth, or explicit error pressure.
 
 use std::time::Instant;
 
@@ -60,7 +60,7 @@ impl SessionMemoryState {
     }
 }
 
-/// Check whether extraction should run based on dual thresholds.
+/// Check whether extraction should run based on growth thresholds.
 pub fn should_extract(
     state: &SessionMemoryState,
     current_tokens: usize,
@@ -73,7 +73,7 @@ pub fn should_extract(
     let token_growth = current_tokens.saturating_sub(state.tokens_at_last_extraction);
     let tool_growth = current_tool_calls.saturating_sub(state.tool_calls_at_last_extraction);
     token_growth >= config.min_tokens_between_updates
-        && tool_growth >= config.min_tool_calls_between_updates
+        || tool_growth >= config.min_tool_calls_between_updates
 }
 
 /// Check whether extraction should run, with error-triggered override.
@@ -150,9 +150,11 @@ pub fn build_extraction_prompt(current_memory: &str, recent_messages: &[Value]) 
          - Keep each section under 200 words.\n\
          - Be factual and concise.\n\
          - Output the complete updated document.\n\
+         - Prefer the LATEST session state over stale earlier bullets; when recent messages supersede earlier progress, rewrite the section instead of keeping outdated status.\n\
          - Active Goals: only record goals explicitly stated by the user or assistant. Do NOT invent or infer goals.\n\
          - Pending Todos: list tasks planned but NOT yet completed.\n\
-         - Completed: list tasks finished this session. Cross-check: if an item appears in Completed it MUST NOT appear in Pending Todos.";
+         - Completed: list tasks finished this session, especially concrete substeps completed in the MOST RECENT turn. Only mark a task Completed if the assistant has explicitly confirmed it — do NOT infer completion from a passing mention. Cross-check: if an item appears in Completed it MUST NOT appear in Pending Todos.\n\
+         - Current State: summarize what is true NOW, including when the broader task is still incomplete but some review/fix substeps have already landed.";
     let user = format!(
         "## Current session memory:\n\n{current_memory}\n\n\
          ## Recent conversation:\n\n{recent_text}\n\n\
@@ -391,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn should_extract_false_insufficient_growth() {
+    fn should_extract_false_when_neither_growth_threshold_is_met() {
         let state = SessionMemoryState {
             initialized: true,
             tokens_at_last_extraction: 10_000,
@@ -399,8 +401,38 @@ mod tests {
             last_extraction_time: None,
         };
         let config = SessionMemoryExtractConfig::default();
-        // Token growth OK (2K) but below 5K threshold
+        // Both token growth (+2K) and tool growth (+1) are below thresholds.
         assert!(!should_extract(&state, 12_000, 6, &config));
+    }
+
+    #[test]
+    fn should_extract_true_after_token_growth_even_without_tool_growth() {
+        let state = SessionMemoryState {
+            initialized: true,
+            tokens_at_last_extraction: 10_000,
+            tool_calls_at_last_extraction: 5,
+            last_extraction_time: None,
+        };
+        let config = SessionMemoryExtractConfig::default();
+        assert!(
+            should_extract(&state, 15_000, 5, &config),
+            "tool-sparse sessions must still refresh once enough semantic text accumulates"
+        );
+    }
+
+    #[test]
+    fn should_extract_true_after_tool_growth_even_without_token_growth() {
+        let state = SessionMemoryState {
+            initialized: true,
+            tokens_at_last_extraction: 10_000,
+            tool_calls_at_last_extraction: 5,
+            last_extraction_time: None,
+        };
+        let config = SessionMemoryExtractConfig::default();
+        assert!(
+            should_extract(&state, 10_000, 8, &config),
+            "tool-dense sessions must refresh even when token estimates stay flat"
+        );
     }
 
     // ── Error-Triggered Extraction Tests ─────────────────────────────
@@ -645,9 +677,10 @@ mod tests {
         state.mark_extracted(12_000, 0);
         // Same counters → must NOT re-extract.
         assert!(!should_extract(&state, 12_000, 0, &config));
-        // Token growth alone (+5K) but no tool-call growth → still debounced.
-        assert!(!should_extract(&state, 17_000, 0, &config));
-        // Token growth + tool-call growth ≥ 3 → fires again.
+        // Token growth alone (+5K) is enough to keep session memory fresh.
+        assert!(should_extract(&state, 17_000, 0, &config));
+        state.mark_extracted(17_000, 0);
+        // Tool-call growth alone ≥ 3 also fires.
         assert!(should_extract(&state, 17_000, 3, &config));
     }
 
@@ -703,6 +736,19 @@ mod tests {
                 || system.to_lowercase().contains("explicit")
                 || system.to_lowercase().contains("do not invent"),
             "system prompt must warn against inventing goals, got: {system}"
+        );
+    }
+
+    #[test]
+    fn build_extraction_prompt_prefers_latest_state_and_recent_completed_substeps() {
+        let msgs = vec![json!({"role": "user", "content": "continue"})];
+        let result = build_extraction_prompt("", &msgs);
+        let system = result[0]["content"].as_str().unwrap();
+        assert!(
+            system.contains("LATEST session state")
+                && system.contains("MOST RECENT turn")
+                && system.contains("what is true NOW"),
+            "system prompt must emphasize latest-state updates, got: {system}"
         );
     }
 }

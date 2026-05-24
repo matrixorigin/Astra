@@ -992,6 +992,64 @@ mod tests {
     }
 
     #[test]
+    fn bridge_pipeline_outcome_keeps_session_memory_out_of_anthropic_cached_prefix() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        remove_test_env("ASTRA_OUTPUT_STYLE");
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+        let session_memory = astra_turn_core::context_sources::MemoryEntry::new(
+            "## Session State\nLatest state: volatile session memory update",
+        );
+
+        let outcome = assemble_bridge_pipeline_outcome(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            &[],
+            Some(&session_memory),
+            0.8,
+            None,
+            &cache_cfg,
+            None,
+            "sid-session-memory-anthropic",
+            "claude-sonnet-4-6",
+            "anthropic",
+            None,
+            None,
+            None,
+            "",
+            "",
+        );
+
+        let primary_text = outcome
+            .primary_system
+            .get("content")
+            .and_then(Value::as_array)
+            .expect("anthropic primary content is block array")
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        let dynamic_text = outcome
+            .dynamic_system
+            .as_ref()
+            .and_then(|msg| msg.get("content"))
+            .and_then(Value::as_str)
+            .expect("volatile session memory should be emitted as dynamic system text");
+
+        assert!(
+            !primary_text.contains("volatile session memory update"),
+            "session memory changes must not invalidate Anthropic cached prefix: {primary_text}"
+        );
+        assert!(
+            dynamic_text.contains("volatile session memory update"),
+            "session memory must still reach the prompt via volatile lane: {dynamic_text}"
+        );
+    }
+
+    #[test]
     fn bridge_pipeline_outcome_keeps_deferred_tools_block_in_session_prefix() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         remove_test_env("ASTRA_OUTPUT_STYLE");

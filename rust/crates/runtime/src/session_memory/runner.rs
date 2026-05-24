@@ -1045,10 +1045,7 @@ fn build_rule_fallback_memory(
     if pending_todos.is_empty() {
         pending_todos.push(format!("Continue: {}", truncate(last_user, 180)));
     }
-    let mut completed = prior_snapshot.narrative.completed;
-    if completed.is_empty() {
-        completed.push("Persisted a deterministic session-memory fallback snapshot.".to_string());
-    }
+    let completed = prior_snapshot.narrative.completed;
     let mut current_state = prior_snapshot.narrative.current_state;
     current_state.push(format!("Turn {turn_number}"));
     current_state.push(format!("Approximate context size: {current_tokens} tokens"));
@@ -1062,10 +1059,7 @@ fn build_rule_fallback_memory(
         "# Session Memory\n\n## Session Title\n{first_user}\n\n## Active Goals\n{active_goals}\n\n## Pending Todos\n{pending_todos}\n\n## Completed\n{completed}\n\n## Current State\n{current_state}\n\n## Task Specification\n{task_spec}\n\n## Files and Functions\n{files}\n\n## Workflow\n{workflow}\n\n## Errors & Corrections\n{errors}\n\n## Learnings\n{learnings}\n\n## Worklog\n{worklog}",
         active_goals = render_list(&active_goals, &format!("- {}", truncate(last_user, 180))),
         pending_todos = render_list(&pending_todos, "- Continue the current session task."),
-        completed = render_list(
-            &completed,
-            "- Persisted a deterministic session-memory fallback snapshot."
-        ),
+        completed = render_list(&completed, "- No completed work recorded."),
         current_state = render_list(&current_state, "- No current state recorded."),
         task_spec = render_scalar(&prior_snapshot.narrative.task_spec, first_user),
         files = detect_file_mentions(messages),
@@ -1089,7 +1083,7 @@ fn build_rule_fallback_memory(
         },
         learnings = render_list(
             &prior_snapshot.narrative.learnings,
-            "- Keep session memory synchronized when the session grows."
+            "- No learnings recorded."
         ),
         worklog = if current_memory.trim().is_empty() {
             "- Initialized session memory document.".to_string()
@@ -1558,6 +1552,29 @@ mod tests {
             json!({"role": "user", "content": "Fix rust/crates/runtime/src/session_memory/runner.rs"}),
             json!({"role": "assistant", "content": "Investigating the session memory runner."}),
         ]
+    }
+
+    #[test]
+    fn rule_fallback_records_user_state_not_persistence_in_completed() {
+        let content = build_rule_fallback_memory("", &sample_messages(), 3, 12_345);
+
+        assert!(
+            content.contains(
+                "Latest user focus: Fix rust/crates/runtime/src/session_memory/runner.rs"
+            )
+        );
+        assert!(
+            !content.contains("Persisted a deterministic session-memory fallback snapshot"),
+            "fallback Completed must not claim an implementation detail as user-visible progress: {content}"
+        );
+        assert!(
+            !content.contains("Keep session memory synchronized when the session grows"),
+            "fallback Learnings must not invent generic advice: {content}"
+        );
+        assert!(
+            content.contains("## Completed\n- No completed work recorded."),
+            "fallback should be explicit when no completed user work is known: {content}"
+        );
     }
 
     #[tokio::test]

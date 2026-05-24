@@ -649,6 +649,7 @@ dependencies = [
  "astra-core",
  "astra-messaging",
  "astra-pipeline",
+ "astra-prompts",
  "astra-sandbox",
  "astra-services",
  "astra-text-utils",

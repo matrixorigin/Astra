@@ -1162,9 +1162,9 @@ fn append_memory_section(
 /// When the Memory section is expanded, render the richer
 /// retrieval-pipeline detail the trace carries: the query that
 /// drove retrieval, how many candidates were considered, the
-/// rejected list with reasons, and repository-memory injections
-/// (distinct from selected memories — they live in the system
-/// prompt rather than the retrieval output).
+/// rejected list with reasons, and memory injected directly into
+/// the system prompt (distinct from selected memories — they live
+/// outside the retrieval output).
 fn append_memory_focus(out: &mut Vec<Line<'static>>, focus: &super::model::MemoryFocus) {
     if focus.is_empty() {
         return;
@@ -1227,18 +1227,25 @@ fn append_memory_focus(out: &mut Vec<Line<'static>>, focus: &super::model::Memor
             ]));
         }
     }
-    if !focus.repository.is_empty() {
+    if !focus.injected.is_empty() {
         out.push(Line::from(vec![
             Span::raw("    └ "),
             Span::styled(
-                "Repository memories",
+                "Injected memories",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  (.astra/memories)", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "  (session + repository prompt context)",
+                Style::default().fg(Color::DarkGray),
+            ),
         ]));
-        for r in &focus.repository {
+        for r in &focus.injected {
             out.push(Line::from(vec![
                 Span::raw("        └ "),
+                Span::styled(
+                    format!("{}: ", r.source_label),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(format!("\"{}\"", truncate_preview(&r.preview, 100))),
                 Span::styled(
                     format!("   {} tokens", fmt_tokens(r.tokens)),
@@ -2299,8 +2306,35 @@ mod tests {
         assert!(text.contains("42ms"), "latency missing: {text}");
         assert!(text.contains("Rejected (1)"), "rejected header: {text}");
         assert!(text.contains("below threshold"), "reason: {text}");
-        assert!(text.contains("Repository memories"), "repo header: {text}");
+        t.system_prompt.session_memory_injected = Some(MemoryInjection {
+            memory_id: "sess".into(),
+            memory_type: "working".into(),
+            tokens: 120,
+            relevance_score: 1.0,
+            content_preview: "# Session Memory".into(),
+        });
+        let b = ContextBreakdown::from_trace(&t);
+        let state = ViewState {
+            focus: Some(Section::Memory),
+            expanded: Some(Section::Memory),
+            selected_item: 0,
+            drilled: false,
+        };
+        let text: String = build_lines_with(&b, 80, state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("retrieval bug"), "query missing: {text}");
+        assert!(text.contains("7 candidates"), "candidates missing: {text}");
+        assert!(text.contains("42ms"), "latency missing: {text}");
+        assert!(text.contains("Rejected (1)"), "rejected header: {text}");
+        assert!(text.contains("below threshold"), "reason: {text}");
+        assert!(text.contains("Injected memories"), "memory header: {text}");
+        assert!(text.contains("Repository memory"), "repo label: {text}");
         assert!(text.contains("# Project rules"), "repo preview: {text}");
+        assert!(text.contains("Session memory"), "session label: {text}");
+        assert!(text.contains("# Session Memory"), "session preview: {text}");
     }
 
     #[test]

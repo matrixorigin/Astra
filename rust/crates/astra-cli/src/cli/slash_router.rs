@@ -206,7 +206,7 @@ pub(crate) async fn handle_slash_command(
                     eprintln!(
                         "  {} {}",
                         theme::icon_ok(),
-                        format!("Model set to: {model_with_suffix}").green()
+                        format!("Set model to {model_with_suffix}").green()
                     );
                 } else {
                     eprintln!("{}", "  Cancelled.".dim());
@@ -289,7 +289,7 @@ pub(crate) async fn handle_slash_command(
                 &state.runtime_config,
                 Some(base_model),
             );
-            eprintln!("{}", format!("  \u{2713}  Model set to: {}", arg).green());
+            eprintln!("{}", format!("  \u{2713}  Set model to {}", arg).green());
             if let Some(ref j) = state.journal {
                 let _ = j.append(&session_journal::JournalEvent::config_change(
                     state.session_id.as_deref(),

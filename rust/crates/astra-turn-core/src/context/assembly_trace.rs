@@ -636,6 +636,7 @@ pub fn build_memory_trace_from_retrieval(
 ) -> MemoryRetrievalTrace {
     let memories_selected: Vec<MemorySelection> = ranked_results
         .iter()
+        .filter(|(content, _)| !astra_prompts::memory_proto::is_session_namespace_memory(content))
         .enumerate()
         .map(|(idx, (content, score))| {
             let preview = if content.len() > 100 {
@@ -725,5 +726,26 @@ mod tests {
         let selected_tools: Vec<String> = (0..16).map(|i| format!("tool-{i}")).collect();
         let trace = build_tool_trace_from_selection(16, &selected_tools, "tfidf", 0.4, &[], 5);
         assert!(trace.tools_selected.iter().all(|tool| tool.score >= 0.0));
+    }
+
+    #[test]
+    fn memory_trace_drops_session_namespace_entries() {
+        let trace = build_memory_trace_from_retrieval(
+            "memory",
+            4,
+            &[
+                ("[@session/active] Session 1 active state".to_string(), 0.9),
+                ("[@session/memory] session_id=other body".to_string(), 0.8),
+                ("[@pref/active] prefer Rust".to_string(), 0.7),
+            ],
+            12,
+        );
+
+        assert_eq!(trace.memories_selected.len(), 1);
+        assert_eq!(
+            trace.memories_selected[0].content_preview,
+            "[@pref/active] prefer Rust"
+        );
+        assert_eq!(trace.candidates_considered, 4);
     }
 }

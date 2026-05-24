@@ -176,6 +176,21 @@ pub const NS_LESSON: &str = "lesson";
 pub const NS_FEEDBACK: &str = "feedback";
 pub const NS_SESSION: &str = "session";
 
+/// Returns `true` when `content` is a `[@session/…]` tagged memory entry.
+///
+/// Session-namespace entries are injected through a dedicated session-memory
+/// lane rather than generic cross-session recall. Both the memory prefetch
+/// filter and the assembly-trace builder use this check so entries don't
+/// leak into the prompt through the wrong channel.
+///
+/// Uses `MemoryEntry::parse` as the authoritative check (handles leading
+/// whitespace, exact namespace matching), falling back to a fast prefix
+/// scan for entries that don't parse.
+pub fn is_session_namespace_memory(content: &str) -> bool {
+    MemoryEntry::parse(content).is_some_and(|entry| entry.ns == NS_SESSION)
+        || content.trim_start().starts_with("[@session/")
+}
+
 // ── Status values ────────────────────────────────────────────────
 pub const ST_PENDING: &str = "pending";
 pub const ST_ACTIVE: &str = "active";

@@ -81,6 +81,13 @@ pub fn render_digest(contents: &[String]) -> Option<String> {
 /// filter is intentionally lenient (Recall has a hard `MAX_BULLETS=4` cap, so
 /// the cost of letting noise through is an entire useful bullet).
 fn is_digest_worthy(line: &str) -> bool {
+    // Session-namespace entries are not generic cross-session memories:
+    // they represent active/current session state and must flow only
+    // through the dedicated session-memory lane.
+    if astra_prompts::memory_proto::is_session_namespace_memory(line) {
+        return false;
+    }
+
     // Structured tagged entries (`[@ns/type] body`) always pass — the
     // namespace already asserts meaning.
     if line.starts_with("[@") && line.contains('/') && line.contains(']') {
@@ -420,6 +427,19 @@ mod tests {
             out.contains("[@swap/archived]"),
             "structured-tagged entries must pass filter, got:\n{out}"
         );
+    }
+
+    #[test]
+    fn rejects_structured_session_namespace_entries() {
+        let hits = vec![
+            "[@session/active] Session 33f9703d-566f-4824-81e7-c3012903650a: Turn 4 Task specification: review uncommitted changes".to_string(),
+            "[@session/memory] session_id=05126755-33ec-4a9d-bc95-e846a6f80369 # Session Memory ## Session Title review uncommitted changes".to_string(),
+            "[@pref/active] prefer Rust for CLI work".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        assert!(!out.contains("[@session/active]"), "leaked: {out}");
+        assert!(!out.contains("[@session/memory]"), "leaked: {out}");
+        assert!(out.contains("prefer Rust for CLI work"), "got:\n{out}");
     }
 
     #[test]

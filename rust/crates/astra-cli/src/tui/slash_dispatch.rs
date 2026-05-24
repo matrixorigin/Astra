@@ -934,6 +934,37 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 return SlashResult::Handled;
             };
 
+            if args.trim() == "session" {
+                let Some(session_id) = ctx.state.session_id.as_deref() else {
+                    ctx.show_error("No active session yet.".into());
+                    return SlashResult::Handled;
+                };
+                match crate::slash_memory::load_current_session_memory(ctx.api, &token, session_id)
+                    .await
+                {
+                    Ok(record) => {
+                        let body = record
+                            .as_ref()
+                            .map(|memory| memory.body.as_str())
+                            .unwrap_or_default();
+                        let hint = if body.trim().is_empty() {
+                            crate::slash_memory::latest_session_memory_status_hint(session_id)
+                        } else {
+                            None
+                        };
+                        let summary = record.as_ref().and_then(|memory| memory.summary.as_deref());
+                        ctx.show_response(crate::slash_memory::format_session_memory_response(
+                            summary,
+                            body,
+                            Some(session_id),
+                            hint.as_ref().map(|hint| hint.summary.as_str()),
+                        ));
+                    }
+                    Err(e) => ctx.show_error(format!("Session memory failed: {e}")),
+                }
+                return SlashResult::Handled;
+            }
+
             if route == MemoryCommandRoute::Health {
                 use crate::tui::bottom_pane::info_view::InfoView;
 
