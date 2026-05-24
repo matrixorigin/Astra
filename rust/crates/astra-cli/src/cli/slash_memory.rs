@@ -71,34 +71,7 @@ pub(super) async fn handle_memory_domain_command(
                                 if arr.is_empty() {
                                     eprintln!("  {}", "No memories found.".dim());
                                 } else {
-                                    for (i, m) in arr.iter().enumerate() {
-                                        let content = m
-                                            .get("content")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("?");
-                                        let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                                        let short_id = prefix_chars(id, 8);
-                                        // Use protocol-aware display
-                                        let display = if let Some(entry) =
-                                            prompts::memory_proto::MemoryEntry::parse(content)
-                                        {
-                                            entry.display_line()
-                                        } else {
-                                            let mtype = m
-                                                .get("memory_type")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("?");
-                                            let preview: String =
-                                                content.chars().take(80).collect();
-                                            format!("[{mtype}] {preview}")
-                                        };
-                                        eprintln!(
-                                            "  {}. {} {}",
-                                            (i + 1).to_string().magenta(),
-                                            display,
-                                            short_id.dim()
-                                        );
-                                    }
+                                    render_memory_search_results(&arr, sub_arg);
                                 }
                             } else {
                                 print_json_or_raw(&body);
@@ -123,39 +96,7 @@ pub(super) async fn handle_memory_domain_command(
                                 if arr.is_empty() {
                                     eprintln!("  {}", "No memories stored yet.".dim());
                                 } else {
-                                    eprintln!(
-                                        "\n  {}",
-                                        "─── Memories ───────────────────────────────────".dim()
-                                    );
-                                    for (i, m) in arr.iter().enumerate() {
-                                        let content = m
-                                            .get("content")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("?");
-                                        let display = if let Some(entry) =
-                                            prompts::memory_proto::MemoryEntry::parse(content)
-                                        {
-                                            entry.display_line()
-                                        } else {
-                                            let mtype = m
-                                                .get("memory_type")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("?");
-                                            let preview: String =
-                                                content.chars().take(80).collect();
-                                            format!("[{mtype}] {preview}")
-                                        };
-                                        eprintln!(
-                                            "  {}. {}",
-                                            (i + 1).to_string().magenta(),
-                                            display
-                                        );
-                                    }
-                                    eprintln!(
-                                        "  {}",
-                                        "────────────────────────────────────────────────".dim()
-                                    );
-                                    eprintln!("  {} memories", arr.len().to_string().magenta());
+                                    render_memory_list(&arr);
                                 }
                             } else {
                                 print_json_or_raw(&body);
@@ -215,7 +156,7 @@ pub(super) async fn handle_memory_domain_command(
                 "show" if !sub_arg.is_empty() => {
                     let memory_id = sub_arg.trim();
                     match super::edge_tools::memoria::memoria_show(memory_id).await {
-                        Ok(body) => print_json_or_raw(&body),
+                        Ok(body) => print_memory_detail(&body),
                         Err(e) => eprintln!("{}", format!("  ✗ Show failed: {e}").red()),
                     }
                 }
@@ -273,7 +214,7 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
                 "snapshots" => match super::edge_tools::memoria::memoria_snapshots_list().await {
-                    Ok(body) => print_json_or_raw(&body),
+                    Ok(body) => print_snapshots_list(&body),
                     Err(e) => eprintln!("  {} {e}", theme::icon_err()),
                 },
                 // ─── Cloud: Branches ──────────────────────────────
@@ -314,10 +255,10 @@ pub(super) async fn handle_memory_domain_command(
                 "diff" if !sub_arg.is_empty() => {
                     // Try branch diff first; fall back to snapshot diff on 404.
                     match super::edge_tools::memoria::memoria_branch_diff(sub_arg).await {
-                        Ok(body) => print_json_or_raw(&body),
+                        Ok(body) => print_memory_diff(&body, sub_arg),
                         Err(branch_err) => {
                             match super::edge_tools::memoria::memoria_snapshot_diff(sub_arg).await {
-                                Ok(body) => print_json_or_raw(&body),
+                                Ok(body) => print_memory_diff(&body, sub_arg),
                                 Err(_) => eprintln!(
                                     "  {} diff failed (branch: {branch_err})",
                                     theme::icon_err()
@@ -327,19 +268,19 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
                 "branches" => match super::edge_tools::memoria::memoria_branches_list().await {
-                    Ok(body) => print_json_or_raw(&body),
+                    Ok(body) => print_branches_list(&body),
                     Err(e) => eprintln!("  {} {e}", theme::icon_err()),
                 },
                 // ─── Cloud: Analysis ─────────────────────────────
                 "reflect" => {
                     eprintln!("  {} Analyzing memory patterns...", "⋯".dim());
                     match super::edge_tools::memoria::memoria_reflect().await {
-                        Ok(body) => print_json_or_raw(&body),
+                        Ok(body) => print_reflect_result(&body),
                         Err(e) => eprintln!("  {} {e}", theme::icon_err()),
                     }
                 }
                 "health" => match super::edge_tools::memoria::memoria_health().await {
-                    Ok(body) => print_json_or_raw(&body),
+                    Ok(body) => print_health_status(&body),
                     Err(e) => eprintln!("  {} {e}", theme::icon_err()),
                 },
                 // ─── Current session memory ───────────────────────
@@ -351,7 +292,7 @@ pub(super) async fn handle_memory_domain_command(
                     match load_current_session_memory(api, tok, session_id).await {
                         Ok(record) => {
                             let body = record.map(|memory| memory.body).unwrap_or_default();
-                            eprintln!("{}", format_session_memory_display(&body));
+                            eprintln!("{}", format_session_memory_display(&body, Some(session_id)));
                         }
                         Err(e) => eprintln!("{}", format!("  ✗ Session memory failed: {e}").red()),
                     }
@@ -447,49 +388,101 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
 
+                "stats" => {
+                    let payload = serde_json::json!({
+                        "query": "user preferences knowledge plans tasks",
+                        "top_k": 100,
+                    });
+                    match api.post_memory_search_json(tok, &payload).await {
+                        Ok(r) if r.status().is_success() => {
+                            let body = r.text().await.unwrap_or_default();
+                            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&body) {
+                                render_memory_stats(&arr);
+                            } else {
+                                print_json_or_raw(&body);
+                            }
+                        }
+                        Ok(r) => {
+                            eprintln!("{}", format!("  ✗ Stats failed ({})", r.status()).red())
+                        }
+                        Err(e) => eprintln!("{}", format!("  ✗ Unreachable: {e}").red()),
+                    }
+                }
+
                 _ => {
                     eprintln!("  {} /memory <subcommand>", "Usage:".dim());
-                    eprintln!("  {}", "  list                    List all memories".dim());
-                    eprintln!("  {}", "  search <query>          Search memories".dim());
+                    eprintln!();
+                    eprintln!("  {}", "Browse".dim());
                     eprintln!(
                         "  {}",
-                        "  session                 Show session memory".dim()
+                        "    list                  List memories grouped by type".dim()
+                    );
+                    eprintln!("  {}", "    search <query>        Search by content".dim());
+                    eprintln!(
+                        "  {}",
+                        "    show <id>             Inspect one memory in detail".dim()
                     );
                     eprintln!(
                         "  {}",
-                        "  edit <section>          Edit one session section".dim()
+                        "    stats                 Count memories by type".dim()
                     );
                     eprintln!(
                         "  {}",
-                        "  dismiss <query>         Mark memories as irrelevant".dim()
+                        "    dismiss <query>       Mark memories as irrelevant".dim()
+                    );
+                    eprintln!();
+                    eprintln!("  {}", "Session".dim());
+                    eprintln!(
+                        "  {}",
+                        "    session               Show current session memory".dim()
                     );
                     eprintln!(
                         "  {}",
-                        "  snapshot [name]         Create memory checkpoint".dim()
+                        "    edit <section>        Edit a session memory section".dim()
+                    );
+                    eprintln!();
+                    eprintln!("  {}", "Manage".dim());
+                    eprintln!(
+                        "  {}",
+                        "    forget <id> --reason  Permanently delete a memory".dim()
                     );
                     eprintln!(
                         "  {}",
-                        "  rollback <name>         Restore to checkpoint".dim()
-                    );
-                    eprintln!("  {}", "  snapshots               List checkpoints".dim());
-                    eprintln!(
-                        "  {}",
-                        "  branch <name>           Create experiment branch".dim()
-                    );
-                    eprintln!("  {}", "  checkout <name>         Switch branch".dim());
-                    eprintln!("  {}", "  merge <name>            Merge branch back".dim());
-                    eprintln!(
-                        "  {}",
-                        "  diff <name>             Preview branch changes".dim()
-                    );
-                    eprintln!("  {}", "  branches                List branches".dim());
-                    eprintln!(
-                        "  {}",
-                        "  reflect                 Analyze memory patterns".dim()
+                        "    snapshot [name]       Create a memory checkpoint".dim()
                     );
                     eprintln!(
                         "  {}",
-                        "  health                  Memory hygiene status".dim()
+                        "    rollback <name>       Restore to a checkpoint".dim()
+                    );
+                    eprintln!(
+                        "  {}",
+                        "    snapshots             List all checkpoints".dim()
+                    );
+                    eprintln!();
+                    eprintln!("  {}", "Branches".dim());
+                    eprintln!(
+                        "  {}",
+                        "    branch <name>         Create experiment branch".dim()
+                    );
+                    eprintln!("  {}", "    checkout <name>       Switch to a branch".dim());
+                    eprintln!(
+                        "  {}",
+                        "    merge <name>          Merge branch back into main".dim()
+                    );
+                    eprintln!(
+                        "  {}",
+                        "    diff <name>           Preview branch changes".dim()
+                    );
+                    eprintln!("  {}", "    branches              List all branches".dim());
+                    eprintln!();
+                    eprintln!("  {}", "Analysis".dim());
+                    eprintln!(
+                        "  {}",
+                        "    reflect               Analyze memory patterns".dim()
+                    );
+                    eprintln!(
+                        "  {}",
+                        "    health                Memory hygiene status".dim()
                     );
                 }
             }
@@ -503,7 +496,7 @@ pub(super) async fn handle_memory_domain_command(
 
 /// Format the session memory markdown body for human-readable terminal display.
 /// Pure function — no I/O, no API calls. Testable in isolation.
-pub(crate) fn format_session_memory_display(body: &str) -> String {
+pub(crate) fn format_session_memory_display(body: &str, session_id: Option<&str>) -> String {
     if body.trim().is_empty() {
         return format!(
             "  {}\n  {}\n",
@@ -513,22 +506,38 @@ pub(crate) fn format_session_memory_display(body: &str) -> String {
     }
 
     let mut out = String::new();
-    out.push_str(&format!(
-        "\n  {}\n",
-        "── Session Memory ──────────────────────────────────────".dim()
-    ));
+    out.push_str(&format!("\n  {}", "── Session Memory".dim()));
+    if let Some(sid) = session_id {
+        out.push_str(&format!("    {} {}", "session:".dim(), sid.dim()));
+    }
+    out.push('\n');
 
     // Priority-ordered sections: actionable state first, then background
+    const PER_SECTION_LIMIT: usize = 12;
+    let mut sections_shown = 0usize;
     for (section_name, label) in SECTION_DISPLAY_NAMES {
         if let Some(content) = extract_md_section(body, section_name) {
             let trimmed = content.trim();
-            if !trimmed.is_empty() {
-                out.push_str(&format!("\n  {}\n", label.bold()));
-                for line in trimmed.lines().take(15) {
-                    out.push_str(&format!("    {line}\n"));
-                }
+            if trimmed.is_empty() {
+                continue;
+            }
+            sections_shown += 1;
+            out.push_str(&format!("\n  {}\n", label.bold()));
+            let lines: Vec<&str> = trimmed.lines().collect();
+            for line in lines.iter().take(PER_SECTION_LIMIT) {
+                out.push_str(&format!("    {line}\n"));
+            }
+            if lines.len() > PER_SECTION_LIMIT {
+                out.push_str(&format!(
+                    "    {}\n",
+                    format!("… {} more lines", lines.len() - PER_SECTION_LIMIT).dim()
+                ));
             }
         }
+    }
+
+    if sections_shown == 0 {
+        out.push_str(&format!("  {}\n", "No sections populated yet.".dim()));
     }
 
     out.push_str(&format!(
@@ -728,6 +737,433 @@ fn update_fenced_code_block_state(line: &str, active_fence: &mut Option<&'static
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Memory display helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Returns true if the memory content is an internal session-snapshot entry
+/// that should be hidden from general list/search output.
+fn is_session_proto(content: &str) -> bool {
+    content.trim_start().starts_with("[@session/memory]")
+}
+
+/// Build a short one-line display string for a raw memory JSON object.
+fn format_memory_entry_line(m: &serde_json::Value) -> String {
+    let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("?");
+    if let Some(entry) = prompts::memory_proto::MemoryEntry::parse(content) {
+        entry.display_line()
+    } else {
+        let mtype = m.get("memory_type").and_then(|v| v.as_str()).unwrap_or("?");
+        let preview: String = content
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(80)
+            .collect();
+        format!("[{mtype}] {preview}")
+    }
+}
+
+/// Render `/memory list`: group visible entries by memory_type, collapse session protos.
+fn render_memory_list(arr: &[serde_json::Value]) {
+    const TYPE_ORDER: &[(&str, &str)] = &[
+        ("semantic", "Semantic"),
+        ("profile", "Profile"),
+        ("procedural", "Procedural"),
+        ("episodic", "Episodic"),
+        ("working", "Working"),
+    ];
+
+    let mut session_count = 0usize;
+    let mut buckets: Vec<Vec<&serde_json::Value>> = vec![Vec::new(); TYPE_ORDER.len()];
+
+    for m in arr {
+        let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if is_session_proto(content) {
+            session_count += 1;
+            continue;
+        }
+        let mtype = m
+            .get("memory_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("semantic");
+        let idx = TYPE_ORDER
+            .iter()
+            .position(|(k, _)| *k == mtype)
+            .unwrap_or(0);
+        buckets[idx].push(m);
+    }
+
+    let total_visible: usize = buckets.iter().map(|b| b.len()).sum();
+    if total_visible == 0 && session_count == 0 {
+        eprintln!("  {}", "No memories stored yet.".dim());
+        return;
+    }
+
+    let mut counter = 1usize;
+    eprintln!();
+    for ((_, label), bucket) in TYPE_ORDER.iter().zip(buckets.iter()) {
+        if bucket.is_empty() {
+            continue;
+        }
+        eprintln!(
+            "  {}",
+            format!(
+                "── {label} ({}) ──────────────────────────────────────",
+                bucket.len()
+            )
+            .dim()
+        );
+        for m in bucket {
+            eprintln!(
+                "  {}. {}",
+                counter.to_string().magenta(),
+                format_memory_entry_line(m)
+            );
+            counter += 1;
+        }
+        eprintln!();
+    }
+    if session_count > 0 {
+        eprintln!(
+            "  {}",
+            format!("{session_count} session entries hidden — /memory session to view").dim()
+        );
+    }
+    eprintln!("  {} memories", total_visible.to_string().magenta());
+}
+
+/// Render `/memory search` results: numbered list with session protos filtered out.
+fn render_memory_search_results(arr: &[serde_json::Value], query: &str) {
+    let mut session_count = 0usize;
+    let mut visible: Vec<&serde_json::Value> = Vec::new();
+    for m in arr {
+        let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if is_session_proto(content) {
+            session_count += 1;
+        } else {
+            visible.push(m);
+        }
+    }
+    if visible.is_empty() {
+        eprintln!("  {}", format!("No results for {query:?}").dim());
+    } else {
+        for (i, m) in visible.iter().enumerate() {
+            let id = m
+                .get("id")
+                .or_else(|| m.get("memory_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let short_id = prefix_chars(id, 8);
+            eprintln!(
+                "  {}. {}  {}",
+                (i + 1).to_string().magenta(),
+                format_memory_entry_line(m),
+                short_id.dim()
+            );
+        }
+    }
+    if session_count > 0 {
+        eprintln!(
+            "  {}",
+            format!("({session_count} session entries hidden)").dim()
+        );
+    }
+}
+
+/// Pretty-print a single memory for `/memory show`.
+fn print_memory_detail(body: &str) {
+    if let Ok(m) = serde_json::from_str::<serde_json::Value>(body) {
+        let id = m
+            .get("memory_id")
+            .or_else(|| m.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let mtype = m.get("memory_type").and_then(|v| v.as_str()).unwrap_or("?");
+        let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("?");
+        let created = m.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        let tags: Vec<&str> = m
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|t| t.as_str()).collect())
+            .unwrap_or_default();
+
+        eprintln!("\n  Memory  {}", id.magenta());
+        eprintln!("  {}", "─".repeat(50).dim());
+        eprintln!("  {:<12}  {mtype}", "type".dim());
+        if !created.is_empty() {
+            eprintln!("  {:<12}  {created}", "created".dim());
+        }
+        if !tags.is_empty() {
+            eprintln!("  {:<12}  {}", "tags".dim(), tags.join(", "));
+        }
+        eprintln!("  {}", "─".repeat(50).dim());
+        for line in content.lines().take(20) {
+            eprintln!("  {line}");
+        }
+        let line_count = content.lines().count();
+        if line_count > 20 {
+            eprintln!("  {} ({} more lines)", "…".dim(), line_count - 20);
+        }
+        eprintln!();
+    } else {
+        print_json_or_raw(body);
+    }
+}
+
+/// Pretty-print a snapshots list.
+fn print_snapshots_list(body: &str) {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) => {
+            let arr = v
+                .as_array()
+                .or_else(|| v.get("snapshots").and_then(|s| s.as_array()));
+            match arr {
+                Some(snaps) if snaps.is_empty() => {
+                    eprintln!(
+                        "  {}",
+                        "No snapshots yet.  Create one: /memory snapshot [name]".dim()
+                    );
+                }
+                Some(snaps) => {
+                    eprintln!("\n  Snapshots  {}", format!("({})", snaps.len()).magenta());
+                    eprintln!("  {}", "─".repeat(50).dim());
+                    for snap in snaps {
+                        let name = snap.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                        let ts = snap
+                            .get("created_at")
+                            .or_else(|| snap.get("timestamp"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if ts.is_empty() {
+                            eprintln!("  {name}");
+                        } else {
+                            eprintln!("  {:<34}  {}", name, ts.dim());
+                        }
+                    }
+                    eprintln!();
+                }
+                None => print_json_or_raw(body),
+            }
+        }
+        Err(_) => eprintln!("  {}", body.trim()),
+    }
+}
+
+/// Pretty-print a branches list.
+fn print_branches_list(body: &str) {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) => {
+            let arr = v
+                .as_array()
+                .or_else(|| v.get("branches").and_then(|b| b.as_array()));
+            match arr {
+                Some(branches) if branches.is_empty() => {
+                    eprintln!(
+                        "  {}",
+                        "No branches yet.  Create one: /memory branch <name>".dim()
+                    );
+                }
+                Some(branches) => {
+                    eprintln!(
+                        "\n  Branches  {}",
+                        format!("({})", branches.len()).magenta()
+                    );
+                    eprintln!("  {}", "─".repeat(50).dim());
+                    for branch in branches {
+                        let name = branch.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                        let is_current = branch
+                            .get("current")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let marker = if is_current { "*" } else { " " };
+                        eprintln!("  {marker} {name}");
+                    }
+                    eprintln!();
+                }
+                None => print_json_or_raw(body),
+            }
+        }
+        Err(_) => eprintln!("  {}", body.trim()),
+    }
+}
+
+/// Pretty-print a memory reflect result.
+fn print_reflect_result(body: &str) {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) => {
+            eprintln!("\n  Memory Reflection");
+            eprintln!("  {}", "─".repeat(50).dim());
+            let summary = v
+                .get("summary")
+                .or_else(|| v.get("reflection"))
+                .or_else(|| v.get("result"))
+                .and_then(|v| v.as_str());
+            if let Some(txt) = summary {
+                for line in txt.lines() {
+                    eprintln!("  {line}");
+                }
+                eprintln!();
+            }
+            if let Some(insights) = v.get("insights").and_then(|v| v.as_array()) {
+                if !insights.is_empty() {
+                    eprintln!("  {}", "Insights:".dim());
+                    for item in insights {
+                        let s = item
+                            .as_str()
+                            .or_else(|| item.get("text").and_then(|v| v.as_str()))
+                            .unwrap_or("?");
+                        eprintln!("  • {s}");
+                    }
+                    eprintln!();
+                }
+            }
+            if summary.is_none()
+                && v.get("insights")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.is_empty())
+                    .unwrap_or(true)
+            {
+                print_json_or_raw(body);
+            }
+        }
+        Err(_) => eprintln!("  {}", body.trim()),
+    }
+}
+
+/// Pretty-print a memory health status.
+fn print_health_status(body: &str) {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) => {
+            eprintln!("\n  Memory Health");
+            eprintln!("  {}", "─".repeat(50).dim());
+            let status = v.get("status").and_then(|v| v.as_str()).unwrap_or("ok");
+            let icon = if status == "ok" || status == "healthy" {
+                "✓"
+            } else {
+                "⚠"
+            };
+            eprintln!("  {icon} {status}");
+            if let Some(total) = v
+                .get("total_memories")
+                .or_else(|| v.get("total"))
+                .and_then(|v| v.as_u64())
+            {
+                eprintln!(
+                    "  {:<22}  {}",
+                    "total memories:".dim(),
+                    total.to_string().magenta()
+                );
+            }
+            if let Some(gc) = v
+                .get("last_gc")
+                .or_else(|| v.get("last_consolidation"))
+                .and_then(|v| v.as_str())
+            {
+                eprintln!("  {:<22}  {gc}", "last consolidation:".dim());
+            }
+            if let Some(q) = v.get("quarantined").and_then(|v| v.as_u64()) {
+                if q > 0 {
+                    eprintln!("  {:<22}  {}", "quarantined:".dim(), q.to_string().yellow());
+                }
+            }
+            eprintln!();
+        }
+        Err(_) => eprintln!("  {}", body.trim()),
+    }
+}
+
+/// Pretty-print a branch/snapshot diff.
+fn print_memory_diff(body: &str, name: &str) {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) => {
+            let added = v.get("added").and_then(|v| v.as_array());
+            let removed = v.get("removed").and_then(|v| v.as_array());
+            let modified = v.get("modified").and_then(|v| v.as_array());
+            let total = added.map(|a| a.len()).unwrap_or(0)
+                + removed.map(|a| a.len()).unwrap_or(0)
+                + modified.map(|a| a.len()).unwrap_or(0);
+            if total == 0 {
+                eprintln!("  {} No differences vs '{name}'", "⋯".dim());
+                return;
+            }
+            eprintln!("\n  diff: {name}");
+            eprintln!("  {}", "─".repeat(50).dim());
+            for m in added.into_iter().flatten() {
+                eprintln!("  + {}", diff_entry_preview(m));
+            }
+            for m in removed.into_iter().flatten() {
+                eprintln!("  - {}", diff_entry_preview(m));
+            }
+            for m in modified.into_iter().flatten() {
+                eprintln!("  ~ {}", diff_entry_preview(m));
+            }
+            eprintln!();
+        }
+        Err(_) => print_json_or_raw(body),
+    }
+}
+
+fn diff_entry_preview(m: &serde_json::Value) -> String {
+    m.get("content")
+        .and_then(|v| v.as_str())
+        .map(|c| c.lines().next().unwrap_or("").chars().take(70).collect())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// Render `/memory stats`: count memories by type.
+fn render_memory_stats(arr: &[serde_json::Value]) {
+    const TYPE_ORDER: &[(&str, &str)] = &[
+        ("semantic", "Semantic"),
+        ("profile", "Profile"),
+        ("procedural", "Procedural"),
+        ("episodic", "Episodic"),
+        ("working", "Working"),
+    ];
+    let mut session_count = 0usize;
+    let mut counts = [0usize; 5];
+    for m in arr {
+        let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if is_session_proto(content) {
+            session_count += 1;
+            continue;
+        }
+        let mtype = m
+            .get("memory_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("semantic");
+        let idx = TYPE_ORDER
+            .iter()
+            .position(|(k, _)| *k == mtype)
+            .unwrap_or(0);
+        counts[idx] += 1;
+    }
+    let total: usize = counts.iter().sum();
+    eprintln!("\n  Memory Stats");
+    eprintln!("  {}", "─".repeat(30).dim());
+    for (i, (_, label)) in TYPE_ORDER.iter().enumerate() {
+        if counts[i] > 0 {
+            eprintln!(
+                "  {:<16}  {}",
+                format!("{label}:").dim(),
+                counts[i].to_string().magenta()
+            );
+        }
+    }
+    if session_count > 0 {
+        eprintln!(
+            "  {:<16}  {} {}",
+            "Session:".dim(),
+            session_count.to_string().dim(),
+            "(hidden)".dim()
+        );
+    }
+    eprintln!("  {}", "─".repeat(30).dim());
+    eprintln!("  {:<16}  {}", "Total:".dim(), total.to_string().magenta());
+    eprintln!();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,7 +1180,7 @@ mod tests {
 
     #[test]
     fn format_session_memory_display_empty_is_graceful() {
-        let result = format_session_memory_display("");
+        let result = format_session_memory_display("", None);
         assert!(
             result.contains("No session memory") || result.contains("not yet extracted"),
             "empty body should show a helpful message, got: {result:?}"
@@ -754,7 +1190,7 @@ mod tests {
     #[test]
     fn format_session_memory_display_shows_l0_content() {
         let body = "## L0 Critical\n- Goal: fix auth module\n";
-        let result = format_session_memory_display(body);
+        let result = format_session_memory_display(body, None);
         assert!(
             result.contains("fix auth module"),
             "should show L0 content, got: {result:?}"
@@ -764,7 +1200,7 @@ mod tests {
     #[test]
     fn format_session_memory_display_shows_goals_todos_completed() {
         let body = "## Active Goals\n- Refactor memory\n\n## Pending Todos\n- Write tests\n\n## Completed\n- Scaffold done\n";
-        let result = format_session_memory_display(body);
+        let result = format_session_memory_display(body, None);
         assert!(
             result.contains("Refactor memory"),
             "missing goals, got: {result:?}"
@@ -782,7 +1218,7 @@ mod tests {
     #[test]
     fn format_session_memory_display_omits_missing_sections() {
         let body = "## L0 Critical\n- only this section\n";
-        let result = strip_ansi(&format_session_memory_display(body));
+        let result = strip_ansi(&format_session_memory_display(body, None));
         // Missing sections must not produce empty labelled blocks
         assert!(
             !result.contains("📝 Important (L1)"),
