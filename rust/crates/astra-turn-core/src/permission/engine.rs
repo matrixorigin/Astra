@@ -519,20 +519,28 @@ pub fn evaluate_permission(
             );
         }
         if ctx.mode() == PermissionMode::Auto && !has_hard_violation {
-            // Soft git violation in auto mode: require explicit approval.
-            // Session overrides and allowlists must not bypass git safety checks.
-            let reason = format!("Git safety: {}", reasons.join(", "));
-            let decision = HardDecision::NeedExternal {
-                prompt: approval_prompt(tool_name, args, reason.clone(), risk_tags.clone()),
-            };
-            push_matched(&mut trace, EvaluationStep::GitSafety, &decision, &reason);
-            return envelope(
-                decision,
-                DecisionSource::GitSafety { violation: reason },
-                trace,
-                will_save,
-                risk_tags,
-            );
+            // Soft git violation in auto mode: allow.
+            // If there's an explicit allowlist, let ExplicitApprovalGate evaluate
+            // whether git is listed. Otherwise allow with GitSafety source.
+            if ctx.inherited.allowed_tools.is_some() {
+                push_skipped(
+                    &mut trace,
+                    EvaluationStep::GitSafety,
+                    &format!("auto mode soft violation, deferring to allowlist: {}", reasons.join(", ")),
+                );
+                // continue to ExplicitApprovalGate
+            } else {
+                let reason = format!("Git safety (auto-allow): {}", reasons.join(", "));
+                let decision = HardDecision::Allow;
+                push_matched(&mut trace, EvaluationStep::GitSafety, &decision, &reason);
+                return envelope(
+                    decision,
+                    DecisionSource::GitSafety { violation: reason },
+                    trace,
+                    will_save,
+                    risk_tags,
+                );
+            }
         } else {
             let reason = format!("Git safety: {}", reasons.join(", "));
             let decision = HardDecision::NeedExternal {
