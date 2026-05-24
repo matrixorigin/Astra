@@ -14,7 +14,7 @@ use astra_turn_core::cloud_session_memory_extract::{
 use astra_turn_types::session_facts::SessionFacts;
 
 use crate::memory_hooks::relevance::LlmConnParams;
-use crate::turn::cloud::memoria_compact::MemoriaClient;
+use crate::turn::cloud::memoria_compact::{MemoriaClient, MemoriaMemory};
 use crate::turn::llm::client::{
     apply_provider_auth, build_provider_request_body_with_overrides, global_llm_client,
     llm_request_url_for_provider, parse_nonstream_response_for_provider,
@@ -753,25 +753,7 @@ async fn purge_prior_session_memory_entries(
     const MAX_PAGES: usize = 8;
     let mut seen_memory_ids = std::collections::HashSet::new();
     for _ in 0..MAX_PAGES {
-        let mut memories = memoria
-            .retrieve_ext(
-                &format!("{SESSION_MEMORY_PREFIX} {session_id} session memory"),
-                Some(session_id),
-                PAGE_SIZE,
-                true,
-            )
-            .await
-            .map_err(|_| SessionMemoryExtractionErrorReason::PurgeFailed)?;
-        let legacy_memories = memoria
-            .retrieve_ext(
-                &format!("{LEGACY_SESSION_MEMORY_PREFIX} {session_id} session memory"),
-                Some(session_id),
-                PAGE_SIZE,
-                true,
-            )
-            .await
-            .map_err(|_| SessionMemoryExtractionErrorReason::PurgeFailed)?;
-        memories.extend(legacy_memories);
+        let memories = retrieve_prior_session_memory_page(memoria, session_id, PAGE_SIZE).await?;
 
         let to_delete: Vec<String> = memories
             .iter()
@@ -801,6 +783,13 @@ async fn purge_prior_session_memory_entries(
                 .map_err(|_| SessionMemoryExtractionErrorReason::PurgeFailed)?;
         }
     }
+    let remaining = retrieve_prior_session_memory_page(memoria, session_id, PAGE_SIZE).await?;
+    if !remaining.iter().any(|memory| {
+        decode_session_memory_snapshot(&memory.content, session_id).is_some()
+            || decode_legacy_session_memory_entry(&memory.content, session_id).is_some()
+    }) {
+        return Ok(());
+    }
     tracing::warn!(
         session_id = %session_id,
         page_size = PAGE_SIZE,
@@ -809,6 +798,33 @@ async fn purge_prior_session_memory_entries(
         "session memory purge hit page cap before exhausting prior entries"
     );
     Err(SessionMemoryExtractionErrorReason::PurgeFailed)
+}
+
+async fn retrieve_prior_session_memory_page(
+    memoria: &Arc<dyn MemoriaClient>,
+    session_id: &str,
+    page_size: usize,
+) -> Result<Vec<MemoriaMemory>, SessionMemoryExtractionErrorReason> {
+    let mut memories = memoria
+        .retrieve_ext(
+            &format!("{SESSION_MEMORY_PREFIX} {session_id} session memory"),
+            Some(session_id),
+            page_size,
+            true,
+        )
+        .await
+        .map_err(|_| SessionMemoryExtractionErrorReason::PurgeFailed)?;
+    let legacy_memories = memoria
+        .retrieve_ext(
+            &format!("{LEGACY_SESSION_MEMORY_PREFIX} {session_id} session memory"),
+            Some(session_id),
+            page_size,
+            true,
+        )
+        .await
+        .map_err(|_| SessionMemoryExtractionErrorReason::PurgeFailed)?;
+    memories.extend(legacy_memories);
+    Ok(memories)
 }
 
 fn build_rule_fallback_memory(
@@ -1022,6 +1038,12 @@ mod tests {
         next_id: Mutex<usize>,
     }
 
+    #[derive(Default)]
+    struct FiniteDeleteMemoria {
+        remaining: Mutex<usize>,
+        stored: Mutex<Vec<String>>,
+    }
+
     #[async_trait::async_trait]
     impl MemoriaClient for CapturingMemoria {
         async fn retrieve_ext(
@@ -1163,6 +1185,55 @@ mod tests {
         }
 
         async fn delete(&self, _memory_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MemoriaClient for FiniteDeleteMemoria {
+        async fn retrieve_ext(
+            &self,
+            query: &str,
+            _session_id: Option<&str>,
+            _top_k: usize,
+            _filter_session: bool,
+        ) -> Result<Vec<MemoriaMemory>, String> {
+            if query.starts_with(LEGACY_SESSION_MEMORY_PREFIX) {
+                return Ok(Vec::new());
+            }
+            let remaining = *self.remaining.lock().unwrap();
+            if remaining == 0 {
+                return Ok(Vec::new());
+            }
+            Ok(vec![MemoriaMemory {
+                memory_id: format!("mem-bounded-{remaining}"),
+                content: encode_session_memory_entry("sess-bounded", "# Session Memory\n\nbounded"),
+                memory_type: "working".to_string(),
+                session_id: Some("sess-bounded".to_string()),
+                ..Default::default()
+            }])
+        }
+
+        async fn store(
+            &self,
+            content: &str,
+            _memory_type: &str,
+            _session_id: Option<&str>,
+            _trust_tier: Option<&str>,
+        ) -> Result<String, String> {
+            self.stored.lock().unwrap().push(content.to_string());
+            Ok("mem-bounded-new".to_string())
+        }
+
+        async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
+            Ok(0)
+        }
+
+        async fn delete(&self, _memory_id: &str) -> Result<(), String> {
+            let mut remaining = self.remaining.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+            }
             Ok(())
         }
     }
@@ -1629,6 +1700,43 @@ mod tests {
             }
             _ => panic!("expected purge failure when page cap is exceeded"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_extraction_persists_when_final_probe_after_page_cap_is_empty() {
+        let memoria = Arc::new(FiniteDeleteMemoria {
+            remaining: Mutex::new(8),
+            stored: Mutex::new(Vec::new()),
+        });
+        let memoria_dyn = Arc::clone(&memoria) as Arc<dyn MemoriaClient>;
+        let artifacts = run_extraction(
+            &memoria_dyn,
+            "sess-bounded",
+            &sample_messages(),
+            3,
+            12_345,
+            "",
+            &SessionFacts::default(),
+            None,
+            Duration::from_secs(3),
+            256,
+        )
+        .await;
+
+        match artifacts {
+            ExtractionArtifacts::Persisted { .. } => {}
+            _ => panic!("expected persisted extraction"),
+        }
+        assert_eq!(
+            *memoria.remaining.lock().unwrap(),
+            0,
+            "all prior entries should be deleted before store"
+        );
+        assert_eq!(
+            memoria.stored.lock().unwrap().len(),
+            1,
+            "new session memory should still be stored after the final empty probe"
+        );
     }
 
     #[test]
