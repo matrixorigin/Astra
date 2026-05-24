@@ -240,6 +240,7 @@ pub enum ExtractionArtifacts {
     },
     LlmFailedPersistedFallback {
         error_reason: SessionMemoryExtractionErrorReason,
+        error_detail: Option<String>,
         bytes_written: u64,
         store_attempt: u32,
         content: String,
@@ -247,7 +248,14 @@ pub enum ExtractionArtifacts {
     PersistFailed {
         error_reason: SessionMemoryExtractionErrorReason,
         llm_error_reason: Option<SessionMemoryExtractionErrorReason>,
+        llm_error_detail: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LlmExtractionFailure {
+    reason: SessionMemoryExtractionErrorReason,
+    detail: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -289,6 +297,7 @@ pub async fn run_extraction(
             Err(error_reason) => ExtractionArtifacts::PersistFailed {
                 error_reason,
                 llm_error_reason: None,
+                llm_error_detail: None,
             },
         };
     };
@@ -320,6 +329,7 @@ pub async fn run_extraction(
             Err(error_reason) => ExtractionArtifacts::PersistFailed {
                 error_reason,
                 llm_error_reason: None,
+                llm_error_detail: None,
             },
         },
         Err(error_reason) => match store_session_memory(
@@ -332,14 +342,16 @@ pub async fn run_extraction(
         .await
         {
             Ok((bytes_written, store_attempt)) => ExtractionArtifacts::LlmFailedPersistedFallback {
-                error_reason,
+                error_reason: error_reason.reason,
+                error_detail: error_reason.detail,
                 bytes_written,
                 store_attempt,
                 content: fallback,
             },
             Err(store_error) => ExtractionArtifacts::PersistFailed {
                 error_reason: store_error,
-                llm_error_reason: Some(error_reason),
+                llm_error_reason: Some(error_reason.reason),
+                llm_error_detail: error_reason.detail,
             },
         },
     }
@@ -566,7 +578,7 @@ async fn update_memory_with_llm(
     params: &LlmConnParams,
     llm_timeout: Duration,
     max_output_tokens: usize,
-) -> Result<String, SessionMemoryExtractionErrorReason> {
+) -> Result<String, LlmExtractionFailure> {
     let prompt = build_extraction_prompt(current_memory, messages);
     let body = build_provider_request_body_with_overrides(
         &prompt,
@@ -589,26 +601,64 @@ async fn update_memory_with_llm(
         .no_proxy()
         .timeout(llm_timeout)
         .build()
-        .map_err(|_| SessionMemoryExtractionErrorReason::LlmError)?;
+        .map_err(|error| LlmExtractionFailure {
+            reason: SessionMemoryExtractionErrorReason::LlmError,
+            detail: Some(summarize_llm_detail(&error.to_string())),
+        })?;
     let request = client.post(url).header("content-type", "application/json");
     let request = apply_provider_auth(request, &params.provider, &params.api_key, None).json(&body);
 
     let response = match tokio::time::timeout(llm_timeout, request.send()).await {
         Ok(Ok(resp)) => resp,
         Ok(Err(error)) if error.is_timeout() => {
-            return Err(SessionMemoryExtractionErrorReason::LlmTimeout);
+            return Err(LlmExtractionFailure {
+                reason: SessionMemoryExtractionErrorReason::LlmTimeout,
+                detail: None,
+            });
         }
-        Ok(Err(_)) => return Err(SessionMemoryExtractionErrorReason::LlmError),
-        Err(_) => return Err(SessionMemoryExtractionErrorReason::LlmTimeout),
+        Ok(Err(error)) => {
+            return Err(LlmExtractionFailure {
+                reason: SessionMemoryExtractionErrorReason::LlmError,
+                detail: Some(summarize_llm_detail(&error.to_string())),
+            });
+        }
+        Err(_) => {
+            return Err(LlmExtractionFailure {
+                reason: SessionMemoryExtractionErrorReason::LlmTimeout,
+                detail: None,
+            });
+        }
     };
 
     let status = response.status();
-    let payload: Value = response
-        .json()
+    let body_text = response
+        .text()
         .await
-        .map_err(|_| SessionMemoryExtractionErrorReason::LlmError)?;
+        .map_err(|error| LlmExtractionFailure {
+            reason: SessionMemoryExtractionErrorReason::LlmError,
+            detail: Some(summarize_llm_detail(&format!(
+                "http {}: failed to read body: {error}",
+                status.as_u16()
+            ))),
+        })?;
+    let payload: Value =
+        serde_json::from_str(&body_text).map_err(|error| LlmExtractionFailure {
+            reason: SessionMemoryExtractionErrorReason::LlmError,
+            detail: Some(summarize_llm_detail(&format!(
+                "http {}: invalid json body ({error}): {}",
+                status.as_u16(),
+                extract_llm_error_detail(&body_text)
+            ))),
+        })?;
     if !status.is_success() {
-        return Err(SessionMemoryExtractionErrorReason::LlmError);
+        return Err(LlmExtractionFailure {
+            reason: SessionMemoryExtractionErrorReason::LlmError,
+            detail: Some(summarize_llm_detail(&format!(
+                "http {}: {}",
+                status.as_u16(),
+                extract_llm_error_detail_from_json(&payload)
+            ))),
+        });
     }
 
     let parsed = parse_nonstream_response_for_provider(
@@ -619,9 +669,33 @@ async fn update_memory_with_llm(
     );
     let content = parsed.full_text.trim();
     if content.is_empty() {
-        return Err(SessionMemoryExtractionErrorReason::EmptyResponse);
+        return Err(LlmExtractionFailure {
+            reason: SessionMemoryExtractionErrorReason::EmptyResponse,
+            detail: None,
+        });
     }
     Ok(content.to_string())
+}
+
+fn summarize_llm_detail(text: &str) -> String {
+    truncate_chars(&text.split_whitespace().collect::<Vec<_>>().join(" "), 220)
+}
+
+fn extract_llm_error_detail(body_text: &str) -> String {
+    match serde_json::from_str::<Value>(body_text) {
+        Ok(payload) => extract_llm_error_detail_from_json(&payload),
+        Err(_) => summarize_llm_detail(body_text),
+    }
+}
+
+fn extract_llm_error_detail_from_json(payload: &Value) -> String {
+    payload
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .or_else(|| payload.pointer("/message").and_then(Value::as_str))
+        .or_else(|| payload.pointer("/error/type").and_then(Value::as_str))
+        .map(summarize_llm_detail)
+        .unwrap_or_else(|| summarize_llm_detail(&payload.to_string()))
 }
 
 async fn store_session_memory(
@@ -1001,9 +1075,19 @@ mod tests {
         assert_request: Arc<dyn Fn(&str) + Send + Sync>,
         body: Value,
     ) -> (String, tokio::task::JoinHandle<()>) {
+        spawn_json_server_with_status(assert_request, 200, "OK", body).await
+    }
+
+    async fn spawn_json_server_with_status(
+        assert_request: Arc<dyn Fn(&str) + Send + Sync>,
+        status_code: u16,
+        reason_phrase: &str,
+        body: Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let body_text = body.to_string();
+        let reason_phrase = reason_phrase.to_string();
         let handle = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut buf = vec![0u8; 32 * 1024];
@@ -1011,7 +1095,7 @@ mod tests {
             let request = String::from_utf8_lossy(&buf[..n]).to_string();
             assert_request(&request);
             let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                "HTTP/1.1 {status_code} {reason_phrase}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body_text.len(),
                 body_text
             );
@@ -1249,6 +1333,7 @@ mod tests {
             ExtractionArtifacts::PersistFailed {
                 error_reason,
                 llm_error_reason,
+                llm_error_detail,
             } => {
                 assert_eq!(
                     error_reason,
@@ -1258,8 +1343,65 @@ mod tests {
                     llm_error_reason,
                     Some(SessionMemoryExtractionErrorReason::EmptyResponse)
                 );
+                assert_eq!(llm_error_detail, None);
             }
             _ => panic!("expected double-failure persist error"),
+        }
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_extraction_captures_http_error_detail_on_fallback() {
+        let (server_url, server_handle) = spawn_json_server_with_status(
+            Arc::new(|request: &str| {
+                assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+            }),
+            502,
+            "Bad Gateway",
+            json!({
+                "error": {
+                    "message": "upstream model gateway timed out"
+                }
+            }),
+        )
+        .await;
+
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>;
+        let params = LlmConnParams {
+            base_url: format!("{server_url}/v1"),
+            api_key: "test-key".to_string(),
+            model_name: "selector-openai".to_string(),
+            provider: "openai".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
+        };
+        let artifacts = run_extraction(
+            &memoria,
+            "sess-http-detail",
+            &sample_messages(),
+            1,
+            20_000,
+            "",
+            &SessionFacts::default(),
+            Some(&params),
+            Duration::from_secs(3),
+            512,
+        )
+        .await;
+
+        match artifacts {
+            ExtractionArtifacts::LlmFailedPersistedFallback {
+                error_reason,
+                error_detail,
+                ..
+            } => {
+                assert_eq!(error_reason, SessionMemoryExtractionErrorReason::LlmError);
+                assert_eq!(
+                    error_detail,
+                    Some("http 502: upstream model gateway timed out".to_string())
+                );
+            }
+            _ => panic!("expected llm-failed fallback persistence"),
         }
         server_handle.await.unwrap();
     }
@@ -1344,12 +1486,14 @@ mod tests {
             ExtractionArtifacts::PersistFailed {
                 error_reason,
                 llm_error_reason,
+                llm_error_detail,
             } => {
                 assert_eq!(
                     error_reason,
                     SessionMemoryExtractionErrorReason::PurgeFailed
                 );
                 assert_eq!(llm_error_reason, None);
+                assert_eq!(llm_error_detail, None);
             }
             _ => panic!("expected purge failure"),
         }

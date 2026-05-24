@@ -262,6 +262,7 @@ const MEMORY_SUBCOMMANDS: &[(&str, &str)] = &[
     ("ls", "Alias for list"),
     ("search", "Search memories by content (needs query)"),
     ("show", "Inspect one memory in detail (needs id)"),
+    ("inspect", "Alias for show (needs id)"),
     ("stats", "Count memories by type"),
     // ── Session ──
     ("session", "Show current session memory"),
@@ -554,11 +555,11 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── Memory & tasks ────────────────────────────────────────────────────
     CommandMeta::new(
         "/memory",
-        "Memoria: list, search <q>, inspect <id>, …",
+        "Memoria: list/search in-panel; show/session/stats/help via full command",
         CommandGroup::MemoryTasks,
     )
     .with_subcommands(MEMORY_SUBCOMMANDS)
-    .with_arg_hint("[list|search <q>|inspect <id>]"),
+    .with_arg_hint("[list|search <q>|show <id>|session|help]"),
     CommandMeta::new(
         "/task",
         "Tasks: list, add, done, status, run <prompt>, result <id>",

@@ -400,6 +400,7 @@ impl MemoryExtractionService {
             selector_model: None,
             attempt: None,
             llm_reason: None,
+            llm_detail: None,
         };
 
         enum Admission {
@@ -727,6 +728,7 @@ impl MemoryExtractionService {
                 ExtractionArtifacts::PersistFailed {
                     error_reason,
                     llm_error_reason,
+                    ..
                 } => {
                     if let Some(llm_error_reason) = llm_error_reason {
                         format!(
@@ -778,6 +780,7 @@ impl MemoryExtractionService {
                     },
                     attempt: Some(store_attempt),
                     llm_reason: None,
+                    llm_detail: None,
                 };
                 self.emit_success_event(
                     Some(&session_id),
@@ -810,6 +813,7 @@ impl MemoryExtractionService {
             }
             ExtractionArtifacts::LlmFailedPersistedFallback {
                 error_reason,
+                error_detail,
                 bytes_written,
                 store_attempt,
                 content,
@@ -832,6 +836,7 @@ impl MemoryExtractionService {
                     selector_model: selector_model_used.clone(),
                     attempt: Some(store_attempt),
                     llm_reason: Some(error_reason),
+                    llm_detail: error_detail.clone(),
                 };
                 self.emit_success_event(
                     Some(&session_id),
@@ -845,6 +850,7 @@ impl MemoryExtractionService {
                     session_id: session_id.clone(),
                     turn,
                     reason: error_reason,
+                    detail: error_detail.clone(),
                     duration_ms,
                 });
                 self.broker.emit(BackgroundActivity::Finished {
@@ -872,6 +878,7 @@ impl MemoryExtractionService {
             ExtractionArtifacts::PersistFailed {
                 error_reason,
                 llm_error_reason,
+                llm_error_detail,
             } => {
                 if llm_error_reason.is_some()
                     && let Some(name) = attempted_selector_model.as_deref()
@@ -893,12 +900,14 @@ impl MemoryExtractionService {
                     // field is omitted rather than misleadingly 0.
                     attempt: None,
                     llm_reason: llm_error_reason,
+                    llm_detail: llm_error_detail.clone(),
                 };
                 self.emit_error_event(Some(&session_id), turn, error_reason, duration_ms, &bc);
                 self.broker.emit(BackgroundActivity::Errored {
                     session_id: session_id.clone(),
                     turn,
                     reason: error_reason,
+                    detail: llm_error_detail.clone(),
                     duration_ms,
                 });
                 self.record_extraction_outcome(

@@ -920,12 +920,12 @@ fn memory_model_priority(
     // (has_selector_tag, off_compatible, incompatible):
     //   false,false means unknown/unprobed capability (including None option).
     match (has_selector_tag, off_compatible, incompatible) {
-        (true, true, _) => 0,  // selector + known off-compatible
-        (true, false, false) => 1, // selector + unknown capability
-        (false, true, _) => 2, // general + known off-compatible
+        (true, true, _) => 0,       // selector + known off-compatible
+        (true, false, false) => 1,  // selector + unknown capability
+        (false, true, _) => 2,      // general + known off-compatible
         (false, false, false) => 3, // general + unknown capability
-        (true, false, true) => 4, // selector + thinking-only (worst within selector)
-        (false, false, true) => 5, // general + thinking-only (worst overall)
+        (true, false, true) => 4,   // selector + thinking-only (worst within selector)
+        (false, false, true) => 5,  // general + thinking-only (worst overall)
     }
 }
 
@@ -3525,10 +3525,8 @@ mod tests {
         let unknown_general = memory_model_priority(false, None);
         let off_selector = memory_model_priority(true, Some(ThinkingCapability::None));
         let off_general = memory_model_priority(false, Some(ThinkingCapability::None));
-        let thinking_selector =
-            memory_model_priority(true, Some(ThinkingCapability::EffortOnly));
-        let thinking_general =
-            memory_model_priority(false, Some(ThinkingCapability::NativeOnly));
+        let thinking_selector = memory_model_priority(true, Some(ThinkingCapability::EffortOnly));
+        let thinking_general = memory_model_priority(false, Some(ThinkingCapability::NativeOnly));
 
         // Unknown is worse (higher number) than known off-compatible.
         assert!(off_selector < unknown_selector);

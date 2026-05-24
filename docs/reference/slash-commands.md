@@ -196,18 +196,23 @@ Show the last delivery report from plan execution.
 
 ### `/memory [subcommand]`
 
-Memoria semantic memory operations.
+Memoria memory operations. In the TUI, `list` and `search` open the memory panel; richer subcommands stay text-first.
 
-| Subcommand     | Description             |
-| -------------- | ----------------------- |
-| `list`         | List memories           |
-| `search <q>`   | Semantic search         |
-| `inspect <id>` | Inspect specific memory |
+| Subcommand     | Description                          |
+| -------------- | ------------------------------------ |
+| `list` / `ls`  | List memories                        |
+| `search <q>`   | Search memories by content           |
+| `show <id>`    | Inspect specific memory              |
+| `inspect <id>` | Alias for `show <id>`                |
+| `stats`        | Count memories by type               |
+| `session`      | Show current session memory          |
+| `help`         | Show the full `/memory` help surface |
 
 ```
 /memory list                     # List all
-/memory search "auth pattern"    # Semantic search
-/memory inspect mem_abc123       # Inspect by ID
+/memory search "auth pattern"    # Search memories
+/memory show mem_abc123          # Inspect by ID
+/memory session                  # Show current session memory
 ```
 
 ### `/task [subcommand]`

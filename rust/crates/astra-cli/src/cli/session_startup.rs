@@ -85,8 +85,8 @@ impl astra_runtime::session_memory::SelectorParamsResolver for CliSessionMemoryS
         model_names
             .into_iter()
             .zip(thinking_caps.into_iter().chain(std::iter::repeat(None)))
-            .map(
-                |(model_name, thinking_cap_str)| astra_runtime::memory_hooks::relevance::LlmConnParams {
+            .map(|(model_name, thinking_cap_str)| {
+                astra_runtime::memory_hooks::relevance::LlmConnParams {
                     base_url: format!("{}/v1", self.api.api_origin()),
                     api_key: token.clone(),
                     model_name,
@@ -95,8 +95,8 @@ impl astra_runtime::session_memory::SelectorParamsResolver for CliSessionMemoryS
                     thinking_capability: thinking_cap_str
                         .as_deref()
                         .and_then(|s| astra_services::models::ThinkingCapability::from_db(Some(s))),
-                },
-            )
+                }
+            })
             .collect()
     }
 }

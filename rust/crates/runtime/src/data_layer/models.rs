@@ -2,11 +2,11 @@ use astra_services::models::*;
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use astra_core::{error_response, ErrorResponse};
+use astra_core::{ErrorResponse, error_response};
 use axum::{
+    Json,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    Json,
 };
 
 pub async fn create_model_handler(

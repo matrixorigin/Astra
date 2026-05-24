@@ -193,14 +193,18 @@ fn handle_event(
             session_id,
             turn,
             reason,
+            detail,
             duration_ms,
             ..
         } => {
             *started_deadline = None;
-            let _ = tx.send(StreamEvent::StatusLine(format!(
-                "⚠ session memory extraction failed ({:?}, {}ms)",
-                reason, duration_ms
-            )));
+            let line = match detail {
+                Some(detail) if !detail.trim().is_empty() => format!(
+                    "⚠ session memory extraction failed ({reason:?}: {detail}, {duration_ms}ms)"
+                ),
+                _ => format!("⚠ session memory extraction failed ({reason:?}, {duration_ms}ms)"),
+            };
+            let _ = tx.send(StreamEvent::StatusLine(line));
             *showed_started = false;
             errored_extractions.insert((session_id, turn));
         }
@@ -301,6 +305,7 @@ mod tests {
             session_id: "s".into(),
             turn: 1,
             reason: SessionMemoryExtractionErrorReason::LlmError,
+            detail: None,
             duration_ms: 1200,
         });
         broker.emit(BackgroundActivity::Finished {
@@ -330,6 +335,7 @@ mod tests {
             session_id: "session-a".into(),
             turn: 1,
             reason: SessionMemoryExtractionErrorReason::LlmError,
+            detail: None,
             duration_ms: 1200,
         });
         broker.emit(BackgroundActivity::Finished {
@@ -389,6 +395,7 @@ mod tests {
             session_id: "s".into(),
             turn: 1,
             reason: SessionMemoryExtractionErrorReason::LlmTimeout,
+            detail: None,
             duration_ms: 30_000,
         });
         let lines = drain_status_lines(&mut rx).await;
@@ -465,6 +472,7 @@ mod tests {
             session_id: "after-lag".into(),
             turn: 2,
             reason: SessionMemoryExtractionErrorReason::LlmTimeout,
+            detail: None,
             duration_ms: 1000,
         });
         let lines = drain_status_lines(&mut rx).await;

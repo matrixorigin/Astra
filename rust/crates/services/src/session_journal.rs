@@ -983,6 +983,9 @@ pub struct SessionMemoryExtractionBreadcrumbs {
     /// When the LLM fails before the final persist error, keep that
     /// upstream reason so the journal reflects the full failure chain.
     pub llm_reason: Option<SessionMemoryExtractionErrorReason>,
+    /// Short human-readable detail for the upstream LLM failure (for
+    /// example an HTTP status or provider error message snippet).
+    pub llm_detail: Option<String>,
 }
 
 impl SessionMemoryExtractionOutcome {
@@ -1028,6 +1031,9 @@ impl SessionMemoryExtractionOutcome {
             }
             if let Some(llm_reason) = bc.llm_reason {
                 map.insert("llm_reason".into(), serde_json::json!(llm_reason));
+            }
+            if let Some(ref llm_detail) = bc.llm_detail {
+                map.insert("llm_detail".into(), serde_json::json!(llm_detail));
             }
         }
         obj

@@ -2900,6 +2900,9 @@ impl ToolExecutor {
                 let llm_reason = meta
                     .and_then(|m| m.get("llm_reason"))
                     .and_then(serde_json::Value::as_str);
+                let llm_detail = meta
+                    .and_then(|m| m.get("llm_detail"))
+                    .and_then(serde_json::Value::as_str);
                 let messages = meta
                     .and_then(|m| m.get("messages_count"))
                     .and_then(serde_json::Value::as_u64)
@@ -2913,6 +2916,9 @@ impl ToolExecutor {
                 }
                 if let Some(llm_reason) = llm_reason {
                     line.push_str(&format!(" llm_reason={llm_reason}"));
+                }
+                if let Some(llm_detail) = llm_detail {
+                    line.push_str(&format!(" llm_detail={llm_detail}"));
                 }
                 line.push_str(&format!(" model={model} messages={messages}"));
                 writeln!(out, "{line}").ok();
@@ -5325,6 +5331,7 @@ mod tests {
             selector_model: Some("haiku".to_string()),
             attempt: Some(1),
             llm_reason: None,
+            llm_detail: None,
         };
         writer
             .append(&astra_services::session_journal::JournalEvent::session_memory_extraction(
@@ -5371,6 +5378,7 @@ mod tests {
             llm_reason: Some(
                 astra_services::session_journal::SessionMemoryExtractionErrorReason::LlmError,
             ),
+            llm_detail: Some("http 502: upstream model gateway timed out".to_string()),
         };
         writer
             .append(&astra_services::session_journal::JournalEvent::session_memory_extraction(
@@ -5389,6 +5397,10 @@ mod tests {
         let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
         assert!(out.contains("extracted source=rule_fallback"), "{out}");
         assert!(out.contains("llm_reason=llm_error"), "{out}");
+        assert!(
+            out.contains("llm_detail=http 502: upstream model gateway timed out"),
+            "{out}"
+        );
         assert!(out.contains("model=haiku"), "{out}");
     }
 

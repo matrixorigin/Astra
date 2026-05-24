@@ -153,7 +153,7 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
                 // ─── Inspect one memory by id ──────────────────────
-                "show" if !sub_arg.is_empty() => {
+                "show" | "inspect" if !sub_arg.is_empty() => {
                     let memory_id = sub_arg.trim();
                     match super::edge_tools::memoria::memoria_show(memory_id).await {
                         Ok(body) => print_memory_detail(&body),
@@ -422,6 +422,7 @@ pub(super) async fn handle_memory_domain_command(
                         "  {}",
                         "    show <id>             Inspect one memory in detail".dim()
                     );
+                    eprintln!("  {}", "    inspect <id>          Alias for show".dim());
                     eprintln!(
                         "  {}",
                         "    stats                 Count memories by type".dim()
@@ -743,12 +744,13 @@ fn update_fenced_code_block_state(line: &str, active_fence: &mut Option<&'static
 
 /// Returns true if the memory content is an internal session-snapshot entry
 /// that should be hidden from general list/search output.
-fn is_session_proto(content: &str) -> bool {
-    content.trim_start().starts_with("[@session/memory]")
+pub(crate) fn is_session_proto(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with("[@session/memory]") || trimmed.starts_with("[@session/active]")
 }
 
 /// Build a short one-line display string for a raw memory JSON object.
-fn format_memory_entry_line(m: &serde_json::Value) -> String {
+pub(crate) fn format_memory_entry_line(m: &serde_json::Value) -> String {
     let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("?");
     if let Some(entry) = prompts::memory_proto::MemoryEntry::parse(content) {
         entry.display_line()
@@ -1041,43 +1043,22 @@ fn print_reflect_result(body: &str) {
 
 /// Pretty-print a memory health status.
 fn print_health_status(body: &str) {
-    match serde_json::from_str::<serde_json::Value>(body) {
-        Ok(v) => {
-            eprintln!("\n  Memory Health");
-            eprintln!("  {}", "─".repeat(50).dim());
-            let status = v.get("status").and_then(|v| v.as_str()).unwrap_or("ok");
-            let icon = if status == "ok" || status == "healthy" {
-                "✓"
-            } else {
-                "⚠"
-            };
-            eprintln!("  {icon} {status}");
-            if let Some(total) = v
-                .get("total_memories")
-                .or_else(|| v.get("total"))
-                .and_then(|v| v.as_u64())
-            {
-                eprintln!(
-                    "  {:<22}  {}",
-                    "total memories:".dim(),
-                    total.to_string().magenta()
-                );
+    for line in memory_health_lines(body) {
+        // Style labels dim, keep values/icon as-is.
+        if line.contains("total memories")
+            || line.contains("last consolidation")
+            || line.contains("quarantined")
+        {
+            if let Some((label, val)) = line.split_once(':') {
+                eprintln!("  {}{}:{}", label.trim().dim(), ":".dim(), val);
+                continue;
             }
-            if let Some(gc) = v
-                .get("last_gc")
-                .or_else(|| v.get("last_consolidation"))
-                .and_then(|v| v.as_str())
-            {
-                eprintln!("  {:<22}  {gc}", "last consolidation:".dim());
-            }
-            if let Some(q) = v.get("quarantined").and_then(|v| v.as_u64()) {
-                if q > 0 {
-                    eprintln!("  {:<22}  {}", "quarantined:".dim(), q.to_string().yellow());
-                }
-            }
-            eprintln!();
         }
-        Err(_) => eprintln!("  {}", body.trim()),
+        if line.starts_with("  ─") || line == "  Memory Health" {
+            eprintln!("{}", line.dim());
+        } else {
+            eprintln!("{line}");
+        }
     }
 }
 
@@ -1121,6 +1102,69 @@ fn diff_entry_preview(m: &serde_json::Value) -> String {
 
 /// Render `/memory stats`: count memories by type.
 fn render_memory_stats(arr: &[serde_json::Value]) {
+    for line in memory_stats_lines(arr) {
+        // Style: title/separator dim, labels dim, counts magenta.
+        if line.starts_with("  ─") || line == "  Memory Stats" {
+            eprintln!("{}", line.dim());
+            continue;
+        }
+        // Lines like "  Semantic        5" or "  Total:           15" or "  Session:         3 (hidden)"
+        if let Some((label, val)) = line.split_once("  ") {
+            let label = label.trim();
+            if !label.is_empty() && !val.is_empty() {
+                eprintln!("  {:<16}  {}", label.dim(), val.magenta());
+                continue;
+            }
+        }
+        eprintln!("{line}");
+    }
+}
+
+pub(crate) fn memory_health_lines(body: &str) -> Vec<String> {
+    if body.trim().is_empty() {
+        return vec!["  Memory health returned an empty response.".to_string()];
+    }
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) => {
+            let mut lines = vec![
+                String::new(),
+                "  Memory Health".to_string(),
+                format!("  {}", "─".repeat(50)),
+            ];
+            let status = v.get("status").and_then(|v| v.as_str()).unwrap_or("ok");
+            let icon = if status == "ok" || status == "healthy" {
+                "✓"
+            } else {
+                "⚠"
+            };
+            lines.push(format!("  {icon} {status}"));
+            if let Some(total) = v
+                .get("total_memories")
+                .or_else(|| v.get("total"))
+                .and_then(|v| v.as_u64())
+            {
+                lines.push(format!("  total memories:        {total}"));
+            }
+            if let Some(gc) = v
+                .get("last_gc")
+                .or_else(|| v.get("last_consolidation"))
+                .and_then(|v| v.as_str())
+            {
+                lines.push(format!("  last consolidation:    {gc}"));
+            }
+            if let Some(q) = v.get("quarantined").and_then(|v| v.as_u64()) {
+                if q > 0 {
+                    lines.push(format!("  quarantined:           {q}"));
+                }
+            }
+            lines.push(String::new());
+            lines
+        }
+        Err(_) => vec![format!("  {}", body.trim())],
+    }
+}
+
+pub(crate) fn memory_stats_lines(arr: &[serde_json::Value]) -> Vec<String> {
     const TYPE_ORDER: &[(&str, &str)] = &[
         ("semantic", "Semantic"),
         ("profile", "Profile"),
@@ -1147,28 +1191,23 @@ fn render_memory_stats(arr: &[serde_json::Value]) {
         counts[idx] += 1;
     }
     let total: usize = counts.iter().sum();
-    eprintln!("\n  Memory Stats");
-    eprintln!("  {}", "─".repeat(30).dim());
+    let mut lines = vec![
+        String::new(),
+        "  Memory Stats".to_string(),
+        format!("  {}", "─".repeat(30)),
+    ];
     for (i, (_, label)) in TYPE_ORDER.iter().enumerate() {
         if counts[i] > 0 {
-            eprintln!(
-                "  {:<16}  {}",
-                format!("{label}:").dim(),
-                counts[i].to_string().magenta()
-            );
+            lines.push(format!("  {label:<16}  {}", counts[i]));
         }
     }
     if session_count > 0 {
-        eprintln!(
-            "  {:<16}  {} {}",
-            "Session:".dim(),
-            session_count.to_string().dim(),
-            "(hidden)".dim()
-        );
+        lines.push(format!("  {:<16}  {} (hidden)", "Session:", session_count));
     }
-    eprintln!("  {}", "─".repeat(30).dim());
-    eprintln!("  {:<16}  {}", "Total:".dim(), total.to_string().magenta());
-    eprintln!();
+    lines.push(format!("  {}", "─".repeat(30)));
+    lines.push(format!("  {:<16}  {}", "Total:", total));
+    lines.push(String::new());
+    lines
 }
 
 #[cfg(test)]
@@ -1286,6 +1325,7 @@ mod tests {
             "list",
             "session",
             "edit",
+            "inspect",
         ] {
             assert!(
                 prod.contains(&format!("\"{cmd}\"")),
@@ -1309,6 +1349,7 @@ mod tests {
             "reflect",
             "health",
             "session",
+            "inspect",
         ] {
             assert!(
                 src.contains(&format!("  {cmd}")),
@@ -1319,6 +1360,13 @@ mod tests {
             src.contains("  edit <section>"),
             "/memory usage text missing edit <section>"
         );
+    }
+
+    #[test]
+    fn session_proto_detection_covers_legacy_and_active_entries() {
+        assert!(is_session_proto("[@session/memory] session_id=sess-1"));
+        assert!(is_session_proto("[@session/active] Active session state"));
+        assert!(!is_session_proto("[@fact/semantic] user prefers rust"));
     }
 
     #[test]

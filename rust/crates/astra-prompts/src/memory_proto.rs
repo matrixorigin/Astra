@@ -547,11 +547,16 @@ impl MemoryEntry {
 
     /// Format for display in CLI (one-line summary).
     pub fn display_line(&self) -> String {
-        let body_preview: String = self
-            .body
+        let preview_source = self
+            .compact_view()
             .lines()
             .next()
-            .unwrap_or("")
+            .unwrap_or(self.compact_view());
+        let body_preview: String = self
+            .compact_view()
+            .lines()
+            .next()
+            .unwrap_or(preview_source)
             .chars()
             .take(80)
             .collect();
@@ -912,6 +917,21 @@ mod tests {
         let line = e.display_line();
         assert!(line.len() < 200); // truncated to 80 chars + prefix
         assert!(line.starts_with("[fact/semantic]"));
+    }
+
+    #[test]
+    fn display_line_prefers_abstract_layer_over_detail() {
+        let e = MemoryEntry::new_layered(
+            "session",
+            "active",
+            "Abstract session summary",
+            Some("Overview paragraph"),
+            Some("{\"detail\":true}"),
+        );
+        assert_eq!(
+            e.display_line(),
+            "[session/active] Abstract session summary"
+        );
     }
 
     #[test]
