@@ -452,7 +452,7 @@ impl DefaultToolExecutor {
             // Consolidated git tool — single entry point for all git operations.
             "git" => string_to_result(crate::git_gix::git_dispatch(pr, args)),
             // Legacy aliases (backward compat during transition, will be removed).
-            "git_status" => string_to_result(crate::git_gix::git_status(pr)),
+            "git_status" => string_to_result(crate::git_gix::git_status(pr, args)),
             "git_diff" => string_to_result(crate::git_gix::git_diff(pr, args, 0.0, 0)),
             "git_log" => string_to_result(crate::git_gix::git_log(pr, args)),
             "git_show" => string_to_result(crate::git_gix::git_show(pr, args, 0.0, 0)),

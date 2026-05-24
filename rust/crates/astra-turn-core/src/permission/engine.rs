@@ -48,7 +48,9 @@
 //! persistence), so it is being migrated in stages; new pure checks should be
 //! added here first and consumed by call sites instead of being copied.
 
-use astra_sandbox::{is_dangerous_file_path, is_soft_violation, validate_git_command};
+use astra_sandbox::{
+    GitSafetyViolation, is_dangerous_file_path, is_soft_violation, validate_git_command,
+};
 use serde_json::Value;
 
 use crate::action_compensation::{explicit_approval_reason, primary_approval_reason};
@@ -455,53 +457,69 @@ pub fn evaluate_permission(
             );
         }
         SafetyMiddlewareDecision::Deny(reason) => {
-            let decision = HardDecision::Deny {
-                reason: reason.clone(),
-            };
-            push_matched(
-                &mut trace,
-                EvaluationStep::SafetyMiddleware,
-                &decision,
-                &reason,
-            );
-            return envelope(
-                decision,
-                DecisionSource::SafetyMiddleware { reason },
-                trace,
-                will_save,
-                risk_tags,
-            );
-        }
-    }
-
-    if is_execute_tool(tool_name, args) {
-        let git_violations = command_hint_from_args(args)
-            .map(validate_git_command)
-            .unwrap_or_default();
-        if !git_violations.is_empty() {
-            let reasons: Vec<String> = git_violations.iter().map(ToString::to_string).collect();
-            let has_hard_violation = git_violations.iter().any(|v| !is_soft_violation(v));
-            if ctx.mode() == PermissionMode::Deny {
+            // In auto mode, shell obfuscation rules (not catastrophic / destructive SQL)
+            // are relaxed: the user has delegated trust to the agent.
+            // Catastrophic commands (rm -rf /, fork bombs) and destructive SQL
+            // (DROP TABLE, etc.) remain hard-denied regardless of mode.
+            if ctx.mode() == PermissionMode::Auto
+                && reason.contains("shell_obfuscation")
+                && !reason.contains("catastrophic")
+            {
+                push_matched(
+                    &mut trace,
+                    EvaluationStep::SafetyMiddleware,
+                    &HardDecision::Allow,
+                    &format!("auto mode relaxed: {reason}"),
+                );
+                // continue to next step — do NOT return early
+            } else {
                 let decision = HardDecision::Deny {
-                    reason: "Git safety violation (deny mode)".to_string(),
+                    reason: reason.clone(),
                 };
                 push_matched(
                     &mut trace,
-                    EvaluationStep::GitSafety,
+                    EvaluationStep::SafetyMiddleware,
                     &decision,
-                    &reasons.join(", "),
+                    &reason,
                 );
                 return envelope(
                     decision,
-                    DecisionSource::GitSafety {
-                        violation: reasons.join(", "),
-                    },
+                    DecisionSource::SafetyMiddleware { reason },
                     trace,
                     will_save,
                     risk_tags,
                 );
             }
-            if ctx.mode() == PermissionMode::Auto && !has_hard_violation {
+        }
+    }
+
+    let git_violations = git_safety_violations_for_request(tool_name, args);
+    let mut git_safety_skip_note = "no git violation";
+    if !git_violations.is_empty() {
+        let reasons: Vec<String> = git_violations.iter().map(ToString::to_string).collect();
+        let has_hard_violation = git_violations.iter().any(|v| !is_soft_violation(v));
+        if ctx.mode() == PermissionMode::Deny {
+            let decision = HardDecision::Deny {
+                reason: "Git safety violation (deny mode)".to_string(),
+            };
+            push_matched(
+                &mut trace,
+                EvaluationStep::GitSafety,
+                &decision,
+                &reasons.join(", "),
+            );
+            return envelope(
+                decision,
+                DecisionSource::GitSafety {
+                    violation: reasons.join(", "),
+                },
+                trace,
+                will_save,
+                risk_tags,
+            );
+        }
+        if ctx.mode() == PermissionMode::Auto && !has_hard_violation {
+            if ctx.inherited.is_tool_allowed_by_allowlist(tool_name) {
                 let decision = HardDecision::Allow;
                 push_matched(
                     &mut trace,
@@ -519,6 +537,8 @@ pub fn evaluate_permission(
                     risk_tags,
                 );
             }
+            git_safety_skip_note = "soft git violation deferred to mode allowlist";
+        } else {
             let reason = format!("Git safety: {}", reasons.join(", "));
             let decision = HardDecision::NeedExternal {
                 prompt: approval_prompt(tool_name, args, reason.clone(), risk_tags.clone()),
@@ -533,7 +553,7 @@ pub fn evaluate_permission(
             );
         }
     }
-    push_skipped(&mut trace, EvaluationStep::GitSafety, "no git violation");
+    push_skipped(&mut trace, EvaluationStep::GitSafety, git_safety_skip_note);
 
     if let Some(path) = sensitive_path_match(args) {
         if ctx.mode() == PermissionMode::Deny {
@@ -1183,6 +1203,44 @@ fn is_execute_tool(tool_name: &str, args: &Value) -> bool {
     )
 }
 
+fn git_safety_violations_for_request(tool_name: &str, args: &Value) -> Vec<GitSafetyViolation> {
+    if is_execute_tool(tool_name, args) {
+        return command_hint_from_args(args)
+            .map(validate_git_command)
+            .unwrap_or_default();
+    }
+
+    structured_git_command_hint(tool_name, args)
+        .map(|command| validate_git_command(&command))
+        .unwrap_or_default()
+}
+
+fn structured_git_command_hint(tool_name: &str, args: &Value) -> Option<String> {
+    if tool_name != "git" {
+        return None;
+    }
+    let action = args.get("action").and_then(Value::as_str)?;
+    if action != "push"
+        || !args
+            .get("force_with_lease")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let mut command = String::from("git push --force-with-lease");
+    if let Some(remote) = args.get("remote").and_then(Value::as_str) {
+        command.push(' ');
+        command.push_str(remote);
+    }
+    if let Some(branch) = args.get("branch").and_then(Value::as_str) {
+        command.push(' ');
+        command.push_str(branch);
+    }
+    Some(command)
+}
+
 fn sensitive_path_match(args: &Value) -> Option<String> {
     if let Some(path) = path_hint_from_args(args)
         && !path.is_empty()
@@ -1339,6 +1397,7 @@ fn push_unique_fingerprint(
 
 fn risk_tags_for_request(tool_name: &str, args: &Value) -> Vec<RiskTag> {
     let mut tags = Vec::new();
+    let has_git_safety_violation = !git_safety_violations_for_request(tool_name, args).is_empty();
     if tool_name.starts_with("sandbox_expand:") {
         push_risk_tag(&mut tags, RiskTag::SandboxExpansion);
     }
@@ -1348,18 +1407,15 @@ fn risk_tags_for_request(tool_name: &str, args: &Value) -> Vec<RiskTag> {
     match cloud_gated_tool_kind_with_args(tool_name, Some(args)) {
         Some(CloudGatedToolKind::Execute) => {
             push_risk_tag(&mut tags, RiskTag::BashExecute);
-            if command_hint_from_args(args)
-                .map(validate_git_command)
-                .is_some_and(|violations| !violations.is_empty())
-            {
-                push_risk_tag(&mut tags, RiskTag::GitDestructive);
-            }
         }
         Some(CloudGatedToolKind::Write) if sensitive_path_match(args).is_some() => {
             push_risk_tag(&mut tags, RiskTag::WritesSensitiveFile);
         }
         Some(CloudGatedToolKind::Write) => {}
         None => {}
+    }
+    if has_git_safety_violation {
+        push_risk_tag(&mut tags, RiskTag::GitDestructive);
     }
     if tool_name == "mo_query"
         && let SafetyMiddlewareDecision::Deny(reason) =
@@ -1780,6 +1836,78 @@ mod tests {
         assert!(matches!(
             envelope.source,
             DecisionSource::ExecuteHardDeny { .. }
+        ));
+    }
+
+    #[test]
+    fn structured_git_force_push_feature_branch_is_soft_in_auto_mode() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let envelope = evaluate_permission(
+            "git",
+            &serde_json::json!({
+                "action": "push",
+                "remote": "origin",
+                "branch": "feature/my-branch",
+                "force_with_lease": true
+            }),
+            &ctx,
+        );
+
+        assert!(matches!(envelope.decision, HardDecision::Allow));
+        assert!(matches!(envelope.source, DecisionSource::GitSafety { .. }));
+        assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
+    }
+
+    #[test]
+    fn structured_git_force_push_protected_branch_requires_approval_in_auto_mode() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let envelope = evaluate_permission(
+            "git",
+            &serde_json::json!({
+                "action": "push",
+                "remote": "origin",
+                "branch": "main",
+                "force_with_lease": true
+            }),
+            &ctx,
+        );
+
+        assert!(matches!(
+            envelope.decision,
+            HardDecision::NeedExternal { .. }
+        ));
+        assert!(matches!(envelope.source, DecisionSource::GitSafety { .. }));
+        assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
+    }
+
+    #[test]
+    fn structured_git_force_push_respects_auto_allowlist() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Auto,
+                allowed_tools: Some(std::collections::HashSet::from(["read_file".to_string()])),
+                ..Default::default()
+            },
+        );
+        let envelope = evaluate_permission(
+            "git",
+            &serde_json::json!({
+                "action": "push",
+                "remote": "origin",
+                "branch": "feature/my-branch",
+                "force_with_lease": true
+            }),
+            &ctx,
+        );
+
+        assert!(matches!(envelope.decision, HardDecision::Deny { .. }));
+        assert!(matches!(
+            envelope.source,
+            DecisionSource::ExplicitApprovalGate { .. }
         ));
     }
 

@@ -293,6 +293,23 @@ fn validate_commit_ref(commit_ref: &str, param_name: &str) -> Result<String, Str
     Ok(trimmed.to_string())
 }
 
+fn validate_push_target(value: Option<&str>, param_name: &str) -> Result<String, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Err(format!("Error: missing required parameter '{param_name}'"));
+    };
+    if value.starts_with('-') {
+        return Err(format!("Error: {param_name} must not start with '-'"));
+    }
+    if value.contains('\0') || value.chars().any(char::is_control) {
+        return Err(format!("Error: {param_name} contains control characters"));
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(format!("Error: {param_name} must not contain whitespace"));
+    }
+    reject_shell_meta(value)?;
+    Ok(value.to_string())
+}
+
 fn resolve_commit_ref(project_root: &Path, commit_ref: &str) -> Option<String> {
     std::process::Command::new("git")
         .args(["rev-parse", "--verify", commit_ref])
@@ -575,7 +592,19 @@ fn format_author_date(sig: &gix::actor::SignatureRef<'_>) -> String {
 
 // ─── git_status ─────────────────────────────────────────────────────────────
 
-pub fn git_status(project_root: &Path) -> String {
+pub fn git_status(project_root: &Path, args: &Value) -> String {
+    // staged=true shows staged diff (index vs HEAD) instead of porcelain status
+    if let Some(true) = args.get("staged").and_then(Value::as_bool) {
+        let stat_only = args
+            .get("stat_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if stat_only {
+            return git_diff_stat_cli(project_root, args, SHOW_LIMIT);
+        }
+        return git_diff(project_root, args, 0.0, 0);
+    }
+
     let repo = match open_repo(project_root) {
         Ok(r) => r,
         Err(e) => return e,
@@ -2509,6 +2538,76 @@ pub fn git_stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecuti
     }
 }
 
+/// git push — push commits to a remote.
+///
+/// Parameters:
+/// - `remote` (string): remote name (required)
+/// - `branch` (string): branch to push (required)
+/// - `force_with_lease` (bool, default false): use --force-with-lease
+/// - `set_upstream` (bool, default false): set upstream tracking with -u
+pub fn git_push_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
+    let remote = match validate_push_target(args.get("remote").and_then(Value::as_str), "remote") {
+        Ok(remote) => remote,
+        Err(error) => return ToolExecutionOutcome::error(error),
+    };
+    let branch = match validate_push_target(args.get("branch").and_then(Value::as_str), "branch") {
+        Ok(branch) => branch,
+        Err(error) => return ToolExecutionOutcome::error(error),
+    };
+
+    let force_with_lease = args
+        .get("force_with_lease")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let set_upstream = args
+        .get("set_upstream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(project_root);
+    cmd.arg("push");
+
+    if force_with_lease {
+        cmd.arg("--force-with-lease");
+    }
+    if set_upstream {
+        cmd.arg("--set-upstream");
+    }
+
+    cmd.arg(remote);
+    cmd.arg(branch);
+
+    match cmd.output() {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if out.status.success() {
+                let result = stdout.trim();
+                let output = if result.is_empty() {
+                    "✓ Push successful".to_string()
+                } else {
+                    result.to_string()
+                };
+                ToolExecutionOutcome {
+                    output,
+                    tool_result_fields: None,
+                    is_error: false,
+                }
+            } else {
+                let err = stderr.trim();
+                ToolExecutionOutcome::error(format!("Error: git push failed: {err}"))
+            }
+        }
+        Err(e) => ToolExecutionOutcome::error(format!("Error: git push failed: {e}")),
+    }
+}
+
+/// Plain-text wrapper for git_push (used by tests and simple callers).
+pub fn git_push(project_root: &Path, args: &Value) -> String {
+    git_push_with_metadata(project_root, args).output
+}
+
 /// Consolidated `git` tool dispatcher. Routes `args.action` to the
 /// appropriate git sub-operation. Replaces 11 separate git_* tools with
 /// a single `git { action: "...", ...params }` interface.
@@ -2519,12 +2618,12 @@ pub fn git_dispatch(project_root: &Path, args: &Value) -> String {
             return "Missing required parameter: action. \
                     Use one of: status, diff, log, show, blame, \
                     file_history, log_search, contributors, commit, \
-                    revert_commit, stash"
+                    revert_commit, stash, push"
                 .to_string();
         }
     };
     match action {
-        "status" => git_status(project_root),
+        "status" => git_status(project_root, args),
         "diff" => git_diff(project_root, args, 0.0, 0),
         "log" => git_log(project_root, args),
         "show" => git_show(project_root, args, 0.0, 0),
@@ -2535,10 +2634,11 @@ pub fn git_dispatch(project_root: &Path, args: &Value) -> String {
         "commit" => git_commit_with_metadata(project_root, args).output,
         "revert_commit" => git_revert_commit_with_metadata(project_root, args).output,
         "stash" => git_stash_with_metadata(project_root, args).output,
+        "push" => git_push(project_root, args),
         other => format!(
             "Unknown git action: '{other}'. Valid actions: status, diff, log, \
              show, blame, file_history, log_search, contributors, commit, \
-             revert_commit, stash"
+             revert_commit, stash, push"
         ),
     }
 }
@@ -2687,12 +2787,64 @@ mod tests {
     #[test]
     fn git_status_returns_output() {
         let root = repo_root();
-        let result = git_status(&root);
+        let result = git_status(&root, &json!({}));
         assert!(
             result.contains("##")
                 || result.contains("nothing to commit")
                 || result.contains("Error"),
             "unexpected status: {result}"
+        );
+    }
+
+    #[test]
+    fn git_push_missing_remote_reports_error() {
+        let dir = init_temp_repo();
+        let result = git_push(dir.path(), &json!({"remote": "origin", "branch": "main"}));
+        // Should fail (no remote configured) but not crash
+        assert!(
+            result.contains("Error") || result.contains("fatal"),
+            "push without remote should report error: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn git_push_requires_explicit_remote_and_branch() {
+        let dir = init_temp_repo();
+
+        let missing_remote = git_push(dir.path(), &json!({"branch": "main"}));
+        assert!(
+            missing_remote.contains("missing required parameter 'remote'"),
+            "{missing_remote}"
+        );
+
+        let missing_branch = git_push(dir.path(), &json!({"remote": "origin"}));
+        assert!(
+            missing_branch.contains("missing required parameter 'branch'"),
+            "{missing_branch}"
+        );
+    }
+
+    #[test]
+    fn git_push_rejects_option_like_and_shell_meta_targets() {
+        let dir = init_temp_repo();
+
+        let option_remote = git_push(
+            dir.path(),
+            &json!({"remote": "--receive-pack=sh", "branch": "main"}),
+        );
+        assert!(
+            option_remote.contains("remote must not start with '-'"),
+            "{option_remote}"
+        );
+
+        let injected_branch = git_push(
+            dir.path(),
+            &json!({"remote": "origin", "branch": "main;echo-pwned"}),
+        );
+        assert!(
+            injected_branch.contains("disallowed characters"),
+            "{injected_branch}"
         );
     }
 
@@ -3230,7 +3382,7 @@ mod tests {
     #[test]
     fn git_status_shows_branch() {
         let root = repo_root();
-        let result = git_status(&root);
+        let result = git_status(&root, &json!({}));
         // Should show branch info or be clean
         assert!(
             result.contains("##")

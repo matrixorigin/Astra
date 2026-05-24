@@ -1042,7 +1042,7 @@ mod tests {
     #[test]
     fn git_status_returns_output() {
         let root = repo_root();
-        let result = git_status(&root);
+        let result = git_status(&root, &json!({}));
         assert!(
             result.contains("##")
                 || result.contains("nothing to commit")
@@ -1454,7 +1454,7 @@ mod tests {
     #[test]
     fn git_status_shows_branch() {
         let root = repo_root();
-        let result = git_status(&root);
+        let result = git_status(&root, &json!({}));
         // Should show branch info or be clean
         assert!(
             result.contains("##")

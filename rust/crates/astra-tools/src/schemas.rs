@@ -359,12 +359,17 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "git",
-                "description": "Git operations. Actions: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree.\n\n\
+                "description": "Git operations. Actions: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree, push.\n\n\
          ## Diff modes\n\
          - **Default (no flags)**: worktree vs index — shows UNSTAGED changes only (like `git diff`)\n\
-         - **staged=true**: index vs HEAD — shows `git add`ed changes (like `git diff --staged`)\n\
-         - **ref=<commit/branch/tag>**: compares that ref vs worktree\n\
-         - **ref + base_ref**: range diff base_ref..ref\n\n\
+         - **staged=true**: index vs HEAD — shows `git add`ed changes (like `git diff --staged`)\n\n\
+         ## Status\n\
+         - **Default**: shows `git status --porcelain` (all unstaged + untracked)\n\
+         - **staged=true**: shows staged changes only (like `git diff --staged`)\n\n\
+         ## Push\n\
+         - push requires explicit `remote` and `branch`\n\
+         - `force_with_lease=true` enables `--force-with-lease` (safer than bare --force)\n\
+         - `set_upstream=true` sets upstream tracking (`-u`)\n\n\
          ## Limits\n\
          - diff output capped at 40 KB; show output at 16 KB\n\
          - log / file_history `n` max: 500 (auto-throttled); log_search `n` default 200\n\
@@ -375,7 +380,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["status","diff","log","show","blame","file_history","log_search","contributors","commit","revert_commit","stash","checkout_file","worktree"],
+                            "enum": ["status","diff","log","show","blame","file_history","log_search","contributors","commit","revert_commit","stash","checkout_file","worktree","push"],
                             "description": "Git operation to perform"
                         },
                         "path": {
@@ -437,6 +442,22 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "stash_ref": {
                             "type": "string",
                             "description": "Exact stash selector or OID. Used by: stash with sub_action=apply. Takes precedence over index."
+                        },
+                        "remote": {
+                            "type": "string",
+                            "description": "Remote name (e.g. 'origin'). Used by: push (required)."
+                        },
+                        "branch": {
+                            "type": "string",
+                            "description": "Target branch name. Used by: push (required)."
+                        },
+                        "force_with_lease": {
+                            "type": "boolean",
+                            "description": "Use --force-with-lease (safer than bare --force). Used by: push. Default false."
+                        },
+                        "set_upstream": {
+                            "type": "boolean",
+                            "description": "Set upstream tracking (-u). Used by: push. Default false."
                         }
                     },
                     "required": ["action"],
@@ -447,7 +468,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "log_search": ["query"],
                         "stash": ["sub_action"],
                         "checkout_file": ["path", "ref"],
-                        "worktree": ["sub_action"]
+                        "worktree": ["sub_action"],
+                        "push": ["remote", "branch"]
                     }
                 }
             }

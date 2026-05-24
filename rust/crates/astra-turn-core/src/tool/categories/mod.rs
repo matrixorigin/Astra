@@ -185,6 +185,9 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("git_file_history", RO, GR),
     tool("git_contributors", RO, GR),
     tool("git_log_search", RO, GR),
+    // Consolidated git tool; action-aware classification below mirrors
+    // the legacy git_* aliases and fails closed when args are absent.
+    tool("git", MU, A),
     // ── Code intelligence (LSP-derived, read-only) ───────────────────
     tool("symbols", RO, CI.union(EX)),
     tool("find_definition", RO, CI.union(EX)),
@@ -655,6 +658,30 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
         }
     }
 
+    if name == "git" {
+        match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
+            Some(
+                "status" | "diff" | "log" | "show" | "blame" | "file_history" | "log_search"
+                | "contributors",
+            ) => {
+                meta_category = ToolCategory::ReadOnly;
+                meta_flags = GR;
+            }
+            Some("checkout_file" | "worktree") => {
+                meta_category = ToolCategory::Mutating;
+                meta_flags = NONE;
+            }
+            Some("commit" | "revert_commit" | "stash" | "push") | None => {
+                meta_category = ToolCategory::Mutating;
+                meta_flags = A;
+            }
+            Some(_) => {
+                meta_category = ToolCategory::Mutating;
+                meta_flags = A;
+            }
+        }
+    }
+
     let shell_read_only = meta_category.is_shell()
         && args
             .and_then(|a| a.get("command"))
@@ -692,6 +719,14 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
     } else if name == "task" {
         match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
             Some("list" | "get" | "output") => ToolIdempotency::PureRead,
+            _ => ToolIdempotency::NonIdempotent,
+        }
+    } else if name == "git" {
+        match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
+            Some(
+                "status" | "diff" | "log" | "show" | "blame" | "file_history" | "log_search"
+                | "contributors",
+            ) => ToolIdempotency::PureRead,
             _ => ToolIdempotency::NonIdempotent,
         }
     } else {
@@ -783,6 +818,27 @@ mod tests {
             assert!(r.is_git_read(name), "{name} should be git-read");
             assert!(r.is_never_restrict(name), "{name} should be never-restrict");
         }
+    }
+
+    #[test]
+    fn consolidated_git_is_action_aware() {
+        let status = classify("git", Some(&serde_json::json!({"action": "status"})));
+        assert_eq!(status.category, ToolCategory::ReadOnly);
+        assert!(!status.approval_required);
+        assert!(status.parallelizable);
+        assert_eq!(status.idempotency, ToolIdempotency::PureRead);
+
+        let push = classify(
+            "git",
+            Some(&serde_json::json!({
+                "action": "push",
+                "remote": "origin",
+                "branch": "feature/my-branch"
+            })),
+        );
+        assert_eq!(push.category, ToolCategory::Mutating);
+        assert!(push.approval_required);
+        assert_eq!(push.idempotency, ToolIdempotency::NonIdempotent);
     }
 
     #[test]

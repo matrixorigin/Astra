@@ -61,7 +61,44 @@ fn abort_git_revert(workspace_root: &Path) -> Result<bool, String> {
     }
 }
 
-pub fn status(workspace_root: &Path) -> ToolResult {
+fn validate_push_target(value: Option<&str>, param_name: &str) -> Result<String, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Err(format!("Error: missing required parameter '{param_name}'"));
+    };
+    if value.starts_with('-') {
+        return Err(format!("Error: {param_name} must not start with '-'"));
+    }
+    if value.contains('\0') || value.chars().any(char::is_control) {
+        return Err(format!("Error: {param_name} contains control characters"));
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(format!("Error: {param_name} must not contain whitespace"));
+    }
+    if value.chars().any(|c| {
+        matches!(
+            c,
+            ';' | '|' | '&' | '$' | '`' | '(' | ')' | '{' | '}' | '<' | '>' | '!' | '\n'
+        )
+    }) {
+        return Err(format!(
+            "Error: {param_name} contains disallowed characters: {value}"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+/// Git status — `--porcelain` output.
+/// Set `staged=true` to show staged changes only (via `git diff --staged`).
+pub fn status(workspace_root: &Path, args: &Value) -> ToolResult {
+    if let Some(true) = args.get("staged").and_then(|v| v.as_bool()) {
+        // Show staged changes (index vs HEAD)
+        let mut git_args = vec!["diff", "--staged"];
+        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+            git_args.push("--");
+            git_args.push(path);
+        }
+        return git_command(workspace_root, &git_args);
+    }
     git_command(workspace_root, &["status", "--porcelain", "-b"])
 }
 
@@ -164,6 +201,29 @@ pub fn commit(workspace_root: &Path, args: &Value) -> ToolResult {
     }
 }
 
+/// Git push — push to a remote branch.
+/// Requires `remote` and `branch`. Set `force_with_lease=true` for safe force push.
+pub fn push(workspace_root: &Path, args: &Value) -> ToolResult {
+    let mut git_args = vec!["push"];
+    if let Some(true) = args.get("force_with_lease").and_then(|v| v.as_bool()) {
+        git_args.push("--force-with-lease");
+    }
+    if let Some(true) = args.get("set_upstream").and_then(|v| v.as_bool()) {
+        git_args.push("--set-upstream");
+    }
+    let remote = match validate_push_target(args.get("remote").and_then(Value::as_str), "remote") {
+        Ok(remote) => remote,
+        Err(error) => return ToolResult::error(error),
+    };
+    let branch = match validate_push_target(args.get("branch").and_then(Value::as_str), "branch") {
+        Ok(branch) => branch,
+        Err(error) => return ToolResult::error(error),
+    };
+    git_args.push(&remote);
+    git_args.push(&branch);
+    git_command(workspace_root, &git_args)
+}
+
 pub fn revert_commit(workspace_root: &Path, args: &Value) -> ToolResult {
     let commit_ref = match args.get("commit_sha").and_then(|v| v.as_str()) {
         Some(commit_ref) if !commit_ref.trim().is_empty() => commit_ref.trim().to_string(),
@@ -233,12 +293,13 @@ pub fn revert_commit(workspace_root: &Path, args: &Value) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tempfile::TempDir;
 
     #[test]
     fn status_in_non_git_dir() {
         let tmp = TempDir::new().unwrap();
-        let result = status(tmp.path());
+        let result = status(tmp.path(), &json!({}));
         assert!(result.is_error);
     }
 
@@ -250,8 +311,38 @@ mod tests {
             .current_dir(tmp.path())
             .output()
             .unwrap();
-        let result = status(tmp.path());
+        let result = status(tmp.path(), &json!({}));
         assert!(!result.is_error);
+    }
+
+    #[test]
+    fn push_requires_safe_remote_and_branch() {
+        let tmp = TempDir::new().unwrap();
+        let missing = push(tmp.path(), &json!({"remote": "origin"}));
+        assert!(missing.is_error);
+        assert!(
+            missing
+                .output
+                .contains("missing required parameter 'branch'")
+        );
+
+        let option_remote = push(
+            tmp.path(),
+            &json!({"remote": "--receive-pack=sh", "branch": "main"}),
+        );
+        assert!(option_remote.is_error);
+        assert!(
+            option_remote
+                .output
+                .contains("remote must not start with '-'")
+        );
+
+        let injected_branch = push(
+            tmp.path(),
+            &json!({"remote": "origin", "branch": "main;echo-pwned"}),
+        );
+        assert!(injected_branch.is_error);
+        assert!(injected_branch.output.contains("disallowed characters"));
     }
 
     #[test]

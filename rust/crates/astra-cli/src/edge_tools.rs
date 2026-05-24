@@ -3414,7 +3414,7 @@ impl ToolExecutor {
                         .and_then(Value::as_str)
                         .unwrap_or("status");
                     match action {
-                        "status" => git_gix::git_status(&self.project_root),
+                        "status" => git_gix::git_status(&self.project_root, args),
                         "diff" => git_gix::git_diff(
                             &self.project_root,
                             args,
@@ -3439,12 +3439,13 @@ impl ToolExecutor {
                         "stash" => self.git_stash(args),
                         "checkout_file" => self.git_checkout_file(args),
                         "worktree" => self.git_worktree(args),
+                        "push" => git_gix::git_push(&self.project_root, args),
                         _ => format!(
-                            "Error: unknown git action '{action}'. Use one of: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree"
+                            "Error: unknown git action '{action}'. Use one of: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree, push"
                         ),
                     }
                 }
-                "git_status" => git_gix::git_status(&self.project_root),
+                "git_status" => git_gix::git_status(&self.project_root, args),
                 "git_diff" => git_gix::git_diff(
                     &self.project_root,
                     args,

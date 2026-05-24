@@ -81,7 +81,9 @@ impl std::fmt::Display for GitSafetyViolation {
 pub fn is_soft_violation(v: &GitSafetyViolation) -> bool {
     matches!(
         v,
-        GitSafetyViolation::CdGitCompound | GitSafetyViolation::CommitAmend
+        GitSafetyViolation::ForcePush
+            | GitSafetyViolation::CdGitCompound
+            | GitSafetyViolation::CommitAmend
     )
 }
 
