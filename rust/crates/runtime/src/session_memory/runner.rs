@@ -369,6 +369,24 @@ pub fn decode_session_memory_entry(raw: &str, session_id: &str) -> Option<String
         .or_else(|| decode_legacy_session_memory_entry(raw, session_id))
 }
 
+pub async fn load_current_session_memory(
+    memoria: &dyn MemoriaClient,
+    session_id: &str,
+) -> Option<String> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    let query = format!("{SESSION_MEMORY_PREFIX} {session_id} session memory");
+    let memories = memoria
+        .retrieve_ext(&query, Some(session_id), 5, true)
+        .await
+        .ok()?;
+    memories
+        .iter()
+        .find_map(|memory| decode_session_memory_entry(&memory.content, session_id))
+}
+
 pub fn decode_session_memory_overview(raw: &str, session_id: &str) -> Option<String> {
     decode_session_memory_snapshot(raw, session_id)?;
     let entry = MemoryEntry::parse(raw.trim())?;
@@ -1502,6 +1520,35 @@ mod tests {
         assert!(decoded.contains("## Current State"));
         assert!(decoded.contains("- hello"));
         assert!(decode_session_memory_entry(&encoded, "other").is_none());
+    }
+
+    #[tokio::test]
+    async fn load_current_session_memory_returns_only_matching_active_entry() {
+        let memoria = CapturingMemoria {
+            retrieve_results: Mutex::new(vec![
+                MemoriaMemory {
+                    content: encode_session_memory_entry("other", "# Session Memory\n\nignore me"),
+                    ..Default::default()
+                },
+                MemoriaMemory {
+                    content: encode_session_memory_entry("sess-42", "# Session Memory\n\nhello"),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let loaded = load_current_session_memory(&memoria, "sess-42")
+            .await
+            .expect("matching session memory should load");
+        assert!(loaded.contains("## Current State"));
+        assert!(loaded.contains("- hello"));
+        assert!(
+            load_current_session_memory(&memoria, "missing")
+                .await
+                .is_none()
+        );
+        assert!(load_current_session_memory(&memoria, "   ").await.is_none());
     }
 
     #[test]

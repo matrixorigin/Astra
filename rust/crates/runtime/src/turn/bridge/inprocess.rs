@@ -2037,6 +2037,16 @@ impl InProcessChatTurnBridge {
             );
             let bridge_selection_trace = edge_profile.get("recommended_tools").cloned();
             let bridge_restricted_snapshot = HashSet::new();
+            let initial_session_memory_entry = if let Some(memoria) = memoria_client_shared.as_ref() {
+                crate::turn::wire_assembly::session_memory_entry_for_pipeline(
+                    crate::session_memory::runner::load_current_session_memory(memoria, &session_id)
+                        .await
+                        .as_deref(),
+                    trace_turn,
+                )
+            } else {
+                None
+            };
             let pipeline_outcome = crate::turn::llm::context::assemble_bridge_context(
                 crate::turn::llm::context::BridgeContextAssemblyInput {
                     tool_surface:
@@ -2050,7 +2060,7 @@ impl InProcessChatTurnBridge {
                         &stable_sections,
                         &effective_dynamic_sections,
                         &memoria_prefetch_entries,
-                        None,
+                        initial_session_memory_entry,
                         selection_confidence,
                         task_type,
                     ),

@@ -2132,26 +2132,6 @@ impl ServerAgenticLoopHost {
         )
     }
 
-    fn run_turn_pipeline_with_cache_capability(
-        &mut self,
-        state: &mut AgenticLoopState,
-        visible_tools: &[Value],
-        provider: &str,
-        model_name: &str,
-        cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
-        user_content: &str,
-    ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
-        self.run_turn_pipeline_with_cache_capability_and_session_memory(
-            state,
-            visible_tools,
-            provider,
-            model_name,
-            cache_capability,
-            None,
-            user_content,
-        )
-    }
-
     fn run_turn_pipeline_with_cache_capability_and_session_memory(
         &mut self,
         state: &mut AgenticLoopState,
@@ -2551,12 +2531,20 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         //   * compaction tier selection
         //   * tier-pruned tool schemas
         // Runtime no longer re-derives any of these.
-        let turn_pipeline = self.run_turn_pipeline_with_cache_capability(
+        let initial_session_memory_entry =
+            if let Some(svc) = state.memory_extraction_service.as_ref() {
+                svc.current_session_memory_entry_for_pipeline(&self.session_id, state.session_turn)
+                    .await
+            } else {
+                None
+            };
+        let turn_pipeline = self.run_turn_pipeline_with_cache_capability_and_session_memory(
             state,
             &visible_tools,
             &llm_cfg.provider,
             &llm_cfg.model_name,
             llm_cfg.cache_capability,
+            initial_session_memory_entry,
             &user_content,
         )?;
         let PipelineTurnOutcome {

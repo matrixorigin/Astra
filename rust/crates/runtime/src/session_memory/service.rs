@@ -1040,6 +1040,17 @@ fn is_terminal_selector_failure(detail: Option<&str>) -> bool {
 }
 
 impl MemoryExtractionService {
+    pub async fn current_session_memory_entry_for_pipeline(
+        &self,
+        session_id: &str,
+        turn_number: u32,
+    ) -> Option<astra_turn_core::context_sources::MemoryEntry> {
+        let content =
+            super::runner::load_current_session_memory(self.memoria_client.as_ref(), session_id)
+                .await?;
+        crate::turn::wire_assembly::session_memory_entry_for_pipeline(Some(&content), turn_number)
+    }
+
     fn record_selector_failure(&self, model_name: &str, detail: Option<&str>) {
         if is_terminal_selector_failure(detail) {
             self.health.mark_terminal_failure(model_name);
@@ -1049,23 +1060,8 @@ impl MemoryExtractionService {
     }
 
     async fn load_current_memory(&self, session_id: &str) -> String {
-        let query = format!(
-            "{} {} session memory",
-            super::runner::SESSION_MEMORY_PREFIX,
-            session_id
-        );
-        let Ok(memories) = self
-            .memoria_client
-            .retrieve_ext(&query, Some(session_id), 5, true)
+        super::runner::load_current_session_memory(self.memoria_client.as_ref(), session_id)
             .await
-        else {
-            return String::new();
-        };
-        memories
-            .iter()
-            .find_map(|memory| {
-                super::runner::decode_session_memory_entry(&memory.content, session_id)
-            })
             .unwrap_or_default()
     }
 
