@@ -2039,9 +2039,12 @@ impl InProcessChatTurnBridge {
             let bridge_restricted_snapshot = HashSet::new();
             let initial_session_memory_entry = if let Some(memoria) = memoria_client_shared.as_ref() {
                 crate::turn::wire_assembly::session_memory_entry_for_pipeline(
-                    crate::session_memory::runner::load_current_session_memory(memoria, &session_id)
-                        .await
-                        .as_deref(),
+                    crate::session_memory::runner::load_current_session_memory_preferring_local(
+                        memoria,
+                        &session_id,
+                    )
+                    .await
+                    .as_deref(),
                     trace_turn,
                 )
             } else {

@@ -380,6 +380,7 @@ async fn build_cli_session_memory_extractor(
     let service = astra_runtime::session_memory::MemoryExtractionService::new(
         selector, memoria, ingestion, me.user_id, broker,
     )
+    .with_local_current_snapshot()
     .with_local_event_sink(build_cli_session_memory_event_sink());
     Some(std::sync::Arc::new(service))
 }

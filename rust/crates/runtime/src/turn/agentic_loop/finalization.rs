@@ -1728,7 +1728,8 @@ mod tests {
             ingestion,
             "test-user",
             Arc::new(crate::session_memory::BackgroundActivityBroker::new()),
-        ));
+        )
+        .with_local_current_snapshot());
         state.memory_extraction_service = Some(svc);
         (rx, memoria)
     }

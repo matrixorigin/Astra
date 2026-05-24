@@ -3,14 +3,13 @@
 //!
 //! Produces one unified artifact per turn: an L1 markdown document
 //! persisted to Memoria under the [`SESSION_MEMORY_PREFIX`] convention,
-//! keyed on `session_id`. Writes go through
-//! (legacy `persist_l1`, removed in wip-3)
-//! — same path as the pre-existing bridge write, now the only path.
+//! keyed on `session_id`. CLI edge-cloud mode can additionally require a
+//! local `session-memory.md` refresh before the extraction is considered
+//! successful for current-session UX.
 //!
-//! Read-side consumers (compaction injection,
-//! `crate::server::run::lifecycle::session_end_governance`, `session_cleanup`) all
-//! read from Memoria by prefix, so there's exactly one storage and one
-//! schema.
+//! Read-side consumers still share one schema. The durable store remains
+//! Memoria; the optional local artifact is only the CLI edge mode's
+//! current-session read model.
 //!
 //! Ownership model:
 //!
@@ -50,7 +49,7 @@ use super::observatory::{
     ExtractionTrigger, SessionMemoryObservatory, clip_preview,
 };
 use super::request::{ExtractionRequest, SpawnDecision};
-use super::runner::{ExtractionArtifacts, run_extraction};
+use super::runner::{ExtractionArtifacts, persist_local_session_memory_artifact, run_extraction};
 
 type LocalJournalEventSink = dyn Fn(&JournalEvent) + Send + Sync + 'static;
 
@@ -214,6 +213,7 @@ pub struct MemoryExtractionService {
     /// payloads or cache hashes by construction.
     observatory: Option<Arc<SessionMemoryObservatory>>,
     local_event_sink: Option<Arc<LocalJournalEventSink>>,
+    require_local_current_snapshot: bool,
 }
 
 impl std::fmt::Debug for MemoryExtractionService {
@@ -251,6 +251,7 @@ impl MemoryExtractionService {
             session_states: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             observatory: None,
             local_event_sink: None,
+            require_local_current_snapshot: false,
         }
     }
 
@@ -272,10 +273,31 @@ impl MemoryExtractionService {
         self
     }
 
+    /// Require a successful local `session-memory.md` refresh before the
+    /// extraction counts as success. CLI edge-cloud mode enables this so
+    /// `/memory session` reflects the same current-session artifact the
+    /// extractor just wrote; web/cloud runtimes leave it off because their
+    /// current-session read model is server-side.
+    pub fn with_local_current_snapshot(mut self) -> Self {
+        self.require_local_current_snapshot = true;
+        self
+    }
+
     /// Read-only handle to the observatory. `None` when the service
     /// was built without one. Callers: `introspect`, tests.
     pub fn observatory(&self) -> Option<&Arc<SessionMemoryObservatory>> {
         self.observatory.as_ref()
+    }
+
+    fn write_required_local_snapshot(
+        &self,
+        session_id: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        if !self.require_local_current_snapshot {
+            return Ok(());
+        }
+        persist_local_session_memory_artifact(session_id, content)
     }
 
     /// Live circuit breaker snapshot, for introspect. Cheap — no locks
@@ -793,6 +815,55 @@ impl MemoryExtractionService {
                 {
                     self.health.clear(name);
                 }
+                let selector_model_for_obs = match source {
+                    SessionMemoryExtractionSource::Llm => selector_model.clone(),
+                    SessionMemoryExtractionSource::RuleFallback => selector_model
+                        .clone()
+                        .or_else(|| resolved_selector_model.clone()),
+                };
+                if let Err(error) = self.write_required_local_snapshot(&session_id, &content) {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %error,
+                        "session_memory persisted remotely but could not refresh the required local current-session snapshot"
+                    );
+                    let bc = SessionMemoryExtractionBreadcrumbs {
+                        messages_count: Some(messages_count),
+                        selector_model: selector_model_for_obs.clone(),
+                        attempt: Some(store_attempt),
+                        llm_reason: None,
+                        llm_detail: None,
+                        persist_detail: Some(error.clone()),
+                    };
+                    self.emit_error_event(
+                        Some(&session_id),
+                        turn,
+                        SessionMemoryExtractionErrorReason::WriteFailed,
+                        duration_ms,
+                        &bc,
+                    );
+                    self.broker.emit(BackgroundActivity::Errored {
+                        session_id: session_id.clone(),
+                        turn,
+                        reason: SessionMemoryExtractionErrorReason::WriteFailed,
+                        detail: Some(error),
+                        duration_ms,
+                    });
+                    self.record_extraction_outcome(
+                        &session_id,
+                        turn,
+                        trigger,
+                        selector_model_for_obs,
+                        ObsExtractionOutcome::PersistFailed {
+                            reason: SessionMemoryExtractionErrorReason::WriteFailed.into(),
+                            llm_reason: None,
+                        },
+                        Vec::new(),
+                        String::new(),
+                        latency,
+                    );
+                    return;
+                }
                 self.mark_session_extracted(
                     &session_id,
                     req.current_tokens,
@@ -806,12 +877,7 @@ impl MemoryExtractionService {
                 });
                 let bc = SessionMemoryExtractionBreadcrumbs {
                     messages_count: Some(messages_count),
-                    selector_model: match source {
-                        SessionMemoryExtractionSource::Llm => selector_model.clone(),
-                        SessionMemoryExtractionSource::RuleFallback => selector_model
-                            .clone()
-                            .or_else(|| resolved_selector_model.clone()),
-                    },
+                    selector_model: selector_model_for_obs.clone(),
                     attempt: Some(store_attempt),
                     llm_reason: None,
                     llm_detail: None,
@@ -830,12 +896,7 @@ impl MemoryExtractionService {
                     &session_id,
                     turn,
                     trigger,
-                    match source {
-                        SessionMemoryExtractionSource::Llm => selector_model.clone(),
-                        SessionMemoryExtractionSource::RuleFallback => selector_model
-                            .clone()
-                            .or_else(|| resolved_selector_model.clone()),
-                    },
+                    selector_model_for_obs,
                     ObsExtractionOutcome::Persisted {
                         source: source.into(),
                         bytes_written,
@@ -861,6 +922,49 @@ impl MemoryExtractionService {
                 // model is marked unhealthy.
                 if let Some(g) = probe_guard.take() {
                     g.record_success();
+                }
+                if let Err(error) = self.write_required_local_snapshot(&session_id, &content) {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %error,
+                        "session_memory fallback persisted remotely but could not refresh the required local current-session snapshot"
+                    );
+                    let bc = SessionMemoryExtractionBreadcrumbs {
+                        messages_count: Some(messages_count),
+                        selector_model: selector_model.clone(),
+                        attempt: Some(store_attempt),
+                        llm_reason: Some(error_reason),
+                        llm_detail: error_detail.clone(),
+                        persist_detail: Some(error.clone()),
+                    };
+                    self.emit_error_event(
+                        Some(&session_id),
+                        turn,
+                        SessionMemoryExtractionErrorReason::WriteFailed,
+                        duration_ms,
+                        &bc,
+                    );
+                    self.broker.emit(BackgroundActivity::Errored {
+                        session_id: session_id.clone(),
+                        turn,
+                        reason: SessionMemoryExtractionErrorReason::WriteFailed,
+                        detail: Some(error),
+                        duration_ms,
+                    });
+                    self.record_extraction_outcome(
+                        &session_id,
+                        turn,
+                        trigger,
+                        selector_model.clone(),
+                        ObsExtractionOutcome::PersistFailed {
+                            reason: SessionMemoryExtractionErrorReason::WriteFailed.into(),
+                            llm_reason: Some(error_reason.into()),
+                        },
+                        Vec::new(),
+                        String::new(),
+                        latency,
+                    );
+                    return;
                 }
                 self.mark_session_extracted(
                     &session_id,
@@ -1067,9 +1171,16 @@ impl MemoryExtractionService {
         session_id: &str,
         turn_number: u32,
     ) -> Option<astra_turn_core::context_sources::MemoryEntry> {
-        let content =
+        let content = if self.require_local_current_snapshot {
+            super::runner::load_current_session_memory_preferring_local(
+                self.memoria_client.as_ref(),
+                session_id,
+            )
+            .await?
+        } else {
             super::runner::load_current_session_memory(self.memoria_client.as_ref(), session_id)
-                .await?;
+                .await?
+        };
         crate::turn::wire_assembly::session_memory_entry_for_pipeline(Some(&content), turn_number)
     }
 
@@ -1103,9 +1214,18 @@ impl MemoryExtractionService {
     }
 
     async fn load_current_memory(&self, session_id: &str) -> String {
-        super::runner::load_current_session_memory(self.memoria_client.as_ref(), session_id)
+        if self.require_local_current_snapshot {
+            super::runner::load_current_session_memory_preferring_local(
+                self.memoria_client.as_ref(),
+                session_id,
+            )
             .await
             .unwrap_or_default()
+        } else {
+            super::runner::load_current_session_memory(self.memoria_client.as_ref(), session_id)
+                .await
+                .unwrap_or_default()
+        }
     }
 
     // ── event emission helpers ────────────────────────────────────────
@@ -1327,6 +1447,23 @@ mod tests {
         TestCtx { svc, rx, memoria }
     }
 
+    fn build_ctx_with_local_snapshot(selector: Option<LlmConnParams>) -> TestCtx {
+        let (ingestion, rx) = IngestionSender::for_tests(256);
+        let broker = Arc::new(BackgroundActivityBroker::new());
+        let memoria = Arc::new(CapturingMemoria::default());
+        let svc = Arc::new(
+            MemoryExtractionService::new(
+                Arc::new(ConstSelectorResolver(selector)),
+                Arc::clone(&memoria) as Arc<dyn MemoriaClient>,
+                ingestion,
+                "test-user",
+                broker,
+            )
+            .with_local_current_snapshot(),
+        );
+        TestCtx { svc, rx, memoria }
+    }
+
     fn sample_req(session_id: &str, tokens: usize, had_error: bool) -> ExtractionRequest {
         ExtractionRequest {
             session_id: session_id.to_string(),
@@ -1429,6 +1566,87 @@ mod tests {
         let leftover = ctx.svc.wait_for_pending(Duration::from_secs(2)).await;
         assert_eq!(leftover, 0);
         assert_eq!(ctx.memoria.stored.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn persisted_extraction_writes_local_session_memory_artifact() {
+        use astra_services::SessionArtifactStore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let ctx = build_ctx_with_local_snapshot(None);
+        let sid = format!("local-session-memory-{}", nanos());
+        let req = meaningful_shutdown_req(&sid, 600);
+
+        assert_eq!(
+            ctx.svc.maybe_spawn_shutdown_flush(req),
+            SpawnDecision::Spawned
+        );
+        let leftover = ctx.svc.wait_for_pending(Duration::from_secs(2)).await;
+        assert_eq!(leftover, 0);
+
+        let path = astra_services::local_session_artifact_store()
+            .session_path(&sid, "session-memory.md")
+            .unwrap();
+        let body = std::fs::read_to_string(&path).expect("session-memory.md");
+        assert!(
+            body.contains("# Session Memory"),
+            "expected local session-memory artifact after successful extraction, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_extraction_without_local_snapshot_mode_skips_local_artifact_refresh() {
+        use astra_services::SessionArtifactStore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let ctx = build_ctx(None);
+        let sid = format!("remote-only-session-memory-{}", nanos());
+        let req = meaningful_shutdown_req(&sid, 600);
+
+        assert_eq!(
+            ctx.svc.maybe_spawn_shutdown_flush(req),
+            SpawnDecision::Spawned
+        );
+        let leftover = ctx.svc.wait_for_pending(Duration::from_secs(2)).await;
+        assert_eq!(leftover, 0);
+        assert_eq!(ctx.memoria.stored.lock().unwrap().len(), 1);
+
+        let path = astra_services::local_session_artifact_store()
+            .session_path(&sid, "session-memory.md")
+            .unwrap();
+        assert!(
+            !path.exists(),
+            "non-CLI mode should not require or materialize a local session-memory artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn required_local_snapshot_failure_surfaces_write_failed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let mut ctx = build_ctx_with_local_snapshot(None);
+        let sid = "bad/session-id";
+        let req = meaningful_shutdown_req(sid, 600);
+
+        assert_eq!(
+            ctx.svc.maybe_spawn_shutdown_flush(req),
+            SpawnDecision::Spawned
+        );
+        let leftover = ctx.svc.wait_for_pending(Duration::from_secs(2)).await;
+        assert_eq!(leftover, 0);
+        assert_eq!(ctx.memoria.stored.lock().unwrap().len(), 1);
+
+        let events = collect_extraction_events(&mut ctx.rx);
+        assert!(events.iter().any(|event| {
+            let metadata = event.metadata.as_ref().unwrap();
+            metadata["outcome"] == "errored" && metadata["reason"] == "write_failed"
+        }));
+        assert!(
+            ctx.svc.peek_state(sid).is_none(),
+            "current-session success state must not advance when the required local snapshot failed"
+        );
     }
 
     #[tokio::test]

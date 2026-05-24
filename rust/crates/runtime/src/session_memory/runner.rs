@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use astra_prompts::memory_proto::{MemoryEntry, NS_SESSION, ST_ACTIVE};
+use astra_services::SessionArtifactStore;
 use astra_services::session_journal::{
     SessionMemoryExtractionErrorReason, SessionMemoryExtractionSource,
 };
@@ -473,6 +474,32 @@ pub async fn load_current_session_memory(
     select_latest_session_memory(&memories, session_id)
 }
 
+pub fn load_local_session_memory_artifact(session_id: &str) -> Option<String> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    let path = astra_services::local_session_artifact_store()
+        .session_path(session_id, "session-memory.md")
+        .ok()?;
+    let body = std::fs::read_to_string(path).ok()?;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+pub async fn load_current_session_memory_preferring_local(
+    memoria: &dyn MemoriaClient,
+    session_id: &str,
+) -> Option<String> {
+    if let Some(local) = load_local_session_memory_artifact(session_id) {
+        return Some(local);
+    }
+    load_current_session_memory(memoria, session_id).await
+}
+
 fn select_latest_session_memory(memories: &[MemoriaMemory], session_id: &str) -> Option<String> {
     let mut latest_active: Option<(u32, String)> = None;
     // Legacy entries (pre-v2 schema) lack `updated_turn` metadata, so we
@@ -921,6 +948,38 @@ async fn store_session_memory(
         reason: SessionMemoryExtractionErrorReason::WriteFailed,
         detail: last_detail,
     })
+}
+
+pub fn persist_local_session_memory_artifact(
+    session_id: &str,
+    content: &str,
+) -> Result<(), String> {
+    let path = astra_services::local_session_artifact_store()
+        .session_path(session_id, "session-memory.md")?;
+    let Some(parent) = path.parent() else {
+        return Err(format!(
+            "session-memory path has no parent: {}",
+            path.display()
+        ));
+    };
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create session-memory dir {}: {error}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid session-memory file name: {}", path.display()))?;
+    let tmp_path = path.with_file_name(format!("{file_name}.tmp"));
+    std::fs::write(&tmp_path, content)
+        .map_err(|error| format!("write session-memory tmp {}: {error}", tmp_path.display()))?;
+    if let Err(error) = std::fs::rename(&tmp_path, &path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!(
+            "rename session-memory tmp {} -> {}: {error}",
+            tmp_path.display(),
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 async fn purge_prior_session_memory_entries(
@@ -2247,6 +2306,42 @@ mod tests {
 
         assert!(loaded.contains("- newer"));
         assert!(!loaded.contains("- older"));
+    }
+
+    #[tokio::test]
+    async fn load_current_session_memory_preferring_local_uses_local_artifact_first() {
+        use astra_services::SessionArtifactStore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = "sess-local-first";
+        let path = astra_services::local_session_artifact_store()
+            .session_path(session_id, "session-memory.md")
+            .unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "# Session Memory\n\n## Current State\n- local snapshot wins\n",
+        )
+        .unwrap();
+
+        let memoria = CapturingMemoria {
+            retrieve_results: Mutex::new(vec![MemoriaMemory {
+                content: encode_session_memory_entry(
+                    session_id,
+                    "# Session Memory\n\n## Current State\n- remote snapshot",
+                ),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let loaded = load_current_session_memory_preferring_local(&memoria, session_id)
+            .await
+            .expect("local session-memory artifact should load");
+
+        assert!(loaded.contains("- local snapshot wins"));
+        assert!(!loaded.contains("- remote snapshot"));
     }
 
     #[test]

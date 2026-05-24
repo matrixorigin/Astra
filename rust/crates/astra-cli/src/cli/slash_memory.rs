@@ -923,6 +923,9 @@ pub(crate) async fn load_current_session_memory(
     session_id: &str,
 ) -> Result<Option<SessionMemoryRecord>, String> {
     const SESSION_MEMORY_TOP_K: usize = 64;
+    if let Some(record) = load_local_session_memory(session_id) {
+        return Ok(Some(record));
+    }
     let typed_payload = serde_json::json!({
         "query": astra_runtime::session_memory::runner::SESSION_MEMORY_PREFIX,
         "top_k": SESSION_MEMORY_TOP_K,
@@ -1065,9 +1068,12 @@ async fn store_current_session_memory(
     memory_id: Option<&str>,
     body: &str,
 ) -> Result<(), String> {
+    astra_runtime::session_memory::runner::persist_local_session_memory_artifact(session_id, body)
+        .map_err(|error| format!("current session memory write failed: {error}"))?;
     let encoded =
         astra_runtime::session_memory::runner::encode_session_memory_entry(session_id, body);
-    if let Some(memory_id) = memory_id {
+    let remote_memory_id = memory_id.filter(|memory_id| *memory_id != "local-session-memory");
+    if let Some(memory_id) = remote_memory_id {
         let path = format!("/memory/{memory_id}/correct");
         let payload = serde_json::json!({
             "new_content": encoded,
@@ -1075,7 +1081,7 @@ async fn store_current_session_memory(
         });
         api.put_bearer_path_json_text(token, &path, &payload)
             .await
-            .map_err(|error| format!("memory update failed: {error}"))?;
+            .map_err(|error| format!("current session memory updated locally but cloud sync failed: {error}"))?;
         return Ok(());
     }
 
@@ -1087,13 +1093,16 @@ async fn store_current_session_memory(
     let response = api
         .post_memory_store_json(token, &payload)
         .await
-        .map_err(|error| format!("memory store failed: {error}"))?;
+        .map_err(|error| format!("current session memory updated locally but cloud sync failed: {error}"))?;
     if response.status().is_success() {
         Ok(())
     } else {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        Err(format!("memory store failed ({status}): {}", body.trim()))
+        Err(format!(
+            "current session memory updated locally but cloud sync failed ({status}): {}",
+            body.trim()
+        ))
     }
 }
 
@@ -1939,6 +1948,121 @@ mod tests {
         assert!(record.body.contains("# Session Memory"));
 
         std::fs::remove_file(&path).expect("remove session memory");
+    }
+
+    #[tokio::test]
+    async fn load_current_session_memory_prefers_local_artifact() {
+        let session_id = format!(
+            "sess-local-first-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let path = astra_services::local_session_artifact_store()
+            .session_path(&session_id, "session-memory.md")
+            .expect("session path");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create session dir");
+        }
+        std::fs::write(
+            &path,
+            "# Session Memory\n\n## Current State\nPrefer the local session-memory artifact for the current session.\n",
+        )
+        .expect("write session memory");
+
+        let api =
+            astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).expect("thin client");
+        let record = load_current_session_memory(&api, "", &session_id)
+            .await
+            .expect("load session memory")
+            .expect("record");
+        assert_eq!(record.memory_id, "local-session-memory");
+        assert!(
+            record
+                .body
+                .contains("Prefer the local session-memory artifact")
+        );
+
+        std::fs::remove_file(&path).expect("remove session memory");
+    }
+
+    #[tokio::test]
+    async fn store_current_session_memory_rejects_invalid_local_session_id_before_cloud_sync() {
+        let api =
+            astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).expect("thin client");
+        let error = store_current_session_memory(
+            &api,
+            "",
+            "bad/session-id",
+            None,
+            "# Session Memory\n\n## Current State\nshould fail locally first\n",
+        )
+        .await
+        .expect_err("invalid session id should fail before any cloud sync");
+
+        assert!(error.contains("current session memory write failed"));
+    }
+
+    #[tokio::test]
+    async fn store_current_session_memory_reports_local_success_when_cloud_sync_fails() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = format!(
+            "sess-store-local-first-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let api =
+            astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).expect("thin client");
+        let body = "# Session Memory\n\n## Current State\nlocal write should land before cloud sync\n";
+
+        let error = store_current_session_memory(&api, "", &session_id, None, body)
+            .await
+            .expect_err("unreachable cloud should fail after local write");
+
+        assert!(error.contains("updated locally but cloud sync failed"));
+        let path = astra_services::local_session_artifact_store()
+            .session_path(&session_id, "session-memory.md")
+            .expect("session path");
+        let written = std::fs::read_to_string(path).expect("local session-memory.md");
+        assert!(written.contains("local write should land before cloud sync"));
+    }
+
+    #[tokio::test]
+    async fn store_current_session_memory_treats_local_artifact_id_as_create_not_correct() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = format!(
+            "sess-local-artifact-id-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/memory/store"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+
+        store_current_session_memory(
+            &api,
+            "token",
+            &session_id,
+            Some("local-session-memory"),
+            "# Session Memory\n\n## Current State\nsynthetic local ids must store remotely\n",
+        )
+        .await
+        .expect("synthetic local ids should create/store remotely");
     }
 
     // ── /memory subcommand contracts ──
