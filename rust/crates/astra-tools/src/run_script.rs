@@ -52,8 +52,8 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -62,10 +62,10 @@ use tokio::io::{AsyncReadExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 
-use crate::rpc_bridge::{
-    handle_rpc_connection, kill_process_group, AuthToken, RpcOutcome, RpcPolicy, STDOUT_HEAD_RATIO,
-};
 use crate::ToolExecutor;
+use crate::rpc_bridge::{
+    AuthToken, RpcOutcome, RpcPolicy, STDOUT_HEAD_RATIO, handle_rpc_connection, kill_process_group,
+};
 
 // Re-export only what external callers need. The char-boundary helpers are
 // implementation details of `truncate_head_tail`; keep them crate-private.
