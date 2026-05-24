@@ -855,7 +855,7 @@ async fn store_current_session_memory(
 /// Returns content between the header and the next `##` header (exclusive).
 fn extract_md_section(md: &str, section_name: &str) -> Option<String> {
     let (_, content_start, section_end) = find_md_section_bounds(md, section_name)?;
-    Some(md[content_start..section_end].to_string())
+    sanitize_md_section_content(&md[content_start..section_end])
 }
 
 /// Replace (or append) a `## SectionName` block in a markdown string.
@@ -887,6 +887,26 @@ fn normalize_section_content(content: &str) -> String {
     } else {
         format!("{content}\n")
     }
+}
+
+fn sanitize_md_section_content(content: &str) -> Option<String> {
+    let section_body = content.trim();
+    if section_body.is_empty()
+        || (section_body.starts_with("<!--")
+            && section_body.ends_with("-->")
+            && section_body.matches("-->").count() == 1)
+    {
+        return None;
+    }
+    let stripped = if section_body.starts_with("<!--") {
+        match section_body.find("-->") {
+            Some(after_comment) => section_body[after_comment + 3..].trim(),
+            None => section_body,
+        }
+    } else {
+        section_body
+    };
+    (!stripped.is_empty()).then(|| stripped.to_string())
 }
 
 fn find_md_section_bounds(md: &str, section_name: &str) -> Option<(usize, usize, usize)> {
@@ -1497,6 +1517,16 @@ mod tests {
     }
 
     #[test]
+    fn format_session_memory_display_hides_template_comment_sections() {
+        let body = "## Active Goals\n<!-- Current goals explicitly stated by the user or assistant. Do NOT invent goals. -->\n\n## Pending Todos\n- real todo\n";
+        let result = strip_ansi(&format_session_memory_display(body, None, None));
+        assert!(!result.contains("Current goals explicitly stated"));
+        assert!(!result.contains("🎯 Active Goals"));
+        assert!(result.contains("📌 Pending Todos"));
+        assert!(result.contains("real todo"));
+    }
+
+    #[test]
     fn select_session_memory_record_decodes_protocol_entry() {
         let payload = serde_json::json!({
             "memories": [
@@ -1657,7 +1687,7 @@ mod tests {
     fn extract_md_section_returns_exact_named_section() {
         let body = "## Active Goals\n- old goal\n\n## Pending Todos\n- do stuff\n";
         let result = extract_md_section(body, "Active Goals").expect("section exists");
-        assert_eq!(result, "- old goal\n\n");
+        assert_eq!(result, "- old goal");
     }
 
     #[test]
@@ -1676,6 +1706,19 @@ mod tests {
             !result.ends_with("## Pending Todos\n- real todo\n"),
             "next real section should not leak into extracted section: {result:?}"
         );
+    }
+
+    #[test]
+    fn extract_md_section_treats_single_comment_placeholder_as_empty() {
+        let body = "## Active Goals\n<!-- Current goals explicitly stated by the user or assistant. Do NOT invent goals. -->\n\n## Pending Todos\n- real todo\n";
+        assert!(extract_md_section(body, "Active Goals").is_none());
+    }
+
+    #[test]
+    fn extract_md_section_strips_leading_comment_placeholder() {
+        let body = "## Active Goals\n<!-- Current goals explicitly stated by the user or assistant. Do NOT invent goals. -->\n- real goal\n\n## Pending Todos\n- real todo\n";
+        let result = extract_md_section(body, "Active Goals").expect("section exists");
+        assert_eq!(result, "- real goal");
     }
 
     #[test]
