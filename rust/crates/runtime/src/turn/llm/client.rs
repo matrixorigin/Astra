@@ -1512,6 +1512,8 @@ pub(crate) fn build_provider_request_body_with_overrides(
     thinking: &astra_turn_core::thinking_config::ThinkingConfig,
     request_body_overrides: Option<&Map<String, Value>>,
 ) -> Value {
+    let sanitized_overrides =
+        sanitize_request_body_overrides_for_thinking(thinking, request_body_overrides);
     match llm_provider_protocol(provider) {
         LlmProviderProtocol::BedrockConverse => {
             let repaired = repair_openai_tool_pairing_for_bedrock(messages);
@@ -1552,7 +1554,7 @@ pub(crate) fn build_provider_request_body_with_overrides(
             if thinking.is_enabled() {
                 assert_bedrock_thinking_signature_contract(&bedrock_messages);
             }
-            apply_request_body_overrides(&mut body, request_body_overrides);
+            apply_request_body_overrides(&mut body, sanitized_overrides.as_ref());
             body
         }
         LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::OpenAiCompatible => {
@@ -1580,7 +1582,7 @@ pub(crate) fn build_provider_request_body_with_overrides(
                     body["tool_choice"] = json!({"type": "auto"});
                 }
                 thinking.apply_anthropic(&mut body);
-                apply_request_body_overrides(&mut body, request_body_overrides);
+                apply_request_body_overrides(&mut body, sanitized_overrides.as_ref());
                 return body;
             }
             let normalized_messages = normalize_openai_tool_message_content(messages);
@@ -1656,7 +1658,7 @@ pub(crate) fn build_provider_request_body_with_overrides(
             } else {
                 thinking.apply_openai(&mut body);
             }
-            apply_request_body_overrides(&mut body, request_body_overrides);
+            apply_request_body_overrides(&mut body, sanitized_overrides.as_ref());
             body
         }
     }
@@ -1672,6 +1674,57 @@ fn apply_request_body_overrides(
     let keys: Vec<&String> = overrides.keys().collect();
     tracing::debug!(?keys, "applying request body overrides");
     merge_json_object(body, overrides);
+}
+
+fn sanitize_request_body_overrides_for_thinking(
+    thinking: &ThinkingConfig,
+    request_body_overrides: Option<&Map<String, Value>>,
+) -> Option<Map<String, Value>> {
+    let overrides = request_body_overrides?;
+    if !thinking.is_off() {
+        return Some(overrides.clone());
+    }
+    let mut sanitized = overrides.clone();
+    strip_override_path(&mut sanitized, &["reasoning_effort"]);
+    strip_override_path(&mut sanitized, &["enable_thinking"]);
+    strip_override_path(&mut sanitized, &["thinking"]);
+    strip_override_path(&mut sanitized, &["reasoning"]);
+    strip_override_path(&mut sanitized, &["output_config", "effort"]);
+    strip_override_path(&mut sanitized, &["output_config", "reasoning_effort"]);
+    strip_override_path(
+        &mut sanitized,
+        &["additionalModelRequestFields", "thinking"],
+    );
+    strip_override_path(
+        &mut sanitized,
+        &["additionalModelRequestFields", "reasoning"],
+    );
+    strip_override_path(
+        &mut sanitized,
+        &["additionalModelRequestFields", "output_config", "effort"],
+    );
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+fn strip_override_path(target: &mut Map<String, Value>, path: &[&str]) {
+    let Some((head, tail)) = path.split_first() else {
+        return;
+    };
+    if tail.is_empty() {
+        target.remove(*head);
+        return;
+    }
+    let Some(Value::Object(child)) = target.get_mut(*head) else {
+        return;
+    };
+    strip_override_path(child, tail);
+    if child.is_empty() {
+        target.remove(*head);
+    }
 }
 
 fn merge_json_object(target: &mut Value, overrides: &Map<String, Value>) {
@@ -9416,6 +9469,80 @@ mod tests {
         assert_eq!(
             body["additionalModelRequestFields"]["reasoningMode"],
             "compact"
+        );
+    }
+
+    #[test]
+    fn request_body_overrides_strip_openai_thinking_fields_when_off() {
+        let overrides = Map::from_iter([
+            ("reasoning_effort".to_string(), json!("high")),
+            ("enable_thinking".to_string(), json!(true)),
+            ("reasoning".to_string(), json!({"effort": "high"})),
+            (
+                "output_config".to_string(),
+                json!({"effort": "high", "keep": "preserved"}),
+            ),
+        ]);
+
+        let body = build_provider_request_body_with_overrides(
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            "gpt-4o-mini",
+            "openai",
+            Some(256),
+            None,
+            false,
+            &ThinkingConfig::Off,
+            Some(&overrides),
+        );
+
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("enable_thinking").is_none());
+        assert!(body.get("reasoning").is_none());
+        assert_eq!(body["output_config"]["keep"], "preserved");
+        assert!(body["output_config"].get("effort").is_none());
+    }
+
+    #[test]
+    fn request_body_overrides_strip_bedrock_thinking_fields_when_off() {
+        let overrides = Map::from_iter([(
+            "additionalModelRequestFields".to_string(),
+            json!({
+                "thinking": {"type": "enabled", "budget_tokens": 4096},
+                "output_config": {"effort": "high", "keep": "preserved"},
+                "reasoningMode": "compact"
+            }),
+        )]);
+
+        let body = build_provider_request_body_with_overrides(
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            "claude-bedrock",
+            "bedrock",
+            Some(256),
+            None,
+            false,
+            &ThinkingConfig::Off,
+            Some(&overrides),
+        );
+
+        assert!(
+            body["additionalModelRequestFields"]
+                .get("thinking")
+                .is_none()
+        );
+        assert_eq!(
+            body["additionalModelRequestFields"]["reasoningMode"],
+            "compact"
+        );
+        assert_eq!(
+            body["additionalModelRequestFields"]["output_config"]["keep"],
+            "preserved"
+        );
+        assert!(
+            body["additionalModelRequestFields"]["output_config"]
+                .get("effort")
+                .is_none()
         );
     }
 }

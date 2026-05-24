@@ -716,6 +716,8 @@ async fn maybe_load_memory_model_params(
                     api_key: token.to_string(),
                     model_name: response.model_name,
                     provider: "openai".to_string(),
+                    request_body_overrides: None,
+                    thinking_capability: None,
                 });
         }
         Err(error) => {

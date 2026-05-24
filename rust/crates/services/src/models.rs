@@ -877,19 +877,91 @@ pub async fn resolve_reasoning_model(
     build_resolved_active_llm_from_row(&rows[best_idx], encryptor)
 }
 
-/// Resolve the cheapest model tagged `"selector"` for memory-related
-/// decisions (relevance filtering, lesson synthesis, L1b extraction).
+fn row_has_selector_tag(row: &sqlx::mysql::MySqlRow) -> bool {
+    let tags_json: String = row
+        .try_get("tags_json")
+        .unwrap_or_else(|_| "[]".to_string());
+    tags_json.contains("\"selector\"")
+}
+
+fn row_thinking_capability(row: &sqlx::mysql::MySqlRow) -> Option<ThinkingCapability> {
+    let thinking_cap_str: Option<String> = row.try_get("thinking_capability").ok().flatten();
+    ThinkingCapability::from_db(thinking_cap_str.as_deref())
+}
+
+fn memory_model_priority(
+    has_selector_tag: bool,
+    thinking_capability: Option<ThinkingCapability>,
+) -> u8 {
+    let off_compatible = matches!(
+        thinking_capability,
+        Some(ThinkingCapability::Both | ThinkingCapability::None)
+    );
+    let incompatible = matches!(
+        thinking_capability,
+        Some(ThinkingCapability::EffortOnly | ThinkingCapability::NativeOnly)
+    );
+    match (has_selector_tag, off_compatible, incompatible) {
+        (true, true, _) => 0,
+        (true, false, false) => 1,
+        (false, true, _) => 2,
+        (false, false, false) => 3,
+        (true, false, true) => 4,
+        (false, false, true) => 5,
+    }
+}
+
+fn rank_memory_model_candidate_indices(rows: &[sqlx::mysql::MySqlRow]) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..rows.len()).collect();
+    indices.sort_by(|left, right| {
+        let left_row = &rows[*left];
+        let right_row = &rows[*right];
+        let left_priority = memory_model_priority(
+            row_has_selector_tag(left_row),
+            row_thinking_capability(left_row),
+        );
+        let right_priority = memory_model_priority(
+            row_has_selector_tag(right_row),
+            row_thinking_capability(right_row),
+        );
+        left_priority
+            .cmp(&right_priority)
+            .then_with(|| {
+                let left_pricing: String = left_row
+                    .try_get("pricing_json")
+                    .unwrap_or_else(|_| "{}".to_string());
+                let right_pricing: String = right_row
+                    .try_get("pricing_json")
+                    .unwrap_or_else(|_| "{}".to_string());
+                score_completion(&left_pricing)
+                    .partial_cmp(&score_completion(&right_pricing))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                let left_name: String = left_row.try_get("model_name").unwrap_or_default();
+                let right_name: String = right_row.try_get("model_name").unwrap_or_default();
+                left_name.cmp(&right_name)
+            })
+    });
+    indices
+}
+
+/// Resolve ordered candidates for memory-related decisions (relevance
+/// filtering, lesson synthesis, L1b extraction).
 ///
-/// 1. Cheapest active model tagged `"selector"`.
-/// 2. Fallback: cheapest active model overall.
+/// Ordering prioritizes:
+/// 1. `"selector"`-tagged models that are known to support `thinking=off`
+/// 2. unprobed selector-tagged models
+/// 3. non-selector models that are known to support `thinking=off`
+/// 4. unprobed non-selector models
+/// 5. thinking-only models as a last resort
 ///
-/// Callers use `thinking_capability` from the resolved model to decide
-/// whether to apply thinking suppression.
-pub async fn resolve_memory_model(
+/// Within each bucket, cheaper completion pricing wins.
+pub async fn resolve_memory_models(
     matrixone: &MatrixOneSettings,
     encryptor: &FernetTokenEncryptor,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
-) -> Result<ResolvedActiveLlmModel, String> {
+) -> Result<Vec<ResolvedActiveLlmModel>, String> {
     let pool = acquire_pool(pool, matrixone).await?;
 
     let rows = sqlx::query(&format!(
@@ -903,41 +975,23 @@ pub async fn resolve_memory_model(
         return Err("No active LLM model configured.".to_string());
     }
 
-    let selector_rows: Vec<usize> = rows
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| {
-            let tags_json: String = row
-                .try_get("tags_json")
-                .unwrap_or_else(|_| "[]".to_string());
-            tags_json.contains("\"selector\"")
-        })
-        .map(|(i, _)| i)
-        .collect();
+    rank_memory_model_candidate_indices(&rows)
+        .into_iter()
+        .map(|index| build_resolved_active_llm_from_row(&rows[index], encryptor))
+        .collect()
+}
 
-    let pick_cheapest_in = |indices: &[usize]| -> usize {
-        let entries: Vec<(String, String)> = indices
-            .iter()
-            .map(|&i| {
-                let name: String = rows[i].try_get("model_name").unwrap_or_default();
-                let pricing: String = rows[i]
-                    .try_get("pricing_json")
-                    .unwrap_or_else(|_| "{}".to_string());
-                (name, pricing)
-            })
-            .collect();
-        let local_best = rank_cheapest_index(&entries);
-        indices[local_best]
-    };
-
-    let best_idx = if !selector_rows.is_empty() {
-        pick_cheapest_in(&selector_rows)
-    } else {
-        let all_indices: Vec<usize> = (0..rows.len()).collect();
-        pick_cheapest_in(&all_indices)
-    };
-
-    build_resolved_active_llm_from_row(&rows[best_idx], encryptor)
+/// Resolve the best memory-model candidate.
+pub async fn resolve_memory_model(
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    pool: Option<&sqlx::Pool<sqlx::MySql>>,
+) -> Result<ResolvedActiveLlmModel, String> {
+    resolve_memory_models(matrixone, encryptor, pool)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "No active LLM model configured.".to_string())
 }
 
 /// Return the index of the cheapest entry by `pricing.completion`.
@@ -3422,6 +3476,26 @@ mod tests {
         assert_eq!(
             selector_entries[best].0, "qwen-flash",
             "cheapest selector should be qwen-flash"
+        );
+    }
+
+    #[test]
+    fn memory_model_priority_prefers_nonthinking_selector() {
+        assert!(
+            memory_model_priority(true, Some(ThinkingCapability::None))
+                < memory_model_priority(true, Some(ThinkingCapability::EffortOnly))
+        );
+        assert!(
+            memory_model_priority(true, Some(ThinkingCapability::Both))
+                < memory_model_priority(true, Some(ThinkingCapability::NativeOnly))
+        );
+    }
+
+    #[test]
+    fn memory_model_priority_prefers_general_nonthinking_over_selector_thinking_only() {
+        assert!(
+            memory_model_priority(false, Some(ThinkingCapability::None))
+                < memory_model_priority(true, Some(ThinkingCapability::EffortOnly))
         );
     }
 

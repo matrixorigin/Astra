@@ -145,6 +145,10 @@ fn should_force_shutdown_refresh(messages: &[Value], current_tokens: usize) -> b
 #[async_trait]
 pub trait SelectorParamsResolver: Send + Sync + std::fmt::Debug {
     async fn resolve(&self) -> Option<LlmConnParams>;
+
+    async fn resolve_ordered(&self) -> Vec<LlmConnParams> {
+        self.resolve().await.into_iter().collect()
+    }
 }
 
 /// Always returns the same params. Unit tests.
@@ -663,24 +667,19 @@ impl MemoryExtractionService {
             );
         }
 
-        let selector_params = self.selector_resolver.resolve().await;
-        let resolved_selector_model = selector_params.as_ref().map(|p| p.model_name.clone());
-        let selector_healthy = match selector_params.as_ref() {
-            Some(p) => self.health.is_healthy(&p.model_name),
-            None => false,
-        };
-        if selector_healthy && selector_params.is_some() {
+        let selector_candidates = self.selector_resolver.resolve_ordered().await;
+        let resolved_selector_model = selector_candidates
+            .first()
+            .map(|candidate| candidate.model_name.clone());
+        let effective_selector = selector_candidates
+            .into_iter()
+            .find(|candidate| self.health.is_healthy(&candidate.model_name));
+        if effective_selector.is_some() {
             self.broker.emit(BackgroundActivity::Started {
                 session_id: session_id.clone(),
                 turn,
             });
         }
-
-        let effective_selector = if selector_healthy {
-            selector_params
-        } else {
-            None
-        };
         let attempted_selector_model = effective_selector.as_ref().map(|p| p.model_name.clone());
 
         // Fetch current L1 so the extraction prompt can build on it.
@@ -1526,6 +1525,40 @@ mod tests {
         (svc, rx, broker)
     }
 
+    #[derive(Debug)]
+    struct OrderedSelectorResolver(Vec<LlmConnParams>);
+
+    #[async_trait]
+    impl SelectorParamsResolver for OrderedSelectorResolver {
+        async fn resolve(&self) -> Option<LlmConnParams> {
+            self.0.first().cloned()
+        }
+
+        async fn resolve_ordered(&self) -> Vec<LlmConnParams> {
+            self.0.clone()
+        }
+    }
+
+    fn build_ctx_with_resolver(
+        resolver: Arc<dyn SelectorParamsResolver>,
+        memoria: Arc<dyn MemoriaClient>,
+    ) -> (
+        Arc<MemoryExtractionService>,
+        tokio::sync::mpsc::Receiver<IngestionEvent>,
+        Arc<BackgroundActivityBroker>,
+    ) {
+        let (ingestion, rx) = IngestionSender::for_tests(256);
+        let broker = Arc::new(BackgroundActivityBroker::new());
+        let svc = Arc::new(MemoryExtractionService::new(
+            resolver,
+            memoria,
+            ingestion,
+            "test-user",
+            Arc::clone(&broker),
+        ));
+        (svc, rx, broker)
+    }
+
     #[tokio::test]
     async fn store_failure_emits_write_failed_event() {
         let memoria = Arc::new(ScriptedMemoria {
@@ -1582,6 +1615,8 @@ mod tests {
             api_key: "k".to_string(),
             model_name: "cheap-selector".to_string(),
             provider: "test".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
         };
         let memoria = Arc::new(CapturingMemoria::default());
         let (svc, mut rx, _broker) = build_ctx_with_memoria(
@@ -1623,6 +1658,56 @@ mod tests {
         assert!(
             !memoria.stored.lock().unwrap().is_empty(),
             "cooldown must still persist fallback memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn selector_cooldown_skips_to_next_healthy_candidate() {
+        let first = LlmConnParams {
+            base_url: "https://nope.invalid".to_string(),
+            api_key: "k".to_string(),
+            model_name: "selector-first".to_string(),
+            provider: "test".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
+        };
+        let second = LlmConnParams {
+            model_name: "selector-second".to_string(),
+            ..first.clone()
+        };
+        let memoria = Arc::new(CapturingMemoria::default());
+        let (svc, mut rx, _broker) = build_ctx_with_resolver(
+            Arc::new(OrderedSelectorResolver(vec![first.clone(), second.clone()])),
+            Arc::clone(&memoria) as Arc<dyn MemoriaClient>,
+        );
+        svc.health.mark_failed(&first.model_name);
+
+        let sid = format!("next-candidate-{}", nanos());
+        let req = sample_req(&sid, 50_000, false);
+        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut attempted_second = false;
+        while Instant::now() < deadline && !attempted_second {
+            while let Ok(evt) = rx.try_recv() {
+                if evt.event_type != "session_memory_extraction" {
+                    continue;
+                }
+                let metadata = evt.metadata.as_ref().unwrap();
+                if metadata["outcome"] == "extracted"
+                    && metadata["source"] == "rule_fallback"
+                    && metadata["selector_model"] == second.model_name
+                {
+                    attempted_second = true;
+                }
+            }
+            if !attempted_second {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        assert!(
+            attempted_second,
+            "service should skip the cooled-down selector and attempt the next healthy candidate"
         );
     }
 
@@ -1874,6 +1959,8 @@ mod tests {
             api_key: "k".to_string(),
             model_name: "cheap-selector-leak".to_string(),
             provider: "test".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
         };
         let (ingestion, _rx) = IngestionSender::for_tests(256);
         let broker = Arc::new(BackgroundActivityBroker::new());

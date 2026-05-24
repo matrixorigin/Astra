@@ -81,7 +81,7 @@ pub async fn get_memory_model_handler(
         )
     })?;
     let pool_ref = state.shared_pool.as_ref().map(|sp| sp.get());
-    let resolved = resolve_memory_model(&matrixone, &state.fernet_encryptor, pool_ref)
+    let resolved = resolve_memory_models(&matrixone, &state.fernet_encryptor, pool_ref)
         .await
         .map_err(|e| {
             error_response(
@@ -89,14 +89,27 @@ pub async fn get_memory_model_handler(
                 format!("Memory model resolution failed: {e}"),
             )
         })?;
+    let candidate_model_names = resolved
+        .iter()
+        .map(|model| model.model_name.clone())
+        .collect::<Vec<_>>();
+    let model_name = candidate_model_names.first().cloned().ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No active LLM model configured.",
+        )
+    })?;
     Ok(Json(MemoryModelResponse {
-        model_name: resolved.model_name,
+        model_name,
+        candidate_model_names,
     }))
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemoryModelResponse {
     pub model_name: String,
+    #[serde(default)]
+    pub candidate_model_names: Vec<String>,
 }
 
 pub async fn update_model_handler(

@@ -64,18 +64,27 @@ impl std::fmt::Debug for PoolSelectorResolver {
 #[async_trait::async_trait]
 impl crate::session_memory::SelectorParamsResolver for PoolSelectorResolver {
     async fn resolve(&self) -> Option<crate::memory_hooks::relevance::LlmConnParams> {
+        self.resolve_ordered().await.into_iter().next()
+    }
+
+    async fn resolve_ordered(&self) -> Vec<crate::memory_hooks::relevance::LlmConnParams> {
         let settings = self.pool.settings();
         let pool = self.pool.get();
         let resolved =
-            astra_services::models::resolve_memory_model(settings, &self.encryptor, Some(pool))
+            astra_services::models::resolve_memory_models(settings, &self.encryptor, Some(pool))
                 .await
-                .ok()?;
-        Some(crate::memory_hooks::relevance::LlmConnParams {
-            base_url: resolved.base_url,
-            api_key: resolved.api_key,
-            model_name: resolved.model_name,
-            provider: resolved.provider,
-        })
+                .unwrap_or_default();
+        resolved
+            .into_iter()
+            .map(|model| crate::memory_hooks::relevance::LlmConnParams {
+                base_url: model.base_url,
+                api_key: model.api_key,
+                model_name: model.model_name,
+                provider: model.provider,
+                request_body_overrides: model.request_body_overrides,
+                thinking_capability: model.thinking_capability,
+            })
+            .collect()
     }
 }
 
@@ -235,6 +244,8 @@ impl MatrixCloudRuntime {
             api_key: resolved.api_key,
             model_name: resolved.model_name,
             provider: resolved.provider,
+            request_body_overrides: resolved.request_body_overrides,
+            thinking_capability: resolved.thinking_capability,
         })
     }
 

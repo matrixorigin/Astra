@@ -42,24 +42,52 @@ struct CliSessionMemorySelectorResolver {
 #[async_trait::async_trait]
 impl astra_runtime::session_memory::SelectorParamsResolver for CliSessionMemorySelectorResolver {
     async fn resolve(&self) -> Option<astra_runtime::memory_hooks::relevance::LlmConnParams> {
+        self.resolve_ordered().await.into_iter().next()
+    }
+
+    async fn resolve_ordered(&self) -> Vec<astra_runtime::memory_hooks::relevance::LlmConnParams> {
         #[derive(serde::Deserialize)]
         struct MemoryModelWire {
             model_name: String,
+            #[serde(default)]
+            candidate_model_names: Vec<String>,
         }
 
-        let token = session_runtime::fresh_access_token(&self.api, self.profile.as_deref()).await?;
+        let Some(token) =
+            session_runtime::fresh_access_token(&self.api, self.profile.as_deref()).await
+        else {
+            return Vec::new();
+        };
         let body = self
             .api
             .get_authed_path_text(&token, astra_thin_client::paths::model_memory())
             .await
-            .ok()?;
-        let response = serde_json::from_str::<MemoryModelWire>(&body).ok()?;
-        Some(astra_runtime::memory_hooks::relevance::LlmConnParams {
-            base_url: format!("{}/v1", self.api.api_origin()),
-            api_key: token,
-            model_name: response.model_name,
-            provider: "openai".to_string(),
-        })
+            .ok();
+        let Some(body) = body else {
+            return Vec::new();
+        };
+        let response = serde_json::from_str::<MemoryModelWire>(&body).ok();
+        let Some(response) = response else {
+            return Vec::new();
+        };
+        let model_names = if response.candidate_model_names.is_empty() {
+            vec![response.model_name]
+        } else {
+            response.candidate_model_names
+        };
+        model_names
+            .into_iter()
+            .map(
+                |model_name| astra_runtime::memory_hooks::relevance::LlmConnParams {
+                    base_url: format!("{}/v1", self.api.api_origin()),
+                    api_key: token.clone(),
+                    model_name,
+                    provider: "openai".to_string(),
+                    request_body_overrides: None,
+                    thinking_capability: None,
+                },
+            )
+            .collect()
     }
 }
 

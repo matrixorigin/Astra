@@ -16,7 +16,7 @@ use astra_turn_types::session_facts::SessionFacts;
 use crate::memory_hooks::relevance::LlmConnParams;
 use crate::turn::cloud::memoria_compact::MemoriaClient;
 use crate::turn::llm::client::{
-    apply_provider_auth, build_provider_request_body, llm_request_url_for_provider,
+    apply_provider_auth, build_provider_request_body_with_overrides, llm_request_url_for_provider,
     parse_nonstream_response_for_provider,
 };
 
@@ -568,7 +568,7 @@ async fn update_memory_with_llm(
     max_output_tokens: usize,
 ) -> Result<String, SessionMemoryExtractionErrorReason> {
     let prompt = build_extraction_prompt(current_memory, messages);
-    let body = build_provider_request_body(
+    let body = build_provider_request_body_with_overrides(
         &prompt,
         &[],
         &params.model_name,
@@ -577,6 +577,7 @@ async fn update_memory_with_llm(
         Some(0.0),
         false,
         &astra_turn_core::thinking_config::ThinkingConfig::Off,
+        params.request_body_overrides.as_ref(),
     );
     let url = llm_request_url_for_provider(
         &params.base_url,
@@ -1077,6 +1078,8 @@ mod tests {
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
             provider: "openai".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
         };
         let artifacts = run_extraction(
             &memoria,
@@ -1126,6 +1129,8 @@ mod tests {
             api_key: "anthropic-key".to_string(),
             model_name: "selector-anthropic".to_string(),
             provider: "anthropic".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
         };
         let artifacts = run_extraction(
             &memoria,
@@ -1175,6 +1180,8 @@ mod tests {
             api_key: "bedrock-key".to_string(),
             model_name: "anthropic.claude".to_string(),
             provider: "bedrock".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
         };
         let artifacts = run_extraction(
             &memoria,
@@ -1221,6 +1228,8 @@ mod tests {
             api_key: "test-key".to_string(),
             model_name: "selector-openai".to_string(),
             provider: "openai".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
         };
         let artifacts = run_extraction(
             &memoria,
