@@ -1006,8 +1006,18 @@ fn session_memory_headline_from_body(body: &str) -> Option<String> {
         extract_md_section(body, section).and_then(|content| {
             content
                 .lines()
-                .find(|line| !line.trim().is_empty())
                 .map(str::trim)
+                .find(|line| {
+                    !(line.is_empty()
+                        || (section == "Current State"
+                            && astra_runtime::session_memory::runner::is_terminal_current_state(
+                                line,
+                            ))
+                        || (section == "Active Goals"
+                            && astra_runtime::session_memory::runner::is_effectively_empty_active_goal(
+                                line,
+                            )))
+                })
                 .map(str::to_string)
         })
     })
@@ -1068,10 +1078,22 @@ async fn store_current_session_memory(
     memory_id: Option<&str>,
     body: &str,
 ) -> Result<(), String> {
-    astra_runtime::session_memory::runner::persist_local_session_memory_artifact(session_id, body)
-        .map_err(|error| format!("current session memory write failed: {error}"))?;
-    let encoded =
-        astra_runtime::session_memory::runner::encode_session_memory_entry(session_id, body);
+    let canonical_body =
+        astra_runtime::session_memory::runner::canonicalize_session_memory_markdown(
+            session_id,
+            body,
+            0,
+            &astra_turn_types::session_facts::SessionFacts::default(),
+        );
+    astra_runtime::session_memory::runner::persist_local_session_memory_artifact(
+        session_id,
+        &canonical_body,
+    )
+    .map_err(|error| format!("current session memory write failed: {error}"))?;
+    let encoded = astra_runtime::session_memory::runner::encode_session_memory_entry(
+        session_id,
+        &canonical_body,
+    );
     let remote_memory_id = memory_id.filter(|memory_id| *memory_id != "local-session-memory");
     if let Some(memory_id) = remote_memory_id {
         let path = format!("/memory/{memory_id}/correct");
@@ -1081,7 +1103,9 @@ async fn store_current_session_memory(
         });
         api.put_bearer_path_json_text(token, &path, &payload)
             .await
-            .map_err(|error| format!("current session memory updated locally but cloud sync failed: {error}"))?;
+            .map_err(|error| {
+                format!("current session memory updated locally but cloud sync failed: {error}")
+            })?;
         return Ok(());
     }
 
@@ -1093,7 +1117,9 @@ async fn store_current_session_memory(
     let response = api
         .post_memory_store_json(token, &payload)
         .await
-        .map_err(|error| format!("current session memory updated locally but cloud sync failed: {error}"))?;
+        .map_err(|error| {
+            format!("current session memory updated locally but cloud sync failed: {error}")
+        })?;
     if response.status().is_success() {
         Ok(())
     } else {
@@ -1173,6 +1199,15 @@ fn sanitize_md_section_content(section_name: &str, content: &str) -> Option<Stri
                     .trim();
                 !astra_runtime::session_memory::runner::is_effectively_empty_active_goal(semantic)
             })
+            .collect();
+        return (!lines.is_empty()).then(|| lines.join("\n"));
+    }
+    if section_name == "Current State" {
+        let lines: Vec<&str> = stripped
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .filter(|line| !astra_runtime::session_memory::runner::is_terminal_current_state(line))
             .collect();
         return (!lines.is_empty()).then(|| lines.join("\n"));
     }
@@ -1830,6 +1865,25 @@ mod tests {
     }
 
     #[test]
+    fn session_memory_headline_skips_terminal_current_state_handoff() {
+        let body = "## Session Title\nReview uncommitted changes in the session memory feature.\n\n## Current State\nThe user's request is complete. No issues remain. The session is idle.\n\n## Completed\n- Ran tests\n";
+        let headline = session_memory_headline_from_body(body).expect("headline");
+        assert_eq!(
+            headline,
+            "Review uncommitted changes in the session memory feature."
+        );
+    }
+
+    #[test]
+    fn sanitize_current_state_hides_terminal_idle_handoff_text() {
+        let result = sanitize_md_section_content(
+            "Current State",
+            "The user's request is complete. No issues remain. The session is idle.",
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
     fn format_session_memory_response_uses_hint_when_body_empty() {
         let result = format_session_memory_response(
             None,
@@ -2017,7 +2071,8 @@ mod tests {
         );
         let api =
             astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).expect("thin client");
-        let body = "# Session Memory\n\n## Current State\nlocal write should land before cloud sync\n";
+        let body =
+            "# Session Memory\n\n## Current State\nlocal write should land before cloud sync\n";
 
         let error = store_current_session_memory(&api, "", &session_id, None, body)
             .await

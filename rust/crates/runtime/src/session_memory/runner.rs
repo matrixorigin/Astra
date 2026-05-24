@@ -302,6 +302,12 @@ pub(crate) async fn run_extraction(
     let fallback = build_rule_fallback_memory(&base_memory, messages, turn_number, current_tokens);
 
     if memory_model_params.is_empty() {
+        let fallback = canonicalize_session_memory_markdown(
+            session_id,
+            &fallback,
+            turn_number as u32,
+            session_facts,
+        );
         return match store_session_memory(
             memoria,
             session_id,
@@ -341,36 +347,44 @@ pub(crate) async fn run_extraction(
         )
         .await
         {
-            Ok(updated) => match store_session_memory(
-                memoria,
-                session_id,
-                turn_number as u32,
-                session_facts,
-                &updated,
-            )
-            .await
-            {
-                Ok((bytes_written, store_attempt)) => {
-                    return ExtractionArtifacts::Persisted {
-                        source: SessionMemoryExtractionSource::Llm,
-                        bytes_written,
-                        store_attempt,
-                        content: updated,
-                        selector_model: Some(params.model_name.clone()),
-                        failed_candidates,
-                    };
+            Ok(updated) => {
+                let updated = canonicalize_session_memory_markdown(
+                    session_id,
+                    &updated,
+                    turn_number as u32,
+                    session_facts,
+                );
+                match store_session_memory(
+                    memoria,
+                    session_id,
+                    turn_number as u32,
+                    session_facts,
+                    &updated,
+                )
+                .await
+                {
+                    Ok((bytes_written, store_attempt)) => {
+                        return ExtractionArtifacts::Persisted {
+                            source: SessionMemoryExtractionSource::Llm,
+                            bytes_written,
+                            store_attempt,
+                            content: updated,
+                            selector_model: Some(params.model_name.clone()),
+                            failed_candidates,
+                        };
+                    }
+                    Err(error) => {
+                        return ExtractionArtifacts::PersistFailed {
+                            error_reason: error.reason,
+                            persist_error_detail: error.detail,
+                            llm_error_reason: None,
+                            llm_error_detail: None,
+                            selector_model: Some(params.model_name.clone()),
+                            failed_candidates,
+                        };
+                    }
                 }
-                Err(error) => {
-                    return ExtractionArtifacts::PersistFailed {
-                        error_reason: error.reason,
-                        persist_error_detail: error.detail,
-                        llm_error_reason: None,
-                        llm_error_detail: None,
-                        selector_model: Some(params.model_name.clone()),
-                        failed_candidates,
-                    };
-                }
-            },
+            }
             Err(error) => failed_candidates.push(LlmCandidateFailure {
                 model_name: params.model_name.clone(),
                 reason: error.reason,
@@ -380,6 +394,12 @@ pub(crate) async fn run_extraction(
     }
 
     let last_failure = failed_candidates.last();
+    let fallback = canonicalize_session_memory_markdown(
+        session_id,
+        &fallback,
+        turn_number as u32,
+        session_facts,
+    );
     match store_session_memory(
         memoria,
         session_id,
@@ -420,6 +440,16 @@ pub fn decode_session_memory_entry(raw: &str, session_id: &str) -> Option<String
     decode_session_memory_snapshot(raw, session_id)
         .map(|snapshot| snapshot.to_markdown())
         .or_else(|| decode_legacy_session_memory_entry(raw, session_id))
+}
+
+pub fn canonicalize_session_memory_markdown(
+    session_id: &str,
+    content: &str,
+    updated_turn: u32,
+    session_facts: &SessionFacts,
+) -> String {
+    SessionMemorySnapshot::from_markdown(session_id, content, updated_turn, session_facts.clone())
+        .to_markdown()
 }
 
 pub async fn load_current_session_memory(
@@ -632,6 +662,44 @@ fn normalize_goal_placeholder(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn normalize_placeholder_text(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches("- ")
+        .trim_start_matches("* ")
+        .trim()
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '.' | '!' | ':'
+            )
+        })
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn is_effectively_empty_list_item(value: &str) -> bool {
+    matches!(
+        normalize_placeholder_text(value).as_str(),
+        "" | "none"
+            | "n/a"
+            | "na"
+            | "none explicitly stated"
+            | "not explicitly stated"
+            | "none recorded"
+            | "no pending todos"
+            | "no pending todo"
+            | "no open loops"
+            | "no open loops recorded"
+            | "no completed work"
+            | "no completed work recorded"
+            | "no learnings"
+            | "no learnings recorded"
+    )
+}
+
 pub fn is_effectively_empty_active_goal(value: &str) -> bool {
     let normalized = normalize_goal_placeholder(value);
     matches!(
@@ -649,6 +717,23 @@ pub fn is_effectively_empty_active_goal(value: &str) -> bool {
         || normalized == "task complete"
 }
 
+pub fn is_terminal_current_state(value: &str) -> bool {
+    let normalized = normalize_placeholder_text(value);
+    normalized == "all done"
+        || normalized == "done"
+        || normalized == "session idle"
+        || normalized == "the session is idle"
+        || normalized.contains("session is idle")
+        || normalized.contains("no issues remain")
+        || normalized.contains("no further action needed")
+        || (normalized.contains("user's request") && normalized.contains("complete"))
+        || (normalized.contains("users request") && normalized.contains("complete"))
+        || (normalized.contains("user request") && normalized.contains("complete"))
+        || (normalized.contains("request")
+            && normalized.contains("complete")
+            && normalized.contains("verified"))
+}
+
 fn seed_active_goal(narrative: &SessionNarrative) -> Option<String> {
     [
         narrative.task_spec.as_str(),
@@ -663,6 +748,15 @@ fn normalize_narrative(narrative: &mut SessionNarrative) {
     narrative
         .active_goals
         .retain(|goal| !is_effectively_empty_active_goal(goal));
+    narrative
+        .pending_todos
+        .retain(|pending| !is_effectively_empty_list_item(pending));
+    narrative
+        .completed
+        .retain(|done| !is_effectively_empty_list_item(done));
+    narrative.current_state.retain(|state| {
+        !is_terminal_current_state(state) && !is_effectively_empty_list_item(state)
+    });
     dedup_preserve_order(&mut narrative.active_goals);
     if narrative.active_goals.is_empty()
         && let Some(goal) = seed_active_goal(narrative)
@@ -2306,6 +2400,25 @@ mod tests {
 
         assert!(loaded.contains("- newer"));
         assert!(!loaded.contains("- older"));
+    }
+
+    #[test]
+    fn canonicalize_session_memory_markdown_strips_terminal_current_state_noise() {
+        let canonical = canonicalize_session_memory_markdown(
+            "sess-42",
+            "# Session Memory\n\n## Session Title\nReview uncommitted changes in the session memory feature.\n\n## Active Goals\nNone.\n\n## Pending Todos\nNone.\n\n## Completed\n- Ran tests\n\n## Current State\nThe user's request is complete. No issues remain. The session is idle.\n",
+            4,
+            &SessionFacts::default(),
+        );
+
+        assert!(canonical.contains("## Session Title"));
+        assert!(canonical.contains("Review uncommitted changes in the session memory feature."));
+        assert!(canonical.contains("## Active Goals"));
+        assert!(canonical.contains("Review uncommitted changes in the session memory feature"));
+        assert!(canonical.contains("## Pending Todos\n- No open loops recorded."));
+        assert!(!canonical.contains("The user's request is complete"));
+        assert!(!canonical.contains("session is idle"));
+        assert!(!canonical.contains("No issues remain"));
     }
 
     #[tokio::test]

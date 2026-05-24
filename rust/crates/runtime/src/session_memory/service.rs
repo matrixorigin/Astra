@@ -289,11 +289,7 @@ impl MemoryExtractionService {
         self.observatory.as_ref()
     }
 
-    fn write_required_local_snapshot(
-        &self,
-        session_id: &str,
-        content: &str,
-    ) -> Result<(), String> {
+    fn write_required_local_snapshot(&self, session_id: &str, content: &str) -> Result<(), String> {
         if !self.require_local_current_snapshot {
             return Ok(());
         }

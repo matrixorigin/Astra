@@ -154,7 +154,10 @@ pub fn build_extraction_prompt(current_memory: &str, recent_messages: &[Value]) 
          - Active Goals: only record goals explicitly stated by the user or assistant. Do NOT invent or infer goals.\n\
          - Pending Todos: list tasks planned but NOT yet completed.\n\
          - Completed: list tasks finished this session, especially concrete substeps completed in the MOST RECENT turn. Only mark a task Completed if the assistant has explicitly confirmed it — do NOT infer completion from a passing mention. Cross-check: if an item appears in Completed it MUST NOT appear in Pending Todos.\n\
-         - Current State: summarize what is true NOW, including when the broader task is still incomplete but some review/fix substeps have already landed.";
+         - Current State: summarize what is true NOW as a neutral resumable state snapshot, not as an assistant handoff or victory lap.\n\
+         - NEVER write completion-report phrasing such as \"the user's request is complete\", \"all done\", \"no issues remain\", \"the session is idle\", or \"no further action needed\".\n\
+         - When work is complete, keep Current State concrete and minimal; preserve the task in Task Specification / Active Goals instead of replacing the whole snapshot with a final status paragraph.\n\
+         - If a section has nothing meaningful to add, leave it empty instead of writing placeholders like \"None.\".";
     let user = format!(
         "## Current session memory:\n\n{current_memory}\n\n\
          ## Recent conversation:\n\n{recent_text}\n\n\
@@ -744,10 +747,13 @@ mod tests {
         let msgs = vec![json!({"role": "user", "content": "continue"})];
         let result = build_extraction_prompt("", &msgs);
         let system = result[0]["content"].as_str().unwrap();
+        let system_lower = system.to_lowercase();
         assert!(
             system.contains("LATEST session state")
                 && system.contains("MOST RECENT turn")
-                && system.contains("what is true NOW"),
+                && system.contains("what is true NOW")
+                && system_lower.contains("not as an assistant handoff")
+                && system_lower.contains("never write completion-report phrasing"),
             "system prompt must emphasize latest-state updates, got: {system}"
         );
     }
