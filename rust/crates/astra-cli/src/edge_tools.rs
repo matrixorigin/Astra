@@ -5412,6 +5412,7 @@ mod tests {
             attempt: Some(1),
             llm_reason: None,
             llm_detail: None,
+            persist_detail: None,
         };
         writer
             .append(&astra_services::session_journal::JournalEvent::session_memory_extraction(
@@ -5459,6 +5460,7 @@ mod tests {
                 astra_services::session_journal::SessionMemoryExtractionErrorReason::LlmError,
             ),
             llm_detail: Some("http 502: upstream model gateway timed out".to_string()),
+            persist_detail: None,
         };
         writer
             .append(&astra_services::session_journal::JournalEvent::session_memory_extraction(

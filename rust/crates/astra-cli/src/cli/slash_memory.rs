@@ -32,6 +32,11 @@ struct SessionMemoryRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionMemoryStatusHint {
+    summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DismissCandidate {
     memory_id: String,
     preview: String,
@@ -364,7 +369,19 @@ pub(super) async fn handle_memory_domain_command(
                     match load_current_session_memory(api, tok, session_id).await {
                         Ok(record) => {
                             let body = record.map(|memory| memory.body).unwrap_or_default();
-                            eprintln!("{}", format_session_memory_display(&body, Some(session_id)));
+                            let hint = if body.trim().is_empty() {
+                                latest_session_memory_status_hint(session_id)
+                            } else {
+                                None
+                            };
+                            eprintln!(
+                                "{}",
+                                format_session_memory_display(
+                                    &body,
+                                    Some(session_id),
+                                    hint.as_ref().map(|hint| hint.summary.as_str())
+                                )
+                            );
                         }
                         Err(e) => eprintln!("{}", format!("  ✗ Session memory failed: {e}").red()),
                     }
@@ -578,13 +595,25 @@ fn print_memory_usage() {
 
 /// Format the session memory markdown body for human-readable terminal display.
 /// Pure function — no I/O, no API calls. Testable in isolation.
-pub(crate) fn format_session_memory_display(body: &str, session_id: Option<&str>) -> String {
+pub(crate) fn format_session_memory_display(
+    body: &str,
+    session_id: Option<&str>,
+    status_hint: Option<&str>,
+) -> String {
     if body.trim().is_empty() {
-        return format!(
-            "  {}\n  {}\n",
-            "No session memory yet.".dim(),
+        let mut out = String::new();
+        out.push_str(&format!("  {}\n", "No session memory yet.".dim()));
+        if let Some(sid) = session_id {
+            out.push_str(&format!("  {} {}\n", "session:".dim(), sid.dim()));
+        }
+        if let Some(hint) = status_hint.filter(|hint| !hint.trim().is_empty()) {
+            out.push_str(&format!("  {}\n", hint.yellow()));
+        }
+        out.push_str(&format!(
+            "  {}\n",
             "Memory is captured automatically during the conversation. Use /save to capture the current context immediately.".dim()
-        );
+        ));
+        return out;
     }
 
     let mut out = String::new();
@@ -657,19 +686,106 @@ fn select_session_memory_record(
         })
 }
 
+fn parse_session_memory_status_hint_from_journal_text(
+    journal_text: &str,
+) -> Option<SessionMemoryStatusHint> {
+    let mut latest_error: Option<SessionMemoryStatusHint> = None;
+    let mut latest_skip: Option<SessionMemoryStatusHint> = None;
+
+    for line in journal_text.lines() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if event.get("type").and_then(serde_json::Value::as_str)
+            != Some("session_memory_extraction")
+        {
+            continue;
+        }
+        let Some(metadata) = event.get("metadata").and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        let Some(outcome) = metadata.get("outcome").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let turn = event
+            .get("turn")
+            .and_then(serde_json::Value::as_u64)
+            .map(|turn| format!("turn {turn}"))
+            .unwrap_or_else(|| "recent turn".to_string());
+        match outcome {
+            "errored" => {
+                let reason = metadata
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown_error");
+                let detail = metadata
+                    .get("persist_detail")
+                    .or_else(|| metadata.get("llm_detail"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let summary = if detail.is_empty() {
+                    format!("Latest extraction failed on {turn}: {reason}.")
+                } else {
+                    format!("Latest extraction failed on {turn}: {reason} — {detail}.")
+                };
+                latest_error = Some(SessionMemoryStatusHint { summary });
+            }
+            "skipped" => {
+                let reason = metadata
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown_skip");
+                latest_skip = Some(SessionMemoryStatusHint {
+                    summary: format!("Latest extraction was skipped on {turn}: {reason}."),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    latest_error.or(latest_skip)
+}
+
+fn latest_session_memory_status_hint(session_id: &str) -> Option<SessionMemoryStatusHint> {
+    let writer = astra_services::session_journal::JournalWriter::new(session_id).ok()?;
+    let path = writer.path().clone();
+    let journal = std::fs::read_to_string(path).ok()?;
+    parse_session_memory_status_hint_from_journal_text(&journal)
+}
+
 async fn load_current_session_memory(
     api: &astra_thin_client::ThinClient,
     token: &str,
     session_id: &str,
 ) -> Result<Option<SessionMemoryRecord>, String> {
-    let payload = serde_json::json!({
+    const SESSION_MEMORY_TOP_K: usize = 64;
+    let typed_payload = serde_json::json!({
         "query": astra_runtime::session_memory::runner::SESSION_MEMORY_PREFIX,
-        "top_k": 8,
+        "top_k": SESSION_MEMORY_TOP_K,
+        "session_id": session_id,
+        "session_scope": "only",
+        "memory_types": [astra_runtime::session_memory::runner::SESSION_MEMORY_MEMORIA_TYPE],
+    });
+    if let Ok(response) = api.post_memory_retrieve_json(token, &typed_payload).await {
+        let status = response.status();
+        if status.is_success() {
+            let payload: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|error| format!("memory retrieve parse failed: {error}"))?;
+            if let Some(record) = select_session_memory_record(&payload, session_id) {
+                return Ok(Some(record));
+            }
+        }
+    }
+    let fallback_payload = serde_json::json!({
+        "query": astra_runtime::session_memory::runner::SESSION_MEMORY_PREFIX,
+        "top_k": SESSION_MEMORY_TOP_K,
         "session_id": session_id,
         "session_scope": "only",
     });
     let response = api
-        .post_memory_retrieve_json(token, &payload)
+        .post_memory_retrieve_json(token, &fallback_payload)
         .await
         .map_err(|error| format!("memory retrieve failed: {error}"))?;
     let status = response.status();
@@ -719,7 +835,7 @@ async fn store_current_session_memory(
 
     let payload = serde_json::json!({
         "content": encoded,
-        "memory_type": "working",
+        "memory_type": astra_runtime::session_memory::runner::SESSION_MEMORY_MEMORIA_TYPE,
         "session_id": session_id,
     });
     let response = api
@@ -729,7 +845,9 @@ async fn store_current_session_memory(
     if response.status().is_success() {
         Ok(())
     } else {
-        Err(format!("memory store failed ({})", response.status()))
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(format!("memory store failed ({status}): {}", body.trim()))
     }
 }
 
@@ -1317,7 +1435,7 @@ mod tests {
 
     #[test]
     fn format_session_memory_display_empty_is_graceful() {
-        let result = format_session_memory_display("", None);
+        let result = format_session_memory_display("", None, None);
         assert!(
             result.contains("No session memory") || result.contains("not yet extracted"),
             "empty body should show a helpful message, got: {result:?}"
@@ -1325,9 +1443,20 @@ mod tests {
     }
 
     #[test]
+    fn format_session_memory_display_empty_shows_recent_failure_hint() {
+        let result = strip_ansi(&format_session_memory_display(
+            "",
+            Some("sess-1"),
+            Some("Latest extraction failed on turn 15: write_failed — upstream 500."),
+        ));
+        assert!(result.contains("Latest extraction failed on turn 15"));
+        assert!(result.contains("sess-1"));
+    }
+
+    #[test]
     fn format_session_memory_display_shows_l0_content() {
         let body = "## L0 Critical\n- Goal: fix auth module\n";
-        let result = format_session_memory_display(body, None);
+        let result = format_session_memory_display(body, None, None);
         assert!(
             result.contains("fix auth module"),
             "should show L0 content, got: {result:?}"
@@ -1337,7 +1466,7 @@ mod tests {
     #[test]
     fn format_session_memory_display_shows_goals_todos_completed() {
         let body = "## Active Goals\n- Refactor memory\n\n## Pending Todos\n- Write tests\n\n## Completed\n- Scaffold done\n";
-        let result = format_session_memory_display(body, None);
+        let result = format_session_memory_display(body, None, None);
         assert!(
             result.contains("Refactor memory"),
             "missing goals, got: {result:?}"
@@ -1355,7 +1484,7 @@ mod tests {
     #[test]
     fn format_session_memory_display_omits_missing_sections() {
         let body = "## L0 Critical\n- only this section\n";
-        let result = strip_ansi(&format_session_memory_display(body, None));
+        let result = strip_ansi(&format_session_memory_display(body, None, None));
         // Missing sections must not produce empty labelled blocks
         assert!(
             !result.contains("📝 Important (L1)"),
@@ -1391,6 +1520,19 @@ mod tests {
         let record = select_session_memory_record(&payload, "sess-1").expect("session memory");
         assert_eq!(record.memory_id, "mem-1");
         assert!(record.body.contains("Fix memory"));
+    }
+
+    #[test]
+    fn parse_session_memory_status_hint_prefers_error_detail() {
+        let journal = r#"
+{"type":"session_memory_extraction","turn":7,"metadata":{"outcome":"skipped","reason":"in_flight"}}
+{"type":"session_memory_extraction","turn":15,"metadata":{"outcome":"errored","reason":"write_failed","persist_detail":"memory store HTTP 500 Internal Server Error"}}
+"#;
+        let hint =
+            parse_session_memory_status_hint_from_journal_text(journal).expect("status hint");
+        assert!(hint.summary.contains("turn 15"));
+        assert!(hint.summary.contains("write_failed"));
+        assert!(hint.summary.contains("500 Internal Server Error"));
     }
 
     // ── /memory subcommand contracts ──

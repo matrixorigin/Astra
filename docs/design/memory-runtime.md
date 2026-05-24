@@ -105,7 +105,7 @@ therefore produce episodes + forward-fed scenes just like one-shot runs.
 | `semantic`  | `scene`     | T4 (30d)  | 30d  | **Reflect forward-feed** (P7) |
 | `procedural`| `ref`       | T2 (180d) | 180d | Background extraction / explicit `remember` |
 | `episodic`  | `episode`   | T3 (60d)  | 60d  | **Session-end governance** |
-| `working`   | —           | —         | —    | Orchestrator scratch-pad (purged at session end) |
+| `working`   | —           | —         | —    | Orchestrator scratch-pad / compaction context (purged at session end) |
 
 Tags include `astra:<category>` and, for team memories, `astra:team:<id>`.
 Scene memories are tagged `astra:scene`.

@@ -1,12 +1,12 @@
 //! Memoria-based message compaction.
 //!
-//! Uses Memoria's `working` memory type for session-level context storage,
+//! Uses Memoria's `working` memory type for compaction scratch storage,
 //! enabling cloud-side compaction without edge→cloud file sync.
 //!
 //! Architecture:
 //! ```text
 //! 1. Messages exceed budget threshold
-//! 2. Retrieve working memories for session → inject as context summary
+//! 2. Retrieve working memories for session → inject as compaction scratch summary
 //! 3. Truncate old messages (keep recent turns)
 //! 4. Optionally store new working memory with updated context
 //! ```
@@ -195,6 +195,25 @@ pub trait MemoriaClient: Send + Sync {
         filter_session: bool,
     ) -> Result<Vec<MemoriaMemory>, String>;
 
+    /// Retrieve one session's memories with an optional exact `memory_types`
+    /// filter. Default falls back to plain strict-session retrieval so mocks
+    /// stay lightweight.
+    async fn retrieve_scoped_typed(
+        &self,
+        query: &str,
+        session_id: &str,
+        top_k: usize,
+        memory_types: &[&str],
+    ) -> Result<Vec<MemoriaMemory>, String> {
+        tracing::trace!(
+            ?memory_types,
+            "retrieve_scoped_typed falling back to unfiltered retrieve_ext"
+        );
+        let _ = memory_types;
+        self.retrieve_ext(query, Some(session_id), top_k, true)
+            .await
+    }
+
     /// Store a memory with optional trust tier for confidence decay.
     async fn store(
         &self,
@@ -206,6 +225,17 @@ pub trait MemoriaClient: Send + Sync {
 
     /// Purge working memories for a session.
     async fn purge_working(&self, session_id: &str) -> Result<u64, String>;
+
+    /// Purge an exact set of memory types for a session. Default is a benign
+    /// no-op so tests that only care about retrieval/storage don't need extra
+    /// boilerplate.
+    async fn purge_memory_types(
+        &self,
+        _session_id: &str,
+        _memory_types: &[&str],
+    ) -> Result<u64, String> {
+        Ok(0)
+    }
 
     /// Delete a single memory by ID.
     /// Default: no-op. Override for clients that support deletion.
@@ -632,6 +662,48 @@ impl MemoriaClient for HttpMemoriaClient {
         Ok(parse_retrieved_memories(&data))
     }
 
+    async fn retrieve_scoped_typed(
+        &self,
+        query: &str,
+        session_id: &str,
+        top_k: usize,
+        memory_types: &[&str],
+    ) -> Result<Vec<MemoriaMemory>, String> {
+        let url = format!(
+            "{}/v1/memories/retrieve",
+            self.base_url.trim_end_matches('/')
+        );
+        let mut body = json!({
+            "query": query,
+            "top_k": top_k,
+            "session_id": session_id,
+            "session_scope": "only",
+        });
+        if !memory_types.is_empty() {
+            body["memory_types"] = Value::Array(memory_types.iter().map(|ty| json!(ty)).collect());
+        }
+
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Memoria typed retrieve failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("Memoria typed retrieve HTTP {}", resp.status()));
+        }
+
+        let data: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Memoria typed retrieve parse failed: {e}"))?;
+
+        Ok(parse_retrieved_memories(&data))
+    }
+
     async fn store(
         &self,
         content: &str,
@@ -661,7 +733,12 @@ impl MemoriaClient for HttpMemoriaClient {
             .map_err(|e| format!("Memoria store failed: {e}"))?;
 
         if !resp.status().is_success() {
-            return Err(format!("Memoria store HTTP {}", resp.status()));
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "<body unreadable>".to_string());
+            return Err(format!("Memoria store HTTP {status}: {}", body.trim()));
         }
 
         let data: Value = resp
@@ -684,13 +761,24 @@ impl MemoriaClient for HttpMemoriaClient {
     /// tokenization; UUID tokens never matched, so `purge_working` was
     /// silently a no-op on every real session.
     async fn purge_working(&self, session_id: &str) -> Result<u64, String> {
+        self.purge_memory_types(session_id, &["working"]).await
+    }
+
+    async fn purge_memory_types(
+        &self,
+        session_id: &str,
+        memory_types: &[&str],
+    ) -> Result<u64, String> {
         if session_id.is_empty() {
-            return Err("purge_working requires non-empty session_id".into());
+            return Err("purge_memory_types requires non-empty session_id".into());
+        }
+        if memory_types.is_empty() {
+            return Ok(0);
         }
         let url = format!("{}/v1/memories/purge", self.base_url.trim_end_matches('/'));
         let body = json!({
             "session_id": session_id,
-            "memory_types": ["working"],
+            "memory_types": memory_types,
             "reason": "session compaction cleanup",
         });
 
@@ -3039,6 +3127,86 @@ mod tests {
             err.contains("non-empty"),
             "expected validation error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn retrieve_scoped_typed_sends_memory_types_filter() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_cl = captured.clone();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&buf[..idx]).unwrap_or("");
+                    let cl: usize = headers
+                        .lines()
+                        .find_map(|l| {
+                            l.strip_prefix("content-length: ")
+                                .or_else(|| l.strip_prefix("Content-Length: "))
+                        })
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    let body_so_far = buf.len() - idx - 4;
+                    if body_so_far >= cl {
+                        break;
+                    }
+                }
+            }
+            let full = String::from_utf8_lossy(&buf).to_string();
+            let body_start = full.find("\r\n\r\n").map(|i| i + 4).unwrap_or(full.len());
+            *captured_cl.lock().unwrap() = full[body_start..].to_string();
+            let payload = b"{\"memories\":[]}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.write_all(payload).await;
+            let _ = sock.shutdown().await;
+        });
+
+        let client = HttpMemoriaClient::new(format!("http://{addr}"), "test-key".to_string());
+        client
+            .retrieve_scoped_typed(
+                "session memory",
+                "8ae95566-f123-4abc-9def-0123456789ab",
+                7,
+                &["session_memory"],
+            )
+            .await
+            .expect("typed retrieve ok");
+        server.await.unwrap();
+
+        let body = captured.lock().unwrap().clone();
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("body parse fail: {e}, body=<{body}>"));
+        assert_eq!(
+            json.get("session_id").and_then(Value::as_str),
+            Some("8ae95566-f123-4abc-9def-0123456789ab")
+        );
+        assert_eq!(
+            json.get("session_scope").and_then(Value::as_str),
+            Some("only")
+        );
+        assert_eq!(json.get("top_k").and_then(Value::as_u64), Some(7));
+        let types = json
+            .get("memory_types")
+            .and_then(Value::as_array)
+            .expect("memory_types array");
+        assert_eq!(types.len(), 1);
+        assert_eq!(types[0].as_str(), Some("session_memory"));
     }
 
     #[tokio::test]

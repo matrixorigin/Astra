@@ -986,6 +986,9 @@ pub struct SessionMemoryExtractionBreadcrumbs {
     /// Short human-readable detail for the upstream LLM failure (for
     /// example an HTTP status or provider error message snippet).
     pub llm_detail: Option<String>,
+    /// Short human-readable detail for the final persist failure (for
+    /// example a backend validation or proxy error snippet).
+    pub persist_detail: Option<String>,
 }
 
 impl SessionMemoryExtractionOutcome {
@@ -1034,6 +1037,9 @@ impl SessionMemoryExtractionOutcome {
             }
             if let Some(ref llm_detail) = bc.llm_detail {
                 map.insert("llm_detail".into(), serde_json::json!(llm_detail));
+            }
+            if let Some(ref persist_detail) = bc.persist_detail {
+                map.insert("persist_detail".into(), serde_json::json!(persist_detail));
             }
         }
         obj

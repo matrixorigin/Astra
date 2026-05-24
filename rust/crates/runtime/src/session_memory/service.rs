@@ -401,6 +401,7 @@ impl MemoryExtractionService {
             attempt: None,
             llm_reason: None,
             llm_detail: None,
+            persist_detail: None,
         };
 
         enum Admission {
@@ -681,6 +682,7 @@ impl MemoryExtractionService {
                 attempt: None,
                 llm_reason: None,
                 llm_detail: None,
+                persist_detail: None,
             };
             self.emit_skip_event(
                 Some(&session_id),
@@ -813,6 +815,7 @@ impl MemoryExtractionService {
                     attempt: Some(store_attempt),
                     llm_reason: None,
                     llm_detail: None,
+                    persist_detail: None,
                 };
                 self.emit_success_event(
                     Some(&session_id),
@@ -874,6 +877,7 @@ impl MemoryExtractionService {
                     attempt: Some(store_attempt),
                     llm_reason: Some(error_reason),
                     llm_detail: error_detail.clone(),
+                    persist_detail: None,
                 };
                 self.emit_success_event(
                     Some(&session_id),
@@ -914,6 +918,7 @@ impl MemoryExtractionService {
             }
             ExtractionArtifacts::PersistFailed {
                 error_reason,
+                persist_error_detail,
                 llm_error_reason,
                 llm_error_detail,
                 selector_model,
@@ -936,13 +941,16 @@ impl MemoryExtractionService {
                     attempt: None,
                     llm_reason: llm_error_reason,
                     llm_detail: llm_error_detail.clone(),
+                    persist_detail: persist_error_detail.clone(),
                 };
                 self.emit_error_event(Some(&session_id), turn, error_reason, duration_ms, &bc);
                 self.broker.emit(BackgroundActivity::Errored {
                     session_id: session_id.clone(),
                     turn,
                     reason: error_reason,
-                    detail: llm_error_detail.clone(),
+                    detail: persist_error_detail
+                        .clone()
+                        .or_else(|| llm_error_detail.clone()),
                     duration_ms,
                 });
                 self.record_extraction_outcome(
@@ -1660,6 +1668,7 @@ mod tests {
                 }
                 let m = evt.metadata.as_ref().unwrap();
                 if m["outcome"] == "errored" && m["reason"] == "write_failed" {
+                    assert_eq!(m["persist_detail"], "store down");
                     saw_write_failed = true;
                 }
             }
@@ -1714,7 +1723,7 @@ mod tests {
     async fn selector_cooldown_fires_after_llm_failure() {
         // An unhealthy selector should no longer leave session memory
         // empty. We degrade to the deterministic rule-fallback path and
-        // persist a working snapshot instead of skipping the whole run.
+        // persist a session-memory snapshot instead of skipping the whole run.
         let selector_params = LlmConnParams {
             base_url: "https://nope.invalid".to_string(),
             api_key: "k".to_string(),

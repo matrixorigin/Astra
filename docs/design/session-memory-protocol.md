@@ -612,9 +612,9 @@ Session end:
      → Store as semantic memory (cross-session)
   2. Generate episodic summary (cheap model)
      → Store as episodic memory
-  3. Purge working memory for this session_id
-     → POST /v1/memories/purge { "topic": "session:{session_id}", "reason": "session ended" }
-       (Memoria purge uses topic-based keyword matching, not a session_id field)
+  3. Purge transient session memory for this session_id
+     → POST /v1/memories/purge { "session_id": "{session_id}", "memory_types": ["working"], "reason": "session ended" }
+       (Memoria purge uses the explicit session_id + memory_types selector)
   4. Update active Goal status if applicable
      → PUT /v1/memories/{goal_id}/correct
 ```

@@ -305,6 +305,7 @@ fn session_memory_extraction_journal_event_structure() {
         attempt: Some(1),
         llm_reason: None,
         llm_detail: None,
+        persist_detail: None,
     };
     let evt = astra_services::session_journal::JournalEvent::session_memory_extraction(
         Some("sess-42"),
