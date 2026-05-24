@@ -494,7 +494,7 @@ pub fn evaluate_permission(
     }
 
     let git_violations = git_safety_violations_for_request(tool_name, args);
-    let mut git_safety_skip_note = "no git violation";
+    let git_safety_skip_note = "no git violation";
     if !git_violations.is_empty() {
         let reasons: Vec<String> = git_violations.iter().map(ToString::to_string).collect();
         let has_hard_violation = git_violations.iter().any(|v| !is_soft_violation(v));
@@ -519,25 +519,20 @@ pub fn evaluate_permission(
             );
         }
         if ctx.mode() == PermissionMode::Auto && !has_hard_violation {
-            if ctx.inherited.is_tool_allowed_by_allowlist(tool_name) {
-                let decision = HardDecision::Allow;
-                push_matched(
-                    &mut trace,
-                    EvaluationStep::GitSafety,
-                    &decision,
-                    &reasons.join(", "),
-                );
-                return envelope(
-                    decision,
-                    DecisionSource::GitSafety {
-                        violation: reasons.join(", "),
-                    },
-                    trace,
-                    will_save,
-                    risk_tags,
-                );
-            }
-            git_safety_skip_note = "soft git violation deferred to mode allowlist";
+            // Soft git violation in auto mode: require explicit approval.
+            // Session overrides and allowlists must not bypass git safety checks.
+            let reason = format!("Git safety: {}", reasons.join(", "));
+            let decision = HardDecision::NeedExternal {
+                prompt: approval_prompt(tool_name, args, reason.clone(), risk_tags.clone()),
+            };
+            push_matched(&mut trace, EvaluationStep::GitSafety, &decision, &reason);
+            return envelope(
+                decision,
+                DecisionSource::GitSafety { violation: reason },
+                trace,
+                will_save,
+                risk_tags,
+            );
         } else {
             let reason = format!("Git safety: {}", reasons.join(", "));
             let decision = HardDecision::NeedExternal {

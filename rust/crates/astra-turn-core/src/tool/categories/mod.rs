@@ -475,7 +475,7 @@ impl ToolRegistry {
         let category = self.category(name);
         if flags.contains(ToolFlags::CODE_INTEL) {
             ToolDisplayCategory::Code
-        } else if flags.contains(ToolFlags::GIT_READ) || name.starts_with("git_") {
+        } else if flags.contains(ToolFlags::GIT_READ) || name.starts_with("git_") || name == "git" {
             ToolDisplayCategory::Git
         } else if flags.contains(ToolFlags::MATRIXONE) {
             ToolDisplayCategory::Mo
