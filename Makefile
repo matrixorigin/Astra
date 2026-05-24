@@ -683,14 +683,15 @@ test-online:
 		cp .env.example .env; \
 	fi
 	@set -a; [ -f .env ] && . ./.env; set +a; \
-	TEST_DB=$${ASTRA_TEST_DATABASE:-astra_runtime_test}; \
+	TEST_DB_BASE=$${ASTRA_TEST_DATABASE:-astra_runtime_test}; \
+	RUNTIME_IGNORED_DB="$${TEST_DB_BASE}_runtime_ignored"; \
+	INTEGRATION_DB="$${TEST_DB_BASE}_integration"; \
 	DB_HOST=$${MATRIXONE_HOST:-127.0.0.1}; \
 	DB_PORT=$${MATRIXONE_PORT:-6001}; \
 	DB_USER=$${MATRIXONE_USER:-root}; \
 	DB_PASS=$${MATRIXONE_PASSWORD:-111}; \
-	echo "Recreating test database $$TEST_DB ..."; \
-	SQL="DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;"; \
-	run_mysql_ddl() { mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$SQL"; }; \
+	echo "Recreating test databases $$RUNTIME_IGNORED_DB and $$INTEGRATION_DB ..."; \
+	run_mysql_ddl() { mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$1"; }; \
 	mysql_ssl_disable_arg() { \
 		if mysql --no-defaults --skip-ssl --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --skip-ssl --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--skip-ssl"; \
 		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl=0 --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl=0"; \
@@ -698,16 +699,21 @@ test-online:
 		fi; \
 	}; \
 	MYSQL_SSL_ARG=$$(mysql_ssl_disable_arg); \
-	run_mysql_ddl 2>/dev/null || { \
-		if [ -n "$$MYSQL_SSL_ARG" ]; then run_mysql_ddl "$$MYSQL_SSL_ARG"; else run_mysql_ddl; fi; \
-	} 2>/dev/null || true; \
-	echo "Running astra-runtime ignored unit tests (live DB; nextest profile=$(NEXTEST_ONLINE_PROFILE); live-LLM suite gated by ASTRA_LIVE_LLM)..."; \
+	for DB_NAME in "$$RUNTIME_IGNORED_DB" "$$INTEGRATION_DB"; do \
+		SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
+		run_mysql_ddl "$$SQL" 2>/dev/null || { \
+			if [ -n "$$MYSQL_SSL_ARG" ]; then run_mysql_ddl "$$SQL" "$$MYSQL_SSL_ARG"; else run_mysql_ddl "$$SQL"; fi; \
+		} 2>/dev/null || true; \
+	done; \
+	echo "Running astra-runtime ignored unit/bin tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE); live-LLM suite gated by ASTRA_LIVE_LLM)..."; \
 	FAILED=""; \
-	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+	ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
-			--run-ignored only $(NEXTEST_ONLINE_FLAGS) \
+			--lib --bins --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
 			|| FAILED="$$FAILED astra-runtime-ignored"; \
-	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+	echo "Running ignored integration suites (live DB=$$INTEGRATION_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
+	ASTRA_DATABASE=$$INTEGRATION_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+		ASTRA_TEST_DATABASE=$$INTEGRATION_DB \
 		ASTRA_TEST_DB_IT=1 \
 		$(MAKE) test-ignored-integration \
 		|| FAILED="$$FAILED test-ignored-integration"; \
