@@ -521,7 +521,9 @@ pub fn evaluate_permission(
         if ctx.mode() == PermissionMode::Auto && !has_hard_violation {
             // Soft git violation in auto mode: allow.
             // If there's an explicit allowlist, let ExplicitApprovalGate evaluate
-            // whether git is listed. Otherwise allow with GitSafety source.
+            // whether git is listed.
+            // If a session override exists, defer so SessionOverride can refuse
+            // to bypass git safety.
             if ctx.inherited.allowed_tools.is_some() {
                 push_skipped(
                     &mut trace,
@@ -529,6 +531,13 @@ pub fn evaluate_permission(
                     &format!("auto mode soft violation, deferring to allowlist: {}", reasons.join(", ")),
                 );
                 // continue to ExplicitApprovalGate
+            } else if fingerprinted_override(tool_name, args, ctx).is_some() {
+                push_skipped(
+                    &mut trace,
+                    EvaluationStep::GitSafety,
+                    &format!("auto mode soft violation, deferring for session override: {}", reasons.join(", ")),
+                );
+                // continue — SessionOverride will refuse to bypass git safety
             } else {
                 let reason = format!("Git safety (auto-allow): {}", reasons.join(", "));
                 let decision = HardDecision::Allow;
@@ -842,6 +851,32 @@ pub fn evaluate_permission(
     }
 
     if let Some(allowed) = fingerprinted_override(tool_name, args, ctx) {
+        // Session overrides must not bypass git safety. If a git
+        // safety violation is present, refuse the override and
+        // require explicit approval.
+        if allowed && !git_safety_violations_for_request(tool_name, args).is_empty() {
+            let reasons: Vec<String> = git_safety_violations_for_request(tool_name, args)
+                .iter()
+                .map(|v| v.to_string())
+                .collect();
+            let reason = format!("Git safety: {}", reasons.join(", "));
+            let decision = HardDecision::NeedExternal {
+                prompt: approval_prompt(tool_name, args, reason.clone(), risk_tags.clone()),
+            };
+            push_matched(
+                &mut trace,
+                EvaluationStep::SessionOverride,
+                &decision,
+                "session override refused — git safety violation present",
+            );
+            return envelope(
+                decision,
+                DecisionSource::GitSafety { violation: reason },
+                trace,
+                will_save,
+                risk_tags,
+            );
+        }
         let decision = if allowed {
             HardDecision::Allow
         } else {
