@@ -2093,11 +2093,18 @@ impl ServerToolExecutor {
                         "Error: Tool '{name}' is not available — no MCP manager configured."
                     ));
                 };
-                match mgr.read().await.call_tool_by_mcp_name(name, args.clone()).await {
+                match mgr
+                    .read()
+                    .await
+                    .call_tool_by_mcp_name(name, args.clone())
+                    .await
+                {
                     Ok(content) => astra_tools::ToolResult::text(content),
-                    Err(e) => astra_tools::ToolResult::error(format!(
-                        "MCP tool '{name}' failed: {e}"
-                    )),
+                    Err(e) => {
+                        astra_tools::ToolResult::error(super::runtime_mcp::redact_mcp_error_text(
+                            &format!("MCP tool '{name}' failed: {e}"),
+                        ))
+                    }
                 }
             }
             // ── Unknown tool fallback ──────────────────────────────────

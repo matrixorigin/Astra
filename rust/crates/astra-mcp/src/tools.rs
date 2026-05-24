@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use rmcp::model::{CallToolResult, Tool};
 use serde_json::Value;
 
@@ -43,17 +45,44 @@ pub fn mcp_tool_to_schema(server_name: &str, tool: &Tool) -> Value {
     });
 
     let raw_desc = tool.description.as_deref().unwrap_or("");
-    let description = truncate_with_marker(raw_desc, MAX_DESCRIPTION_LENGTH);
-    let tool_name = sanitize_tool_name(&format!("mcp__{}__{}", server_name, tool.name));
+    mcp_tool_schema_from_parts(server_name, tool.name.as_ref(), raw_desc, params)
+}
+
+/// Convert cached MCP tool metadata to Astra tool schema.
+pub fn mcp_tool_schema_from_parts(
+    server_name: &str,
+    tool_name: &str,
+    description: &str,
+    parameters: Value,
+) -> Value {
+    let description = truncate_with_marker(description, MAX_DESCRIPTION_LENGTH);
+    let tool_name = sanitize_tool_name(&format!("mcp__{}__{}", server_name, tool_name));
 
     serde_json::json!({
         "type": "function",
         "function": {
             "name": tool_name,
             "description": description,
-            "parameters": params,
+            "parameters": parameters,
         }
     })
+}
+
+/// Convert MCP tools to schemas and fail if sanitized public names collide.
+pub fn tools_to_schemas_checked(server_name: &str, tools: &[Tool]) -> Result<Vec<Value>, String> {
+    let mut seen = HashSet::new();
+    let mut schemas = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let schema = mcp_tool_to_schema(server_name, tool);
+        let name = schema["function"]["name"].as_str().unwrap_or_default();
+        if !seen.insert(name.to_string()) {
+            return Err(format!(
+                "duplicate MCP public tool name after sanitization: {name}"
+            ));
+        }
+        schemas.push(schema);
+    }
+    Ok(schemas)
 }
 
 /// Extract tool call result content as string, with default truncation limit.
@@ -91,7 +120,9 @@ pub fn extract_result_text_with_limit(result: &CallToolResult, max_len: usize) -
 
     let joined = parts.join("\n");
     if total_len >= max_len {
-        tracing::warn!("MCP tool result truncated: {total_len} chars exceeded {max_len} char limit");
+        tracing::warn!(
+            "MCP tool result truncated: {total_len} chars exceeded {max_len} char limit"
+        );
         format!(
             "{}\n\n[OUTPUT TRUNCATED - exceeded {} char limit]",
             joined, max_len
@@ -176,6 +207,17 @@ mod tests {
     }
 
     #[test]
+    fn tools_to_schemas_checked_rejects_sanitized_collision() {
+        let empty: serde_json::Map<String, Value> = serde_json::Map::new();
+        let tools = vec![
+            Tool::new("query.sql", "Query", Arc::new(empty.clone())),
+            Tool::new("query sql", "Query", Arc::new(empty)),
+        ];
+        let err = tools_to_schemas_checked("jinpan", &tools).unwrap_err();
+        assert!(err.contains("mcp__jinpan__query_sql"));
+    }
+
+    #[test]
     fn extract_result_text_multiple() {
         use rmcp::model::{Content, RawContent};
 
@@ -191,10 +233,7 @@ mod tests {
         use rmcp::model::{Content, RawContent};
 
         let big_text = "a".repeat(200);
-        let result = CallToolResult::success(vec![Content::new(
-            RawContent::text(&big_text),
-            None,
-        )]);
+        let result = CallToolResult::success(vec![Content::new(RawContent::text(&big_text), None)]);
         let text = extract_result_text_with_limit(&result, 100);
         assert!(text.contains("[OUTPUT TRUNCATED"));
     }

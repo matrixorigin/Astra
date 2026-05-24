@@ -99,6 +99,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/chat/turn", post(chat_handlers::chat_turn_handler))
         .route("/chat/route", post(chat_handlers::chat_route_handler))
         .route(
+            "/api/v1/mcp/register-or-update",
+            post(mcp_handlers::register_or_update_handler),
+        )
+        .route(
             "/v1/chat/completions",
             post(completions::completions_handler),
         )

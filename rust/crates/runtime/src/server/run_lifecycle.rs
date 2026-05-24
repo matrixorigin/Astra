@@ -2444,6 +2444,8 @@ pub struct AgenticRunLifecycleService {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     /// Optional database skill provider for runtime skill resolution.
     skill_service: Option<Arc<dyn SkillService>>,
+    /// Registry-backed MCP bindings available to server-side chat loops.
+    mcp_registry_service: Arc<dyn astra_services::McpRegistryService>,
     /// Per-run approval request channel receivers (Phase E).
     /// Key: run_id → receiver that the WS handler drains.
     approval_channels: Arc<TokioMutex<HashMap<String, mpsc::UnboundedReceiver<serde_json::Value>>>>,
@@ -2500,6 +2502,7 @@ impl AgenticRunLifecycleService {
             resource_governor: None,
             edge_connection_pool: None,
             skill_service: None,
+            mcp_registry_service: Arc::new(astra_services::UnconfiguredMcpRegistryService),
             approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
             user_prompt_channels: Arc::new(TokioMutex::new(HashMap::new())),
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
@@ -2562,6 +2565,14 @@ impl AgenticRunLifecycleService {
 
     pub fn with_skill_service(mut self, service: Arc<dyn SkillService>) -> Self {
         self.skill_service = Some(service);
+        self
+    }
+
+    pub fn with_mcp_registry_service(
+        mut self,
+        service: Arc<dyn astra_services::McpRegistryService>,
+    ) -> Self {
+        self.mcp_registry_service = service;
         self
     }
 
@@ -4316,24 +4327,17 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let edge_tools = Self::extract_edge_tools(&request);
         let edge_profile = Self::extract_edge_profile(&request);
 
-        // ── MCP: parse context.mcp_servers and connect ────────────────
-        let mcp_servers: Vec<super::runtime_mcp::ContextMcpServer> = request
-            .context
-            .as_ref()
-            .and_then(|c| c.get("mcp_servers"))
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-
-        let mcp_required = !mcp_servers.is_empty();
-        let mcp_manager = if mcp_required {
-            Some(
-                super::runtime_mcp::RuntimeMcpManager::connect_all(
-                    &mcp_servers,
-                    &request.forward_headers,
-                )
-                .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, Json(e)))?,
-            )
+        // ── MCP: load registry bindings and validate cached tools ─────
+        let mcp_bundle = if let Some(binding_ids) = request
+            .mcp_binding_ids
+            .as_deref()
+            .filter(|binding_ids| !binding_ids.is_empty())
+        {
+            let records = self
+                .mcp_registry_service
+                .load_runtime_bindings(user_id.clone(), binding_ids)
+                .await?;
+            super::runtime_mcp::prepare_runtime_bundle(&records).await?
         } else {
             None
         };
@@ -4434,14 +4438,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         host.set_event_tx(event_tx.clone());
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
 
-        // ── MCP: inject schemas into host tool surface ────────────────
-        let mcp_schemas = if let Some(ref mcp) = mcp_manager {
-            let schemas = mcp.tool_schemas().await;
-            host.install_runtime_tool_schemas(schemas.clone());
-            Some(schemas)
-        } else {
-            None
-        };
+        // ── MCP: inject cached schemas into host tool surface ─────────
+        if let Some(ref bundle) = mcp_bundle {
+            host.install_runtime_tool_schemas(bundle.schemas.clone());
+        }
 
         // Guard: reject if this session already has a blocking run.
         // Hold write lock across check+insert to prevent TOCTOU race.
@@ -4506,11 +4506,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .with_task_store(task_store);
 
             // ── MCP: inject manager + plugin schemas into executor ────
-            if let Some(ref mcp) = mcp_manager {
-                executor.set_mcp_manager(mcp.inner().clone());
-                if let Some(ref schemas) = mcp_schemas {
-                    executor.set_plugin_schemas(schemas.clone());
-                }
+            if let Some(ref bundle) = mcp_bundle {
+                executor.set_mcp_manager(bundle.manager.clone());
+                executor.set_plugin_schemas(bundle.schemas.clone());
             }
 
             if let Some(pool) = &self.edge_connection_pool {
@@ -6581,6 +6579,7 @@ mod tests {
             skill_search: None,
             allow_skills: None,
             allow_tools: None,
+            mcp_binding_ids: None,
             context: None,
             forward_headers: HashMap::new(),
             execution_budget: None,
@@ -7325,6 +7324,7 @@ mod tests {
             skill_search: None,
             allow_skills: None,
             allow_tools: None,
+            mcp_binding_ids: None,
             context: Some(ctx),
             forward_headers: HashMap::new(),
             execution_budget: None,
@@ -7452,6 +7452,7 @@ mod tests {
             skill_search: None,
             allow_skills: None,
             allow_tools: None,
+            mcp_binding_ids: None,
             context: Some(ctx),
             forward_headers: HashMap::new(),
             execution_budget: None,

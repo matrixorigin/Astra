@@ -1,174 +1,407 @@
-//! Runtime MCP manager — server-side MCP connection lifecycle.
+//! Registry-backed runtime MCP wiring for server-side agent loops.
 //!
-//! Parses `context.mcp_servers` from the chat request, connects to MCP
-//! servers, discovers tools, and provides schema injection + tool dispatch
-//! for the server-side agent loop.
+//! The runtime never accepts MCP credentials in `/chat/stream`. Control-plane
+//! registration performs discovery and persists a binding-scoped catalog; chat
+//! requests reference those bindings by id.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 
-use astra_mcp::{McpClientManager, McpServerConfig, Transport};
+use astra_core::{ErrorResponse, error_response_coded};
+use astra_mcp::{
+    McpClientManager, McpServerConfig, McpTool, Transport, mcp_tool_schema_from_parts,
+    sanitize_tool_name, tools_to_schemas_checked,
+};
+use astra_services::{
+    McpDiscoveredToolData, McpRegisterRequestData, McpRuntimeBindingRecord, mcp_schema_hash,
+};
+use axum::{Json, http::StatusCode};
+use regex::Regex;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::RwLock;
 
-use astra_core::ErrorResponse;
-
-/// A single MCP server entry from `context.mcp_servers`.
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub(crate) struct ContextMcpServer {
-    pub name: String,
-    #[serde(alias = "type")]
-    pub transport: String,
-    #[serde(default)]
-    pub url: Option<String>,
-    #[serde(default)]
-    pub command: Option<String>,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub forward_headers: Vec<String>,
-    #[serde(default)]
-    pub allowed_tools: Option<Vec<String>>,
+#[derive(Clone)]
+pub(crate) struct RuntimeMcpBundle {
+    pub manager: Arc<RwLock<McpClientManager>>,
+    pub schemas: Vec<Value>,
 }
 
-/// Parsed MCP server configuration with header filtering applied.
-#[derive(Debug, Clone)]
-struct ResolvedMcpConfig {
-    mcp_config: McpServerConfig,
-    allowed_tools: Option<Vec<String>>,
+#[derive(Debug, Default, Deserialize)]
+struct McpCredentialTransport {
+    #[serde(default)]
+    auth_token: Option<String>,
+    #[serde(default)]
+    headers: HashMap<String, String>,
 }
 
-/// Runtime MCP manager — connects to MCP servers, provides schemas and tool dispatch.
-pub(crate) struct RuntimeMcpManager {
-    inner: Arc<RwLock<McpClientManager>>,
+fn mcp_error(
+    status: StatusCode,
+    detail: impl Into<String>,
+    code: &'static str,
+) -> (StatusCode, Json<ErrorResponse>) {
+    error_response_coded(status, detail, code)
 }
 
-impl RuntimeMcpManager {
-    /// Parse `context.mcp_servers` from the chat request, connect to all servers
-    /// with header forwarding, and return the manager with discovered tools.
-    pub async fn connect_all(
-        context_servers: &[ContextMcpServer],
-        forward_headers: &HashMap<String, String>,
-    ) -> Result<Self, ErrorResponse> {
-        let mut manager = McpClientManager::new();
+fn validate_url(url: &str) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let parsed = reqwest::Url::parse(url).map_err(|error| {
+        mcp_error(
+            StatusCode::BAD_REQUEST,
+            format!("MCP server url is invalid: {error}"),
+            "mcp_server_invalid",
+        )
+    })?;
+    match parsed.scheme() {
+        "http" | "https" | "ws" | "wss" => Ok(()),
+        other => Err(mcp_error(
+            StatusCode::BAD_REQUEST,
+            format!("MCP server url scheme '{other}' is unsupported"),
+            "mcp_server_invalid",
+        )),
+    }
+}
 
-        for server in context_servers {
-            let resolved = Self::resolve_config(server, forward_headers)?;
-            manager
-                .connect(resolved.mcp_config)
-                .await
-                .map_err(|e| {
-                    ErrorResponse::new(format!(
-                        "MCP discovery failed for server '{}': {e}",
-                        server.name
-                    ))
-                    .with_error_code("mcp_discovery_failed")
-                })?;
+fn credential_transport(
+    key_value: &Value,
+) -> Result<McpCredentialTransport, (StatusCode, Json<ErrorResponse>)> {
+    if !key_value.is_object() {
+        return Err(mcp_error(
+            StatusCode::BAD_REQUEST,
+            "MCP binding key_value must be a JSON object",
+            "mcp_key_value_invalid",
+        ));
+    }
+    serde_json::from_value::<McpCredentialTransport>(key_value.clone()).map_err(|_| {
+        mcp_error(
+            StatusCode::BAD_REQUEST,
+            "MCP binding key_value supports string auth_token and string headers only",
+            "mcp_key_value_invalid",
+        )
+    })
+}
 
-            if let Some(ref allowed) = resolved.allowed_tools {
-                tracing::info!(
-                    "MCP server '{}': {} tools discovered, {} allowed",
-                    server.name,
-                    manager
-                        .get(&server.name)
-                        .map(|c| c.tools().len())
-                        .unwrap_or(0),
-                    allowed.len()
-                );
+fn server_config(
+    binding_alias: &str,
+    transport: &str,
+    url: &str,
+    description: Option<&str>,
+    key_value: &Value,
+) -> Result<McpServerConfig, (StatusCode, Json<ErrorResponse>)> {
+    let binding_alias = sanitize_tool_name(binding_alias.trim());
+    if binding_alias.is_empty() {
+        return Err(mcp_error(
+            StatusCode::BAD_REQUEST,
+            "binding.alias must not be empty after sanitization",
+            "mcp_binding_invalid",
+        ));
+    }
+
+    validate_url(url.trim())?;
+    let credential = credential_transport(key_value)?;
+    let transport = match transport.trim().to_ascii_lowercase().as_str() {
+        "sse" | "http" => Transport::Sse {
+            url: url.trim().to_string(),
+            auth_token: credential.auth_token,
+            headers: credential.headers,
+        },
+        "ws" | "websocket" => Transport::Ws {
+            url: url.trim().to_string(),
+            auth_token: credential.auth_token,
+            headers: credential.headers,
+        },
+        other => {
+            return Err(mcp_error(
+                StatusCode::BAD_REQUEST,
+                format!("unsupported MCP transport '{other}'"),
+                "mcp_transport_unsupported",
+            ));
+        }
+    };
+
+    Ok(McpServerConfig {
+        name: binding_alias,
+        transport,
+        description: description.unwrap_or_default().to_string(),
+        enabled: true,
+        retry: Default::default(),
+    })
+}
+
+fn collect_secret_strings(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) => {
+            if s.len() >= 4 {
+                out.push(s.clone());
             }
         }
+        Value::Array(values) => {
+            for value in values {
+                collect_secret_strings(value, out);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_secret_strings(value, out);
+            }
+        }
+        _ => {}
+    }
+}
 
-        Ok(Self {
-            inner: Arc::new(RwLock::new(manager)),
+fn redact_known_secrets(raw: &str, key_value: &Value) -> String {
+    let mut redacted = raw.to_string();
+    let mut secrets = Vec::new();
+    collect_secret_strings(key_value, &mut secrets);
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    secrets.dedup();
+    for secret in secrets {
+        redacted = redacted.replace(&secret, "[REDACTED]");
+    }
+    redact_mcp_error_text(&redacted)
+}
+
+pub(crate) fn redact_mcp_error_text(raw: &str) -> String {
+    static BEARER_RE: OnceLock<Regex> = OnceLock::new();
+    static SECRET_KV_RE: OnceLock<Regex> = OnceLock::new();
+
+    let redacted = BEARER_RE
+        .get_or_init(|| Regex::new("(?i)(bearer\\s+)[A-Za-z0-9._~+/=-]+").unwrap())
+        .replace_all(raw, "${1}[REDACTED]")
+        .to_string();
+    SECRET_KV_RE
+        .get_or_init(|| {
+            Regex::new("(?i)((?:api[_-]?key|token|authorization)\\s*[:=]\\s*)[^\\s,;]+").unwrap()
         })
+        .replace_all(&redacted, "${1}[REDACTED]")
+        .to_string()
+}
+
+fn discovery_error(
+    alias: &str,
+    key_value: &Value,
+    error: impl ToString,
+) -> (StatusCode, Json<ErrorResponse>) {
+    mcp_error(
+        StatusCode::BAD_GATEWAY,
+        format!(
+            "MCP discovery failed for binding '{}': {}",
+            alias,
+            redact_known_secrets(&error.to_string(), key_value)
+        ),
+        "mcp_discovery_failed",
+    )
+}
+
+fn output_schema_value(tool: &McpTool) -> Option<Value> {
+    tool.output_schema
+        .as_ref()
+        .map(|schema| Value::Object((**schema).clone()))
+}
+
+fn input_schema_value(tool: &McpTool) -> Value {
+    Value::Object((*tool.input_schema).clone())
+}
+
+pub(crate) async fn discover_binding_tools(
+    request: &McpRegisterRequestData,
+) -> Result<Vec<McpDiscoveredToolData>, (StatusCode, Json<ErrorResponse>)> {
+    let binding_alias = sanitize_tool_name(request.binding.alias.trim());
+    if binding_alias.is_empty() {
+        return Err(mcp_error(
+            StatusCode::BAD_REQUEST,
+            "binding.alias must not be empty after sanitization",
+            "mcp_binding_invalid",
+        ));
     }
 
-    /// Resolve a single MCP server config: validate, apply header forwarding,
-    /// and convert to `McpServerConfig`.
-    fn resolve_config(
-        server: &ContextMcpServer,
-        forward_headers: &HashMap<String, String>,
-    ) -> Result<ResolvedMcpConfig, ErrorResponse> {
-        let transport = match server.transport.as_str() {
-            "sse" | "http" => {
-                let url = server.url.as_deref().ok_or_else(|| {
-                    ErrorResponse::new(format!(
-                        "MCP server '{}': SSE transport requires `url`",
-                        server.name
-                    ))
-                    .with_error_code("mcp_discovery_failed")
-                })?;
+    let config = server_config(
+        &binding_alias,
+        &request.server.transport,
+        &request.server.url,
+        request.server.description.as_deref(),
+        &request.binding.key_value,
+    )?;
+    let mut manager = McpClientManager::new();
+    manager
+        .connect(config)
+        .await
+        .map_err(|error| discovery_error(&binding_alias, &request.binding.key_value, error))?;
 
-                // Filter headers: only forward those declared in server.forward_headers
-                let mut headers = HashMap::new();
-                for header_name in &server.forward_headers {
-                    let lower = header_name.to_ascii_lowercase();
-                    match forward_headers.get(&lower) {
-                        Some(value) => {
-                            headers.insert(header_name.clone(), value.clone());
-                        }
-                        None => {
-                            return Err(ErrorResponse::new(format!(
-                                "MCP server '{}': required header '{}' not found in forwarded headers",
-                                server.name, header_name
-                            ))
-                            .with_error_code("mcp_discovery_failed"));
-                        }
-                    }
-                }
+    let conn = manager.get(&binding_alias).ok_or_else(|| {
+        mcp_error(
+            StatusCode::BAD_GATEWAY,
+            "MCP discovery failed after connection initialization",
+            "mcp_discovery_failed",
+        )
+    })?;
+    let tools = conn.tools();
+    let schemas = tools_to_schemas_checked(&binding_alias, tools)
+        .map_err(|error| mcp_error(StatusCode::CONFLICT, error, "mcp_public_name_conflict"))?;
 
-                Transport::Sse {
-                    url: url.to_string(),
-                    auth_token: None,
-                    headers,
-                }
+    let mut discovered = Vec::with_capacity(tools.len());
+    for (tool, schema) in tools.iter().zip(schemas) {
+        let public_name = schema["function"]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let input_schema_json = input_schema_value(tool);
+        let output_schema_json = output_schema_value(tool);
+        let description = tool.description.as_deref().map(str::to_string);
+        let hash_parts = json!({
+            "tool_name": tool.name.as_ref(),
+            "public_name": public_name,
+            "description": description,
+            "input_schema_json": input_schema_json,
+            "output_schema_json": output_schema_json,
+        });
+        discovered.push(McpDiscoveredToolData {
+            tool_name: tool.name.to_string(),
+            public_name,
+            description,
+            input_schema_json: Some(input_schema_value(tool)),
+            output_schema_json,
+            schema_hash: mcp_schema_hash(&hash_parts),
+        });
+    }
+
+    Ok(discovered)
+}
+
+fn cached_tool_schema(
+    binding_alias: &str,
+    tool: &McpDiscoveredToolData,
+) -> Result<Value, (StatusCode, Json<ErrorResponse>)> {
+    let schema = mcp_tool_schema_from_parts(
+        binding_alias,
+        &tool.tool_name,
+        tool.description.as_deref().unwrap_or_default(),
+        tool.input_schema_json
+            .clone()
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+    );
+    let generated_name = schema["function"]["name"].as_str().unwrap_or_default();
+    if generated_name != tool.public_name {
+        return Err(mcp_error(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "cached MCP tool catalog is inconsistent for binding '{}'",
+                binding_alias
+            ),
+            "mcp_tools_missing",
+        ));
+    }
+    Ok(schema)
+}
+
+pub(crate) async fn prepare_runtime_bundle(
+    records: &[McpRuntimeBindingRecord],
+) -> Result<Option<RuntimeMcpBundle>, (StatusCode, Json<ErrorResponse>)> {
+    if records.is_empty() {
+        return Ok(None);
+    }
+
+    let mut manager = McpClientManager::new();
+    let mut schemas = Vec::new();
+    let mut public_names = HashSet::new();
+
+    for record in records {
+        if record.tools.is_empty() {
+            return Err(mcp_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "MCP binding {} has no cached tools; register/update it again",
+                    record.binding_id
+                ),
+                "mcp_tools_missing",
+            ));
+        }
+
+        let config = server_config(
+            &record.binding_alias,
+            &record.transport,
+            &record.url,
+            record.server_description.as_deref(),
+            &record.key_value,
+        )?;
+        let binding_alias = config.name.clone();
+        manager.connect(config).await.map_err(|error| {
+            mcp_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "MCP connection failed for binding {}: {}",
+                    record.binding_id,
+                    redact_known_secrets(&error.to_string(), &record.key_value)
+                ),
+                "mcp_discovery_failed",
+            )
+        })?;
+
+        let conn = manager.get(&binding_alias).ok_or_else(|| {
+            mcp_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "MCP binding {} connected without a session",
+                    record.binding_id
+                ),
+                "mcp_discovery_failed",
+            )
+        })?;
+
+        for tool in &record.tools {
+            if !conn.has_tool(&tool.tool_name) {
+                return Err(mcp_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                        "cached MCP tool '{}' is no longer visible for binding {}; register/update it again",
+                        tool.tool_name, record.binding_id
+                    ),
+                    "mcp_tools_missing",
+                ));
             }
-            "stdio" => {
-                let command = server.command.as_deref().ok_or_else(|| {
-                    ErrorResponse::new(format!(
-                        "MCP server '{}': stdio transport requires `command`",
-                        server.name
-                    ))
-                    .with_error_code("mcp_discovery_failed")
-                })?;
-                Transport::Stdio {
-                    command: vec![command.to_string()],
-                    args: server.args.clone(),
-                    env: HashMap::new(),
-                }
+            if !public_names.insert(tool.public_name.clone()) {
+                return Err(mcp_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("duplicate MCP public tool name: {}", tool.public_name),
+                    "mcp_public_name_conflict",
+                ));
             }
-            other => {
-                return Err(ErrorResponse::new(format!(
-                    "MCP server '{}': unsupported transport '{}' for runtime MCP",
-                    server.name, other
-                ))
-                .with_error_code("mcp_discovery_failed"));
-            }
+            schemas.push(cached_tool_schema(&binding_alias, tool)?);
+        }
+    }
+
+    Ok(Some(RuntimeMcpBundle {
+        manager: Arc::new(RwLock::new(manager)),
+        schemas,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_bearer_and_token_fragments() {
+        let raw = "upstream said Authorization: Bearer abc.def token=secret";
+        let redacted = redact_mcp_error_text(raw);
+        assert!(!redacted.contains("abc.def"));
+        assert!(!redacted.contains("secret"));
+        assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn cached_tool_schema_preserves_public_name() {
+        let tool = McpDiscoveredToolData {
+            tool_name: "query_sql".to_string(),
+            public_name: "mcp__jinpan_moi__query_sql".to_string(),
+            description: Some("Query SQL".to_string()),
+            input_schema_json: Some(json!({"type": "object", "properties": {}})),
+            output_schema_json: None,
+            schema_hash: "hash".to_string(),
         };
-
-        let mcp_config = McpServerConfig {
-            name: server.name.clone(),
-            transport,
-            description: String::new(),
-            enabled: true,
-            retry: Default::default(),
-        };
-
-        Ok(ResolvedMcpConfig {
-            mcp_config,
-            allowed_tools: server.allowed_tools.clone(),
-        })
-    }
-
-    /// Get all MCP tool schemas for injection into the LLM tool surface.
-    pub async fn tool_schemas(&self) -> Vec<Value> {
-        self.inner.read().await.all_tool_schemas()
-    }
-
-    /// Get the inner manager reference for MCP tool execution.
-    pub fn inner(&self) -> &Arc<RwLock<McpClientManager>> {
-        &self.inner
+        let schema = cached_tool_schema("jinpan_moi", &tool).unwrap();
+        assert_eq!(
+            schema["function"]["name"].as_str(),
+            Some("mcp__jinpan_moi__query_sql")
+        );
     }
 }

@@ -51,6 +51,7 @@ fn chat_request_defaults_applied() {
     assert!(req.agent_id.is_none());
     assert!(req.model.is_none());
     assert!(req.llm_token_service.is_none());
+    assert!(req.mcp_binding_ids.is_none());
     assert!(req.context.is_none());
 }
 
@@ -128,6 +129,7 @@ fn chat_request_all_fields() {
             "url": "http://catalog:8081/api/v1/llm-token",
             "timeout_ms": 2500
         },
+        "mcp_binding_ids": [301, 302],
         "context": {"key": "value"},
         "execution_budget": {"initial_turns": 10, "hard_turn_limit": 18},
         "explain": true
@@ -145,6 +147,7 @@ fn chat_request_all_fields() {
         req.llm_token_service.as_ref().and_then(|v| v.timeout_ms),
         Some(2500)
     );
+    assert_eq!(req.mcp_binding_ids, Some(vec![301, 302]));
     assert_eq!(
         req.execution_budget,
         Some(ExecutionBudget {
@@ -917,6 +920,7 @@ fn chat_request_into_data_maps_all_fields() {
         skill_search: Some(astra_core::SkillSearchSettings::default()),
         allow_skills: None,
         allow_tools: None,
+        mcp_binding_ids: Some(vec![301]),
         context: Some(ctx.clone()),
         execution_budget: Some(ExecutionBudget {
             initial_turns: Some(3),
@@ -943,6 +947,7 @@ fn chat_request_into_data_maps_all_fields() {
         data.skill_search,
         Some(astra_core::SkillSearchSettings::default())
     );
+    assert_eq!(data.mcp_binding_ids, Some(vec![301]));
     assert_eq!(data.context, Some(ctx));
     assert_eq!(
         data.execution_budget,
@@ -963,6 +968,7 @@ fn chat_request_into_data_maps_defaults() {
     assert!(data.agent_id.is_none());
     assert!(data.model.is_none());
     assert!(data.llm_token_service.is_none());
+    assert!(data.mcp_binding_ids.is_none());
     assert!(data.context.is_none());
     assert!(data.execution_budget.is_none());
     assert!(!data.explain);
@@ -979,6 +985,7 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         skill_search: None,
         allow_skills: None,
         allow_tools: None,
+        mcp_binding_ids: None,
         context: None,
         execution_budget: None,
         explain: false,

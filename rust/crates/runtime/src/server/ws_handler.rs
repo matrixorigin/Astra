@@ -990,6 +990,7 @@ fn build_ws_chat_request(
         skill_search,
         allow_skills,
         allow_tools,
+        mcp_binding_ids: None,
         context: merge_plan_subtask_context(context, plan_subtask_id, is_plan_subtask),
         forward_headers: std::collections::HashMap::new(),
         execution_budget,

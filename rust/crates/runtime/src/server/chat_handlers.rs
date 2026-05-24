@@ -142,6 +142,7 @@ fn chat_stream_bridge_fallback_payload(
         "skill_search": chat_data.skill_search.as_ref(),
         "allow_skills": allow_skills,
         "allow_tools": allow_tools,
+        "mcp_binding_ids": chat_data.mcp_binding_ids.as_ref(),
         "context": chat_data.context.as_ref(),
         "execution_budget": chat_data.execution_budget.as_ref(),
         "explain": chat_data.explain,
@@ -549,6 +550,7 @@ mod tests {
             }),
             allow_skills: Some(vec!["plan".to_string()]),
             allow_tools: Some(vec!["bash".to_string()]),
+            mcp_binding_ids: Some(vec![301]),
             context: None,
             forward_headers: std::collections::HashMap::new(),
             execution_budget: Some(astra_services::runs::ExecutionBudget {
@@ -574,6 +576,7 @@ mod tests {
         assert_eq!(obj["llm_token_service"]["timeout_ms"], 2500);
         assert_eq!(obj["allow_skills"], serde_json::json!(["plan"]));
         assert_eq!(obj["allow_tools"], serde_json::json!(["bash"]));
+        assert_eq!(obj["mcp_binding_ids"], serde_json::json!([301]));
         let messages = obj["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
@@ -599,6 +602,7 @@ mod tests {
                 "BASH".to_string(),
                 "read_file".to_string(),
             ]),
+            mcp_binding_ids: None,
             context: None,
             forward_headers: std::collections::HashMap::new(),
             execution_budget: Some(astra_services::runs::ExecutionBudget {

@@ -2164,6 +2164,62 @@ pub async fn ensure_core_schema(
     .await?;
 
     query(
+        "CREATE TABLE IF NOT EXISTS mcp_servers (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            owner_user_id VARCHAR(128) NOT NULL,
+            name VARCHAR(128) NOT NULL,
+            description TEXT NULL,
+            transport VARCHAR(32) NOT NULL,
+            url TEXT NOT NULL,
+            is_active SMALLINT NOT NULL DEFAULT 1,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_mcp_servers_owner_name (owner_user_id, name),
+            INDEX idx_mcp_servers_owner_active (owner_user_id, is_active, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS mcp_bindings (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            owner_user_id VARCHAR(128) NOT NULL,
+            mcp_id BIGINT NOT NULL,
+            alias VARCHAR(128) NOT NULL,
+            key_value_encrypted TEXT NOT NULL,
+            comment TEXT NULL,
+            is_active SMALLINT NOT NULL DEFAULT 1,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_mcp_bindings_owner_alias (owner_user_id, alias),
+            INDEX idx_mcp_bindings_owner_active (owner_user_id, is_active, updated_at),
+            INDEX idx_mcp_bindings_mcp_id (mcp_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS mcp_tools (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            binding_id BIGINT NOT NULL,
+            tool_name VARCHAR(256) NOT NULL,
+            public_name VARCHAR(384) NOT NULL,
+            description TEXT NULL,
+            input_schema_json JSON NULL,
+            output_schema_json JSON NULL,
+            schema_hash VARCHAR(128) NOT NULL,
+            discovered_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_mcp_tools_binding_tool (binding_id, tool_name),
+            UNIQUE KEY uq_mcp_tools_binding_public (binding_id, public_name),
+            INDEX idx_mcp_tools_binding (binding_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
         "CREATE TABLE IF NOT EXISTS task_leases (
             task_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(64) NOT NULL,

@@ -214,6 +214,7 @@ pub struct ChatRequestData {
     pub skill_search: Option<astra_core::SkillSearchSettings>,
     pub allow_skills: Option<Vec<String>>,
     pub allow_tools: Option<Vec<String>>,
+    pub mcp_binding_ids: Option<Vec<i64>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     pub forward_headers: std::collections::HashMap<String, String>,
     pub execution_budget: Option<ExecutionBudget>,
@@ -254,6 +255,7 @@ impl std::fmt::Debug for ChatRequestData {
             .field("skill_search", &self.skill_search)
             .field("allow_skills", &self.allow_skills)
             .field("allow_tools", &self.allow_tools)
+            .field("mcp_binding_ids", &self.mcp_binding_ids)
             .field("context", &self.context)
             .field(
                 "forward_headers",
@@ -2983,6 +2985,7 @@ mod tests {
             skill_search: None,
             allow_skills: None,
             allow_tools: None,
+            mcp_binding_ids: None,
             context: None,
             forward_headers,
             execution_budget: Some(ExecutionBudget {
@@ -3017,6 +3020,7 @@ mod tests {
                     skill_search: None,
                     allow_skills: None,
                     allow_tools: None,
+                    mcp_binding_ids: None,
                     context: None,
                     forward_headers: std::collections::HashMap::new(),
                     execution_budget: Some(ExecutionBudget {
