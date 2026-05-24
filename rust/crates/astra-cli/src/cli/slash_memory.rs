@@ -84,10 +84,10 @@ pub(super) async fn handle_memory_domain_command(
                         Err(e) => eprintln!("{}", format!("  ✗ Memory unreachable: {e}").red()),
                     }
                 }
-                _ if sub_arg.is_empty() && subcmd == "list" => {
+                _ if sub_arg.is_empty() && (subcmd == "list" || subcmd == "ls") => {
                     let payload = serde_json::json!({
-                        "query": "user preferences knowledge plans tasks",
-                        "top_k": 20,
+                        "query": "memory knowledge fact preference plan task note",
+                        "top_k": 50,
                     });
                     match api.post_memory_search_json(tok, &payload).await {
                         Ok(r) if r.status().is_success() => {
@@ -388,10 +388,10 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
 
-                "stats" => {
+                "stats" | "count" => {
                     let payload = serde_json::json!({
-                        "query": "user preferences knowledge plans tasks",
-                        "top_k": 100,
+                        "query": "memory knowledge fact preference plan task note",
+                        "top_k": 200,
                     });
                     match api.post_memory_search_json(tok, &payload).await {
                         Ok(r) if r.status().is_success() => {
@@ -816,10 +816,17 @@ fn render_memory_list(arr: &[serde_json::Value]) {
             .dim()
         );
         for m in bucket {
+            let id = m
+                .get("id")
+                .or_else(|| m.get("memory_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let short_id = prefix_chars(id, 8);
             eprintln!(
-                "  {}. {}",
+                "  {}. {}  {}",
                 counter.to_string().magenta(),
-                format_memory_entry_line(m)
+                format_memory_entry_line(m),
+                short_id.dim()
             );
             counter += 1;
         }

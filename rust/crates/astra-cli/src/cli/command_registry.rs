@@ -259,6 +259,7 @@ const TASK_SUBCOMMANDS: &[(&str, &str)] = &[
 const MEMORY_SUBCOMMANDS: &[(&str, &str)] = &[
     // ── Browse ──
     ("list", "List memories grouped by type"),
+    ("ls", "Alias for list"),
     ("search", "Search memories by content (needs query)"),
     ("show", "Inspect one memory in detail (needs id)"),
     ("stats", "Count memories by type"),
