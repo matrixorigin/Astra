@@ -387,9 +387,15 @@ pub fn budget_for_model_with_override(
         // OpenAI — o1/o3 reasoning models (200K context)
         m if m.contains("o1") || m.contains("o3") => (200_000, 0.15),
         // Anthropic — Claude 4.6+ generation (1M context)
-        m if m.contains("opus-4-6") || m.contains("sonnet-4-6") || m.contains("haiku-4-6")
-            || m.contains("opus-4-7") || m.contains("sonnet-4-7") || m.contains("haiku-4-7")
-            => (1_000_000, 0.10),
+        m if m.contains("opus-4-6")
+            || m.contains("sonnet-4-6")
+            || m.contains("haiku-4-6")
+            || m.contains("opus-4-7")
+            || m.contains("sonnet-4-7")
+            || m.contains("haiku-4-7") =>
+        {
+            (1_000_000, 0.10)
+        }
         // Anthropic — Claude older (128K context default)
         m if m.contains("claude") => (128_000, 0.15),
         // Google — Gemini (1M context)
