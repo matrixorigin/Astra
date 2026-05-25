@@ -3758,26 +3758,6 @@ impl ToolExecutor {
                         other => format!("Error: unknown `agent_job` action '{other}'. Valid: shell, agent, output, kill."),
                     }
                 }
-                // Legacy standalone agent tool names (journal replay / old sessions)
-                "spawn_agent" => {
-                    agent_spawning::handle_agent_spawn_action(args, self.spawn_context.as_ref())
-                        .await
-                }
-                "get_agent_result" => {
-                    agent_spawning::handle_agent_get_result_action(
-                        args,
-                        self.spawn_context.as_ref(),
-                    )
-                    .await
-                }
-                "send_message" => {
-                    let ctx = self
-                        .send_message_context
-                        .lock()
-                        .ok()
-                        .and_then(|g| g.clone());
-                    agent_messaging::handle_send_message_tool(args, ctx.as_ref()).await
-                }
                 // Legacy separate task_* names (backward compat)
                 "task_create" => self.task_create(args).await,
                 "task_list" => self.task_list(args).await,

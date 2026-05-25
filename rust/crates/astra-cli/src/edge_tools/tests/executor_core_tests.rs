@@ -39,51 +39,6 @@ async fn execute_unknown_tool_returns_error() {
     );
 }
 
-#[tokio::test]
-async fn legacy_spawn_agent_routes_to_spawn_handler_instead_of_unknown_tool() {
-    let executor = test_executor();
-    let result = executor
-        .execute(
-            "spawn_agent",
-            &json!({
-                "description": "Review auth flow",
-                "prompt": "Inspect auth paths"
-            }),
-        )
-        .await;
-    assert!(
-        result.contains("Agent spawning not available in this context."),
-        "legacy spawn_agent should route to the shared spawn handler; got: {result}"
-    );
-}
-
-#[tokio::test]
-async fn legacy_get_agent_result_routes_to_result_handler_instead_of_unknown_tool() {
-    let executor = test_executor();
-    let result = executor
-        .execute("get_agent_result", &json!({"agent_id": "reviewer@abc"}))
-        .await;
-    assert!(
-        result.contains("Agent spawning not available in this context."),
-        "legacy get_agent_result should route to the shared result handler; got: {result}"
-    );
-}
-
-#[tokio::test]
-async fn legacy_send_message_routes_to_message_handler_instead_of_unknown_tool() {
-    let executor = test_executor();
-    let result = executor
-        .execute(
-            "send_message",
-            &json!({"to": "reviewer@abc", "message": "status?"}),
-        )
-        .await;
-    assert!(
-        result.contains("Messaging not available in this context"),
-        "legacy send_message should route to the messaging handler; got: {result}"
-    );
-}
-
 /// Standalone `delegate` tool (the engine-managed delegation flow).
 /// In server mode the runtime intercepts this call upstream in
 /// `agentic_delegate_interception.rs` and runs real sub-agents — the
