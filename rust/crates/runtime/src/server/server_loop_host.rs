@@ -276,6 +276,8 @@ struct ResolvedTurnLlmConfig {
     request_body_overrides: Option<Map<String, Value>>,
     completions_url_override: Option<String>,
     request_timeout: Option<Duration>,
+    /// Context window from model config. Falls back to hardcoded table when `None`.
+    context_window: Option<u32>,
 }
 
 type PipelineTurnOutcome = crate::turn::llm::context::LlmContextAssemblyOutput;
@@ -363,6 +365,7 @@ async fn resolve_llm_model_for_turn(
             request_body_overrides: None,
             completions_url_override: Some(config.url.clone()),
             request_timeout: config.timeout_ms.map(Duration::from_millis),
+            context_window: None,
         });
     }
     let resolved =
@@ -382,6 +385,7 @@ async fn resolve_llm_model_for_turn(
         request_body_overrides: resolved.request_body_overrides,
         completions_url_override: None,
         request_timeout: None,
+        context_window: resolved.context_window,
     })
 }
 
@@ -1484,6 +1488,7 @@ impl ServerAgenticLoopHost {
             request_body_overrides: None,
             completions_url_override: None,
             request_timeout: None,
+            context_window: None,
         };
         let wire_messages = self.assemble_llm_messages(
             system_msgs.clone(),
@@ -2629,7 +2634,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         );
 
         // ── 3. Call LLM ─────────────────────────────────────────────────
-        let budget = crate::prompts::budget_for_model(Some(&llm_cfg.model_name));
+        let budget = crate::prompts::budget_for_model_with_override(
+            Some(&llm_cfg.model_name),
+            llm_cfg.context_window,
+        );
         let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
         let cache_cap =
@@ -4131,6 +4139,7 @@ mod tests {
             request_body_overrides: None,
             completions_url_override: None,
             request_timeout: None,
+            context_window: None,
         };
         let msgs = host.assemble_llm_messages(
             vec![json!({"role": "system", "content": "system prompt text"})],

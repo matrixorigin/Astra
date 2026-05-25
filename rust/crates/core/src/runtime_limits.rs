@@ -142,7 +142,28 @@ impl RuntimeLimits {
 ///
 /// Returns the full context window in tokens. The caller should
 /// apply a reserve (e.g., 80% for input, 20% for output).
+/// Convenience wrapper around [`context_window_for_model_with_override`].
 pub fn context_window_for_model(model: &str) -> Option<u64> {
+    context_window_for_model_with_override(model, None)
+}
+
+/// Known context window sizes for common models.
+///
+/// When `config_override` is provided (from `.models.yaml` or the DB),
+/// it takes precedence over the hardcoded lookup table. When `None`, falls
+/// back to the static lookup table keyed by model name.
+///
+/// Returns the full context window in tokens. The caller should
+/// apply a reserve (e.g., 80% for input, 20% for output).
+pub fn context_window_for_model_with_override(
+    model: &str,
+    config_override: Option<u32>,
+) -> Option<u64> {
+    // Dynamic override from model config — always wins.
+    if let Some(cw) = config_override {
+        return Some(cw as u64);
+    }
+
     let lower = model.to_lowercase();
     // Anthropic 4.6+ generation: 1M context window.
     // The 4.6 generation (Opus 4.6, Sonnet 4.6, Haiku 4.6) advertises a 1M
@@ -158,17 +179,25 @@ pub fn context_window_for_model(model: &str) -> Option<u64> {
         return Some(1_000_000);
     }
     if lower.contains("opus-4") || lower.contains("claude-opus") {
-        return Some(200_000);
+        return Some(128_000);
     }
     if lower.contains("sonnet-4") || lower.contains("claude-sonnet") {
-        return Some(200_000);
+        return Some(128_000);
     }
     if lower.contains("haiku-4") || lower.contains("claude-haiku") {
-        return Some(200_000);
-    }
-    // DeepSeek
-    if lower.contains("deepseek") {
         return Some(128_000);
+    }
+    // DeepSeek V4 (1M context) — must precede generic deepseek arm
+    if lower.contains("deepseek-v4") {
+        return Some(1_000_000);
+    }
+    // DeepSeek V3 / R1 (64K context)
+    if lower.contains("deepseek") {
+        return Some(64_000);
+    }
+    // Google — Gemini (1M context)
+    if lower.contains("gemini") {
+        return Some(1_000_000);
     }
     // Qwen (most have 1M but practical limit is lower)
     if lower.contains("qwen") {

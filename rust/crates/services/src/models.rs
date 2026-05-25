@@ -356,6 +356,9 @@ pub struct ResolvedActiveLlmModel {
     pub prompt_cache_capability: Option<PromptCacheCapabilityData>,
     /// Probe-determined thinking capability. NULL if unprobed.
     pub thinking_capability: Option<ThinkingCapability>,
+    /// Context window size from model config (`.models.yaml` or DB).
+    /// `None` means use the hardcoded fallback table.
+    pub context_window: Option<u32>,
 }
 
 impl std::fmt::Debug for ResolvedActiveLlmModel {
@@ -371,6 +374,7 @@ impl std::fmt::Debug for ResolvedActiveLlmModel {
             .field("request_body_overrides", &self.request_body_overrides)
             .field("prompt_cache_capability", &self.prompt_cache_capability)
             .field("thinking_capability", &self.thinking_capability)
+            .field("context_window", &self.context_window)
             .finish()
     }
 }
@@ -474,6 +478,8 @@ fn build_resolved_active_llm_from_row(
     let prompt_cache_capability = quirks.prompt_cache_capability;
     let request_body_overrides = quirks.request_body_overrides;
 
+    let context_window: Option<i32> = row.try_get("context_window").ok().flatten();
+
     Ok(ResolvedActiveLlmModel {
         model_name,
         wire_model_name,
@@ -485,6 +491,7 @@ fn build_resolved_active_llm_from_row(
         request_body_overrides,
         prompt_cache_capability,
         thinking_capability,
+        context_window: context_window.map(|cw| cw as u32),
     })
 }
 
@@ -2841,6 +2848,7 @@ mod tests {
             request_body_overrides: None,
             prompt_cache_capability: None,
             thinking_capability: None,
+            context_window: None,
         };
         assert_eq!(r.upstream_model_name(), "deepseek-v4-pro");
         // The local name is still reachable for routing / metrics.
@@ -2860,6 +2868,7 @@ mod tests {
             request_body_overrides: None,
             prompt_cache_capability: None,
             thinking_capability: None,
+            context_window: None,
         };
         assert_eq!(r.upstream_model_name(), "claude-sonnet-4-6");
     }
