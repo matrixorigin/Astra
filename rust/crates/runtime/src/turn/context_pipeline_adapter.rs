@@ -235,15 +235,14 @@ pub(crate) fn build_external_sources(
     // Tool and skill capability counts (per-turn volatile — tool_names and
     // active_skill_names are clipped per turn by the optimizer, and
     // max_turn_input_tokens can be adjusted mid-session by adaptive tuning).
+    // Skill names are NOT listed here — they already appear in ## Active Skills
+    // above. Duplicating them wastes tokens and risks stale data.
     {
         let tool_count = tool_names.len();
         let skill_count = active_skill_names.len();
         let mut cap = format!(
             "\n\n## Capabilities\n{tool_count} tools available. {skill_count} active skills."
         );
-        if !active_skill_names.is_empty() {
-            cap.push_str(&format!(" Skills: {}.", active_skill_names.join(", ")));
-        }
         // Context window capacity (effective per-turn limit)
         if state.max_turn_input_tokens > 0 {
             cap.push_str(&format!(
