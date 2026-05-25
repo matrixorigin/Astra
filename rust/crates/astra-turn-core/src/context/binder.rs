@@ -13,8 +13,8 @@ use serde_json::Value;
 use crate::context_planner::ContextPlan;
 use crate::context_sources::ContextSources;
 use crate::section_types::{
-    BYTES_PER_TOKEN_ESTIMATE, BoundSection, PlannedSection, SectionArtifact, SectionKind,
-    estimate_text_tokens,
+    estimate_text_tokens, BoundSection, PlannedSection, SectionArtifact, SectionKind,
+    BYTES_PER_TOKEN_ESTIMATE,
 };
 use crate::working_memory::WorkingMemoryState;
 
@@ -300,6 +300,15 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
 fn bind_runtime_volatile(sources: &ContextSources<'_>) -> String {
     let ext = &sources.external;
     let mut parts = Vec::new();
+
+    // Model identity lives in the volatile (CacheScope::None) lane so
+    // model-switching mid-session doesn't invalidate the Session-scoped
+    // cache prefix. The model needs this for self-awareness ("what model
+    // are you?").
+    parts.push(format!(
+        "Model: {} (via {})",
+        sources.session.model_id, sources.session.provider_name,
+    ));
 
     // Session UUID is *not* emitted to the prompt. It used to ride the
     // volatile lane ("Session: <uuid>\n" = ~45c/turn) so it wouldn't
