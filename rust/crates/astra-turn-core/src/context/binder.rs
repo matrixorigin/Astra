@@ -257,6 +257,9 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
     let ext = &sources.external;
     let mut parts = Vec::new();
 
+    // Agent version: compile-time constant, truly session-stable.
+    parts.push(format!("Astra v{}", env!("CARGO_PKG_VERSION")));
+
     // Core identity. Exact model id is request metadata, not prompt content:
     // putting it in the Session-scoped prefix churns prompt caches when a
     // session switches between models in the same provider family.

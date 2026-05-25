@@ -15,45 +15,6 @@ use astra_text_utils::output_style::OutputStyle;
 
 /// Session-stable runtime context for the agent's self-knowledge.
 ///
-/// Injected into the system prompt so the agent knows its identity,
-/// environment, and session context — enabling inquiry, reflection,
-/// and retrospection without hallucinating these details.
-#[derive(Debug, Clone, Default)]
-pub struct AgentRuntimeContext {
-    pub model_name: Option<String>,
-    pub workspace_cwd: Option<String>,
-    pub git_branch: Option<String>,
-    pub session_id: Option<String>,
-    pub user_id: Option<String>,
-    pub current_date: Option<String>,
-}
-
-impl AgentRuntimeContext {
-    pub fn to_prompt_section(&self) -> String {
-        let mut s = String::with_capacity(256);
-        s.push_str("\n## Runtime Identity\n");
-        if let Some(ref v) = self.model_name {
-            let _ = writeln!(s, "Model: {v}");
-        }
-        if let Some(ref v) = self.current_date {
-            let _ = writeln!(s, "Date: {v}");
-        }
-        if let Some(ref v) = self.workspace_cwd {
-            let _ = writeln!(s, "Workspace: {v}");
-        }
-        if let Some(ref v) = self.git_branch {
-            let _ = writeln!(s, "Git branch: {v}");
-        }
-        if let Some(ref v) = self.session_id {
-            let _ = writeln!(s, "Session: {v}");
-        }
-        if let Some(ref v) = self.user_id {
-            let _ = writeln!(s, "User: {v}");
-        }
-        s
-    }
-}
-
 /// Confidence threshold below which the system prompt includes an advisory
 /// telling the LLM to ask for clarification rather than guessing with wrong tools.
 pub const LOW_CONFIDENCE_THRESHOLD: f64 = 0.3;
