@@ -528,14 +528,20 @@ pub fn evaluate_permission(
                 push_skipped(
                     &mut trace,
                     EvaluationStep::GitSafety,
-                    &format!("auto mode soft violation, deferring to allowlist: {}", reasons.join(", ")),
+                    &format!(
+                        "auto mode soft violation, deferring to allowlist: {}",
+                        reasons.join(", ")
+                    ),
                 );
                 // continue to ExplicitApprovalGate
             } else if fingerprinted_override(tool_name, args, ctx).is_some() {
                 push_skipped(
                     &mut trace,
                     EvaluationStep::GitSafety,
-                    &format!("auto mode soft violation, deferring for session override: {}", reasons.join(", ")),
+                    &format!(
+                        "auto mode soft violation, deferring for session override: {}",
+                        reasons.join(", ")
+                    ),
                 );
                 // continue — SessionOverride will refuse to bypass git safety
             } else {
