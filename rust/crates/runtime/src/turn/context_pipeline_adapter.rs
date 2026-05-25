@@ -55,7 +55,11 @@ pub(crate) fn build_external_sources(
             &profile_for_tc,
             selection_confidence,
         );
-        if text.is_empty() { None } else { Some(text) }
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     };
 
     // 3. Environment context — routed split by cache volatility.
@@ -89,7 +93,11 @@ pub(crate) fn build_external_sources(
                 "\n\n## Agent Type\nYou are acting as a **{agent_type}** agent for this skill.",
             ));
         }
-        if hint.is_empty() { None } else { Some(hint) }
+        if hint.is_empty() {
+            None
+        } else {
+            Some(hint)
+        }
     };
 
     // 6. System override (delegation)
@@ -121,7 +129,7 @@ pub(crate) fn build_external_sources(
     };
 
     // 9. Active skill names as hint
-    let _active_skill_names: Vec<&str> = edge_profile
+    let active_skill_names: Vec<&str> = edge_profile
         .get("active_skills")
         .and_then(Value::as_array)
         .map(|arr| arr.iter().filter_map(Value::as_str).collect())
@@ -187,6 +195,29 @@ pub(crate) fn build_external_sources(
     if let Some(text) = env_volatile {
         extra_dynamic_sections.push(crate::prompts::PromptSection::dynamic(
             text,
+            crate::prompts::PromptTokenBucket::Environment,
+        ));
+    }
+
+    // 9a. Active skills visibility hint (volatile)
+    if !active_skill_names.is_empty() {
+        extra_dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+            format!(
+                "\n\n## Active Skills\nThe following skills are currently active: {}. Use `discover_skills` to see their full descriptions.",
+                active_skill_names.join(", ")
+            ),
+            crate::prompts::PromptTokenBucket::Environment,
+        ));
+    }
+
+    // 9b. Turn budget hint (volatile)
+    if state.max_turns > 0 && state.remaining_turns > 0 {
+        let budget_pct = (state.remaining_turns as f64 / state.max_turns as f64) * 100.0;
+        extra_dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+            format!(
+                "\n\n## Turn Budget\n{}/{} turns remaining ({:.0}%). Complete the current task promptly — do not consume turns needlessly.",
+                state.remaining_turns, state.max_turns, budget_pct
+            ),
             crate::prompts::PromptTokenBucket::Environment,
         ));
     }
@@ -648,11 +679,9 @@ mod tests {
         assert_eq!(sources.memory_entries[0].source.as_deref(), Some("test"));
         assert_eq!(sources.memory_entries[0].token_estimate, 7);
         assert_eq!(sources.memory_entries[0].freshness_turn, Some(3));
-        assert!(
-            sources.memory_entries[1]
-                .content
-                .contains("ranked fallback string")
-        );
+        assert!(sources.memory_entries[1]
+            .content
+            .contains("ranked fallback string"));
     }
 
     #[test]
