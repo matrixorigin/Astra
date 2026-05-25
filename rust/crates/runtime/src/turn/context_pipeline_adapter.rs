@@ -210,12 +210,19 @@ pub(crate) fn build_external_sources(
         ));
     }
 
-    // 9b. Turn budget hint (volatile)
+    // 9b. Turn budget hint (volatile, tiered urgency)
     if state.max_turns > 0 && state.remaining_turns > 0 {
         let budget_pct = (state.remaining_turns as f64 / state.max_turns as f64) * 100.0;
+        let urgency = if budget_pct >= 80.0 {
+            ""
+        } else if budget_pct >= 50.0 {
+            " Use turns efficiently."
+        } else {
+            " Do not consume turns needlessly."
+        };
         extra_dynamic_sections.push(crate::prompts::PromptSection::dynamic(
             format!(
-                "\n\n## Turn Budget\n{}/{} turns remaining ({:.0}%). Complete the current task promptly — do not consume turns needlessly.",
+                "\n\n## Turn Budget\n{}/{} turns remaining ({:.0}%).{urgency}",
                 state.remaining_turns, state.max_turns, budget_pct
             ),
             crate::prompts::PromptTokenBucket::Environment,
