@@ -153,6 +153,7 @@ mod tests {
                 working_memory: Default::default(),
                 cache_detector_state: Default::default(),
                 pending_prompt_snapshot: None,
+                session_current_date: "2026-05-25".to_string(),
                 turns_completed: 0,
             },
         );
@@ -240,6 +241,7 @@ mod tests {
                 working_memory: Default::default(),
                 cache_detector_state: Default::default(),
                 pending_prompt_snapshot: None,
+                session_current_date: "2026-05-25".to_string(),
                 turns_completed: 0,
             },
         );

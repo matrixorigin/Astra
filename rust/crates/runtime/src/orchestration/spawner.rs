@@ -1037,7 +1037,10 @@ impl DynamicAgentSpawner {
                         .await;
                         self.unregister_mailbox(&agent_id).await;
 
-                        Ok(SpawnAgentOutput::Failed { error: e, duration_ms: 0 })
+                        Ok(SpawnAgentOutput::Failed {
+                            error: e,
+                            duration_ms: 0,
+                        })
                     }
                 }
             } else {

@@ -230,7 +230,10 @@ pub fn normalize_agent_spawn_args(args: &Value) -> Result<Value, String> {
 }
 
 /// Handle `agent(action='get_result')`.
-pub async fn handle_agent_get_result_action(args: &Value, ctx: Option<&AgentToolContext>) -> String {
+pub async fn handle_agent_get_result_action(
+    args: &Value,
+    ctx: Option<&AgentToolContext>,
+) -> String {
     let agent_id = match args.get("agent_id").and_then(Value::as_str).map(str::trim) {
         Some(id) if !id.is_empty() => id,
         None => {
@@ -647,7 +650,8 @@ mod tests {
         let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
 
         let result =
-            handle_agent_get_result_action(&json!({"agent_id": "security-review"}), Some(&ctx)).await;
+            handle_agent_get_result_action(&json!({"agent_id": "security-review"}), Some(&ctx))
+                .await;
         let value: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(value["status"], "failed");
         assert_eq!(value["agent_id"], "security-review");

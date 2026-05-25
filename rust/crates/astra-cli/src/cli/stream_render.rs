@@ -7858,7 +7858,10 @@ mod tests {
     #[test]
     fn format_meta_tool_preview_display_names() {
         assert_eq!(
-            format_tool_display_from_preview("agent", Some("Spawn agent: reviewer-A (code-review)")),
+            format_tool_display_from_preview(
+                "agent",
+                Some("Spawn agent: reviewer-A (code-review)")
+            ),
             "Spawn agent: reviewer-A (code-review)"
         );
         assert_eq!(

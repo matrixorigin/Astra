@@ -169,7 +169,7 @@ mod tests {
     use super::*;
     use crate::context_binder::bind_all;
     use crate::context_optimizer::optimize;
-    use crate::context_planner::{plan_turn, PlanInput};
+    use crate::context_planner::{PlanInput, plan_turn};
     use crate::context_sources::*;
     use crate::emergent_context::EmergentContext;
     use crate::microcompact::ProviderCacheStrategy;
@@ -271,10 +271,12 @@ mod tests {
             .push(serde_json::json!({"role": "user", "content": "extra"}));
         let result = diff_pipeline_outputs(&opt1, &opt2, 2);
         assert!(result.has_errors());
-        assert!(result
-            .alerts
-            .iter()
-            .any(|a| a.rule == "shadow_message_count"));
+        assert!(
+            result
+                .alerts
+                .iter()
+                .any(|a| a.rule == "shadow_message_count")
+        );
     }
 
     #[test]
@@ -286,10 +288,12 @@ mod tests {
         }
         let result = diff_pipeline_outputs(&opt1, &opt2, 3);
         assert!(result.has_errors());
-        assert!(result
-            .alerts
-            .iter()
-            .any(|a| a.rule == "shadow_system_block_hash"));
+        assert!(
+            result
+                .alerts
+                .iter()
+                .any(|a| a.rule == "shadow_system_block_hash")
+        );
     }
 
     #[test]
@@ -298,9 +302,11 @@ mod tests {
         let (opt2, _) = build_optimized();
         // Identical sections → identical tokens → no delta alert
         let result = diff_pipeline_outputs(&opt1, &opt2, 4);
-        assert!(!result
-            .alerts
-            .iter()
-            .any(|a| a.rule == "shadow_token_estimate_delta"));
+        assert!(
+            !result
+                .alerts
+                .iter()
+                .any(|a| a.rule == "shadow_token_estimate_delta")
+        );
     }
 }

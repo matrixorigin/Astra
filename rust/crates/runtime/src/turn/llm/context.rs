@@ -774,6 +774,11 @@ pub(crate) fn assemble_context_pipeline(
     let model_context_limit =
         u64::try_from(crate::prompts::budget_for_model(Some(input.model_name)).model_limit)
             .unwrap_or(u64::MAX);
+    let session_current_date = state
+        .pipeline_session
+        .as_ref()
+        .map(|session| session.current_date().to_string())
+        .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
     let mut session_ctx = build_session_context(
         input.session_id,
         state.current_run_id.as_deref(),
@@ -783,6 +788,7 @@ pub(crate) fn assemble_context_pipeline(
         input.provider,
         state.project_context.as_deref(),
         Some(cache_cap),
+        &session_current_date,
         state.context_manifest_user_id.as_deref(),
     );
     if !input.tool_surface.deferred_tools_block.is_empty() {

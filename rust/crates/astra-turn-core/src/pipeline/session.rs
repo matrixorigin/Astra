@@ -8,8 +8,8 @@
 //! pipeline invocation that carries forward learned behavior across turns.
 
 use crate::cache_diagnostics::{
-    CacheBreakDetector, CacheBreakDetectorState, PromptStateSnapshot,
-    DEFAULT_MIN_CACHE_BREAK_TOKENS,
+    CacheBreakDetector, CacheBreakDetectorState, DEFAULT_MIN_CACHE_BREAK_TOKENS,
+    PromptStateSnapshot,
 };
 use crate::compaction_types::CompactionTier;
 use crate::context_feedback::ContextFeedback;
@@ -29,7 +29,7 @@ use crate::pipeline_config::PipelineConfig;
 use crate::pipeline_stats::PipelineStats;
 use crate::recovery_state::RecoveryState;
 use crate::session_latches::SessionLatches;
-use crate::shadow_diff::{diff_pipeline_outputs, ShadowDiffResult};
+use crate::shadow_diff::{ShadowDiffResult, diff_pipeline_outputs};
 use crate::working_memory::WorkingMemoryState;
 
 /// Per-turn input provided by the agentic loop to `PipelineSession::run_turn()`.
@@ -81,11 +81,16 @@ pub struct PipelineSession {
     pub latches: SessionLatches,
     pub emergent: EmergentContext,
     pub recovery: RecoveryState,
+    session_current_date: String,
     working_memory: WorkingMemoryState,
     cache_detector: CacheBreakDetector,
     pending_prompt_snapshot: Option<PendingPromptSnapshot>,
     turns_completed: u32,
     pending_audits: Vec<crate::pipeline_journal::PipelineJournalEvent>,
+}
+
+fn default_session_current_date() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -104,6 +109,7 @@ impl PipelineSession {
             latches: SessionLatches::default(),
             emergent: EmergentContext::default(),
             recovery: RecoveryState::default(),
+            session_current_date: default_session_current_date(),
             working_memory: WorkingMemoryState::default(),
             cache_detector: CacheBreakDetector::new(),
             pending_prompt_snapshot: None,
@@ -121,6 +127,7 @@ impl PipelineSession {
             latches: SessionLatches::default(),
             emergent: EmergentContext::default(),
             recovery: RecoveryState::default(),
+            session_current_date: default_session_current_date(),
             working_memory: WorkingMemoryState::default(),
             cache_detector: CacheBreakDetector::new(),
             pending_prompt_snapshot: None,
@@ -147,6 +154,7 @@ impl PipelineSession {
             latches,
             emergent: EmergentContext::default(),
             recovery,
+            session_current_date: default_session_current_date(),
             working_memory: WorkingMemoryState::default(),
             cache_detector: CacheBreakDetector::new(),
             pending_prompt_snapshot: None,
@@ -514,6 +522,7 @@ impl PipelineSession {
             cache_detector_state: self.cache_detector.snapshot_state(),
             pending_prompt_snapshot: self.pending_prompt_snapshot.clone(),
             turns_completed: self.turns_completed,
+            session_current_date: self.session_current_date.clone(),
         }
     }
 
@@ -532,12 +541,18 @@ impl PipelineSession {
             latches: snapshot.latches,
             emergent: snapshot.emergent,
             recovery,
+            session_current_date: snapshot.session_current_date,
             working_memory: snapshot.working_memory,
             cache_detector: CacheBreakDetector::from_state(snapshot.cache_detector_state),
             pending_prompt_snapshot: snapshot.pending_prompt_snapshot,
             turns_completed: snapshot.turns_completed,
             pending_audits: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn current_date(&self) -> &str {
+        &self.session_current_date
     }
 }
 
@@ -556,6 +571,8 @@ pub struct PipelineSessionSnapshot {
     pub(crate) pending_prompt_snapshot: Option<PendingPromptSnapshot>,
     #[serde(default)]
     pub turns_completed: u32,
+    #[serde(default = "default_session_current_date")]
+    pub session_current_date: String,
 }
 
 /// Summary metrics extracted from pipeline state for cloud_session_facts.

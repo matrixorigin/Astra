@@ -10,7 +10,7 @@ use astra_turn_core::compaction_types::CompactionTier;
 use astra_turn_core::context_binder::bind_all;
 use astra_turn_core::context_feedback::ContextFeedback;
 use astra_turn_core::context_optimizer::optimize;
-use astra_turn_core::context_planner::{plan_turn, PlanInput};
+use astra_turn_core::context_planner::{PlanInput, plan_turn};
 use astra_turn_core::context_sources::*;
 use astra_turn_core::emergent_context::*;
 use astra_turn_core::microcompact::ProviderCacheStrategy;
@@ -115,10 +115,11 @@ fn pipeline_single_turn_produces_valid_output() {
     // Plan
     let plan = plan_turn(&plan_input);
     assert!(!plan.sections.is_empty());
-    assert!(plan
-        .sections
-        .iter()
-        .any(|s| s.kind == SectionKind::Identity));
+    assert!(
+        plan.sections
+            .iter()
+            .any(|s| s.kind == SectionKind::Identity)
+    );
     assert!(plan.sections.iter().any(|s| s.kind == SectionKind::Memory));
 
     // Bind
