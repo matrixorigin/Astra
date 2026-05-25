@@ -475,8 +475,8 @@ mod tests {
     #[test]
     fn effective_input_limit_claude() {
         let b = budget_for_model(Some("claude-3.5-sonnet"));
-        // 200_000 * (1 - 0.20) = 160_000
-        assert_eq!(b.effective_input_limit(), 160_000);
+        // 128_000 * (1 - 0.15) = 108_800
+        assert_eq!(b.effective_input_limit(), 108_800);
     }
 
     #[test]
@@ -655,10 +655,30 @@ mod tests {
     }
 
     #[test]
-    fn model_claude() {
+    fn model_claude_legacy() {
         let b = budget_for_model(Some("claude-3-opus"));
-        assert_eq!(b.model_limit, 200_000);
-        assert!((b.output_reserve_ratio - 0.20).abs() < f64::EPSILON);
+        assert_eq!(b.model_limit, 128_000);
+        assert!((b.output_reserve_ratio - 0.15).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn model_claude_4_6_gets_1m() {
+        let b = budget_for_model(Some("claude-sonnet-4-6"));
+        assert_eq!(b.model_limit, 1_000_000);
+        assert!((b.output_reserve_ratio - 0.10).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn model_claude_4_7_gets_1m() {
+        let b = budget_for_model(Some("claude-opus-4-7"));
+        assert_eq!(b.model_limit, 1_000_000);
+    }
+
+    #[test]
+    fn model_deepseek_v4_gets_1m() {
+        let b = budget_for_model(Some("deepseek-v4-pro"));
+        assert_eq!(b.model_limit, 1_000_000);
+        assert!((b.output_reserve_ratio - 0.10).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -671,6 +691,44 @@ mod tests {
     #[test]
     fn model_qwen() {
         let b = budget_for_model(Some("qwen-turbo"));
+        assert_eq!(b.model_limit, 128_000);
+    }
+
+    // ---------------------------------------------------------------
+    // 4b. Dynamic override from model config
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn override_wins_over_hardcoded() {
+        // deepseek-chat is hardcoded at 64K, override should win
+        let b = budget_for_model_with_override(Some("deepseek-chat"), Some(1_000_000));
+        assert_eq!(b.model_limit, 1_000_000);
+        assert!((b.output_reserve_ratio - 0.10).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn override_for_unknown_model() {
+        let b = budget_for_model_with_override(Some("my-custom-model"), Some(256_000));
+        assert_eq!(b.model_limit, 256_000);
+        assert!((b.output_reserve_ratio - 0.10).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn override_small_window_gets_small_reserve() {
+        let b = budget_for_model_with_override(Some("small-model"), Some(32_000));
+        assert_eq!(b.model_limit, 32_000);
+        assert!((b.output_reserve_ratio - 0.15).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn no_override_falls_back_to_hardcoded() {
+        let b = budget_for_model_with_override(Some("deepseek-chat"), None);
+        assert_eq!(b.model_limit, 64_000);
+    }
+
+    #[test]
+    fn no_override_unknown_falls_back_to_default() {
+        let b = budget_for_model_with_override(Some("totally-unknown-model"), None);
         assert_eq!(b.model_limit, 128_000);
     }
 
@@ -1346,8 +1404,8 @@ mod tests {
         let b = ContextBudget::from_runtime_config(&config, Some("claude-3.5-sonnet"));
 
         // Model-specific values should be applied
-        assert_eq!(b.model_limit, 200_000); // Claude
-        assert!((b.output_reserve_ratio - 0.20).abs() < f64::EPSILON);
+        assert_eq!(b.model_limit, 128_000); // Claude
+        assert!((b.output_reserve_ratio - 0.15).abs() < f64::EPSILON);
 
         // RuntimeConfig values should be applied
         assert!((b.compact_threshold - 0.6).abs() < f64::EPSILON);
