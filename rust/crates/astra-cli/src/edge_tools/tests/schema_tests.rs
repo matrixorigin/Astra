@@ -577,6 +577,26 @@ fn local_cli_catalog_includes_plan_mode_wrappers() {
 }
 
 #[test]
+fn cli_runtime_catalog_includes_plan_mode_wrappers() {
+    let names: Vec<String> = astra_runtime::capabilities::cli_local_tool_schemas(
+        crate::edge_tools::local_tool_schemas(),
+        Vec::new(),
+        &crate::edge_tools::cli_default_capabilities(false),
+    )
+    .into_iter()
+    .filter_map(|s| s["function"]["name"].as_str().map(ToString::to_string))
+    .collect();
+    assert!(
+        names.iter().any(|n| n == "enter_plan_mode"),
+        "runtime-filtered local CLI catalog should still expose enter_plan_mode; got {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "exit_plan_mode"),
+        "runtime-filtered local CLI catalog should still expose exit_plan_mode; got {names:?}"
+    );
+}
+
+#[test]
 fn enter_plan_mode_and_exit_plan_mode_surface_with_plan_lifecycle() {
     use astra_turn_core::capability::{Capability, CapabilitySet};
     use astra_turn_core::tool_surface::{Surface, resolve};

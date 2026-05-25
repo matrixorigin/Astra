@@ -86,6 +86,7 @@ pub fn cli_default_capabilities(
         .with(Capability::GitHubAuth)
         .with(Capability::LSPServer)
         .with(Capability::SkillsCatalog)
+        .with(Capability::PlanLifecycle)
         .with_if(has_agent_spawner, Capability::AgentSpawner)
 }
 
@@ -4687,8 +4688,8 @@ mod tests {
             "bare executor must report AgentSpawner inactive; got {out}"
         );
         assert!(
-            inactive.contains(&"PlanLifecycle"),
-            "PlanLifecycle is server-owned on the CLI; got {out}"
+            !inactive.contains(&"PlanLifecycle"),
+            "local CLI exposes client-backed plan lifecycle wrappers, so PlanLifecycle must stay active; got {out}"
         );
 
         let dropped = parsed["tools_dropped_by_capability"]

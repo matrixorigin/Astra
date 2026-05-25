@@ -69,6 +69,72 @@ use astra_turn_core::tool_schema_prune::prune_tool_schemas;
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 const ROOT_TURN_JOURNAL_HEADER: &str = "x-mo-root-turn-journal";
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CachedSessionStartMemory {
+    stable_memory_section: Option<String>,
+    stable_ids: Vec<String>,
+    fetch_ms: i64,
+}
+
+impl CachedSessionStartMemory {
+    fn from_prefetch(
+        session_start: SessionStartPrefetchResult,
+        memory_index: Option<String>,
+    ) -> Self {
+        let stable_memory_section = crate::turn::memory_prefetch::build_session_stable_memory_block(
+            memory_index.as_deref(),
+            session_start.section.as_deref(),
+        );
+        let stable_ids = session_start
+            .profile
+            .iter()
+            .chain(session_start.recent_episodes.iter())
+            .chain(session_start.recent_scenes.iter())
+            .map(|m| m.memory_id.clone())
+            .filter(|id| !id.is_empty())
+            .collect();
+        Self {
+            stable_memory_section,
+            stable_ids,
+            fetch_ms: session_start.fetch_ms,
+        }
+    }
+}
+
+async fn cached_first_turn_session_start_memory<F, Fut>(
+    cache: &tokio::sync::Mutex<HashMap<String, CachedSessionStartMemory>>,
+    session_id: &str,
+    trace_turn: u32,
+    fetcher: F,
+) -> Option<CachedSessionStartMemory>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = CachedSessionStartMemory>,
+{
+    if trace_turn > 1 {
+        if !session_id.is_empty() {
+            cache.lock().await.remove(session_id);
+        }
+        return None;
+    }
+    if session_id.is_empty() {
+        return Some(fetcher().await);
+    }
+    if let Some(snapshot) = cache.lock().await.get(session_id).cloned() {
+        return Some(snapshot);
+    }
+    // Intentionally release the mutex before awaiting the fetcher so turn-1
+    // prompt assembly never serializes on network I/O. Two concurrent turn-1
+    // requests for the same session can both miss and fetch here; that is a
+    // benign cache race, and the last completed insert simply wins.
+    let snapshot = fetcher().await;
+    cache
+        .lock()
+        .await
+        .insert(session_id.to_string(), snapshot.clone());
+    Some(snapshot)
+}
+
 /// Build a prompt section for the CLI-injected skill listing.
 ///
 /// Returns `None` when the CLI didn't include a listing (no skills loaded
@@ -1030,6 +1096,9 @@ pub struct InProcessChatTurnBridge {
     pub feedback_store: Arc<astra_pipeline::feedback_store::FeedbackStore>,
     /// Cached Memoria client — created once, reused across turns.
     pub memoria_client: Option<crate::turn::cloud::memoria_compact::HttpMemoriaClient>,
+    /// First-turn session-start memory snapshot, latched per session so repeated
+    /// round re-entries don't refetch and churn the cached prompt prefix.
+    session_start_memory_cache: Arc<tokio::sync::Mutex<HashMap<String, CachedSessionStartMemory>>>,
     /// Shared session facts for facts-first compaction. Updated by the agentic loop
     /// at each turn end; read by the bridge during compaction.
     pub session_facts: Arc<std::sync::Mutex<astra_turn_types::session_facts::SessionFacts>>,
@@ -1047,6 +1116,7 @@ impl InProcessChatTurnBridge {
             edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             feedback_store: Arc::new(astra_pipeline::feedback_store::FeedbackStore::new()),
             memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env(),
+            session_start_memory_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             session_facts: Arc::new(std::sync::Mutex::new(Default::default())),
             persist_tracker: None,
         }
@@ -1169,6 +1239,7 @@ impl InProcessChatTurnBridge {
         let matrixone = self.matrixone.clone();
         let encryptor = self.encryptor.clone();
         let shared_pool = self.shared_pool.clone();
+        let session_start_memory_cache = self.session_start_memory_cache.clone();
         let (trace_turn, trace_turn_source) = if let Some(turn) = header_session_turn {
             (turn, "header")
         } else if !session_id.is_empty() {
@@ -1184,6 +1255,19 @@ impl InProcessChatTurnBridge {
             turn_chain_id: turn_chain_id.clone(),
             user_query_event_id: user_query_event_id.clone(),
         };
+        if trace_turn > 1 && !session_id.is_empty() {
+            // `cached_first_turn_session_start_memory` also clears on later
+            // turns. Keeping this outer eviction makes the "not a first-turn
+            // snapshot anymore" intent explicit before prompt assembly starts,
+            // while the helper retains the same guarantee for any future
+            // callers. A concurrent turn-1 refetch may repopulate the cache in
+            // between these two sites, which is acceptable for this
+            // best-effort optimization.
+            self.session_start_memory_cache
+                .lock()
+                .await
+                .remove(&session_id);
+        }
         let root_runtime_owns_turn_journal =
             bridge_root_turn_journal_owned(headers, &payload, bridge_e2e_authorized);
         let _edge_callback_ledger = self.edge_callback_ledger.clone();
@@ -1562,14 +1646,45 @@ impl InProcessChatTurnBridge {
                 // (profile + episodes) only on turn 1.
                 let sid_for_suppress: Option<&str> =
                     if session_id.is_empty() { None } else { Some(&session_id) };
-                let (per_turn, session_start_opt) = tokio::join!(
+                let (per_turn, cached_session_start) = tokio::join!(
                     prefetch_memories(mem_url, mem_key, user_msg, &user_id, top_k, sid_for_suppress),
                     async {
                         if is_first_turn {
-                            Some(
-                                prefetch_session_start_memories(mem_url, mem_key, &user_id)
-                                    .await,
+                            cached_first_turn_session_start_memory(
+                                &session_start_memory_cache,
+                                &session_id,
+                                trace_turn,
+                                || async {
+                                    let session_start =
+                                        prefetch_session_start_memories(mem_url, mem_key, &user_id)
+                                            .await;
+                                    let session_start_exposed_ids =
+                                        crate::turn::memory_prefetch::session_start_exposed_ids(
+                                            &session_start,
+                                        );
+                                    let memory_index = if std::env::var(
+                                        "ASTRA_MEMORY_INDEX_INJECT",
+                                    )
+                                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                                    .unwrap_or(false)
+                                    {
+                                        prefetch_memory_index(
+                                            mem_url,
+                                            mem_key,
+                                            &user_id,
+                                            &session_start_exposed_ids,
+                                        )
+                                        .await
+                                    } else {
+                                        None
+                                    };
+                                    CachedSessionStartMemory::from_prefetch(
+                                        session_start,
+                                        memory_index,
+                                    )
+                                },
                             )
+                            .await
                         } else {
                             None
                         }
@@ -1577,7 +1692,7 @@ impl InProcessChatTurnBridge {
                 );
 
                 memory_fetch_ms = per_turn.fetch_ms
-                    + session_start_opt
+                    + cached_session_start
                         .as_ref()
                         .map(|s| s.fetch_ms)
                         .unwrap_or(0);
@@ -1588,32 +1703,9 @@ impl InProcessChatTurnBridge {
                 // `ASTRA_MEMORY_INDEX_INJECT`; when on, dedup against
                 // the ids that will already appear in `<session_memory>`
                 // so the two blocks don't repeat the same content.
-                let session_start_exposed_ids = session_start_opt
+                stable_memory_section = cached_session_start
                     .as_ref()
-                    .map(crate::turn::memory_prefetch::session_start_exposed_ids)
-                    .unwrap_or_default();
-                let memory_index = if is_first_turn
-                    && std::env::var("ASTRA_MEMORY_INDEX_INJECT")
-                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                        .unwrap_or(false)
-                {
-                    prefetch_memory_index(
-                        mem_url,
-                        mem_key,
-                        &user_id,
-                        &session_start_exposed_ids,
-                    )
-                    .await
-                } else {
-                    None
-                };
-                let session_start_section = session_start_opt
-                    .as_ref()
-                    .and_then(|s| s.section.clone());
-                stable_memory_section = crate::turn::memory_prefetch::build_session_stable_memory_block(
-                    memory_index.as_deref(),
-                    session_start_section.as_deref(),
-                );
+                    .and_then(|s| s.stable_memory_section.clone());
 
                 // Record stable-lane contents into the canonical store
                 // so volatile entries matching them get filtered out.
@@ -1639,17 +1731,9 @@ impl InProcessChatTurnBridge {
                 }
                 // Also record the memory_ids so tool-side recall dedup
                 // (which filters on memory_id) sees them too.
-                let stable_ids: Vec<String> = session_start_opt
+                let stable_ids = cached_session_start
                     .as_ref()
-                    .map(|s| {
-                        s.profile
-                            .iter()
-                            .chain(s.recent_episodes.iter())
-                            .chain(s.recent_scenes.iter())
-                            .map(|m| m.memory_id.clone())
-                            .filter(|id| !id.is_empty())
-                            .collect()
-                    })
+                    .map(|s| s.stable_ids.clone())
                     .unwrap_or_default();
                 if !stable_ids.is_empty() {
                     ToolClient::record_seen(&session_id, stable_ids);
@@ -4453,7 +4537,10 @@ mod tests {
     use astra_turn_core::turn_guard::TurnGuard;
     use async_trait::async_trait;
     use http_body_util::BodyExt;
-    use std::sync::Mutex;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     /// RAII guard that restores an environment variable on drop (panic-safe).
     ///
@@ -4487,6 +4574,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn first_turn_session_start_memory_snapshot_is_cached_per_session() {
+        let cache = tokio::sync::Mutex::new(HashMap::new());
+        let fetches = Arc::new(AtomicUsize::new(0));
+
+        let first = cached_first_turn_session_start_memory(&cache, "sess-1", 1, {
+            let fetches = Arc::clone(&fetches);
+            move || async move {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                CachedSessionStartMemory {
+                    stable_memory_section: Some(
+                        "<session_memory>\nfirst\n</session_memory>".into(),
+                    ),
+                    stable_ids: vec!["m1".into()],
+                    fetch_ms: 7,
+                }
+            }
+        })
+        .await
+        .expect("first-turn snapshot");
+
+        let second = cached_first_turn_session_start_memory(&cache, "sess-1", 1, {
+            let fetches = Arc::clone(&fetches);
+            move || async move {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                CachedSessionStartMemory {
+                    stable_memory_section: Some(
+                        "<session_memory>\nsecond\n</session_memory>".into(),
+                    ),
+                    stable_ids: vec!["m2".into()],
+                    fetch_ms: 99,
+                }
+            }
+        })
+        .await
+        .expect("cached snapshot");
+
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(second, first);
+    }
+
+    #[tokio::test]
+    async fn later_turn_clears_cached_session_start_memory_snapshot() {
+        let cache = tokio::sync::Mutex::new(HashMap::new());
+
+        let _ = cached_first_turn_session_start_memory(&cache, "sess-1", 1, || async {
+            CachedSessionStartMemory {
+                stable_memory_section: Some("<session_memory>\nfirst\n</session_memory>".into()),
+                stable_ids: vec!["m1".into()],
+                fetch_ms: 7,
+            }
+        })
+        .await;
+
+        let later = cached_first_turn_session_start_memory(&cache, "sess-1", 2, || async {
+            CachedSessionStartMemory {
+                stable_memory_section: Some("<session_memory>\nlater\n</session_memory>".into()),
+                stable_ids: vec!["m2".into()],
+                fetch_ms: 8,
+            }
+        })
+        .await;
+
+        assert!(later.is_none());
+        assert!(cache.lock().await.is_empty());
     }
 
     // The journal-flow helpers below are only compiled when the

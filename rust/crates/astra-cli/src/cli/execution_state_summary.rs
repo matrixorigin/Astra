@@ -20,6 +20,7 @@ use astra_tools::task_mgmt::SessionTask;
 pub(crate) struct ExecutionStateSummaryInput<'a> {
     pub model: Option<&'a str>,
     pub last_turn_interrupted: bool,
+    pub plan_mode_active: bool,
     pub plan_mode: Option<&'a PlanModeState>,
     pub executing_plan: Option<&'a TaskPlan>,
     pub executing_plan_goal: Option<&'a str>,
@@ -37,6 +38,7 @@ pub(crate) fn format_for_session_state(
     format_summary(ExecutionStateSummaryInput {
         model: state.model.as_deref(),
         last_turn_interrupted: state.last_turn_interrupted,
+        plan_mode_active: state.plan_mode_active(),
         plan_mode: state.cloud_plan_mirror.as_ref(),
         executing_plan: state.executing_plan.as_ref(),
         executing_plan_goal: state.executing_plan_goal.as_deref(),
@@ -59,7 +61,7 @@ pub(crate) fn format_summary(input: ExecutionStateSummaryInput<'_>) -> Option<St
             "turn state: last turn was interrupted; inspect partial work before resuming".into(),
         );
     }
-    if let Some(plan_mode) = input.plan_mode {
+    if let Some(plan_mode) = input.plan_mode.filter(|_| input.plan_mode_active) {
         let mut line = format!(
             "plan authoring: {}",
             plan_resume_digest(plan_mode)
@@ -398,6 +400,7 @@ mod tests {
         let out = format_summary(ExecutionStateSummaryInput {
             model: Some("gpt-5.4"),
             last_turn_interrupted: true,
+            plan_mode_active: true,
             plan_mode: Some(&plan_mode),
             executing_plan: Some(&executing_plan),
             executing_plan_goal: Some("Ship auth flow"),
@@ -447,6 +450,7 @@ mod tests {
         let out = format_summary(ExecutionStateSummaryInput {
             model: Some("gpt-5.4"),
             last_turn_interrupted: false,
+            plan_mode_active: false,
             plan_mode: None,
             executing_plan: None,
             executing_plan_goal: None,
@@ -488,6 +492,7 @@ mod tests {
         let out = format_summary(ExecutionStateSummaryInput {
             model: None,
             last_turn_interrupted: false,
+            plan_mode_active: false,
             plan_mode: None,
             executing_plan: Some(&executing_plan),
             executing_plan_goal: Some("Ship auth flow"),
@@ -501,5 +506,43 @@ mod tests {
 
         assert!(out.contains("next=\"Model auth state\""), "{out}");
         assert!(out.contains("done=0/2"), "{out}");
+    }
+
+    #[test]
+    fn summary_hides_stale_plan_authoring_when_plan_mode_is_inactive() {
+        let plan_mode = PlanModeState::new("Stale plan".into());
+        let executing_plan = TaskPlan {
+            subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
+                id: "exec-1".into(),
+                title: "Verify stale plan is hidden".into(),
+                status: TaskStatus::InProgress,
+                ..Default::default()
+            }],
+            notes: None,
+        };
+
+        let out = format_summary(ExecutionStateSummaryInput {
+            model: Some("gpt-5.4"),
+            last_turn_interrupted: false,
+            plan_mode_active: false,
+            plan_mode: Some(&plan_mode),
+            executing_plan: Some(&executing_plan),
+            executing_plan_goal: Some("Keep executing plan visible"),
+            plan_execution_rounds: 2,
+            plan_execution_corrections: &[],
+            durable_contract: None,
+            last_turn_event: None,
+            tasks: &[task("task-1", "Implement checkout", "pending")],
+        })
+        .expect("summary");
+
+        assert!(
+            !out.contains("plan authoring:"),
+            "inactive plan mode must not leak stale plan-authoring summary: {out}"
+        );
+        assert!(
+            out.contains("plan execution: goal=\"Keep executing plan visible\""),
+            "executing-plan summary must remain visible when only plan authoring is stale: {out}"
+        );
     }
 }
