@@ -509,13 +509,6 @@ impl DefaultToolExecutor {
             // ── Web search ───────────────────────────────────────────
             "web_search" => string_to_result(crate::web_search::web_search(args)),
 
-            // ── Task management ──────────────────────────────────────
-            "task_create" => string_to_result(self.task_manager.create(args).await),
-            "task_list" => string_to_result(self.task_manager.list(args).await),
-            "task_get" => string_to_result(self.task_manager.get(args).await),
-            "task_update" => string_to_result(self.task_manager.update(args).await),
-            "task_stop" => string_to_result(self.task_manager.stop(args).await),
-
             // ── Utility tools ────────────────────────────────────────
             "tool_search" => {
                 let schemas = self.tool_schemas();
@@ -1469,22 +1462,6 @@ mod tests {
             .execute("tool_search", &serde_json::json!({"query": "file"}))
             .await;
         assert!(!result.is_error);
-    }
-
-    #[tokio::test]
-    async fn dispatch_task_lifecycle() {
-        let (_tmp, exec) = test_executor();
-        let result = exec
-            .execute(
-                "task_create",
-                &serde_json::json!({"title": "test task", "description": "do stuff"}),
-            )
-            .await;
-        assert!(!result.is_error);
-
-        let result = exec.execute("task_list", &serde_json::json!({})).await;
-        assert!(!result.is_error);
-        assert!(result.output.contains("test task"));
     }
 
     #[tokio::test]
