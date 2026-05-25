@@ -412,6 +412,16 @@ async fn exit_plan_mode_overlay_approve_auto_records_pending_mode_change() {
         Some(crate::permission_manager::PermissionMode::Auto),
         "host must see Auto staged in the pending slot to apply on the next turn"
     );
+    assert_eq!(
+        executor.take_pending_round_tool_boost(),
+        Some(vec![
+            "bash".to_string(),
+            "read_file".to_string(),
+            "write_file".to_string(),
+            "str_replace".to_string(),
+        ]),
+        "approved exit must stage a one-shot core-tool boost for the next round"
+    );
 }
 
 // ── Plan-mode systemic invariants (Step 4) ────────────────────────────
@@ -554,6 +564,21 @@ async fn exit_plan_mode_local_path_makes_zero_cloud_calls() {
     assert!(
         result.starts_with("Exited plan mode"),
         "local path should report success without server confirmation. Got: {result}"
+    );
+    assert_eq!(
+        executor.take_pending_permission_mode_change(),
+        Some(crate::permission_manager::PermissionMode::Prompt),
+        "Prompt approval must be staged for the next round"
+    );
+    assert_eq!(
+        executor.take_pending_round_tool_boost(),
+        Some(vec![
+            "bash".to_string(),
+            "read_file".to_string(),
+            "write_file".to_string(),
+            "str_replace".to_string(),
+        ]),
+        "Prompt approval must still restore the core execution tool schemas"
     );
 }
 
@@ -718,6 +743,39 @@ async fn exit_plan_mode_overlay_keep_planning_leaves_plan_open() {
         executor.take_pending_permission_mode_change(),
         None,
         "no mode change should be staged when the user keeps planning"
+    );
+    assert_eq!(
+        executor.take_pending_round_tool_boost(),
+        None,
+        "keep-planning must not leave a deferred execution-tool boost behind"
+    );
+}
+
+#[test]
+fn switching_sessions_clears_deferred_plan_exit_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-a");
+    executor.debug_stage_pending_permission_mode_change_for_test(
+        crate::permission_manager::PermissionMode::AcceptEdits,
+    );
+    executor.debug_stage_pending_round_tool_boost_for_test(&[
+        "bash",
+        "read_file",
+        "write_file",
+        "str_replace",
+    ]);
+
+    executor.set_active_session_id("sess-b");
+
+    assert_eq!(
+        executor.take_pending_permission_mode_change(),
+        None,
+        "deferred permission-mode changes must not bleed into another session"
+    );
+    assert_eq!(
+        executor.take_pending_round_tool_boost(),
+        None,
+        "deferred tool boosts must not bleed into another session"
     );
 }
 

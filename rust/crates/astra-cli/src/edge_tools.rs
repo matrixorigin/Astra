@@ -689,6 +689,11 @@ pub struct ToolExecutor {
     /// loop's borrow of `perm_manager`.
     pending_permission_mode_change:
         std::sync::Mutex<Option<crate::permission_manager::PermissionMode>>,
+    /// One-shot schema boost for the next agentic round. Used by
+    /// `exit_plan_mode` so the model immediately regains the core
+    /// edit tools (`bash` / `read_file` / `write_file` /
+    /// `str_replace`) after the user approves execution.
+    pending_round_tool_boost: std::sync::Mutex<Option<Vec<String>>>,
 }
 
 impl ToolExecutor {
@@ -782,6 +787,7 @@ impl ToolExecutor {
             ask_user_request_tx: std::sync::Mutex::new(None),
             plan_review_request_tx: std::sync::Mutex::new(None),
             pending_permission_mode_change: std::sync::Mutex::new(None),
+            pending_round_tool_boost: std::sync::Mutex::new(None),
         }
     }
 
@@ -812,6 +818,15 @@ impl ToolExecutor {
         &self,
     ) -> Option<crate::permission_manager::PermissionMode> {
         self.pending_permission_mode_change
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+    }
+
+    /// Drain a one-shot list of tool names that should be force-injected into
+    /// the next agentic round's schema selection.
+    pub fn take_pending_round_tool_boost(&self) -> Option<Vec<String>> {
+        self.pending_round_tool_boost
             .lock()
             .ok()
             .and_then(|mut g| g.take())
@@ -917,13 +932,17 @@ impl ToolExecutor {
 
     pub fn set_active_session_id(&self, session_id: impl Into<String>) {
         let session_id = session_id.into();
-        if let Ok(ws) = astra_services::session_workspace::read_workspace(&session_id) {
-            if let Ok(mut pinned) = self.self_mod_pinned_tools.lock() {
-                *pinned = ws.pinned_tools.clone();
-            }
-            if let Ok(mut deprioritized) = self.self_mod_deprioritized_tools.lock() {
-                *deprioritized = ws.deprioritized_tools.clone();
-            }
+        let session_changed = self.active_session_id().as_deref() != Some(session_id.as_str());
+        let (pinned_tools, deprioritized_tools) =
+            match astra_services::session_workspace::read_workspace(&session_id) {
+                Ok(ws) => (ws.pinned_tools, ws.deprioritized_tools),
+                Err(_) => (Vec::new(), Vec::new()),
+            };
+        if let Ok(mut pinned) = self.self_mod_pinned_tools.lock() {
+            *pinned = pinned_tools;
+        }
+        if let Ok(mut deprioritized) = self.self_mod_deprioritized_tools.lock() {
+            *deprioritized = deprioritized_tools;
         }
         // File-edit checkpoint persistence: on session-id set, rebind the
         // journal to an auto-persist directory keyed by session.
@@ -982,6 +1001,23 @@ impl ToolExecutor {
                     }
                     journal.enable_persistence(dir);
                 }
+            }
+        }
+        if session_changed {
+            if let Ok(mut pending_mode) = self.pending_permission_mode_change.lock() {
+                *pending_mode = None;
+            }
+            if let Ok(mut pending_boost) = self.pending_round_tool_boost.lock() {
+                *pending_boost = None;
+            }
+            if let Ok(mut lessons) = self.session_lessons.lock() {
+                lessons.clear();
+            }
+            if let Ok(mut diag) = self.latest_skill_diagnosis.lock() {
+                *diag = None;
+            }
+            if let Ok(mut feedback) = self.latest_turn_quality_feedback.lock() {
+                *feedback = None;
             }
         }
         if let Ok(mut guard) = self.active_session_id.lock() {
@@ -1595,6 +1631,25 @@ impl ToolExecutor {
         }
     }
 
+    fn stage_pending_round_tool_boost(&self, tools: &[&str]) {
+        if let Ok(mut slot) = self.pending_round_tool_boost.lock() {
+            *slot = Some(tools.iter().map(|name| (*name).to_string()).collect());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_stage_pending_round_tool_boost_for_test(&self, tools: &[&str]) {
+        self.stage_pending_round_tool_boost(tools);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_stage_pending_permission_mode_change_for_test(
+        &self,
+        mode: crate::permission_manager::PermissionMode,
+    ) {
+        self.stage_pending_permission_mode_change(mode);
+    }
+
     async fn exit_plan_mode_remote(&self, args: &Value) -> String {
         // `exit_plan_mode` has two structurally different sources of
         // truth depending on how plan mode was entered:
@@ -1718,6 +1773,12 @@ impl ToolExecutor {
             self.set_plan_mode_authoring_cache_for_active_session(false)
                 .await;
             self.stage_pending_permission_mode_change(next_mode);
+            self.stage_pending_round_tool_boost(&[
+                "bash",
+                "read_file",
+                "write_file",
+                "str_replace",
+            ]);
             let mode_suffix = format!(" Next turn will run in {next_mode} mode.");
             format!(
                 "Exited plan mode. plan_id={resolved_plan_id} is approved; write tools unlocked.{mode_suffix}"
@@ -1760,6 +1821,12 @@ impl ToolExecutor {
             self.set_plan_mode_authoring_cache_for_active_session(false)
                 .await;
             self.stage_pending_permission_mode_change(next_mode);
+            self.stage_pending_round_tool_boost(&[
+                "bash",
+                "read_file",
+                "write_file",
+                "str_replace",
+            ]);
             let plan_suffix = match plan_markdown {
                 Some(plan) if !plan.is_empty() => {
                     format!(" Plan recorded:\n{plan}")

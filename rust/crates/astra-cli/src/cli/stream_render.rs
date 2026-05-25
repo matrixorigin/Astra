@@ -1,4 +1,5 @@
 use super::*;
+use astra_runtime::turn::tool_side_effects::tool_call_invalidates_read_cache;
 use astra_services::session_journal::{JournalEvent, JournalWriter};
 use astra_tools::git_gix::{git_worktree_is_clean, head_short};
 use astra_turn_core::chat_turn_sse_dispatch::{
@@ -530,6 +531,14 @@ impl EdgeToolCache {
             call_counts: std::collections::HashMap::new(),
             max_identical_calls,
         }
+    }
+
+    fn reset_read_only_after_workspace_mutation(&mut self) {
+        self.output_cache.clear();
+        self.call_counts.retain(|sig, _| {
+            let tool_name = sig.split_once(':').map_or(sig.as_str(), |(name, _)| name);
+            !READ_ONLY_TOOLS.contains(&tool_name)
+        });
     }
 }
 
@@ -3193,7 +3202,16 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             self.active_turn_rollback = None;
         }
 
-        // Store successful cacheable tool results for cross-turn dedup.
+        // Mutation tools: clear cached read-only outputs before processing
+        // the result. Disjoint from the read-only branch below.
+        if allowed && status != "error" && tool_call_invalidates_read_cache(tool, Some(args)) {
+            // A successful mutation changes the workspace baseline, so cached
+            // read-only outputs and duplicate-call counts are no longer valid.
+            // Keep mutation-tool counters so runaway write loops still trip the
+            // identical-call guard.
+            self.tool_cache.reset_read_only_after_workspace_mutation();
+        }
+        // Read-only tools: populate output cache for cross-turn dedup.
         if allowed
             && status != "error"
             && READ_ONLY_TOOLS.contains(&tool)
@@ -9521,6 +9539,198 @@ diff --git a/src/a.rs b/src/a.rs\n\
             "stale cache should not replay old file contents: {}",
             second.output
         );
+    }
+
+    #[tokio::test]
+    async fn successful_write_file_clears_cross_turn_read_cache_and_call_counts() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let file = temp.path().join("cached.txt");
+        std::fs::write(&file, "v1\n").expect("seed");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut tool_cache = EdgeToolCache::new(2);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: std::sync::Arc::clone(&executor),
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+            },
+            80,
+            false,
+        );
+
+        let read_args = serde_json::json!({"path": "cached.txt"});
+        let initial = host
+            .execute_tool("cache-read-1", "read_file", &read_args)
+            .await;
+        assert!(initial.output.contains("v1"), "{}", initial.output);
+        let read_sig = tool_dedup_signature("read_file", &read_args);
+        let write_sig = tool_dedup_signature(
+            "write_file",
+            &serde_json::json!({"path": "cached.txt", "content": "v2\n"}),
+        );
+        let timestamp_ms = path_mtime_ms(&file);
+        host.tool_cache.output_cache.insert(
+            read_sig.clone(),
+            EdgeToolCacheEntry {
+                output: "v1\n".to_string(),
+                status: "success".to_string(),
+                validation: EdgeToolCacheValidation::FileMtime {
+                    path: file.clone(),
+                    timestamp_ms,
+                },
+            },
+        );
+        host.tool_cache.call_counts.insert(read_sig.clone(), 2);
+
+        let write = host
+            .execute_tool(
+                "cache-write-1",
+                "write_file",
+                &serde_json::json!({"path": "cached.txt", "content": "v2\n"}),
+            )
+            .await;
+        assert_eq!(write.status, "success", "{}", write.output);
+        assert!(
+            host.tool_cache.output_cache.is_empty(),
+            "successful write_file must clear stale read cache"
+        );
+        assert!(
+            !host.tool_cache.call_counts.contains_key(&read_sig),
+            "successful write_file must reset stale read duplicate-call counters"
+        );
+        assert_eq!(
+            host.tool_cache.call_counts.get(&write_sig),
+            Some(&1),
+            "successful write_file must preserve mutation-tool counters"
+        );
+
+        let reread = host
+            .execute_tool("cache-read-2", "read_file", &read_args)
+            .await;
+        assert!(reread.output.contains("v2"), "{}", reread.output);
+        assert_eq!(host.tool_cache.call_counts.get(&read_sig), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn successful_str_replace_clears_cross_turn_read_cache_and_call_counts() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let file = temp.path().join("cached.txt");
+        std::fs::write(&file, "alpha\n").expect("seed");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut tool_cache = EdgeToolCache::new(2);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: std::sync::Arc::clone(&executor),
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+            },
+            80,
+            false,
+        );
+
+        let read_args = serde_json::json!({"path": "cached.txt"});
+        let initial = host
+            .execute_tool("cache-read-alpha", "read_file", &read_args)
+            .await;
+        assert!(initial.output.contains("alpha"), "{}", initial.output);
+        let read_sig = tool_dedup_signature("read_file", &read_args);
+        let replace_sig = tool_dedup_signature(
+            "str_replace",
+            &serde_json::json!({
+                "path": "cached.txt",
+                "old_str": "alpha",
+                "new_str": "omega"
+            }),
+        );
+        let timestamp_ms = path_mtime_ms(&file);
+        host.tool_cache.output_cache.insert(
+            read_sig.clone(),
+            EdgeToolCacheEntry {
+                output: "alpha\n".to_string(),
+                status: "success".to_string(),
+                validation: EdgeToolCacheValidation::FileMtime {
+                    path: file.clone(),
+                    timestamp_ms,
+                },
+            },
+        );
+        host.tool_cache.call_counts.insert(read_sig.clone(), 2);
+
+        let replace = host
+            .execute_tool(
+                "cache-replace-1",
+                "str_replace",
+                &serde_json::json!({
+                    "path": "cached.txt",
+                    "old_str": "alpha",
+                    "new_str": "omega"
+                }),
+            )
+            .await;
+        assert_eq!(replace.status, "success", "{}", replace.output);
+        assert!(
+            host.tool_cache.output_cache.is_empty(),
+            "successful str_replace must clear stale read cache"
+        );
+        assert!(
+            !host.tool_cache.call_counts.contains_key(&read_sig),
+            "successful str_replace must reset stale read duplicate-call counters"
+        );
+        assert_eq!(
+            host.tool_cache.call_counts.get(&replace_sig),
+            Some(&1),
+            "successful str_replace must preserve mutation-tool counters"
+        );
+
+        let reread = host
+            .execute_tool("cache-read-3", "read_file", &read_args)
+            .await;
+        assert!(reread.output.contains("omega"), "{}", reread.output);
+        assert_eq!(host.tool_cache.call_counts.get(&read_sig), Some(&1));
     }
 
     #[tokio::test]

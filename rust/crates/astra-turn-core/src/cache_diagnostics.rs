@@ -689,7 +689,7 @@ impl CacheBreakDetector {
         }
 
         // 2. System prompt change
-        if prev.system_prompt_hash != curr.system_prompt_hash {
+        if effective_prefix_system_prompt_hash(prev) != effective_prefix_system_prompt_hash(curr) {
             reasons.push(CacheBreakReason::SystemPromptChanged);
         }
 
@@ -1031,6 +1031,36 @@ fn hash_serialized_system_prompt(system_blocks: &[SerializedSystemBlock]) -> u64
             hasher.write(b"\n\n");
         }
         hasher.write(block.text.as_bytes());
+    }
+    hasher.write_u8(0xff);
+    hasher.finish()
+}
+
+fn effective_prefix_system_prompt_hash(snapshot: &PromptStateSnapshot) -> u64 {
+    if snapshot.system_blocks.is_empty() {
+        return snapshot.system_prompt_hash;
+    }
+    let mut hasher = DefaultHasher::new();
+    let mut wrote_any = false;
+    for block in &snapshot.system_blocks {
+        if block.scope == "None" {
+            continue;
+        }
+        if wrote_any {
+            hasher.write(b"\n\n");
+        }
+        block.kind.hash(&mut hasher);
+        hasher.write_u8(0x1f);
+        block.scope.hash(&mut hasher);
+        hasher.write_u8(0x1e);
+        block.text_hash.hash(&mut hasher);
+        wrote_any = true;
+    }
+    if !wrote_any {
+        // No cache-scoped blocks exist in the prefix. Return 0 as a sentinel
+        // so the detector treats this turn as having no prefix to compare
+        // against (a real hash from hash_serialized_system_prompt is never 0).
+        return 0;
     }
     hasher.write_u8(0xff);
     hasher.finish()
@@ -1562,6 +1592,55 @@ mod tests {
             .expect("cache-control change should be detected");
 
         assert_eq!(event.reason, CacheBreakReason::CacheControlChanged);
+    }
+
+    #[test]
+    fn volatile_system_tail_change_does_not_claim_system_prompt_changed() {
+        use crate::section_types::{CacheScope, SectionKind};
+
+        let stable = SerializedSystemBlock {
+            kind: SectionKind::Identity,
+            scope: CacheScope::Session,
+            text: "stable prefix".into(),
+            cache_control: Some(json!({"type": "ephemeral"})),
+        };
+        let volatile_v1 = SerializedSystemBlock {
+            kind: SectionKind::RuntimeVolatile,
+            scope: CacheScope::None,
+            text: "tail v1".into(),
+            cache_control: None,
+        };
+        let volatile_v2 = SerializedSystemBlock {
+            text: "tail v2".into(),
+            ..volatile_v1.clone()
+        };
+
+        let mut det = CacheBreakDetector::new();
+        det.record_turn(
+            PromptStateSnapshot::capture_serialized(
+                &[stable.clone(), volatile_v1],
+                &[],
+                "anthropic",
+                "claude",
+                8_000,
+            ),
+            None,
+        );
+        let event = det.record_turn(
+            PromptStateSnapshot::capture_serialized(
+                &[stable, volatile_v2],
+                &[],
+                "anthropic",
+                "claude",
+                8_000,
+            ),
+            None,
+        );
+
+        assert!(
+            event.is_none(),
+            "changing only CacheScope::None system blocks must not count as a cache-prefix break"
+        );
     }
 
     #[test]
