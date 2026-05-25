@@ -232,6 +232,22 @@ pub(crate) fn build_external_sources(
         extra_stable_sections.push(section);
     }
 
+    // Tool and skill capability counts (session-stable identity)
+    {
+        let tool_count = tool_names.len();
+        let skill_count = active_skill_names.len();
+        let mut cap = format!(
+            "\n\n## Capabilities\n{tool_count} tools available. {skill_count} active skills."
+        );
+        if !active_skill_names.is_empty() {
+            cap.push_str(&format!(" Skills: {}.", active_skill_names.join(", ")));
+        }
+        extra_stable_sections.push(crate::prompts::PromptSection::stable(
+            cap,
+            crate::prompts::CacheScope::Session,
+        ));
+    }
+
     ExternalSources {
         memory_entries,
         session_memory_entry: None,
