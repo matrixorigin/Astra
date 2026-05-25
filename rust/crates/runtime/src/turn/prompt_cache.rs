@@ -1,8 +1,109 @@
 //! Prompt caching utilities for LLM system messages.
 //!
-//! Provides provider-aware system message construction with cache_control annotations
-//! for Anthropic and stable-prefix splitting for OpenAI. Used by both the bridge proxy
-//! and `ServerAgenticLoopHost`.
+//! # Architecture Overview
+//!
+//! The prompt cache system optimises LLM costs by maximising cache hit rates across
+//! consecutive turns within a session. Two distinct strategies are used depending on the
+//! provider:
+//!
+//! ## Anthropic Strategy (CacheControl)
+//!
+//! Anthropic supports exactly **one** [`cache_control` breakpoint](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching)
+//! per request. The breakpoint marks the boundary between cached and uncached content:
+//! everything *before* the breakpoint may be served from cache; everything *after* is
+//! always recomputed.
+//!
+//! We partition every turn's system message into two layers:
+//!
+//! ```text
+//! ┌─ stable_prefix (cached) ────────────┬─ dynamic_suffix (per-turn) ─┐
+//! │                                      │                             │
+//! │  Global-scoped sections   Session-   │  None-scoped sections       │
+//! │  (core rules, safety)     scoped     │  (model identity, skills,  │
+//! │                           sections   │   turn budget, low-conf     │
+//! │                           ▲          │   warnings)                 │
+//! │                           │          │                             │
+//! └───────────────────────────┘──────────┴─────────────────────────────┘
+//!                      cache_control breakpoint
+//! ```
+//!
+//! Sections are tagged with a [`CacheScope`] enum:
+//!
+//! | Scope | Meaning | Serialised positions |
+//! |---|---|---|
+//! | `Global` | Never changes across sessions (core rules, safety guardrails) | Always at the prefix |
+//! | `Session` | Stable within a session (version, cwd, date, user, branch) | Middle, before the breakpoint |
+//! | `None` | Per-turn volatile (model id, skills, turn budget, low-confidence warn) | After the breakpoint |
+//!
+//! `CacheScope` implements `Ord` such that `Global < Session < None`, guaranteeing stable
+//! byte ordering regardless of insertion order.
+//!
+//! ### Bedrock Claude
+//!
+//! Bedrock-hosted Claude models use the same `CacheScope` partitioning. The `cache_control`
+//! markers are translated to Bedrock-native `cachePoint` blocks at request-build time in
+//! the Bedrock request adapter.
+//!
+//! ## OpenAI / OpenAI-Compatible Strategy (Stable/Dynamic Split)
+//!
+//! Providers that do not support `cache_control` annotations use a **two-message split**:
+//!
+//! - **`primary_system`**: all `Global` + `Session` scoped blocks concatenated
+//! - **`dynamic_system`** (`Option<String>`): all `None` scoped blocks, sent as a separate
+//!   system message *after* the primary one
+//!
+//! This separation allows OpenAI's automatic caching to recognise the stable prefix across
+//! turns, even though the dynamic suffix changes. DeepSeek's `/anthropic` endpoint is
+//! known to use payload-identity checks that treat the full request body as a cache key,
+//! so dynamic content **must** be moved to the second message to avoid per-turn cache
+//! invalidation.
+//!
+//! ## Tool Schema Pinning
+//!
+//! For Anthropic, tool schemas in the request body also participate in caching.
+//! [`annotate_tool_schemas_for_caching`] pins a predefined set of high-frequency tools
+//! (read, write, edit, search, shell, task management) at the start of the tool list with
+//! `cache_control` markers. Lower-frequency tools follow without markers — when the tool
+//! list changes, only the tail is invalidated while the pinned prefix remains cached.
+//!
+//! ## Cache Key Design
+//!
+//! [`section_cache_key`] (test-only) produces a hash from `(tool_names, task_type,
+//! confidence_bucket)`. It deliberately excludes prompt text, so wording tweaks and
+//! formatting changes do not cause cache misses — only semantically meaningful input
+//! changes affect the key.
+//!
+//! ## Provider Strategy Resolution
+//!
+//! [`provider_cache_policy_for`] determines the caching strategy from three sources in
+//! priority order:
+//!
+//! 1. **Explicit** `CacheCapability` marker (highest priority — overrides everything)
+//! 2. **Provider heuristics** (Anthropic direct, Bedrock Claude, other)
+//! 3. **Environment override** (`ASTRA_TEST_PROMPT_CACHE_DISABLED`)
+//!
+//! ## Public Interface
+//!
+//! The primary entry points consumed by callers:
+//!
+//! | Function | Consumer | Purpose |
+//! |---|---|---|
+//! | [`assemble_bridge_pipeline_outcome`] | Bridge proxy, agentic loop | Full assembly: prompt + tool schemas + cache strategy |
+//! | [`assemble_system_message_via_pipeline`] | Bridge proxy | Build Anthropic multi-block or OpenAI split message |
+//! | [`annotate_tool_schemas_for_caching`] | Request build | Add `cache_control` to tool definitions |
+//! | [`add_message_cache_breakpoint`] | Request build | Insert breakpoint into final message array |
+//! | [`apply_anthropic_cache_metadata`] | Anthropic adapter | Emit Anthropic-specific cache metadata response fields |
+//!
+//! ## Testing
+//!
+//! The module includes extensive tests in two categories:
+//!
+//! - **`cache_stability_regression`** (L1818+): byte-level determinism tests that verify
+//!   identical inputs produce identical Anthropic direct, Bedrock, and OpenAI request
+//!   bodies across calls.
+//! - **Functional tests**: correctness of scope partitioning, cache control annotation,
+//!   provider policy selection, and edge cases (empty tools, disabled cache, override
+//!   files).
 
 use serde_json::{Value, json};
 
@@ -454,6 +555,18 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         };
         (primary, dynamic)
     };
+
+    tracing::debug!(
+        cache_enabled = cache_cfg.cache_enabled,
+        uses_anthropic = uses_anthropic_protocol,
+        should_annotate = should_annotate_cache_controls,
+        stable_blocks = output.serialized.system_blocks.iter().filter(|b| !matches!(b.scope, astra_turn_core::section_types::CacheScope::None)).count(),
+        volatile_chars = output.serialized.system_blocks.iter().filter(|b| matches!(b.scope, astra_turn_core::section_types::CacheScope::None)).map(|b| b.text.len()).sum::<usize>(),
+        provider = %provider,
+        model_id = %model_id,
+        tier = ?tier,
+        "assembled bridge pipeline outcome with cache strategy",
+    );
 
     BridgePipelineOutcome {
         primary_system,
