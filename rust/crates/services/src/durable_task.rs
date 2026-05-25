@@ -5731,6 +5731,7 @@ mod tests {
             request_body_overrides: None,
             prompt_cache_capability: None,
             thinking_capability: None,
+            context_window: None,
         };
         let config = CloudLlmConfig::from_resolved(resolved);
         assert_eq!(config.model, "gpt-4o-mini");
