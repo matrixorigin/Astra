@@ -530,24 +530,6 @@ fn fmt_utility_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
                 _ => None,
             }
         }
-        "spawn_agent" => {
-            let description = obj.get("description").and_then(|v| v.as_str());
-            let agent_type = obj.get("agent_type").and_then(|v| v.as_str());
-            match (description, agent_type) {
-                (Some(description), Some(agent_type)) => Some(format!(
-                    "{} ({})",
-                    truncate_str(description, 32),
-                    truncate_str(agent_type, 12)
-                )),
-                (Some(description), None) => Some(truncate_str(description, 50)),
-                (None, Some(agent_type)) => Some(truncate_str(agent_type, 24)),
-                _ => None,
-            }
-        }
-        "get_agent_result" => obj
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .map(|id| truncate_str(id, 50)),
         // Consolidated agent tool
         "agent" => {
             let action = obj.get("action").and_then(|v| v.as_str()).unwrap_or("");
@@ -1098,21 +1080,6 @@ mod tests {
             &json!({"to": "agent-2", "summary": "Need review on auth flow"}),
         );
         assert_eq!(detail.as_deref(), Some("agent-2: Need review on auth flow"));
-    }
-
-    #[test]
-    fn tool_call_detail_spawn_agent_shows_description_and_type() {
-        let detail = tool_call_detail(
-            "spawn_agent",
-            &json!({"description": "review auth", "agent_type": "code-review"}),
-        );
-        assert_eq!(detail.as_deref(), Some("review auth (code-review)"));
-    }
-
-    #[test]
-    fn tool_call_detail_get_agent_result_shows_agent_id() {
-        let detail = tool_call_detail("get_agent_result", &json!({"agent_id": "agent-abc-123"}));
-        assert_eq!(detail.as_deref(), Some("agent-abc-123"));
     }
 
     #[test]

@@ -2008,6 +2008,8 @@ impl InProcessChatTurnBridge {
                 .get("project_context")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty());
+            let bridge_session_current_date =
+                crate::turn::session_current_date::resolve_session_current_date(&session_id);
             // Provider-aware volatile gating — see
             // `effective_volatile_sections_for_round` for the full rationale.
             // CurrentUserOnly (MiniMax) drops ALL rounds, not just >0.
@@ -2076,6 +2078,7 @@ impl InProcessChatTurnBridge {
                         edge_profile.get("cwd").and_then(Value::as_str),
                         edge_profile.get("git_branch").and_then(Value::as_str),
                         project_context,
+                        &bridge_session_current_date,
                     )
                     .with_skill_listing_block(skill_listing_hint_text.as_deref().unwrap_or("")),
                 },
@@ -2208,6 +2211,7 @@ impl InProcessChatTurnBridge {
                                             edge_profile.get("cwd").and_then(Value::as_str),
                                             edge_profile.get("git_branch").and_then(Value::as_str),
                                             project_context,
+                                            &bridge_session_current_date,
                                         )
                                         .with_skill_listing_block(
                                             skill_listing_hint_text.as_deref().unwrap_or(""),

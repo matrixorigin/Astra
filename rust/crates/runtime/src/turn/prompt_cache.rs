@@ -235,9 +235,7 @@ pub(crate) fn provider_cache_policy_for(
 /// invalidate the cached prefix.
 ///
 /// Returns `(primary_system_message, optional_dynamic_message, all_sections)`
-/// matching the legacy signature. Production call-sites have migrated to
-/// [`assemble_bridge_pipeline_outcome`]; this 3-tuple wrapper remains only
-/// as a convenience for tests that still assert on the legacy shape.
+/// as a convenience for tests that still assert on the tuple shape.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_system_message_via_pipeline(
@@ -271,6 +269,7 @@ pub(crate) fn assemble_system_message_via_pipeline(
         None,
         "",
         "",
+        "2026-05-25",
     );
     (
         outcome.primary_system,
@@ -320,6 +319,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     project_context: Option<&str>,
     deferred_tools_block: &str,
     skill_listing_block: &str,
+    current_date: &str,
 ) -> BridgePipelineOutcome {
     use astra_turn_core::context_sources::{
         AgentContext, EdgeProfile, ExternalSources, SessionContext, TurnState,
@@ -417,7 +417,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         self_model: None,
         deferred_tools_block: deferred_tools_block.to_string(),
         skill_listing_block: skill_listing_block.to_string(),
-        current_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        current_date: current_date.to_string(),
         user_id: None,
     };
 
@@ -965,6 +965,7 @@ mod tests {
             None,
             "",
             "",
+            "2026-05-25",
         );
 
         // Low-pressure turn: planner stays at Normal, tool count preserved.
@@ -1021,6 +1022,7 @@ mod tests {
             None,
             "",
             "",
+            "2026-05-25",
         );
 
         let dynamic_text = outcome
@@ -1070,6 +1072,7 @@ mod tests {
             None,
             "",
             "",
+            "2026-05-25",
         );
 
         let primary_text = outcome
@@ -1129,6 +1132,7 @@ mod tests {
             None,
             "",
             "",
+            "2026-05-25",
         );
 
         let primary_text = outcome
@@ -1184,6 +1188,7 @@ mod tests {
             None,
             "<deferred_tools><tool><name>github</name></tool></deferred_tools>",
             "",
+            "2026-05-25",
         );
 
         let primary_text = outcome
@@ -1230,6 +1235,7 @@ mod tests {
             None,
             "",
             "",
+            "2026-05-25",
         );
 
         let primary_text = outcome
@@ -1784,6 +1790,7 @@ mod tests {
             None,
             "",
             "",
+            "2026-05-25",
         );
 
         // Model identity is always emitted in volatile (CacheScope::None),

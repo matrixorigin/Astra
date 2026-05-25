@@ -5031,20 +5031,6 @@ impl StreamRenderState {
                     _ => None,
                 }
             }
-            "spawn_agent" => {
-                let description = args.get("description").and_then(Value::as_str);
-                let agent_type = args.get("agent_type").and_then(Value::as_str);
-                match (description, agent_type) {
-                    (Some(description), Some(agent_type)) => Some(format!(
-                        "{} ({})",
-                        truncate_line(description, 28),
-                        truncate_line(agent_type, 12)
-                    )),
-                    (Some(description), None) => Some(truncate_line(description, 40)),
-                    (None, Some(agent_type)) => Some(truncate_line(agent_type, 24)),
-                    _ => None,
-                }
-            }
             "diagnose" => {
                 let category = args.get("category").and_then(Value::as_str);
                 let verbose = args.get("verbose").and_then(Value::as_bool);
@@ -6334,8 +6320,6 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "rollback_database_snapshots" => format!("Revert DB snapshots: {preview}"),
         "rollback_turn_actions" => format!("Rollback turn actions: {preview}"),
         "send_message" => format!("Send message: {preview}"),
-        "spawn_agent" => format!("Spawn agent: {preview}"),
-        "get_agent_result" => format!("Get agent result: {preview}"),
         "diagnose" => format!("Diagnose: {preview}"),
         "env" => format!("Env: {preview}"),
         "notebook_edit" => format!("Notebook edit: {preview}"),

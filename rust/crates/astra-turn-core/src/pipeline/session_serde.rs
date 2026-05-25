@@ -57,8 +57,10 @@ pub fn parse_pipeline_state(value: Option<&Value>) -> RestoreOutcome {
 /// - Missing / null → fresh `PipelineSession::new(config)`
 /// - Corrupt payload → fresh session + `tracing::warn!` (operators see why
 ///   warm-start data was lost; they can investigate the on-disk blob)
-/// - Valid snapshot → `PipelineSession::from_snapshot(config, snapshot)`
-///   (retains stats / latches / emergent / recovery-escalation counters)
+/// - Valid snapshot → `PipelineSession::from_snapshot(config, snapshot, fallback_date)`
+///   (retains stats / latches / emergent / recovery-escalation counters and
+///   uses `fallback_date` when restoring legacy checkpoints that predate
+///   `session_current_date`)
 ///
 /// This is the canonical way to construct a `PipelineSession` on server
 /// resume. Use it at EVERY site that currently calls `PipelineSession::new`
@@ -66,15 +68,27 @@ pub fn parse_pipeline_state(value: Option<&Value>) -> RestoreOutcome {
 /// regresses to cold.
 #[must_use]
 pub fn restore_or_new(config: PipelineConfig, checkpoint_value: Option<&Value>) -> PipelineSession {
+    let current_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    restore_or_new_with_current_date(config, checkpoint_value, &current_date)
+}
+
+#[must_use]
+pub fn restore_or_new_with_current_date(
+    config: PipelineConfig,
+    checkpoint_value: Option<&Value>,
+    current_date: &str,
+) -> PipelineSession {
     match parse_pipeline_state(checkpoint_value) {
-        RestoreOutcome::Missing => PipelineSession::new(config),
+        RestoreOutcome::Missing => {
+            PipelineSession::new_with_current_date(config, current_date.to_string())
+        }
         RestoreOutcome::Restored(snapshot) => {
             tracing::debug!(
                 turns = snapshot.stats.turns_executed,
                 cache_breaks = snapshot.stats.cache_breaks.len(),
                 "pipeline session restored from checkpoint (warm-start)"
             );
-            PipelineSession::from_snapshot(config, *snapshot)
+            PipelineSession::from_snapshot(config, *snapshot, current_date)
         }
         RestoreOutcome::Corrupt(err) => {
             tracing::warn!(
@@ -82,7 +96,7 @@ pub fn restore_or_new(config: PipelineConfig, checkpoint_value: Option<&Value>) 
                 "pipeline_state checkpoint is corrupt; starting fresh. \
                  Warm-start data lost — cache/feedback history reset to defaults"
             );
-            PipelineSession::new(config)
+            PipelineSession::new_with_current_date(config, current_date.to_string())
         }
     }
 }
@@ -153,9 +167,10 @@ mod tests {
                 working_memory: Default::default(),
                 cache_detector_state: Default::default(),
                 pending_prompt_snapshot: None,
-                session_current_date: "2026-05-25".to_string(),
+                session_current_date: Some("2026-05-25".to_string()),
                 turns_completed: 0,
             },
+            "1999-12-31",
         );
         let value = serde_json::to_value(session.snapshot_full_state()).unwrap();
 
@@ -203,6 +218,7 @@ mod tests {
                 );
                 assert_eq!(snapshot.turns_completed, 0);
                 assert!(snapshot.pending_prompt_snapshot.is_none());
+                assert!(snapshot.session_current_date.is_none());
             }
             other => panic!("expected legacy snapshot to restore, got {other:?}"),
         }
@@ -215,6 +231,12 @@ mod tests {
     }
 
     #[test]
+    fn restore_or_new_with_current_date_preserves_supplied_date_when_missing() {
+        let sess = restore_or_new_with_current_date(PipelineConfig::default(), None, "1999-12-31");
+        assert_eq!(sess.current_date(), "1999-12-31");
+    }
+
+    #[test]
     fn restore_or_new_corrupt_falls_back_to_fresh() {
         let corrupt = serde_json::json!({"stats": "bad"});
         let sess = restore_or_new(PipelineConfig::default(), Some(&corrupt));
@@ -222,6 +244,33 @@ mod tests {
             sess.stats.turns_executed, 0,
             "corrupt payload must fall back to fresh, not panic"
         );
+    }
+
+    #[test]
+    fn restore_or_new_with_current_date_preserves_supplied_date_when_corrupt() {
+        let corrupt = serde_json::json!({"stats": "bad"});
+        let sess = restore_or_new_with_current_date(
+            PipelineConfig::default(),
+            Some(&corrupt),
+            "1999-12-31",
+        );
+        assert_eq!(sess.current_date(), "1999-12-31");
+    }
+
+    #[test]
+    fn restore_or_new_with_current_date_legacy_missing_date_uses_supplied_date() {
+        let legacy = serde_json::json!({
+            "stats": PipelineStats::default(),
+            "latches": SessionLatches::default(),
+            "recovery": RecoveryState::default(),
+            "emergent": crate::emergent_context::EmergentContext::default()
+        });
+        let sess = restore_or_new_with_current_date(
+            PipelineConfig::default(),
+            Some(&legacy),
+            "1999-12-31",
+        );
+        assert_eq!(sess.current_date(), "1999-12-31");
     }
 
     #[test]
@@ -241,9 +290,10 @@ mod tests {
                 working_memory: Default::default(),
                 cache_detector_state: Default::default(),
                 pending_prompt_snapshot: None,
-                session_current_date: "2026-05-25".to_string(),
+                session_current_date: Some("2026-05-25".to_string()),
                 turns_completed: 0,
             },
+            "1999-12-31",
         );
         original
             .working_memory_mut()

@@ -425,9 +425,14 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             },
             messaging: Default::default(),
             error_recovery: Default::default(),
-            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
-                astra_turn_core::pipeline_config::PipelineConfig::default(),
-            )),
+            pipeline_session: Some(
+                astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
+                    astra_turn_core::pipeline_config::PipelineConfig::default(),
+                    crate::turn::session_current_date::resolve_session_current_date(
+                        &self.session_id,
+                    ),
+                ),
+            ),
             message: task_context.to_string(),
             recent_tools: Vec::new(),
             task_profile: infer_task_execution_profile(task_context),

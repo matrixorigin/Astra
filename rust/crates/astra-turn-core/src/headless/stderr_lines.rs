@@ -39,8 +39,6 @@ fn friendly_tool_name(tool_name: &str) -> &str {
         "sleep" => "Sleeping",
         "agent" => "Agent operation",
         "send_message" => "Sending message",
-        "spawn_agent" => "Spawning agent",
-        "get_agent_result" => "Getting agent result",
         "diagnose" => "Diagnosing",
         "env" => "Environment",
         "notebook_edit" => "Editing notebook",

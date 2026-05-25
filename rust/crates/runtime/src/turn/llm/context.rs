@@ -109,6 +109,17 @@ fn session_memory_injection(
     })
 }
 
+fn resolve_pipeline_session_current_date(
+    pipeline_session: Option<&astra_turn_core::pipeline_session::PipelineSession>,
+    session_id: &str,
+) -> String {
+    pipeline_session
+        .map(|session| session.current_date().to_string())
+        .unwrap_or_else(|| {
+            crate::turn::session_current_date::resolve_session_current_date(session_id)
+        })
+}
+
 /// Input for the shared context-pipeline assembly phase.
 ///
 /// This is intentionally still close to the current server/web host state so
@@ -403,6 +414,7 @@ pub(crate) struct BridgeSessionContextInput<'a> {
     pub edge_profile_cwd: Option<&'a str>,
     pub edge_profile_git_branch: Option<&'a str>,
     pub project_context: Option<&'a str>,
+    pub current_date: &'a str,
     pub skill_listing_block: &'a str,
 }
 
@@ -417,6 +429,7 @@ impl<'a> BridgeSessionContextInput<'a> {
         edge_profile_cwd: Option<&'a str>,
         edge_profile_git_branch: Option<&'a str>,
         project_context: Option<&'a str>,
+        current_date: &'a str,
     ) -> Self {
         Self {
             cache_cfg,
@@ -427,6 +440,7 @@ impl<'a> BridgeSessionContextInput<'a> {
             edge_profile_cwd,
             edge_profile_git_branch,
             project_context,
+            current_date,
             skill_listing_block: "",
         }
     }
@@ -676,6 +690,7 @@ pub(crate) fn assemble_bridge_context(
         input.session.project_context,
         input.tool_surface.deferred_tools_block,
         input.session.skill_listing_block,
+        input.session.current_date,
     );
     let system_prompt_tokens = estimate_json_tokens(&outcome.primary_system).saturating_add(
         outcome
@@ -774,11 +789,8 @@ pub(crate) fn assemble_context_pipeline(
     let model_context_limit =
         u64::try_from(crate::prompts::budget_for_model(Some(input.model_name)).model_limit)
             .unwrap_or(u64::MAX);
-    let session_current_date = state
-        .pipeline_session
-        .as_ref()
-        .map(|session| session.current_date().to_string())
-        .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+    let session_current_date =
+        resolve_pipeline_session_current_date(state.pipeline_session.as_ref(), input.session_id);
     let mut session_ctx = build_session_context(
         input.session_id,
         state.current_run_id.as_deref(),
@@ -1500,5 +1512,47 @@ mod context_cache_contract_tests {
 
         assert!(synthetic_tail_prefix_end.is_none());
         assert_eq!(messages[0]["content"], "original user");
+    }
+
+    #[test]
+    fn resolve_pipeline_session_current_date_uses_journal_anchor_without_pipeline_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "00000000-0000-0000-0000-000000000291";
+        let writer = astra_services::session_journal::JournalWriter::new(session_id)
+            .expect("journal writer");
+
+        let mut start =
+            astra_services::session_journal::JournalEvent::session_start(Some(session_id), None);
+        start.ts = "2026-05-24T23:59:50Z".to_string();
+        writer.append(&start).unwrap();
+
+        let mut later = astra_services::session_journal::JournalEvent::llm_request_full(
+            Some(session_id),
+            1,
+            0,
+            serde_json::json!({"provider": "openai", "request": {"messages": []}}),
+        );
+        later.ts = "2026-05-25T00:10:00Z".to_string();
+        writer.append(&later).unwrap();
+
+        assert_eq!(
+            resolve_pipeline_session_current_date(None, session_id),
+            "2026-05-24",
+            "context assembly must use the journal-anchored session date when no pipeline session exists yet"
+        );
+    }
+
+    #[test]
+    fn resolve_pipeline_session_current_date_prefers_pipeline_session_date() {
+        let session = astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+            "2026-05-21",
+        );
+
+        assert_eq!(
+            resolve_pipeline_session_current_date(Some(&session), "ignored-session-id"),
+            "2026-05-21"
+        );
     }
 }

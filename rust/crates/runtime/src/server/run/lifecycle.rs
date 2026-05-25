@@ -3562,9 +3562,12 @@ impl AgenticRunLifecycleService {
             cancellation: Default::default(),
             messaging: Default::default(),
             error_recovery: Default::default(),
-            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
-                astra_turn_core::pipeline_config::PipelineConfig::default(),
-            )),
+            pipeline_session: Some(
+                astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
+                    astra_turn_core::pipeline_config::PipelineConfig::default(),
+                    crate::turn::session_current_date::resolve_session_current_date(session_id),
+                ),
+            ),
             message: request.message.clone(),
             recent_tools: Vec::new(),
             task_profile,
@@ -3954,6 +3957,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         loop_state.harness.set_user_id(&user_id);
 
         loop_state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
+        let fresh_session_current_date = loop_state
+            .pipeline_session
+            .as_ref()
+            .map(|session| session.current_date().to_string())
+            .unwrap_or_else(|| {
+                crate::turn::session_current_date::resolve_session_current_date(&session_id)
+            });
 
         // ── Pipeline warm-start: restore PipelineSession from checkpoint ──
         // Overwrites the fresh `PipelineSession::new()` with a snapshot that
@@ -3965,11 +3975,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         if let Ok(Some(restored)) = astra_pipeline::step_restore::restore_session(&session_id)
             && restored.pipeline_state.is_some()
         {
-            loop_state.pipeline_session =
-                Some(astra_turn_core::pipeline_session_serde::restore_or_new(
+            loop_state.pipeline_session = Some(
+                astra_turn_core::pipeline_session_serde::restore_or_new_with_current_date(
                     astra_turn_core::pipeline_config::PipelineConfig::default(),
                     restored.pipeline_state.as_ref(),
-                ));
+                    &fresh_session_current_date,
+                ),
+            );
         }
 
         // ── CSL: Load conversation history from the log ─────────────
@@ -4427,16 +4439,25 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         state.harness.set_user_id(&user_id);
 
         state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
+        let fresh_session_current_date = state
+            .pipeline_session
+            .as_ref()
+            .map(|session| session.current_date().to_string())
+            .unwrap_or_else(|| {
+                crate::turn::session_current_date::resolve_session_current_date(&session_id)
+            });
 
         // ── Pipeline warm-start from step checkpoint ────────────────
         if request.session_id.is_some() {
             if let Ok(Some(restored)) = astra_pipeline::step_restore::restore_session(&session_id) {
                 if restored.pipeline_state.is_some() {
-                    state.pipeline_session =
-                        Some(astra_turn_core::pipeline_session_serde::restore_or_new(
+                    state.pipeline_session = Some(
+                        astra_turn_core::pipeline_session_serde::restore_or_new_with_current_date(
                             astra_turn_core::pipeline_config::PipelineConfig::default(),
                             restored.pipeline_state.as_ref(),
-                        ));
+                            &fresh_session_current_date,
+                        ),
+                    );
                 }
             }
         }
@@ -5909,9 +5930,14 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 ..Default::default()
             },
             error_recovery: Default::default(),
-            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
-                astra_turn_core::pipeline_config::PipelineConfig::default(),
-            )),
+            pipeline_session: Some(
+                astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
+                    astra_turn_core::pipeline_config::PipelineConfig::default(),
+                    crate::turn::session_current_date::resolve_session_current_date(
+                        &config.session_id,
+                    ),
+                ),
+            ),
             message: full_task,
             recent_tools: Vec::new(),
             task_profile,

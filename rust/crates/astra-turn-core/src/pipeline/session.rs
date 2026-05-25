@@ -103,13 +103,23 @@ impl PipelineSession {
     /// Create a new session with the given pipeline configuration.
     #[must_use]
     pub fn new(config: PipelineConfig) -> Self {
+        Self::new_with_current_date(config, default_session_current_date())
+    }
+
+    /// Create a new session with the given pipeline configuration and an
+    /// explicit session-stable current date.
+    #[must_use]
+    pub fn new_with_current_date(
+        config: PipelineConfig,
+        session_current_date: impl Into<String>,
+    ) -> Self {
         Self {
             pipeline: ContextPipeline::new(config),
             stats: PipelineStats::default(),
             latches: SessionLatches::default(),
             emergent: EmergentContext::default(),
             recovery: RecoveryState::default(),
-            session_current_date: default_session_current_date(),
+            session_current_date: session_current_date.into(),
             working_memory: WorkingMemoryState::default(),
             cache_detector: CacheBreakDetector::new(),
             pending_prompt_snapshot: None,
@@ -120,14 +130,18 @@ impl PipelineSession {
 
     /// Create a session with pre-loaded stats (warm start from persistence).
     #[must_use]
-    pub fn with_warm_stats(config: PipelineConfig, stats: PipelineStats) -> Self {
+    pub fn with_warm_stats(
+        config: PipelineConfig,
+        stats: PipelineStats,
+        session_current_date: impl Into<String>,
+    ) -> Self {
         Self {
             pipeline: ContextPipeline::new(config),
             stats,
             latches: SessionLatches::default(),
             emergent: EmergentContext::default(),
             recovery: RecoveryState::default(),
-            session_current_date: default_session_current_date(),
+            session_current_date: session_current_date.into(),
             working_memory: WorkingMemoryState::default(),
             cache_detector: CacheBreakDetector::new(),
             pending_prompt_snapshot: None,
@@ -147,6 +161,7 @@ impl PipelineSession {
         stats: PipelineStats,
         latches: SessionLatches,
         recovery: RecoveryState,
+        session_current_date: impl Into<String>,
     ) -> Self {
         Self {
             pipeline: ContextPipeline::new(config),
@@ -154,7 +169,7 @@ impl PipelineSession {
             latches,
             emergent: EmergentContext::default(),
             recovery,
-            session_current_date: default_session_current_date(),
+            session_current_date: session_current_date.into(),
             working_memory: WorkingMemoryState::default(),
             cache_detector: CacheBreakDetector::new(),
             pending_prompt_snapshot: None,
@@ -522,30 +537,49 @@ impl PipelineSession {
             cache_detector_state: self.cache_detector.snapshot_state(),
             pending_prompt_snapshot: self.pending_prompt_snapshot.clone(),
             turns_completed: self.turns_completed,
-            session_current_date: self.session_current_date.clone(),
+            session_current_date: Some(self.session_current_date.clone()),
         }
     }
 
     /// Restore a session from a full snapshot (checkpoint restore).
     #[must_use]
-    pub fn from_snapshot(config: PipelineConfig, snapshot: PipelineSessionSnapshot) -> Self {
-        let mut recovery = snapshot.recovery;
+    pub fn from_snapshot(
+        config: PipelineConfig,
+        snapshot: PipelineSessionSnapshot,
+        fallback_current_date: impl Into<String>,
+    ) -> Self {
+        let fallback_current_date = fallback_current_date.into();
+        let PipelineSessionSnapshot {
+            stats,
+            latches,
+            recovery,
+            emergent,
+            working_memory,
+            cache_detector_state,
+            pending_prompt_snapshot,
+            turns_completed,
+            session_current_date,
+        } = snapshot;
+        let mut recovery = recovery;
         // Clear transient per-session error state on restore
         recovery.consecutive_ptl_errors = 0;
         recovery.consecutive_same_errors = 0;
         recovery.has_attempted_reactive_compact = false;
+        let session_current_date = session_current_date
+            .filter(|value| !value.is_empty())
+            .unwrap_or(fallback_current_date);
 
         Self {
             pipeline: ContextPipeline::new(config),
-            stats: snapshot.stats,
-            latches: snapshot.latches,
-            emergent: snapshot.emergent,
+            stats,
+            latches,
+            emergent,
             recovery,
-            session_current_date: snapshot.session_current_date,
-            working_memory: snapshot.working_memory,
-            cache_detector: CacheBreakDetector::from_state(snapshot.cache_detector_state),
-            pending_prompt_snapshot: snapshot.pending_prompt_snapshot,
-            turns_completed: snapshot.turns_completed,
+            session_current_date,
+            working_memory,
+            cache_detector: CacheBreakDetector::from_state(cache_detector_state),
+            pending_prompt_snapshot,
+            turns_completed,
             pending_audits: Vec::new(),
         }
     }
@@ -571,8 +605,8 @@ pub struct PipelineSessionSnapshot {
     pub(crate) pending_prompt_snapshot: Option<PendingPromptSnapshot>,
     #[serde(default)]
     pub turns_completed: u32,
-    #[serde(default = "default_session_current_date")]
-    pub session_current_date: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_current_date: Option<String>,
 }
 
 /// Summary metrics extracted from pipeline state for cloud_session_facts.
@@ -743,7 +777,7 @@ mod tests {
             ..Default::default()
         };
 
-        let sess = PipelineSession::with_warm_stats(PipelineConfig::default(), stats);
+        let sess = PipelineSession::with_warm_stats(PipelineConfig::default(), stats, "2026-05-25");
         assert_eq!(sess.stats.turns_executed, 5);
         assert!((sess.stats.avg_cache_hit_ratio - 0.85).abs() < 1e-9);
         assert_eq!(sess.turns_completed(), 0);
@@ -1016,8 +1050,11 @@ mod tests {
         assert_eq!(sess.turns_completed(), 1);
         assert!(sess.pending_prompt_snapshot.is_some());
 
-        let restored =
-            PipelineSession::from_snapshot(PipelineConfig::default(), sess.snapshot_full_state());
+        let restored = PipelineSession::from_snapshot(
+            PipelineConfig::default(),
+            sess.snapshot_full_state(),
+            sess.current_date(),
+        );
 
         assert_eq!(restored.turns_completed(), 1);
         assert!(

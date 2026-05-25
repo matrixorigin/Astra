@@ -109,7 +109,6 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
         | "session_history_around"
         | "mo_query"
         | "get_agent_info"
-        | "get_agent_result"
         | "reflect"
         | "context_analysis"
         | "diagnose"

@@ -726,18 +726,15 @@ pub(crate) async fn stream_chat_sse(
         },
         pipeline_session: Some({
             let config = astra_turn_core::pipeline_config::PipelineConfig::default();
-            match p.pipeline_state.as_ref().and_then(|v| {
-                serde_json::from_value::<astra_turn_core::pipeline_session::PipelineSessionSnapshot>(
-                    v.clone(),
-                ).ok()
-            }) {
-                Some(snapshot) => {
-                    astra_turn_core::pipeline_session::PipelineSession::from_snapshot(
-                        config, snapshot,
-                    )
-                }
-                None => astra_turn_core::pipeline_session::PipelineSession::new(config),
-            }
+            let session_current_date =
+                astra_runtime::turn::session_current_date::resolve_session_current_date(
+                    p.session_id.unwrap_or(""),
+                );
+            astra_turn_core::pipeline_session_serde::restore_or_new_with_current_date(
+                config,
+                p.pipeline_state.as_ref(),
+                &session_current_date,
+            )
         }),
         message: p.message.to_string(),
         recent_tools: p.recent_tools.to_vec(),
