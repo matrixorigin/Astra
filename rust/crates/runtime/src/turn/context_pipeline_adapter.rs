@@ -232,7 +232,9 @@ pub(crate) fn build_external_sources(
         extra_stable_sections.push(section);
     }
 
-    // Tool and skill capability counts (session-stable identity)
+    // Tool and skill capability counts (per-turn volatile — tool_names and
+    // active_skill_names are clipped per turn by the optimizer, and
+    // max_turn_input_tokens can be adjusted mid-session by adaptive tuning).
     {
         let tool_count = tool_names.len();
         let skill_count = active_skill_names.len();
@@ -249,9 +251,9 @@ pub(crate) fn build_external_sources(
                 state.max_turn_input_tokens
             ));
         }
-        extra_stable_sections.push(crate::prompts::PromptSection::stable(
+        extra_dynamic_sections.push(crate::prompts::PromptSection::dynamic(
             cap,
-            crate::prompts::CacheScope::Session,
+            crate::prompts::PromptTokenBucket::Environment,
         ));
     }
 
