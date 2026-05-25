@@ -8,8 +8,8 @@
 //! pipeline invocation that carries forward learned behavior across turns.
 
 use crate::cache_diagnostics::{
-    CacheBreakDetector, CacheBreakDetectorState, DEFAULT_MIN_CACHE_BREAK_TOKENS,
-    PromptStateSnapshot,
+    CacheBreakDetector, CacheBreakDetectorState, PromptStateSnapshot,
+    DEFAULT_MIN_CACHE_BREAK_TOKENS,
 };
 use crate::compaction_types::CompactionTier;
 use crate::context_feedback::ContextFeedback;
@@ -29,7 +29,7 @@ use crate::pipeline_config::PipelineConfig;
 use crate::pipeline_stats::PipelineStats;
 use crate::recovery_state::RecoveryState;
 use crate::session_latches::SessionLatches;
-use crate::shadow_diff::{ShadowDiffResult, diff_pipeline_outputs};
+use crate::shadow_diff::{diff_pipeline_outputs, ShadowDiffResult};
 use crate::working_memory::WorkingMemoryState;
 
 /// Per-turn input provided by the agentic loop to `PipelineSession::run_turn()`.
@@ -641,6 +641,8 @@ mod tests {
             self_model: None,
             deferred_tools_block: String::new(),
             skill_listing_block: String::new(),
+            current_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+            user_id: None,
         }
     }
 

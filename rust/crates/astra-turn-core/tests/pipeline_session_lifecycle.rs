@@ -43,6 +43,8 @@ fn make_session_context() -> SessionContext {
         self_model: Some("Good at coding, struggles with design.".into()),
         deferred_tools_block: String::new(),
         skill_listing_block: String::new(),
+        current_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        user_id: Some("test-user".into()),
     }
 }
 

@@ -264,6 +264,16 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
     // putting it in the Session-scoped prefix churns prompt caches when a
     // session switches between models in the same provider family.
     let _model_id_is_transport_metadata = &sources.session.model_id;
+
+    // Current date (session-stable: computed once at session creation)
+    let current_date = &sources.session.current_date;
+    parts.push(format!("Date: {current_date}"));
+
+    // Authenticated user (session-stable: set once at session creation)
+    if let Some(ref uid) = sources.session.user_id {
+        parts.push(format!("User: {uid}"));
+    }
+
     if let Some(cwd) = &ep.cwd {
         parts.push(format!("CWD: {cwd}"));
     }
@@ -454,6 +464,8 @@ mod tests {
                 self_model: Some("Expert coder.".into()),
                 deferred_tools_block: String::new(),
                 skill_listing_block: String::new(),
+                current_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+                user_id: None,
             },
             turn: TurnState {
                 messages: vec![serde_json::json!({"role": "user", "content": "hello"})],

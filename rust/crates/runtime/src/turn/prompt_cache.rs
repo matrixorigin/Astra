@@ -316,6 +316,8 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         self_model: None,
         deferred_tools_block: deferred_tools_block.to_string(),
         skill_listing_block: skill_listing_block.to_string(),
+        current_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        user_id: None,
     };
 
     let agent = AgentContext {

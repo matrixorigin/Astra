@@ -10,7 +10,7 @@ use astra_turn_core::compaction_types::CompactionTier;
 use astra_turn_core::context_binder::bind_all;
 use astra_turn_core::context_feedback::ContextFeedback;
 use astra_turn_core::context_optimizer::optimize;
-use astra_turn_core::context_planner::{PlanInput, plan_turn};
+use astra_turn_core::context_planner::{plan_turn, PlanInput};
 use astra_turn_core::context_sources::*;
 use astra_turn_core::emergent_context::*;
 use astra_turn_core::microcompact::ProviderCacheStrategy;
@@ -55,6 +55,8 @@ fn build_sources() -> (
             self_model: Some("Expert Rust engineer.".into()),
             deferred_tools_block: String::new(),
             skill_listing_block: String::new(),
+            current_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+            user_id: None,
         },
         TurnState {
             messages: vec![
@@ -113,11 +115,10 @@ fn pipeline_single_turn_produces_valid_output() {
     // Plan
     let plan = plan_turn(&plan_input);
     assert!(!plan.sections.is_empty());
-    assert!(
-        plan.sections
-            .iter()
-            .any(|s| s.kind == SectionKind::Identity)
-    );
+    assert!(plan
+        .sections
+        .iter()
+        .any(|s| s.kind == SectionKind::Identity));
     assert!(plan.sections.iter().any(|s| s.kind == SectionKind::Memory));
 
     // Bind

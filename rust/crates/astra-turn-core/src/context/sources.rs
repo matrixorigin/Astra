@@ -145,6 +145,12 @@ pub struct SessionContext {
     /// Pre-rendered `<available_skills>` system block. Session-scoped.
     /// Empty when no skills are loaded.
     pub skill_listing_block: String,
+    /// Session-creation date (YYYY-MM-DD). Session-stable; injected into
+    /// RuntimeIdentity so the model knows the current date.
+    pub current_date: String,
+    /// Authenticated user identity. Session-stable; injected into
+    /// RuntimeIdentity so the model knows who it is talking to.
+    pub user_id: Option<String>,
 }
 
 /// Edge profile — workspace and runtime environment info.

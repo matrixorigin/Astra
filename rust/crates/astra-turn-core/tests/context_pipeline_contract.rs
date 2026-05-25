@@ -1,7 +1,7 @@
 use astra_turn_core::context_binder::bind_all;
 use astra_turn_core::context_optimizer::{CacheMarker, ContextOptimized};
 use astra_turn_core::context_pipeline::{ContextPipeline, PipelineAbort, PipelineRunInput};
-use astra_turn_core::context_planner::{PlanInput, plan_turn};
+use astra_turn_core::context_planner::{plan_turn, PlanInput};
 use astra_turn_core::context_serializer::{
     flatten_serialized_system_blocks, serialize_prompt_sections, serialize_provider_request,
 };
@@ -51,6 +51,8 @@ fn build_sources() -> (
             self_model: Some("Senior Rust agent.".into()),
             deferred_tools_block: String::new(),
             skill_listing_block: String::new(),
+            current_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+            user_id: None,
         },
         TurnState {
             messages: vec![serde_json::json!({"role": "user", "content": "hello"})],

@@ -417,6 +417,7 @@ pub(crate) fn build_session_context(
     provider: &str,
     project_context: Option<&str>,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+    user_id: Option<&str>,
 ) -> SessionContext {
     let provider_policy =
         super::prompt_cache::provider_cache_policy_for(cache_capability, provider, model_name);
@@ -453,6 +454,11 @@ pub(crate) fn build_session_context(
         self_model: None,
         deferred_tools_block: String::new(),
         skill_listing_block: String::new(),
+        // Session-stable identity: computed once, reused across turns.
+        // `current_date` uses UTC date so it's invariant within a session
+        // (even if the session spans midnight local time).
+        current_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        user_id: user_id.map(str::to_string),
     }
 }
 
@@ -508,6 +514,7 @@ mod tests {
             "anthropic",
             None,
             None,
+                    None,
         );
         // anthropic policy supports cache_control markers (max_markers > 0).
         assert!(
@@ -529,6 +536,7 @@ mod tests {
             "bedrock",
             None,
             None,
+                    None,
         );
         // Bedrock Claude translates cache_control → cachePoint downstream,
         // so the pipeline still emits Anthropic-style markers.
@@ -551,6 +559,7 @@ mod tests {
             "bedrock",
             None,
             None,
+                    None,
         );
         assert_eq!(
             ctx.provider_policy.max_markers, 0,
@@ -562,14 +571,14 @@ mod tests {
     #[test]
     fn session_context_saturates_oversized_model_limit() {
         let ep = serde_json::Map::new();
-        let ctx = build_session_context("sid", None, "gpt-4o", u64::MAX, &ep, "openai", None, None);
+        let ctx = build_session_context("sid", None, "gpt-4o", u64::MAX, &ep, "openai", None, None, None);
         assert_eq!(ctx.model_limit, u32::MAX);
     }
 
     #[test]
     fn session_context_picks_openai_policy_for_openai_provider() {
         let ep = serde_json::Map::new();
-        let ctx = build_session_context("sid", None, "gpt-4o", 128_000, &ep, "openai", None, None);
+        let ctx = build_session_context("sid", None, "gpt-4o", 128_000, &ep, "openai", None, None, None);
         // OpenAI uses prefix-only caching — emitting cache_control is a no-op
         // at best and (for some proxies) a 400 Bad Request at worst.
         assert_eq!(
@@ -595,6 +604,7 @@ mod tests {
             "unknown",
             None,
             None,
+                    None,
         );
         assert_eq!(ctx.provider_policy.max_markers, 0);
     }
@@ -618,6 +628,7 @@ mod tests {
                     astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
                 ),
             }),
+                    None,
         );
         assert!(
             ctx.provider_strategy.supports_cache_control,
@@ -646,6 +657,7 @@ mod tests {
                 "1. [active] (2026-05-06, 22 turns, branch: main)\n2. [active] (2026-05-05, 4 turns)",
             ),
             None,
+                    None,
         );
         assert!(
             ctx.project_context.contains("22 turns"),
@@ -657,7 +669,7 @@ mod tests {
     #[test]
     fn session_context_defaults_project_context_to_empty_when_absent() {
         let ep = serde_json::Map::new();
-        let ctx = build_session_context("sid", None, "gpt-4o", 128_000, &ep, "openai", None, None);
+        let ctx = build_session_context("sid", None, "gpt-4o", 128_000, &ep, "openai", None, None, None);
         assert!(ctx.project_context.is_empty());
     }
 
@@ -823,6 +835,7 @@ mod tests {
             provider,
             None,
             None,
+                    None,
         );
         let turn = build_turn_state(state, user_content);
         let external = build_external_sources(

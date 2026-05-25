@@ -783,6 +783,7 @@ pub(crate) fn assemble_context_pipeline(
         input.provider,
         state.project_context.as_deref(),
         Some(cache_cap),
+        state.context_manifest_user_id.as_deref(),
     );
     if !input.tool_surface.deferred_tools_block.is_empty() {
         session_ctx.deferred_tools_block = input.tool_surface.deferred_tools_block.to_string();
