@@ -937,8 +937,9 @@ fn build_bedrock_message_content(msg: &Value, include_reasoning_content: bool) -
 /// no matching response. The model sees this and can recover (e.g. retry).
 const SYNTHETIC_TOOL_INTERRUPTED_CONTENT: &str = "[tool execution not recorded]";
 
-/// Repair tool_use/tool_result pairing mismatches that Bedrock Converse rejects
-/// as 400. Three classes of corruption we observe, in order of severity:
+/// Repair OpenAI-wire `assistant.tool_calls` / `role=tool` pairing mismatches
+/// before provider-specific translation. Three classes of corruption we observe,
+/// in order of severity:
 ///
 /// 1. Missing tool_result for a declared tool_call (stream cut mid-execution,
 ///    session resume, or bridge restart). Bedrock: "Expected toolResult blocks
@@ -948,10 +949,9 @@ const SYNTHETIC_TOOL_INTERRUPTED_CONTENT: &str = "[tool execution not recorded]"
 /// 3. Duplicate tool_call_id within one tool-group (retry artifact). Bedrock:
 ///    duplicate-id 400.
 ///
-/// Bedrock-only: OpenAI and Anthropic providers consume the original messages
-/// unchanged. This mirrors claudecode's `ensureToolResultPairing` but operates
-/// on OpenAI wire format (role=tool messages) instead of Anthropic blocks.
-pub(crate) fn repair_openai_tool_pairing_for_bedrock(messages: &[Value]) -> Vec<Value> {
+/// This mirrors claudecode's `ensureToolResultPairing` but operates on OpenAI
+/// wire format (role=tool messages) instead of Anthropic blocks.
+pub(crate) fn repair_openai_tool_pairing(messages: &[Value]) -> Vec<Value> {
     let mut repaired: Vec<Value> = Vec::with_capacity(messages.len());
     let mut missing_counts: usize = 0;
     let mut orphan_counts: usize = 0;
@@ -1038,7 +1038,7 @@ pub(crate) fn repair_openai_tool_pairing_for_bedrock(messages: &[Value]) -> Vec<
             duplicate = dup_counts,
             input_len = messages.len(),
             output_len = repaired.len(),
-            "repaired tool_use/tool_result pairing for Bedrock request"
+            "repaired OpenAI tool_call/tool_result pairing"
         );
     }
     repaired
@@ -1528,7 +1528,7 @@ pub(crate) fn build_provider_request_body_with_overrides(
         sanitize_request_body_overrides_for_thinking(thinking, request_body_overrides);
     match llm_provider_protocol(provider) {
         LlmProviderProtocol::BedrockConverse => {
-            let repaired = repair_openai_tool_pairing_for_bedrock(messages);
+            let repaired = repair_openai_tool_pairing(messages);
             let (system, bedrock_messages) =
                 build_bedrock_messages(&repaired, thinking.is_enabled());
             let mut body = json!({
@@ -1607,7 +1607,8 @@ pub(crate) fn build_provider_request_body_with_overrides(
                 );
                 return body;
             }
-            let normalized_messages = normalize_openai_tool_message_content(messages);
+            let repaired = repair_openai_tool_pairing(messages);
+            let normalized_messages = normalize_openai_tool_message_content(&repaired);
             let mut body = json!({
                 "model": model_name,
                 "messages": normalized_messages,
@@ -7446,7 +7447,7 @@ mod tests {
             }),
             json!({"role": "tool", "tool_call_id": "call_a", "name": "f", "content": "ok"}),
         ];
-        let repaired = repair_openai_tool_pairing_for_bedrock(&messages);
+        let repaired = repair_openai_tool_pairing(&messages);
         // Expected: assistant / tool(call_a) / synthetic tool(call_b, is_error).
         assert_eq!(repaired.len(), 3, "{repaired:#?}");
         assert_eq!(repaired[1]["tool_call_id"], "call_a");
@@ -7471,7 +7472,7 @@ mod tests {
             json!({"role": "tool", "tool_call_id": "nonexistent", "name": "f", "content": "ghost"}),
             json!({"role": "user", "content": "continue"}),
         ];
-        let repaired = repair_openai_tool_pairing_for_bedrock(&messages);
+        let repaired = repair_openai_tool_pairing(&messages);
         // Orphan removed, non-tool messages untouched.
         assert_eq!(repaired.len(), 2);
         assert_eq!(repaired[0]["content"], "hi");
@@ -7493,7 +7494,7 @@ mod tests {
             json!({"role": "tool", "tool_call_id": "dup", "name": "f", "content": "first"}),
             json!({"role": "tool", "tool_call_id": "dup", "name": "f", "content": "second"}),
         ];
-        let repaired = repair_openai_tool_pairing_for_bedrock(&messages);
+        let repaired = repair_openai_tool_pairing(&messages);
         assert_eq!(repaired.len(), 2, "{repaired:#?}");
         assert_eq!(repaired[1]["tool_call_id"], "dup");
         assert_eq!(repaired[1]["content"], "first");
@@ -7515,7 +7516,7 @@ mod tests {
             json!({"role": "tool", "tool_call_id": "t1", "name": "f", "content": "a"}),
             json!({"role": "tool", "tool_call_id": "t2", "name": "f", "content": "b"}),
         ];
-        let repaired = repair_openai_tool_pairing_for_bedrock(&messages);
+        let repaired = repair_openai_tool_pairing(&messages);
         assert_eq!(repaired, messages);
     }
 
@@ -7635,7 +7636,7 @@ mod tests {
             // No tool responses — jumps straight to another user turn.
             json!({"role": "user", "content": "next question"}),
         ];
-        let repaired = repair_openai_tool_pairing_for_bedrock(&messages);
+        let repaired = repair_openai_tool_pairing(&messages);
         // assistant / tool(Npi0, synthetic) / tool(94F3, synthetic) / user
         assert_eq!(repaired.len(), 4, "{repaired:#?}");
         assert_eq!(repaired[1]["role"], "tool");
@@ -7660,7 +7661,7 @@ mod tests {
             json!({"role": "user", "content": "interrupt"}),
             json!({"role": "tool", "tool_call_id": "late", "name": "f", "content": "delayed"}),
         ];
-        let repaired = repair_openai_tool_pairing_for_bedrock(&messages);
+        let repaired = repair_openai_tool_pairing(&messages);
         // assistant / tool(late, synthetic) / user(interrupt); orphan dropped.
         assert_eq!(repaired.len(), 3, "{repaired:#?}");
         assert_eq!(repaired[1]["tool_call_id"], "late");
@@ -7669,6 +7670,62 @@ mod tests {
             SYNTHETIC_TOOL_INTERRUPTED_CONTENT
         );
         assert_eq!(repaired[2]["content"], "interrupt");
+    }
+
+    #[test]
+    fn build_openai_body_repairs_orphaned_tool_history_before_send() {
+        // Regression from session d644d257-...: compaction/resume dropped the
+        // assistant tool_calls message while leaving its tool results in place,
+        // which OpenAI-compatible providers reject with invalid_request_error.
+        let messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "continue"}),
+            json!({"role": "tool", "tool_call_id": "orphan-a", "name": "bash", "content": "ghost-a"}),
+            json!({"role": "tool", "tool_call_id": "orphan-b", "name": "bash", "content": "ghost-b"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "kept", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "kept", "name": "read_file", "content": "ok"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "deepseek-v4-pro-official",
+            "openai",
+            Some(8192),
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        let out = body["messages"].as_array().expect("messages array");
+        assert_eq!(out.len(), 4, "{out:#?}");
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[2]["role"], "assistant");
+        assert_eq!(
+            out[2]["tool_calls"][0]["id"], "kept",
+            "valid assistant tool_calls must survive repair"
+        );
+        assert_eq!(out[3]["role"], "tool");
+        assert_eq!(out[3]["tool_call_id"], "kept");
+        assert!(
+            out.iter().all(|msg| {
+                msg.get("role").and_then(Value::as_str) != Some("tool")
+                    || msg.get("tool_call_id").and_then(Value::as_str) != Some("orphan-a")
+            }),
+            "orphaned tool result should be stripped: {out:#?}"
+        );
+        assert!(
+            out.iter().all(|msg| {
+                msg.get("role").and_then(Value::as_str) != Some("tool")
+                    || msg.get("tool_call_id").and_then(Value::as_str) != Some("orphan-b")
+            }),
+            "all orphaned tool results should be stripped: {out:#?}"
+        );
     }
 
     #[test]

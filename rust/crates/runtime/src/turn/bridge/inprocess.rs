@@ -647,6 +647,12 @@ fn build_bridge_tool_call_records(
             ok,
             error.as_deref(),
         );
+        // Extract exit semantics from the tool_result (propagated
+        // from astra-tools shell_ops and server_tool_executor).
+        let exit_semantics = tool_result
+            .get("exit_semantics")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
         records.push(ToolCallRecord {
             name: tool_name,
             ok,
@@ -670,6 +676,7 @@ fn build_bridge_tool_call_records(
             round,
             batch_id,
             parallel,
+            exit_semantics,
             ..Default::default()
         });
     }
@@ -709,6 +716,7 @@ fn build_bridge_tool_call_records(
             round,
             batch_id,
             parallel,
+            exit_semantics: None,
             ..Default::default()
         });
     }

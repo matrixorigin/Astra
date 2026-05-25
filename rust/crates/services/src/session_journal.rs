@@ -564,6 +564,13 @@ pub struct ToolCallRecord {
     /// produce a follow-the-instructions stub and returned a BLOCKED result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_locked_out: Option<bool>,
+    /// Exit-code semantic classification for this tool call.
+    /// Serialized from `ExitSemantics` enum (snake_case). When present,
+    /// downstream exit-code logic uses this to distinguish real errors
+    /// from domain-negative outcomes (grep no-match, diff differences,
+    /// test failures).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_semantics: Option<String>,
 }
 
 /// Tool call name sentinel used for assistant messages that had parallel tool
