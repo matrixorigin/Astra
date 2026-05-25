@@ -448,7 +448,7 @@ pub enum SpawnAgentOutput {
         messaging_address: Option<String>,
     },
     /// Failed to spawn.
-    Failed { error: String },
+    Failed { error: String, duration_ms: u64 },
 }
 
 impl SpawnAgentOutput {
@@ -865,10 +865,10 @@ mod tests {
         // field allows..." rewording produces near-zero uptake in
         // practice. The word "RECOMMENDED" is the dominant signal.
         let schema = spawn_agent_schema();
-        let ip_desc =
-            schema["function"]["parameters"]["properties"]["inherit_prefix"]["description"]
-                .as_str()
-                .unwrap();
+        let ip_desc = schema["function"]["parameters"]["properties"]["inherit_prefix"]
+            ["description"]
+            .as_str()
+            .unwrap();
         assert!(
             ip_desc.contains("RECOMMENDED"),
             "inherit_prefix description must carry an explicit \

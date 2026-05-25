@@ -1005,6 +1005,7 @@ impl DynamicAgentSpawner {
                                 error: run_result
                                     .error
                                     .unwrap_or_else(|| "agent run failed".to_string()),
+                                duration_ms,
                             }),
                             _ => Ok(SpawnAgentOutput::Completed {
                                 agent_id,
@@ -1036,7 +1037,7 @@ impl DynamicAgentSpawner {
                         .await;
                         self.unregister_mailbox(&agent_id).await;
 
-                        Ok(SpawnAgentOutput::Failed { error: e })
+                        Ok(SpawnAgentOutput::Failed { error: e, duration_ms: 0 })
                     }
                 }
             } else {
@@ -2276,7 +2277,7 @@ mod tests {
         let result = spawner.spawn(input, &context).await.unwrap();
         assert!(matches!(
             result,
-            SpawnAgentOutput::Failed { ref error } if error == "boom"
+            SpawnAgentOutput::Failed { ref error, .. } if error == "boom"
         ));
     }
 
