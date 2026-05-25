@@ -5832,11 +5832,22 @@ mod tests {
 
     #[test]
     fn openai_request_body_tool_message_empty_object_content_becomes_empty_string() {
-        let messages = vec![json!({
-            "role": "tool",
-            "tool_call_id": "call_obj",
-            "content": {},
-        })];
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_obj",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_obj",
+                "content": {},
+            }),
+        ];
         let body = build_provider_request_body(
             &messages,
             &[],
@@ -5847,7 +5858,7 @@ mod tests {
             true,
             &ThinkingConfig::Off,
         );
-        assert_eq!(body["messages"][0]["content"].as_str(), Some(""));
+        assert_eq!(body["messages"][1]["content"].as_str(), Some(""));
     }
 
     #[test]
