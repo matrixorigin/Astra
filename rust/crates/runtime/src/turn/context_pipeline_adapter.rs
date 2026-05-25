@@ -242,6 +242,13 @@ pub(crate) fn build_external_sources(
         if !active_skill_names.is_empty() {
             cap.push_str(&format!(" Skills: {}.", active_skill_names.join(", ")));
         }
+        // Context window capacity (effective per-turn limit)
+        if state.max_turn_input_tokens > 0 {
+            cap.push_str(&format!(
+                " Context window: {} tokens per turn.",
+                state.max_turn_input_tokens
+            ));
+        }
         extra_stable_sections.push(crate::prompts::PromptSection::stable(
             cap,
             crate::prompts::CacheScope::Session,
