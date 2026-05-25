@@ -2299,6 +2299,28 @@ fn should_preserve_manual_pause_on_completion(
     *current_status == RunStatus::Paused && *final_status == RunStatus::Completed
 }
 
+async fn should_preserve_manual_pause_from_durable(
+    run_engine: &RunEngine,
+    run_id: &str,
+    final_status: &RunStatus,
+) -> bool {
+    if *final_status != RunStatus::Completed {
+        return false;
+    }
+    match run_engine.load_run(run_id).await {
+        Ok(Some(run)) => run.status == STATUS_PAUSED,
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(
+                %run_id,
+                error = %error,
+                "failed to reload durable run while checking late completion pause preservation"
+            );
+            false
+        }
+    }
+}
+
 fn merge_run_finished_event_data(target: &mut Value, source: &Value) {
     let source_data = source
         .get("data")
@@ -4215,6 +4237,21 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
             }
 
+            if persist_status_update
+                && should_preserve_manual_pause_from_durable(&run_engine, &bg_run_id, &final_status)
+                    .await
+            {
+                persist_status_update = false;
+                persisted_status = RunStatus::Paused;
+                if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                    run.status = RunStatus::Paused;
+                    run.pause_flag.store(true, Ordering::SeqCst);
+                    run.waiting_for
+                        .get_or_insert_with(|| "user_resume".to_string());
+                    run.live_tx = None;
+                }
+            }
+
             // Schedule eviction of the terminal run from the in-memory cache.
             // Waiting and paused runs are NOT evicted — they may still be resumed.
             if persisted_status != RunStatus::Waiting && persisted_status != RunStatus::Paused {
@@ -4625,6 +4662,21 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         run.live_tx = None;
                     }
                     flush_turn_observability(&mut state, &bg_session_id, false);
+                }
+            }
+
+            if persist_status_update
+                && should_preserve_manual_pause_from_durable(&run_engine, &bg_run_id, &final_status)
+                    .await
+            {
+                persist_status_update = false;
+                persisted_status = RunStatus::Paused;
+                if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                    run.status = RunStatus::Paused;
+                    run.pause_flag.store(true, Ordering::SeqCst);
+                    run.waiting_for
+                        .get_or_insert_with(|| "user_resume".to_string());
+                    run.live_tx = None;
                 }
             }
 
@@ -7830,6 +7882,33 @@ mod tests {
             &RunStatus::Running,
             &RunStatus::Completed
         ));
+    }
+
+    #[tokio::test]
+    async fn durable_paused_state_wins_over_late_completed_status() {
+        let svc = test_service_with_engine();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        svc.run_engine
+            .persist_status(&run.run_id, STATUS_PAUSED, Some("user_resume"), None)
+            .await
+            .unwrap();
+
+        assert!(
+            should_preserve_manual_pause_from_durable(
+                &svc.run_engine,
+                &run.run_id,
+                &RunStatus::Completed,
+            )
+            .await
+        );
+        assert!(
+            !should_preserve_manual_pause_from_durable(
+                &svc.run_engine,
+                &run.run_id,
+                &RunStatus::Failed,
+            )
+            .await
+        );
     }
 
     #[tokio::test]
