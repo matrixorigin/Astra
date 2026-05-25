@@ -298,7 +298,7 @@ pub struct SpawnRunResult {
 
 /// Trait for executing spawned agent runs.
 ///
-/// Similar to `SubRunExecutor` but specifically for spawn_agent.
+/// Similar to `SubRunExecutor` but specifically for dynamic agent spawning.
 /// CLI layer implements this to run the agentic loop.
 #[async_trait]
 pub trait SpawnAgentExecutor: Send + Sync {
@@ -337,7 +337,7 @@ pub struct DynamicAgentSpawner {
     background_abort_handles: Arc<RwLock<HashMap<String, tokio::task::AbortHandle>>>,
     /// Agent IDs spawned in background mode, for result collection after drain.
     background_agent_ids: Arc<std::sync::Mutex<Vec<String>>>,
-    /// Completion notifiers: get_agent_result awaits these instead of polling.
+    /// Completion notifiers: `agent(action='get_result')` awaits these instead of polling.
     completion_notifiers: Arc<RwLock<HashMap<String, Arc<tokio::sync::Notify>>>>,
     /// Optional fork-prefix store for cache inheritance across
     /// parent/child spawns. When `None` (default), spawn behavior is
@@ -581,7 +581,7 @@ impl DynamicAgentSpawner {
 
     /// Spawn a new agent from the given specification.
     ///
-    /// This is called by the `spawn_agent` tool handler.
+    /// This is called by the `agent(action='spawn')` handler.
     pub async fn spawn(
         &self,
         input: SpawnAgentInput,

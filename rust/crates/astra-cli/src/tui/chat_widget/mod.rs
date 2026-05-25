@@ -1797,7 +1797,7 @@ fn agent_action_from_description(description: &str) -> Option<&'static str> {
     }
 }
 
-/// LEGACY label extractor — see [`agent_action_from_description`].
+/// Compatibility label extractor for journal replay / older task rows.
 fn agent_label_from_description(description: &str) -> String {
     description
         .strip_prefix("Spawn agent:")

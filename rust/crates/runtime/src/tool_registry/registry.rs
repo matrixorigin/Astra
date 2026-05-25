@@ -564,7 +564,7 @@ impl ToolRegistry {
     }
 
     /// Return all tool names from THIS registry instance (includes
-    /// dynamically injected schemas like spawn_agent, skill, etc.).
+    /// runtime-surface-only schemas like skill, etc.).
     pub fn all_schema_names(&self) -> Vec<String> {
         self.all_schemas
             .iter()

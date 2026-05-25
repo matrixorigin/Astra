@@ -141,7 +141,7 @@ fn every_catalog_tool_has_schema() {
 }
 
 // NOTE: no reverse test (every schema → catalog entry) because TOOL_CATALOG
-// is only for selection-eligible tools.  Many tools (ask_user, spawn_agent,
+// is only for selection-eligible tools.  Many tools (ask_user, task,
 // plan-mode tools, etc.) have schemas but are dispatched directly without
 // catalog-based selection.  The forward check above is the meaningful one.
 

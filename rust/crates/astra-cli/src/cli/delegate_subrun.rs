@@ -290,7 +290,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             // same as pre-fork-prefix. The probe helper inside
             // `on_turn_completed` early-returns on None, so a delegate
             // without resolved inheritance emits nothing, just like
-            // the spawn_agent path.
+            // the dynamic agent-spawn path.
             inherited_prefix: config.inherited_prefix.clone(),
             fork_cache_sink: self.fork_cache_sink.clone(),
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),

@@ -1,8 +1,6 @@
 //! Spawn agent tool schema and types.
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-
 /// Request to inherit the parent's cacheable prefix when spawning.
 ///
 /// When present in a `SpawnAgentInput`, the runtime looks up the
@@ -15,7 +13,7 @@ use serde_json::json;
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct InheritPrefixSpec {
     /// Parent run id to inherit from. `None` means "the run calling
-    /// spawn_agent" — the resolver substitutes the caller's run id
+    /// `agent(action='spawn')`" — the resolver substitutes the caller's run id
     /// at resolution time.
     #[serde(default)]
     pub from_run_id: Option<String>,
@@ -27,10 +25,10 @@ pub struct InheritPrefixSpec {
     pub required: bool,
 }
 
-/// Input for the spawn_agent tool.
+/// Input for `agent(action='spawn')`.
 ///
 /// **Field order is load-bearing.** The struct is serialized to
-/// JSON for the spawn_agent tool schema and included in tool-schema
+/// JSON for the agent-spawn schema fragment and included in tool-schema
 /// cache-break attribution (see `cache_diagnostics.rs::per_tool_hashes`).
 /// Reordering fields changes the canonical JSON bytes and invalidates
 /// every captured parent prefix across a deploy. Add new fields at
@@ -461,114 +459,9 @@ impl SpawnAgentOutput {
     }
 }
 
-/// Generate the JSON schema for spawn_agent tool.
-/// Returns a schema in the standard format: `{ type: "function", function: { name, description, parameters } }`.
-pub fn spawn_agent_schema() -> serde_json::Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": "spawn_agent",
-            "description": "Launch a sub-agent for independent work. Types: explore, code-review, task, general-purpose. Use `inherit_prefix: {}` when the child builds on current context. When `run_in_background` is true, use the exact runtime-generated `agent_id` returned by spawn_agent with get_agent_result; do not invent one or reuse `name`.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "description": {
-                        "type": "string",
-                        "description": "A short (3-5 word) description of the task."
-                    },
-                    "prompt": {
-                        "type": "string",
-                        "description": "Detailed task prompt for the agent. Be specific about what you want."
-                    },
-                    "agent_type": {
-                        "type": "string",
-                        "enum": ["explore", "code-review", "task", "general-purpose"],
-                        "description": "Agent type: explore (research), code-review, task, or general-purpose.",
-                        "default": "general-purpose"
-                    },
-                    "model": {
-                        "type": "string",
-                        "description": "Optional model override."
-                    },
-                    "run_in_background": {
-                        "type": "boolean",
-                        "description": "If true, return immediately with a runtime-generated agent_id and you MUST call get_agent_result(agent_id) with that exact returned value to collect the output. Default false waits for the result synchronously.",
-                        "default": false
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": "Name for agent-to-agent messaging. Makes agent addressable via send_message. This is not the runtime agent_id used by get_agent_result."
-                    },
-                    "max_turns": {
-                        "type": "integer",
-                        "description": "Max turns before stopping. Default varies by agent_type.",
-                        "minimum": 1,
-                        "maximum": 100
-                    },
-                    "isolated": {
-                        "type": "boolean",
-                        "description": "Create isolated git worktree for this agent.",
-                        "default": false
-                    },
-                    "allowed_tools": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Tool allowlist (overrides agent_type defaults)."
-                    },
-                    "max_output_tokens": {
-                        "type": "integer",
-                        "description": "Max output tokens for the child's first API call.",
-                        "minimum": 1
-                    },
-                    "inherit_prefix": {
-                        "type": "object",
-                        "description": "RECOMMENDED when the child builds on current context: pass `{}` to inherit the parent's prompt-cache prefix, cutting first-turn input tokens and latency (often 70-95% reuse). Omit for independent tasks. Use {\"required\": true} only when missing inherited context should fail the spawn.",
-                        "properties": {
-                            "from_run_id": {
-                                "type": "string",
-                                "description": "Parent run id. Omit to use the caller's run."
-                            },
-                            "required": {
-                                "type": "boolean",
-                                "description": "If true, fail when the prefix is missing or incompatible. Default false.",
-                                "default": false
-                            }
-                        }
-                    },
-                    "inherit_context": {
-                        "type": "object",
-                        "description": "Alias for inherit_prefix. Prefer inherit_prefix in generated calls; accepted for product-facing P0 wording.",
-                        "properties": {
-                            "from_run_id": {
-                                "type": "string",
-                                "description": "Parent run id. Omit to use the caller's run."
-                            },
-                            "required": {
-                                "type": "boolean",
-                                "description": "If true, fail when the prefix is missing or incompatible. Default false.",
-                                "default": false
-                            }
-                        }
-                    }
-                },
-                "required": ["description", "prompt"],
-                "additionalProperties": false
-            }
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_spawn_agent_schema() {
-        let schema = spawn_agent_schema();
-        assert_eq!(schema["type"], "function");
-        assert_eq!(schema["function"]["name"], "spawn_agent");
-        assert!(schema["function"]["parameters"]["properties"]["description"].is_object());
-    }
 
     #[test]
     fn test_deserialize_input() {
@@ -673,18 +566,6 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_exposes_inherit_prefix() {
-        let schema = spawn_agent_schema();
-        let props = &schema["function"]["parameters"]["properties"];
-        assert!(props["inherit_prefix"].is_object());
-        assert!(
-            props["inherit_context"].is_object(),
-            "schema must expose the product-facing inherit_context alias"
-        );
-        assert!(props["max_output_tokens"].is_object());
-    }
-
-    #[test]
     fn inherit_context_alias_populates_inherit_prefix() {
         let json = r#"{
             "description": "D",
@@ -736,27 +617,6 @@ mod tests {
         assert!(
             input.inherit_prefix.is_none(),
             "null alias should behave like null inherit_prefix"
-        );
-    }
-
-    #[test]
-    fn schema_top_level_description_hints_at_inherit_prefix() {
-        // Tripwire: models discover `inherit_prefix` partly from the
-        // tool's top-level description. If the hint gets rewritten
-        // away, observed inherit_prefix usage drops to ~zero in the
-        // wild (verified: MiniMax-M2.5 doesn't pass the field unless
-        // it's suggested somewhere the model sees).
-        let schema = spawn_agent_schema();
-        let desc = schema["function"]["description"].as_str().unwrap();
-        assert!(
-            desc.contains("inherit_prefix"),
-            "top-level description must mention inherit_prefix so \
-             models discover the opportunity; got: {desc}"
-        );
-        assert!(
-            desc.contains("runtime-generated `agent_id`")
-                || desc.contains("runtime-generated agent_id"),
-            "top-level description must explain that spawn returns the runtime-generated agent_id; got: {desc}"
         );
     }
 
@@ -856,38 +716,6 @@ mod tests {
                 "type {bad} must be rejected, got parsed result"
             );
         }
-    }
-
-    #[test]
-    fn schema_inherit_prefix_description_recommends_opting_in() {
-        // Tripwire: the field-level description must actively
-        // recommend passing `{}` when appropriate. A passive "This
-        // field allows..." rewording produces near-zero uptake in
-        // practice. The word "RECOMMENDED" is the dominant signal.
-        let schema = spawn_agent_schema();
-        let ip_desc = schema["function"]["parameters"]["properties"]["inherit_prefix"]
-            ["description"]
-            .as_str()
-            .unwrap();
-        assert!(
-            ip_desc.contains("RECOMMENDED"),
-            "inherit_prefix description must carry an explicit \
-             recommendation signal; got: {ip_desc}"
-        );
-        assert!(
-            ip_desc.contains("{}"),
-            "inherit_prefix description must show the `{{}}` opt-in \
-             shorthand so models know the minimum call form; got: {ip_desc}"
-        );
-    }
-
-    #[test]
-    fn schema_rejects_unknown_top_level_fields() {
-        let schema = spawn_agent_schema();
-        assert_eq!(
-            schema["function"]["parameters"]["additionalProperties"],
-            false
-        );
     }
 }
 

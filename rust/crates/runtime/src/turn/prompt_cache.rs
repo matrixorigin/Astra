@@ -549,8 +549,7 @@ pub(crate) fn annotate_tool_schemas_for_caching_with_pinned(
 
 /// Default pinned tool names — the static-lib set that should appear in every
 /// turn of every session. Derived from `TOOL_CATALOG` + schemas that are
-/// auto-pinned via `ToolRegistry::upsert_schema` (skill, spawn_agent,
-/// get_agent_result, send_message, etc.).
+/// auto-pinned via `ToolRegistry::upsert_schema` (skill, send_message, etc.).
 ///
 /// Returning a fresh `HashSet` per call keeps the API safe across threads
 /// without a static — the set is small (~15 entries) so this is cheap.
@@ -572,14 +571,7 @@ pub(crate) fn default_pinned_tool_names() -> std::collections::HashSet<String> {
     // pinned set the marker landed on `skill` (idx 19) and web_search
     // (idx 20) fell outside the cached tool prefix, shaving ~500 tokens
     // off every cache hit on the deepseek-anthropic path.
-    for name in [
-        "skill",
-        "spawn_agent",
-        "get_agent_result",
-        "send_message",
-        "introspect",
-        "web_search",
-    ] {
+    for name in ["skill", "send_message", "introspect", "web_search"] {
         out.insert(name.to_string());
     }
     out
@@ -1893,7 +1885,7 @@ mod cache_stability_regression {
             );
         }
         // Auto-pinned via upsert_schema — not in TOOL_CATALOG but structurally part of the static lib.
-        for name in ["skill", "spawn_agent", "get_agent_result", "send_message"] {
+        for name in ["skill", "send_message"] {
             assert!(
                 pinned.contains(name),
                 "{name} is auto-pinned at runtime; default set must mirror that"

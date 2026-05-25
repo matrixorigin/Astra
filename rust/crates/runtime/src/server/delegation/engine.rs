@@ -1273,7 +1273,7 @@ impl DelegationEngine {
 
     /// Attach the fork-prefix store the spawner owns. Delegate
     /// sub-runs will then inherit the parent's captured prefix for
-    /// prompt-cache reuse — matching spawn_agent behavior. When
+    /// prompt-cache reuse — matching agent-spawn behavior. When
     /// unset, delegate sub-runs run fresh (pre-fork-prefix
     /// behavior).
     pub fn with_prefix_store(
@@ -1306,7 +1306,7 @@ impl DelegationEngine {
     /// - no parent prefix captured for `parent_run_id`
     /// - resolver rejects the prefix (provider / model mismatch,
     ///   thinking budget clamp, etc.) — soft-fallback semantics,
-    ///   same as spawn_agent
+    ///   same as agent spawn
     ///
     /// `child_provider` and `child_model_id` come from the resolved
     /// agent profile's model string. For now we use
@@ -2094,7 +2094,7 @@ impl DelegationEngine {
             // back to an empty string hint, which maps to
             // `Other("")` — resolver will soft-fallback if the
             // parent's provider doesn't match). Soft semantics
-            // match spawn_agent: on miss or mismatch the child
+            // match agent spawn: on miss or mismatch the child
             // runs fresh, no hard error.
             let delegate_model = profile.model_override.as_deref().unwrap_or("");
             let inherited_prefix =

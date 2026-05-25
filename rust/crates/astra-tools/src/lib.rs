@@ -933,11 +933,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_agent_and_get_agent_result_registered_together() {
-        // Regression guard: if spawn_agent is in the catalog but
-        // get_agent_result is not, the LLM can launch background
-        // agents but never retrieve their results — silent data loss.
-        // See session dc285027 for the production failure.
+    fn consolidated_agent_schema_is_registered() {
         let schemas = schemas::all_tool_schemas();
         let names: Vec<String> = schemas
             .iter()
@@ -948,13 +944,9 @@ mod tests {
                     .map(String::from)
             })
             .collect();
-        let has_spawn = names.contains(&"spawn_agent".into());
-        let has_result = names.contains(&"get_agent_result".into());
-        assert_eq!(
-            has_spawn, has_result,
-            "spawn_agent and get_agent_result must be registered together \
-             (spawn={has_spawn}, get_result={has_result}) — otherwise the LLM \
-             can launch background agents whose results are unreachable"
+        assert!(
+            names.contains(&"agent".into()),
+            "the consolidated `agent` schema must stay registered"
         );
     }
 

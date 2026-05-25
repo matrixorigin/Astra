@@ -832,7 +832,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         self.executor.set_plan_review_request_tx(None);
 
         // Bug B step 3: capture the parent turn's cacheable prefix
-        // so subsequent spawn_agent / delegate calls can inherit it
+        // so subsequent agent-spawn / delegate calls can inherit it
         // for prompt-cache reuse. No-op unless:
         //   - the `prefix_store` Arc was plumbed in (CLI startup
         //     sets this on every host when fork_prefix.enabled)

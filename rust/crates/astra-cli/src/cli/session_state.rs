@@ -529,7 +529,7 @@ impl Default for SessionState {
             dead_letter_queue: Some(std::sync::Arc::new(
                 astra_messaging::dead_letter::DeadLetterQueue::new(),
             )),
-            agent_spawner: None, // Created lazily when spawn_agent is first used
+            agent_spawner: None, // Created lazily when agent spawning is first used
             root_mailbox: None,
             pending_idle_agent_messages: Vec::new(),
             redo_stack: Vec::new(),

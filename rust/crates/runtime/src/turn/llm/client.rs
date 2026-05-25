@@ -9250,8 +9250,8 @@ mod tests {
         let tools = vec![json!({
             "type": "function",
             "function": {
-                "name": "spawn_agent",
-                "description": "Spawn a sub-agent",
+                "name": "agent",
+                "description": "Multi-agent operations",
                 "parameters": {
                     "type": "object",
                     "properties": {

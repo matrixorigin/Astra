@@ -51,7 +51,7 @@ fn truly_unknown_name_stays_rejected() {
 
 #[test]
 fn visible_schema_not_in_catalog_is_still_admitted() {
-    // A runtime-injected schema (skill / tool_search / spawn_agent etc.)
+    // A runtime-surface schema (skill / task / tool_search etc.)
     // lives in `visible` but not in the static catalog. It must be
     // admitted.
     let visible = vec![schema("skill"), schema("bash")];
@@ -63,8 +63,8 @@ fn visible_schema_not_in_catalog_is_still_admitted() {
 }
 
 #[test]
-fn runtime_injected_tools_like_skill_and_spawn_agent_are_admitted_when_visible() {
-    // Runtime-injected schemas (skill, spawn_agent, web_search, task, notify,
+fn runtime_surface_tools_like_skill_and_task_are_admitted_when_visible() {
+    // Runtime-surface schemas (skill, task, web_search, notify,
     // ask_user) aren't in TOOL_CATALOG but they ARE dispatchable. When
     // they're in the visible tools[] slice, admissible_tool_names must
     // include them (this was already trivially true via the union) —
@@ -72,14 +72,14 @@ fn runtime_injected_tools_like_skill_and_spawn_agent_are_admitted_when_visible()
     // via the injected extra list. Covered by the explicit helper.
     use astra_runtime::turn::headless_tool_pipeline::admissible_tool_names_from_visible_and_extras;
     let visible = vec![schema("bash")];
-    let extras = vec!["skill".to_string(), "spawn_agent".to_string()];
+    let extras = vec!["skill".to_string(), "task".to_string()];
     let admitted = admissible_tool_names_from_visible_and_extras(&visible, &extras);
     assert!(admitted.contains("bash"));
     assert!(
         admitted.contains("skill"),
         "runtime-injected 'skill' must be admitted via extras"
     );
-    assert!(admitted.contains("spawn_agent"));
+    assert!(admitted.contains("task"));
     // Catalog entries still admitted.
     assert!(admitted.contains("github"));
 }

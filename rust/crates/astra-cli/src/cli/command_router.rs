@@ -1914,7 +1914,7 @@ pub(super) async fn execute_cli_command(
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 skill_search: &skill_search,
                 // Non-Chat (Message-style) path — legacy single-shot
-                // invocation without spawn_agent support. Keep
+                // invocation without dynamic sub-agent support. Keep
                 // pre-fix behavior; extend later if this path needs
                 // spawning too.
                 agent_spawner: None,
@@ -2385,9 +2385,9 @@ pub(super) async fn execute_cli_command(
             };
 
             // Bug-A fix: build a DynamicAgentSpawner so `astra chat -m`
-            // can service spawn_agent tool calls, matching the REPL
+            // can service `agent(action='spawn', ...)`, matching the REPL
             // path. Without this, one-shot LLM invocations that try
-            // to spawn_agent hit "Agent spawning not available in
+            // to spawn hit "Agent spawning not available in
             // this context." — discovered during real-world MiniMax
             // verification. Mirrors the REPL's
             // `initialize_multi_agent_runtime` wiring via the
@@ -2410,7 +2410,7 @@ pub(super) async fn execute_cli_command(
 
             // Keep a clone of the Arc so we can drain background
             // spawned children before process exit — otherwise
-            // background tasks (the default spawn_agent mode) get
+            // background tasks (the default background-agent mode) get
             // aborted when main returns, which silently drops any
             // ForkCacheEvent / child telemetry they would have
             // emitted on their first response.
@@ -2510,7 +2510,7 @@ pub(super) async fn execute_cli_command(
 
             // Drain any background-spawned child agents before
             // returning. Without this, background tasks (the
-            // default spawn_agent mode) are aborted when main
+            // default background-agent mode) are aborted when main
             // returns, which silently drops any ForkCacheEvent /
             // child output they would have emitted. Deadline is
             // bounded so a misbehaving child can't hang the CLI;

@@ -6247,6 +6247,18 @@ async fn execute_with_metadata_responsive(
     }
 }
 
+fn is_agent_control_preview(preview: &str) -> bool {
+    [
+        "Spawn agent:",
+        "Get agent result:",
+        "Send message:",
+        "Running chain:",
+        "Delegating:",
+    ]
+    .iter()
+    .any(|prefix| preview.starts_with(prefix))
+}
+
 /// Human-friendly tool description from a `ToolCallRecord`'s name + args_preview.
 /// Mirrors `format_tool_description_with_output` but works without full args JSON.
 pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<&str>) -> String {
@@ -6298,9 +6310,15 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "github" => format!("GitHub: {preview}"),
         "session" => format!("Session: {preview}"),
         "mo" => format!("MO: {preview}"),
-        "agent" => format!("Agent: {preview}"),
+        "agent" => {
+            if is_agent_control_preview(preview) {
+                preview.to_string()
+            } else {
+                format!("Agent: {preview}")
+            }
+        }
         "introspect" => "Introspecting…".to_string(),
-        // Legacy individual names
+        // Legacy individual names for journal replay / old sessions.
         "github_get_pr" => format!("Getting PR: {preview}"),
         "github_list_prs" => format!("Listing PRs: {preview}"),
         "github_get_issue" => format!("Getting issue: {preview}"),
@@ -7839,6 +7857,18 @@ mod tests {
 
     #[test]
     fn format_meta_tool_preview_display_names() {
+        assert_eq!(
+            format_tool_display_from_preview("agent", Some("Spawn agent: reviewer-A (code-review)")),
+            "Spawn agent: reviewer-A (code-review)"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("agent", Some("Get agent result: reviewer@abc12345")),
+            "Get agent result: reviewer@abc12345"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("agent", Some("Send message: agent-2: Need review")),
+            "Send message: agent-2: Need review"
+        );
         assert_eq!(
             format_tool_display_from_preview("send_message", Some("agent-2: Need review")),
             "Send message: agent-2: Need review"

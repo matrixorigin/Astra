@@ -603,8 +603,8 @@ pub struct ToolExecutor {
     /// (server mode, headless tests) — bash there runs through the
     /// legacy reader.
     pub(crate) bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
-    /// Optional agent spawning context for the `spawn_agent` tool.
-    pub spawn_context: Option<agent_spawning::SpawnAgentContext>,
+    /// Optional agent spawning context for `agent(action='spawn'|'get_result')`.
+    pub spawn_context: Option<agent_spawning::AgentActionContext>,
     /// Optional shared context cache for cross-agent knowledge sharing.
     /// Used by share_context and query_context tools.
     pub context_cache: Option<std::sync::Arc<astra_runtime::orchestration::SharedContextCache>>,
@@ -818,7 +818,7 @@ impl ToolExecutor {
     }
 
     /// Set the spawn context for agent spawning.
-    pub fn with_spawn_context(mut self, ctx: agent_spawning::SpawnAgentContext) -> Self {
+    pub fn with_spawn_context(mut self, ctx: agent_spawning::AgentActionContext) -> Self {
         self.spawn_context = Some(ctx);
         self
     }
@@ -1999,7 +1999,7 @@ impl ToolExecutor {
             .unwrap_or_else(|| astra_text_utils::str_preview::truncate_line(&prompt, 60));
 
         let Some(ctx) = self.spawn_context.as_ref() else {
-            return "Error: background_agent requires agent spawning context; use the spawn_agent tool when available".to_string();
+            return "Error: background_agent requires agent spawning context; use `agent(action='spawn', ...)` when available".to_string();
         };
 
         let mut spawn_args = json!({
@@ -2015,7 +2015,7 @@ impl ToolExecutor {
             spawn_args["model"] = json!(model);
         }
 
-        agent_spawning::handle_spawn_agent_tool(&spawn_args, Some(ctx)).await
+        agent_spawning::handle_agent_spawn_action(&spawn_args, Some(ctx)).await
     }
 
     async fn task_output(&self, args: &Value) -> String {
@@ -3653,14 +3653,14 @@ impl ToolExecutor {
                             }
                         }
                         "spawn" => {
-                            agent_spawning::handle_spawn_agent_tool(
+                            agent_spawning::handle_agent_spawn_action(
                                 args,
                                 self.spawn_context.as_ref(),
                             )
                             .await
                         }
                         "get_result" => {
-                            agent_spawning::handle_get_agent_result_tool(
+                            agent_spawning::handle_agent_get_result_action(
                                 args,
                                 self.spawn_context.as_ref(),
                             )

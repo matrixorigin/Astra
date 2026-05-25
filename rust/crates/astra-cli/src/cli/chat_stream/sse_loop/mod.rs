@@ -162,7 +162,7 @@ pub(crate) async fn stream_chat_sse(
     // Stable run_id for this turn — shared by:
     //   1. state.current_run_id (so on_turn_completed captures the
     //      parent prefix keyed on this id)
-    //   2. SpawnAgentContext.run_id (so the spawner's resolver looks
+    //   2. AgentActionContext.run_id (so the spawner's resolver looks
     //      up the same key)
     // Pre-fix these were different ("ephemeral" vs None), so the
     // parent capture never happened and fork-cache probes were dead.
@@ -263,7 +263,7 @@ pub(crate) async fn stream_chat_sse(
         } else {
             ex
         };
-        // Wire spawn_agent tool context when spawner is available.
+        // Wire `agent(action='spawn'|'get_result')` context when a spawner is available.
         // The run_id MUST match what state.current_run_id uses so that
         // on_turn_completed captures the parent prefix under the same
         // key the spawner resolves against. Previously this was
@@ -273,7 +273,7 @@ pub(crate) async fn stream_chat_sse(
         // nothing. Generating a stable UUID here and threading it into
         // both sites closes the gap.
         if let Some(ref spawner) = p.agent_spawner {
-            let spawn_ctx = edge_tools::agent_spawning::SpawnAgentContext {
+            let spawn_ctx = edge_tools::agent_spawning::AgentActionContext {
                 run_id: parent_turn_run_id.clone(),
                 agent_id: root_agent_id.to_string(),
                 current_model: p.model.map(str::to_string),
@@ -363,19 +363,10 @@ pub(crate) async fn stream_chat_sse(
     // Install MCP schemas on the edge executor so `tool_search(select:NAME)`
     // can resolve plugin tool schemas by name.
     executor.set_plugin_schemas(mcp_plugin_schemas);
-    let mut registry = ToolRegistry::new_runtime_surface(all_schemas.clone());
-    // G3: when a DynamicAgentSpawner is wired, force-pin spawn_agent's
-    // schema so the tfidf selector always surfaces it. Without this,
-    // spawn_agent sits in all_schemas but TOOL_CATALOG has no entry
-    // for it — so resolve_pinned skips it and tfidf can't score it,
-    // leaving spawn_agent invisible to the LLM even when calls to it
-    // would succeed. Mirrors the lifecycle-level delegate injection
-    // pattern in `runtime::turn::agentic_loop::lifecycle` but gated on the CLI
-    // side because the spawner is a CLI-level dependency.
-    maybe_pin_spawn_agent_schema(&mut registry, p.agent_spawner.is_some());
+    let registry = ToolRegistry::new_runtime_surface(all_schemas.clone());
     let pinned_schema_tokens = registry.total_pinned_token_cost() as u64;
-    // Build valid_tool_names from the registry (includes dynamically injected
-    // spawn_agent/get_agent_result), not from the pre-injection all_schemas vec.
+    // Build valid_tool_names from the registry's runtime surface rather than
+    // reusing the pre-filtered schema vec directly.
     let valid_tool_names: HashSet<String> = registry.all_schema_names().into_iter().collect();
 
     // --allowed-tools: if set, restrict to only the specified tools
@@ -1021,23 +1012,6 @@ fn load_turn_messages(
     openai_messages_from_repl_history(history, current_message)
 }
 
-/// Conditionally force-pin the `spawn_agent` schema into the registry
-/// so the tfidf selector always surfaces it when a spawner is wired.
-///
-/// Rationale: `spawn_agent` sits in `all_tool_schemas()` (so the edge
-/// knows how to dispatch it) but has no entry in `TOOL_CATALOG` —
-/// which is the metadata table tfidf uses for scoring + pinning. As
-/// a result, the selector can't score it and `resolve_pinned` skips
-/// it. The only way it becomes visible to the LLM is `registry.upsert_schema`,
-/// which defaults to pinned. Models then see spawn_agent every turn
-/// exactly when it's callable (spawner present) and never when it's
-/// not — no dead schema, no wasted tokens.
-fn maybe_pin_spawn_agent_schema(_registry: &mut ToolRegistry, _spawner_wired: bool) {
-    // No-op: spawn/get_result/send_message are now actions within the
-    // consolidated `agent` schema (in all_tool_schemas). No separate
-    // schema injection needed.
-}
-
 #[cfg(test)]
 mod tests {
     use super::circuit_breaker_config_from_tool_selection;
@@ -1240,41 +1214,5 @@ hooks:
         let mut restricted = HashSet::new();
         extend_restricted_with_blocked_tools(&mut restricted, Some(&hub));
         assert!(restricted.is_empty());
-    }
-
-    // ── G3: spawn_agent visibility gate ──
-    //
-    // Regression for the tool-selector gap: without a catalog entry,
-    // spawn_agent was invisible to the LLM even when the CLI had a
-    // spawner wired. `maybe_pin_spawn_agent_schema` makes the schema
-    // visible iff the spawner is wired, so the model sees it exactly
-    // when calls would succeed.
-
-    // spawn_agent is now subsumed into the consolidated `agent` tool.
-    // maybe_pin_spawn_agent_schema is a no-op — no separate schema injection needed.
-    #[test]
-    fn maybe_pin_spawn_agent_schema_is_noop_always() {
-        use super::maybe_pin_spawn_agent_schema;
-        use crate::edge_tools;
-        use astra_runtime::tool_registry::ToolRegistry;
-
-        let mut registry = ToolRegistry::new(edge_tools::all_tool_schemas());
-        let before: std::collections::HashSet<String> = registry
-            .pinned_schemas()
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect();
-
-        maybe_pin_spawn_agent_schema(&mut registry, true);
-        let after: std::collections::HashSet<String> = registry
-            .pinned_schemas()
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect();
-
-        assert_eq!(
-            before, after,
-            "maybe_pin_spawn_agent_schema is now a no-op (spawn is an agent action)"
-        );
     }
 }

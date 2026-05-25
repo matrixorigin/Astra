@@ -718,7 +718,7 @@ pub struct ServerAgenticLoopHost {
     valid_tools: HashSet<String>,
     /// Names the validator should admit beyond the static catalog.
     ///
-    /// Covers runtime-injected tools (`skill`, `spawn_agent`, `web_search`,
+    /// Covers runtime-surface tools (`skill`, `agent`, `web_search`,
     /// etc.) plus plugin/MCP tool names. Populated by the host's init
     /// path before the first `sync_valid_tools_to_visible` call; stable
     /// for the rest of the session.
@@ -798,7 +798,7 @@ pub struct ServerAgenticLoopHost {
     // ── Fork-prefix parent capture (G2) ──
     /// Optional fork-prefix store. When set + the fork-prefix feature
     /// flag is on, `on_turn_completed` captures the parent turn's
-    /// cacheable prefix so delegate / spawn_agent sub-runs routed
+    /// cacheable prefix so delegate / agent-spawn sub-runs routed
     /// through the server-side DelegationEngine can inherit it. Mirrors
     /// the CLI-side wiring in `CliAgenticLoopHost::prefix_store`.
     prefix_store: Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
@@ -886,7 +886,7 @@ impl ServerAgenticLoopHostBuilder {
 
     /// Inject a shared fork-prefix store. When set, the built host
     /// captures the parent turn's cacheable prefix into this store so
-    /// delegate / spawn_agent sub-runs can inherit it. `None` (default)
+    /// delegate / agent-spawn sub-runs can inherit it. `None` (default)
     /// makes `on_turn_completed` a no-op — preserves zero-overhead
     /// behavior for callers that don't enable the fork-prefix feature.
     pub fn with_prefix_store(
@@ -3267,7 +3267,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
     fn on_turn_completed(&mut self, state: &crate::turn::agentic_loop::host::AgenticLoopState) {
         // G2: server-side parent capture. Mirrors the CLI host's
-        // `on_turn_completed`, so delegate / spawn_agent sub-runs
+        // `on_turn_completed`, so delegate / agent-spawn sub-runs
         // routed through the server DelegationEngine can inherit the
         // parent's cacheable prefix. No-op unless the store was wired
         // in and the feature flag is on (`capture_parent_prefix`

@@ -10,9 +10,8 @@ pub mod worktree_registry;
 pub mod worktree_sweep;
 
 pub use agent_tool::{
-    AgentToolContext, get_agent_result_schema, get_spawn_agent_schema,
-    handle_agent_get_result_tool, handle_agent_spawn_tool, handle_agent_tool,
-    normalize_spawn_agent_args, render_completed_agent_result, render_wait_timeout_outcome,
+    AgentToolContext, handle_agent_get_result_action, handle_agent_spawn_action, handle_agent_tool,
+    normalize_agent_spawn_args, render_completed_agent_result, render_wait_timeout_outcome,
 };
 pub use astra_turn_core::orchestration_context_cache::{
     AgentFindings, CacheStats, CachedFile, Finding, FindingCategory, Knowledge, SharedContextCache,
@@ -21,9 +20,7 @@ pub use astra_turn_core::orchestration_context_cache::{
 pub use astra_turn_core::orchestration_progress::{
     AgentProgressEmitter, AgentProgressEvent, ProgressBroadcaster, ProgressEventType,
 };
-pub use astra_turn_core::orchestration_spawn_tool::{
-    SpawnAgentInput, SpawnAgentOutput, spawn_agent_schema,
-};
+pub use astra_turn_core::orchestration_spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
 pub use astra_turn_core::orchestration_team_config::{AgentRegistry, AgentTypeConfig};
 pub mod permission_sync {
     pub use astra_turn_core::permission::sync::*;

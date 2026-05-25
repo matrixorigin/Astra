@@ -11,7 +11,7 @@
 //! Scope cut in this first landing:
 //! - Single-session view (no cross-session lineage). `SessionFork` events
 //!   are recorded but not rendered as edges here.
-//! - Delegation events only. `spawn_agent` (dynamic) journals under the
+//! - Delegation events only. Dynamic agent-spawn activity journals under the
 //!   same plumbing as delegation today, so both show up; if they
 //!   diverge we add a second event-type bucket here.
 //!

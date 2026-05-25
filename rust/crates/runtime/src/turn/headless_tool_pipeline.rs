@@ -56,7 +56,7 @@ pub fn admissible_tool_names_from_visible(
 
 /// Like [`admissible_tool_names_from_visible`] but also admits names from
 /// an `extras` list — used to surface runtime-injected schemas (`skill`,
-/// `spawn_agent`, `web_search`, `task`, `notify`, `ask_user`) and
+/// `web_search`, `task`, `notify`, `ask_user`) and
 /// plugin-registered MCP tools that don't live in the static
 /// `TOOL_CATALOG`. Without this escape hatch the validator would reject
 /// tool calls for names the executor can dispatch.

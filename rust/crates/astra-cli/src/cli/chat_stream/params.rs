@@ -377,7 +377,7 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) discovered_skills: Option<&'a mut HashSet<String>>,
     /// Shared messaging metrics for inter-agent communication observability.
     pub(crate) messaging_metrics: Option<Arc<astra_messaging::MessagingMetrics>>,
-    /// Optional agent spawner for dynamic sub-agent creation via spawn_agent tool.
+    /// Optional agent spawner for dynamic sub-agent creation via `agent(action='spawn', ...)`.
     pub(crate) agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// Optional logical root agent ID for this top-level turn when agent spawning is enabled.
     pub(crate) root_agent_id: Option<&'a str>,
@@ -472,14 +472,14 @@ pub(crate) struct BasicCliChatContext<'a> {
     pub unified_skill_registry: &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     pub skill_search: &'a astra_core::SkillSearchSettings,
     /// Optional agent spawner so `astra chat -m` (non-REPL one-shot)
-    /// can trigger the `spawn_agent` tool just like the interactive
-    /// REPL does. When `None`, spawn_agent returns "not available" —
+    /// can trigger `agent(action='spawn', ...)` just like the interactive
+    /// REPL does. When `None`, agent spawning returns "not available" —
     /// the previous behavior before the fix. Callers that want the
     /// fix set this via `initialize_multi_agent_runtime`-equivalent
     /// bootstrap before constructing the context.
     pub agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// Optional logical root agent id when `agent_spawner` is set.
-    /// Passed through to `sse_loop::mod` for `SpawnAgentContext`
+    /// Passed through to `sse_loop::mod` for `AgentActionContext`
     /// wiring. When `agent_spawner` is None this is ignored.
     pub root_agent_id: Option<&'a str>,
     /// Session-scoped task manager used by one-shot/headless paths that still
@@ -587,7 +587,7 @@ mod tests {
     //! bug. One-shot `chat -m` goes through
     //! `ChatTurnParams::basic_cli` without `run_chat_repl`; before
     //! the fix that helper hardcoded `agent_spawner: None`, so the
-    //! LLM's `spawn_agent` tool calls always returned "Agent
+    //! LLM's `agent(action='spawn', ...)` calls always returned "Agent
     //! spawning not available in this context".
     //!
     //! A full end-to-end test here would require mocking the
@@ -625,7 +625,7 @@ mod tests {
         // The structural AST contract the rest of the CLI relies
         // on: BasicCliChatContext exposes public `agent_spawner`
         // and `root_agent_id` fields. If these go away we can't
-        // wire one-shot chat to spawn_agent.
+        // wire one-shot chat to dynamic agent spawning.
         let src = include_str!("params.rs");
         assert!(src.contains("pub agent_spawner: Option<Arc<"));
         assert!(src.contains("pub root_agent_id: Option<&'a str>"));

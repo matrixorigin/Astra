@@ -145,13 +145,13 @@ impl TaskCell {
         self.error = error;
     }
 
-    fn is_get_agent_result_wait(&self) -> bool {
+    fn is_agent_result_wait(&self) -> bool {
         self.description.starts_with("Get agent result:")
     }
 
     pub(crate) fn is_interrupted_wait(&self) -> bool {
         self.status == TaskStatus::Failed
-            && self.is_get_agent_result_wait()
+            && self.is_agent_result_wait()
             && self.error.as_deref() == Some(GET_AGENT_RESULT_INTERRUPTED_ERROR)
     }
 
@@ -360,7 +360,7 @@ impl HistoryCell for TaskCell {
                 self.duration_ms = Some(self.started_at.elapsed().as_millis() as u64);
             }
             if self.error.is_none() {
-                self.error = Some(if self.is_get_agent_result_wait() {
+                self.error = Some(if self.is_agent_result_wait() {
                     GET_AGENT_RESULT_INTERRUPTED_ERROR.into()
                 } else {
                     "Task did not complete before the turn ended.".into()
