@@ -5,6 +5,7 @@ pub(crate) const MEMORY_BROWSE_QUERY: &str = "memory knowledge fact preference p
 pub(crate) const MEMORY_BROWSE_TOP_K: usize = 50;
 pub(crate) const MEMORY_STATS_TOP_K: usize = 200;
 const MEMORY_DISMISS_TOP_K: usize = 3;
+const SESSION_MEMORY_STATUS_TAIL_LIMIT: usize = 128;
 
 const SECTION_NAMES: &[&str] = &[
     "Active Goals",
@@ -49,6 +50,18 @@ pub(crate) struct SessionMemoryRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionMemoryStatusHint {
     pub(crate) summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionMemorySurfaceStatus {
+    pub(crate) snapshot: String,
+    pub(crate) extraction: Option<String>,
+    pub(crate) prompt_injection: Option<String>,
+    pub(crate) relevant_recall: Option<String>,
+    pub(crate) user_preferences: Option<String>,
+    pub(crate) remote_sync: Option<String>,
+    pub(crate) last_local_refresh_at: Option<String>,
+    pub(crate) stable_memory_epoch: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,11 +116,13 @@ pub(super) async fn handle_memory_domain_command(
                             let summary =
                                 record.as_ref().and_then(|memory| memory.summary.as_deref());
                             let hint = latest_session_memory_status_hint(session_id);
+                            let status = session_memory_surface_status(session_id, record.as_ref());
                             let out = format_session_memory_response(
                                 summary,
                                 body,
                                 Some(session_id),
                                 hint.as_ref().map(|h| h.summary.as_str()),
+                                Some(&status),
                             );
                             println!("{out}");
                         }
@@ -730,6 +745,7 @@ pub(crate) fn format_session_memory_response(
     body: &str,
     session_id: Option<&str>,
     status_hint: Option<&str>,
+    surface_status: Option<&SessionMemorySurfaceStatus>,
 ) -> String {
     let mut out = String::new();
     let headline = summary
@@ -744,20 +760,198 @@ pub(crate) fn format_session_memory_response(
         out.push_str(&format!("\nsession: {sid}"));
     }
 
+    if let Some(status) = surface_status {
+        let block = render_session_memory_surface_status(status);
+        if !block.is_empty() {
+            out.push_str("\n\n");
+            out.push_str(&block);
+        }
+    }
+
     if body.trim().is_empty() {
         if let Some(hint) = status_hint.filter(|hint| !hint.trim().is_empty()) {
-            out.push_str(&format!("\n{hint}"));
+            out.push_str(&format!("\n\n{hint}"));
         } else {
-            out.push_str("\nNo session memory yet.");
+            out.push_str("\n\nNo session memory yet.");
         }
         return out;
     }
 
+    out.push('\n');
     append_section_block(&mut out, body, SECTION_DISPLAY_NAMES, 8);
     if !has_any_section(body, SECTION_DISPLAY_NAMES) {
         append_section_block(&mut out, body, FALLBACK_SECTION_DISPLAY_NAMES, 8);
     }
     out
+}
+
+pub(crate) fn render_session_memory_surface_status(status: &SessionMemorySurfaceStatus) -> String {
+    let mut lines = vec![
+        "Memory Status".to_string(),
+        format!("- Current Session Snapshot: {}", status.snapshot),
+    ];
+    if let Some(ts) = status.last_local_refresh_at.as_deref() {
+        lines.push(format!("- Last Local Refresh: {ts}"));
+    }
+    if let Some(extraction) = status.extraction.as_deref() {
+        lines.push(format!("- Extraction Status: {extraction}"));
+    }
+    if let Some(injection) = status.prompt_injection.as_deref() {
+        lines.push(format!("- Current Session Snapshot Injection: {injection}"));
+    }
+    if let Some(recall) = status.relevant_recall.as_deref() {
+        lines.push(format!("- Relevant Recall: {recall}"));
+    }
+    if let Some(preferences) = status.user_preferences.as_deref() {
+        lines.push(format!("- User Preferences: {preferences}"));
+    }
+    if let Some(sync) = status.remote_sync.as_deref() {
+        lines.push(format!("- Remote Sync: {sync}"));
+    }
+    if let Some(epoch) = status.stable_memory_epoch {
+        lines.push(format!("- Stable Memory Epoch: {epoch}"));
+    }
+    lines.join("\n")
+}
+
+pub(crate) fn session_memory_surface_status(
+    session_id: &str,
+    record: Option<&SessionMemoryRecord>,
+) -> SessionMemorySurfaceStatus {
+    let metadata =
+        astra_runtime::session_memory::runner::load_local_session_memory_metadata(session_id);
+    let snapshot = match record {
+        Some(record) if record.memory_id == "local-session-memory" => {
+            "local current-session artifact".to_string()
+        }
+        Some(_) => "remote Memoria session memory".to_string(),
+        None => metadata
+            .as_ref()
+            .and_then(|meta| meta.current_snapshot_source.as_deref())
+            .map(|source| format!("not loaded (last writer: {source})"))
+            .unwrap_or_else(|| "not available".to_string()),
+    };
+    let extraction = latest_session_memory_status_hint(session_id).map(|hint| hint.summary);
+    let prompt_trace = latest_prompt_memory_trace(session_id);
+    let prompt_injection = prompt_trace.as_ref().map(|trace| {
+        let status = if trace.session_memory_present {
+            "injected"
+        } else {
+            "absent"
+        };
+        format!(
+            "{status} on turn {}; tokens={}",
+            trace.turn, trace.session_memory_tokens
+        )
+    });
+    let relevant_recall = prompt_trace.as_ref().map(|trace| {
+        format!(
+            "{} prompt-visible memories on turn {}",
+            trace.repository_memory_count, trace.turn
+        )
+    });
+    let user_preferences = prompt_trace.as_ref().and_then(|trace| {
+        if trace.user_preferences_tokens == 0 {
+            None
+        } else {
+            Some(format!(
+                "{} prompt tokens on turn {}",
+                trace.user_preferences_tokens, trace.turn
+            ))
+        }
+    });
+    let remote_sync = metadata
+        .as_ref()
+        .and_then(render_remote_sync_status)
+        .or_else(|| {
+            record
+                .filter(|record| record.memory_id != "local-session-memory")
+                .map(|_| "using remote Memoria snapshot".to_string())
+        });
+    SessionMemorySurfaceStatus {
+        snapshot,
+        extraction,
+        prompt_injection,
+        relevant_recall,
+        user_preferences,
+        remote_sync,
+        last_local_refresh_at: metadata
+            .as_ref()
+            .and_then(|meta| meta.last_local_refresh_at.clone()),
+        stable_memory_epoch: metadata
+            .as_ref()
+            .map(|meta| meta.stable_memory_epoch)
+            .filter(|epoch| *epoch > 0),
+    }
+}
+
+fn render_remote_sync_status(
+    metadata: &astra_runtime::session_memory::runner::SessionMemoryArtifactMetadata,
+) -> Option<String> {
+    let status = match metadata.last_remote_sync_status.as_deref()? {
+        "memoria_pending" => "pending remote Memoria sync",
+        "memoria_synced" => "Memoria sync complete",
+        "memoria_failed" => "Memoria sync failed",
+        other => other,
+    };
+    let when = metadata
+        .last_remote_sync_at
+        .as_deref()
+        .map(|ts| format!(" at {ts}"))
+        .unwrap_or_default();
+    let detail = metadata
+        .last_remote_sync_detail
+        .as_deref()
+        .filter(|detail| !detail.trim().is_empty())
+        .map(|detail| format!(" ({detail})"))
+        .unwrap_or_default();
+    Some(format!("{status}{when}{detail}"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptMemoryTraceStatus {
+    turn: u32,
+    session_memory_present: bool,
+    session_memory_tokens: u64,
+    repository_memory_count: usize,
+    user_preferences_tokens: u64,
+}
+
+fn latest_prompt_memory_trace(session_id: &str) -> Option<PromptMemoryTraceStatus> {
+    let events = astra_services::session_journal::read_journal_tail(
+        session_id,
+        SESSION_MEMORY_STATUS_TAIL_LIMIT,
+    )
+    .ok()?;
+    events.iter().rev().find_map(|event| {
+        if event.event_type
+            != astra_services::session_journal::JournalEventType::ContextAssemblyRecorded
+        {
+            return None;
+        }
+        let trace = event.context_assembly_trace.as_ref()?;
+        let system_prompt = trace.get("system_prompt")?;
+        let session_memory = system_prompt.get("session_memory_injected");
+        let repository_memory_count = system_prompt
+            .get("repository_memories")
+            .and_then(serde_json::Value::as_array)
+            .map(|entries| entries.len())
+            .unwrap_or(0);
+        let user_preferences_tokens = system_prompt
+            .get("user_preferences_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        Some(PromptMemoryTraceStatus {
+            turn: event.turn.unwrap_or(0),
+            session_memory_present: session_memory.is_some_and(|value| !value.is_null()),
+            session_memory_tokens: session_memory
+                .and_then(|value| value.get("tokens"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            repository_memory_count,
+            user_preferences_tokens,
+        })
+    })
 }
 
 fn select_session_memory_record(
@@ -911,9 +1105,16 @@ fn humanize_session_memory_skip(turn: &str, reason: &str) -> String {
 pub(crate) fn latest_session_memory_status_hint(
     session_id: &str,
 ) -> Option<SessionMemoryStatusHint> {
-    let writer = astra_services::session_journal::JournalWriter::new(session_id).ok()?;
-    let path = writer.path().clone();
-    let journal = std::fs::read_to_string(path).ok()?;
+    let events = astra_services::session_journal::read_journal_tail(
+        session_id,
+        SESSION_MEMORY_STATUS_TAIL_LIMIT,
+    )
+    .ok()?;
+    let journal = events
+        .into_iter()
+        .filter_map(|event| serde_json::to_string(&event).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
     parse_session_memory_status_hint_from_journal_text(&journal)
 }
 
@@ -978,7 +1179,7 @@ pub(crate) async fn load_current_session_memory(
         .or_else(|| load_local_session_memory(session_id)))
 }
 
-fn load_local_session_memory(session_id: &str) -> Option<SessionMemoryRecord> {
+pub(crate) fn load_local_session_memory(session_id: &str) -> Option<SessionMemoryRecord> {
     let path = astra_services::local_session_artifact_store()
         .session_path(session_id, "session-memory.md")
         .ok()?;
@@ -1090,6 +1291,8 @@ async fn store_current_session_memory(
         &canonical_body,
     )
     .map_err(|error| format!("current session memory write failed: {error}"))?;
+    update_manual_session_memory_sync_metadata(session_id, "memoria_pending", None)
+        .map_err(|error| format!("current session memory metadata write failed: {error}"))?;
     let encoded = astra_runtime::session_memory::runner::encode_session_memory_entry(
         session_id,
         &canonical_body,
@@ -1104,8 +1307,20 @@ async fn store_current_session_memory(
         api.put_bearer_path_json_text(token, &path, &payload)
             .await
             .map_err(|error| {
+                if let Err(write_error) = update_manual_session_memory_sync_metadata(
+                    session_id,
+                    "memoria_failed",
+                    Some(&error.to_string()),
+                ) {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %write_error,
+                        "failed to persist manual session-memory sync failure metadata"
+                    );
+                }
                 format!("current session memory updated locally but cloud sync failed: {error}")
             })?;
+        update_manual_session_memory_sync_metadata(session_id, "memoria_synced", None)?;
         return Ok(());
     }
 
@@ -1118,18 +1333,67 @@ async fn store_current_session_memory(
         .post_memory_store_json(token, &payload)
         .await
         .map_err(|error| {
+            if let Err(write_error) = update_manual_session_memory_sync_metadata(
+                session_id,
+                "memoria_failed",
+                Some(&error.to_string()),
+            ) {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %write_error,
+                    "failed to persist manual session-memory sync failure metadata"
+                );
+            }
             format!("current session memory updated locally but cloud sync failed: {error}")
         })?;
     if response.status().is_success() {
+        update_manual_session_memory_sync_metadata(session_id, "memoria_synced", None)?;
         Ok(())
     } else {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
+        if let Err(write_error) = update_manual_session_memory_sync_metadata(
+            session_id,
+            "memoria_failed",
+            Some(body.trim()),
+        ) {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %write_error,
+                "failed to persist manual session-memory sync failure metadata"
+            );
+        }
         Err(format!(
             "current session memory updated locally but cloud sync failed ({status}): {}",
             body.trim()
         ))
     }
+}
+
+fn update_manual_session_memory_sync_metadata(
+    session_id: &str,
+    status: &str,
+    detail: Option<&str>,
+) -> Result<(), String> {
+    let mut metadata =
+        astra_runtime::session_memory::runner::load_local_session_memory_metadata(session_id)
+            .unwrap_or_default();
+    metadata.session_id = session_id.to_string();
+    if metadata.current_snapshot_source.as_deref() != Some("manual_edit") {
+        metadata.current_snapshot_source = Some("manual_edit".to_string());
+    }
+    if metadata.last_extraction_source.as_deref() != Some("manual_edit") {
+        metadata.last_extraction_source = Some("manual_edit".to_string());
+    }
+    metadata.last_remote_sync_status = Some(status.to_string());
+    metadata.last_remote_sync_at = Some(chrono::Utc::now().to_rfc3339());
+    metadata.last_remote_sync_detail = detail
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+        .map(str::to_string);
+    astra_runtime::session_memory::runner::persist_local_session_memory_metadata(
+        session_id, &metadata,
+    )
 }
 
 /// Extract a `## SectionName` block from a markdown string.
@@ -1857,7 +2121,7 @@ mod tests {
         let body =
             "## Active Goals\n- Ship the fix\n\n## Completed\n- Root-caused the regression\n";
         let result =
-            format_session_memory_response(Some("Task complete"), body, Some("sess-1"), None);
+            format_session_memory_response(Some("Task complete"), body, Some("sess-1"), None, None);
         assert!(result.starts_with("Task complete"));
         assert!(result.contains("session: sess-1"));
         assert!(result.contains("🎯 Active Goals"));
@@ -1890,11 +2154,43 @@ mod tests {
             "",
             Some("sess-1"),
             Some("Latest extraction on turn 3 could not store the new session-memory snapshot."),
+            None,
         );
         assert!(result.contains("Session memory"));
         assert!(result.contains("session: sess-1"));
         assert!(!result.contains("No session memory extracted yet."));
         assert!(result.contains("could not store the new session-memory snapshot"));
+    }
+
+    #[test]
+    fn format_session_memory_response_renders_surface_status_block() {
+        let status = SessionMemorySurfaceStatus {
+            snapshot: "local current-session artifact".to_string(),
+            extraction: Some(
+                "Latest extraction completed on turn 9 via the background extractor.".to_string(),
+            ),
+            prompt_injection: Some("injected on turn 10; tokens=27".to_string()),
+            relevant_recall: Some("2 prompt-visible memories on turn 10".to_string()),
+            user_preferences: Some("200 prompt tokens on turn 10".to_string()),
+            remote_sync: Some("Memoria sync complete at 2026-05-25T10:00:00+08:00".to_string()),
+            last_local_refresh_at: Some("2026-05-25T10:00:00+08:00".to_string()),
+            stable_memory_epoch: Some(1),
+        };
+        let result = format_session_memory_response(
+            Some("Task complete"),
+            "## Active Goals\n- Ship it\n",
+            Some("sess-1"),
+            None,
+            Some(&status),
+        );
+        assert!(result.contains("Memory Status"));
+        assert!(result.contains("Current Session Snapshot: local current-session artifact"));
+        assert!(
+            result.contains("Current Session Snapshot Injection: injected on turn 10; tokens=27")
+        );
+        assert!(result.contains("Relevant Recall: 2 prompt-visible memories on turn 10"));
+        assert!(result.contains("User Preferences: 200 prompt tokens on turn 10"));
+        assert!(result.contains("Stable Memory Epoch: 1"));
     }
 
     #[test]
@@ -2084,6 +2380,17 @@ mod tests {
             .expect("session path");
         let written = std::fs::read_to_string(path).expect("local session-memory.md");
         assert!(written.contains("local write should land before cloud sync"));
+        let metadata =
+            astra_runtime::session_memory::runner::load_local_session_memory_metadata(&session_id)
+                .expect("local metadata");
+        assert_eq!(
+            metadata.current_snapshot_source.as_deref(),
+            Some("manual_edit")
+        );
+        assert_eq!(
+            metadata.last_remote_sync_status.as_deref(),
+            Some("memoria_failed")
+        );
     }
 
     #[tokio::test]

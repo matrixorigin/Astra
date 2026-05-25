@@ -26,6 +26,7 @@ pub const SESSION_MEMORY_MEMORIA_TYPE: &str = "working";
 const LEGACY_SESSION_MEMORY_PREFIX: &str = "[@session/memory]";
 const SESSION_MEMORY_SCHEMA_VERSION: u16 = 2;
 const CURRENT_SESSION_MEMORY_RETRIEVE_TOP_K: usize = 64;
+const LOCAL_SESSION_MEMORY_METADATA_FILE: &str = "session-memory.meta.json";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionNarrative {
@@ -61,6 +62,50 @@ pub struct SessionMemorySnapshot {
     #[serde(default)]
     pub facts: SessionFacts,
     pub narrative: SessionNarrative,
+}
+
+fn default_stable_memory_epoch() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionMemoryArtifactMetadata {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_local_refresh_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_snapshot_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_extracted_turn: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_extraction_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_remote_sync_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_remote_sync_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_remote_sync_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_selector_model: Option<String>,
+    #[serde(default = "default_stable_memory_epoch")]
+    pub stable_memory_epoch: u32,
+}
+
+impl Default for SessionMemoryArtifactMetadata {
+    fn default() -> Self {
+        Self {
+            session_id: String::new(),
+            last_local_refresh_at: None,
+            current_snapshot_source: None,
+            last_extracted_turn: None,
+            last_extraction_source: None,
+            last_remote_sync_status: None,
+            last_remote_sync_at: None,
+            last_remote_sync_detail: None,
+            last_selector_model: None,
+            stable_memory_epoch: default_stable_memory_epoch(),
+        }
+    }
 }
 
 impl SessionMemorySnapshot {
@@ -518,6 +563,30 @@ pub fn load_local_session_memory_artifact(session_id: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_string())
+}
+
+pub fn load_local_session_memory_metadata(
+    session_id: &str,
+) -> Option<SessionMemoryArtifactMetadata> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    let path = astra_services::local_session_artifact_store()
+        .session_path(session_id, LOCAL_SESSION_MEMORY_METADATA_FILE)
+        .ok()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    let mut metadata = serde_json::from_str::<SessionMemoryArtifactMetadata>(&raw).ok()?;
+    if metadata.session_id.trim().is_empty() {
+        metadata.session_id = session_id.to_string();
+    }
+    // Older or manually edited metadata files may explicitly store `0`,
+    // which bypasses serde's defaulting. Normalize it here so the rest of
+    // the read path can treat the epoch as a total invariant.
+    if metadata.stable_memory_epoch == 0 {
+        metadata.stable_memory_epoch = default_stable_memory_epoch();
+    }
+    Some(metadata)
 }
 
 pub async fn load_current_session_memory_preferring_local(
@@ -1069,6 +1138,61 @@ pub fn persist_local_session_memory_artifact(
         let _ = std::fs::remove_file(&tmp_path);
         return Err(format!(
             "rename session-memory tmp {} -> {}: {error}",
+            tmp_path.display(),
+            path.display()
+        ));
+    }
+    let mut metadata = load_local_session_memory_metadata(session_id).unwrap_or_default();
+    metadata.session_id = session_id.to_string();
+    metadata.last_local_refresh_at = Some(chrono::Utc::now().to_rfc3339());
+    persist_local_session_memory_metadata(session_id, &metadata)?;
+    Ok(())
+}
+
+pub fn persist_local_session_memory_metadata(
+    session_id: &str,
+    metadata: &SessionMemoryArtifactMetadata,
+) -> Result<(), String> {
+    let path = astra_services::local_session_artifact_store()
+        .session_path(session_id, LOCAL_SESSION_MEMORY_METADATA_FILE)?;
+    let Some(parent) = path.parent() else {
+        return Err(format!(
+            "session-memory metadata path has no parent: {}",
+            path.display()
+        ));
+    };
+    std::fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "create session-memory metadata dir {}: {error}",
+            parent.display()
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "invalid session-memory metadata file name: {}",
+                path.display()
+            )
+        })?;
+    let tmp_path = path.with_file_name(format!("{file_name}.tmp"));
+    let raw = serde_json::to_string_pretty(metadata).map_err(|error| {
+        format!(
+            "serialize session-memory metadata {}: {error}",
+            path.display()
+        )
+    })?;
+    std::fs::write(&tmp_path, raw).map_err(|error| {
+        format!(
+            "write session-memory metadata tmp {}: {error}",
+            tmp_path.display()
+        )
+    })?;
+    if let Err(error) = std::fs::rename(&tmp_path, &path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!(
+            "rename session-memory metadata tmp {} -> {}: {error}",
             tmp_path.display(),
             path.display()
         ));
@@ -2360,6 +2484,28 @@ mod tests {
             memoria.requested_top_k.lock().unwrap().as_slice(),
             &[CURRENT_SESSION_MEMORY_RETRIEVE_TOP_K]
         );
+    }
+
+    #[test]
+    fn persist_local_session_memory_artifact_refreshes_metadata_sidecar() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = format!(
+            "sess-meta-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        persist_local_session_memory_artifact(
+            &session_id,
+            "# Session Memory\n\n## Current State\nmetadata sidecar should refresh\n",
+        )
+        .expect("persist local artifact");
+        let metadata = load_local_session_memory_metadata(&session_id).expect("metadata");
+        assert_eq!(metadata.session_id, session_id);
+        assert!(metadata.last_local_refresh_at.is_some());
+        assert_eq!(metadata.stable_memory_epoch, 1);
     }
 
     #[tokio::test]

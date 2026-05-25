@@ -2662,6 +2662,17 @@ impl ToolExecutor {
     fn render_session_memory_introspect(&self) -> String {
         use std::fmt::Write as _;
 
+        let surface_status = self
+            .active_session_id()
+            .filter(|sid| !sid.is_empty())
+            .map(|sid| {
+                let record = crate::slash_memory::load_local_session_memory(&sid);
+                crate::slash_memory::session_memory_surface_status(&sid, record.as_ref())
+            });
+        let surface_block = surface_status
+            .as_ref()
+            .map(crate::slash_memory::render_session_memory_surface_status)
+            .filter(|block| !block.trim().is_empty());
         let journal_fallback = self.render_session_memory_journal_fallback();
         let journal_pipeline = self
             .active_session_id()
@@ -2669,13 +2680,14 @@ impl ToolExecutor {
             .and_then(|sid| astra_services::session_journal::read_journal(&sid).ok())
             .and_then(|events| Self::render_session_memory_pipeline_traces(&events));
         let Some(obs) = self.session_memory_observatory.as_ref() else {
-            return journal_fallback.unwrap_or_else(|| {
+            let body = journal_fallback.unwrap_or_else(|| {
                 "# session-memory observatory\n\n\
-                    No observatory attached to this runtime. This is expected \
-                    for offline CLI or legacy test modes; production servers \
-                    attach one so extractions + injections are traceable here."
+                     No observatory attached to this runtime. This is expected \
+                     for offline CLI or legacy test modes; production servers \
+                     attach one so extractions + injections are traceable here."
                     .to_string()
             });
+            return Self::prepend_session_memory_surface_status(surface_block.as_deref(), &body);
         };
 
         let ext = obs.extractions_snapshot();
@@ -2684,9 +2696,15 @@ impl ToolExecutor {
             && inj.is_empty()
             && let Some(fallback) = journal_fallback
         {
-            return fallback;
+            return Self::prepend_session_memory_surface_status(
+                surface_block.as_deref(),
+                &fallback,
+            );
         }
         let mut out = String::from("# session-memory observatory\n\n");
+        if let Some(block) = surface_block.as_deref() {
+            writeln!(out, "{block}\n").ok();
+        }
 
         writeln!(
             out,
@@ -3033,6 +3051,13 @@ impl ToolExecutor {
         Some(format!(
             "- t{turn} session_memory=present source={source} tokens={tokens} retrieved_memories={selected} preview=\"{preview}\""
         ))
+    }
+
+    fn prepend_session_memory_surface_status(surface_block: Option<&str>, body: &str) -> String {
+        match surface_block.filter(|block| !block.trim().is_empty()) {
+            Some(block) => format!("{block}\n\n{body}"),
+            None => body.to_string(),
+        }
     }
 
     /// `introspect(subtopic="cache")` — scan recent `llm_capture_*.json`

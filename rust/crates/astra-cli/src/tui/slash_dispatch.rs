@@ -953,11 +953,16 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                             None
                         };
                         let summary = record.as_ref().and_then(|memory| memory.summary.as_deref());
+                        let status = crate::slash_memory::session_memory_surface_status(
+                            session_id,
+                            record.as_ref(),
+                        );
                         ctx.show_response(crate::slash_memory::format_session_memory_response(
                             summary,
                             body,
                             Some(session_id),
                             hint.as_ref().map(|hint| hint.summary.as_str()),
+                            Some(&status),
                         ));
                     }
                     Err(e) => ctx.show_error(format!("Session memory failed: {e}")),

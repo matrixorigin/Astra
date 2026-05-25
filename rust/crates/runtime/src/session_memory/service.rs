@@ -49,7 +49,10 @@ use super::observatory::{
     ExtractionTrigger, SessionMemoryObservatory, clip_preview,
 };
 use super::request::{ExtractionRequest, SpawnDecision};
-use super::runner::{ExtractionArtifacts, persist_local_session_memory_artifact, run_extraction};
+use super::runner::{
+    ExtractionArtifacts, persist_local_session_memory_artifact,
+    persist_local_session_memory_metadata, run_extraction,
+};
 
 type LocalJournalEventSink = dyn Fn(&JournalEvent) + Send + Sync + 'static;
 
@@ -294,6 +297,41 @@ impl MemoryExtractionService {
             return Ok(());
         }
         persist_local_session_memory_artifact(session_id, content)
+    }
+
+    fn persist_success_metadata(
+        &self,
+        session_id: &str,
+        turn: u32,
+        source: SessionMemoryExtractionSource,
+        selector_model: Option<&str>,
+    ) {
+        if !self.require_local_current_snapshot {
+            return;
+        }
+        let mut metadata =
+            super::runner::load_local_session_memory_metadata(session_id).unwrap_or_default();
+        metadata.session_id = session_id.to_string();
+        metadata.current_snapshot_source = Some("background_extraction".to_string());
+        metadata.last_extracted_turn = Some(turn);
+        metadata.last_extraction_source = Some(
+            match source {
+                SessionMemoryExtractionSource::Llm => "llm",
+                SessionMemoryExtractionSource::RuleFallback => "rule_fallback",
+            }
+            .to_string(),
+        );
+        metadata.last_remote_sync_status = Some("memoria_synced".to_string());
+        metadata.last_remote_sync_at = Some(chrono::Utc::now().to_rfc3339());
+        metadata.last_remote_sync_detail = None;
+        metadata.last_selector_model = selector_model.map(str::to_string);
+        if let Err(error) = persist_local_session_memory_metadata(session_id, &metadata) {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %error,
+                "failed to persist local session-memory metadata after successful extraction"
+            );
+        }
     }
 
     /// Live circuit breaker snapshot, for introspect. Cheap — no locks
@@ -887,6 +925,12 @@ impl MemoryExtractionService {
                     duration_ms,
                     &bc,
                 );
+                self.persist_success_metadata(
+                    &session_id,
+                    turn,
+                    source,
+                    selector_model_for_obs.as_deref(),
+                );
                 let preview = summarize_persisted_content(&content);
                 self.record_extraction_outcome(
                     &session_id,
@@ -986,6 +1030,12 @@ impl MemoryExtractionService {
                     bytes_written,
                     duration_ms,
                     &bc,
+                );
+                self.persist_success_metadata(
+                    &session_id,
+                    turn,
+                    SessionMemoryExtractionSource::RuleFallback,
+                    selector_model.as_deref(),
                 );
                 self.broker.emit(BackgroundActivity::Errored {
                     session_id: session_id.clone(),
