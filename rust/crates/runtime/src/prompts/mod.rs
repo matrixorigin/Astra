@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn budget_for_model_claude() {
         let b = budget_for_model(Some("claude-3.5-sonnet"));
-        assert_eq!(b.model_limit, 200_000);
+        assert_eq!(b.model_limit, 128_000);
     }
 
     #[test]
