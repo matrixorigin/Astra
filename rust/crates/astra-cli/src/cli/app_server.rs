@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use std::io::{BufRead, Write};
+use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -468,8 +469,8 @@ async fn run_turn(
     };
     drop(chat_ctx);
     drop(approval_tx);
-    let _ = event_task.await;
-    let _ = approval_task.await;
+    join_or_abort_app_server_task(event_task, Duration::from_millis(250)).await;
+    join_or_abort_app_server_task(approval_task, Duration::from_millis(250)).await;
     deny_pending_approvals_for_turn(&state, &turn_id).await;
     let mut sr = match result {
         Ok(sr) => sr,
@@ -489,6 +490,13 @@ async fn run_turn(
         .await;
     write_turn_result(&writer, &thread_id, &turn_id, &sr).await?;
     Ok(())
+}
+
+async fn join_or_abort_app_server_task<T>(mut task: tokio::task::JoinHandle<T>, timeout: Duration) {
+    if tokio::time::timeout(timeout, &mut task).await.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 fn extract_turn_message(params: &Value) -> Option<String> {
@@ -976,5 +984,16 @@ mod tests {
         assert_eq!(method, "turn/explain");
         assert_eq!(params["format"], "dag");
         assert_eq!(params["text"], "Explain Analyze DAG — turn-1");
+    }
+
+    #[tokio::test]
+    async fn join_or_abort_app_server_task_does_not_wait_for_open_channel() {
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let task = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let started = std::time::Instant::now();
+
+        join_or_abort_app_server_task(task, Duration::from_millis(10)).await;
+
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
