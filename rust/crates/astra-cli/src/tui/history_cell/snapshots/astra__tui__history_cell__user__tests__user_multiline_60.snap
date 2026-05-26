@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/user.rs
+assertion_line: 245
 expression: "render_cell(&cell, 60, 5)"
 ---
 › first line

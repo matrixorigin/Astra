@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/session_picker/view.rs
+assertion_line: 441
 expression: "render_picker(&d, 80, 4)"
 ---
 ┌ Resume session (0) ──────────────────────────────────────────────────────────┐

@@ -481,11 +481,6 @@ where
     }
 }
 
-/// Read `ASTRA_CLI_USER_ID` from environment, defaulting to `"local"`.
-pub fn cli_user_id() -> String {
-    env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string())
-}
-
 fn normalize_jwt_secret(secret: &str) -> String {
     if secret.len() >= 32 {
         secret.to_string()

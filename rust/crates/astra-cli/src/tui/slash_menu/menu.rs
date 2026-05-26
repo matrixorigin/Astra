@@ -12,7 +12,7 @@
 
 #![allow(dead_code)]
 
-use crate::command_registry::TuiHandler;
+use crate::cli::command_registry::TuiHandler;
 use nucleo_matcher::{
     Config, Matcher, Utf32Str,
     pattern::{Atom, AtomKind, CaseMatching, Normalization},
@@ -36,9 +36,9 @@ pub(crate) struct SlashItem {
     /// Frequency hint — higher means "show sooner on ties".
     pub usage_boost: u32,
     /// Command group for categorized rendering in the popup.
-    pub group: Option<crate::command_registry::CommandGroup>,
+    pub group: Option<crate::cli::command_registry::CommandGroup>,
     /// How the command behaves in the TUI — e.g. shows a panel or modal.
-    pub tui_handler: crate::command_registry::TuiHandler,
+    pub tui_handler: crate::cli::command_registry::TuiHandler,
     /// Example usages shown in help output.
     pub usage_examples: &'static [&'static str],
 }

@@ -376,7 +376,9 @@ struct PlanModeUiSnapshot {
     executing: bool,
 }
 
-fn capture_plan_mode_ui_snapshot(state: &crate::session_state::SessionState) -> PlanModeUiSnapshot {
+fn capture_plan_mode_ui_snapshot(
+    state: &crate::cli::session_state::SessionState,
+) -> PlanModeUiSnapshot {
     PlanModeUiSnapshot {
         active: state.plan_mode_active(),
         goal: state
@@ -433,7 +435,7 @@ fn plan_transition_notice(
 fn commit_plan_transition_notice(
     chat_widget: &mut chat_widget::ChatWidget,
     before: &PlanModeUiSnapshot,
-    state: &crate::session_state::SessionState,
+    state: &crate::cli::session_state::SessionState,
     triggered_by_plan_request: bool,
 ) {
     let after = capture_plan_mode_ui_snapshot(state);
@@ -495,7 +497,7 @@ fn slash_plan_goal(text: &str) -> Option<&str> {
 
 fn refresh_footer_from_state(
     bottom_pane: &mut BottomPane,
-    state: &crate::session_state::SessionState,
+    state: &crate::cli::session_state::SessionState,
 ) {
     bottom_pane.footer.model = state.model.clone();
     bottom_pane.footer.session_id = state
@@ -566,13 +568,14 @@ pub(crate) async fn run_tui_session(
     resume_session_id: Option<&str>,
     no_instructions: bool,
     max_budget: f64,
+    cli_context: &crate::cli::cli_context::CliContext,
 ) -> Result<(), String> {
-    use crate::session_runtime::{
+    use crate::cli::session_runtime::{
         initialize_session_state, install_task_service, install_task_store, resolve_task_service,
         resolve_task_store,
     };
-    use crate::session_startup::complete_session_startup;
-    use crate::startup_trace::StartupTracer;
+    use crate::cli::session_startup::complete_session_startup;
+    use crate::cli::startup_trace::StartupTracer;
 
     // ── Ensure terminal is in sane state before startup output ────────
     // Previous astra crashes may leave terminal in raw mode, causing
@@ -587,9 +590,9 @@ pub(crate) async fn run_tui_session(
 
     // ── Business initialization BEFORE entering TUI ─────────────────────
     let mut tracer = StartupTracer::new();
-    crate::session_runtime::try_silent_auth(api, profile).await;
+    crate::cli::session_runtime::try_silent_auth(api, profile).await;
     tracer.phase("auth");
-    let mut state = initialize_session_state(profile, initial_model);
+    let mut state = initialize_session_state(profile, initial_model, cli_context);
     let task_service = resolve_task_service(profile).await;
     install_task_service(&mut state, task_service);
     let (task_store, task_notify_tx) = resolve_task_store(profile, Some(&api.api_origin())).await;
@@ -606,25 +609,26 @@ pub(crate) async fn run_tui_session(
         profile,
         resume_session_id,
         no_instructions,
+        cli_context,
     )
     .await?;
     tracer.finish();
 
     // ── TUI mode overrides ──────────────────────────────────────────────
     let (tui_tx, mut tui_rx) = stream_bridge::create_channels();
-    state.tui_render_policy = Some(crate::stream_render::RenderPolicy::Silent);
+    state.tui_render_policy = Some(crate::cli::stream_render::RenderPolicy::Silent);
     let mut tui_cancel_token = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
     state.tui_cancel_token = Some(tui_cancel_token.clone());
 
     // Approval channel: tool approval requests from SSE host → TUI overlay
     let (approval_tx, mut approval_rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::ApprovalRequest>();
+        tokio::sync::mpsc::unbounded_channel::<crate::cli::chat_stream::ApprovalRequest>();
     state.tui_approval_request_tx = Some(approval_tx);
     let (ask_user_tx, mut ask_user_rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::AskUserRequest>();
+        tokio::sync::mpsc::unbounded_channel::<crate::cli::chat_stream::AskUserRequest>();
     state.tui_ask_user_request_tx = Some(ask_user_tx);
     let (plan_review_tx, mut plan_review_rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::PlanReviewRequest>();
+        tokio::sync::mpsc::unbounded_channel::<crate::cli::chat_stream::PlanReviewRequest>();
     state.tui_plan_review_request_tx = Some(plan_review_tx);
 
     // ── Enter TUI ───────────────────────────────────────────────────────
@@ -670,7 +674,7 @@ pub(crate) async fn run_tui_session(
 
     // Load slash-command catalog for the inline `/` menu.
     {
-        let slash_items: Vec<slash_menu::SlashItem> = crate::command_registry::COMMANDS
+        let slash_items: Vec<slash_menu::SlashItem> = crate::cli::command_registry::COMMANDS
             .iter()
             .filter(|m| !m.is_alias && !m.name.contains(' '))
             .map(|m| slash_menu::SlashItem {
@@ -689,7 +693,7 @@ pub(crate) async fn run_tui_session(
         // startup (e.g. from a resumed session or fast-connecting transports).
         let mcp_extras = {
             let mgr = state.mcp_manager.read().await;
-            crate::slash_mcp::build_mcp_extra_subcommands(&mgr)
+            crate::cli::slash_mcp::build_mcp_extra_subcommands(&mgr)
         };
         bottom_pane.update_mcp_completions(mcp_extras);
     }
@@ -1195,7 +1199,7 @@ pub(crate) async fn run_tui_session(
                                 if let Some(plan_goal) = slash_plan_goal(&text) {
                                     let before = capture_plan_mode_ui_snapshot(&state);
                                     let Some(token) =
-                                        crate::plan_lifecycle::fresh_token_for_plan(api, profile).await
+                                        crate::cli::plan_lifecycle::fresh_token_for_plan(api, profile).await
                                     else {
                                         chat_widget.commit_system(
                                             history_cell::system::SystemCell::error(
@@ -1206,7 +1210,7 @@ pub(crate) async fn run_tui_session(
                                         frame_requester.schedule_frame();
                                         continue;
                                     };
-                                    match crate::plan_lifecycle::enter_remote_plan_mode(
+                                    match crate::cli::plan_lifecycle::enter_remote_plan_mode(
                                         api,
                                         profile,
                                         &token,
@@ -1269,8 +1273,8 @@ pub(crate) async fn run_tui_session(
                                         slash_dispatch::SlashResult::Fallback => {
                                             let slash_text = text.clone();
                                             let slash_result = guard.with_restored(|| async {
-                                                let token = crate::session_runtime::fresh_access_token(api, profile).await;
-                                                crate::slash_router::handle_slash_command(
+                                                let token = crate::cli::session_runtime::fresh_access_token(api, profile).await;
+                                                crate::cli::slash_router::handle_slash_command(
                                                     &slash_text, api, profile, &mut state,
                                                     token.as_deref(),
                                                 ).await
@@ -1322,7 +1326,7 @@ pub(crate) async fn run_tui_session(
                                     if text.starts_with("/mcp") {
                                         let mcp_extras = {
                                             let mgr = state.mcp_manager.read().await;
-                                            crate::slash_mcp::build_mcp_extra_subcommands(&mgr)
+                                            crate::cli::slash_mcp::build_mcp_extra_subcommands(&mgr)
                                         };
                                         bottom_pane.update_mcp_completions(mcp_extras);
                                     }
@@ -1338,11 +1342,11 @@ pub(crate) async fn run_tui_session(
                                 } else {
                                     let submit_was_inline_plan_goal = inline_chat_submit.is_some();
                                     let submit_text = inline_chat_submit.unwrap_or(text);
-                                    if crate::plan_lifecycle::looks_like_pending_local_plan_entry(
+                                    if crate::cli::plan_lifecycle::looks_like_pending_local_plan_entry(
                                         &state,
                                     ) {
                                         let Some(token) =
-                                            crate::plan_lifecycle::fresh_token_for_plan(api, profile)
+                                            crate::cli::plan_lifecycle::fresh_token_for_plan(api, profile)
                                                 .await
                                         else {
                                             chat_widget.commit_system(
@@ -1355,7 +1359,7 @@ pub(crate) async fn run_tui_session(
                                             frame_requester.schedule_frame();
                                             continue;
                                         };
-                                        match crate::plan_lifecycle::enter_remote_plan_mode(
+                                        match crate::cli::plan_lifecycle::enter_remote_plan_mode(
                                             api,
                                             profile,
                                             &token,
@@ -1392,19 +1396,19 @@ pub(crate) async fn run_tui_session(
                                     } else {
                                         if !submit_was_inline_plan_goal {
                                             if let Some(plan_command) =
-                                                crate::plan_commands::parse_plan_command(&submit_text)
+                                                crate::cli::plan_commands::parse_plan_command(&submit_text)
                                                     .filter(|command| {
-                                                        crate::plan_commands::is_plan_command_available(
+                                                        crate::cli::plan_commands::is_plan_command_available(
                                                             &state, command,
                                                         )
                                                     })
                                             {
                                                 match plan_command {
-                                                    crate::plan_commands::ParsedPlanCommand::Go => {
+                                                    crate::cli::plan_commands::ParsedPlanCommand::Go => {
                                                         let go_result = guard
                                                             .with_restored(|| async {
                                                                 let Some(token) =
-                                                                    crate::plan_lifecycle::fresh_token_for_plan(
+                                                                    crate::cli::plan_lifecycle::fresh_token_for_plan(
                                                                         api, profile,
                                                                     )
                                                                     .await
@@ -1414,11 +1418,11 @@ pub(crate) async fn run_tui_session(
                                                                             .to_string(),
                                                                     );
                                                                 };
-                                                                crate::plan_commands::prepare_plan_execution(
+                                                                crate::cli::plan_commands::prepare_plan_execution(
                                                                     &mut state, api, &token,
                                                                 )
                                                                 .await?;
-                                                                crate::plan_runtime::start_and_monitor_plan(
+                                                                crate::cli::plan_runtime::start_and_monitor_plan(
                                                                     &mut state,
                                                                     Some(&token),
                                                                     api,
@@ -1477,8 +1481,8 @@ pub(crate) async fn run_tui_session(
                                                         frame_requester.schedule_frame();
                                                         continue;
                                                     }
-                                                    crate::plan_commands::ParsedPlanCommand::Show => {
-                                                        match crate::plan_commands::render_plan_snapshot(
+                                                    crate::cli::plan_commands::ParsedPlanCommand::Show => {
+                                                        match crate::cli::plan_commands::render_plan_snapshot(
                                                             &state,
                                                         ) {
                                                             Ok(message) => chat_widget.commit_system(
@@ -1504,15 +1508,15 @@ pub(crate) async fn run_tui_session(
                                                         frame_requester.schedule_frame();
                                                         continue;
                                                     }
-                                                    crate::plan_commands::ParsedPlanCommand::Rewind {
+                                                    crate::cli::plan_commands::ParsedPlanCommand::Rewind {
                                                         anchor,
                                                     } => {
                                                         let token =
-                                                            crate::plan_lifecycle::fresh_token_for_plan(
+                                                            crate::cli::plan_lifecycle::fresh_token_for_plan(
                                                                 api, profile,
                                                             )
                                                             .await;
-                                                        match crate::plan_commands::rewind_plan(
+                                                        match crate::cli::plan_commands::rewind_plan(
                                                             &mut state,
                                                             api,
                                                             token.as_deref(),
@@ -1543,9 +1547,9 @@ pub(crate) async fn run_tui_session(
                                                         frame_requester.schedule_frame();
                                                         continue;
                                                     }
-                                                    crate::plan_commands::ParsedPlanCommand::AddCorrection { .. }
-                                                    | crate::plan_commands::ParsedPlanCommand::ClearCorrections => {
-                                                        match crate::plan_commands::apply_plan_correction(
+                                                    crate::cli::plan_commands::ParsedPlanCommand::AddCorrection { .. }
+                                                    | crate::cli::plan_commands::ParsedPlanCommand::ClearCorrections => {
+                                                        match crate::cli::plan_commands::apply_plan_correction(
                                                             &mut state,
                                                             &plan_command,
                                                         ) {
@@ -1576,7 +1580,7 @@ pub(crate) async fn run_tui_session(
                                             }
                                             if state.executing_plan.is_some()
                                                 && !state.plan_mode_active()
-                                                && crate::plan_commands::abandon_plan_execution(
+                                                && crate::cli::plan_commands::abandon_plan_execution(
                                                     &mut state,
                                                 )
                                             {
@@ -1599,7 +1603,7 @@ pub(crate) async fn run_tui_session(
                                         if looks_like_implicit_plan_request(&submit_text) {
                                         let before = capture_plan_mode_ui_snapshot(&state);
                                         let Some(token) =
-                                            crate::plan_lifecycle::fresh_token_for_plan(api, profile)
+                                            crate::cli::plan_lifecycle::fresh_token_for_plan(api, profile)
                                                 .await
                                         else {
                                             chat_widget.commit_system(
@@ -1612,7 +1616,7 @@ pub(crate) async fn run_tui_session(
                                             frame_requester.schedule_frame();
                                             continue;
                                         };
-                                        match crate::plan_lifecycle::enter_remote_plan_mode(
+                                        match crate::cli::plan_lifecycle::enter_remote_plan_mode(
                                             api,
                                             profile,
                                             &token,
@@ -1697,10 +1701,10 @@ pub(crate) async fn run_tui_session(
                                         // us from reaching through `state` inside the
                                         // inner select.
                                         let task_service_for_cancel = state.task_service.clone();
-                                        let ctx = crate::chat_turn::TurnContext { api, profile };
-                                        let token = crate::session_runtime::fresh_access_token(api, profile).await;
+                                        let ctx = crate::cli::chat_turn::TurnContext { api, profile };
+                                        let token = crate::cli::session_runtime::fresh_access_token(api, profile).await;
                                         let mut tui_ui = ui_adapter::TuiUiAdapter::new(tui_tx.clone());
-                                        let fut = crate::chat_turn::handle_chat_input_with_ui(submit_text, token.as_deref(), &mut state, ctx, &mut tui_ui);
+                                        let fut = crate::cli::chat_turn::handle_chat_input_with_ui(submit_text, token.as_deref(), &mut state, ctx, &mut tui_ui);
                                         tokio::pin!(fut);
 
                                         let r: Result<(), String> = loop {
@@ -2529,7 +2533,7 @@ pub(crate) async fn run_tui_session(
                                         let mut parts = rest.splitn(2, '\n');
                                         let username = parts.next().unwrap_or("").to_string();
                                         let password = parts.next().unwrap_or("").to_string();
-                                        match crate::auth_flow::do_login(api, profile, &username, &password).await {
+                                        match crate::cli::auth_flow::do_login(api, profile, &username, &password).await {
                                             Ok(_) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
                                                 crate::post_auth_cloud_resync(profile, &mut state).await;
@@ -2550,10 +2554,10 @@ pub(crate) async fn run_tui_session(
                                         let username = parts.next().unwrap_or("").to_string();
                                         let email = parts.next().unwrap_or("").to_string();
                                         let password = parts.next().unwrap_or("").to_string();
-                                        match crate::auth_flow::do_register(api, profile, &username, &email, &password).await {
+                                        match crate::cli::auth_flow::do_register(api, profile, &username, &email, &password).await {
                                             Ok(_) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response("Registered — logging in…"));
-                                                match crate::auth_flow::do_login(api, profile, &username, &password).await {
+                                                match crate::cli::auth_flow::do_login(api, profile, &username, &password).await {
                                                     Ok(_) => {
                                                         chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
                                                         crate::post_auth_cloud_resync(profile, &mut state).await;
@@ -2620,21 +2624,21 @@ pub(crate) async fn run_tui_session(
                                         name.strip_prefix(slash_dispatch::MODEL_PICK_SENTINEL)
                                     {
                                         let base_model = base_model.to_string();
-                                        let token = crate::session_runtime::fresh_access_token(api, profile).await;
-                                        let raw = crate::slash_router::fetch_model_list_raw(
+                                        let token = crate::cli::session_runtime::fresh_access_token(api, profile).await;
+                                        let raw = crate::cli::slash_router::fetch_model_list_raw(
                                             api,
                                             token.as_deref(),
                                         )
                                         .await
                                         .unwrap_or_default();
-                                        let entry = crate::slash_router::find_model_entry_by_name(
+                                        let entry = crate::cli::slash_router::find_model_entry_by_name(
                                             &raw,
                                             &base_model,
                                         );
                                         let thinking_cap = entry
-                                            .and_then(crate::slash_router::entry_thinking_capability);
+                                            .and_then(crate::cli::slash_router::entry_thinking_capability);
                                         let provider =
-                                            entry.and_then(crate::slash_router::entry_provider);
+                                            entry.and_then(crate::cli::slash_router::entry_provider);
                                         let opts = astra_turn_core::thinking_config::thinking_options_with_capability(
                                             &base_model,
                                             provider,
@@ -2642,7 +2646,7 @@ pub(crate) async fn run_tui_session(
                                         );
                                         if opts.is_empty() {
                                             state.model = Some(base_model.clone());
-                                            crate::slash_config::set_active_model_for_display(
+                                            crate::cli::slash_config::set_active_model_for_display(
                                                 Some(base_model.clone()),
                                             );
                                             bottom_pane.footer.model = Some(base_model.clone());
@@ -2693,21 +2697,21 @@ pub(crate) async fn run_tui_session(
                                         let mut parts = rest.splitn(2, '\n');
                                         let base_model = parts.next().unwrap_or("").to_string();
                                         let label = parts.next().unwrap_or("").to_string();
-                                        let token = crate::session_runtime::fresh_access_token(api, profile).await;
-                                        let raw = crate::slash_router::fetch_model_list_raw(
+                                        let token = crate::cli::session_runtime::fresh_access_token(api, profile).await;
+                                        let raw = crate::cli::slash_router::fetch_model_list_raw(
                                             api,
                                             token.as_deref(),
                                         )
                                         .await
                                         .unwrap_or_default();
-                                        let entry = crate::slash_router::find_model_entry_by_name(
+                                        let entry = crate::cli::slash_router::find_model_entry_by_name(
                                             &raw,
                                             &base_model,
                                         );
                                         let provider =
-                                            entry.and_then(crate::slash_router::entry_provider);
+                                            entry.and_then(crate::cli::slash_router::entry_provider);
                                         let thinking_cap = entry
-                                            .and_then(crate::slash_router::entry_thinking_capability);
+                                            .and_then(crate::cli::slash_router::entry_thinking_capability);
                                         let opts = astra_turn_core::thinking_config::thinking_options_with_capability(
                                             &base_model,
                                             provider,
@@ -2735,7 +2739,7 @@ pub(crate) async fn run_tui_session(
                                         };
                                         let composed = format!("{base_model}{suffix}");
                                         state.model = Some(composed.clone());
-                                        crate::slash_config::set_active_model_for_display(
+                                        crate::cli::slash_config::set_active_model_for_display(
                                             Some(composed.clone()),
                                         );
                                         bottom_pane.footer.model = Some(composed.clone());
@@ -2760,8 +2764,8 @@ pub(crate) async fn run_tui_session(
                                         let pre_sid = state.session_id.clone();
                                         let slash_text = format!("/resume {name}");
                                         let slash_result = guard.with_restored(|| async {
-                                            let token = crate::session_runtime::fresh_access_token(api, profile).await;
-                                            crate::slash_router::handle_slash_command(
+                                            let token = crate::cli::session_runtime::fresh_access_token(api, profile).await;
+                                            crate::cli::slash_router::handle_slash_command(
                                                 &slash_text, api, profile, &mut state,
                                                 token.as_deref(),
                                             ).await
@@ -3328,17 +3332,17 @@ mod tests {
 
         assert!(
             arm.contains("slash_plan_goal(&text)")
-                && arm.contains("crate::plan_lifecycle::enter_remote_plan_mode("),
+                && arm.contains("crate::cli::plan_lifecycle::enter_remote_plan_mode("),
             "/plan <goal> should pre-enter remote plan mode before the chat turn"
         );
         assert!(
             arm.contains("looks_like_implicit_plan_request(&submit_text)")
-                && arm.contains("crate::plan_lifecycle::enter_remote_plan_mode("),
+                && arm.contains("crate::cli::plan_lifecycle::enter_remote_plan_mode("),
             "plain planning requests should enter remote /plan semantics before normal chat turns"
         );
         assert!(
-            arm.contains("crate::plan_lifecycle::looks_like_pending_local_plan_entry(")
-                && arm.contains("crate::plan_lifecycle::enter_remote_plan_mode("),
+            arm.contains("crate::cli::plan_lifecycle::looks_like_pending_local_plan_entry(")
+                && arm.contains("crate::cli::plan_lifecycle::enter_remote_plan_mode("),
             "the first plain message after bare /plan should bind remote plan mode and continue as chat"
         );
     }
@@ -3347,7 +3351,7 @@ mod tests {
     fn pending_local_plan_goal_binding_does_not_emit_synthetic_notice() {
         let source = include_str!("event_loop.rs");
         let branch_start = source
-            .find("if crate::plan_lifecycle::looks_like_pending_local_plan_entry(")
+            .find("if crate::cli::plan_lifecycle::looks_like_pending_local_plan_entry(")
             .expect("pending local plan entry branch must exist");
         let branch_end = source[branch_start..]
             .find("} else {")
@@ -3373,12 +3377,12 @@ mod tests {
         let arm = &source[arm_start..arm_start + arm_end];
 
         assert!(
-            arm.contains("crate::plan_commands::parse_plan_command(&submit_text)")
-                && arm.contains("crate::plan_runtime::start_and_monitor_plan("),
+            arm.contains("crate::cli::plan_commands::parse_plan_command(&submit_text)")
+                && arm.contains("crate::cli::plan_runtime::start_and_monitor_plan("),
             "plain TUI submits should intercept go/show/rewind/correct plan commands and wire `go` into the real plan runtime"
         );
         assert!(
-            arm.contains("crate::plan_commands::abandon_plan_execution("),
+            arm.contains("crate::cli::plan_commands::abandon_plan_execution("),
             "ordinary prose after a paused plan should abandon the paused execution instead of keeping stale state around"
         );
     }

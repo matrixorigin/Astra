@@ -260,7 +260,7 @@ impl ToolExecutor {
 
         if let Some(session_id) = self.active_session_id()
             && let Some(ref persisted_value) = new_value
-            && let Err(error) = crate::self_command::persist_config_override(
+            && let Err(error) = crate::cli::self_command::persist_config_override(
                 &session_id,
                 path,
                 persisted_value.clone(),
@@ -320,8 +320,11 @@ impl ToolExecutor {
         deprioritized.retain(|t| t != &tool);
 
         if let Some(session_id) = self.active_session_id()
-            && let Err(error) =
-                crate::self_command::persist_tool_preferences(&session_id, &pinned, &deprioritized)
+            && let Err(error) = crate::cli::self_command::persist_tool_preferences(
+                &session_id,
+                &pinned,
+                &deprioritized,
+            )
         {
             *pinned = original_pinned;
             *deprioritized = original_deprioritized;
@@ -378,8 +381,11 @@ impl ToolExecutor {
         pinned.retain(|t| t != &tool);
 
         if let Some(session_id) = self.active_session_id()
-            && let Err(error) =
-                crate::self_command::persist_tool_preferences(&session_id, &pinned, &deprioritized)
+            && let Err(error) = crate::cli::self_command::persist_tool_preferences(
+                &session_id,
+                &pinned,
+                &deprioritized,
+            )
         {
             *pinned = original_pinned;
             *deprioritized = original_deprioritized;
@@ -436,7 +442,7 @@ impl ToolExecutor {
 
         if let Some(session_id) = self.active_session_id()
             && let Err(error) =
-                crate::self_command::persist_manual_compression(&session_id, turn, reason)
+                crate::cli::self_command::persist_manual_compression(&session_id, turn, reason)
         {
             return json!({
                 "error": "failed_to_persist_manual_compression",

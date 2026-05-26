@@ -1,6 +1,7 @@
 use super::*;
+use crate::{manifest_loader, mcp_client};
 
-pub(super) fn create_pipeline_modules(
+pub(crate) fn create_pipeline_modules(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> PipelineModules {
@@ -26,7 +27,7 @@ pub(crate) fn local_task_service() -> std::sync::Arc<dyn astra_services::TaskSer
 ///
 /// Edge-cloud contract: the CLI never connects to MatrixOne
 /// directly. When `cloud_base` is configured (via env or the
-/// authenticated session), we return [`crate::http_task_service::HttpTaskService`]
+/// authenticated session), we return [`crate::cli::http_task_service::HttpTaskService`]
 /// which proxies trait calls through `POST /tasks:rpc`. Otherwise
 /// we fall back to the local on-disk store so offline / one-shot
 /// CLI and headless tests stay functional.
@@ -38,7 +39,7 @@ pub(crate) async fn resolve_task_service(
 ) -> std::sync::Arc<dyn astra_services::TaskService> {
     if let Some(cloud_base) = resolve_cloud_base() {
         let token = current_access_token(profile);
-        return std::sync::Arc::new(crate::http_task_service::HttpTaskService::new(
+        return std::sync::Arc::new(crate::cli::http_task_service::HttpTaskService::new(
             cloud_base, token,
         ));
     }
@@ -56,7 +57,7 @@ fn resolve_cloud_base() -> Option<String> {
 
 /// Task store for the Tier 1 session scratchpad (`session_todos`).
 ///
-/// When cloud is configured, returns an [`crate::session_todo_client::HttpTaskStore`]
+/// When cloud is configured, returns an [`crate::cli::session_todo_client::HttpTaskStore`]
 /// that polls the server's `GET /sessions/{sid}/todos` endpoint and
 /// receives broadcast notifications from `route_task_action` after
 /// every successful mutation. The observer sees tasks within one poll
@@ -89,7 +90,8 @@ pub(crate) async fn resolve_task_store(
         .or_else(resolve_cloud_base);
     if let Some(cloud_base) = cloud_base {
         let token = current_access_token(profile);
-        let (store, notify_tx) = crate::session_todo_client::HttpTaskStore::new(cloud_base, token);
+        let (store, notify_tx) =
+            crate::cli::session_todo_client::HttpTaskStore::new(cloud_base, token);
         return (store, Some(notify_tx));
     }
     (
@@ -144,10 +146,10 @@ pub(crate) async fn resolve_cloud_task_runtime(
     })?;
     let token = current_access_token(profile);
     let task_service: std::sync::Arc<dyn astra_services::TaskService> = std::sync::Arc::new(
-        crate::http_task_service::HttpTaskService::new(cloud_base.clone(), token.clone()),
+        crate::cli::http_task_service::HttpTaskService::new(cloud_base.clone(), token.clone()),
     );
     let lease_service: std::sync::Arc<dyn astra_services::TaskLeaseService> = std::sync::Arc::new(
-        crate::http_task_service::HttpTaskLeaseService::new(cloud_base, token),
+        crate::cli::http_task_service::HttpTaskLeaseService::new(cloud_base, token),
     );
     Ok((task_service, lease_service))
 }
@@ -156,7 +158,7 @@ pub(crate) async fn resolve_cloud_task_runtime(
 ///
 /// Holds the unified skill registry, MCP client manager, and skill-watcher
 /// handle so the REPL can wire them into its shared state after startup.
-pub(super) struct PipelineModules {
+pub(crate) struct PipelineModules {
     /// Unified skill registry (single source of truth for all skill resolution).
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// MCP client manager for external tool servers.
@@ -368,7 +370,7 @@ fn create_pipeline_modules_inner(
 
 /// Quick check whether the server has at least one LLM model configured.
 /// Returns `true` on network errors (optimistic — don't block startup).
-pub(super) async fn check_server_has_models(
+pub(crate) async fn check_server_has_models(
     api: &astra_thin_client::ThinClient,
     token: &str,
 ) -> bool {
@@ -415,7 +417,7 @@ impl SilentRefreshError {
 /// Never blocks or prompts — just ensures credentials are fresh if possible.
 /// Clears credentials only when the server definitively rejects auth (after handling
 /// refresh-token rotation races — see `recover_credentials_after_refresh_race`).
-pub(super) async fn try_silent_auth(api: &astra_thin_client::ThinClient, profile: Option<&str>) {
+pub(crate) async fn try_silent_auth(api: &astra_thin_client::ThinClient, profile: Option<&str>) {
     // When gateway provides a pre-validated token via env, skip auth entirely —
     // the gateway owns token lifecycle and the HTTP round-trip is wasteful.
     if std::env::var("ASTRA_ACCESS_TOKEN")
@@ -546,7 +548,7 @@ async fn try_refresh_token(
 /// Returns `true` (and persists new credentials) on success.
 /// On failure, logs the underlying reason before returning `false`, so users
 /// can see why a refresh did not recover their session.
-pub(super) async fn attempt_token_refresh(
+pub(crate) async fn attempt_token_refresh(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> bool {
@@ -623,7 +625,7 @@ fn active_env_access_token(now_epoch: i64) -> Option<String> {
     Some(token)
 }
 
-pub(super) async fn fresh_access_token(
+pub(crate) async fn fresh_access_token(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> Option<String> {
@@ -661,9 +663,22 @@ pub(super) async fn fresh_access_token(
 pub(crate) fn initialize_session_state(
     profile: Option<&str>,
     initial_model: Option<&str>,
+    cli_context: &crate::cli::cli_context::CliContext,
 ) -> SessionState {
     let mut state = SessionState::default();
+    state.cli_context = cli_context.clone();
+    state.perm_manager = PermissionManager::with_workspace_trust(
+        cli_context.auto_approve,
+        &std::env::current_dir().unwrap_or_default(),
+    );
+    if let Some(session_id) = &cli_context.session_id {
+        state.set_session_id(session_id.clone());
+    }
+    state.session_name = cli_context.session_name.clone();
     state.pending_recovery = detect_pending_recovery_session(profile);
+    if state.cli_context.session_id.is_some() {
+        state.pending_recovery = None;
+    }
     if let Some(m) = normalize_model_override(initial_model) {
         state.model = Some(m.to_string());
     }
@@ -774,7 +789,7 @@ pub struct RestoredSessionState {
 
 /// Rebuild `(user_msg, assistant_msg)` history from the session journal.
 /// Only `Turn` events with both user_input and assistant_output are included.
-pub(super) fn restore_history_from_journal(session_id: &str) -> Vec<(String, String)> {
+pub(crate) fn restore_history_from_journal(session_id: &str) -> Vec<(String, String)> {
     restore_session_state_from_journal(session_id).history
 }
 
@@ -818,7 +833,7 @@ fn restore_session_state_from_journal(session_id: &str) -> RestoredSessionState 
     restored
 }
 
-pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) {
+pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) {
     let creds = load_credentials();
     let pname = profile_name(profile, &creds);
     let p = creds.profiles.get(&pname);
@@ -874,7 +889,7 @@ pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     // Derive left column width from content (was hardcoded 24)
     let left_col_w = left
         .iter()
-        .map(|l| crate::terminal_region::visible_char_width(l))
+        .map(|l| crate::cli::terminal_region::visible_char_width(l))
         .max()
         .unwrap_or(20)
         .max(10);
@@ -885,7 +900,7 @@ pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     // Truncation helper: ensure visible text fits within max_vis columns.
     // Operates on plain text before ANSI styling; appends "…" when truncated.
     let trunc_vis = |text: &str, max_vis: usize| -> String {
-        let w = crate::terminal_region::visible_char_width(text);
+        let w = crate::cli::terminal_region::visible_char_width(text);
         if w <= max_vis {
             return text.to_string();
         }
@@ -981,7 +996,7 @@ pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     let title_text = format!("astra v{version}");
     // " astra v0.1.0 " — leading and trailing space so the title breathes.
     let title_padded = format!(" {} ", title_text);
-    let title_w = crate::terminal_region::visible_char_width(&title_padded);
+    let title_w = crate::cli::terminal_region::visible_char_width(&title_padded);
     // Layout: ╭ ─ <title> ── … ── ╮  (1 leading dash before the title)
     let lead_dash = 1usize;
     let trail_dash = inner_w.saturating_sub(lead_dash + title_w);
@@ -1005,7 +1020,7 @@ pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     fn render_banner_frame(layout: &BannerLayout<'_>, with_stars: bool, mut rng_seed: u64) {
         use crossterm::style::Stylize;
         use std::io::Write;
-        let vis_w = crate::terminal_region::visible_char_width;
+        let vis_w = crate::cli::terminal_region::visible_char_width;
         let next = |r: &mut u64| -> u64 {
             *r ^= *r << 13;
             *r ^= *r >> 7;
@@ -1174,7 +1189,7 @@ pub(crate) fn current_access_token(profile: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli_utils::{CredentialsFile, Profile};
+    use crate::cli::cli_utils::{CredentialsFile, Profile};
     use crate::tests::isolate_credentials;
     use tempfile::tempdir;
     use wiremock::matchers::{method, path};
@@ -1563,7 +1578,11 @@ mod tests {
         );
         save_credentials(&creds).unwrap();
 
-        let state = initialize_session_state(None, Some("gpt-5"));
+        let state = initialize_session_state(
+            None,
+            Some("gpt-5"),
+            &crate::cli::cli_context::CliContext::default(),
+        );
         assert_eq!(state.session_id, None);
         assert_eq!(state.pending_recovery, None);
         assert!(state.history.is_empty());
@@ -1575,7 +1594,11 @@ mod tests {
         let (_tmp, _g) = isolated_sessions_dir();
         let _creds_guard = isolate_credentials();
 
-        let state = initialize_session_state(None, Some("default"));
+        let state = initialize_session_state(
+            None,
+            Some("default"),
+            &crate::cli::cli_context::CliContext::default(),
+        );
 
         assert_eq!(state.model, None);
     }
@@ -1641,11 +1664,80 @@ mod tests {
         );
         save_credentials(&creds).unwrap();
 
-        let state = initialize_session_state(None, Some("gpt-5"));
+        let state = initialize_session_state(
+            None,
+            Some("gpt-5"),
+            &crate::cli::cli_context::CliContext::default(),
+        );
         assert_eq!(state.session_id, None);
         assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
         assert!(state.history.is_empty());
         assert_eq!(state.turn, 0);
+    }
+
+    #[test]
+    fn initialize_session_state_explicit_session_id_suppresses_pending_recovery() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let _creds_guard = isolate_credentials();
+
+        let sid = uuid::Uuid::new_v4().to_string();
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::interruption_recorded(
+                Some(&sid),
+                0,
+                serde_json::json!({
+                    "kind": "rate_limited",
+                    "resumable": true,
+                    "has_checkpoint": true,
+                    "tool_calls_completed": 0,
+                    "turns_completed": 0,
+                    "remaining_turns": 5,
+                }),
+            ))
+            .unwrap();
+
+        let current_cwd = std::env::current_dir().unwrap();
+        let mut ws = astra_services::session_workspace::WorkspaceMetadata::with_context(
+            &sid,
+            "gpt-5",
+            &current_cwd.display().to_string(),
+            Some("main"),
+        );
+        ws.git_root = current_git_root().map(|path| path.display().to_string());
+        astra_services::session_workspace::write_workspace(&ws).unwrap();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some(sid.clone()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let cli_context = crate::cli::cli_context::CliContext::from_launch_options(
+            false,
+            None,
+            &[],
+            &[],
+            &[],
+            false,
+            Some(sid.clone()),
+            None,
+        )
+        .expect("valid cli context");
+        let state = initialize_session_state(None, Some("gpt-5"), &cli_context);
+
+        assert_eq!(state.session_id.as_deref(), Some(sid.as_str()));
+        assert_eq!(state.pending_recovery, None);
     }
 
     #[test]
@@ -1708,7 +1800,11 @@ mod tests {
         );
         save_credentials(&creds).unwrap();
 
-        let state = initialize_session_state(None, Some("gpt-5"));
+        let state = initialize_session_state(
+            None,
+            Some("gpt-5"),
+            &crate::cli::cli_context::CliContext::default(),
+        );
         assert_eq!(state.session_id, None);
         assert_eq!(state.pending_recovery, None);
         assert!(state.history.is_empty());
@@ -1924,7 +2020,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let path = crate::cli_utils::credentials_path();
+        let path = crate::cli::cli_utils::credentials_path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }

@@ -1,7 +1,7 @@
 #![allow(unused_imports)]
 use super::*;
 
-pub(super) async fn handle_task_command(
+pub(crate) async fn handle_task_command(
     arg: &str,
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
@@ -234,6 +234,7 @@ pub(super) async fn handle_task_command(
             let bg_session_id = state.session_id.clone();
             let bg_model = state.model.clone();
             let bg_history = state.history.clone();
+            let bg_cli_context = state.cli_context.clone();
             let bg_unified_skill_registry = state.unified_skill_registry.clone();
             let bg_skill_search = state.skill_search.clone();
             let bg_messaging_metrics = state.messaging_metrics.clone();
@@ -274,14 +275,14 @@ pub(super) async fn handle_task_command(
 
                 // Create fresh auto-approve permission manager for background
                 let mut perm_manager = PermissionManager::with_load_policy(
-                    crate::permission_manager::PermissionMode::Auto,
+                    crate::cli::permission_manager::PermissionMode::Auto,
                     &workspace_root,
-                    &crate::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+                    &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
                 );
                 let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
                 let _modules =
-                    crate::session_runtime::create_pipeline_modules_quiet(&api_clone, None);
+                    crate::cli::session_runtime::create_pipeline_modules_quiet(&api_clone, None);
 
                 let result = stream_chat_sse(ChatTurnParams {
                     api: &api_clone,
@@ -296,7 +297,8 @@ pub(super) async fn handle_task_command(
                     history: &bg_history,
                     perm_manager: &mut perm_manager,
                     verbose_mode: false,
-                    render_policy: crate::stream_render::RenderPolicy::Silent,
+                    render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+                    cli_context: Some(&bg_cli_context),
                     recent_tools: &[],
                     tool_health_entries: &[],
                     session_lessons: &[],
@@ -475,7 +477,7 @@ pub(super) async fn handle_task_command(
 }
 
 /// Find a task by prefix match on task_id or substring match on title.
-pub(super) async fn find_task_by_query(
+pub(crate) async fn find_task_by_query(
     svc: &dyn astra_services::TaskService,
     user_id: &str,
     query: &str,

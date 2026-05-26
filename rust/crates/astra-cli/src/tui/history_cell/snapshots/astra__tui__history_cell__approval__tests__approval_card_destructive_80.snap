@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/approval.rs
+assertion_line: 1044
 expression: "render_at(&cell, 80)"
 ---
 ╭─ ⏸ edit /etc/hosts

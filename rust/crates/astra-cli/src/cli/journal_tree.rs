@@ -34,8 +34,8 @@ use serde::{Deserialize, Serialize};
 
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
 
-use crate::cli_args;
-use crate::journal_digest;
+use crate::cli::cli_args;
+use crate::cli::journal_digest;
 
 /// One node in the rendered tree. Leaf = no `children`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -311,7 +311,7 @@ fn render_node_text(
 }
 
 /// CLI entrypoint for `astra journal tree`.
-pub fn run_tree(args: &cli_args::JournalTreeArgs) -> Result<(), String> {
+pub(crate) fn run_tree(args: &cli_args::JournalTreeArgs) -> Result<(), String> {
     let session_id = journal_digest::resolve_session_for_digest(
         args.session_id.as_deref(),
         args.session.as_deref(),

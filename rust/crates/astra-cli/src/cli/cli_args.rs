@@ -6,7 +6,7 @@
 //!
 //! ## Observability (flags and environment)
 //!
-//! Applied in [`crate::diagnostic_log::init_cli_observability`] immediately after [`Cli`] is parsed.
+//! Applied in [`crate::cli::diagnostic_log::init_cli_observability`] immediately after [`Cli`] is parsed.
 //!
 //! **Priority:** `--log-file` → `ASTRA_LOG_FILE` → (`--diagnostic-log` or `ASTRA_DIAGNOSTIC_LOG=1`) for stderr.
 //!
@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 fn parse_permission_mode_arg(value: &str) -> Result<String, String> {
     value
-        .parse::<crate::permission_manager::PermissionMode>()
+        .parse::<crate::cli::permission_manager::PermissionMode>()
         .map(|mode| mode.to_string())
 }
 
@@ -132,7 +132,7 @@ pub(crate) struct Cli {
     #[arg(long = "log-file", value_name = "PATH", hide = true)]
     pub log_file: Option<String>,
     #[command(subcommand)]
-    pub command: Option<Command>,
+    pub(crate) command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]

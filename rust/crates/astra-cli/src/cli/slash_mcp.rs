@@ -261,7 +261,7 @@ async fn show_help(state: &SessionState) {
 /// `tui::slash_dispatch`; advanced mutating forms still fall back here.
 /// Kept for headless / non-interactive execution paths.
 #[allow(dead_code)]
-pub(super) async fn handle_mcp_command(arg: &str, state: &mut SessionState) -> Result<(), String> {
+pub(crate) async fn handle_mcp_command(arg: &str, state: &mut SessionState) -> Result<(), String> {
     match parse_mcp_command(arg) {
         ParsedMcpCommand::Help => show_help(state).await,
         ParsedMcpCommand::Overview => show_status(state).await,
@@ -1196,7 +1196,7 @@ async fn handle_mcp_log_level(arg: &str, state: &SessionState) {
 /// Fetches the prompt result from the server, extracts text content,
 /// and injects it into conversation history so the LLM sees it on the
 /// next turn.
-pub(super) async fn handle_mcp_prompt_invoke(
+pub(crate) async fn handle_mcp_prompt_invoke(
     arg: &str,
     state: &mut SessionState,
 ) -> Result<(), String> {

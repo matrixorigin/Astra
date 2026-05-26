@@ -34,7 +34,7 @@
 //!     required: ["resource"]
 //! ```
 
-use crate::theme;
+use crate::cli::theme;
 use astra_runtime::tool_registry::plugin::{PluginRegistry, PluginToolEntry};
 use astra_runtime::tool_registry::{IntentType, Scope};
 use serde::Deserialize;

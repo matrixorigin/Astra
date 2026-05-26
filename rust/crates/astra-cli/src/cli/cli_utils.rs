@@ -1,12 +1,13 @@
 use super::*;
 
-pub(super) use astra_credentials::{CredentialStore, CredentialsFile, Profile};
+pub(crate) use astra_credentials::{CredentialStore, CredentialsFile, Profile};
+use crossterm::event::{Event, KeyCode, KeyModifiers};
 
-pub(super) fn credential_store() -> CredentialStore {
+pub(crate) fn credential_store() -> CredentialStore {
     CredentialStore::new()
 }
 
-pub(super) fn credentials_path() -> PathBuf {
+pub(crate) fn credentials_path() -> PathBuf {
     credential_store().path().clone()
 }
 
@@ -22,7 +23,7 @@ pub(super) fn credentials_path() -> PathBuf {
 /// Repeated failures within a single process are deduplicated (we only print
 /// a warning when the error string changes) to avoid flooding stderr when
 /// the underlying condition persists across many calls.
-pub(super) fn load_credentials() -> CredentialsFile {
+pub(crate) fn load_credentials() -> CredentialsFile {
     use std::sync::Mutex;
     use std::sync::OnceLock;
 
@@ -44,7 +45,7 @@ pub(super) fn load_credentials() -> CredentialsFile {
 }
 
 #[cfg(test)]
-pub(super) fn save_credentials(data: &CredentialsFile) -> Result<(), String> {
+pub(crate) fn save_credentials(data: &CredentialsFile) -> Result<(), String> {
     let store = credential_store();
     store
         .mutate(|d| {
@@ -53,26 +54,34 @@ pub(super) fn save_credentials(data: &CredentialsFile) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-pub(super) fn mutate_credentials<F, R>(f: F) -> Result<R, String>
+pub(crate) fn mutate_credentials<F, R>(f: F) -> Result<R, String>
 where
     F: FnOnce(&mut CredentialsFile) -> R,
 {
     credential_store().mutate(f).map_err(|e| e.to_string())
 }
 
-pub(super) fn profile_name(cli_profile: Option<&str>, data: &CredentialsFile) -> String {
+pub(crate) fn profile_name(cli_profile: Option<&str>, data: &CredentialsFile) -> String {
     CredentialStore::resolve_profile_name(cli_profile, data.current_profile.as_deref())
 }
 
-pub(super) fn normalize_model_override(model: Option<&str>) -> Option<&str> {
+pub(crate) fn normalize_model_override(model: Option<&str>) -> Option<&str> {
     astra_core::model_override::normalize_model_override(model)
 }
 
-pub(super) fn normalize_model_override_owned(model: Option<String>) -> Option<String> {
+pub(crate) fn normalize_model_override_owned(model: Option<String>) -> Option<String> {
     astra_core::model_override::normalize_model_override_owned(model)
 }
 
-pub(super) fn get_profile_and_token(
+pub(crate) fn cli_user_id() -> String {
+    std::env::var("ASTRA_CLI_USER_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "local".to_string())
+}
+
+pub(crate) fn get_profile_and_token(
     cli_profile: Option<&str>,
 ) -> Result<(CredentialsFile, String, Profile, String), String> {
     let creds = load_credentials();
@@ -89,7 +98,7 @@ pub(super) fn get_profile_and_token(
     Ok((creds, name, profile, token))
 }
 
-pub(super) fn session_is_resumable(session_id: &str) -> bool {
+pub(crate) fn session_is_resumable(session_id: &str) -> bool {
     match session_journal::classify_session_end_state(session_id) {
         Ok(session_journal::SessionEndState::Completed) => false,
         Ok(session_journal::SessionEndState::Interrupted { resumable, .. }) => resumable,
@@ -98,7 +107,7 @@ pub(super) fn session_is_resumable(session_id: &str) -> bool {
     }
 }
 
-pub(super) fn resumable_last_session_id(cli_profile: Option<&str>) -> Option<String> {
+pub(crate) fn resumable_last_session_id(cli_profile: Option<&str>) -> Option<String> {
     let creds = load_credentials();
     let name = profile_name(cli_profile, &creds);
     creds
@@ -109,30 +118,40 @@ pub(super) fn resumable_last_session_id(cli_profile: Option<&str>) -> Option<Str
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SessionResumePreflight {
+pub(crate) enum SessionResumePreflight {
     Valid,
     Missing,
     Unknown,
 }
 
-pub(super) fn clear_profile_last_session_if_matches(
+pub(crate) fn clear_profile_last_session_if_matches(
     cli_profile: Option<&str>,
     session_id: &str,
 ) -> Result<bool, String> {
     mutate_credentials(|creds| {
-        let name = profile_name(cli_profile, creds);
-        let Some(entry) = creds.profiles.get_mut(&name) else {
-            return false;
-        };
-        if entry.last_session_id.as_deref() != Some(session_id) {
+        let resolved_name = profile_name(cli_profile, creds);
+        if let Some(entry) = creds.profiles.get_mut(&resolved_name)
+            && entry.last_session_id.as_deref() == Some(session_id)
+        {
+            entry.last_session_id = None;
+            return true;
+        }
+
+        if cli_profile.is_some() {
             return false;
         }
-        entry.last_session_id = None;
-        true
+
+        creds.profiles.iter_mut().any(|(name, entry)| {
+            if name == &resolved_name || entry.last_session_id.as_deref() != Some(session_id) {
+                return false;
+            }
+            entry.last_session_id = None;
+            true
+        })
     })
 }
 
-pub(super) fn persist_profile_last_session(
+pub(crate) fn persist_profile_last_session(
     cli_profile: Option<&str>,
     session_id: &str,
 ) -> Result<(), String> {
@@ -143,7 +162,7 @@ pub(super) fn persist_profile_last_session(
     })
 }
 
-pub(super) fn persist_profile_memoria_api_key(
+pub(crate) fn persist_profile_memoria_api_key(
     cli_profile: Option<&str>,
     api_key: &str,
 ) -> Result<(), String> {
@@ -154,7 +173,7 @@ pub(super) fn persist_profile_memoria_api_key(
     })
 }
 
-pub(super) async fn preflight_remote_resume_session(
+pub(crate) async fn preflight_remote_resume_session(
     api: &astra_thin_client::ThinClient,
     cli_profile: Option<&str>,
     session_id: &str,
@@ -178,7 +197,7 @@ pub(super) async fn preflight_remote_resume_session(
     }
 }
 
-pub(super) async fn validated_resumable_last_session_id(
+pub(crate) async fn validated_resumable_last_session_id(
     api: &astra_thin_client::ThinClient,
     cli_profile: Option<&str>,
 ) -> Option<String> {
@@ -192,7 +211,7 @@ pub(super) async fn validated_resumable_last_session_id(
     }
 }
 
-pub(super) fn read_api_error(status: u16, body: &str) -> String {
+pub(crate) fn read_api_error(status: u16, body: &str) -> String {
     // Try to extract user-friendly message from JSON error response
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
         // Common API error formats: {"error": "..."} or {"message": "..."} or {"detail": "..."}
@@ -232,12 +251,12 @@ pub(super) fn read_api_error(status: u16, body: &str) -> String {
 }
 
 /// Get a helpful hint for an HTTP status code.
-pub(super) fn status_hint(status: u16) -> Option<&'static str> {
+pub(crate) fn status_hint(status: u16) -> Option<&'static str> {
     status_hint_for(status, "")
 }
 
 /// Message-aware hint: checks error body for known patterns before falling back to status-only hints.
-fn status_hint_for(status: u16, message: &str) -> Option<&'static str> {
+pub(crate) fn status_hint_for(status: u16, message: &str) -> Option<&'static str> {
     if (status == 500 || status == 503) && message.to_ascii_lowercase().contains("pool timed out") {
         return Some(
             "Database pool timeout — the API could not obtain a free DB connection in time (other requests may be holding connections or the DB is slow). Retry; on the server enable RUST_LOG=astra_services::auth=warn to log pool_size, pool_idle, and the auth operation name.",
@@ -257,19 +276,43 @@ fn status_hint_for(status: u16, message: &str) -> Option<&'static str> {
 }
 
 /// Format error with helpful context based on status code
-fn format_error_with_context(status: u16, message: &str) -> String {
+pub(crate) fn format_error_with_context(status: u16, message: &str) -> String {
     match status_hint_for(status, message) {
         Some(hint) => format!("request failed ({status}): {message}\n  Hint: {hint}"),
         None => format!("request failed ({status}): {message}"),
     }
 }
 
-pub(super) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
+pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
     match e {
         astra_thin_client::ThinClientError::Api { status, body } => {
-            read_api_error(status.as_u16(), &body)
+            format_error_with_context(status.as_u16(), &body)
         }
-        other => other.to_string(),
+        astra_thin_client::ThinClientError::Http(error) => {
+            if error.is_timeout() {
+                "Request timed out".to_string()
+            } else {
+                format!("Network error: {error}")
+            }
+        }
+        astra_thin_client::ThinClientError::Json(error) => {
+            format!("API response parse error: {error}")
+        }
+        astra_thin_client::ThinClientError::SseParse(error) => {
+            format!("SSE parse error: {error}")
+        }
+        astra_thin_client::ThinClientError::InvalidSseJson(value) => {
+            format!("Invalid SSE JSON payload: {value}")
+        }
+        astra_thin_client::ThinClientError::InvalidBaseUrl(value) => {
+            format!("Invalid API URL: {value}")
+        }
+        astra_thin_client::ThinClientError::InvalidAuthHeader => {
+            "Invalid authorization header".to_string()
+        }
+        astra_thin_client::ThinClientError::InvalidInput(value) => {
+            format!("Invalid request: {value}")
+        }
     }
 }
 
@@ -290,7 +333,7 @@ pub(crate) fn is_astra_session_auth_error(message: &str) -> bool {
 }
 
 /// Print an LLM/API call failure message with optional hint
-pub(super) fn eprint_api_error(status: u16, context: &str) {
+pub(crate) fn eprint_api_error(status: u16, context: &str) {
     use crossterm::style::Stylize;
     eprintln!("  {} {} ({})", theme::icon_err(), context, status);
     if let Some(hint) = status_hint(status) {
@@ -299,7 +342,7 @@ pub(super) fn eprint_api_error(status: u16, context: &str) {
 }
 
 /// Print a transport/request error with helpful hints.
-pub(super) fn eprint_request_error<E: std::fmt::Display>(error: &E) {
+pub(crate) fn eprint_request_error<E: std::fmt::Display>(error: &E) {
     use crossterm::style::Stylize;
     let err_str = error.to_string().to_lowercase();
 
@@ -326,14 +369,14 @@ pub(super) fn eprint_request_error<E: std::fmt::Display>(error: &E) {
     }
 }
 
-pub(super) fn compact_or_raw(body: &str) -> String {
+pub(crate) fn compact_or_raw(body: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(body) {
         Ok(value) => value.to_string(),
         Err(_) => body.to_string(),
     }
 }
 
-pub(super) fn print_json_or_raw(body: &str) {
+pub(crate) fn print_json_or_raw(body: &str) {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
         println!(
             "{}",
@@ -345,7 +388,7 @@ pub(super) fn print_json_or_raw(body: &str) {
 }
 
 /// Prompt user for a required string value. Uses the provided value if already set.
-pub(super) fn prompt_or(label: &str, existing: Option<String>) -> Result<String, String> {
+pub(crate) fn prompt_or(label: &str, existing: Option<String>) -> Result<String, String> {
     if let Some(v) = existing {
         return Ok(v);
     }
@@ -362,7 +405,7 @@ pub(super) fn prompt_or(label: &str, existing: Option<String>) -> Result<String,
 }
 
 /// Prompt for a password with hidden input.
-pub(super) fn prompt_password_masked(
+pub(crate) fn prompt_password_masked(
     label: &str,
     existing: Option<String>,
 ) -> Result<String, String> {
@@ -384,7 +427,7 @@ pub(super) fn prompt_password_masked(
 /// and type-to-filter. Returns the selected item's label, or None on Esc/Ctrl-C.
 ///
 /// Each item is `(label, description)`. The `current` marks the initially highlighted item.
-pub(super) fn interactive_select(
+pub(crate) fn interactive_select(
     title: &str,
     items: &[(String, String)],
     current: Option<&str>,
@@ -579,7 +622,7 @@ pub(crate) fn terminal_width_usize() -> usize {
 
 pub(crate) use astra_text_utils::str_preview::{prefix_chars, truncate_str};
 
-pub(super) fn urlencoding(s: &str) -> String {
+pub(crate) fn urlencoding(s: &str) -> String {
     s.chars()
         .map(|c| match c {
             ' ' => "%20".to_string(),
@@ -805,22 +848,22 @@ mod tests {
 
     #[test]
     fn status_hint_for_pool_timeout_overrides_generic_500() {
-        let hint = super::status_hint_for(500, "pool timed out while waiting");
+        let hint = status_hint_for(500, "pool timed out while waiting");
         assert!(hint.unwrap().contains("Database pool timeout"));
         // Also works with 503
-        let hint = super::status_hint_for(503, "pool timed out while waiting");
+        let hint = status_hint_for(503, "pool timed out while waiting");
         assert!(hint.unwrap().contains("Database pool timeout"));
     }
 
     #[test]
     fn status_hint_for_normal_500_gives_generic() {
-        let hint = super::status_hint_for(500, "unexpected error");
+        let hint = status_hint_for(500, "unexpected error");
         assert!(hint.unwrap().contains("Server error"));
     }
 
     #[test]
     fn format_error_with_context_includes_hint() {
-        let out = super::format_error_with_context(401, "unauthorized");
+        let out = format_error_with_context(401, "unauthorized");
         assert!(out.contains("401"));
         assert!(out.contains("unauthorized"));
         assert!(out.contains("Hint:"));
@@ -828,7 +871,7 @@ mod tests {
 
     #[test]
     fn format_error_with_context_no_hint_for_unknown_status() {
-        let out = super::format_error_with_context(418, "I'm a teapot");
+        let out = format_error_with_context(418, "I'm a teapot");
         assert!(out.contains("418"));
         assert!(!out.contains("Hint:"));
     }
@@ -837,12 +880,12 @@ mod tests {
     fn astra_session_auth_error_matches_session_specific_failures() {
         let msg =
             "request failed (401): invalid token\n  Hint: Authentication required — try /login";
-        assert!(super::is_astra_session_auth_error(msg));
+        assert!(crate::is_astra_session_auth_error(msg));
     }
 
     #[test]
     fn astra_session_auth_error_ignores_generic_upstream_401s() {
-        assert!(!super::is_astra_session_auth_error(
+        assert!(!crate::is_astra_session_auth_error(
             "GitHub API Error: 401 Unauthorized"
         ));
     }
@@ -930,6 +973,43 @@ mod tests {
         assert_eq!(profile.memoria_api_key.as_deref(), Some("mem-new"));
         assert_eq!(profile.last_session_id.as_deref(), Some("sess-old"));
         assert_eq!(profile.access_token.as_deref(), Some("tok"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn clear_profile_last_session_if_matches_falls_back_to_exact_session_match() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some("sess-stale".to_string()),
+                ..Default::default()
+            },
+        );
+        creds.profiles.insert(
+            "other".to_string(),
+            Profile {
+                last_session_id: Some("sess-live".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        temp_env::with_var("ASTRA_PROFILE", Some("other"), || {
+            assert!(clear_profile_last_session_if_matches(None, "sess-stale").unwrap());
+        });
+
+        let creds = load_credentials();
+        assert_eq!(
+            creds.profiles["default"].last_session_id.as_deref(),
+            None,
+            "stale session pointer should be cleared even if ASTRA_PROFILE points elsewhere"
+        );
+        assert_eq!(
+            creds.profiles["other"].last_session_id.as_deref(),
+            Some("sess-live")
+        );
     }
 
     #[test]
@@ -1110,7 +1190,7 @@ mod tests {
     #[test]
     fn git_snapshot_returns_head_and_branch_in_git_repo() {
         // This test runs inside the astra git repo, so both should be Some.
-        let (head, _branch) = super::git_snapshot(None);
+        let (head, _branch) = crate::git_snapshot(None);
         assert!(
             head.is_some(),
             "git_snapshot must return Some(head) inside a git repo"
@@ -1132,8 +1212,8 @@ mod tests {
     fn git_snapshot_with_explicit_cwd_matches_none() {
         // Passing the current dir explicitly should give the same result as None.
         let cwd = std::env::current_dir().unwrap();
-        let (head_none, branch_none) = super::git_snapshot(None);
-        let (head_cwd, branch_cwd) = super::git_snapshot(Some(cwd.to_str().unwrap()));
+        let (head_none, branch_none) = crate::git_snapshot(None);
+        let (head_cwd, branch_cwd) = crate::git_snapshot(Some(cwd.to_str().unwrap()));
         assert_eq!(head_none, head_cwd, "explicit cwd must match implicit cwd");
         assert_eq!(
             branch_none, branch_cwd,
@@ -1144,7 +1224,7 @@ mod tests {
     #[test]
     fn git_snapshot_with_non_git_dir_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
-        let (head, branch) = super::git_snapshot(Some(tmp.path().to_str().unwrap()));
+        let (head, branch) = crate::git_snapshot(Some(tmp.path().to_str().unwrap()));
         assert!(
             head.is_none(),
             "non-git dir must return None for head, got {head:?}"

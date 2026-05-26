@@ -10,7 +10,7 @@
 
 #![allow(dead_code)]
 
-use crate::chat_stream::ApprovalResponse;
+use crate::cli::chat_stream::ApprovalResponse;
 
 /// What a single button does when Enter fires.
 #[derive(Debug, Clone, PartialEq, Eq)]

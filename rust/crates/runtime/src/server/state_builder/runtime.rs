@@ -24,12 +24,12 @@ pub(super) async fn build_runtime_wiring(
         crate::server::delegation::engine::DelegationTracker::new()
             .with_progress_broadcaster(Arc::clone(&progress_broadcaster)),
     );
-    let user_id = astra_core::cli_user_id();
+    let user_id = "local";
     let matrix_rt = Arc::new(
         crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(
             shared_pool.clone(),
             "default",
-            &user_id,
+            user_id,
             Arc::clone(lease_hold_cache),
         )
         .with_encryptor(Arc::clone(run_encryptor)),
@@ -83,7 +83,7 @@ pub(super) async fn build_runtime_wiring(
     #[cfg(feature = "harness")]
     let run_lifecycle = run_lifecycle.with_harness_registry(state.harness_registry.clone());
 
-    let team_store = initialize_team_store(shared_pool, &user_id).await;
+    let team_store = initialize_team_store(shared_pool, user_id).await;
     Ok(RuntimeWiring {
         matrix_rt,
         run_lifecycle,

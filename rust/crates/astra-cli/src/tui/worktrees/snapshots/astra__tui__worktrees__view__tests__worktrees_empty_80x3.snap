@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/worktrees/view.rs
+assertion_line: 243
 expression: "draw(&l, 80, 3)"
 ---
 ┌ Worktrees (0) ───────────────────────────────────────────────────────────────┐

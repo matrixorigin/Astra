@@ -566,6 +566,18 @@ fn build_skill_extra(state: &AgenticLoopState) -> HashMap<String, String> {
         "error_count".into(),
         state.turn_guard.errors.total_errors.to_string(),
     );
+    extra.insert(
+        "recent_error_pressure".into(),
+        state.turn_guard.errors.recent_error_pressure().to_string(),
+    );
+    extra.insert(
+        "recent_timeout_pressure".into(),
+        state
+            .turn_guard
+            .errors
+            .recent_error_count(astra_turn_core::error_recovery::ErrorCategory::ToolTimeout)
+            .to_string(),
+    );
     let depri = state.turn_guard.health.deprioritized_tools();
     if !depri.is_empty() {
         extra.insert("deprioritized_tools".into(), depri.join(", "));

@@ -26,8 +26,8 @@ use ratatui::{
 use tokio::sync::oneshot;
 
 use super::view::{BottomPaneView, CancellationEvent};
-use crate::chat_stream::PlanReviewDecision;
-use crate::permission_manager::PermissionMode;
+use crate::cli::chat_stream::PlanReviewDecision;
+use crate::cli::permission_manager::PermissionMode;
 
 const CHOICES: &[(&str, PlanChoice, &str)] = &[
     (

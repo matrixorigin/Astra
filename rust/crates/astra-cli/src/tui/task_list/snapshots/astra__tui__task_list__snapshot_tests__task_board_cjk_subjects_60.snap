@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/task_list/snapshot_tests.rs
+assertion_line: 212
 expression: "draw(&tasks, 60, 24, true)"
 ---
 3 tasks (1 done, 1 in progress, 1 open)  Ctrl+T to collapse

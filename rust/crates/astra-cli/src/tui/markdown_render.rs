@@ -576,7 +576,7 @@ impl Writer {
             self.lines = self
                 .lines
                 .into_iter()
-                .map(|line| crate::terminal_hyperlinks::hyperlink_line_file_paths(&line, cwd))
+                .map(|line| crate::cli::terminal_hyperlinks::hyperlink_line_file_paths(&line, cwd))
                 .collect();
         }
         Text::from(self.lines)

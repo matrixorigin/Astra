@@ -1,5 +1,5 @@
 use super::*;
-use crate::cli_utils::{CredentialsFile, Profile};
+use crate::cli::cli_utils::{CredentialsFile, Profile};
 
 // ── auth_flow ─────────────────────────────────────────────────────────
 

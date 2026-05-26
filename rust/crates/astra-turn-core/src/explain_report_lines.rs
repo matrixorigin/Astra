@@ -158,22 +158,31 @@ pub fn verdict_severity_icon(severity: &str) -> &'static str {
 }
 
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn verdict_event_summary_line(
     turn: u32,
     icon: &str,
     severity: &str,
     nudge_count: usize,
-    total_errors: usize,
+    interaction_mode: &str,
+    suppressed_loop_nudges: bool,
+    recent_error_pressure: usize,
     deprioritized_count: usize,
     force_stop: bool,
 ) -> String {
     format!(
-        "T{} {} {}  nudges={}  errors={}  deprioritized={}{}",
+        "T{} {} {}  mode={}{}  nudges={}  pressure={}  deprioritized={}{}",
         turn,
         icon,
         severity,
+        interaction_mode,
+        if suppressed_loop_nudges {
+            " suppress_nudges=1"
+        } else {
+            ""
+        },
         nudge_count,
-        total_errors,
+        recent_error_pressure,
         deprioritized_count,
         if force_stop { "  FORCE_STOP" } else { "" },
     )
@@ -430,18 +439,20 @@ mod tests {
 
     #[test]
     fn verdict_event_summary_no_force_stop() {
-        let s = verdict_event_summary_line(3, "⚠", "warning", 2, 1, 0, false);
+        let s = verdict_event_summary_line(3, "⚠", "warning", 2, "prompt", false, 1, 0, false);
         assert!(s.contains("T3"));
         assert!(s.contains("⚠"));
+        assert!(s.contains("mode=prompt"));
         assert!(s.contains("nudges=2"));
-        assert!(s.contains("errors=1"));
+        assert!(s.contains("pressure=1"));
         assert!(!s.contains("FORCE_STOP"));
     }
 
     #[test]
     fn verdict_event_summary_with_force_stop() {
-        let s = verdict_event_summary_line(1, "🛑", "critical", 0, 5, 2, true);
+        let s = verdict_event_summary_line(1, "🛑", "critical", 0, "auto", true, 5, 2, true);
         assert!(s.contains("FORCE_STOP"));
+        assert!(s.contains("suppress_nudges=1"));
         assert!(s.contains("deprioritized=2"));
     }
 

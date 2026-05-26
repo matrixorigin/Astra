@@ -41,6 +41,7 @@ use crate::turn::prompt_cache::PromptCacheConfig;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;
+use astra_services::runs::RequestedTurnInteractionMode;
 use astra_turn_core::bridge_rate_limit_cooldown::{
     FallbackOutcome, RateLimitAction, try_resolve_fallback,
 };
@@ -62,6 +63,16 @@ fn request_aware_summary_http_client() -> Result<reqwest::Client, String> {
     }) {
         Ok(client) => Ok(client.clone()),
         Err(error) => Err(error.clone()),
+    }
+}
+
+fn server_requested_interaction_mode(mode: RequestedTurnInteractionMode) -> TurnInteractionMode {
+    match mode {
+        RequestedTurnInteractionMode::NonInteractive => TurnInteractionMode::NonInteractive,
+        RequestedTurnInteractionMode::Prompt => TurnInteractionMode::Prompt,
+        RequestedTurnInteractionMode::Auto => TurnInteractionMode::Auto,
+        RequestedTurnInteractionMode::Deny => TurnInteractionMode::Deny,
+        RequestedTurnInteractionMode::Headless => TurnInteractionMode::Headless,
     }
 }
 
@@ -732,6 +743,8 @@ pub struct ServerAgenticLoopHost {
     server_side_tools: bool,
     /// `true` when the connected client can answer ask_user prompts.
     interactive_client: bool,
+    /// Optional request-level interaction policy override.
+    interaction_mode: Option<RequestedTurnInteractionMode>,
     /// `true` when this session explicitly requests full LLM request/response capture.
     full_llm_capture: bool,
     /// System-prompt section reminding the LLM that a plan is in-flight.
@@ -827,6 +840,7 @@ pub struct ServerAgenticLoopHostBuilder {
     session_id: String,
     progress_broadcaster: Option<Arc<crate::orchestration::ProgressBroadcaster>>,
     interactive_client: bool,
+    interaction_mode: Option<RequestedTurnInteractionMode>,
     full_llm_capture: bool,
     event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
     plan_resume_hint: Option<String>,
@@ -870,6 +884,7 @@ impl ServerAgenticLoopHostBuilder {
             session_id,
             progress_broadcaster: None,
             interactive_client: false,
+            interaction_mode: None,
             full_llm_capture: false,
             event_tx: None,
             plan_resume_hint: None,
@@ -976,6 +991,14 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
+    pub fn with_interaction_mode(
+        mut self,
+        interaction_mode: Option<RequestedTurnInteractionMode>,
+    ) -> Self {
+        self.interaction_mode = interaction_mode;
+        self
+    }
+
     pub fn with_full_llm_capture(mut self, full_llm_capture: bool) -> Self {
         self.full_llm_capture = full_llm_capture;
         self
@@ -1054,6 +1077,7 @@ impl ServerAgenticLoopHostBuilder {
             selection_confidence: self.selection_confidence,
             server_side_tools,
             interactive_client: self.interactive_client,
+            interaction_mode: self.interaction_mode,
             full_llm_capture: self.full_llm_capture,
             edge_callback_ledger: self.edge_callback_ledger,
             user_id: self.user_id,
@@ -1157,11 +1181,7 @@ impl ServerAgenticLoopHost {
         } else {
             "edge-agent (edge-provided tools)"
         };
-        let interaction = if self.interactive_client {
-            "interactive"
-        } else {
-            "headless"
-        };
+        let interaction = self.turn_interaction_mode().label();
         let workspace = self
             .edge_profile
             .get("cwd")
@@ -1257,11 +1277,15 @@ impl ServerAgenticLoopHost {
     }
 
     fn turn_interaction_mode(&self) -> TurnInteractionMode {
-        if self.interactive_client {
-            TurnInteractionMode::Prompt
-        } else {
-            TurnInteractionMode::Headless
-        }
+        self.interaction_mode
+            .map(server_requested_interaction_mode)
+            .unwrap_or_else(|| {
+                if self.interactive_client {
+                    TurnInteractionMode::Prompt
+                } else {
+                    TurnInteractionMode::Headless
+                }
+            })
     }
 
     /// Push an SSE event to both the internal buffer and the streaming channel.
@@ -4343,7 +4367,7 @@ mod tests {
         let summary = host.turn_start_lifecycle_summary(&state);
 
         assert!(
-            summary.contains("Mode: edge-agent (edge-provided tools) · interaction: interactive"),
+            summary.contains("Mode: edge-agent (edge-provided tools) · interaction: prompt"),
             "edge-connected mode should be explicit: {summary}"
         );
         assert!(
@@ -5290,6 +5314,36 @@ mod tests {
             vec!["bash".to_string(), "read_file".to_string()]
         );
         assert!(policy.allow_ask_user);
+    }
+
+    #[test]
+    fn server_host_honors_requested_auto_interaction_mode() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_interactive_client(true)
+        .with_interaction_mode(Some(RequestedTurnInteractionMode::Auto))
+        .build();
+
+        assert_eq!(host.turn_interaction_mode(), TurnInteractionMode::Auto);
+        assert!(host.turn_interaction_mode().suppresses_loop_nudges());
+    }
+
+    #[test]
+    fn server_host_defaults_to_prompt_for_interactive_clients_without_override() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_interactive_client(true)
+        .build();
+
+        assert_eq!(host.turn_interaction_mode(), TurnInteractionMode::Prompt);
     }
 
     #[tokio::test]

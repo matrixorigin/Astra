@@ -3626,11 +3626,28 @@ fn truncate(s: &str, max: usize) -> String {
 
 pub const ASTRA_JOURNAL_CONTENT_REDACT_ENV: &str = "ASTRA_JOURNAL_CONTENT_REDACT";
 
+static JOURNAL_CONTENT_REDACT_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_journal_content_redact_override(enabled: Option<bool>) {
+    let encoded = match enabled {
+        Some(false) => 1,
+        Some(true) => 2,
+        None => 0,
+    };
+    JOURNAL_CONTENT_REDACT_OVERRIDE.store(encoded, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Returns true when [`ASTRA_JOURNAL_CONTENT_REDACT_ENV`]=`1` is set in the
 /// environment. When enabled, the on-disk JSONL journal stores a privacy
 /// marker (`<redacted: len=N sha=...>`) in place of `user_input` and
 /// `assistant_output` fields.
 pub fn journal_content_redact_enabled() -> bool {
+    match JOURNAL_CONTENT_REDACT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
     std::env::var(ASTRA_JOURNAL_CONTENT_REDACT_ENV).as_deref() == Ok("1")
 }
 

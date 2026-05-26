@@ -56,7 +56,7 @@ pub enum VerdictSeverity {
 pub struct CorrectionRecord {
     /// Turn number (0-indexed) at which the correction was issued.
     pub turn: u32,
-    /// One of: "stall_nudge", "divergence", "deprioritize", "error_escalation".
+    /// Examples: "stall_nudge", "divergence", "deprioritize", "cache_waste".
     pub correction_type: String,
     /// Tools the agent was told to avoid.
     pub avoid_tools: Vec<String>,
@@ -102,10 +102,22 @@ pub struct TurnGuard {
     /// Consecutive turns at Critical escalation. Progressive degradation:
     /// 1st Critical → restrict to read-only tools, 2nd → force stop.
     critical_turns: usize,
+    /// Consecutive calm turns (severity <= Info) since the last Critical.
+    critical_recovery_turns: usize,
     /// Consecutive Warning-or-higher verdicts. Used for progressive penalty.
     pub(crate) consecutive_warnings: usize,
     /// Total cache hits at last evaluate() — for delta-based nudge counting.
     last_cache_hit_total: usize,
+    /// Whether the current tool round recorded at least one error.
+    round_had_error: bool,
+    /// Fingerprint of the most recently emitted deprioritize warning.
+    last_deprioritize_warning_fingerprint: Option<String>,
+    /// Fingerprint of the most recently emitted timeout guidance.
+    last_timeout_guidance_fingerprint: Option<String>,
+    /// Fingerprint of the most recently emitted cache guidance.
+    last_cache_warning_fingerprint: Option<String>,
+    /// Fingerprint of the most recently emitted escalation guidance.
+    last_escalation_fingerprint: Option<String>,
     /// Correction issued on the most recent `evaluate` call, awaiting compliance check.
     pub pending_correction: Option<CorrectionRecord>,
     /// History of resolved corrections and their outcomes.
@@ -151,8 +163,14 @@ impl TurnGuard {
             errors: SessionErrorSummary::new(),
             last_reflection: None,
             critical_turns: 0,
+            critical_recovery_turns: 0,
             consecutive_warnings: 0,
             last_cache_hit_total: 0,
+            round_had_error: false,
+            last_deprioritize_warning_fingerprint: None,
+            last_timeout_guidance_fingerprint: None,
+            last_cache_warning_fingerprint: None,
+            last_escalation_fingerprint: None,
             pending_correction: None,
             correction_history: Vec::new(),
             adaptive_thresholds: stall::AdaptiveStallThresholds::default(),
@@ -228,8 +246,12 @@ impl TurnGuard {
     pub fn record_tool_result(&mut self, tool_name: &str, result_str: &str) -> ResultQuality {
         let quality = result_quality::classify_result(result_str);
         match quality {
-            ResultQuality::Success => self.health.record_success(tool_name),
+            ResultQuality::Success => {
+                self.health.record_success(tool_name);
+                self.errors.record_success();
+            }
             ResultQuality::Error => {
+                self.round_had_error = true;
                 let category = error_recovery::classify_error(result_str);
                 match category {
                     // Permanent failures: deprioritize immediately, no retry
@@ -252,7 +274,10 @@ impl TurnGuard {
                 self.errors.record_error(category);
             }
             ResultQuality::Empty => self.health.record_empty(tool_name),
-            ResultQuality::Truncated => self.health.record_success(tool_name),
+            ResultQuality::Truncated => {
+                self.health.record_success(tool_name);
+                self.errors.record_success();
+            }
         }
         quality
     }
@@ -260,9 +285,10 @@ impl TurnGuard {
     /// Record a tool timeout (from SchedulingContract enforcement).
     /// Distinct from generic errors — timeouts are infrastructure issues.
     pub fn record_tool_timeout(&mut self, tool_name: &str) {
+        self.round_had_error = true;
         self.health.record_timeout(tool_name);
         self.errors
-            .record_error(error_recovery::ErrorCategory::Network);
+            .record_error(error_recovery::ErrorCategory::ToolTimeout);
     }
 
     /// Record an idempotency cache hit (tool skipped, result served from cache).
@@ -317,7 +343,7 @@ impl TurnGuard {
         }
         if !aborted_tools.is_empty() {
             self.errors
-                .record_error(error_recovery::ErrorCategory::Network);
+                .record_error(error_recovery::ErrorCategory::ToolTimeout);
         }
     }
 
@@ -325,6 +351,35 @@ impl TurnGuard {
     ///
     /// Call this AFTER recording all tool calls and results for the turn,
     /// BEFORE sending the next LLM request.
+    ///
+    /// # Escalation policy
+    ///
+    /// Escalation uses a **sliding window** of the last 16 errors with
+    /// success-decay, not the lifetime `total_errors` counter. Each
+    /// successful tool call or retry pops the oldest error off the window,
+    /// so healthy progress pays down pressure naturally.
+    ///
+    /// ## De-duplication
+    ///
+    /// Every warning category (escalation message, deprioritized tools,
+    /// timeout-dominant tools, cache waste) is emitted at most once per
+    /// unique fingerprint. The warning re-fires only when the fingerprint
+    /// changes — i.e. the underlying health state actually shifts.
+    ///
+    /// ## Critical state
+    ///
+    /// First Critical turn injects a read-only restriction but does NOT
+    /// force-stop. Second consecutive Critical turn force-stops. A prior
+    /// Critical is cleared only after **two consecutive calm turns**
+    /// (severity ≤ Info), giving the agent a grace period to demonstrate
+    /// sustained recovery rather than a single lucky turn.
+    ///
+    /// ## Calm-turn decay
+    ///
+    /// On turns with no stall, divergence, reward-hacking, cache-waste,
+    /// or tool errors, `nudge_count` decays by 1. This prevents stale
+    /// nudge pressure from keeping the session in a warning state
+    /// indefinitely.
     pub fn evaluate(&mut self) -> TurnVerdict {
         let mut injections = Vec::new();
         let mut avoid_tools: HashSet<String> = HashSet::new();
@@ -383,9 +438,10 @@ impl TurnGuard {
                     flags: Vec::new(),
                 }
             });
-        if reward_hacking.risk >= stall::ACTIVE_REWARD_HACKING_RISK_THRESHOLD
-            && !reward_hacking.flags.is_empty()
-        {
+        let reward_hacking_detected = reward_hacking.risk
+            >= stall::ACTIVE_REWARD_HACKING_RISK_THRESHOLD
+            && !reward_hacking.flags.is_empty();
+        if reward_hacking_detected {
             let reward_hacking_avoid = stall::reward_hacking_avoid_tools(&self.latest_tool_calls);
             injections.push(stall::build_reward_hacking_correction(
                 &reward_hacking,
@@ -429,26 +485,45 @@ impl TurnGuard {
         }
 
         // 5. Tool health warnings
-        if let Some(warning) = self.health.deprioritize_warning() {
-            injections.push(warning);
-            for tool in self.health.deprioritized_tools() {
-                avoid_tools.insert(tool.to_string());
+        let mut fresh_deprioritize_warning = false;
+        let deprioritized_tools = self.health.deprioritized_tools();
+        let deprioritized_fingerprint = tool_fingerprint(deprioritized_tools.iter().copied());
+        if let Some(fingerprint) = deprioritized_fingerprint {
+            if self.last_deprioritize_warning_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+                if let Some(warning) = self.health.deprioritize_warning() {
+                    injections.push(warning);
+                    for tool in &deprioritized_tools {
+                        avoid_tools.insert((*tool).to_string());
+                    }
+                    severity = severity.max(VerdictSeverity::Warning);
+                    fresh_deprioritize_warning = true;
+                }
+                self.last_deprioritize_warning_fingerprint = Some(fingerprint);
             }
-            severity = severity.max(VerdictSeverity::Warning);
+        } else {
+            self.last_deprioritize_warning_fingerprint = None;
         }
 
         // 5a. Timeout-dominant tool guidance
         // When most failures are timeouts, give softer guidance (infrastructure issue).
+        let mut fresh_timeout_guidance = false;
         let timeout_dominant = self.health.timeout_dominant_tools();
-        if !timeout_dominant.is_empty() {
-            injections.push(format!(
-                "⏱ Tools [{}] are timing out (infrastructure issue, not a bug). \
-                 Consider: (1) trying a simpler/faster alternative, \
-                 (2) breaking large operations into smaller ones, \
-                 (3) retrying later if the issue is transient.",
-                timeout_dominant.join(", ")
-            ));
-            // Don't add to avoid_tools — timeouts are transient, tool might recover
+        let timeout_fingerprint = tool_fingerprint(timeout_dominant.iter().copied());
+        if let Some(fingerprint) = timeout_fingerprint {
+            if self.last_timeout_guidance_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+                injections.push(format!(
+                    "⏱ Tools [{}] are timing out (infrastructure issue, not a bug). \
+                     Consider: (1) trying a simpler/faster alternative, \
+                     (2) breaking large operations into smaller ones, \
+                     (3) retrying later if the issue is transient.",
+                    timeout_dominant.join(", ")
+                ));
+                severity = severity.max(VerdictSeverity::Warning);
+                fresh_timeout_guidance = true;
+                self.last_timeout_guidance_fingerprint = Some(fingerprint);
+            }
+        } else {
+            self.last_timeout_guidance_fingerprint = None;
         }
 
         // 5b. Cache duplication warning
@@ -456,74 +531,104 @@ impl TurnGuard {
         // High cache-hit counts also contribute to nudge_count so the escalation
         // path can reach Critical even when there are zero tool errors (the model
         // is spinning on reads, not failing).
+        let mut cache_warning_emitted = false;
         let cache_wasteful = self.health.cache_wasteful_tools(3);
-        if !cache_wasteful.is_empty() {
-            let tool_list: Vec<String> = cache_wasteful
-                .iter()
-                .map(|(name, count)| format!("{name} ({count}x)"))
-                .collect();
-            injections.push(format!(
-                "♻ Duplicate calls detected: [{}]. \
-                 You've made identical calls that were served from cache. \
-                 Reuse the earlier results instead of calling again.",
-                tool_list.join(", ")
-            ));
-            for (tool_name, _) in &cache_wasteful {
-                match *tool_name {
-                    "read_file" => injections.push(
-                        "For repeated read_file cache hits, reuse the earlier file output. \
-                         If you need a different slice, switch to start_line/end_line, \
-                         outline=true, grep, or glob instead of rereading the same file."
-                            .to_string(),
-                    ),
-                    "git_diff" => injections.push(
-                        "For repeated git_diff cache hits, reuse the earlier diff until the \
-                         worktree changes, or narrow the diff to a specific path or commit."
-                            .to_string(),
-                    ),
-                    _ => {}
-                }
-            }
-            for (tool_name, _) in &cache_wasteful {
-                avoid_tools.insert((*tool_name).to_string());
-            }
-            // Treat cache waste as a nudge signal so escalation can fire
-            // even with zero tool errors. Add 1 nudge per evaluation where
-            // NEW cache hits occurred (not just stale waste from earlier).
-            let current_total = self.health.total_cache_hits();
-            if current_total > self.last_cache_hit_total && !stall_detected && !divergence_detected
+        let current_total = self.health.total_cache_hits();
+        let new_cache_hits = current_total > self.last_cache_hit_total;
+        let cache_warning_fingerprint =
+            tool_fingerprint(cache_wasteful.iter().map(|(tool_name, _)| *tool_name));
+        if let Some(fingerprint) = cache_warning_fingerprint {
+            if new_cache_hits
+                && self.last_cache_warning_fingerprint.as_deref() != Some(fingerprint.as_str())
             {
+                let tool_list: Vec<String> = cache_wasteful
+                    .iter()
+                    .map(|(name, count)| format!("{name} ({count}x)"))
+                    .collect();
+                injections.push(format!(
+                    "♻ Duplicate calls detected: [{}]. \
+                     You've made identical calls that were served from cache. \
+                     Reuse the earlier results instead of calling again.",
+                    tool_list.join(", ")
+                ));
+                for (tool_name, _) in &cache_wasteful {
+                    match *tool_name {
+                        "read_file" => injections.push(
+                            "For repeated read_file cache hits, reuse the earlier file output. \
+                             If you need a different slice, switch to start_line/end_line, \
+                             outline=true, grep, or glob instead of rereading the same file."
+                                .to_string(),
+                        ),
+                        "git_diff" => injections.push(
+                            "For repeated git_diff cache hits, reuse the earlier diff until the \
+                             worktree changes, or narrow the diff to a specific path or commit."
+                                .to_string(),
+                        ),
+                        _ => {}
+                    }
+                }
+                for (tool_name, _) in &cache_wasteful {
+                    avoid_tools.insert((*tool_name).to_string());
+                }
+                cache_warning_emitted = true;
+                severity = severity.max(VerdictSeverity::Warning);
+                self.last_cache_warning_fingerprint = Some(fingerprint);
+            }
+            if new_cache_hits && !stall_detected && !divergence_detected {
+                // Treat cache waste as a nudge signal so escalation can fire
+                // even with zero tool errors. Add 1 nudge per evaluation where
+                // NEW cache hits occurred (not just stale waste from earlier).
                 self.nudge_count += 1;
             }
-            self.last_cache_hit_total = current_total;
-            severity = severity.max(VerdictSeverity::Warning);
+        } else {
+            self.last_cache_warning_fingerprint = None;
+        }
+        self.last_cache_hit_total = current_total;
+
+        if !stall_detected
+            && !divergence_detected
+            && !reward_hacking_detected
+            && !cache_warning_emitted
+            && !self.round_had_error
+        {
+            self.nudge_count = self.nudge_count.saturating_sub(1);
         }
 
         // 5. Escalation
         // Discount timeout-only errors: they're infrastructure issues, not agent failures.
         // Also discount auth errors: they're credential issues, not agent misbehavior.
-        let total_timeouts = self.health.total_timeouts();
+        let recent_timeouts = self
+            .errors
+            .recent_error_count(error_recovery::ErrorCategory::ToolTimeout);
         let auth_errors = self
             .errors
-            .errors_by_category
-            .get(&error_recovery::ErrorCategory::Auth)
-            .copied()
-            .unwrap_or(0);
+            .recent_error_count(error_recovery::ErrorCategory::Auth);
         let actionable_errors = self
             .errors
-            .total_errors
-            .saturating_sub(total_timeouts)
+            .recent_error_pressure()
+            .saturating_sub(recent_timeouts)
             .saturating_sub(auth_errors);
         let escalation = error_recovery::escalation_level(
             self.nudge_count,
             actionable_errors,
             self.health.deprioritized_tools().len(),
         );
-        if let Some(msg) = error_recovery::build_escalation_message(
-            escalation,
-            &avoid_tools.iter().cloned().collect::<Vec<_>>(),
-        ) {
-            injections.push(msg);
+        let mut escalation_message_emitted = false;
+        if let Some(fingerprint) = escalation_fingerprint(escalation, &avoid_tools) {
+            if self.last_escalation_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+                if let Some(msg) = error_recovery::build_escalation_message(
+                    escalation,
+                    &avoid_tools.iter().cloned().collect::<Vec<_>>(),
+                ) {
+                    injections.push(msg);
+                    escalation_message_emitted = true;
+                }
+                self.last_escalation_fingerprint = Some(fingerprint);
+            }
+        } else {
+            self.last_escalation_fingerprint = None;
+        }
+        if escalation_message_emitted || escalation == EscalationLevel::Critical {
             severity = match escalation {
                 EscalationLevel::Warning => severity.max(VerdictSeverity::Warning),
                 EscalationLevel::Critical => severity.max(VerdictSeverity::Critical),
@@ -536,11 +641,13 @@ impl TurnGuard {
         // Second Critical: force stop — the agent had a chance and didn't recover.
         let force_stop = if escalation == EscalationLevel::Critical {
             self.critical_turns += 1;
+            self.critical_recovery_turns = 0;
             astra_core::agent_escalation!(
                 "turnguard",
                 severity = "Critical",
                 nudge_count = self.nudge_count,
-                error_count = self.errors.total_errors,
+                error_count = actionable_errors,
+                lifetime_errors = self.errors.total_errors,
                 critical_turns = self.critical_turns,
                 force_stop = (self.critical_turns >= 2)
             );
@@ -560,8 +667,15 @@ impl TurnGuard {
                 false
             }
         } else {
-            // Reset critical counter when escalation drops below Critical
-            self.critical_turns = 0;
+            if severity <= VerdictSeverity::Info {
+                self.critical_recovery_turns += 1;
+                if self.critical_recovery_turns >= 2 {
+                    self.critical_turns = 0;
+                    self.critical_recovery_turns = 0;
+                }
+            } else {
+                self.critical_recovery_turns = 0;
+            }
             false
         };
 
@@ -589,20 +703,25 @@ impl TurnGuard {
         }
 
         // Store a CorrectionRecord when the verdict carries actionable corrections.
-        if !avoid_tools_vec.is_empty() || !injections.is_empty() {
-            let correction_type = if escalation == EscalationLevel::Critical
-                || escalation == EscalationLevel::Warning
-            {
-                "error_escalation"
-            } else if stall_detected {
-                "stall_nudge"
-            } else if is_diverging {
-                "divergence"
-            } else if self.health.deprioritize_warning().is_some() {
-                "deprioritize"
-            } else {
-                "stall_nudge"
-            };
+        if !injections.is_empty() {
+            let correction_type =
+                if escalation == EscalationLevel::Critical || escalation_message_emitted {
+                    "error_escalation"
+                } else if stall_detected {
+                    "stall_nudge"
+                } else if is_diverging {
+                    "divergence"
+                } else if reward_hacking_detected {
+                    "reward_hacking"
+                } else if fresh_deprioritize_warning {
+                    "deprioritize"
+                } else if fresh_timeout_guidance {
+                    "timeout_guidance"
+                } else if cache_warning_emitted {
+                    "cache_waste"
+                } else {
+                    "stall_nudge"
+                };
 
             let suggested_alternatives: Vec<String> = if stall_detected {
                 self.last_reflection
@@ -623,10 +742,11 @@ impl TurnGuard {
 
         // Track consecutive warnings for progressive penalty in the agentic loop.
         if severity >= VerdictSeverity::Warning {
-            self.consecutive_warnings += 1;
+            self.consecutive_warnings = self.consecutive_warnings.saturating_add(1);
         } else {
             self.consecutive_warnings = 0;
         }
+        self.round_had_error = false;
 
         // Consolidate: at most 2 injection messages to avoid noise overload.
         // Primary = first (highest-priority: stall/divergence/escalation).
@@ -718,6 +838,26 @@ fn consolidate_injections(injections: Vec<String>) -> Vec<String> {
     let primary = iter.next().unwrap();
     let secondary = iter.collect::<Vec<_>>().join("\n\n");
     vec![primary, secondary]
+}
+
+fn tool_fingerprint<'a>(tools: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let ordered: BTreeSet<&str> = tools.into_iter().filter(|tool| !tool.is_empty()).collect();
+    if ordered.is_empty() {
+        None
+    } else {
+        Some(ordered.into_iter().collect::<Vec<_>>().join(","))
+    }
+}
+
+fn escalation_fingerprint(
+    escalation: EscalationLevel,
+    avoid_tools: &HashSet<String>,
+) -> Option<String> {
+    if escalation == EscalationLevel::Normal {
+        return None;
+    }
+    let tools = tool_fingerprint(avoid_tools.iter().map(String::as_str)).unwrap_or_default();
+    Some(format!("{escalation:?}|{tools}"))
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -958,6 +1098,57 @@ mod tests {
         assert!(!verdict.force_stop);
     }
 
+    #[test]
+    fn lifetime_timeouts_do_not_over_discount_recent_pressure() {
+        let mut guard = TurnGuard::new();
+
+        // Old timeout history should not erase fresh actionable errors.
+        for _ in 0..10 {
+            guard.record_tool_timeout("bash");
+            guard.record_tool_result("glob", "src/main.rs");
+        }
+        assert_eq!(guard.errors.recent_error_pressure(), 0);
+        assert_eq!(guard.errors.total_errors, 10);
+
+        guard.nudge_count = 4;
+        for _ in 0..3 {
+            guard.record_tool_result("read_file", "Error: file not found");
+        }
+
+        let verdict = guard.evaluate();
+        assert_eq!(
+            verdict.severity,
+            VerdictSeverity::Critical,
+            "fresh actionable errors must still escalate even after many older timeouts"
+        );
+    }
+
+    #[test]
+    fn mixed_timeouts_and_actionable_errors_discount_correctly() {
+        let mut guard = TurnGuard::new();
+        for _ in 0..8 {
+            guard.record_tool_timeout("bash");
+        }
+        for _ in 0..8 {
+            guard.record_tool_result("read_file", "Error: file not found");
+        }
+
+        let verdict = guard.evaluate();
+        assert_eq!(guard.errors.recent_error_pressure(), 16);
+        assert_eq!(
+            guard
+                .errors
+                .recent_error_count(error_recovery::ErrorCategory::ToolTimeout),
+            8
+        );
+        assert_eq!(
+            verdict.severity,
+            VerdictSeverity::Warning,
+            "8 actionable errors plus 8 recent timeouts should still warn"
+        );
+        assert!(!verdict.force_stop);
+    }
+
     /// Normal code exploration (grep→read_file→grep→grep) should never
     /// trigger stall or divergence within 4 rounds.
     /// Regression: session f9903b97 was killed during normal code analysis.
@@ -1124,7 +1315,10 @@ mod tests {
             );
         }
 
-        // Second consecutive Critical → force_stop
+        // Next round also goes critical → force_stop
+        for _ in 0..3 {
+            guard.record_tool_result("test_tool", "Error: something failed");
+        }
         let v2 = guard.evaluate();
         assert!(
             v2.force_stop,
@@ -1229,7 +1423,15 @@ mod tests {
         guard.record_tool_result("glob", "src/main.rs\nsrc/lib.rs");
         guard.record_tool_result("glob", "tests/test.rs");
 
-        assert_eq!(guard.errors.total_errors, 2, "only 2 actual errors");
+        assert_eq!(
+            guard.errors.total_errors, 2,
+            "lifetime telemetry should retain the original error count"
+        );
+        assert_eq!(
+            guard.errors.recent_error_pressure(),
+            0,
+            "later successful progress should pay down recent pressure"
+        );
 
         let verdict = guard.evaluate();
         assert!(
@@ -1240,6 +1442,132 @@ mod tests {
             verdict.severity < VerdictSeverity::Critical,
             "should not reach Critical with only 2 errors"
         );
+    }
+
+    #[test]
+    fn deprioritize_warning_emits_once_until_health_changes() {
+        let mut guard = TurnGuard::new();
+        for _ in 0..3 {
+            guard.record_tool_result("bash", "Error: command failed");
+        }
+
+        let first = guard.evaluate();
+        assert_eq!(first.severity, VerdictSeverity::Warning);
+        assert!(
+            !first.injections.is_empty(),
+            "new deprioritization should emit guidance once"
+        );
+        assert!(first.avoid_tools.contains(&"bash".to_string()));
+
+        let second = guard.evaluate();
+        assert_eq!(
+            second.severity,
+            VerdictSeverity::Healthy,
+            "steady-state deprioritization should not keep re-warning"
+        );
+        assert!(second.injections.is_empty());
+        assert!(second.avoid_tools.is_empty());
+    }
+
+    #[test]
+    fn successful_progress_pays_down_error_pressure() {
+        let mut guard = TurnGuard::new();
+        for _ in 0..3 {
+            guard.record_tool_result("bash", "Error: command failed");
+        }
+        assert_eq!(guard.errors.total_errors, 3);
+
+        for _ in 0..3 {
+            guard.record_tool_result("glob", "src/main.rs\nsrc/lib.rs");
+        }
+
+        assert_eq!(
+            guard.errors.total_errors, 3,
+            "lifetime telemetry should retain the original error count"
+        );
+        assert_eq!(
+            guard.errors.recent_error_pressure(),
+            0,
+            "successful tool calls should clear stale recent pressure"
+        );
+    }
+
+    #[test]
+    fn calm_turns_decay_nudge_pressure() {
+        let mut guard = TurnGuard::new();
+        guard.nudge_count = 3;
+
+        let verdict = guard.evaluate();
+        assert_eq!(guard.nudge_count, 2);
+        assert_eq!(
+            verdict.severity,
+            VerdictSeverity::Healthy,
+            "old nudge pressure should decay on a calm turn"
+        );
+        assert!(verdict.injections.is_empty());
+    }
+
+    #[test]
+    fn cache_warning_requires_new_cache_hits() {
+        let mut guard = TurnGuard::new();
+        for _ in 0..3 {
+            guard
+                .health
+                .record_cache_hit_for_signature("read_file", "read_file:path=a.txt");
+        }
+
+        let first = guard.evaluate();
+        assert_eq!(first.severity, VerdictSeverity::Warning);
+        assert!(
+            !first.injections.is_empty(),
+            "new duplicate cache hits should emit guidance"
+        );
+
+        let second = guard.evaluate();
+        assert_eq!(
+            second.severity,
+            VerdictSeverity::Healthy,
+            "stale cache-hit history should not keep the session in warning state"
+        );
+        assert!(second.injections.is_empty());
+
+        for _ in 0..3 {
+            guard
+                .health
+                .record_cache_hit_for_signature("read_file", "read_file:path=a.txt");
+        }
+        let third = guard.evaluate();
+        assert_eq!(
+            third.severity,
+            VerdictSeverity::Healthy,
+            "the same cache-waste pattern should not keep re-emitting identical guidance"
+        );
+        assert!(third.injections.is_empty());
+    }
+
+    #[test]
+    fn critical_state_requires_sustained_recovery_to_clear() {
+        let mut guard = TurnGuard::new();
+        guard.nudge_count = 4;
+        for _ in 0..3 {
+            guard.record_tool_result("bash", "Error: command failed");
+        }
+
+        let first = guard.evaluate();
+        assert_eq!(first.severity, VerdictSeverity::Critical);
+        assert!(!first.force_stop);
+
+        // A warning turn is not enough to clear the prior critical state.
+        let second = guard.evaluate();
+        assert_eq!(second.severity, VerdictSeverity::Warning);
+        assert!(!second.force_stop);
+        assert_eq!(guard.critical_turns, 1);
+
+        // Two genuinely calm turns are required before the critical memory clears.
+        guard.evaluate();
+        assert_eq!(guard.critical_turns, 1);
+        guard.evaluate();
+        assert_eq!(guard.critical_turns, 0);
     }
 
     /// Regression test for resource-limit overwrite bug.

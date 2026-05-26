@@ -62,14 +62,14 @@ use astra_pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
 use astra_tools::task_mgmt::{SessionTask, TaskManager};
-use astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent;
 use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use astra_turn_core::compaction_types::CompactionTier;
+use astra_turn_core::guardrails::turn_guard::TurnGuard;
+use astra_turn_core::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 use astra_turn_core::headless_tool_body_preview::HeadlessStderrStyle;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use astra_turn_core::tool_registry_report::SelectionReport;
-use astra_turn_core::turn_guard::TurnGuard;
 use tokio_util::sync::CancellationToken;
 
 // ─── Host turn result ────────────────────────────────────────────────────────
@@ -2910,6 +2910,10 @@ pub(crate) mod tests {
                 deprioritized_tools: vec![],
                 force_stop: false,
                 nudge_count: 1,
+                interaction_mode: "prompt".into(),
+                suppressed_loop_nudges: false,
+                recent_error_pressure: 0,
+                recent_timeout_pressure: 0,
                 total_errors: 0,
                 deprioritized_count: 0,
                 total_timeouts: 0,

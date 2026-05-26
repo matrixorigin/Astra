@@ -5,7 +5,7 @@ use ratatui::{buffer::Buffer, layout::Rect};
 use tokio::sync::oneshot;
 
 use super::{BottomPane, BottomPaneAction};
-use crate::chat_stream::{
+use crate::cli::chat_stream::{
     AskUserAnnotation, AskUserAnswers, AskUserChoice, AskUserPrompt, AskUserQuestion,
     AskUserQuestionAnswer, AskUserResponse,
 };

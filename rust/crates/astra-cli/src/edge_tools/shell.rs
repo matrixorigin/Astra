@@ -2926,7 +2926,7 @@ struct ShellRunConfig {
     harden_command: bool,
     effective_project_root: PathBuf,
     sandbox_policy: Option<SandboxPolicy>,
-    progress_sink: Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>>,
+    progress_sink: Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
@@ -3172,7 +3172,7 @@ fn set_pipe_nonblocking_stderr(pipe: Option<&mut std::process::ChildStderr>) {
 fn drain_pipe_nonblocking(
     pipe: Option<&mut std::process::ChildStdout>,
     buf: &mut Vec<u8>,
-    sink: &Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>>,
+    sink: &Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
 ) {
     use std::io::Read;
     let Some(p) = pipe else { return };
@@ -3198,7 +3198,7 @@ fn drain_pipe_nonblocking(
 fn drain_pipe_nonblocking_stderr(
     pipe: Option<&mut std::process::ChildStderr>,
     buf: &mut Vec<u8>,
-    sink: &Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>>,
+    sink: &Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
 ) {
     use std::io::Read;
     let Some(p) = pipe else { return };
@@ -3226,7 +3226,7 @@ fn final_drain_stdout(
     pipe: &mut std::process::ChildStdout,
     buf: &mut Vec<u8>,
     timeout: Duration,
-    sink: &Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>>,
+    sink: &Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
 ) {
     use std::io::Read;
     let deadline = std::time::Instant::now() + timeout;
@@ -3258,7 +3258,7 @@ fn final_drain_stderr(
     pipe: &mut std::process::ChildStderr,
     buf: &mut Vec<u8>,
     timeout: Duration,
-    sink: &Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>>,
+    sink: &Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
 ) {
     use std::io::Read;
     let deadline = std::time::Instant::now() + timeout;

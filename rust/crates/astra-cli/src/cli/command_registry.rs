@@ -11,7 +11,7 @@
 //! menus, main.rs) should query this registry rather than maintaining their
 //! own static arrays.
 
-use crate::command_usage;
+use crate::cli::command_usage;
 
 /// Command groups for organizing the help palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

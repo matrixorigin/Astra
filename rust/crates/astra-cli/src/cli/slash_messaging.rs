@@ -8,7 +8,7 @@
 use super::*;
 
 /// Handle `/messaging [subcommand]` command.
-pub(super) fn handle_messaging_command(arg: &str, state: &SessionState) {
+pub(crate) fn handle_messaging_command(arg: &str, state: &SessionState) {
     let parts: Vec<&str> = arg.split_whitespace().collect();
     let subcmd = parts.first().copied().unwrap_or("");
 

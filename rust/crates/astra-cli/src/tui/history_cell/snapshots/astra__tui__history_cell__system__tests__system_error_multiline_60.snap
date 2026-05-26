@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/system.rs
+assertion_line: 372
 expression: "render(&cell, 60, 2)"
 ---
   error: rate limited

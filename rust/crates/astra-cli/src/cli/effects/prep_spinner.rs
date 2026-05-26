@@ -12,7 +12,7 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
-use super::SecStatusLineKind;
+use crate::cli::effects::SecStatusLineKind;
 
 /// Shared label for [`PlanAssembleLineSpinner`] while building a normal-chat `/chat/turn` payload.
 pub type ChatPrepPhaseLabel = Arc<RwLock<String>>;

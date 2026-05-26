@@ -2035,25 +2035,37 @@ mod tests {
     #[test]
     fn snapshot_low_pressure_80x14() {
         let b = ContextBreakdown::from_trace(&trace(100_000, 2_000, 15_000, 500, 4_000, 200));
-        insta::assert_snapshot!("context_panel_low_80x14", render_panel(&b, 80, 14));
+        crate::tui::testing::assert_tui_snapshot!(
+            "context_panel_low_80x14",
+            render_panel(&b, 80, 14)
+        );
     }
 
     #[test]
     fn snapshot_warning_pressure_80x14() {
         let b = ContextBreakdown::from_trace(&trace(100_000, 8_000, 50_000, 1_000, 10_000, 1_500));
-        insta::assert_snapshot!("context_panel_warn_80x14", render_panel(&b, 80, 14));
+        crate::tui::testing::assert_tui_snapshot!(
+            "context_panel_warn_80x14",
+            render_panel(&b, 80, 14)
+        );
     }
 
     #[test]
     fn snapshot_critical_pressure_80x14() {
         let b = ContextBreakdown::from_trace(&trace(100_000, 12_000, 70_000, 2_000, 10_000, 1_500));
-        insta::assert_snapshot!("context_panel_critical_80x14", render_panel(&b, 80, 14));
+        crate::tui::testing::assert_tui_snapshot!(
+            "context_panel_critical_80x14",
+            render_panel(&b, 80, 14)
+        );
     }
 
     #[test]
     fn snapshot_empty_no_trace_80x3() {
         let b = ContextBreakdown::empty();
-        insta::assert_snapshot!("context_panel_empty_80x3", render_panel(&b, 80, 3));
+        crate::tui::testing::assert_tui_snapshot!(
+            "context_panel_empty_80x3",
+            render_panel(&b, 80, 3)
+        );
     }
 
     #[test]
@@ -2113,7 +2125,7 @@ mod tests {
         let p =
             ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         let buf = draw_widget(p, 100, 30);
-        insta::assert_snapshot!(
+        crate::tui::testing::assert_tui_snapshot!(
             "context_panel_history_expanded_100x30",
             buffer_to_string(&buf)
         );
@@ -2154,7 +2166,10 @@ mod tests {
         let p =
             ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         let buf = draw_widget(p, 100, 30);
-        insta::assert_snapshot!("context_panel_history_drill_100x30", buffer_to_string(&buf));
+        crate::tui::testing::assert_tui_snapshot!(
+            "context_panel_history_drill_100x30",
+            buffer_to_string(&buf)
+        );
     }
 
     #[test]
@@ -2215,7 +2230,10 @@ mod tests {
             ..SystemPromptBreakdown::default()
         };
         let b = ContextBreakdown::from_trace(&t);
-        insta::assert_snapshot!("context_panel_nested_80x26", render_panel(&b, 80, 26));
+        crate::tui::testing::assert_tui_snapshot!(
+            "context_panel_nested_80x26",
+            render_panel(&b, 80, 26)
+        );
     }
 
     // ─── Pure helpers ─────────────────────────────────────────────

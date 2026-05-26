@@ -921,13 +921,13 @@ mod tests {
     #[test]
     fn snapshot_simple_paragraph_60() {
         let c = AssistantCell::from_markdown("Here is the plan:\n\n- step one\n- step two");
-        insta::assert_snapshot!("assistant_paragraph_60", render(&c, 60, 5));
+        crate::tui::testing::assert_tui_snapshot!("assistant_paragraph_60", render(&c, 60, 5));
     }
 
     #[test]
     fn snapshot_with_inline_code_60() {
         let c = AssistantCell::from_markdown("Use `cargo build` to compile the project.");
-        insta::assert_snapshot!("assistant_inline_code_60", render(&c, 60, 2));
+        crate::tui::testing::assert_tui_snapshot!("assistant_inline_code_60", render(&c, 60, 2));
     }
 
     #[test]
@@ -935,7 +935,7 @@ mod tests {
         let c = AssistantCell::from_markdown(
             "<think>\nThe user is asking a question.\nI will answer briefly.\n</think>\n\nHello — happy to help.",
         );
-        insta::assert_snapshot!("assistant_think_closed_60", render(&c, 60, 3));
+        crate::tui::testing::assert_tui_snapshot!("assistant_think_closed_60", render(&c, 60, 3));
     }
 
     // ── Token estimate (CJK-aware) ──────────────────────────────
@@ -1007,6 +1007,9 @@ mod tests {
         // Height 4: header + 2 preview rows (under cap) + one spare
         // row. The preview no longer single-lines — it scrolls like
         // `ReasoningCell` — so both thinking rows must appear.
-        insta::assert_snapshot!("assistant_think_streaming_80", render(&c, 80, 4));
+        crate::tui::testing::assert_tui_snapshot!(
+            "assistant_think_streaming_80",
+            render(&c, 80, 4)
+        );
     }
 }

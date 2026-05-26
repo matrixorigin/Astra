@@ -4,13 +4,14 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-use crate::agentic_verdict_audit::AgenticVerdictAuditEvent;
 use crate::chat_history_openai::append_openai_user_content_messages;
+use crate::guardrails::turn_guard::{TurnGuard, VerdictSeverity};
+use crate::guardrails::verdict_audit::AgenticVerdictAuditEvent;
+use crate::interaction_types::TurnInteractionMode;
 use crate::stall::{
     CLI_AGENTIC_VERDICT_REMAINING_PENALTY_CRITICAL, CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING,
 };
 use crate::tool::args::shape::{tool_call_arguments_value, tool_call_name};
-use crate::turn_guard::{TurnGuard, VerdictSeverity};
 use astra_pipeline::step_checkpoint;
 use astra_pipeline::step_protocol::StepCheckpoint;
 use astra_pipeline::step_recorder::StepRecorder;
@@ -32,6 +33,7 @@ pub struct AgenticPostToolPolicyRequest<'a> {
     pub loop_turn: usize,
     pub recent_tools: &'a [String],
     pub last_heavy_checkpoint: &'a mut Option<StepCheckpoint>,
+    pub interaction_mode: TurnInteractionMode,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -84,6 +86,7 @@ pub fn apply_agentic_post_tool_policy(
         loop_turn,
         recent_tools,
         last_heavy_checkpoint,
+        interaction_mode,
     } = ctx;
 
     {
@@ -130,6 +133,12 @@ pub fn apply_agentic_post_tool_policy(
                 deprioritized_tools,
                 force_stop: verdict.force_stop,
                 nudge_count: turn_guard.nudge_count,
+                interaction_mode: interaction_mode.label().to_string(),
+                suppressed_loop_nudges: interaction_mode.suppresses_loop_nudges(),
+                recent_error_pressure: turn_guard.errors.recent_error_pressure(),
+                recent_timeout_pressure: turn_guard
+                    .errors
+                    .recent_error_count(crate::error_recovery::ErrorCategory::ToolTimeout),
                 total_errors: turn_guard.errors.total_errors,
                 deprioritized_count: health_summary.deprioritized_count,
                 total_timeouts: health_summary.total_timeouts,
@@ -142,7 +151,7 @@ pub fn apply_agentic_post_tool_policy(
         append_openai_user_content_messages(messages, &verdict.injections);
 
         for tool in &verdict.avoid_tools {
-            if !crate::turn_guard::is_read_only_never_restrict(tool) {
+            if !crate::guardrails::turn_guard::is_read_only_never_restrict(tool) {
                 restricted_tools.insert(tool.clone());
             }
         }
@@ -255,6 +264,7 @@ mod tests {
             loop_turn: 0,
             recent_tools: &[],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
+            interaction_mode: TurnInteractionMode::Prompt,
         });
 
         assert_eq!(out, AgenticPostToolPolicyOutcome::ProceedEndTurn);
@@ -313,6 +323,7 @@ mod tests {
             loop_turn: 0,
             recent_tools: &[],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
+            interaction_mode: TurnInteractionMode::Prompt,
         });
 
         assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
@@ -365,6 +376,7 @@ mod tests {
             loop_turn: 0,
             recent_tools: &[],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
+            interaction_mode: TurnInteractionMode::Prompt,
         });
 
         assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
@@ -413,6 +425,7 @@ mod tests {
             loop_turn: 0,
             recent_tools: &[],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
+            interaction_mode: TurnInteractionMode::Prompt,
         });
 
         assert_eq!(out, AgenticPostToolPolicyOutcome::ProceedEndTurn);

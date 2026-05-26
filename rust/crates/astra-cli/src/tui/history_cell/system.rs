@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn snapshot_info_40() {
-        insta::assert_snapshot!(
+        crate::tui::testing::assert_tui_snapshot!(
             "system_info_40",
             render(&SystemCell::info("session resumed"), 40, 1)
         );
@@ -346,7 +346,7 @@ mod tests {
 
     #[test]
     fn snapshot_response_60() {
-        insta::assert_snapshot!(
+        crate::tui::testing::assert_tui_snapshot!(
             "system_response_60",
             render(&SystemCell::response("Set model to Opus 4.6"), 60, 1)
         );
@@ -355,12 +355,15 @@ mod tests {
     #[test]
     fn snapshot_response_multiline_80() {
         let cell = SystemCell::response("Set model to Opus 4.6\n(1M context, thinking enabled)");
-        insta::assert_snapshot!("system_response_multiline_80", render(&cell, 80, 2));
+        crate::tui::testing::assert_tui_snapshot!(
+            "system_response_multiline_80",
+            render(&cell, 80, 2)
+        );
     }
 
     #[test]
     fn snapshot_warning_40() {
-        insta::assert_snapshot!(
+        crate::tui::testing::assert_tui_snapshot!(
             "system_warning_40",
             render(&SystemCell::warning("token budget 80%"), 40, 1)
         );
@@ -369,6 +372,9 @@ mod tests {
     #[test]
     fn snapshot_error_multiline_60() {
         let cell = SystemCell::error("error: rate limited\nretry after 60s");
-        insta::assert_snapshot!("system_error_multiline_60", render(&cell, 60, 2));
+        crate::tui::testing::assert_tui_snapshot!(
+            "system_error_multiline_60",
+            render(&cell, 60, 2)
+        );
     }
 }

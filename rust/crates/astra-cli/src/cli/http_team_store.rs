@@ -154,7 +154,7 @@ impl HttpTeamStore {
     }
 
     fn authed_client(&self) -> Result<(reqwest::Client, String), TeamHttpError> {
-        let token = crate::session_runtime::current_access_token(self.profile.as_deref())
+        let token = crate::cli::session_runtime::current_access_token(self.profile.as_deref())
             .ok_or(TeamHttpError::AuthenticationRequired)?;
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -469,7 +469,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        crate::cli_utils::save_credentials(&creds).unwrap();
+        crate::cli::cli_utils::save_credentials(&creds).unwrap();
     }
 
     #[tokio::test]

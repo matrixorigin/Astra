@@ -4,7 +4,7 @@
 //! Plan-oriented CLI flows and `slash_memory` import them — do not duplicate the
 //! `data:` / `text_delta` loop elsewhere.
 
-use crate::theme;
+use crate::cli::theme;
 use futures_util::StreamExt;
 use std::io::IsTerminal;
 use std::time::Duration;

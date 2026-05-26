@@ -671,7 +671,7 @@ mod tests {
 
     #[test]
     fn snapshot_ok_no_output_80() {
-        insta::assert_snapshot!(
+        crate::tui::testing::assert_tui_snapshot!(
             "tool_ok_no_output_80",
             render(&ok_tool("bash", "ls /tmp", 42), 80, 3)
         );
@@ -681,11 +681,14 @@ mod tests {
     fn snapshot_ok_with_summary_80() {
         let mut t = ok_tool("read", "Cargo.toml", 120);
         t.output_summary = Some("[package]\nname = \"demo\"".into());
-        insta::assert_snapshot!("tool_ok_with_summary_80", render(&t, 80, 5));
+        crate::tui::testing::assert_tui_snapshot!("tool_ok_with_summary_80", render(&t, 80, 5));
     }
 
     #[test]
     fn snapshot_err_80() {
-        insta::assert_snapshot!("tool_err_80", render(&err_tool("bash", "false", 10), 80, 3));
+        crate::tui::testing::assert_tui_snapshot!(
+            "tool_err_80",
+            render(&err_tool("bash", "false", 10), 80, 3)
+        );
     }
 }

@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "mock_mcp_server"
 path = "src/bin/mock_mcp_server.rs"
 
+[lib]
+name = "astra_cli"
+path = "src/lib.rs"
+
 [features]
 default = ["harness"]
 harness = ["astra-runtime/harness", "dep:astra-harness"]

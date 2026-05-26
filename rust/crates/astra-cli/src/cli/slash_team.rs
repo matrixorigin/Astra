@@ -1,8 +1,8 @@
 use super::*;
-use crate::is_session_not_found_error;
 use astra_runtime::server::team::orchestrator::ExecutionPhase;
 #[allow(unused_imports)]
 use astra_services::team_persistence::{TeamPersistenceService, WorktreeMode};
+use astra_turn_core::chat_turn_heuristics::is_session_not_found_error;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -11,7 +11,7 @@ use std::time::Instant;
 
 /// Record of a past team execution.
 #[derive(Clone, Debug)]
-pub(super) struct TeamHistoryEntry {
+pub(crate) struct TeamHistoryEntry {
     pub team_name: String,
     pub task: String,
     pub delegation_id: String,
@@ -26,7 +26,7 @@ pub(super) struct TeamHistoryEntry {
 
 /// A saved snapshot associated with a team.
 #[derive(Clone, Debug)]
-pub(super) struct TeamSnapshotEntry {
+pub(crate) struct TeamSnapshotEntry {
     pub snapshot_id: String,
     pub team_name: String,
     pub label: String,
@@ -39,7 +39,7 @@ pub(super) struct TeamSnapshotEntry {
 
 /// A named team of agent roles that can coordinate on tasks.
 #[derive(Clone, Debug)]
-pub(super) struct Team {
+pub(crate) struct Team {
     /// Stable identifier persisted across runs (UUID assigned at creation).
     pub team_id: String,
     pub name: String,
@@ -54,7 +54,7 @@ pub(super) struct Team {
 
 /// A member role within a team.
 #[derive(Clone, Debug)]
-pub(super) struct TeamMember {
+pub(crate) struct TeamMember {
     pub role: String,
     pub description: String,
     pub skills: Vec<String>,
@@ -63,7 +63,7 @@ pub(super) struct TeamMember {
 
 /// Registry of all defined teams (stored in SessionState).
 #[derive(Clone, Debug)]
-pub(super) struct TeamRegistry {
+pub(crate) struct TeamRegistry {
     teams: HashMap<String, Team>,
     pub history: Vec<TeamHistoryEntry>,
     snapshots: Vec<TeamSnapshotEntry>,
@@ -425,9 +425,9 @@ fn infer_coordination(team: &Team) -> astra_services::team_persistence::TeamCoor
 async fn ensure_team_run_session(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    state: &mut super::SessionState,
+    state: &mut crate::SessionState,
 ) -> Result<String, String> {
-    let token = crate::session_runtime::fresh_access_token(api, profile)
+    let token = crate::cli::session_runtime::fresh_access_token(api, profile)
         .await
         .ok_or_else(|| "Not logged in".to_string())?;
     if let Some(session_id) = state.session_id.clone() {
@@ -438,7 +438,7 @@ async fn ensure_team_run_session(
                 if !is_session_not_found_error(&err) {
                     return Ok(session_id);
                 }
-                let _ = crate::auth_flow::clear_profile_last_session(profile);
+                let _ = crate::cli::auth_flow::clear_profile_last_session(profile);
                 state.clear_session_id();
                 state.unregister_root_mailbox().await;
                 state.run_id = None;
@@ -460,17 +460,17 @@ async fn ensure_team_run_session(
         .ok_or_else(|| "session create response missing session_id".to_string())?
         .to_string();
 
-    crate::chat_turn::initialize_journal_pub(state, &session_id);
-    crate::chat_turn::persist_last_session_id(profile, &session_id);
+    crate::cli::chat_turn::initialize_journal_pub(state, &session_id);
+    crate::cli::chat_turn::persist_last_session_id(profile, &session_id);
     state.set_session_id(session_id.clone());
     Ok(session_id)
 }
 
-pub(super) async fn handle_team_command(
+pub(crate) async fn handle_team_command(
     arg: &str,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    state: &mut super::SessionState,
+    state: &mut crate::SessionState,
 ) {
     // Hydrate registry from persistence store on first command
     if !state.team_registry.store_loaded {
@@ -815,7 +815,7 @@ pub(super) async fn handle_team_command(
                 if let Some(pos) = words.iter().position(|&w| w == "--mock") {
                     let task_part = words[..pos].join(" ");
                     let scenario_name = words.get(pos + 1).copied().unwrap_or("complete");
-                    let scenario = super::mock_llm::MockScenario::from_str(scenario_name)
+                    let scenario = super::mock_llm::MockScenario::parse(scenario_name)
                         .unwrap_or_else(|| {
                             eprintln!(
                                 "  {} Unknown mock scenario '{}'. Available: {}",
@@ -904,7 +904,7 @@ pub(super) async fn handle_team_command(
                     return;
                 }
             };
-            let token = match crate::session_runtime::fresh_access_token(api, profile).await {
+            let token = match crate::cli::session_runtime::fresh_access_token(api, profile).await {
                 Some(t) => t,
                 None => {
                     eprintln!("  {} Not logged in", theme::icon_err());
@@ -1882,7 +1882,7 @@ fn format_tokens(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli_utils::{CredentialsFile, Profile};
+    use crate::cli::cli_utils::{CredentialsFile, Profile};
     use axum::{Router, routing::get, routing::post};
 
     async fn spawn_mock(app: Router) -> String {

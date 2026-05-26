@@ -529,6 +529,6 @@ mod tests {
     #[test]
     fn snapshot_finalised_reasoning_60() {
         let c = ReasoningCell::from_text("The user wants X.\nPlan: do Y, then Z.", Some(3000));
-        insta::assert_snapshot!("reasoning_finalised_60", render(&c, 60, 4));
+        crate::tui::testing::assert_tui_snapshot!("reasoning_finalised_60", render(&c, 60, 4));
     }
 }

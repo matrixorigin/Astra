@@ -17,6 +17,8 @@ pub struct ChatStreamRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<serde_json::Map<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_budget: Option<ExecutionBudget>,
@@ -50,6 +52,7 @@ impl ChatStreamRequest {
             session_id: None,
             agent_id: None,
             model: None,
+            interaction_mode: None,
             context: None,
             execution_budget: None,
             explain: false,
@@ -532,6 +535,7 @@ mod tests {
             session_id: Some("s-1".into()),
             agent_id: None,
             model: Some("m".into()),
+            interaction_mode: Some("auto".into()),
             context: None,
             execution_budget: Some(ExecutionBudget {
                 initial_turns: Some(3),

@@ -1,6 +1,6 @@
 //! Local session journal digest for `astra journal digest` and tooling.
 
-use crate::tool_call_groups;
+use crate::cli::tool_call_groups;
 use astra_services::session_journal::{self, JournalEventType};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -481,7 +481,7 @@ fn build_tool_group_rows(calls: &[session_journal::ToolCallRecord]) -> Vec<ToolG
                 .calls
                 .iter()
                 .map(|call| {
-                    crate::stream_render::format_tool_display_from_preview(
+                    crate::cli::stream_render::format_tool_display_from_preview(
                         &call.name,
                         call.args_preview.as_deref(),
                     )
@@ -1045,7 +1045,7 @@ pub fn print_text(d: &JournalDigest) {
     }
 }
 
-pub fn run_digest(args: &super::JournalDigestArgs) -> Result<(), String> {
+pub(crate) fn run_digest(args: &crate::JournalDigestArgs) -> Result<(), String> {
     let focus = parse_focus(args.focus.as_deref())?;
     let sid = resolve_session_for_digest(args.session_id.as_deref(), args.session.as_deref())?;
     let digest = build_digest(&sid, focus)?;

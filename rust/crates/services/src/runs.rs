@@ -203,6 +203,16 @@ pub struct ExecutionBudget {
     pub hard_turn_limit: Option<u32>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestedTurnInteractionMode {
+    NonInteractive,
+    Prompt,
+    Auto,
+    Deny,
+    Headless,
+}
+
 #[derive(Clone, PartialEq)]
 pub struct ChatRequestData {
     pub message: String,
@@ -218,6 +228,7 @@ pub struct ChatRequestData {
     pub forward_headers: std::collections::HashMap<String, String>,
     pub execution_budget: Option<ExecutionBudget>,
     pub explain: bool,
+    pub interaction_mode: Option<RequestedTurnInteractionMode>,
     pub interactive_client: bool,
 }
 
@@ -261,6 +272,7 @@ impl std::fmt::Debug for ChatRequestData {
             )
             .field("execution_budget", &self.execution_budget)
             .field("explain", &self.explain)
+            .field("interaction_mode", &self.interaction_mode)
             .field("interactive_client", &self.interactive_client)
             .finish()
     }
@@ -2401,6 +2413,15 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 if let Some(session_id) = data.get("session_id").cloned() {
                     obj.insert("session_id".to_string(), session_id);
                 }
+                if let Some(interaction_mode) = data.get("interaction_mode").cloned() {
+                    obj.insert("interaction_mode".to_string(), interaction_mode);
+                }
+                if let Some(suppressed_loop_nudges) = data.get("suppressed_loop_nudges").cloned() {
+                    obj.insert("suppressed_loop_nudges".to_string(), suppressed_loop_nudges);
+                }
+                if let Some(interactive_client) = data.get("interactive_client").cloned() {
+                    obj.insert("interactive_client".to_string(), interactive_client);
+                }
             }
             out
         }
@@ -2795,11 +2816,20 @@ mod tests {
     fn run_started_and_finished() {
         let started = transform_run_event_for_client(make_event(
             "run_started",
-            json!({"run_id": "run-1", "session_id": "sess-1"}),
+            json!({
+                "run_id": "run-1",
+                "session_id": "sess-1",
+                "interaction_mode": "auto",
+                "suppressed_loop_nudges": true,
+                "interactive_client": true
+            }),
         ));
         assert_eq!(started["type"], "run_started");
         assert_eq!(started["run_id"], "run-1");
         assert_eq!(started["session_id"], "sess-1");
+        assert_eq!(started["interaction_mode"], "auto");
+        assert_eq!(started["suppressed_loop_nudges"], true);
+        assert_eq!(started["interactive_client"], true);
 
         let finished = transform_run_event_for_client(make_event(
             "run_finished",
@@ -2991,6 +3021,7 @@ mod tests {
             }),
             full_llm_capture: false,
             explain: false,
+            interaction_mode: None,
             interactive_client: false,
         };
 
@@ -3025,6 +3056,7 @@ mod tests {
                     }),
                     full_llm_capture: false,
                     explain: false,
+                    interaction_mode: None,
                     interactive_client: false,
                 },
             )

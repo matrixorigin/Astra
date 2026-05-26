@@ -112,7 +112,7 @@ pub fn interruptible_sleep(duration: std::time::Duration, stop: &AtomicBool) -> 
 /// - `w`: terminal width
 pub fn paint_unified_line(icon: &str, label: &str, time_part: &str, frame: char, w: usize) {
     use crossterm::style::Stylize;
-    let vis_width = crate::terminal_region::visible_char_width;
+    let vis_width = crate::cli::terminal_region::visible_char_width;
     // Visible widths using proper Unicode display width + ANSI stripping
     let icon_vis = vis_width(icon);
     let label_vis = vis_width(label);

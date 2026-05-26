@@ -160,7 +160,7 @@ fn canonical_turn_snapshots_full_scrollback() {
         },
     ))));
 
-    insta::assert_snapshot!("canonical_turn_80", render_history(&w, 80));
+    crate::tui::testing::assert_tui_snapshot!("canonical_turn_80", render_history(&w, 80));
 }
 
 #[test]

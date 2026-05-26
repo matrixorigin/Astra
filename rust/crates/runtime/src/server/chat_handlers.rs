@@ -145,6 +145,7 @@ fn chat_stream_bridge_fallback_payload(
         "context": chat_data.context.as_ref(),
         "execution_budget": chat_data.execution_budget.as_ref(),
         "explain": chat_data.explain,
+        "interaction_mode": chat_data.interaction_mode,
         "test_llm_stream_blocks": test_llm_stream_blocks,
         "messages": [
             {
@@ -556,6 +557,7 @@ mod tests {
                 hard_turn_limit: Some(7),
             }),
             explain: true,
+            interaction_mode: Some(astra_services::runs::RequestedTurnInteractionMode::Auto),
             interactive_client: false,
         });
         let obj = payload.as_object().unwrap();
@@ -564,6 +566,7 @@ mod tests {
         assert_eq!(obj["execution_budget"]["initial_turns"], 3);
         assert_eq!(obj["execution_budget"]["hard_turn_limit"], 7);
         assert_eq!(obj["explain"], true);
+        assert_eq!(obj["interaction_mode"], "auto");
         assert_eq!(obj["skill_search"]["dynamic_surface"], false);
         assert_eq!(obj["skill_search"]["min_catalog_size"], 12);
         assert_eq!(obj["skill_search"]["surface_cap"], 20);
@@ -606,6 +609,7 @@ mod tests {
                 hard_turn_limit: Some(7),
             }),
             explain: true,
+            interaction_mode: None,
             interactive_client: false,
         });
         let obj = payload.as_object().unwrap();

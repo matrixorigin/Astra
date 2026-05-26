@@ -9,7 +9,7 @@
 //! **Client → Server** (JSON text frames):
 //! ```text
 //! {"type": "auth", "token": "Bearer ..."}
-//! {"type": "message", "content": "...", "session_id": "...", "agent_id": "...", "model": "...", "skill_search": {...}, "execution_budget": {"initial_turns": 12, "hard_turn_limit": 24}, "explain": false, "plan_subtask_id": "...", "is_plan_subtask": true}
+//! {"type": "message", "content": "...", "session_id": "...", "agent_id": "...", "model": "...", "skill_search": {...}, "execution_budget": {"initial_turns": 12, "hard_turn_limit": 24}, "explain": false, "interaction_mode": "auto", "plan_subtask_id": "...", "is_plan_subtask": true}
 //! {"type": "cancel_run", "run_id": "..."}
 //! {"type": "pause_run", "run_id": "..."}
 //! {"type": "resume_run", "run_id": "..."}
@@ -116,6 +116,8 @@ pub(super) enum WsClientMessage {
         execution_budget: Option<astra_services::runs::ExecutionBudget>,
         #[serde(default)]
         explain: bool,
+        #[serde(default)]
+        interaction_mode: Option<astra_services::runs::RequestedTurnInteractionMode>,
         #[serde(default)]
         plan_subtask_id: Option<String>,
         #[serde(default)]
@@ -531,6 +533,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                 context,
                                 execution_budget,
                                 explain,
+                                interaction_mode,
                                 plan_subtask_id,
                                 is_plan_subtask,
                             }) => {
@@ -548,6 +551,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                     context,
                                     execution_budget,
                                     explain,
+                                    interaction_mode,
                                     plan_subtask_id,
                                     is_plan_subtask,
                                 )
@@ -660,6 +664,7 @@ async fn handle_chat_message(
     context: Option<serde_json::Map<String, serde_json::Value>>,
     execution_budget: Option<astra_services::runs::ExecutionBudget>,
     explain: bool,
+    interaction_mode: Option<astra_services::runs::RequestedTurnInteractionMode>,
     plan_subtask_id: Option<String>,
     is_plan_subtask: Option<bool>,
 ) {
@@ -682,6 +687,7 @@ async fn handle_chat_message(
         context,
         execution_budget,
         explain,
+        interaction_mode,
         plan_subtask_id,
         is_plan_subtask,
     );
@@ -935,6 +941,7 @@ fn build_bridge_chat_payload(
     context: Option<serde_json::Map<String, serde_json::Value>>,
     execution_budget: Option<astra_services::runs::ExecutionBudget>,
     explain: bool,
+    interaction_mode: Option<astra_services::runs::RequestedTurnInteractionMode>,
 ) -> Value {
     let allow_skills = normalize_bridge_allowlist(allow_skills.as_deref());
     let allow_tools = normalize_bridge_allowlist(allow_tools.as_deref());
@@ -948,6 +955,7 @@ fn build_bridge_chat_payload(
         "context": context,
         "execution_budget": execution_budget,
         "explain": explain,
+        "interaction_mode": interaction_mode,
         "messages": [{
             "role": "user",
             "content": content
@@ -977,6 +985,7 @@ fn build_ws_chat_request(
     context: Option<serde_json::Map<String, serde_json::Value>>,
     execution_budget: Option<astra_services::runs::ExecutionBudget>,
     explain: bool,
+    interaction_mode: Option<astra_services::runs::RequestedTurnInteractionMode>,
     plan_subtask_id: Option<String>,
     is_plan_subtask: Option<bool>,
 ) -> astra_services::runs::ChatRequestData {
@@ -994,6 +1003,7 @@ fn build_ws_chat_request(
         forward_headers: std::collections::HashMap::new(),
         execution_budget,
         explain,
+        interaction_mode,
         interactive_client: true,
     }
 }
@@ -2121,7 +2131,7 @@ mod tests {
 
     #[test]
     fn parse_chat_message() {
-        let json = r#"{"type": "message", "content": "hello", "session_id": "s1", "agent_id": "agent-1", "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "allow_skills": ["plan"], "allow_tools": ["bash"], "execution_budget": {"initial_turns": 3, "hard_turn_limit": 7}, "explain": true, "plan_subtask_id": "sub-42", "is_plan_subtask": true}"#;
+        let json = r#"{"type": "message", "content": "hello", "session_id": "s1", "agent_id": "agent-1", "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "allow_skills": ["plan"], "allow_tools": ["bash"], "execution_budget": {"initial_turns": 3, "hard_turn_limit": 7}, "explain": true, "interaction_mode": "auto", "plan_subtask_id": "sub-42", "is_plan_subtask": true}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
             WsClientMessage::ChatMessage {
@@ -2135,6 +2145,7 @@ mod tests {
                 context,
                 execution_budget,
                 explain,
+                interaction_mode,
                 plan_subtask_id,
                 is_plan_subtask,
             } => {
@@ -2161,6 +2172,10 @@ mod tests {
                     })
                 );
                 assert!(explain);
+                assert_eq!(
+                    interaction_mode,
+                    Some(astra_services::runs::RequestedTurnInteractionMode::Auto)
+                );
                 assert_eq!(plan_subtask_id.as_deref(), Some("sub-42"));
                 assert_eq!(is_plan_subtask, Some(true));
             }
@@ -2223,6 +2238,7 @@ mod tests {
                 hard_turn_limit: Some(7),
             }),
             true,
+            Some(astra_services::runs::RequestedTurnInteractionMode::Auto),
         );
 
         assert_eq!(payload["session_id"], "session-1");
@@ -2237,6 +2253,7 @@ mod tests {
         assert_eq!(payload["execution_budget"]["initial_turns"], 3);
         assert_eq!(payload["execution_budget"]["hard_turn_limit"], 7);
         assert_eq!(payload["explain"], true);
+        assert_eq!(payload["interaction_mode"], "auto");
         assert_eq!(payload["messages"][0]["role"], "user");
         assert_eq!(payload["messages"][0]["content"], "hello");
     }
@@ -2257,6 +2274,7 @@ mod tests {
                 hard_turn_limit: Some(6),
             }),
             true,
+            None,
         );
 
         assert_eq!(
@@ -2292,6 +2310,7 @@ mod tests {
                 hard_turn_limit: Some(11),
             }),
             true,
+            Some(astra_services::runs::RequestedTurnInteractionMode::Auto),
             Some("sub-42".into()),
             Some(true),
         );
@@ -2327,6 +2346,10 @@ mod tests {
         );
         assert_eq!(request.context.as_ref().unwrap()["is_plan_subtask"], true);
         assert!(request.explain);
+        assert_eq!(
+            request.interaction_mode,
+            Some(astra_services::runs::RequestedTurnInteractionMode::Auto)
+        );
         assert!(request.interactive_client);
     }
 

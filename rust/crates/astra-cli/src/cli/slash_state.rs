@@ -1,12 +1,12 @@
 use super::*;
 
-pub(super) struct StateCommandContext<'a> {
-    pub(super) api: &'a astra_thin_client::ThinClient,
-    pub(super) profile: Option<&'a str>,
-    pub(super) token: Option<&'a str>,
+pub(crate) struct StateCommandContext<'a> {
+    pub(crate) api: &'a astra_thin_client::ThinClient,
+    pub(crate) profile: Option<&'a str>,
+    pub(crate) token: Option<&'a str>,
 }
 
-pub(super) async fn handle_state_command(
+pub(crate) async fn handle_state_command(
     cmd: &str,
     arg: &str,
     ctx: StateCommandContext<'_>,
@@ -310,9 +310,9 @@ pub(super) async fn handle_state_command(
 
             eprintln!("  {}", "Summarizing…".dim());
             let mut auto_pm = PermissionManager::with_load_policy(
-                crate::permission_manager::PermissionMode::Auto,
+                crate::cli::permission_manager::PermissionMode::Auto,
                 &std::env::current_dir().unwrap_or_default(),
-                &crate::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+                &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
             );
             let mut _cancel_token_guard: Option<
                 std::sync::Arc<tokio_util::sync::CancellationToken>,
@@ -331,7 +331,8 @@ pub(super) async fn handle_state_command(
                     history: &state.history,
                     perm_manager: &mut auto_pm,
                     verbose_mode: false,
-                    render_policy: crate::stream_render::RenderPolicy::Silent,
+                    render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+                    cli_context: Some(&state.cli_context),
 
                     recent_tools: &[],
                     tool_health_entries: &[],
@@ -441,9 +442,9 @@ pub(super) async fn handle_state_command(
                     if saved_to_memoria && !compact_quick {
                         let extract_msg = format!("{}{summary}", prompts::MEMORY_EXTRACTOR_PROMPT);
                         let mut auto_pm2 = PermissionManager::with_load_policy(
-                            crate::permission_manager::PermissionMode::Auto,
+                            crate::cli::permission_manager::PermissionMode::Auto,
                             &std::env::current_dir().unwrap_or_default(),
-                            &crate::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+                            &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
                         );
                         let extract_result = stream_chat_sse(ChatTurnParams {
                             api,
@@ -458,7 +459,8 @@ pub(super) async fn handle_state_command(
                             history: &[],
                             perm_manager: &mut auto_pm2,
                             verbose_mode: false,
-                            render_policy: crate::stream_render::RenderPolicy::Silent,
+                            render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+                            cli_context: Some(&state.cli_context),
 
                             recent_tools: &[],
                             tool_health_entries: &[],
@@ -546,9 +548,9 @@ pub(super) async fn handle_state_command(
                                     fact_lines.join("\n")
                                 );
                                 let mut auto_pm3 = PermissionManager::with_load_policy(
-                                    crate::permission_manager::PermissionMode::Auto,
+                                    crate::cli::permission_manager::PermissionMode::Auto,
                                     &std::env::current_dir().unwrap_or_default(),
-                                    &crate::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+                                    &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
                                 );
                                 let synth_result = stream_chat_sse(ChatTurnParams {
                                     api,
@@ -563,7 +565,8 @@ pub(super) async fn handle_state_command(
                                     history: &[],
                                     perm_manager: &mut auto_pm3,
                                     verbose_mode: false,
-                                    render_policy: crate::stream_render::RenderPolicy::Silent,
+                                    render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+                                    cli_context: Some(&state.cli_context),
 
                                     recent_tools: &[],
                                     tool_health_entries: &[],
@@ -700,7 +703,7 @@ pub(super) async fn handle_state_command(
                 let anchor = if compact_no_memoria {
                     None
                 } else {
-                    crate::chat_turn::fetch_compact_memory_anchor_snippet(
+                    crate::cli::chat_turn::fetch_compact_memory_anchor_snippet(
                         api,
                         tok,
                         state.session_id.as_deref(),
@@ -708,7 +711,7 @@ pub(super) async fn handle_state_command(
                     )
                     .await
                 };
-                let assistant_text = crate::chat_turn::compact_assistant_message(
+                let assistant_text = crate::cli::chat_turn::compact_assistant_message(
                     trimmed_count,
                     &summary,
                     anchor.as_deref(),
@@ -793,7 +796,7 @@ pub(super) async fn handle_state_command(
                 eprint!("{out}");
                 return Ok(());
             }
-            if let Ok(body) = crate::self_command::render_reflect_surface_for_session(
+            if let Ok(body) = crate::cli::self_command::render_reflect_surface_for_session(
                 &sid,
                 20,
                 requested_focus.as_deref(),
@@ -895,7 +898,7 @@ fn is_local_reflect_report(report: &serde_json::Value) -> bool {
 /// Output enumerates tool-health entries whose failure rate, call count,
 /// or presence changed since last sync. When nothing changed (e.g. fresh
 /// session) the output is an explicit "no delta" line.
-pub(super) fn render_reflect_diff(state: &super::session_state::SessionState) -> String {
+pub(crate) fn render_reflect_diff(state: &super::session_state::SessionState) -> String {
     use std::collections::HashMap;
     use std::fmt::Write;
 
@@ -1291,8 +1294,8 @@ mod tests {
 
     #[test]
     fn render_reflect_diff_reports_no_delta_on_fresh_session() {
-        let state = super::super::session_state::SessionState::default();
-        let out = super::render_reflect_diff(&state);
+        let state = crate::cli::session_state::SessionState::default();
+        let out = crate::render_reflect_diff(&state);
         assert!(out.contains("reflect diff"), "header present: {out}");
         assert!(
             out.contains("no delta since last sync"),
@@ -1303,7 +1306,7 @@ mod tests {
     #[test]
     fn render_reflect_diff_surfaces_new_and_drifting_tools() {
         use astra_turn_core::tool_health_persistence::ToolHealthEntry;
-        let mut state = super::super::session_state::SessionState::default();
+        let mut state = crate::cli::session_state::SessionState::default();
         // Baseline had "grep" at 10 calls / 10% fail.
         state.synced_tool_health_entries = vec![ToolHealthEntry {
             name: "grep".into(),
@@ -1332,7 +1335,7 @@ mod tests {
                 recent_outcomes: vec![],
             },
         ];
-        let out = super::render_reflect_diff(&state);
+        let out = crate::render_reflect_diff(&state);
         assert!(out.contains("grep"), "drifting tool shown: {out}");
         assert!(out.contains("glob"), "new tool shown: {out}");
         assert!(out.contains("new"), "new marker: {out}");

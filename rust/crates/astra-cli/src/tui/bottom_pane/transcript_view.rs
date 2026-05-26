@@ -271,7 +271,7 @@ impl BottomPaneView for TranscriptView {
                 self.status = None;
             }
             KeyCode::Char('y') | KeyCode::Char('c') => {
-                self.copy_selection_with(crate::slash_info::copy_to_clipboard);
+                self.copy_selection_with(crate::cli::slash_info::copy_to_clipboard);
             }
             _ => {}
         }

@@ -1,6 +1,7 @@
 //! Multi-agent runtime initialization for the interactive REPL.
 
-use super::{SessionState, agent_loader, delegate_subrun, spawn_subrun};
+use super::{agent_loader, delegate_subrun, spawn_subrun};
+use crate::SessionState;
 use std::path::PathBuf;
 
 fn attach_session_to_spawner(

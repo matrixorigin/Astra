@@ -213,14 +213,17 @@ detached
     #[test]
     fn snapshot_three_worktrees_default() {
         let l = fixture();
-        insta::assert_snapshot!("worktrees_three_100x7", draw(&l, 100, 7));
+        crate::tui::testing::assert_tui_snapshot!("worktrees_three_100x7", draw(&l, 100, 7));
     }
 
     #[test]
     fn snapshot_second_selected() {
         let mut l = fixture();
         l.move_down();
-        insta::assert_snapshot!("worktrees_second_selected_100x7", draw(&l, 100, 7));
+        crate::tui::testing::assert_tui_snapshot!(
+            "worktrees_second_selected_100x7",
+            draw(&l, 100, 7)
+        );
     }
 
     #[test]
@@ -228,19 +231,22 @@ detached
         let mut l = fixture();
         l.move_down();
         l.move_down();
-        insta::assert_snapshot!("worktrees_detached_selected_100x7", draw(&l, 100, 7));
+        crate::tui::testing::assert_tui_snapshot!(
+            "worktrees_detached_selected_100x7",
+            draw(&l, 100, 7)
+        );
     }
 
     #[test]
     fn snapshot_narrow_60() {
         let l = fixture();
-        insta::assert_snapshot!("worktrees_narrow_60x7", draw(&l, 60, 7));
+        crate::tui::testing::assert_tui_snapshot!("worktrees_narrow_60x7", draw(&l, 60, 7));
     }
 
     #[test]
     fn snapshot_empty() {
         let l = WorktreeList::new(Vec::new());
-        insta::assert_snapshot!("worktrees_empty_80x3", draw(&l, 80, 3));
+        crate::tui::testing::assert_tui_snapshot!("worktrees_empty_80x3", draw(&l, 80, 3));
     }
 
     #[test]

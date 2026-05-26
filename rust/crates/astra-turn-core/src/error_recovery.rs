@@ -6,7 +6,7 @@
 //! 3. **Alternative suggestion** — when a tool fails, suggest domain alternatives
 //! 4. **Progressive escalation** — each stall nudge gets stronger consequences
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 // ── Error Classification ─────────────────────────────────────────────────────
 
@@ -361,10 +361,15 @@ pub fn build_escalation_message(level: EscalationLevel, avoid_tools: &[String]) 
 /// Lightweight session-level error tracking for escalation decisions.
 #[derive(Debug, Clone, Default)]
 pub struct SessionErrorSummary {
+    /// Lifetime session error count for telemetry and diagnostics.
     pub total_errors: usize,
+    /// Lifetime category counts aligned with `total_errors`.
     pub errors_by_category: HashMap<ErrorCategory, usize>,
     pub retries_performed: usize,
     pub retries_succeeded: usize,
+    recent_total_errors: usize,
+    recent_errors_by_category: HashMap<ErrorCategory, usize>,
+    recent_errors: VecDeque<ErrorCategory>,
 }
 
 impl SessionErrorSummary {
@@ -373,15 +378,40 @@ impl SessionErrorSummary {
     }
 
     pub fn record_error(&mut self, category: ErrorCategory) {
+        const RECENT_ERROR_WINDOW: usize = 16;
+
         self.total_errors += 1;
         *self.errors_by_category.entry(category).or_default() += 1;
+        self.recent_total_errors += 1;
+        *self.recent_errors_by_category.entry(category).or_default() += 1;
+        self.recent_errors.push_back(category);
+
+        while self.recent_errors.len() > RECENT_ERROR_WINDOW {
+            self.discard_oldest_recent_error();
+        }
     }
 
     pub fn record_retry(&mut self, succeeded: bool) {
         self.retries_performed += 1;
         if succeeded {
             self.retries_succeeded += 1;
+            self.record_success();
         }
+    }
+
+    pub fn record_success(&mut self) {
+        self.discard_oldest_recent_error();
+    }
+
+    pub fn recent_error_pressure(&self) -> usize {
+        self.recent_total_errors
+    }
+
+    pub fn recent_error_count(&self, category: ErrorCategory) -> usize {
+        self.recent_errors_by_category
+            .get(&category)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Retry success rate. Returns 1.0 if no retries performed.
@@ -390,6 +420,22 @@ impl SessionErrorSummary {
             1.0
         } else {
             self.retries_succeeded as f64 / self.retries_performed as f64
+        }
+    }
+
+    fn discard_oldest_recent_error(&mut self) {
+        let Some(category) = self.recent_errors.pop_front() else {
+            return;
+        };
+
+        self.recent_total_errors = self.recent_total_errors.saturating_sub(1);
+        let mut remove_category = false;
+        if let Some(count) = self.recent_errors_by_category.get_mut(&category) {
+            *count = count.saturating_sub(1);
+            remove_category = *count == 0;
+        }
+        if remove_category {
+            self.recent_errors_by_category.remove(&category);
         }
     }
 }
@@ -864,6 +910,37 @@ mod tests {
         assert_eq!(summary.total_errors, 3);
         assert_eq!(summary.errors_by_category[&ErrorCategory::Network], 2);
         assert_eq!(summary.errors_by_category[&ErrorCategory::Auth], 1);
+        assert_eq!(summary.recent_error_pressure(), 3);
+        assert_eq!(summary.recent_error_count(ErrorCategory::Network), 2);
+        assert_eq!(summary.recent_error_count(ErrorCategory::Auth), 1);
+    }
+
+    #[test]
+    fn error_summary_successes_decay_recent_pressure() {
+        let mut summary = SessionErrorSummary::new();
+        summary.record_error(ErrorCategory::Network);
+        summary.record_error(ErrorCategory::Auth);
+        summary.record_error(ErrorCategory::Network);
+
+        summary.record_success();
+        assert_eq!(summary.total_errors, 3);
+        assert_eq!(summary.errors_by_category[&ErrorCategory::Network], 2);
+        assert_eq!(summary.errors_by_category[&ErrorCategory::Auth], 1);
+        assert_eq!(summary.recent_error_pressure(), 2);
+        assert_eq!(summary.recent_error_count(ErrorCategory::Network), 1);
+        assert_eq!(summary.recent_error_count(ErrorCategory::Auth), 1);
+
+        summary.record_success();
+        assert_eq!(summary.total_errors, 3);
+        assert_eq!(summary.recent_error_pressure(), 1);
+        assert_eq!(summary.recent_error_count(ErrorCategory::Network), 1);
+        assert_eq!(summary.recent_error_count(ErrorCategory::Auth), 0);
+
+        summary.record_success();
+        assert_eq!(summary.total_errors, 3);
+        assert_eq!(summary.recent_error_pressure(), 0);
+        assert_eq!(summary.recent_error_count(ErrorCategory::Network), 0);
+        assert_eq!(summary.recent_error_count(ErrorCategory::Auth), 0);
     }
 
     #[test]
@@ -875,10 +952,35 @@ mod tests {
     #[test]
     fn retry_success_rate_mixed() {
         let mut summary = SessionErrorSummary::new();
+        summary.record_error(ErrorCategory::Network);
+        summary.record_error(ErrorCategory::Network);
         summary.record_retry(true);
         summary.record_retry(false);
         summary.record_retry(true);
         assert!((summary.retry_success_rate() - 0.6667).abs() < 0.01);
+        assert_eq!(
+            summary.total_errors, 2,
+            "retry bookkeeping must not rewrite lifetime telemetry"
+        );
+        assert_eq!(
+            summary.recent_error_pressure(),
+            0,
+            "successful retries should pay down recent pressure"
+        );
+    }
+
+    #[test]
+    fn error_summary_caps_recent_window_at_sixteen() {
+        let mut summary = SessionErrorSummary::new();
+        for _ in 0..17 {
+            summary.record_error(ErrorCategory::Network);
+        }
+
+        assert_eq!(summary.total_errors, 17);
+        assert_eq!(summary.errors_by_category[&ErrorCategory::Network], 17);
+        assert_eq!(summary.recent_error_pressure(), 16);
+        assert_eq!(summary.recent_error_count(ErrorCategory::Network), 16);
+        assert_eq!(summary.recent_error_count(ErrorCategory::Auth), 0);
     }
 
     // ── ResourceLimit classification tests ──

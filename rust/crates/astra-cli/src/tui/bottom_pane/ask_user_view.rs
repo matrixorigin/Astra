@@ -15,7 +15,7 @@ use super::{
     textarea::{TextArea, TextAreaAction},
     view::{BottomPaneView, CancellationEvent, ViewCompletion},
 };
-use crate::chat_stream::{
+use crate::cli::chat_stream::{
     AskUserAnnotation, AskUserAnswers, AskUserPrompt, AskUserQuestion, AskUserQuestionAnswer,
     AskUserResponse,
 };

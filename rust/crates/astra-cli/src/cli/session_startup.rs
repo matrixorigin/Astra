@@ -1,6 +1,7 @@
 //! REPL startup/setup orchestration extracted from `run_chat_repl`.
 
 use super::*;
+use astra_services::session_journal;
 use session_guard::{
     install_session_panic_hook, install_sigterm_handler, subscribe_shutdown_signal,
 };
@@ -392,6 +393,7 @@ pub(crate) async fn complete_session_startup(
     profile: Option<&str>,
     resume_session_id: Option<&str>,
     no_instructions: bool,
+    cli_context: &crate::cli::cli_context::CliContext,
 ) -> Result<SessionStartupArtifacts, String> {
     // Install panic hook to write session_end on unexpected crashes.
     install_session_panic_hook();
@@ -400,18 +402,18 @@ pub(crate) async fn complete_session_startup(
     let shutdown_signal_rx = subscribe_shutdown_signal();
 
     // --session-id: override with explicit session UUID
-    if let Ok(sid) = std::env::var("ASTRA_CLI_SESSION_ID") {
-        state.set_session_id(sid.clone());
+    if let Some(sid) = cli_context.session_id.as_deref() {
+        state.set_session_id(sid.to_string());
         state.pending_recovery = None;
         eprintln!(
             "{}",
-            format!("  Using session {}", truncate_str(&sid, 12)).magenta()
+            format!("  Using session {}", truncate_str(sid, 12)).magenta()
         );
     }
 
     // --name: set session display name
-    if let Ok(name) = std::env::var("ASTRA_CLI_SESSION_NAME") {
-        state.session_name = Some(name);
+    if let Some(name) = cli_context.session_name.as_ref() {
+        state.session_name = Some(name.clone());
     }
 
     // --yes: warn about auto-approve mode
@@ -504,7 +506,7 @@ pub(crate) async fn complete_session_startup(
     }
 
     state.session_memory_extractor = build_cli_session_memory_extractor(api, profile).await;
-    state.team_store = std::sync::Arc::new(crate::http_team_store::HttpTeamStore::new(
+    state.team_store = std::sync::Arc::new(crate::cli::http_team_store::HttpTeamStore::new(
         api.api_origin(),
         profile,
     ));
@@ -619,16 +621,16 @@ mod tests {
     }
 
     fn write_profile_with_token(session_id: &str) {
-        let mut creds = crate::cli_utils::CredentialsFile::default();
+        let mut creds = crate::cli::cli_utils::CredentialsFile::default();
         creds.profiles.insert(
             "default".to_string(),
-            crate::cli_utils::Profile {
+            crate::cli::cli_utils::Profile {
                 access_token: Some("test-token".into()),
                 last_session_id: Some(session_id.to_string()),
                 ..Default::default()
             },
         );
-        crate::cli_utils::save_credentials(&creds).unwrap();
+        crate::cli::cli_utils::save_credentials(&creds).unwrap();
     }
 
     // Verify that no_instructions=true prevents project instructions from being
@@ -714,7 +716,7 @@ mod tests {
 
         assert_eq!(state.pending_recovery, None);
         assert_eq!(
-            crate::cli_utils::load_credentials()
+            crate::cli::cli_utils::load_credentials()
                 .profiles
                 .get("default")
                 .and_then(|profile| profile.last_session_id.as_deref()),

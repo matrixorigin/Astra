@@ -27,9 +27,9 @@ use astra_runtime::{
 };
 use astra_services::coordination::AgentResult;
 
-use super::edge_tools;
 use super::permission_manager::PermissionMode;
 use super::skill_subrun::{SubRunHost, persist_failed_subrun};
+use crate::edge_tools;
 
 const DELEGATE_MAX_TURNS: usize = 25;
 
@@ -334,7 +334,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         // sits behind it as cacheable context, and the child's
         // task message is the fresh suffix. When no prefix was
         // resolved, this degenerates to the pre-fix 2-message layout.
-        let messages = crate::spawn_subrun::build_child_messages(
+        let messages = crate::cli::spawn_subrun::build_child_messages(
             &system_prompt,
             config
                 .inherited_prefix

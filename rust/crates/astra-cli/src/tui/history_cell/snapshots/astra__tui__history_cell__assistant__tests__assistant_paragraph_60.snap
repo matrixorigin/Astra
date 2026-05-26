@@ -1,6 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/assistant.rs
-assertion_line: 920
+assertion_line: 924
 expression: "render(&c, 60, 5)"
 ---
 █ Here is the plan:

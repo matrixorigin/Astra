@@ -83,14 +83,34 @@ pub(crate) mod render {
     }
 }
 
+pub(crate) fn stable_snapshot_name(module_path: &str, local_name: &str) -> String {
+    let mut parts = module_path.split("::");
+    let _crate_name = parts.next();
+    let suffix = parts.collect::<Vec<_>>().join("__");
+    format!("astra__{suffix}__{local_name}")
+}
+
 /// Assert a `Buffer` matches a named insta snapshot.
 ///
 /// Usage: `snapshot_buffer!("user_cell_basic", &buffer);`
 #[allow(unused_macros)]
+macro_rules! assert_tui_snapshot {
+    ($name:expr, $value:expr $(,)?) => {{
+        let snapshot_name =
+            $crate::tui::testing::stable_snapshot_name(module_path!(), $name);
+        insta::with_settings!({ prepend_module_to_snapshot => false }, {
+            insta::assert_snapshot!(snapshot_name, $value);
+        });
+    }};
+}
+#[allow(unused_imports)]
+pub(crate) use assert_tui_snapshot;
+
+#[allow(unused_macros)]
 macro_rules! snapshot_buffer {
     ($name:expr, $buffer:expr) => {{
         let rendered = $crate::tui::testing::render::buffer_to_string($buffer);
-        insta::assert_snapshot!($name, rendered);
+        $crate::tui::testing::assert_tui_snapshot!($name, rendered);
     }};
 }
 #[allow(unused_imports)]
@@ -145,5 +165,13 @@ mod harness_self_tests {
         let buf = render::draw_widget(p, 20, 1);
         let s = render::buffer_to_string(&buf);
         assert_eq!(s, "  indented");
+    }
+
+    #[test]
+    fn stable_snapshot_name_drops_runtime_crate_name() {
+        let lib_name = stable_snapshot_name("astra_cli::tui::status_line::snapshot_tests", "x");
+        let bin_name = stable_snapshot_name("astra::tui::status_line::snapshot_tests", "x");
+        assert_eq!(lib_name, "astra__tui__status_line__snapshot_tests__x");
+        assert_eq!(lib_name, bin_name);
     }
 }

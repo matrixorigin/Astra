@@ -1,4 +1,6 @@
 use super::*;
+use crate::edge_tools;
+use astra_services::session_journal;
 
 // ── Context status thresholds ────────────────────────────────────────────────
 // Used for color-coding pressure indicators in /info and context displays.
@@ -1070,7 +1072,7 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
 /// In TUI mode this is shadowed by the native info panel.
 /// Kept for headless / non-interactive execution paths.
 #[allow(dead_code)]
-pub(super) async fn handle_info_command(
+pub(crate) async fn handle_info_command(
     cmd: &str,
     arg: &str,
     api: &astra_thin_client::ThinClient,
@@ -1223,7 +1225,7 @@ pub(super) async fn handle_info_command(
                     .magenta()
             );
             let _pipeline_modules =
-                crate::session_runtime::create_pipeline_modules_quiet(api, None);
+                crate::cli::session_runtime::create_pipeline_modules_quiet(api, None);
             let mut pm = PermissionManager::with_workspace_trust(false, &project_root);
             let turn_start = std::time::Instant::now();
             let sr = stream_chat_sse(ChatTurnParams {
@@ -1239,7 +1241,8 @@ pub(super) async fn handle_info_command(
                 history: &state.history,
                 perm_manager: &mut pm,
                 verbose_mode: state.verbose_mode,
-                render_policy: crate::stream_render::RenderPolicy::Stream,
+                render_policy: crate::cli::stream_render::RenderPolicy::Stream,
+                cli_context: Some(&state.cli_context),
                 recent_tools: &state.recent_tools,
                 tool_health_entries: &state.tool_health_entries,
                 session_lessons: &state.session_lessons,
@@ -1290,7 +1293,7 @@ pub(super) async fn handle_info_command(
             .await
             .map_err(|f| f.error)?;
             if let Some(session_id) = sr.session_id.as_deref() {
-                crate::chat_turn::initialize_journal_pub(state, session_id);
+                crate::cli::chat_turn::initialize_journal_pub(state, session_id);
                 state.set_session_id(session_id.to_string());
             }
             state.last_response = Some(sr.full_text.clone());
@@ -1456,17 +1459,23 @@ pub(super) async fn handle_info_command(
             }
 
             // Memoria
-            let memoria_base = crate::command_router::resolve_api_url(None);
-            match crate::edge_tools::memoria::memoria_health().await {
-                Ok(_) => rows.push((
-                    true,
+            match crate::cli::config_manager::resolve_api_url(None) {
+                Ok(memoria_base) => match crate::edge_tools::memoria::memoria_health().await {
+                    Ok(_) => rows.push((
+                        true,
+                        "memoria",
+                        format!(
+                            "reachable via {}/memory/health",
+                            memoria_base.trim_end_matches('/')
+                        ),
+                    )),
+                    Err(e) => rows.push((false, "memoria", e)),
+                },
+                Err(error) => rows.push((
+                    false,
                     "memoria",
-                    format!(
-                        "reachable via {}/memory/health",
-                        memoria_base.trim_end_matches('/')
-                    ),
+                    format!("invalid API URL configuration: {error}"),
                 )),
-                Err(e) => rows.push((false, "memoria", e)),
             }
 
             // Print table
@@ -2329,7 +2338,7 @@ fn describe_context_pressure(
 ///
 /// Returns the rendered string so both the handler and tests can consume it
 /// without relying on stderr capture.
-pub(super) fn render_whoami(state: &SessionState) -> String {
+pub(crate) fn render_whoami(state: &SessionState) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let sep = "─".repeat(38);
@@ -2379,7 +2388,7 @@ fn print_whoami(state: &SessionState) {
 }
 
 /// Compact cognition-state view, printed on `/context cognition`.
-pub(super) fn render_cognition(state: &SessionState) -> String {
+pub(crate) fn render_cognition(state: &SessionState) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let sep = "─".repeat(30);
@@ -2510,7 +2519,7 @@ mod tests {
 
     #[test]
     fn build_review_prompt_defaults_to_head() {
-        let prompt = super::build_review_prompt("");
+        let prompt = build_review_prompt("");
         assert!(prompt.contains("Review target: HEAD"));
         assert!(prompt.contains("git_show"));
         assert!(prompt.contains("Do NOT call `read_file`"));
@@ -2518,7 +2527,7 @@ mod tests {
 
     #[test]
     fn build_review_prompt_supports_working_tree() {
-        let prompt = super::build_review_prompt("working");
+        let prompt = build_review_prompt("working");
         assert!(prompt.contains("Review target: WORKING_TREE"));
         assert!(prompt.contains("git_diff"));
         assert!(prompt.contains("Do NOT call `read_file`"));
@@ -2526,7 +2535,7 @@ mod tests {
 
     #[test]
     fn build_review_prompt_local_changes_maps_to_working_tree() {
-        let prompt = super::build_review_prompt("local changes");
+        let prompt = build_review_prompt("local changes");
         assert!(prompt.contains("Review target: WORKING_TREE"));
     }
 
@@ -2588,7 +2597,7 @@ mod tests {
 
     #[test]
     fn build_review_prompt_describes_multi_commit_range() {
-        let prompt = super::build_review_prompt("latest 2 commits");
+        let prompt = build_review_prompt("latest 2 commits");
         assert!(prompt.contains("HEAD~2..HEAD"));
         assert!(prompt.contains("last 2 commits"));
     }
@@ -2649,7 +2658,7 @@ mod tests {
         state.model = Some("gpt-5".to_string());
         state.turn = 3;
         state.history.push(("hi".into(), "hello".into()));
-        let out = super::render_whoami(&state);
+        let out = crate::render_whoami(&state);
         assert!(out.contains("session_id     : sess-abc"), "got: {out}");
         assert!(out.contains("model          : gpt-5"), "got: {out}");
         assert!(out.contains("turn           : 3"), "got: {out}");
@@ -2669,7 +2678,7 @@ mod tests {
                 skill_path: std::path::PathBuf::from("/tmp/git-flow"),
                 improvements: vec![],
             });
-        let out = super::render_whoami(&state);
+        let out = crate::render_whoami(&state);
         assert!(out.contains("pending_improve: git-flow"), "got: {out}");
     }
 
@@ -2677,7 +2686,7 @@ mod tests {
     fn render_cognition_reports_recent_tools_and_proposal_counts() {
         let mut state = SessionState::default();
         state.recent_tools = vec!["bash".into(), "read_file".into()];
-        let out = super::render_cognition(&state);
+        let out = crate::render_cognition(&state);
         assert!(
             out.contains("recent_tools     : bash, read_file"),
             "got: {out}"

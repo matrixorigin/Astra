@@ -1,4 +1,7 @@
-use super::*;
+use super::{IdentityView, identity_view, to_json, verify_runtime_config};
+use astra_config::runtime_config::RuntimeConfig;
+use astra_runtime::self_model::ConstraintSet;
+use astra_runtime::tool_registry::ToolRegistry;
 use astra_services::self_surface::{
     BudgetConfig, LocalSelfSurfaceService, PersistentSelfSnapshot, SelfSurfaceCheck,
     SelfSurfaceDimension, SelfSurfaceResponse, SelfSurfaceRuntimeSupport, SelfSurfaceService,
@@ -46,7 +49,7 @@ impl SelfSurfaceRuntimeSupport for CliSelfSurfaceRuntimeSupport {
     }
 
     fn runtime_checks(&self, tuned_config_json: Option<&str>) -> Vec<SelfSurfaceCheck> {
-        super::verify_runtime_config(tuned_config_json)
+        verify_runtime_config(tuned_config_json)
             .into_iter()
             .map(|check| SelfSurfaceCheck {
                 name: check.name,
@@ -57,7 +60,7 @@ impl SelfSurfaceRuntimeSupport for CliSelfSurfaceRuntimeSupport {
     }
 }
 
-pub(super) async fn render_surface_for_session(
+pub(crate) async fn render_surface_for_session(
     session_id: &str,
     surface: &str,
     journal_limit: usize,

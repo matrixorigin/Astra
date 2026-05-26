@@ -10,7 +10,7 @@ pub(crate) fn enter_local_plan_mode(state: &mut SessionState) {
     state.plan_mode_sync_error = None;
     state
         .perm_manager
-        .set_mode(crate::permission_manager::PermissionMode::Plan);
+        .set_mode(crate::cli::permission_manager::PermissionMode::Plan);
 }
 
 pub(crate) fn exit_local_plan_mode(state: &mut SessionState) {
@@ -18,7 +18,7 @@ pub(crate) fn exit_local_plan_mode(state: &mut SessionState) {
     state.plan_mode_sync_error = None;
     state
         .perm_manager
-        .set_mode(crate::permission_manager::PermissionMode::Auto);
+        .set_mode(crate::cli::permission_manager::PermissionMode::Auto);
 }
 
 async fn resolve_plan_token(
@@ -29,10 +29,10 @@ async fn resolve_plan_token(
     if let Some(token) = token {
         return Some(token.to_string());
     }
-    crate::plan_lifecycle::fresh_token_for_plan(api, profile).await
+    crate::cli::plan_lifecycle::fresh_token_for_plan(api, profile).await
 }
 
-pub(super) async fn handle_plan_command(
+pub(crate) async fn handle_plan_command(
     arg: &str,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
@@ -41,7 +41,8 @@ pub(super) async fn handle_plan_command(
 ) -> Result<(), String> {
     let plan_request = arg.trim();
 
-    if plan_request.is_empty() && crate::plan_lifecycle::looks_like_pending_local_plan_entry(state)
+    if plan_request.is_empty()
+        && crate::cli::plan_lifecycle::looks_like_pending_local_plan_entry(state)
     {
         exit_local_plan_mode(state);
         eprintln!("  {} Exited plan mode.", theme::icon_ok());
@@ -54,7 +55,7 @@ pub(super) async fn handle_plan_command(
             return Ok(());
         };
         let plan_id =
-            crate::plan_lifecycle::exit_remote_plan_mode(api, &token, state, true).await?;
+            crate::cli::plan_lifecycle::exit_remote_plan_mode(api, &token, state, true).await?;
         if let Some(plan_id) = plan_id {
             eprintln!(
                 "  {} Exited plan mode. Approved plan: {}",
@@ -66,7 +67,7 @@ pub(super) async fn handle_plan_command(
         }
         state
             .perm_manager
-            .set_mode(crate::permission_manager::PermissionMode::Auto);
+            .set_mode(crate::cli::permission_manager::PermissionMode::Auto);
         return Ok(());
     }
 
@@ -85,21 +86,21 @@ pub(super) async fn handle_plan_command(
         return Ok(());
     }
 
-    crate::plan_lifecycle::enter_remote_plan_mode(api, profile, &token, state, plan_request)
+    crate::cli::plan_lifecycle::enter_remote_plan_mode(api, profile, &token, state, plan_request)
         .await?;
     state
         .perm_manager
-        .set_mode(crate::permission_manager::PermissionMode::Plan);
+        .set_mode(crate::cli::permission_manager::PermissionMode::Plan);
     eprintln!(
         "  {} Plan mode active. Goal: {}",
         theme::icon_ok(),
         plan_request
     );
-    crate::chat_turn::handle_chat_input(
+    crate::cli::chat_turn::handle_chat_input(
         plan_request.to_string(),
         Some(&token),
         state,
-        crate::chat_turn::TurnContext { api, profile },
+        crate::cli::chat_turn::TurnContext { api, profile },
     )
     .await?;
     Ok(())
@@ -120,9 +121,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(crate::plan_lifecycle::looks_like_pending_local_plan_entry(
-            &state
-        ));
+        assert!(crate::cli::plan_lifecycle::looks_like_pending_local_plan_entry(&state));
         assert!(
             state.plan_mode_active(),
             "bare /plan should switch UI into plan mode"
@@ -136,7 +135,7 @@ mod tests {
         state.cloud_plan_mirror = Some(plan::PlanModeState::new(String::new()));
         state
             .perm_manager
-            .set_mode(crate::permission_manager::PermissionMode::Plan);
+            .set_mode(crate::cli::permission_manager::PermissionMode::Plan);
 
         handle_plan_command("", &api, None, &mut state, None)
             .await
@@ -184,7 +183,7 @@ mod tests {
         state.cloud_plan_mirror = Some(plan::PlanModeState::new("Ship auth".to_string()));
         state
             .perm_manager
-            .set_mode(crate::permission_manager::PermissionMode::Plan);
+            .set_mode(crate::cli::permission_manager::PermissionMode::Plan);
 
         handle_plan_command("", &api, None, &mut state, Some("token"))
             .await

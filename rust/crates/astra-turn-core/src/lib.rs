@@ -50,6 +50,7 @@ pub mod explain_report_lines;
 pub mod file_edit_journal;
 pub mod followup_suggestion;
 pub mod fork;
+pub mod guardrails;
 pub mod headless;
 pub mod history;
 pub mod hook_plans;

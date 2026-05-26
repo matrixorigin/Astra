@@ -17,6 +17,7 @@ use astra_turn_core::tool_policy::is_tool_concurrency_safe;
 use astra_turn_core::tool_result_semantics::{
     cloud_tool_result_status_label, tool_dedup_signature, tool_error_triggers_rollback,
 };
+use crossterm::execute;
 use crossterm::style::Stylize;
 use futures_util::FutureExt;
 use futures_util::StreamExt;
@@ -348,7 +349,7 @@ fn approval_memory_action(
 }
 
 fn persist_scoped_allow_rule(
-    pm: &mut crate::permission_manager::PermissionManager,
+    pm: &mut crate::cli::permission_manager::PermissionManager,
     target: astra_turn_core::permission::audit::PersistTarget,
     tool: &str,
     args: &Value,
@@ -365,7 +366,7 @@ fn persist_scoped_allow_rule(
     let remember_preview =
         astra_turn_core::permission::match_target::remember_preview(tool, args, location);
     pm.record_approval_with_match_target(tool, args, match_target, true);
-    let rule = crate::permission_manager::PermissionManager::make_allow_rule_with_match_target(
+    let rule = crate::cli::permission_manager::PermissionManager::make_allow_rule_with_match_target(
         tool,
         args,
         match_target,
@@ -392,7 +393,7 @@ fn persist_scoped_allow_rule(
 }
 
 fn apply_approval_memory_action(
-    pm: &mut crate::permission_manager::PermissionManager,
+    pm: &mut crate::cli::permission_manager::PermissionManager,
     action: ApprovalMemoryAction,
     tool: &str,
     args: &Value,
@@ -440,7 +441,7 @@ pub use astra_turn_core::chat_turn_sse_dispatch::ChatTurnEdgePending;
 
 // Re-export effects types for callers
 pub(crate) use super::effects::{ChatPrepPhaseLabel, ChatTurnPrepLineGuard};
-pub(super) use super::effects::{
+pub(crate) use super::effects::{
     Spinner, ThinkingPreviewPane, ToolRunningLineSpinner, TtftWaitLineSpinner,
 };
 
@@ -515,7 +516,7 @@ struct EdgeToolCacheEntry {
     validation: EdgeToolCacheValidation,
 }
 
-pub(super) struct EdgeToolCache {
+pub(crate) struct EdgeToolCache {
     /// `dedup_signature → cached output + validity contract` for safe replay.
     output_cache: std::collections::HashMap<String, EdgeToolCacheEntry>,
     /// `dedup_signature → count` across all turns.
@@ -568,13 +569,13 @@ impl EdgeToolCacheValidation {
 }
 
 /// When set, SSE `tool_request` / `approval_required` are handled and posted to the cloud API.
-pub(super) struct EdgeSseContext<'a> {
+pub(crate) struct EdgeSseContext<'a> {
     pub api: &'a astra_thin_client::ThinClient,
     pub token: &'a str,
     pub executor_id: &'a str,
     pub executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
     pub render_policy: RenderPolicy,
-    pub perm_manager: Option<&'a mut crate::permission_manager::PermissionManager>,
+    pub perm_manager: Option<&'a mut crate::cli::permission_manager::PermissionManager>,
     /// Optional cancellation token to abort SSE stream on auth failure.
     pub cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
     /// Optional channel for forwarding fine-grained stream events.
@@ -613,7 +614,7 @@ pub(super) struct EdgeSseContext<'a> {
 /// Delegates protocol parsing to runtime's [`consume_sse_stream`] while handling:
 /// - Terminal rendering (spinners, text deltas) via [`StreamRenderState`]
 /// - Edge tool execution via [`crate::edge_tools::ToolExecutor`]
-/// - Approval prompts via [`crate::permission_manager::PermissionManager`]
+/// - Approval prompts via [`crate::cli::permission_manager::PermissionManager`]
 /// - Cloud API posting (tool results, approvals) via [`astra_thin_client::ThinClient`]
 struct CliSseStreamHost<'a> {
     api: &'a astra_thin_client::ThinClient,
@@ -622,7 +623,7 @@ struct CliSseStreamHost<'a> {
     executor_id: &'a str,
     executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
     render_policy: RenderPolicy,
-    perm_manager: Option<&'a mut crate::permission_manager::PermissionManager>,
+    perm_manager: Option<&'a mut crate::cli::permission_manager::PermissionManager>,
     render: StreamRenderState,
     /// Once this turn has emitted or requested tool work, hide any further prose
     /// so we don't flash an intermediate draft that will be invalidated.
@@ -972,7 +973,10 @@ impl<'a> CliSseStreamHost<'a> {
         };
         self.token = new_token;
         if !self.render_policy.is_silent() {
-            eprintln!("  {} Token refreshed, continuing…", crate::theme::icon_ok());
+            eprintln!(
+                "  {} Token refreshed, continuing…",
+                crate::cli::theme::icon_ok()
+            );
         }
         true
     }
@@ -2577,7 +2581,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let cloud_approved = self.cloud_pre_approved.remove(request_id);
 
         let decision = if cloud_approved {
-            crate::permission_manager::PermissionDecision::Allow
+            crate::cli::permission_manager::PermissionDecision::Allow
         } else {
             match self.perm_manager.as_mut() {
                 Some(pm) => crate::tool_safety_guard::ToolSafetyGuard::check_request(
@@ -2590,12 +2594,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         };
         let mut denied_output = None;
         let mut allowed = match decision {
-            crate::permission_manager::PermissionDecision::Allow => true,
-            crate::permission_manager::PermissionDecision::Deny(reason) => {
-                denied_output = Some(crate::permission_manager::format_denied_message(&reason));
+            crate::cli::permission_manager::PermissionDecision::Allow => true,
+            crate::cli::permission_manager::PermissionDecision::Deny(reason) => {
+                denied_output = Some(crate::cli::permission_manager::format_denied_message(
+                    &reason,
+                ));
                 false
             }
-            crate::permission_manager::PermissionDecision::NeedApproval {
+            crate::cli::permission_manager::PermissionDecision::NeedApproval {
                 tool: t,
                 header,
                 detail,
@@ -2996,9 +3002,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             &guard_args,
                         );
                         let approved = match decision {
-                            crate::permission_manager::PermissionDecision::Allow => true,
-                            crate::permission_manager::PermissionDecision::Deny(_) => false,
-                            crate::permission_manager::PermissionDecision::NeedApproval {
+                            crate::cli::permission_manager::PermissionDecision::Allow => true,
+                            crate::cli::permission_manager::PermissionDecision::Deny(_) => false,
+                            crate::cli::permission_manager::PermissionDecision::NeedApproval {
                                 header,
                                 detail,
                                 reason,
@@ -3035,7 +3041,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         Some(astra_turn_core::permission::scope::AllowScope::Project) => {
                                             // Persistent: writes a tool-level allow
                                             // rule to settings for future sessions.
-                                            let rule = crate::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
+                                            let rule = crate::cli::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
                                             let remember_preview =
                                                 astra_turn_core::permission::match_target::remember_preview(
                                                     &sandbox_tool_key,
@@ -3066,7 +3072,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         Some(
                                             astra_turn_core::permission::scope::AllowScope::User,
                                         ) => {
-                                            let rule = crate::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
+                                            let rule = crate::cli::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
                                             let remember_preview =
                                                 astra_turn_core::permission::match_target::remember_preview(
                                                     &sandbox_tool_key,
@@ -3548,7 +3554,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             };
             let ok = matches!(
                 decision,
-                crate::permission_manager::PermissionDecision::Allow
+                crate::cli::permission_manager::PermissionDecision::Allow
             );
             if !ok {
                 all_allowed = false;
@@ -3823,8 +3829,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 &guard_args,
             );
             let approved = match decision {
-                crate::permission_manager::PermissionDecision::Allow => true,
-                crate::permission_manager::PermissionDecision::Deny(reason) => {
+                crate::cli::permission_manager::PermissionDecision::Allow => true,
+                crate::cli::permission_manager::PermissionDecision::Deny(reason) => {
                     // Surface the deny reason so the LLM and user can
                     // see why the sandbox refused to widen, instead of
                     // silently continuing with the original
@@ -3841,7 +3847,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     }
                     false
                 }
-                crate::permission_manager::PermissionDecision::NeedApproval {
+                crate::cli::permission_manager::PermissionDecision::NeedApproval {
                     tool: approval_tool,
                     header,
                     detail,
@@ -4125,14 +4131,14 @@ fn build_streaming_tool_exec(
 // ─── Turn result from one /chat/turn SSE stream ───────────────────────────────
 
 /// One turn: core fields from [`ChatTurnSseAccum`] plus CLI-only edge bookkeeping and TTFT.
-pub(super) struct TurnResult {
-    pub(super) core: ChatTurnSseAccum,
+pub(crate) struct TurnResult {
+    pub(crate) core: ChatTurnSseAccum,
     /// Time to first token in milliseconds (streaming latency).
-    pub(super) ttft_ms: Option<u64>,
+    pub(crate) ttft_ms: Option<u64>,
     /// Ordered executions from this SSE stream (for rounds without legacy `tool_call` events).
-    pub(super) edge_tool_round: Vec<EdgeToolExecResult>,
+    pub(crate) edge_tool_round: Vec<EdgeToolExecResult>,
     /// New access token obtained by an in-stream auth refresh, if any.
-    pub(super) refreshed_token: Option<String>,
+    pub(crate) refreshed_token: Option<String>,
 }
 
 impl Deref for TurnResult {
@@ -4151,7 +4157,7 @@ impl DerefMut for TurnResult {
 
 impl TurnResult {
     #[cfg(test)]
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             core: ChatTurnSseAccum::default(),
             ttft_ms: None,
@@ -4162,7 +4168,7 @@ impl TurnResult {
 }
 
 /// Live rendering state tracked across SSE chunks within one turn.
-pub(super) struct StreamRenderState {
+pub(crate) struct StreamRenderState {
     /// True while showing the pre-TTFT “waiting for model” spinner (skip thought-duration log).
     waiting_for_first_sse: bool,
     thinking_start: Option<Instant>,
@@ -4171,7 +4177,7 @@ pub(super) struct StreamRenderState {
     thinking_pane: Option<ThinkingPreviewPane>,
     /// Lines written to the terminal during streaming (stdout + stderr).
     /// Used by the re-render pass to clear all streamed output.
-    pub(super) lines_written: usize,
+    pub(crate) lines_written: usize,
     /// Current column position for wrap tracking.
     col: usize,
     /// Terminal width for wrap calculation.
@@ -4316,7 +4322,7 @@ fn tool_completion_icon(
 
 impl StreamRenderState {
     #[cfg(test)]
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_term_width(80, false, false)
     }
 
@@ -4361,7 +4367,7 @@ impl StreamRenderState {
     }
 
     /// Account for text written to the terminal (stdout or stderr).
-    pub(super) fn track_output(&mut self, text: &str) {
+    pub(crate) fn track_output(&mut self, text: &str) {
         for ch in text.chars() {
             if ch == '\n' {
                 self.lines_written += 1;
@@ -4378,7 +4384,7 @@ impl StreamRenderState {
 
     /// Account for a full line written via eprintln! (adds 1 line).
     #[allow(dead_code)]
-    pub(super) fn track_eprintln(&mut self) {
+    pub(crate) fn track_eprintln(&mut self) {
         self.stderr_lines += 1;
         if self.md.is_none() {
             self.lines_written += 1;
@@ -6453,7 +6459,7 @@ fn apply_sse_render_effects(
 ///
 /// If `cancel_token` is provided, the stream can be cancelled mid-flight by triggering the token.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn consume_turn_sse(
+pub(crate) async fn consume_turn_sse(
     prep_line: ChatTurnPrepLineGuard,
     resp: astra_thin_client::HttpResponse,
     render_md: bool,
@@ -6589,7 +6595,7 @@ pub(super) async fn consume_turn_sse(
 
 /// Used by `main` test module and stream_render unit tests; production path is [`consume_turn_sse`].
 #[allow(dead_code)]
-pub(super) fn dispatch_turn_event_block(
+pub(crate) fn dispatch_turn_event_block(
     block: &str,
     result: &mut TurnResult,
     render: &mut StreamRenderState,
@@ -6679,7 +6685,7 @@ fn append_skill_loaded_marker(result: &str, skill_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli_utils::{CredentialsFile, Profile, save_credentials};
+    use crate::cli::cli_utils::{CredentialsFile, Profile, save_credentials};
     use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
     use tempfile::tempdir;
     use wiremock::matchers::{header, method, path};
@@ -7106,7 +7112,8 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
-        let mut pm = crate::permission_manager::PermissionManager::with_project(false, temp.path());
+        let mut pm =
+            crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let (approval_tx, mut approval_rx) =
             tokio::sync::mpsc::unbounded_channel::<super::chat_stream::ApprovalRequest>();
         let mut host = CliSseStreamHost::from_edge_ctx(
@@ -7160,7 +7167,8 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
-        let mut pm = crate::permission_manager::PermissionManager::with_project(false, temp.path());
+        let mut pm =
+            crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let (approval_tx, mut approval_rx) =
             tokio::sync::mpsc::unbounded_channel::<super::chat_stream::ApprovalRequest>();
 
@@ -7208,10 +7216,10 @@ mod tests {
 
         let args = serde_json::json!({"path": "src/main.rs"});
         let mut reloaded =
-            crate::permission_manager::PermissionManager::with_project(false, temp.path());
+            crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         assert!(matches!(
             reloaded.check_nonblocking("write_file", &args),
-            crate::permission_manager::PermissionDecision::Allow
+            crate::cli::permission_manager::PermissionDecision::Allow
         ));
     }
 
@@ -7222,7 +7230,8 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
-        let mut pm = crate::permission_manager::PermissionManager::with_project(false, temp.path());
+        let mut pm =
+            crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let (approval_tx, mut approval_rx) =
             tokio::sync::mpsc::unbounded_channel::<super::chat_stream::ApprovalRequest>();
 
@@ -7271,13 +7280,13 @@ mod tests {
         let args = serde_json::json!({"path": ".env"});
         assert!(matches!(
             pm.check_nonblocking("write_file", &args),
-            crate::permission_manager::PermissionDecision::Allow
+            crate::cli::permission_manager::PermissionDecision::Allow
         ));
         let mut reloaded =
-            crate::permission_manager::PermissionManager::with_project(false, temp.path());
+            crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         assert!(matches!(
             reloaded.check_nonblocking("write_file", &args),
-            crate::permission_manager::PermissionDecision::NeedApproval { .. }
+            crate::cli::permission_manager::PermissionDecision::NeedApproval { .. }
         ));
     }
 
@@ -7700,7 +7709,7 @@ mod tests {
 
     #[test]
     fn could_become_suppressed_tag_matches_known_prefixes() {
-        use super::super::streaming_md::could_become_suppressed_tag;
+        use crate::cli::streaming_md::could_become_suppressed_tag;
         assert!(could_become_suppressed_tag("<"));
         assert!(could_become_suppressed_tag("</"));
         assert!(could_become_suppressed_tag("<t"));
@@ -7716,7 +7725,7 @@ mod tests {
 
     #[test]
     fn could_become_suppressed_tag_rejects_other_tags() {
-        use super::super::streaming_md::could_become_suppressed_tag;
+        use crate::cli::streaming_md::could_become_suppressed_tag;
         assert!(!could_become_suppressed_tag("<co")); // <code>
         assert!(!could_become_suppressed_tag("<p"));
         assert!(!could_become_suppressed_tag("<div"));
@@ -7745,7 +7754,7 @@ mod tests {
             "_cli_unified_diff": diff_body,
         })
         .to_string();
-        let got = super::extract_cli_diff_block(&out).expect("diff");
+        let got = extract_cli_diff_block(&out).expect("diff");
         assert_eq!(got.as_ref(), diff_body);
     }
 
@@ -7753,7 +7762,7 @@ mod tests {
     fn extract_cli_diff_sentinel_wrapped() {
         let embedded = "+++ b/f\n+ok\n";
         let out = format!("<<<ASTRA_UNIFIED_DIFF>>>{embedded}<<<END_ASTRA_UNIFIED_DIFF>>>");
-        let got = super::extract_cli_diff_block(&out).expect("diff");
+        let got = extract_cli_diff_block(&out).expect("diff");
         assert_eq!(got.as_ref(), embedded.trim());
     }
 
@@ -8444,7 +8453,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         // and rendering is handled by host.render_final_text() in the agentic loop.
         // This test verifies the contract by checking that result.full_text
         // carries the answer text without any stdout side-effects.
-        let mut result = super::TurnResult::new();
+        let mut result = TurnResult::new();
         result.core.full_text = "The answer is 42.".to_string();
         assert!(!result.core.has_tool_calls);
         assert!(result.edge_tool_round.is_empty());
@@ -8455,7 +8464,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
     #[test]
     fn tool_turn_discards_text_buffer() {
         // When tools are present, text is intermediate and should be discarded.
-        let mut result = super::TurnResult::new();
+        let mut result = TurnResult::new();
         result.core.full_text = "Let me use a tool...".to_string();
         result.core.has_tool_calls = true;
         let has_any_tool_work = result.core.has_tool_calls || !result.edge_tool_round.is_empty();

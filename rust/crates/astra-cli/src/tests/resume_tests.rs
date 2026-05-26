@@ -1,6 +1,6 @@
 use super::chat_stream_tests::sse_text_response;
 use super::*;
-use crate::cli_utils::{CredentialsFile, Profile, save_credentials};
+use crate::cli::cli_utils::{CredentialsFile, Profile, save_credentials};
 use axum::response::IntoResponse;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -290,7 +290,11 @@ async fn initialize_session_state_marks_workspace_session_as_pending_recovery() 
     );
     save_credentials(&creds).unwrap();
 
-    let state = session_runtime::initialize_session_state(None, None);
+    let state = session_runtime::initialize_session_state(
+        None,
+        None,
+        &crate::cli::cli_context::CliContext::default(),
+    );
     assert_eq!(state.session_id, None);
     assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
     assert!(state.history.is_empty());
@@ -421,7 +425,11 @@ async fn crash_recovery_short_continue_starts_fresh_session_without_auto_restore
     );
     save_credentials(&creds).unwrap();
 
-    let mut state = session_runtime::initialize_session_state(None, Some("gpt-4o"));
+    let mut state = session_runtime::initialize_session_state(
+        None,
+        Some("gpt-4o"),
+        &crate::cli::cli_context::CliContext::default(),
+    );
     assert_eq!(state.session_id, None);
     assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
 
@@ -563,7 +571,11 @@ async fn crash_recovery_low_information_repair_followup_does_not_auto_restore() 
     );
     save_credentials(&creds).unwrap();
 
-    let mut state = session_runtime::initialize_session_state(None, Some("qwen3.6-plus"));
+    let mut state = session_runtime::initialize_session_state(
+        None,
+        Some("qwen3.6-plus"),
+        &crate::cli::cli_context::CliContext::default(),
+    );
     assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
 
     #[derive(Clone)]

@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/task_list/snapshot_tests.rs
+assertion_line: 123
 expression: "draw(&tasks, 80, 24, false)"
 ---
 ⠋ blocker-running

@@ -373,6 +373,6 @@ mod tests {
 
     #[test]
     fn snapshot_full_band_120() {
-        insta::assert_snapshot!("turn_summary_full_120", render(&mk_full(), 120));
+        crate::tui::testing::assert_tui_snapshot!("turn_summary_full_120", render(&mk_full(), 120));
     }
 }

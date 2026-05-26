@@ -415,14 +415,17 @@ mod tests {
     #[test]
     fn snapshot_three_sessions_default_selection() {
         let d = fixture();
-        insta::assert_snapshot!("session_picker_default_100x10", render_picker(&d, 100, 10));
+        crate::tui::testing::assert_tui_snapshot!(
+            "session_picker_default_100x10",
+            render_picker(&d, 100, 10)
+        );
     }
 
     #[test]
     fn snapshot_filtered_to_single_match() {
         let mut d = fixture();
         d.set_filter("auth");
-        insta::assert_snapshot!(
+        crate::tui::testing::assert_tui_snapshot!(
             "session_picker_filter_auth_100x10",
             render_picker(&d, 100, 10)
         );
@@ -431,21 +434,27 @@ mod tests {
     #[test]
     fn snapshot_narrow_collapses_to_single_pane() {
         let d = fixture();
-        insta::assert_snapshot!("session_picker_narrow_60x10", render_picker(&d, 60, 10));
+        crate::tui::testing::assert_tui_snapshot!(
+            "session_picker_narrow_60x10",
+            render_picker(&d, 60, 10)
+        );
     }
 
     #[test]
     fn snapshot_empty_state_no_filter() {
         let src = StaticSessionSource::new(vec![]);
         let d = SessionDiscovery::new(src, 10);
-        insta::assert_snapshot!("session_picker_empty_80x4", render_picker(&d, 80, 4));
+        crate::tui::testing::assert_tui_snapshot!(
+            "session_picker_empty_80x4",
+            render_picker(&d, 80, 4)
+        );
     }
 
     #[test]
     fn snapshot_empty_after_filter() {
         let mut d = fixture();
         d.set_filter("zzz_nope");
-        insta::assert_snapshot!(
+        crate::tui::testing::assert_tui_snapshot!(
             "session_picker_empty_filtered_80x4",
             render_picker(&d, 80, 4)
         );
@@ -455,7 +464,7 @@ mod tests {
     fn snapshot_selection_moved_down() {
         let mut d = fixture();
         d.move_down();
-        insta::assert_snapshot!(
+        crate::tui::testing::assert_tui_snapshot!(
             "session_picker_second_selected_100x10",
             render_picker(&d, 100, 10)
         );

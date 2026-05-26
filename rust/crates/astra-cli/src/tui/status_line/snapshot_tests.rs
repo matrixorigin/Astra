@@ -32,7 +32,10 @@ fn base_ctx() -> StatusContext {
 
 #[test]
 fn snapshot_idle_minimal() {
-    insta::assert_snapshot!("status_idle_minimal_80", render_ctx(&base_ctx(), 80));
+    crate::tui::testing::assert_tui_snapshot!(
+        "status_idle_minimal_80",
+        render_ctx(&base_ctx(), 80)
+    );
 }
 
 #[test]
@@ -41,7 +44,7 @@ fn snapshot_turn_active() {
         turn_active: true,
         ..base_ctx()
     };
-    insta::assert_snapshot!("status_turn_active_80", render_ctx(&ctx, 80));
+    crate::tui::testing::assert_tui_snapshot!("status_turn_active_80", render_ctx(&ctx, 80));
 }
 
 #[test]
@@ -50,7 +53,7 @@ fn snapshot_auto_mode() {
         permission_mode: PermissionMode::Auto,
         ..base_ctx()
     };
-    insta::assert_snapshot!("status_auto_mode_80", render_ctx(&ctx, 80));
+    crate::tui::testing::assert_tui_snapshot!("status_auto_mode_80", render_ctx(&ctx, 80));
 }
 
 #[test]
@@ -59,7 +62,7 @@ fn snapshot_deny_mode() {
         permission_mode: PermissionMode::Deny,
         ..base_ctx()
     };
-    insta::assert_snapshot!("status_deny_mode_80", render_ctx(&ctx, 80));
+    crate::tui::testing::assert_tui_snapshot!("status_deny_mode_80", render_ctx(&ctx, 80));
 }
 
 #[test]
@@ -69,7 +72,10 @@ fn snapshot_high_token_usage_with_cost() {
         cost_usd: Some(3.47),
         ..base_ctx()
     };
-    insta::assert_snapshot!("status_high_tokens_with_cost_80", render_ctx(&ctx, 80));
+    crate::tui::testing::assert_tui_snapshot!(
+        "status_high_tokens_with_cost_80",
+        render_ctx(&ctx, 80)
+    );
 }
 
 #[test]
@@ -78,7 +84,7 @@ fn snapshot_git_branch_included() {
         git_branch: Some("enhance_tui".into()),
         ..base_ctx()
     };
-    insta::assert_snapshot!("status_with_git_branch_80", render_ctx(&ctx, 80));
+    crate::tui::testing::assert_tui_snapshot!("status_with_git_branch_80", render_ctx(&ctx, 80));
 }
 
 #[test]
@@ -93,7 +99,7 @@ fn snapshot_full_context_80() {
         git_branch: Some("enhance_tui".into()),
         ..StatusContext::default()
     };
-    insta::assert_snapshot!("status_full_context_80", render_ctx(&ctx, 80));
+    crate::tui::testing::assert_tui_snapshot!("status_full_context_80", render_ctx(&ctx, 80));
 }
 
 #[test]
@@ -105,7 +111,7 @@ fn snapshot_narrow_drops_right_segments() {
         git_branch: Some("enhance_tui".into()),
         ..StatusContext::default()
     };
-    insta::assert_snapshot!("status_narrow_drops_40", render_ctx(&ctx, 40));
+    crate::tui::testing::assert_tui_snapshot!("status_narrow_drops_40", render_ctx(&ctx, 40));
 }
 
 #[test]
@@ -114,7 +120,7 @@ fn snapshot_pending_approvals_chip() {
         pending_approvals: 3,
         ..base_ctx()
     };
-    insta::assert_snapshot!("status_pending_approvals_80", render_ctx(&ctx, 80));
+    crate::tui::testing::assert_tui_snapshot!("status_pending_approvals_80", render_ctx(&ctx, 80));
 }
 
 #[test]
@@ -124,7 +130,7 @@ fn snapshot_pending_with_auto_mode() {
         permission_mode: PermissionMode::Auto,
         ..base_ctx()
     };
-    insta::assert_snapshot!("status_pending_and_auto_80", render_ctx(&ctx, 80));
+    crate::tui::testing::assert_tui_snapshot!("status_pending_and_auto_80", render_ctx(&ctx, 80));
 }
 
 #[test]
@@ -133,7 +139,7 @@ fn snapshot_very_long_cwd_truncates() {
         cwd: Some("~/a/very/very/very/deep/project/path/that/exceeds/limit".into()),
         ..StatusContext::default()
     };
-    insta::assert_snapshot!("status_long_cwd_80", render_ctx(&ctx, 80));
+    crate::tui::testing::assert_tui_snapshot!("status_long_cwd_80", render_ctx(&ctx, 80));
 }
 
 #[test]
@@ -143,7 +149,10 @@ fn snapshot_task_chip_collapsed_mixed() {
         task_board_expanded: false,
         ..base_ctx()
     };
-    insta::assert_snapshot!("status_task_chip_collapsed_80", render_ctx(&ctx, 80));
+    crate::tui::testing::assert_tui_snapshot!(
+        "status_task_chip_collapsed_80",
+        render_ctx(&ctx, 80)
+    );
 }
 
 #[test]
@@ -153,7 +162,7 @@ fn snapshot_task_chip_expanded_mixed() {
         task_board_expanded: true,
         ..base_ctx()
     };
-    insta::assert_snapshot!("status_task_chip_expanded_80", render_ctx(&ctx, 80));
+    crate::tui::testing::assert_tui_snapshot!("status_task_chip_expanded_80", render_ctx(&ctx, 80));
 }
 
 #[test]
@@ -163,7 +172,7 @@ fn snapshot_task_chip_all_done() {
         task_board_expanded: false,
         ..base_ctx()
     };
-    insta::assert_snapshot!("status_task_chip_all_done_80", render_ctx(&ctx, 80));
+    crate::tui::testing::assert_tui_snapshot!("status_task_chip_all_done_80", render_ctx(&ctx, 80));
 }
 
 #[test]
@@ -173,5 +182,5 @@ fn snapshot_task_chip_empty_board_hidden() {
         task_counts: Some((0, 0)),
         ..base_ctx()
     };
-    insta::assert_snapshot!("status_task_chip_empty_80", render_ctx(&ctx, 80));
+    crate::tui::testing::assert_tui_snapshot!("status_task_chip_empty_80", render_ctx(&ctx, 80));
 }

@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::oneshot;
 
 use super::{ApprovalActivation, BottomPane, BottomPaneAction};
-use crate::chat_stream::ApprovalResponse;
+use crate::cli::chat_stream::ApprovalResponse;
 use crate::tui::approval::queue::ApprovalMetadata;
 use crate::tui::slash_menu::SlashItem;
 

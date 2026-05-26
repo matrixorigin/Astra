@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/system.rs
+assertion_line: 363
 expression: "render(&SystemCell::warning(\"token budget 80%\"), 40, 1)"
 ---
   token budget 80%

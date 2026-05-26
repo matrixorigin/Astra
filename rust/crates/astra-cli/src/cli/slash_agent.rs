@@ -920,7 +920,7 @@ fn format_status(status: &AgentStatus) -> String {
     }
 }
 
-pub(super) fn format_duration(d: std::time::Duration) -> String {
+pub(crate) fn format_duration(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
         format!("{secs}s")

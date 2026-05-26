@@ -10,7 +10,9 @@ use std::process::Command;
 
 use crossterm::style::Stylize;
 
-use crate::terminal_hyperlinks::{osc8_link, sanitize_osc8_component, terminal_hyperlinks_enabled};
+use crate::cli::terminal_hyperlinks::{
+    osc8_link, sanitize_osc8_component, terminal_hyperlinks_enabled,
+};
 
 /// Max bytes read from `git diff` / `git show` (avoid OOM on huge trees).
 const MAX_DIFF_BYTES: usize = 2_000_000;

@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/timeline/view.rs
+assertion_line: 628
 expression: "render_tl(&tl, 80, 3)"
 ---
 ┌ Timeline · 0 turns · 0 in 0 out ─────────────────────────────────────────────┐

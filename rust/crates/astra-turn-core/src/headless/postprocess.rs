@@ -3,11 +3,11 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use crate::error_recovery::{ErrorCategory, build_recovery_message, classify_error};
+use crate::guardrails::error_recovery::{ErrorCategory, build_recovery_message, classify_error};
+use crate::guardrails::turn_guard::TurnGuard;
 use crate::headless_tool_assembly::{HeadlessRoundToolIdx, headless_timeout_aborted_tool_names};
 use crate::result_quality::ResultQuality;
 use crate::tool::result::semantics::is_resource_limit_output;
-use crate::turn_guard::TurnGuard;
 use astra_pipeline::step_checkpoint;
 use astra_pipeline::step_protocol::{
     CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache, StepCheckpoint, epoch_ms,

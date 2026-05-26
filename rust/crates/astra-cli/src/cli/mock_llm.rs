@@ -5,7 +5,7 @@
 //! channels, delegation engine, tool execution, journal) runs for real.
 //!
 //! # Usage
-//! ```
+//! ```text
 //! /team run dev "build login page" --mock complete
 //! /team run dev "build login page" --mock tool_then_complete
 //! /team run dev "build login page" --mock multi_turn
@@ -60,7 +60,7 @@ pub enum MockScenario {
 }
 
 impl MockScenario {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "complete" => Some(Self::Complete),
             "tool_then_complete" | "tool" => Some(Self::ToolThenComplete),
@@ -550,35 +550,29 @@ mod tests {
     fn scenario_from_str_roundtrip() {
         for (name, _) in MockScenario::all() {
             assert!(
-                MockScenario::from_str(name).is_some(),
+                MockScenario::parse(name).is_some(),
                 "scenario '{name}' not parseable"
             );
         }
-        assert!(MockScenario::from_str("nonexistent").is_none());
+        assert!(MockScenario::parse("nonexistent").is_none());
         // Aliases
         assert_eq!(
-            MockScenario::from_str("tool"),
+            MockScenario::parse("tool"),
             Some(MockScenario::ToolThenComplete)
         );
+        assert_eq!(MockScenario::parse("multi"), Some(MockScenario::MultiTurn));
+        assert_eq!(MockScenario::parse("error"), Some(MockScenario::Fail));
         assert_eq!(
-            MockScenario::from_str("multi"),
-            Some(MockScenario::MultiTurn)
-        );
-        assert_eq!(MockScenario::from_str("error"), Some(MockScenario::Fail));
-        assert_eq!(
-            MockScenario::from_str("chunk_split"),
+            MockScenario::parse("chunk_split"),
             Some(MockScenario::SseChunkSplit)
         );
         assert_eq!(
-            MockScenario::from_str("malformed"),
+            MockScenario::parse("malformed"),
             Some(MockScenario::MalformedJson)
         );
+        assert_eq!(MockScenario::parse("429"), Some(MockScenario::RateLimited));
         assert_eq!(
-            MockScenario::from_str("429"),
-            Some(MockScenario::RateLimited)
-        );
-        assert_eq!(
-            MockScenario::from_str("no_tools"),
+            MockScenario::parse("no_tools"),
             Some(MockScenario::TextOnly)
         );
     }

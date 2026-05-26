@@ -41,7 +41,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
 use super::SlashMenu;
-use crate::command_registry::CommandGroup;
+use crate::cli::command_registry::CommandGroup;
 
 /// Maximum number of **data rows** shown at once. Does not include the
 /// scroll-indicator rows (↑ N more / ↓ N more).
@@ -441,34 +441,49 @@ mod tests {
     #[test]
     fn snapshot_three_items_default_selection() {
         let menu = menu_fixture();
-        insta::assert_snapshot!("slash_popup_three_default_80", render_menu(&menu, 80, 5));
+        crate::tui::testing::assert_tui_snapshot!(
+            "slash_popup_three_default_80",
+            render_menu(&menu, 80, 5)
+        );
     }
 
     #[test]
     fn snapshot_filtered_to_one() {
         let mut menu = menu_fixture();
         menu.set_filter("/he");
-        insta::assert_snapshot!("slash_popup_filtered_he_80", render_menu(&menu, 80, 5));
+        crate::tui::testing::assert_tui_snapshot!(
+            "slash_popup_filtered_he_80",
+            render_menu(&menu, 80, 5)
+        );
     }
 
     #[test]
     fn snapshot_second_item_selected() {
         let mut menu = menu_fixture();
         menu.move_down();
-        insta::assert_snapshot!("slash_popup_second_selected_80", render_menu(&menu, 80, 5));
+        crate::tui::testing::assert_tui_snapshot!(
+            "slash_popup_second_selected_80",
+            render_menu(&menu, 80, 5)
+        );
     }
 
     #[test]
     fn snapshot_no_matches_shows_message() {
         let mut menu = menu_fixture();
         menu.set_filter("/zzz_no_match_here");
-        insta::assert_snapshot!("slash_popup_no_matches_80", render_menu(&menu, 80, 3));
+        crate::tui::testing::assert_tui_snapshot!(
+            "slash_popup_no_matches_80",
+            render_menu(&menu, 80, 3)
+        );
     }
 
     #[test]
     fn snapshot_narrow_truncates_description() {
         let menu = menu_fixture();
-        insta::assert_snapshot!("slash_popup_narrow_28", render_menu(&menu, 28, 5));
+        crate::tui::testing::assert_tui_snapshot!(
+            "slash_popup_narrow_28",
+            render_menu(&menu, 28, 5)
+        );
     }
 
     #[test]
@@ -486,13 +501,16 @@ mod tests {
         for _ in 0..11 {
             menu.move_down();
         }
-        insta::assert_snapshot!("slash_popup_long_list_sel11_80", render_menu(&menu, 80, 12));
+        crate::tui::testing::assert_tui_snapshot!(
+            "slash_popup_long_list_sel11_80",
+            render_menu(&menu, 80, 12)
+        );
     }
 
     #[test]
     fn snapshot_groups_with_headers() {
         // 6 items across 3 groups — should render group headers.
-        use crate::command_registry::CommandGroup;
+        use crate::cli::command_registry::CommandGroup;
         let items: Vec<SlashItem> = vec![
             SlashItem {
                 name: "/help",
@@ -532,7 +550,7 @@ mod tests {
             },
         ];
         let menu = SlashMenu::new(items);
-        insta::assert_snapshot!(
+        crate::tui::testing::assert_tui_snapshot!(
             "slash_popup_groups_with_headers_80",
             render_menu(&menu, 80, 10)
         );
@@ -597,7 +615,7 @@ mod tests {
 
     #[test]
     fn selected_item_shows_subcommands() {
-        use crate::command_registry::TuiHandler;
+        use crate::cli::command_registry::TuiHandler;
 
         const SUBS: &[(&str, &str)] = &[
             ("list", "List all memories"),

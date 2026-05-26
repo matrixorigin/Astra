@@ -1,4 +1,4 @@
-use super::{SessionState, StreamResult};
+use crate::{SessionState, StreamResult};
 pub(crate) use astra_turn_core::followup_suggestion::FollowupSuggestion;
 #[cfg(test)]
 use astra_turn_core::followup_suggestion::FollowupSuggestionKind;

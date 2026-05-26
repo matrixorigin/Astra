@@ -4,19 +4,22 @@ use astra_services::session_workspace::ContextTraceBudgetSignal;
 use astra_services::session_workspace::{ContextTraceSignal, ContextTraceToolSelection};
 use astra_text_utils::str_preview::truncate_str;
 use astra_tools::task_mgmt::SessionTask;
+use astra_turn_core::chat_turn_heuristics::{
+    is_session_not_found_error, looks_like_live_query_with_context,
+};
 
 use super::*;
 
-pub(super) struct TurnContext<'a> {
-    pub(super) api: &'a astra_thin_client::ThinClient,
-    pub(super) profile: Option<&'a str>,
+pub(crate) struct TurnContext<'a> {
+    pub(crate) api: &'a astra_thin_client::ThinClient,
+    pub(crate) profile: Option<&'a str>,
 }
 
 /// Cloud journal ingestion is server-owned; CLI keeps the local journal path.
 fn enqueue_ingestion(_state: &SessionState, _event: &session_journal::JournalEvent) {}
 
 /// Public wrapper for enqueue_ingestion — used by main.rs for session_end.
-pub(super) fn enqueue_ingestion_pub(state: &SessionState, event: &session_journal::JournalEvent) {
+pub(crate) fn enqueue_ingestion_pub(state: &SessionState, event: &session_journal::JournalEvent) {
     enqueue_ingestion(state, event);
 }
 
@@ -39,7 +42,7 @@ fn cache_pending_context_assembly_trace(state: &mut SessionState, trace_json: &s
 ///   signal is deterministic.
 /// - Anything else: 0.0 (heuristic; emission is skipped to avoid polluting
 ///   downstream reflection / auto-tuning pipelines with no-op stalls).
-fn stall_type_confidence(stall_type: &str) -> f64 {
+pub(crate) fn stall_type_confidence(stall_type: &str) -> f64 {
     match stall_type {
         "sig_stall" => 1.0,
         s if s == "skill_lockout" || s.starts_with("skill_lockout:") => 1.0,
@@ -55,7 +58,7 @@ const COMPACT_ANCHOR_MAX_LINES: usize = 3;
 const COMPACT_ANCHOR_LINE_MAX: usize = 120;
 const COMPACT_ANCHOR_TOTAL_MAX: usize = 400;
 
-pub(super) async fn fetch_compact_memory_anchor_snippet(
+pub(crate) async fn fetch_compact_memory_anchor_snippet(
     api: &astra_thin_client::ThinClient,
     token: &str,
     session_id: Option<&str>,
@@ -122,7 +125,7 @@ pub(super) async fn fetch_compact_memory_anchor_snippet(
     Some(lines.join("\n"))
 }
 
-pub(super) fn compact_assistant_message(
+pub(crate) fn compact_assistant_message(
     trimmed: usize,
     summary: &str,
     anchor: Option<&str>,
@@ -176,7 +179,7 @@ const CORRECTION_PATTERNS: &[&str] = &[
 /// Detect if a user message appears to be a correction/redirection.
 ///
 /// Returns true if the message contains common correction phrases.
-pub(super) fn detect_correction_signal(message: &str) -> bool {
+pub(crate) fn detect_correction_signal(message: &str) -> bool {
     let msg_lower = message.to_lowercase();
     CORRECTION_PATTERNS.iter().any(|p| msg_lower.contains(p))
 }
@@ -191,7 +194,7 @@ enum TurnAttempt {
     Interrupted(Box<Result<StreamResult, crate::TurnFailure>>),
 }
 
-pub(super) async fn handle_chat_input(
+pub(crate) async fn handle_chat_input(
     line: String,
     current_token: Option<&str>,
     state: &mut SessionState,
@@ -202,17 +205,17 @@ pub(super) async fn handle_chat_input(
         current_token,
         state,
         ctx,
-        &mut crate::ui_adapter::LineUiAdapter,
+        &mut crate::cli::ui_adapter::LineUiAdapter,
     )
     .await
 }
 
-pub(super) async fn handle_chat_input_with_ui(
+pub(crate) async fn handle_chat_input_with_ui(
     line: String,
     current_token: Option<&str>,
     state: &mut SessionState,
     ctx: TurnContext<'_>,
-    ui: &mut dyn crate::ui_adapter::ReplUiAdapter,
+    ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
 ) -> Result<(), String> {
     // ! prefix: execute the rest as a shell command with the real TTY
     // (inherited stdio) so interactive programs like vim work. Using
@@ -252,10 +255,15 @@ pub(super) async fn handle_chat_input_with_ui(
 
     ui.blank_line();
 
-    if crate::plan_lifecycle::looks_like_pending_local_plan_entry(state)
-        && let Err(error) =
-            crate::plan_lifecycle::enter_remote_plan_mode(ctx.api, ctx.profile, token, state, &line)
-                .await
+    if crate::cli::plan_lifecycle::looks_like_pending_local_plan_entry(state)
+        && let Err(error) = crate::cli::plan_lifecycle::enter_remote_plan_mode(
+            ctx.api,
+            ctx.profile,
+            token,
+            state,
+            &line,
+        )
+        .await
     {
         ui.show_error(&error);
         return Ok(());
@@ -404,7 +412,7 @@ pub(super) async fn handle_chat_input_with_ui(
                         {
                             ui.show_info(&format!(
                                 "  {} Token refreshed, retrying…",
-                                crate::theme::icon_ok()
+                                crate::cli::theme::icon_ok()
                             ));
                             match run_chat_turn(
                                 state,
@@ -475,10 +483,10 @@ fn apply_resume_context(mut effective_line: String, resume_guidance: Option<Stri
     effective_line
 }
 
-pub(super) fn build_effective_line(
+pub(crate) fn build_effective_line(
     line: &str,
     state: &SessionState,
-    ui: &mut dyn crate::ui_adapter::ReplUiAdapter,
+    ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
 ) -> String {
     let mut effective_line = if let Some(ref dev) = state.skill_dev {
         let skill_md = dev.dir.join("SKILL.md");
@@ -523,7 +531,7 @@ pub(super) fn build_effective_line(
 
     // Inject project instructions (.astra/instructions.md) if loaded
     if let Some(ref instructions) = state.project_instructions {
-        let block = super::format_project_instructions(instructions);
+        let block = crate::format_project_instructions(instructions);
         effective_line = format!("{block}\n\n{effective_line}");
     }
 
@@ -550,7 +558,7 @@ If the follow-up asks to fix / patch / test / continue, apply that action to thi
     effective_line
 }
 
-pub(super) fn is_short_continuation_prompt(line: &str) -> bool {
+pub(crate) fn is_short_continuation_prompt(line: &str) -> bool {
     use astra_turn_core::chat_turn_heuristics::{
         starts_with_chinese_continuation_prefix, trim_trailing_punctuation,
     };
@@ -651,7 +659,7 @@ fn maybe_checkpoint_lessons(state: &mut SessionState) {
     }
     let sid = state.session_id.clone();
     tokio::spawn(
-        super::edge_tools::memoria::memoria_store_lessons_fire_and_forget(memoria_lessons, sid),
+        crate::edge_tools::memoria::memoria_store_lessons_fire_and_forget(memoria_lessons, sid),
     );
 }
 
@@ -1009,7 +1017,7 @@ fn session_memory_recap(memory_md: &str) -> Option<String> {
     }
 }
 
-pub(super) fn merge_continuation_anchor_with_session_memory(
+pub(crate) fn merge_continuation_anchor_with_session_memory(
     anchor: Option<String>,
     session_memory_markdown: Option<&str>,
 ) -> Option<String> {
@@ -1114,16 +1122,16 @@ fn rebuild_continuation_anchor_from_state_with_active_tasks(
     state.continuation_anchor = Some(sections.join("\n"));
 }
 
-pub(super) fn rebuild_continuation_anchor_from_state(state: &mut SessionState) {
+pub(crate) fn rebuild_continuation_anchor_from_state(state: &mut SessionState) {
     rebuild_continuation_anchor_from_state_with_active_tasks(state, &[]);
 }
 
-pub(super) async fn rebuild_continuation_anchor_from_live_state(state: &mut SessionState) {
+pub(crate) async fn rebuild_continuation_anchor_from_live_state(state: &mut SessionState) {
     let active_tasks = load_active_tasks_for_anchor(state).await;
     rebuild_continuation_anchor_from_state_with_active_tasks(state, &active_tasks);
 }
 
-pub(super) fn history_as_messages(history: &[(String, String)]) -> Vec<serde_json::Value> {
+pub(crate) fn history_as_messages(history: &[(String, String)]) -> Vec<serde_json::Value> {
     history
         .iter()
         .flat_map(|(user, assistant)| {
@@ -1163,7 +1171,7 @@ async fn run_chat_turn(
 
         let lessons = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            super::edge_tools::memoria::memoria_retrieve_lessons(6, Some(message)),
+            crate::edge_tools::memoria::memoria_retrieve_lessons(6, Some(message)),
         )
         .await
         .unwrap_or_default();
@@ -1204,7 +1212,7 @@ async fn run_chat_turn(
     // boards return None so we save cache budget on the common case.
     let execution_state_block = {
         let tasks = state.task_manager.snapshot().await;
-        crate::execution_state_summary::format_for_session_state(state, &tasks)
+        crate::cli::execution_state_summary::format_for_session_state(state, &tasks)
     };
 
     // Snapshot tui_cancel_token before the stream future locks `state` so the
@@ -1227,7 +1235,8 @@ async fn run_chat_turn(
             verbose_mode: state.verbose_mode,
             render_policy: state
                 .tui_render_policy
-                .unwrap_or(crate::stream_render::RenderPolicy::Stream),
+                .unwrap_or(crate::cli::stream_render::RenderPolicy::Stream),
+            cli_context: Some(&state.cli_context),
             recent_tools: &state.recent_tools,
             tool_health_entries: &state.tool_health_entries,
             session_lessons: &state.session_lessons,
@@ -1443,7 +1452,7 @@ async fn maybe_run_auto_invoke(state: &mut SessionState) {
 /// Appended to the assistant text in history so the next turn's prompt
 /// contains file paths and tool outcomes from the previous turn — without
 /// storing the full tool_call / tool_result messages.
-fn build_turn_tool_summary(records: &[session_journal::ToolCallRecord]) -> String {
+pub(crate) fn build_turn_tool_summary(records: &[session_journal::ToolCallRecord]) -> String {
     if records.is_empty() {
         return String::new();
     }
@@ -1485,7 +1494,10 @@ fn build_turn_tool_summary(records: &[session_journal::ToolCallRecord]) -> Strin
 }
 
 /// Build the text stored in history: assistant response + optional tool summary.
-fn build_history_text(full_text: &str, records: &[session_journal::ToolCallRecord]) -> String {
+pub(crate) fn build_history_text(
+    full_text: &str,
+    records: &[session_journal::ToolCallRecord],
+) -> String {
     let summary = build_turn_tool_summary(records);
     if summary.is_empty() {
         return full_text.to_string();
@@ -2075,12 +2087,12 @@ fn merge_interruption_metadata(
 }
 
 /// Routing + turn quality for journal fields and `ToolSelector::record_outcome`.
-pub(super) struct TurnLearningSnapshot {
+pub(crate) struct TurnLearningSnapshot {
     pub routing: astra_turn_core::routing_engine::RoutingDecision,
     pub eval: astra_runtime::pipeline::evaluation::TurnEvaluation,
 }
 
-pub(super) fn analyze_chat_turn_learning(
+pub(crate) fn analyze_chat_turn_learning(
     line: &str,
     turn: u32,
     recent_tools: &[String],
@@ -2246,7 +2258,7 @@ fn apply_turn_success(
     check_skill_improvement_inner(state);
 }
 
-pub(super) async fn close_pending_memory_feedback_at_turn_end(
+pub(crate) async fn close_pending_memory_feedback_at_turn_end(
     session_id: Option<&str>,
     cloud_base: Option<String>,
     cloud_token: Option<String>,
@@ -2272,14 +2284,24 @@ async fn apply_turn_success_async(
     line: &str,
     mut result: StreamResult,
     turn_start: Instant,
-    ui: &mut dyn crate::ui_adapter::ReplUiAdapter,
+    ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
 ) {
     let final_messages = std::mem::take(&mut result.final_messages);
     let csl_checkpoint_fields = extract_csl_fields_from_result(&result);
     apply_turn_success_sync(state, profile, line, result, turn_start);
+    let cloud_base = match crate::cli::config_manager::resolve_api_url(None) {
+        Ok(base) => Some(base),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "skipping pending recall feedback close because API URL configuration is invalid"
+            );
+            None
+        }
+    };
     let report = close_pending_memory_feedback_at_turn_end(
         state.session_id.as_deref(),
-        Some(crate::command_router::resolve_api_url(None)),
+        cloud_base,
         super::session_runtime::current_access_token(profile),
         "cli-turn-end",
     )
@@ -2314,7 +2336,7 @@ async fn apply_turn_success_async(
     if state.plan_mode_active()
         && let Some(token) = super::session_runtime::current_access_token(profile)
         && let Err(error) =
-            crate::plan_lifecycle::sync_remote_plan_mode_state(api, &token, state).await
+            crate::cli::plan_lifecycle::sync_remote_plan_mode_state(api, &token, state).await
     {
         state.plan_mode_sync_error = Some(error.clone());
         ui.show_warning(&format!(
@@ -2397,7 +2419,7 @@ fn apply_turn_success_sync(
     state.total_cache_creation_tokens += result.cache_creation_tokens;
 
     // Accumulate per-turn cost
-    let turn_cost = crate::slash_stats::cost_for_tokens(
+    let turn_cost = crate::cli::slash_stats::cost_for_tokens(
         result.prompt_tokens,
         result.completion_tokens,
         result.cache_read_tokens,
@@ -2408,7 +2430,7 @@ fn apply_turn_success_sync(
     state.last_response = Some(result.full_text.clone());
     state.continuation_anchor = build_continuation_anchor(state, line, &result);
     state.pending_followup_suggestion =
-        crate::followup_suggestion::suggest_followup(line, state, &result);
+        crate::cli::followup_suggestion::suggest_followup(line, state, &result);
     // Followup hint rendering used to live in the line-mode REPL prompt
     // (`repl_ui::set_followup_prompt_hint`); the TUI consumes
     // `state.pending_followup_suggestion` directly.
@@ -2499,7 +2521,7 @@ fn print_turn_status_line(state: &SessionState, result: &StreamResult, turn_star
     };
 
     // Per-turn cost
-    let turn_cost = crate::slash_stats::cost_for_tokens(
+    let turn_cost = crate::cli::slash_stats::cost_for_tokens(
         result.prompt_tokens,
         result.completion_tokens,
         result.cache_read_tokens,
@@ -2519,7 +2541,7 @@ fn print_turn_status_line(state: &SessionState, result: &StreamResult, turn_star
 
     // Show turn cost (skip if pricing not available)
     if turn_cost > 0.0 {
-        parts.push(crate::slash_stats::format_cost(turn_cost));
+        parts.push(crate::cli::slash_stats::format_cost(turn_cost));
     }
 
     parts.push(elapsed_str);
@@ -2560,7 +2582,7 @@ fn print_turn_status_line(state: &SessionState, result: &StreamResult, turn_star
     if session_cost > 0.0 && state.turn > 0 {
         let session_line = format!(
             "  session: {}",
-            crate::slash_stats::format_cost(session_cost)
+            crate::cli::slash_stats::format_cost(session_cost)
         );
         eprintln!("{}", session_line.dim());
     }
@@ -3126,11 +3148,11 @@ fn check_skill_improvement_inner(state: &mut SessionState) {
     state.skill_improvement_tracker.mark_analyzed(state.turn);
 }
 
-pub(super) fn initialize_journal_pub(state: &mut SessionState, session_id: &str) {
+pub(crate) fn initialize_journal_pub(state: &mut SessionState, session_id: &str) {
     initialize_journal(state, session_id);
 }
 
-pub(super) fn persist_last_session_id(profile: Option<&str>, session_id: &str) {
+pub(crate) fn persist_last_session_id(profile: Option<&str>, session_id: &str) {
     let _ = persist_profile_last_session(profile, session_id);
 }
 
@@ -3253,16 +3275,16 @@ fn initialize_journal(state: &mut SessionState, session_id: &str) {
 /// Excludes LLM provider auth failures — those indicate the upstream
 /// model credentials (Bedrock/Anthropic API key) are invalid, not the
 /// astra session token. Refreshing `/login` won't help for those.
-pub(super) fn is_auth_error(error: &str) -> bool {
+pub(crate) fn is_auth_error(error: &str) -> bool {
     if is_llm_provider_auth_error(error) {
         return false;
     }
-    crate::cli_utils::is_astra_session_auth_error(error)
+    crate::cli::cli_utils::is_astra_session_auth_error(error)
 }
 
 /// Detect LLM provider authentication failures — upstream Bedrock/Anthropic
 /// credential issues that `/login` cannot fix.
-pub(super) fn is_llm_provider_auth_error(error: &str) -> bool {
+pub(crate) fn is_llm_provider_auth_error(error: &str) -> bool {
     let lower = error.to_lowercase();
     lower.contains("llm provider authentication failed") || lower.contains("[auth] llm provider")
 }
@@ -3381,7 +3403,7 @@ async fn apply_user_cancelled_turn(
     // path we deliberately route UI through `SilentUi` so the user does not
     // see a duplicate red "⚠ user_interrupted" banner after the dim
     // "Interrupted." print at the cancel arm.
-    _ui: &mut dyn crate::ui_adapter::ReplUiAdapter,
+    _ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
 ) {
     // Set BEFORE delegating: `apply_turn_success_async` clears it via the
     // outer `Completed::Ok` site — but that path is not on this code's
@@ -3437,7 +3459,7 @@ async fn apply_user_cancelled_turn(
 /// "Interrupted." line already informed the user.
 struct SilentUi;
 
-impl crate::ui_adapter::ReplUiAdapter for SilentUi {
+impl crate::cli::ui_adapter::ReplUiAdapter for SilentUi {
     fn show_error(&mut self, _msg: &str) {}
     fn show_warning(&mut self, _msg: &str) {}
     fn show_info(&mut self, _msg: &str) {}
@@ -3451,7 +3473,7 @@ fn report_turn_failure(
     line: &str,
     failure: &crate::TurnFailure,
     turn_start: Instant,
-    ui: &mut dyn crate::ui_adapter::ReplUiAdapter,
+    ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
 ) {
     if is_llm_provider_auth_error(&failure.error) {
         ui.show_error("  LLM provider credentials invalid — check model API key configuration.");
@@ -3460,7 +3482,7 @@ fn report_turn_failure(
     } else {
         ui.show_error(&format!(
             "  {} {}",
-            crate::theme::icon_err(),
+            crate::cli::theme::icon_err(),
             &failure.error
         ));
     }
@@ -3492,7 +3514,7 @@ fn report_turn_failure(
         );
 
         // Enrich with partial data rescued from AgenticLoopState
-        crate::streaming_types::apply_partial_turn_data_to_error_event(
+        crate::cli::streaming_types::apply_partial_turn_data_to_error_event(
             &mut err_event,
             &failure.partial,
         );
@@ -3571,12 +3593,12 @@ fn sync_session_state_to_workspace(
     }
 }
 
-pub(super) struct GoalSteeringChange {
+pub(crate) struct GoalSteeringChange {
     pub previous_goal: Option<String>,
     pub turn: u32,
 }
 
-pub(super) fn steer_observability_goal(
+pub(crate) fn steer_observability_goal(
     _state: &mut SessionState,
     _goal: &str,
 ) -> Option<GoalSteeringChange> {
@@ -3586,7 +3608,7 @@ pub(super) fn steer_observability_goal(
 /// Apply persisted adaptive engine state to a newly created ObservabilitySession.
 /// Called when pending_adaptive_state was stashed during workspace restore and the
 /// ObservabilitySession is now available to receive it.
-pub(super) fn apply_pending_adaptive_state(state: &mut SessionState) {
+pub(crate) fn apply_pending_adaptive_state(state: &mut SessionState) {
     let adaptive = match state.pending_adaptive_state.take() {
         Some(a) => a,
         None => return,
@@ -3742,10 +3764,7 @@ fn build_manual_heavy_step_checkpoint(
         messages.push(serde_json::json!({ "role": "assistant", "content": a }));
     }
 
-    let max_turns = std::env::var("ASTRA_CLI_MAX_TURNS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50u32);
+    let max_turns = state.cli_context.max_turns.unwrap_or(50u32);
     let now_ms = epoch_ms();
     let total_tok = state.total_prompt_tokens + state.total_completion_tokens;
 
@@ -3911,7 +3930,7 @@ fn spawn_manual_checkpoint_cloud_uploads(
 /// User-initiated checkpoint: heavy JSON + composite index first, then session markdown,
 /// journal, and workspace — avoids workspace/checkpoint markdown ahead of failed heavy writes.
 #[derive(Debug, Clone)]
-pub(super) struct ManualCheckpointSummary {
+pub(crate) struct ManualCheckpointSummary {
     pub checkpoint_number: u32,
     pub turn: u32,
     pub checkpoint_path: std::path::PathBuf,
@@ -3928,7 +3947,7 @@ impl ManualCheckpointSummary {
     }
 }
 
-pub(super) fn create_manual_checkpoint(
+pub(crate) fn create_manual_checkpoint(
     state: &mut SessionState,
     label_arg: &str,
 ) -> Result<ManualCheckpointSummary, String> {
@@ -4033,7 +4052,7 @@ mod tests {
         warnings: Vec<String>,
     }
 
-    impl crate::ui_adapter::ReplUiAdapter for CollectingUi {
+    impl crate::cli::ui_adapter::ReplUiAdapter for CollectingUi {
         fn show_error(&mut self, _msg: &str) {}
         fn show_warning(&mut self, msg: &str) {
             self.warnings.push(msg.to_string());
@@ -4053,22 +4072,22 @@ mod tests {
         //     "LLM provider authentication failed" classified-error message.
         //   - "[auth] LLM provider" prefix used by upstream agent_warn! emits.
         let provider_msg = "LLM provider authentication failed";
-        assert!(super::is_llm_provider_auth_error(provider_msg));
-        assert!(!super::is_auth_error(provider_msg));
+        assert!(is_llm_provider_auth_error(provider_msg));
+        assert!(!is_auth_error(provider_msg));
 
         let prefixed = "[auth] LLM provider rejected request: 401";
-        assert!(super::is_llm_provider_auth_error(prefixed));
-        assert!(!super::is_auth_error(prefixed));
+        assert!(is_llm_provider_auth_error(prefixed));
+        assert!(!is_auth_error(prefixed));
 
         let session_msg =
             "API Error (401): Could not validate credentials\n  Hint: Session expired — try /login";
-        assert!(!super::is_llm_provider_auth_error(session_msg));
-        assert!(super::is_auth_error(session_msg));
+        assert!(!is_llm_provider_auth_error(session_msg));
+        assert!(is_auth_error(session_msg));
 
         let unrelated_401 = "GitHub API Error: 401 Unauthorized";
-        assert!(!super::is_llm_provider_auth_error(unrelated_401));
+        assert!(!is_llm_provider_auth_error(unrelated_401));
         assert!(
-            !super::is_auth_error(unrelated_401),
+            !is_auth_error(unrelated_401),
             "generic upstream 401s must not be reported as Astra session expiry"
         );
     }
@@ -4606,7 +4625,8 @@ mod tests {
             ..SessionState::default()
         };
 
-        let effective = build_effective_line("继续", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let effective =
+            build_effective_line("继续", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
         assert!(effective.contains("[Active task attachment]"));
         assert!(effective.contains("debug Chinese input drops"));
         assert!(effective.contains("[User follow-up]\n继续"));
@@ -4643,7 +4663,7 @@ mod tests {
         };
 
         let effective =
-            build_effective_line("修复?", &state, &mut crate::ui_adapter::LineUiAdapter);
+            build_effective_line("修复?", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
         assert!(effective.contains("[Active task attachment]"));
         assert!(effective.contains("review commit aa1f419b"));
         assert!(effective.contains("fix / patch / test / continue"));
@@ -4660,8 +4680,11 @@ mod tests {
             ..SessionState::default()
         };
 
-        let effective =
-            build_effective_line("还有什么？", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let effective = build_effective_line(
+            "还有什么？",
+            &state,
+            &mut crate::cli::ui_adapter::LineUiAdapter,
+        );
         assert!(effective.contains("[Active task attachment]"));
         assert!(effective.contains("reconcile it before proceeding"));
         assert!(effective.contains("Active task board:"));
@@ -4672,7 +4695,7 @@ mod tests {
     fn pending_recovery_never_restores_from_ordinary_chat_input() {
         let source = include_str!("chat_turn.rs");
         let start = source
-            .find("pub(super) async fn handle_chat_input_with_ui")
+            .find("pub(crate) async fn handle_chat_input_with_ui")
             .expect("handle_chat_input_with_ui should exist");
         let body = &source[start..];
         let gate_end = body
@@ -4697,7 +4720,7 @@ mod tests {
         let effective = build_effective_line(
             "修一下输入法问题",
             &state,
-            &mut crate::ui_adapter::LineUiAdapter,
+            &mut crate::cli::ui_adapter::LineUiAdapter,
         );
         assert!(!effective.contains("[Active task attachment]"));
         assert_eq!(effective, "修一下输入法问题");
@@ -4725,7 +4748,7 @@ mod tests {
         .unwrap();
 
         let state = SessionState {
-            skill_dev: Some(super::super::SkillDevState {
+            skill_dev: Some(crate::cli::SkillDevState {
                 name: "test-skill".to_string(),
                 dir: skill_dir,
             }),
@@ -4735,7 +4758,7 @@ mod tests {
         let effective = build_effective_line(
             "improve this skill",
             &state,
-            &mut crate::ui_adapter::LineUiAdapter,
+            &mut crate::cli::ui_adapter::LineUiAdapter,
         );
         assert!(effective.contains("[SKILL DEV: test-skill]"));
         assert!(effective.contains("Do stuff."));
@@ -4756,14 +4779,15 @@ mod tests {
         .unwrap();
 
         let state = SessionState {
-            skill_dev: Some(super::super::SkillDevState {
+            skill_dev: Some(crate::cli::SkillDevState {
                 name: "evolving".to_string(),
                 dir: skill_dir.clone(),
             }),
             ..SessionState::default()
         };
 
-        let turn1 = build_effective_line("check", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let turn1 =
+            build_effective_line("check", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
         assert!(turn1.contains(OLD_BODY));
 
         // Simulate external edit between turns
@@ -4773,8 +4797,11 @@ mod tests {
         )
         .unwrap();
 
-        let turn2 =
-            build_effective_line("check again", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let turn2 = build_effective_line(
+            "check again",
+            &state,
+            &mut crate::cli::ui_adapter::LineUiAdapter,
+        );
         assert!(
             !turn2.contains(OLD_BODY),
             "should not contain old skill body"
@@ -4785,7 +4812,7 @@ mod tests {
     #[test]
     fn build_effective_line_skill_dev_missing_file_falls_through() {
         let state = SessionState {
-            skill_dev: Some(super::super::SkillDevState {
+            skill_dev: Some(crate::cli::SkillDevState {
                 name: "ghost".to_string(),
                 dir: std::path::PathBuf::from("/nonexistent/path/ghost"),
             }),
@@ -4793,7 +4820,7 @@ mod tests {
         };
 
         let effective =
-            build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+            build_effective_line("hello", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
         assert_eq!(effective, "hello");
     }
 
@@ -4805,7 +4832,7 @@ mod tests {
         std::fs::write(skill_dir.join("SKILL.md"), "").unwrap();
 
         let state = SessionState {
-            skill_dev: Some(super::super::SkillDevState {
+            skill_dev: Some(crate::cli::SkillDevState {
                 name: "empty-skill".to_string(),
                 dir: skill_dir,
             }),
@@ -4813,7 +4840,7 @@ mod tests {
         };
 
         let effective =
-            build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+            build_effective_line("hello", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
         // Empty SKILL.md should not inject a useless prefix
         assert_eq!(effective, "hello");
     }
@@ -4830,14 +4857,15 @@ mod tests {
         .unwrap();
 
         let state = SessionState {
-            skill_dev: Some(super::super::SkillDevState {
+            skill_dev: Some(crate::cli::SkillDevState {
                 name: "custom-loc".to_string(),
                 dir: skill_dir.clone(),
             }),
             ..SessionState::default()
         };
 
-        let effective = build_effective_line("x", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let effective =
+            build_effective_line("x", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
         // Must contain the actual path, not a hardcoded .astra/skills/ path
         let expected_path = skill_dir.join("SKILL.md").display().to_string();
         assert!(
@@ -4858,7 +4886,7 @@ mod tests {
         .unwrap();
 
         let state = SessionState {
-            skill_dev: Some(super::super::SkillDevState {
+            skill_dev: Some(crate::cli::SkillDevState {
                 name: "combo".to_string(),
                 dir: skill_dir,
             }),
@@ -4868,8 +4896,11 @@ mod tests {
         };
 
         // Short continuation prompt triggers all three layers
-        let effective =
-            build_effective_line("continue", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let effective = build_effective_line(
+            "continue",
+            &state,
+            &mut crate::cli::ui_adapter::LineUiAdapter,
+        );
         assert!(effective.contains("[SKILL DEV: combo]"), "skill dev prefix");
         assert!(effective.contains("Concise"), "system skill");
         assert!(effective.contains("[Active task attachment]"), "anchor");
@@ -4960,12 +4991,14 @@ mod tests {
         };
 
         // First turn
-        let cost1 = crate::slash_stats::cost_for_tokens(1000, 500, 800, 100, &state.cached_pricing);
+        let cost1 =
+            crate::cli::slash_stats::cost_for_tokens(1000, 500, 800, 100, &state.cached_pricing);
         state.total_session_cost += cost1;
         assert!(cost1 > 0.0);
 
         // Second turn
-        let cost2 = crate::slash_stats::cost_for_tokens(2000, 1000, 1500, 0, &state.cached_pricing);
+        let cost2 =
+            crate::cli::slash_stats::cost_for_tokens(2000, 1000, 1500, 0, &state.cached_pricing);
         state.total_session_cost += cost2;
 
         assert!((state.total_session_cost - (cost1 + cost2)).abs() < 1e-10);
@@ -5036,7 +5069,8 @@ mod tests {
             ..SessionState::default()
         };
 
-        let effective = build_effective_line("继续", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let effective =
+            build_effective_line("继续", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
         assert!(
             effective.contains("[Active task attachment]"),
             "anchor injection must work after compaction"
@@ -5054,7 +5088,7 @@ mod tests {
         let normal = build_effective_line(
             "explain Pin in detail",
             &state,
-            &mut crate::ui_adapter::LineUiAdapter,
+            &mut crate::cli::ui_adapter::LineUiAdapter,
         );
         assert!(
             !normal.contains("[Active task attachment]"),
@@ -5309,7 +5343,7 @@ mod tests {
 
         // The follow-up suggestion is exposed on `state` for the TUI
         // to render; the original assertion against the line-mode
-        // prompt hint (`super::repl_ui::prompt_inline_hint`) is gone
+        // prompt hint (`crate::repl_ui::prompt_inline_hint`) is gone
         // along with the line-mode REPL itself.
         assert_eq!(
             state
@@ -5411,7 +5445,7 @@ mod tests {
         // gates the sync, mirror holds the goal text.
         state
             .perm_manager
-            .set_mode(crate::permission_manager::PermissionMode::Plan);
+            .set_mode(crate::cli::permission_manager::PermissionMode::Plan);
         state.cloud_plan_mirror = Some(astra_runtime::plan::PlanModeState::new(
             "Ship auth".to_string(),
         ));
@@ -5488,7 +5522,7 @@ mod tests {
             "show session metrics",
             &failure,
             Instant::now(),
-            &mut crate::ui_adapter::LineUiAdapter,
+            &mut crate::cli::ui_adapter::LineUiAdapter,
         );
 
         let event = state.last_turn_event.as_ref().expect("turn_error event");
@@ -5551,7 +5585,7 @@ mod tests {
             "explain LoopDispatcher",
             Err(failure),
             Instant::now(),
-            &mut crate::ui_adapter::LineUiAdapter,
+            &mut crate::cli::ui_adapter::LineUiAdapter,
         )
         .await;
 
@@ -5634,7 +5668,7 @@ mod tests {
             "explain LoopDispatcher",
             Ok(stream_result),
             Instant::now(),
-            &mut crate::ui_adapter::LineUiAdapter,
+            &mut crate::cli::ui_adapter::LineUiAdapter,
         )
         .await;
 
@@ -5693,7 +5727,7 @@ mod tests {
             "what's in run_lifecycle.rs",
             Err(failure),
             Instant::now(),
-            &mut crate::ui_adapter::LineUiAdapter,
+            &mut crate::cli::ui_adapter::LineUiAdapter,
         )
         .await;
 
@@ -5987,7 +6021,7 @@ mod tests {
         // mirror's presence.
         state
             .perm_manager
-            .set_mode(crate::permission_manager::PermissionMode::Plan);
+            .set_mode(crate::cli::permission_manager::PermissionMode::Plan);
         let result = stub_stream_result("Plan updated.");
 
         apply_turn_success(&mut state, None, "continue", result, Instant::now());
@@ -6174,8 +6208,11 @@ mod tests {
             "Latest user task: now explain borrowing\nLatest assistant summary:\nBorrowing lets you reference data"
                 .to_string(),
         );
-        let effective =
-            build_effective_line("continue", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let effective = build_effective_line(
+            "continue",
+            &state,
+            &mut crate::cli::ui_adapter::LineUiAdapter,
+        );
         assert!(effective.contains("[Active task attachment]"));
         assert!(effective.contains("explain borrowing"));
 
@@ -6532,28 +6569,22 @@ mod tests {
     #[test]
     fn stall_type_confidence_maps_known_signals() {
         // Deterministic signals → full confidence.
-        assert_eq!(super::stall_type_confidence("sig_stall"), 1.0);
-        assert_eq!(super::stall_type_confidence("skill_lockout"), 1.0);
-        assert_eq!(
-            super::stall_type_confidence("skill_lockout:review-changes"),
-            1.0
-        );
-        assert_eq!(
-            super::stall_type_confidence("skill_lockout:any-other-skill"),
-            1.0
-        );
-        assert_eq!(super::stall_type_confidence("skill_lockout:"), 1.0);
+        assert_eq!(stall_type_confidence("sig_stall"), 1.0);
+        assert_eq!(stall_type_confidence("skill_lockout"), 1.0);
+        assert_eq!(stall_type_confidence("skill_lockout:review-changes"), 1.0);
+        assert_eq!(stall_type_confidence("skill_lockout:any-other-skill"), 1.0);
+        assert_eq!(stall_type_confidence("skill_lockout:"), 1.0);
 
         // Heuristic / unknown types must stay at 0.0 so journal write-through
         // skips emission (avoids polluting downstream reflection pipelines).
-        assert_eq!(super::stall_type_confidence("repetition_stall"), 0.0);
-        assert_eq!(super::stall_type_confidence("name_stall"), 0.0);
-        assert_eq!(super::stall_type_confidence(""), 0.0);
-        assert_eq!(super::stall_type_confidence("unknown_type"), 0.0);
+        assert_eq!(stall_type_confidence("repetition_stall"), 0.0);
+        assert_eq!(stall_type_confidence("name_stall"), 0.0);
+        assert_eq!(stall_type_confidence(""), 0.0);
+        assert_eq!(stall_type_confidence("unknown_type"), 0.0);
         // Near-miss must not match — prefix is literal.
-        assert_eq!(super::stall_type_confidence("skill_lockou"), 0.0);
+        assert_eq!(stall_type_confidence("skill_lockou"), 0.0);
         // Underscore suffix must not match — only exact or colon suffix.
-        assert_eq!(super::stall_type_confidence("skill_lockout_v2"), 0.0);
+        assert_eq!(stall_type_confidence("skill_lockout_v2"), 0.0);
     }
 
     // ── tool summary for cross-turn context ───────────────────────────────────
@@ -6573,7 +6604,7 @@ mod tests {
 
     #[test]
     fn tool_summary_empty_when_no_tools() {
-        let summary = super::build_turn_tool_summary(&[]);
+        let summary = build_turn_tool_summary(&[]);
         assert!(summary.is_empty());
     }
 
@@ -6584,7 +6615,7 @@ mod tests {
             make_record("str_replace", true, Some("src/main.rs")),
             make_record("read_file", true, Some("src/lib.rs")),
         ];
-        let summary = super::build_turn_tool_summary(&records);
+        let summary = build_turn_tool_summary(&records);
         assert!(
             summary.contains("src/main.rs"),
             "should list files: {summary}"
@@ -6607,7 +6638,7 @@ mod tests {
             make_record("read_file", false, Some("src/missing.rs")),
             make_record("bash", true, None),
         ];
-        let summary = super::build_turn_tool_summary(&records);
+        let summary = build_turn_tool_summary(&records);
         assert!(
             summary.contains("read_file") && summary.contains("fail"),
             "should show failures: {summary}"
@@ -6621,7 +6652,7 @@ mod tests {
             make_record("str_replace", true, Some("src/main.rs")),
         ];
         let full_text = "## Done\nFixed the bug.".to_string();
-        let history_text = super::build_history_text(&full_text, &records);
+        let history_text = build_history_text(&full_text, &records);
         assert!(
             history_text.starts_with("## Done"),
             "original text preserved"
@@ -6635,7 +6666,7 @@ mod tests {
     #[test]
     fn tool_summary_not_appended_when_no_tools() {
         let full_text = "Just a text response.".to_string();
-        let history_text = super::build_history_text(&full_text, &[]);
+        let history_text = build_history_text(&full_text, &[]);
         assert_eq!(history_text, full_text, "no summary when no tools");
     }
 
@@ -6655,10 +6686,7 @@ mod tests {
         // ── Turn 1: simple chat ──
         let t1_text = "I can help you with that project.";
         let t1_records: Vec<session_journal::ToolCallRecord> = vec![];
-        history.push((
-            "hello".into(),
-            super::build_history_text(t1_text, &t1_records),
-        ));
+        history.push(("hello".into(), build_history_text(t1_text, &t1_records)));
 
         // ── Turn 2: code review (skill + git_diff + read_file) ──
         let t2_text = "## Code Review\n\n**permission_manager.rs:978** — boundary check incomplete\n**safety_middleware.rs:8** — missing UPDATE keyword\n**journal_digest.rs:241** — use enum instead of String";
@@ -6685,11 +6713,11 @@ mod tests {
         ];
         history.push((
             "review latest commit".into(),
-            super::build_history_text(t2_text, &t2_records),
+            build_history_text(t2_text, &t2_records),
         ));
 
         // ── Turn 3: model sees the prompt ──
-        let messages = super::history_as_messages(&history);
+        let messages = history_as_messages(&history);
         // Add current user message
         let current = "修复和优化";
         let mut full_messages = messages;
@@ -6739,7 +6767,7 @@ mod tests {
         ];
         history.push((
             "review latest commit".into(),
-            super::build_history_text(
+            build_history_text(
                 "## Review\nIssues found in permission_manager.rs",
                 &t1_records,
             ),
@@ -6757,7 +6785,7 @@ mod tests {
         ];
         history.push((
             "修复和优化".into(),
-            super::build_history_text("## Done\nFixed 3 files.", &t2_records),
+            build_history_text("## Done\nFixed 3 files.", &t2_records),
         ));
 
         // Turn 3
@@ -6767,14 +6795,14 @@ mod tests {
         ];
         history.push((
             "review changes".into(),
-            super::build_history_text(
+            build_history_text(
                 "## Review\nLGTM. Suggest adding Default to ErrorCategory.",
                 &t3_records,
             ),
         ));
 
         // Turn 4 prompt
-        let messages = super::history_as_messages(&history);
+        let messages = history_as_messages(&history);
         let mut full_messages = messages;
         full_messages.push(serde_json::json!({"role": "user", "content": "按照建议优化"}));
 
@@ -6826,7 +6854,7 @@ mod tests {
                 Some(&file),
             ));
         }
-        let summary = super::build_turn_tool_summary(&records);
+        let summary = build_turn_tool_summary(&records);
         assert!(
             summary.len() < 2048,
             "summary should be compact, got {} bytes: {summary}",
@@ -6861,10 +6889,10 @@ mod tests {
         ];
         history.push((
             "add Default derive".into(),
-            super::build_history_text("Added #[derive(Default)] to ErrorCategory.", &records),
+            build_history_text("Added #[derive(Default)] to ErrorCategory.", &records),
         ));
 
-        let messages = super::history_as_messages(&history);
+        let messages = history_as_messages(&history);
         let mut full = messages;
         full.push(serde_json::json!({"role": "user", "content": "run tests"}));
 

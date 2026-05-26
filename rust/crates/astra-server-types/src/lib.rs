@@ -96,6 +96,11 @@ pub struct ChatRequest {
     pub execution_budget: Option<astra_services::runs::ExecutionBudget>,
     #[serde(default)]
     pub explain: bool,
+    #[serde(default)]
+    pub interaction_mode: Option<astra_services::runs::RequestedTurnInteractionMode>,
+    /// Whether the client can handle interactive callbacks (`ask_user` / approval prompts).
+    #[serde(default)]
+    pub interactive_client: bool,
     /// Durable plan subtask id — merged into `context` for cloud stop-hooks (`when: task_completed`).
     #[serde(default)]
     pub plan_subtask_id: Option<String>,
@@ -1031,7 +1036,8 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         forward_headers: std::collections::HashMap::new(),
         execution_budget: request.execution_budget,
         explain: request.explain,
-        interactive_client: false,
+        interaction_mode: request.interaction_mode,
+        interactive_client: request.interactive_client,
     }
 }
 

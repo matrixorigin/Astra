@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/table_view/view.rs
+assertion_line: 225
 expression: "draw(&t, &n, 80, 3)"
 ---
 ┌ Table · 0 rows × 0 cols──────────────────────────────────────────────────────┐

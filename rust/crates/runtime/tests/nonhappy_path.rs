@@ -632,7 +632,7 @@ mod result_quality_integration {
 // ── Error Recovery Integration ──────────────────────────────────────────────
 
 mod error_recovery_integration {
-    use astra_turn_core::error_recovery::*;
+    use astra_turn_core::guardrails::error_recovery::*;
 
     #[test]
     fn full_recovery_flow() {
@@ -695,8 +695,8 @@ mod error_recovery_integration {
 mod chat_stream_turnguard_e2e {
     use astra_runtime::pipeline::persistence::ToolHealthEntry;
     use astra_runtime::turn::result_quality::ResultQuality;
+    use astra_turn_core::guardrails::turn_guard::{TurnGuard, TurnVerdict, VerdictSeverity};
     use astra_turn_core::tool_health::ToolHealthTracker;
-    use astra_turn_core::turn_guard::{TurnGuard, TurnVerdict, VerdictSeverity};
     use serde_json::json;
     use std::collections::HashSet;
 

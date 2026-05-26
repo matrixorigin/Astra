@@ -70,7 +70,7 @@ use astra_core::{
     STATUS_WAITING,
 };
 
-use crate::server::run::engine::RunEngine;
+use crate::server::run::engine::{RunEngine, RunStartContext};
 use crate::server::run::handlers as run_handlers;
 use crate::server::server_loop_host::{self, ServerAgenticLoopHostBuilder};
 use crate::server::{server_skill_subrun, server_tool_executor};
@@ -3060,9 +3060,18 @@ impl AgenticRunLifecycleService {
         run_id: &str,
         user_id: &str,
         session_id: &str,
+        request: &ChatRequestData,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         self.run_engine
-            .start_run(run_id, user_id, session_id)
+            .start_run_with_context(
+                run_id,
+                user_id,
+                session_id,
+                RunStartContext {
+                    interaction_mode: request.interaction_mode,
+                    interactive_client: Some(request.interactive_client),
+                },
+            )
             .await
             .map_err(|error| {
                 let status = if error == "session already has an active run" {
@@ -3321,6 +3330,7 @@ impl AgenticRunLifecycleService {
         ))
         .with_edge_profile(edge_profile)
         .with_edge_callback_ledger(self.edge_callback_ledger.clone())
+        .with_interaction_mode(request.interaction_mode)
         .with_interactive_client(request.interactive_client)
         .with_plan_resume_hint(plan_resume_hint);
 
@@ -3910,7 +3920,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             runs.insert(run_id.clone(), run_state);
         }
 
-        if let Err(error) = self.persist_run_start(&run_id, &user_id, &session_id).await {
+        if let Err(error) = self
+            .persist_run_start(&run_id, &user_id, &session_id, &request)
+            .await
+        {
             self.runs.write().await.remove(&run_id);
             return Err(error);
         }
@@ -4500,7 +4513,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
             runs.insert(run_id.clone(), run_state);
         }
-        if let Err(error) = self.persist_run_start(&run_id, &user_id, &session_id).await {
+        if let Err(error) = self
+            .persist_run_start(&run_id, &user_id, &session_id, &request)
+            .await
+        {
             self.runs.write().await.remove(&run_id);
             return Err(error);
         }
@@ -6839,6 +6855,7 @@ mod tests {
             forward_headers: HashMap::new(),
             execution_budget: None,
             explain: false,
+            interaction_mode: None,
             interactive_client: false,
         }
     }
@@ -7090,6 +7107,10 @@ mod tests {
                 deprioritized_tools: vec![],
                 force_stop: false,
                 nudge_count: 1,
+                interaction_mode: "prompt".into(),
+                suppressed_loop_nudges: false,
+                recent_error_pressure: 0,
+                recent_timeout_pressure: 0,
                 total_errors: 0,
                 deprioritized_count: 0,
                 total_timeouts: 0,
@@ -7375,6 +7396,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_run_persists_interaction_mode_into_run_started_event() {
+        let svc = test_service();
+        let mut req = test_request("hello");
+        req.interaction_mode = Some(astra_services::runs::RequestedTurnInteractionMode::Auto);
+        req.interactive_client = true;
+        let run = ok(svc.create_run("user-1".into(), req).await);
+
+        let durable = svc
+            .run_engine
+            .load_run(&run.run_id)
+            .await
+            .expect("load run")
+            .expect("run exists");
+        assert_eq!(durable.events[0]["event_type"], "run_started");
+        assert_eq!(durable.events[0]["data"]["interaction_mode"], "auto");
+        assert_eq!(durable.events[0]["data"]["suppressed_loop_nudges"], true);
+        assert_eq!(durable.events[0]["data"]["interactive_client"], true);
+    }
+
+    #[tokio::test]
     async fn get_run_status_not_found() {
         let svc = test_service();
         let e = err(svc
@@ -7583,6 +7624,7 @@ mod tests {
             forward_headers: HashMap::new(),
             execution_budget: None,
             explain: false,
+            interaction_mode: None,
             interactive_client: false,
         };
         let tools = AgenticRunLifecycleService::extract_edge_tools(&req);
@@ -7710,6 +7752,7 @@ mod tests {
             forward_headers: HashMap::new(),
             execution_budget: None,
             explain: false,
+            interaction_mode: None,
             interactive_client: false,
         };
         let profile = AgenticRunLifecycleService::extract_edge_profile(&req);

@@ -41,7 +41,7 @@ use std::time::SystemTime;
 
 use serde::Serialize;
 
-use crate::session_state::SessionState;
+use crate::cli::session_state::SessionState;
 
 const SCHEMA_VERSION: &str = "astra.context_dump/v1";
 
@@ -96,7 +96,7 @@ pub struct ActiveSkillDump {
 /// path under `~/.astra/context-dumps/`.  Callers hand in the
 /// chat history separately because `ChatWidget` lives in a
 /// private module that `cli::` can't import.
-pub fn write_dump_for_repl(
+pub(crate) fn write_dump_for_repl(
     state: &SessionState,
     chat_history: Vec<ChatTurnDump>,
     arg: Option<&str>,

@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/assistant.rs
+assertion_line: 1010
 expression: "render(&c, 80, 4)"
 ---
   ✻ Thinking…

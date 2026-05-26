@@ -9,8 +9,8 @@ use astra_turn_core::decision_explainer::{DriftDetector, FocusDriftAnalysis};
 use chrono::{DateTime, Utc};
 
 use super::*;
-use crate::session_runtime;
-use crate::tool_call_groups;
+use crate::cli::session_runtime;
+use crate::cli::tool_call_groups;
 
 /// `/home/foo/bar` → `~/bar` when under the user home dir (readability).
 fn tilde_path(abs: &str) -> String {
@@ -655,7 +655,7 @@ fn handle_session_switch(sub_arg: &str, state: &mut SessionState) {
     }
 
     // Restore session state
-    let st = crate::session_runtime::session_state_from_journal(&session_id);
+    let st = crate::cli::session_runtime::session_state_from_journal(&session_id);
     state.set_session_id(session_id.clone());
     state.journal = session_journal::JournalWriter::new(&session_id).ok();
     state.history = st.history;
@@ -676,7 +676,7 @@ fn handle_session_switch(sub_arg: &str, state: &mut SessionState) {
     );
 }
 
-pub(super) fn resolve_journal_target_session(
+pub(crate) fn resolve_journal_target_session(
     sub_arg: &str,
     state: &SessionState,
     _missing_active_msg: &str,
@@ -729,7 +729,7 @@ pub(super) fn resolve_journal_target_session(
     }
 }
 
-pub(super) async fn handle_session_command(
+pub(crate) async fn handle_session_command(
     arg: &str,
     _api: &astra_thin_client::ThinClient,
     _profile: Option<&str>,
@@ -3589,7 +3589,7 @@ fn handle_session_analyze(arg: &str, state: &SessionState) {
     // errored picker flow cannot leak into a later invocation and
     // silently analyze the wrong session.  When `arg` is supplied
     // the caller's value wins.
-    let stashed = crate::slash_config::take_deep_analyze_arg();
+    let stashed = crate::cli::slash_config::take_deep_analyze_arg();
     let arg_owned: String;
     let effective_arg: &str = if arg.trim().is_empty() {
         match stashed {
@@ -4973,7 +4973,7 @@ async fn apply_restored_session(
     Ok(())
 }
 
-pub(super) async fn restore_session_into_state(
+pub(crate) async fn restore_session_into_state(
     session_id: &str,
     profile: Option<&str>,
     api: &astra_thin_client::ThinClient,
@@ -5004,7 +5004,7 @@ pub(super) async fn restore_session_into_state(
 
 // ═══════════════════════════════════════════════════════════ Resume ═══════
 
-pub(super) async fn handle_resume_command(
+pub(crate) async fn handle_resume_command(
     arg: &str,
     profile: Option<&str>,
     api: &astra_thin_client::ThinClient,
@@ -5565,16 +5565,16 @@ mod resume_tests {
     }
 
     fn write_profile_with_token(session_id: &str) {
-        let mut creds = crate::cli_utils::CredentialsFile::default();
+        let mut creds = crate::cli::cli_utils::CredentialsFile::default();
         creds.profiles.insert(
             "default".to_string(),
-            crate::cli_utils::Profile {
+            crate::cli::cli_utils::Profile {
                 access_token: Some("test-token".into()),
                 last_session_id: Some(session_id.to_string()),
                 ..Default::default()
             },
         );
-        crate::cli_utils::save_credentials(&creds).unwrap();
+        crate::cli::cli_utils::save_credentials(&creds).unwrap();
     }
 
     #[test]
@@ -5867,7 +5867,7 @@ mod resume_tests {
         assert_eq!(state.session_id, None);
         assert_eq!(state.turn, 0);
         assert_eq!(
-            crate::cli_utils::load_credentials()
+            crate::cli::cli_utils::load_credentials()
                 .profiles
                 .get("default")
                 .and_then(|profile| profile.last_session_id.as_deref()),
@@ -6077,7 +6077,7 @@ mod resume_tests {
         assert!(state.durable_task_state.is_some());
 
         let summary =
-            crate::execution_state_summary::format_for_session_state(&state, &[]).unwrap();
+            crate::cli::execution_state_summary::format_for_session_state(&state, &[]).unwrap();
         assert!(summary.contains("turn state: last turn was interrupted"));
         assert!(summary.contains("plan execution: goal=\"Ship lifecycle UX\""));
         assert!(summary.contains("in_progress=\"Verify lifecycle state\""));

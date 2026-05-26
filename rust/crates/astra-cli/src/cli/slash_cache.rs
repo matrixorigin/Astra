@@ -22,7 +22,7 @@ struct CacheTurnSummary {
 }
 
 #[allow(dead_code)]
-pub(super) fn handle_cache_command(arg: &str, state: &SessionState) {
+pub(crate) fn handle_cache_command(arg: &str, state: &SessionState) {
     let Some(session_id) = state.session_id.as_deref() else {
         eprintln!(
             "{}",
@@ -52,7 +52,7 @@ pub(super) fn handle_cache_command(arg: &str, state: &SessionState) {
     );
 }
 
-pub(super) fn render_cache_diagnosis(session_id: &str, rounds: &[RoundSnapshot]) -> String {
+pub(crate) fn render_cache_diagnosis(session_id: &str, rounds: &[RoundSnapshot]) -> String {
     let findings = cache_diagnosis::evaluate_all(rounds);
     let mut out = String::new();
     out.push_str(&format!("session: {session_id}\n\n"));
@@ -62,7 +62,7 @@ pub(super) fn render_cache_diagnosis(session_id: &str, rounds: &[RoundSnapshot])
     out
 }
 
-pub(super) fn load_cache_rounds(session_id: &str) -> Vec<RoundSnapshot> {
+pub(crate) fn load_cache_rounds(session_id: &str) -> Vec<RoundSnapshot> {
     let session_dir = session_journal::local_sessions_dir().join(session_id);
     cache_diagnosis::load_session_captures(&session_dir).unwrap_or_default()
 }

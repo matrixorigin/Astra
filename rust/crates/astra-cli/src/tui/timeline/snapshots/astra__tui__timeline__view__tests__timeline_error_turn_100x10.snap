@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/timeline/view.rs
+assertion_line: 639
 expression: "render_tl(&tl, 100, 10)"
 ---
 ┌ Timeline · 2 turns · 500 in 200 out ─────────────────────────────────────────────────────────────┐

@@ -25,12 +25,12 @@ use serde_json::Value;
 
 use crate::{
     ExplainMode,
+    cli::permission_manager::{PermissionManager, PermissionMode},
+    cli::stream_render::RenderPolicy,
     edge_tools::ToolExecutor,
-    permission_manager::{PermissionManager, PermissionMode},
-    stream_render::RenderPolicy,
 };
 
-use super::agentic_loop_turn::{
+use crate::cli::chat_stream::sse_loop::agentic_loop_turn::{
     ChatTurnSseFetchRequest, PrepareTurnTelemetry, fetch_chat_turn_sse,
 };
 
@@ -65,23 +65,23 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub plan_subtask_id: Option<&'a str>,
     pub plan_assemble_line_release: Option<Arc<AtomicBool>>,
     /// Optional channel for forwarding fine-grained stream events.
-    pub stream_event_tx: Option<super::super::StreamEventTx>,
+    pub stream_event_tx: Option<crate::cli::StreamEventTx>,
     /// Optional channel for async tool approval requests during plan execution.
-    pub approval_request_tx: Option<super::super::ApprovalRequestTx>,
+    pub approval_request_tx: Option<crate::cli::ApprovalRequestTx>,
     /// Optional channel for native TUI ask_user prompts.
-    pub ask_user_request_tx: Option<super::super::AskUserRequestTx>,
+    pub ask_user_request_tx: Option<crate::cli::AskUserRequestTx>,
     /// Per-turn channel into the dedicated plan-review overlay used
     /// by `exit_plan_mode`. Lives next to `ask_user_request_tx` but
     /// stays separate so plan markdown does not have to be smuggled
     /// through the question/option layout `ask_user` expects.
-    pub plan_review_request_tx: Option<super::super::PlanReviewRequestTx>,
+    pub plan_review_request_tx: Option<crate::cli::PlanReviewRequestTx>,
     /// Root-level messaging context used when the current turn has no mailbox.
     pub root_send_message_context:
         Option<crate::edge_tools::agent_messaging::SendMessageRuntimeContext>,
     /// REPL turn counter (0-based) for correct turn_id in trace collector.
     pub chat_turn_index: u32,
     /// Cross-turn tool output cache for edge-path dedup.
-    pub tool_cache: crate::stream_render::EdgeToolCache,
+    pub tool_cache: crate::cli::stream_render::EdgeToolCache,
     /// Extra context appended to the system prompt via edge_profile.system_prompt_override.
     pub append_system_prompt: Option<String>,
     /// Optional fork-prefix store: when set + fork flag enabled,
@@ -335,7 +335,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // (`is_singleton` on the kind), so re-pushing every turn keeps
         // exactly one entry on the lane. Drained alongside other
         // runtime nudges by the call below.
-        if self.perm_manager.mode() == crate::permission_manager::PermissionMode::Plan {
+        if self.perm_manager.mode() == crate::cli::permission_manager::PermissionMode::Plan {
             state.push_volatile(
                 astra_runtime::turn::agentic_loop::host::VolatileKind::PlanModeMarker,
                 "[mode=plan] You are in read-only plan mode. Investigate with read-only tools (read_file, grep, glob, web_fetch, …); mutating tools are intentionally absent from the schema. When the plan is ready call `exit_plan_mode(plan=\"<markdown>\")` so the user can approve and choose an execution mode. Do not attempt edits or shell mutations in this mode.",
@@ -393,7 +393,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // `remove` left `write_file` / `bash` permanently
         // restricted after the model called `exit_plan_mode`.
         let plan_scoped_restrictions = plan_mode_restriction_names(
-            self.perm_manager.mode() == crate::permission_manager::PermissionMode::Plan,
+            self.perm_manager.mode() == crate::cli::permission_manager::PermissionMode::Plan,
             &self.all_schemas,
         );
         state
@@ -460,6 +460,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             all_schemas: &self.all_schemas,
             turn_guard: &state.turn_guard,
             restricted_tools: &mut state.restricted_tools,
+            widen_selection_pending: &mut state.widen_selection_pending,
             step_recorder: &mut state.step_recorder,
             file_context: &self.file_context,
             assembly_start,
@@ -708,9 +709,9 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             if let Some((tool, reason)) =
                 astra_turn_core::permission::notice::parse_auto_approved_permission(&line)
             {
-                let _ = tx.send(super::super::StreamEvent::PermissionAutoApproved { tool, reason });
+                let _ = tx.send(crate::cli::StreamEvent::PermissionAutoApproved { tool, reason });
             } else {
-                let _ = tx.send(super::super::StreamEvent::StatusLine(line.clone()));
+                let _ = tx.send(crate::cli::StreamEvent::StatusLine(line.clone()));
             }
         }
         if self.render_policy.suppress_headless() {
@@ -808,7 +809,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             return;
         }
         if self.render_md {
-            let mut md = crate::streaming_md::StreamingMarkdown::new(self.term_width);
+            let mut md = crate::cli::streaming_md::StreamingMarkdown::new(self.term_width);
             md.push(text);
             md.finish();
         } else {

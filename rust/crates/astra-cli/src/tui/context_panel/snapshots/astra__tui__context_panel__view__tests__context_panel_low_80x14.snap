@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/context_panel/view.rs
+assertion_line: 2038
 expression: "render_panel(&b, 80, 14)"
 ---
 ┌ Context window (22% · low) ──────────────────────────────────────────────────┐

@@ -1386,6 +1386,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             loop_turn: turn_index,
             recent_tools: &state.recent_tools,
             last_heavy_checkpoint: &mut state.stall.last_heavy_checkpoint,
+            interaction_mode: host.turn_interaction_mode(),
         },
     )) {
         AgenticPostToolIterationControl::Abort(e) => {

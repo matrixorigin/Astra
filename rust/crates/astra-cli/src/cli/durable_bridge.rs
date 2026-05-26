@@ -4,7 +4,7 @@
 //! so plan execution can show contract generation, verification results, and delivery
 //! reports in a user-friendly way.
 
-use crate::cli_utils::{prefix_chars, truncate_str};
+use crate::cli::cli_utils::{prefix_chars, truncate_str};
 
 use astra_services::task_orchestrator::TaskOutcome;
 use astra_services::{
@@ -14,7 +14,7 @@ use astra_services::{
 use crossterm::style::Stylize;
 use std::sync::Arc;
 
-use crate::theme;
+use crate::cli::theme;
 
 /// Build a reqwest client for the durable-task bridge.
 ///
@@ -438,7 +438,7 @@ pub async fn on_plan_complete(durable: &mut DurableTaskState) -> bool {
 }
 
 /// Pretty-print the final delivery report.
-pub(super) fn display_delivery_report(report: &TaskDeliveryReport) {
+pub(crate) fn display_delivery_report(report: &TaskDeliveryReport) {
     let all_subtasks_verified = report
         .subtask_summaries
         .iter()
@@ -631,7 +631,7 @@ pub fn plan_run_finish_from_delivery_report(
 
 /// Save the delivery report as JSON to the working directory.
 /// Prints the file path on success (dim grey, non-intrusive).
-pub(super) fn save_delivery_report_json(report: &TaskDeliveryReport) {
+pub(crate) fn save_delivery_report_json(report: &TaskDeliveryReport) {
     let filename = format!(
         ".mo-delivery-{}.json",
         report.contract_id.chars().take(8).collect::<String>()

@@ -9,11 +9,11 @@ use super::agentic::headless_round::{HeadlessRoundTerminal, PermissionSyncHandle
 use astra_pipeline::step_protocol::{IdempotencyKey, InMemoryIdempotencyCache};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
+use astra_turn_core::guardrails::turn_guard::TurnGuard;
 use astra_turn_core::headless_tool_assembly::{
     EdgeToolRoundRow, HeadlessResolvedToolSlot, HeadlessRoundToolIdx, resolve_headless_tool_slot,
     take_edge_output_for_tool_call_with_duration,
 };
-use astra_turn_core::turn_guard::TurnGuard;
 
 mod execute;
 mod policy;

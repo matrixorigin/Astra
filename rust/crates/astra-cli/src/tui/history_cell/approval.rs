@@ -339,7 +339,7 @@ impl ApprovalCell {
     fn button_disabled(&self, btn: &crate::tui::approval::Button) -> bool {
         match &btn.action {
             crate::tui::approval::ButtonAction::Respond(
-                crate::chat_stream::ApprovalResponse::AlwaysAllow,
+                crate::cli::chat_stream::ApprovalResponse::AlwaysAllow,
             ) => self.always_action_disabled(),
             _ => false,
         }
@@ -1002,17 +1002,26 @@ mod tests {
     /// stripped), so they're cheap and human-readable.
     #[test]
     fn snapshot_full_card_80() {
-        insta::assert_snapshot!("approval_card_80", render_at(&fixture_full(), 80));
+        crate::tui::testing::assert_tui_snapshot!(
+            "approval_card_80",
+            render_at(&fixture_full(), 80)
+        );
     }
 
     #[test]
     fn snapshot_full_card_100() {
-        insta::assert_snapshot!("approval_card_100", render_at(&fixture_full(), 100));
+        crate::tui::testing::assert_tui_snapshot!(
+            "approval_card_100",
+            render_at(&fixture_full(), 100)
+        );
     }
 
     #[test]
     fn snapshot_full_card_160() {
-        insta::assert_snapshot!("approval_card_160", render_at(&fixture_full(), 160));
+        crate::tui::testing::assert_tui_snapshot!(
+            "approval_card_160",
+            render_at(&fixture_full(), 160)
+        );
     }
 
     #[test]
@@ -1022,7 +1031,10 @@ mod tests {
         let cell = fixture_full()
             .with_source_agent("review-subagent")
             .with_host("ssh:bastion-prod");
-        insta::assert_snapshot!("approval_card_agent_and_host_80", render_at(&cell, 80));
+        crate::tui::testing::assert_tui_snapshot!(
+            "approval_card_agent_and_host_80",
+            render_at(&cell, 80)
+        );
     }
 
     #[test]
@@ -1041,7 +1053,10 @@ mod tests {
             "WritesOutsideWorkspace".into(),
             "WritesSensitiveFile".into(),
         ]);
-        insta::assert_snapshot!("approval_card_destructive_80", render_at(&cell, 80));
+        crate::tui::testing::assert_tui_snapshot!(
+            "approval_card_destructive_80",
+            render_at(&cell, 80)
+        );
     }
 
     #[test]

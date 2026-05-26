@@ -17,7 +17,7 @@ use crossterm::{cursor, execute, terminal};
 /// Tracks what's currently on screen and performs minimal updates
 /// when content changes — like a simplified React reconciler for
 /// terminal lines.
-pub(super) struct TerminalRegion {
+pub(crate) struct TerminalRegion {
     /// Lines currently displayed, each with its physical row count.
     lines: Vec<LineEntry>,
     /// Cached terminal width for wrap calculations.
@@ -32,7 +32,7 @@ struct LineEntry {
 }
 
 impl TerminalRegion {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let term_width = terminal::size().map(|(w, _)| w).unwrap_or(80);
         Self {
             lines: Vec::new(),
@@ -42,7 +42,7 @@ impl TerminalRegion {
 
     /// Number of logical lines currently on screen.
     #[allow(dead_code)]
-    pub(super) fn height(&self) -> usize {
+    pub(crate) fn height(&self) -> usize {
         self.lines.len()
     }
 
@@ -76,7 +76,7 @@ impl TerminalRegion {
     /// Diffs against current lines and only redraws what changed.
     /// If new content is shorter, clears leftover lines.
     /// If new content is longer, appends new lines.
-    pub(super) fn update(&mut self, new_lines: Vec<String>) {
+    pub(crate) fn update(&mut self, new_lines: Vec<String>) {
         // Refresh terminal width in case of resize
         self.refresh_term_width();
 
@@ -151,7 +151,7 @@ impl TerminalRegion {
 
     /// Append lines without diffing (for content that only grows).
     #[allow(dead_code)]
-    pub(super) fn append(&mut self, new_lines: &[String]) {
+    pub(crate) fn append(&mut self, new_lines: &[String]) {
         for line in new_lines {
             println!("{line}");
             let rows = self.calc_physical_rows(line);
@@ -163,7 +163,7 @@ impl TerminalRegion {
         let _ = io::stdout().flush();
     }
     /// Clear the entire region from the terminal.
-    pub(super) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         // Refresh width in case terminal was resized
         self.refresh_term_width();
         let rows = self.total_physical_rows();
@@ -188,14 +188,14 @@ impl TerminalRegion {
 /// - Control chars (0x00-0x1F, 0x7F) = 0 width
 /// - Zero-width Unicode (combining marks, etc.) = 0 width
 /// - CJK, emoji, etc. = 2 width
-pub(super) fn visible_char_width(s: &str) -> usize {
+pub(crate) fn visible_char_width(s: &str) -> usize {
     use unicode_width::UnicodeWidthStr;
     let stripped = strip_ansi_codes(s);
     UnicodeWidthStr::width(stripped.as_str())
 }
 
 /// Display width of a single character per Unicode Standard Annex #11.
-pub(super) fn char_display_width(c: char) -> usize {
+pub(crate) fn char_display_width(c: char) -> usize {
     use unicode_width::UnicodeWidthChar;
     UnicodeWidthChar::width(c).unwrap_or(0)
 }

@@ -5,7 +5,7 @@ use crate::{cli_dim, cli_info, cli_section};
 ///
 /// Cloud sync orchestration is server-owned; the CLI no longer opens MatrixOne
 /// pools or drives sync domains directly.
-pub(super) async fn handle_sync_command(arg: &str, _state: &SessionState) {
+pub(crate) async fn handle_sync_command(arg: &str, _state: &SessionState) {
     let sub = arg.trim();
     cli_section!("Sync Engine Status");
     eprintln!();

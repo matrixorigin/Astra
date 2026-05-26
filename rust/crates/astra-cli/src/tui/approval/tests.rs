@@ -3,7 +3,7 @@
 #![cfg(test)]
 
 use super::ApprovalQueue;
-use crate::chat_stream::ApprovalResponse;
+use crate::cli::chat_stream::ApprovalResponse;
 use tokio::sync::oneshot;
 
 fn channel() -> (

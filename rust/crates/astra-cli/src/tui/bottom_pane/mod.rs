@@ -55,7 +55,7 @@ use super::mention_menu::{
 };
 use super::slash_menu::{SlashItem, SlashMenu, is_open_for, popup as slash_popup_render};
 use super::task_status::TaskStatus;
-use crate::chat_stream::ApprovalResponse;
+use crate::cli::chat_stream::ApprovalResponse;
 use ask_user_view::AskUserView;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -211,8 +211,8 @@ impl BottomPane {
 
     pub fn enqueue_ask_user(
         &mut self,
-        prompt: crate::chat_stream::AskUserPrompt,
-        response_tx: oneshot::Sender<crate::chat_stream::AskUserResponse>,
+        prompt: crate::cli::chat_stream::AskUserPrompt,
+        response_tx: oneshot::Sender<crate::cli::chat_stream::AskUserResponse>,
     ) {
         self.view_stack
             .push(Box::new(AskUserView::new(prompt, response_tx)));
@@ -225,7 +225,7 @@ impl BottomPane {
     pub fn enqueue_plan_review(
         &mut self,
         plan_markdown: String,
-        response_tx: oneshot::Sender<crate::chat_stream::PlanReviewDecision>,
+        response_tx: oneshot::Sender<crate::cli::chat_stream::PlanReviewDecision>,
     ) {
         self.view_stack
             .push(Box::new(plan_review_view::PlanReviewView::new(
@@ -423,7 +423,7 @@ impl BottomPane {
     /// is refreshed so the chip reads the new pending count.
     pub fn reevaluate_approvals_for_mode(
         &mut self,
-        new_mode: crate::permission_manager::PermissionMode,
+        new_mode: crate::cli::permission_manager::PermissionMode,
     ) -> usize {
         use astra_turn_core::permission::engine::{HardDecision, evaluate_permission};
         use astra_turn_core::permission::types::{InheritedPermissions, PermissionSyncContext};

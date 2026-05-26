@@ -1,8 +1,8 @@
 use super::*;
 
 #[cfg(test)]
-use crate::workspace_trust::evaluate_workspace_trust_from_path;
-use crate::workspace_trust::{
+use crate::cli::workspace_trust::evaluate_workspace_trust_from_path;
+use crate::cli::workspace_trust::{
     TrustState, WorkspaceTrustEvaluation, WorkspaceTrustLedger, WorkspaceTrustReason,
     evaluate_workspace_trust, project_permissions_hash,
 };
@@ -33,7 +33,7 @@ use astra_turn_core::tool_argument_hints::{
 /// concrete, pattern-matched suggestion so a denial is more than an
 /// opaque error string. Returns `None` when no obvious alternative
 /// applies (caller renders the bare reason).
-pub(super) fn safe_alternative_for(reason: &str) -> Option<&'static str> {
+pub(crate) fn safe_alternative_for(reason: &str) -> Option<&'static str> {
     let lower = reason.to_lowercase();
     if lower.contains("sensitive path") {
         Some(
@@ -72,7 +72,7 @@ pub(super) fn safe_alternative_for(reason: &str) -> Option<&'static str> {
 /// raw reason and appends a structured safe-alternative hint when one
 /// applies. Kept as a free function so call sites (stream_render) remain
 /// a one-liner.
-pub(super) fn format_denied_message(reason: &str) -> String {
+pub(crate) fn format_denied_message(reason: &str) -> String {
     match safe_alternative_for(reason) {
         Some(alt) => format!("Error: {reason}\nSafe alternative: {alt}"),
         None => format!("Error: {reason}"),
@@ -396,8 +396,8 @@ fn sensitive_path_match(args: &serde_json::Value) -> Option<String> {
 // `PermissionDecision` (renamed to `GateOutcome` in P1) because its
 // shape (Allow / Deny / NeedApproval) is genuinely different from
 // turn-core's `PermissionDecision` (Approve / Deny / Escalate).
-pub(super) use astra_turn_core::permission::types::PermissionMode;
-pub(super) use astra_turn_core::permission::types::PermissionRule;
+pub(crate) use astra_turn_core::permission::types::PermissionMode;
+pub(crate) use astra_turn_core::permission::types::PermissionRule;
 
 /// Atomic encoding of [`PermissionMode`] for the lock-free mirror
 /// the TUI inner-tick path consumes. Keeps the mapping local and
@@ -474,7 +474,7 @@ enum ExecuteDecision {
 
 /// Persistent permission settings, loaded from and saved to disk.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub(super) struct PermissionSettings {
+pub(crate) struct PermissionSettings {
     #[serde(default)]
     pub allow: Vec<String>,
     #[serde(default)]
@@ -503,8 +503,8 @@ pub(super) struct PermissionSettings {
 /// wrong so the TUI can show a banner instead of silently dropping a
 /// corrupt file.
 #[derive(Debug)]
-pub struct PermissionSettingsLoadOutcome {
-    pub settings: PermissionSettings,
+pub(crate) struct PermissionSettingsLoadOutcome {
+    pub(crate) settings: PermissionSettings,
     pub error: Option<PermissionSettingsLoadError>,
 }
 
@@ -659,7 +659,7 @@ impl PermissionLoadPolicy {
 /// deny rules and other safety opt-ins are preserved (deny is
 /// always safe to apply).
 #[must_use]
-pub fn apply_load_policy(
+pub(crate) fn apply_load_policy(
     raw: PermissionSettings,
     policy: &PermissionLoadPolicy,
 ) -> PermissionSettings {
@@ -1016,7 +1016,7 @@ fn parse_rule_with_grammar_v2(s: &str) -> PermissionRule {
     PermissionRule::parse(s)
 }
 
-pub(super) struct PermissionManager {
+pub(crate) struct PermissionManager {
     mode: PermissionMode,
     /// Atomic mirror of `mode` for read-only consumers that hold no
     /// borrow of the `PermissionManager`. The TUI's inner-tick path
@@ -1133,14 +1133,14 @@ impl PermissionManager {
     }
 
     /// Return the current permission mode (for propagation to sub-runs).
-    pub(super) fn mode(&self) -> PermissionMode {
+    pub(crate) fn mode(&self) -> PermissionMode {
         self.mode
     }
 
     /// Whether project-level allow rules are active for this manager.
     /// TUI approval cards use the inverse to disable Project scope
     /// when workspace trust has not been granted or has gone stale.
-    pub(super) fn project_allow_rules_active(&self) -> bool {
+    pub(crate) fn project_allow_rules_active(&self) -> bool {
         self.load_policy.applies_project_allow()
     }
 
@@ -1191,7 +1191,7 @@ impl PermissionManager {
     /// [`DenialTracker`]. Surfaced to the agent via `SelfModel` so it can
     /// self-regulate (narrow scope / ask user) before the hard
     /// fallback-to-user threshold actually fires.
-    pub(super) fn denial_pressure(&self) -> (u32, u32) {
+    pub(crate) fn denial_pressure(&self) -> (u32, u32) {
         (
             self.denial_tracker.total_denials(),
             self.denial_tracker.limits().max_total,
@@ -1200,13 +1200,13 @@ impl PermissionManager {
 
     /// Gap 3: snapshot of recent `(tool, reason)` rejections for the
     /// SelfModel surface. Newest at the back; caller clones.
-    pub(super) fn recent_rejections(&self) -> Vec<(String, String)> {
+    pub(crate) fn recent_rejections(&self) -> Vec<(String, String)> {
         self.recent_rejections.iter().cloned().collect()
     }
 
     /// Gap 3: record a user/system rejection with a short reason. Dedups
     /// `(tool, reason)` pairs and trims to a bounded buffer.
-    pub(super) fn record_rejection(&mut self, tool: &str, reason: &str) {
+    pub(crate) fn record_rejection(&mut self, tool: &str, reason: &str) {
         const MAX: usize = 5;
         self.recent_rejections
             .retain(|(t, r)| !(t == tool && r == reason));
@@ -1218,7 +1218,7 @@ impl PermissionManager {
     }
 
     /// Switch the permission mode at runtime (e.g., via `/allow` command).
-    pub(super) fn set_mode(&mut self, mode: PermissionMode) {
+    pub(crate) fn set_mode(&mut self, mode: PermissionMode) {
         self.mode = mode;
         self.mode_mirror.store(
             encode_mode_for_mirror(mode),
@@ -1230,7 +1230,7 @@ impl PermissionManager {
     /// observer (the TUI status line) can read the current mode
     /// without holding any borrow of the `PermissionManager`.
     /// The handle stays valid for the lifetime of the manager.
-    pub(super) fn mode_mirror_handle(&self) -> PermissionModeMirror {
+    pub(crate) fn mode_mirror_handle(&self) -> PermissionModeMirror {
         PermissionModeMirror {
             inner: std::sync::Arc::clone(&self.mode_mirror),
         }
@@ -1240,7 +1240,7 @@ impl PermissionManager {
     /// boundaries when a UI event (mid-turn Shift+Tab) wrote to the
     /// mirror without being able to borrow `&mut self`. Cheap; no-op
     /// when already in sync.
-    pub(super) fn pull_mode_from_mirror(&mut self) {
+    pub(crate) fn pull_mode_from_mirror(&mut self) {
         let mirror =
             decode_mode_for_mirror(self.mode_mirror.load(std::sync::atomic::Ordering::Acquire));
         if self.mode != mirror {
@@ -1248,7 +1248,7 @@ impl PermissionManager {
         }
     }
 
-    pub(super) fn set_active_session_id(&mut self, session_id: &str) {
+    pub(crate) fn set_active_session_id(&mut self, session_id: &str) {
         self.active_session_id = Some(session_id.to_string());
     }
 
@@ -1258,7 +1258,7 @@ impl PermissionManager {
 
     /// Start a new LLM turn: per-turn approvals from the previous
     /// SSE stream must not leak into the next user message.
-    pub(super) fn clear_turn_overrides(&mut self) {
+    pub(crate) fn clear_turn_overrides(&mut self) {
         self.turn_overrides =
             astra_turn_core::approval_fingerprint::FingerprintedOverrides::default();
     }
@@ -1329,7 +1329,7 @@ impl PermissionManager {
 
     /// Create without loading project settings. Used in tests and internal auto-approved operations.
     #[cfg(test)]
-    pub(super) fn new(auto_approve: bool) -> Self {
+    pub(crate) fn new(auto_approve: bool) -> Self {
         let mode = if auto_approve {
             PermissionMode::Auto
         } else {
@@ -1365,7 +1365,7 @@ impl PermissionManager {
 
     /// Create with settings loaded from a project directory.
     /// Loads `.kiro/permissions.json` if it exists, applying persistent allow/deny rules.
-    pub(super) fn with_project(auto_approve: bool, project_root: &Path) -> Self {
+    pub(crate) fn with_project(auto_approve: bool, project_root: &Path) -> Self {
         let mode = if auto_approve {
             PermissionMode::Auto
         } else {
@@ -1375,7 +1375,7 @@ impl PermissionManager {
     }
 
     /// Create with explicit permission mode and project directory.
-    pub(super) fn with_project_mode(mode: PermissionMode, project_root: &Path) -> Self {
+    pub(crate) fn with_project_mode(mode: PermissionMode, project_root: &Path) -> Self {
         // Default to InteractiveTrusted for backwards compat. New
         // code paths should prefer `with_load_policy` so the trust
         // posture is explicit at the call site.
@@ -1388,7 +1388,7 @@ impl PermissionManager {
 
     /// Create with workspace-trust evaluation. Unknown, untrusted, corrupt,
     /// or changed workspaces apply project deny rules only.
-    pub(super) fn with_workspace_trust(auto_approve: bool, project_root: &Path) -> Self {
+    pub(crate) fn with_workspace_trust(auto_approve: bool, project_root: &Path) -> Self {
         let mode = if auto_approve {
             PermissionMode::Auto
         } else {
@@ -1398,7 +1398,7 @@ impl PermissionManager {
     }
 
     /// Create with explicit mode and workspace-trust evaluation.
-    pub(super) fn with_workspace_trust_mode(mode: PermissionMode, project_root: &Path) -> Self {
+    pub(crate) fn with_workspace_trust_mode(mode: PermissionMode, project_root: &Path) -> Self {
         let trust = evaluate_workspace_trust(project_root);
         Self::with_workspace_trust_evaluation(mode, project_root, trust)
     }
@@ -1437,7 +1437,7 @@ impl PermissionManager {
     /// pass the matching [`PermissionLoadPolicy`]. The policy
     /// shapes which parts of the on-disk file end up in the
     /// effective rule set.
-    pub(super) fn with_load_policy(
+    pub(crate) fn with_load_policy(
         mode: PermissionMode,
         project_root: &Path,
         policy: &PermissionLoadPolicy,
@@ -1509,7 +1509,7 @@ impl PermissionManager {
     /// instead of relying on the legacy `tool_name → bool` collapse.
     /// A deserialization failure logs a warning and leaves overrides
     /// empty rather than silently downgrading to a wider rule.
-    pub(super) fn with_inherited(
+    pub(crate) fn with_inherited(
         project_root: &Path,
         inherited: astra_runtime::orchestration::InheritedPermissions,
     ) -> Self {
@@ -1643,7 +1643,7 @@ impl PermissionManager {
     }
 
     /// Check if this is a background agent (cannot show prompts).
-    pub(super) fn is_background_agent(&self) -> bool {
+    pub(crate) fn is_background_agent(&self) -> bool {
         self.inherited.as_ref().is_some_and(|i| i.is_background)
     }
 
@@ -1664,7 +1664,7 @@ impl PermissionManager {
     /// through to the legacy `allow_rules` / `deny_rules`. The
     /// `to_legacy_overrides()` helper still exists for telemetry /
     /// display but is **no longer wired into enforcement**.
-    pub(super) fn inherited_permissions_for_child(
+    pub(crate) fn inherited_permissions_for_child(
         &self,
         is_background: bool,
     ) -> astra_runtime::orchestration::InheritedPermissions {
@@ -1734,7 +1734,7 @@ impl PermissionManager {
     /// when `None`, matching the pre-split behaviour so existing
     /// cloud consumers don't have to upgrade in lockstep.
     #[cfg(test)]
-    pub(super) fn resolve_cloud_approval(
+    pub(crate) fn resolve_cloud_approval(
         &mut self,
         tool: &str,
         detail: Option<&str>,
@@ -1792,7 +1792,7 @@ impl PermissionManager {
     ///
     /// See [`resolve_cloud_approval`] for the raw-vs-display split contract.
     #[cfg(test)]
-    pub(super) async fn resolve_cloud_approval_async(
+    pub(crate) async fn resolve_cloud_approval_async(
         &mut self,
         tool: &str,
         detail: Option<&str>,
@@ -1848,7 +1848,7 @@ impl PermissionManager {
     }
 
     #[cfg(test)]
-    pub(super) async fn resolve_cloud_approval_batch_async(
+    pub(crate) async fn resolve_cloud_approval_batch_async(
         &mut self,
         requests: &[(&str, Option<&str>, Option<&str>, ApprovalKind)],
         quiet: bool,
@@ -1967,7 +1967,7 @@ impl PermissionManager {
             .collect()
     }
 
-    pub(super) fn preflight_cloud_approval_decision(
+    pub(crate) fn preflight_cloud_approval_decision(
         &mut self,
         tool: &str,
         detail: Option<&str>,
@@ -2354,7 +2354,7 @@ impl PermissionManager {
         'n'
     }
 
-    pub(super) fn apply_cloud_approval_choice(
+    pub(crate) fn apply_cloud_approval_choice(
         &mut self,
         tool: &str,
         detail: Option<&str>,
@@ -2570,7 +2570,7 @@ impl PermissionManager {
 
     /// Persist trust for the current workspace and reload project
     /// settings so project allow rules become active immediately.
-    pub(super) fn trust_workspace(&mut self) -> Result<String, String> {
+    pub(crate) fn trust_workspace(&mut self) -> Result<String, String> {
         let Some(root) = self.project_root.clone() else {
             return Err("no project root is associated with this permission manager".to_string());
         };
@@ -2591,7 +2591,7 @@ impl PermissionManager {
 
     /// Persist an explicit untrusted decision and reload project
     /// settings so project allow rules are removed from the active set.
-    pub(super) fn untrust_workspace(&mut self) -> Result<String, String> {
+    pub(crate) fn untrust_workspace(&mut self) -> Result<String, String> {
         let Some(root) = self.project_root.clone() else {
             return Err("no project root is associated with this permission manager".to_string());
         };
@@ -2642,7 +2642,7 @@ impl PermissionManager {
     /// to the current in-memory session so the user's explicit approval
     /// takes effect immediately; callers must inspect `last_save_error()`
     /// and notify the user that persistence failed.
-    pub(super) fn add_allow_rule(&mut self, rule: &str) {
+    pub(crate) fn add_allow_rule(&mut self, rule: &str) {
         use astra_turn_core::permission::audit::PersistTarget;
 
         let rule_text = rule.to_string();
@@ -2711,7 +2711,7 @@ impl PermissionManager {
     /// Add a user-level persistent allow rule and save to
     /// `~/.astra/permissions.json` using the same lock/reload/merge/save
     /// path as project rules.
-    pub(super) fn add_user_allow_rule(&mut self, rule: &str) {
+    pub(crate) fn add_user_allow_rule(&mut self, rule: &str) {
         self.add_user_allow_rule_with_home(rule, None);
     }
 
@@ -2824,11 +2824,11 @@ impl PermissionManager {
     /// will-save copy and Project/User persistence use one rule shape. That
     /// keeps the selected scope from changing the matched object: Turn,
     /// Session, Project, and User all start from the same tool-call facts.
-    pub(super) fn make_allow_rule(name: &str, args: &serde_json::Value) -> String {
+    pub(crate) fn make_allow_rule(name: &str, args: &serde_json::Value) -> String {
         allow_rule_preview(name, args)
     }
 
-    pub(super) fn make_allow_rule_with_match_target(
+    pub(crate) fn make_allow_rule_with_match_target(
         name: &str,
         args: &serde_json::Value,
         target: &AllowMatchTarget,
@@ -2839,7 +2839,7 @@ impl PermissionManager {
     /// Synchronous permission check — blocks on terminal prompt if needed.
     /// Only used by tests; production code uses [`check_nonblocking()`].
     #[cfg(test)]
-    pub(super) fn check(&mut self, name: &str, args: &serde_json::Value) -> bool {
+    pub(crate) fn check(&mut self, name: &str, args: &serde_json::Value) -> bool {
         // Step 1: Deny rules are bypass-immune (checked first, even with auto_approve).
         if self.check_deny_rules(name, args) {
             eprintln!("{}", format!("  ✗  Denied by rule: {name}").red());
@@ -3058,7 +3058,7 @@ impl PermissionManager {
     /// Wraps `check_nonblocking_inner` to uniformly record every system-driven
     /// `Deny` into `recent_rejections` so Gap 3 surfaces all refusal reasons
     /// to the SelfModel (not just user-declined approvals).
-    pub(super) fn check_nonblocking(
+    pub(crate) fn check_nonblocking(
         &mut self,
         name: &str,
         args: &serde_json::Value,
@@ -3191,7 +3191,7 @@ impl PermissionManager {
     }
 
     /// Record a session override from an async approval response.
-    pub(super) fn record_approval(
+    pub(crate) fn record_approval(
         &mut self,
         name: &str,
         args: Option<&serde_json::Value>,
@@ -3208,7 +3208,7 @@ impl PermissionManager {
         }
     }
 
-    pub(super) fn record_approval_with_match_target(
+    pub(crate) fn record_approval_with_match_target(
         &mut self,
         name: &str,
         args: &serde_json::Value,
@@ -3224,7 +3224,7 @@ impl PermissionManager {
     }
 
     /// Record an approval that is valid only for the current LLM turn.
-    pub(super) fn record_turn_approval(
+    pub(crate) fn record_turn_approval(
         &mut self,
         name: &str,
         args: Option<&serde_json::Value>,
@@ -3241,7 +3241,7 @@ impl PermissionManager {
         }
     }
 
-    pub(super) fn record_turn_approval_with_match_target(
+    pub(crate) fn record_turn_approval_with_match_target(
         &mut self,
         name: &str,
         args: &serde_json::Value,
@@ -3268,7 +3268,7 @@ impl PermissionManager {
     /// Only canonical, existing paths are trusted. Non-existent paths
     /// are ignored rather than remembered as raw strings because a path
     /// can later appear as a symlink to a different subtree.
-    pub(super) fn trust_sandbox_root(&mut self, root: PathBuf) {
+    pub(crate) fn trust_sandbox_root(&mut self, root: PathBuf) {
         let Ok(canonical) = std::fs::canonicalize(root) else {
             return;
         };
@@ -3280,7 +3280,7 @@ impl PermissionManager {
     /// Parse the target path out of a sandbox-denied reason string and
     /// trust it. Expected format:
     /// `Path '{target}' is outside the project directory '{root}'. …`
-    pub(super) fn trust_sandbox_root_from_reason(&mut self, reason: &str) {
+    pub(crate) fn trust_sandbox_root_from_reason(&mut self, reason: &str) {
         if let Some(p) = parse_sandbox_target_path(reason) {
             self.trust_sandbox_root(p);
         }
@@ -3297,7 +3297,7 @@ impl PermissionManager {
     }
 
     /// Summary of current permission state for `/allow rules`.
-    pub(super) fn rules_summary(&self) -> String {
+    pub(crate) fn rules_summary(&self) -> String {
         use std::fmt::Write;
         let mut out = String::new();
         let _ = writeln!(out, "  Mode: {}", self.mode);
@@ -3340,12 +3340,12 @@ impl PermissionManager {
 
     /// Merge restored approval overrides from a checkpoint into this session.
     /// Existing live overrides take priority (session-priority merge).
-    pub(super) fn merge_restored_overrides(&mut self, json: &serde_json::Value) {
+    pub(crate) fn merge_restored_overrides(&mut self, json: &serde_json::Value) {
         self.session_overrides.merge_from_json(json);
     }
 
     /// Export session overrides as a `FingerprintedOverrides` clone for checkpoint persistence.
-    pub(super) fn export_session_overrides(
+    pub(crate) fn export_session_overrides(
         &self,
     ) -> Option<astra_turn_core::approval_fingerprint::FingerprintedOverrides> {
         if self.session_overrides.is_empty() {
@@ -3370,7 +3370,7 @@ impl PermissionManager {
 /// to avoid churning every call site; new code should use
 /// `GateOutcome`.
 #[derive(Debug)]
-pub(super) enum GateOutcome {
+pub(crate) enum GateOutcome {
     Allow,
     Deny(String),
     /// Tool requires interactive approval — route through async channel.
@@ -3385,7 +3385,7 @@ pub(super) enum GateOutcome {
 /// Backwards-compatible alias for the previous name. Exists only so
 /// the existing call sites in `stream_render.rs` etc. keep compiling
 /// during the P1 type-merge transition. Will be removed in P2.
-pub(super) type PermissionDecision = GateOutcome;
+pub(crate) type PermissionDecision = GateOutcome;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
@@ -3507,7 +3507,7 @@ mod tests {
 
     #[test]
     fn safe_alternative_covers_sensitive_path_denial() {
-        let out = super::safe_alternative_for("Sensitive path (deny mode)").unwrap();
+        let out = safe_alternative_for("Sensitive path (deny mode)").unwrap();
         assert!(
             out.contains("allow_sensitive_path_writes"),
             "safe alt must name the opt-in flag: {out}"
@@ -3516,7 +3516,7 @@ mod tests {
 
     #[test]
     fn safe_alternative_covers_git_force_push() {
-        let out = super::safe_alternative_for("Git safety violation: force push").unwrap();
+        let out = safe_alternative_for("Git safety violation: force push").unwrap();
         assert!(
             out.to_lowercase().contains("non-forcing") || out.contains("plain `git push`"),
             "safe alt must steer away from force push: {out}"
@@ -3526,8 +3526,7 @@ mod tests {
     #[test]
     fn safe_alternative_covers_shell_obfuscation() {
         let out =
-            super::safe_alternative_for("Dangerous pattern: shell_obfuscation detected (eval)")
-                .unwrap();
+            safe_alternative_for("Dangerous pattern: shell_obfuscation detected (eval)").unwrap();
         assert!(
             out.contains("eval"),
             "safe alt must mention eval specifically: {out}"
@@ -3542,12 +3541,12 @@ mod tests {
 
     #[test]
     fn safe_alternative_returns_none_for_unknown_reason() {
-        assert!(super::safe_alternative_for("some unrelated error").is_none());
+        assert!(safe_alternative_for("some unrelated error").is_none());
     }
 
     #[test]
     fn format_denied_message_appends_safe_alt_when_matched() {
-        let out = super::format_denied_message("Sensitive path (deny mode)");
+        let out = format_denied_message("Sensitive path (deny mode)");
         assert!(
             out.starts_with("Error: Sensitive path"),
             "must preserve the raw error line: {out}"
@@ -3560,18 +3559,14 @@ mod tests {
 
     #[test]
     fn format_denied_message_omits_label_when_no_alt_known() {
-        let out = super::format_denied_message("some unrelated error");
+        let out = format_denied_message("some unrelated error");
         assert_eq!(out, "Error: some unrelated error");
     }
 
     #[test]
     fn cloud_always_feedback_message_explains_sensitive_path_session_only() {
-        let out = super::cloud_always_feedback_message(
-            "this file edit in this workspace",
-            true,
-            None,
-            true,
-        );
+        let out =
+            cloud_always_feedback_message("this file edit in this workspace", true, None, true);
         assert!(
             out.contains("session only"),
             "missing session-only hint: {out}"
@@ -3584,7 +3579,7 @@ mod tests {
 
     #[test]
     fn cloud_always_feedback_message_uses_command_family_language() {
-        let out = super::cloud_always_feedback_message(
+        let out = cloud_always_feedback_message(
             "the `cargo test` command family in this workspace",
             true,
             None,
@@ -3599,7 +3594,7 @@ mod tests {
     #[test]
     fn cloud_always_feedback_message_falls_back_to_session_when_workspace_persistence_unavailable()
     {
-        let out = super::cloud_always_feedback_message(
+        let out = cloud_always_feedback_message(
             "the `cargo test` command family in this session",
             false,
             None,
