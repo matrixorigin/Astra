@@ -81,6 +81,7 @@ mod delegate_subrun;
 mod diagnostic_log;
 #[path = "cli/diff_presenter.rs"]
 mod diff_presenter;
+mod diff_utils;
 #[path = "cli/durable_bridge.rs"]
 mod durable_bridge;
 #[path = "cli/edge_lifecycle.rs"]

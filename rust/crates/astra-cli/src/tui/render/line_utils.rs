@@ -1,20 +1,105 @@
 use std::borrow::Cow;
+use std::iter::Peekable;
+use std::str::Chars;
 
 use ratatui::text::{Line, Span};
+
+const MAX_STRING_ESCAPE_SCAN_CHARS: usize = 256;
 
 fn is_unsafe_terminal_control(ch: char) -> bool {
     ch.is_control() && ch != '\n' && ch != '\t'
 }
 
+fn skip_csi(chars: &mut Peekable<Chars<'_>>) {
+    for ch in chars.by_ref() {
+        if ('@'..='~').contains(&ch) {
+            break;
+        }
+    }
+}
+
+fn skip_string_escape(chars: &mut Peekable<Chars<'_>>, allow_bel: bool) -> Option<char> {
+    let mut scanned = 0usize;
+    while let Some(ch) = chars.next() {
+        scanned += 1;
+        if allow_bel && ch == '\x07' {
+            return None;
+        }
+        if ch == '\u{009c}' {
+            return None;
+        }
+        if ch == '\x1b' && matches!(chars.peek(), Some('\\')) {
+            chars.next();
+            return None;
+        }
+        if ch == '\n' {
+            return Some('\n');
+        }
+        if scanned >= MAX_STRING_ESCAPE_SCAN_CHARS {
+            return (!is_unsafe_terminal_control(ch)).then_some(ch);
+        }
+    }
+    None
+}
+
 pub(crate) fn sanitize_terminal_text(text: &str) -> Cow<'_, str> {
-    if !text.chars().any(is_unsafe_terminal_control) {
+    if !text.chars().any(|ch| {
+        is_unsafe_terminal_control(ch)
+            || matches!(
+                ch,
+                '\x1b'
+                    | '\u{0090}'
+                    | '\u{0098}'
+                    | '\u{009b}'
+                    | '\u{009c}'
+                    | '\u{009d}'
+                    | '\u{009e}'
+                    | '\u{009f}'
+            )
+    }) {
         return Cow::Borrowed(text);
     }
 
     let mut sanitized = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if !is_unsafe_terminal_control(ch) {
-            sanitized.push(ch);
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    skip_csi(&mut chars);
+                }
+                Some(']') => {
+                    chars.next();
+                    if let Some(ch) = skip_string_escape(&mut chars, true) {
+                        sanitized.push(ch);
+                    }
+                }
+                Some('P' | 'X' | '^' | '_') => {
+                    chars.next();
+                    if let Some(ch) = skip_string_escape(&mut chars, false) {
+                        sanitized.push(ch);
+                    }
+                }
+                Some(next) if ('@'..='_').contains(next) => {
+                    chars.next();
+                }
+                _ => {}
+            },
+            '\u{009b}' => skip_csi(&mut chars),
+            '\u{009d}' => {
+                if let Some(ch) = skip_string_escape(&mut chars, true) {
+                    sanitized.push(ch);
+                }
+            }
+            '\u{0090}' | '\u{0098}' | '\u{009e}' | '\u{009f}' => {
+                if let Some(ch) = skip_string_escape(&mut chars, false) {
+                    sanitized.push(ch);
+                }
+            }
+            '\u{009c}' => {}
+            _ if !is_unsafe_terminal_control(ch) => sanitized.push(ch),
+            _ => {}
         }
     }
     Cow::Owned(sanitized)
@@ -82,8 +167,8 @@ mod tests {
 
     #[test]
     fn sanitize_terminal_text_strips_control_sequences_but_keeps_newlines_and_tabs() {
-        let text = "ok\x1b[31m\tstill\nfine\r\u{009b}1m";
-        assert_eq!(sanitize_terminal_text(text), "ok[31m\tstill\nfine1m");
+        let text = "ok\x1b[31m\tstill\nfine\r\u{009b}1m\x1b]0;title\x07";
+        assert_eq!(sanitize_terminal_text(text), "ok\tstill\nfine");
     }
 
     #[test]
@@ -97,7 +182,7 @@ mod tests {
 
         let sanitized = sanitize_line_for_terminal(&line);
         assert_eq!(sanitized.spans.len(), 2);
-        assert_eq!(sanitized.spans[0].content.as_ref(), "safe[31m");
+        assert_eq!(sanitized.spans[0].content.as_ref(), "safe");
         assert_eq!(sanitized.spans[1].content.as_ref(), "\tb\t");
         assert_eq!(sanitized.spans[0].style, Style::default().fg(Color::Green));
         assert_eq!(sanitized.style, Style::default().bg(Color::Black));
@@ -105,5 +190,19 @@ mod tests {
             sanitized.alignment,
             Some(ratatui::layout::Alignment::Center)
         );
+    }
+
+    #[test]
+    fn sanitize_terminal_text_limits_unterminated_string_escape_damage() {
+        let text = format!("prefix\x1b]0;{}tail", "x".repeat(300));
+        let sanitized = sanitize_terminal_text(&text);
+        assert!(sanitized.starts_with("prefix"));
+        assert!(sanitized.ends_with("tail"));
+    }
+
+    #[test]
+    fn sanitize_terminal_text_preserves_newline_after_unterminated_string_escape() {
+        let text = "prefix\x1b]0;title\nvisible";
+        assert_eq!(sanitize_terminal_text(text), "prefix\nvisible");
     }
 }

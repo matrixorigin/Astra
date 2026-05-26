@@ -28,6 +28,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use super::HistoryCell;
+use crate::tui::render::line_utils::sanitize_terminal_text;
 use crate::tui::turn_event::{ToolStatus as PersistStatus, TurnEvent};
 
 /// Live status. `Running` is intentionally separate from the
@@ -330,7 +331,8 @@ impl HistoryCell for ToolCell {
         // `│ <description>` — the command, path, or summary line.
         if !self.description.is_empty() {
             let max_w = w.saturating_sub(4);
-            for dl in self.description.lines().take(2) {
+            let description = sanitize_terminal_text(&self.description);
+            for dl in description.lines().take(2) {
                 lines.push(Line::from(vec![
                     Span::styled("  │ ", dim),
                     Span::raw(truncate_by_width(dl, max_w)),
@@ -341,11 +343,12 @@ impl HistoryCell for ToolCell {
         // `└ <output summary>` — diff renderer for +/- content,
         // plain truncated preview otherwise.
         if let Some(ref summary) = self.output_summary {
+            let summary = sanitize_terminal_text(summary);
             let has_diff = summary
                 .lines()
                 .any(|l| l.starts_with('+') || l.starts_with('-'));
             if has_diff {
-                let diff_lines = crate::tui::diff_render::render_diff_lines(summary, 8);
+                let diff_lines = crate::tui::diff_render::render_diff_lines(&summary, 10);
                 for (i, dl) in diff_lines.into_iter().enumerate() {
                     if i == 0 {
                         let mut spans = vec![Span::styled("  └ ", dim)];
@@ -587,13 +590,56 @@ mod tests {
         t.output_summary = Some("line-1\x1b[2J\nline-2\u{009b}1m".into());
 
         let out = render(&t, 100, 6);
-        assert!(out.contains("bash[31m"));
+        assert!(out.contains("bash"));
         assert!(out.contains("boom\tok"));
-        assert!(out.contains("line-1[2J"));
-        assert!(out.contains("line-21m"));
+        assert!(out.contains("line-1"));
+        assert!(out.contains("line-2"));
+        assert!(!out.contains("[2J"));
+        assert!(!out.contains("[31m"));
+        assert!(!out.contains("1m"));
         assert!(!out.contains('\x1b'));
         assert!(!out.contains('\r'));
         assert!(!out.contains('\u{9b}'));
+    }
+
+    #[test]
+    fn ansi_wrapped_diff_summary_still_uses_diff_renderer() {
+        let mut t = ok_tool("write_file", "/tmp/hello.py", 7);
+        t.output_summary = Some(
+            "\x1b[2mhello.py\x1b[0m\n\x1b[38;5;10m+\x1b[39m\x1b[38;5;10m#!/usr/bin/env python3\x1b[0m\n\x1b[38;5;10m+\x1b[39mprint(\"hello\")".into(),
+        );
+
+        let out = render(&t, 100, 8);
+        assert!(out.contains("hello.py"));
+        assert!(out.contains("   1 + #!/usr/bin/env python3"), "{out}");
+        assert!(out.contains("   2 + print(\"hello\")"), "{out}");
+        assert!(!out.contains("[38;5;10m"));
+        assert!(!out.contains("[2m"));
+    }
+
+    #[test]
+    fn raw_diff_preview_preserves_folded_change_count() {
+        let mut t = ok_tool("str_replace", "src/hello.py", 7);
+        t.output_summary = Some(
+            "\
+--- a/src/hello.py\n\
++++ b/src/hello.py\n\
+@@ -1,2 +1,7 @@\n\
+-print(\"old\")\n\
++print(\"new1\")\n\
++print(\"new2\")\n\
++print(\"new3\")\n\
++print(\"new4\")\n\
++print(\"new5\")\n\
+… +1 more changed lines"
+                .into(),
+        );
+
+        let out = render(&t, 100, 12);
+        assert!(out.contains("   1 - print(\"old\")"), "{out}");
+        assert!(out.contains("   1 + print(\"new1\")"), "{out}");
+        assert!(out.contains("   5 + print(\"new5\")"), "{out}");
+        assert!(out.contains("… +1 more changed lines"), "{out}");
     }
 
     // ── Progress signals ─────────────────────────────────────────

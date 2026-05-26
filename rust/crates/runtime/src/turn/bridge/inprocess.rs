@@ -514,6 +514,30 @@ fn normalize_exit_semantics_tag(tag: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+#[cfg(test)]
+mod exit_semantics_tests {
+    use super::normalize_exit_semantics_tag;
+
+    #[test]
+    fn normalize_exit_semantics_tag_accepts_canonical_values() {
+        assert_eq!(
+            normalize_exit_semantics_tag("execution_error"),
+            Some("execution_error".to_string())
+        );
+        assert_eq!(
+            normalize_exit_semantics_tag("domain_negative"),
+            Some("domain_negative".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_exit_semantics_tag_rejects_unknown_values() {
+        assert_eq!(normalize_exit_semantics_tag("made_up"), None);
+        assert_eq!(normalize_exit_semantics_tag("ExecutionError"), None);
+        assert_eq!(normalize_exit_semantics_tag("domain-negative"), None);
+    }
+}
+
 fn build_bridge_tool_call_records(
     tool_calls: &[Value],
     tool_results: &[Value],

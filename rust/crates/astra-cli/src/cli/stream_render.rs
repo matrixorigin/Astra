@@ -77,8 +77,8 @@ fn tool_output_event_text(tool: &str, output: &str) -> String {
 
 // CLI formatting utilities
 use super::cli_formatting::{
-    colorize_diff_summary, extract_cli_diff_block, format_byte_size, format_duration_suffix,
-    github_repo_display, shorten_path, truncate_line,
+    colorize_diff_summary, compact_unified_diff_preview, extract_cli_diff_block, format_byte_size,
+    format_duration_suffix, github_repo_display, shorten_path, truncate_line,
 };
 
 // Effects module types
@@ -4200,6 +4200,7 @@ pub(super) struct StreamRenderState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolOutputSummaryKind {
     Error,
+    Diff,
     Structural,
     Preview,
 }
@@ -4208,6 +4209,32 @@ enum ToolOutputSummaryKind {
 struct ToolOutputSummary {
     kind: ToolOutputSummaryKind,
     text: String,
+}
+
+fn format_terminal_tool_summary(tool: &str, summary: &ToolOutputSummary, warning: bool) -> String {
+    let rendered = if matches!(summary.kind, ToolOutputSummaryKind::Diff)
+        && matches!(tool, "write_file" | "str_replace" | "multi_edit")
+    {
+        colorize_diff_summary(&summary.text)
+    } else {
+        match summary.kind {
+            ToolOutputSummaryKind::Diff => summary.text.clone(),
+            ToolOutputSummaryKind::Preview | ToolOutputSummaryKind::Structural => {
+                if warning {
+                    format!("{}", summary.text.as_str().yellow())
+                } else {
+                    format!("{}", summary.text.as_str().dim())
+                }
+            }
+            ToolOutputSummaryKind::Error => format!("{}", summary.text.as_str().red()),
+        }
+    };
+
+    rendered
+        .lines()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ── Tool completion icon + output-summary sentinels (shared by `format_output_summary`) ──
@@ -5235,24 +5262,15 @@ impl StreamRenderState {
                 .unwrap_or_else(|| "failed".to_string());
             format!("    {}", err_msg.red())
         } else if is_warning {
-            // Show warning context in yellow.
-            match output_summary {
-                Some(summary) => match summary.kind {
-                    ToolOutputSummaryKind::Preview
-                    | ToolOutputSummaryKind::Structural
-                    | ToolOutputSummaryKind::Error => format!("    {}", summary.text.yellow()),
-                },
-                None => String::new(),
-            }
+            output_summary
+                .as_ref()
+                .map(|summary| format_terminal_tool_summary(tool, summary, true))
+                .unwrap_or_default()
         } else {
-            match output_summary {
-                Some(summary) => match summary.kind {
-                    ToolOutputSummaryKind::Preview
-                    | ToolOutputSummaryKind::Structural
-                    | ToolOutputSummaryKind::Error => format!("    {}", summary.text.dim()),
-                },
-                None => String::new(),
-            }
+            output_summary
+                .as_ref()
+                .map(|summary| format_terminal_tool_summary(tool, summary, false))
+                .unwrap_or_default()
         };
         if self.md.is_some() {
             self.stop_tool_stderr_running();
@@ -5321,23 +5339,15 @@ impl StreamRenderState {
                 .unwrap_or_else(|| "failed".to_string());
             format!("    {}", err_msg.red())
         } else if is_warning {
-            match output_summary {
-                Some(summary) => match summary.kind {
-                    ToolOutputSummaryKind::Preview
-                    | ToolOutputSummaryKind::Structural
-                    | ToolOutputSummaryKind::Error => format!("    {}", summary.text.yellow()),
-                },
-                None => String::new(),
-            }
+            output_summary
+                .as_ref()
+                .map(|summary| format_terminal_tool_summary(tool, summary, true))
+                .unwrap_or_default()
         } else {
-            match output_summary {
-                Some(summary) => match summary.kind {
-                    ToolOutputSummaryKind::Preview
-                    | ToolOutputSummaryKind::Structural
-                    | ToolOutputSummaryKind::Error => format!("    {}", summary.text.dim()),
-                },
-                None => String::new(),
-            }
+            output_summary
+                .as_ref()
+                .map(|summary| format_terminal_tool_summary(tool, summary, false))
+                .unwrap_or_default()
         };
 
         let mut out_lines = 1usize;
@@ -5366,6 +5376,10 @@ impl StreamRenderState {
     ) -> Option<ToolOutputSummary> {
         let structural = |text: String| ToolOutputSummary {
             kind: ToolOutputSummaryKind::Structural,
+            text,
+        };
+        let diff_summary = |text: String| ToolOutputSummary {
+            kind: ToolOutputSummaryKind::Diff,
             text,
         };
         let preview = |text: String| ToolOutputSummary {
@@ -5514,9 +5528,9 @@ impl StreamRenderState {
                 // str_replace: sentinel-wrapped diff; write_file: JSON `_cli_unified_diff` (same as headless preview).
                 let diff_block = extract_cli_diff_block(output);
                 if let Some(ref diff) = diff_block {
-                    let colored = colorize_diff_summary(diff.as_ref(), 5);
-                    if !colored.is_empty() {
-                        return Some(structural(colored));
+                    let preview = compact_unified_diff_preview(diff.as_ref(), 5);
+                    if !preview.is_empty() {
+                        return Some(diff_summary(preview));
                     }
                 }
                 // Fallback: check if output itself looks like a diff
@@ -5524,9 +5538,9 @@ impl StreamRenderState {
                     .lines()
                     .any(|l| l.starts_with("+++ ") || l.starts_with("--- "))
                 {
-                    let colored = colorize_diff_summary(output, 5);
-                    if !colored.is_empty() {
-                        return Some(structural(colored));
+                    let preview = compact_unified_diff_preview(output, 5);
+                    if !preview.is_empty() {
+                        return Some(diff_summary(preview));
                     }
                 }
                 if tool == "write_file"
@@ -6464,7 +6478,7 @@ pub(super) async fn consume_turn_sse(
     let idle = stream_idle_timeout();
     let (
         mut sse_result,
-        edge_tool_round,
+        host_edge_tool_round,
         mut md_renderer,
         lines_written,
         _pending_xml_buffer,
@@ -6517,6 +6531,7 @@ pub(super) async fn consume_turn_sse(
         (result, Vec::new(), md, lw, String::new(), false, None)
     };
     apply_edge_auth_failure_result(&mut sse_result.accum, auth_failure);
+    let edge_tool_round = merge_edge_tool_rounds(host_edge_tool_round, &sse_result.tool_results);
 
     let mut result = TurnResult {
         core: sse_result.accum,
@@ -6583,6 +6598,33 @@ pub(super) fn dispatch_turn_event_block(
 ) {
     let effects = dispatch_chat_turn_sse_event_block(block, &mut result.core, pending_edge);
     apply_sse_render_effects(effects, render, policy);
+}
+
+fn merge_edge_tool_rounds(
+    host_round: Vec<EdgeToolExecResult>,
+    consumed_tool_results: &[EdgeToolExecResult],
+) -> Vec<EdgeToolExecResult> {
+    if consumed_tool_results.is_empty() {
+        return host_round;
+    }
+
+    let mut merged = host_round;
+    let mut seen_request_ids: std::collections::HashSet<String> = merged
+        .iter()
+        .map(|result| result.request_id.clone())
+        .collect();
+
+    // Host wins on duplicate request_id; if consumed has the same id
+    // multiple times (unlikely but not enforced upstream), only the
+    // first unseen occurrence is appended — later duplicates are
+    // silently dropped.
+    for result in consumed_tool_results {
+        if seen_request_ids.insert(result.request_id.clone()) {
+            merged.push(result.clone());
+        }
+    }
+
+    merged
 }
 
 /// Append `<skill-loaded name="..."/>` to a successful skill result.
@@ -8222,6 +8264,29 @@ diff --git a/src/a.rs b/src/a.rs\n\
         assert!(summary.text.contains("+1"));
         assert!(summary.text.contains("-1"));
         assert!(summary.text.contains("src/a.rs"));
+    }
+
+    #[test]
+    fn str_replace_output_summary_keeps_raw_diff_preview_for_tui_rendering() {
+        let r = StreamRenderState::new();
+        let output = "\
+<<<ASTRA_UNIFIED_DIFF>>>\n\
+--- a/src/hello.py\n\
++++ b/src/hello.py\n\
+@@ -1,2 +1,3 @@\n\
+-print(\"old\")\n\
++print(\"new\")\n\
++print(\"more\")\n\
+<<<END_ASTRA_UNIFIED_DIFF>>>";
+        let summary = r
+            .format_output_summary("str_replace", output, "ok")
+            .expect("summary");
+        assert_eq!(summary.kind, ToolOutputSummaryKind::Diff);
+        assert!(summary.text.contains("--- a/src/hello.py"));
+        assert!(summary.text.contains("+++ b/src/hello.py"));
+        assert!(summary.text.contains("@@ -1,2 +1,3 @@"));
+        assert!(summary.text.contains("+print(\"new\")"));
+        assert!(!summary.text.contains('\x1b'));
     }
 
     #[test]
@@ -10055,6 +10120,59 @@ diff --git a/src/a.rs b/src/a.rs\n\
             "{}",
             result.output
         );
+    }
+
+    #[test]
+    fn merge_edge_tool_rounds_recovers_missing_host_result() {
+        let consumed = vec![EdgeToolExecResult {
+            request_id: "call-exit".to_string(),
+            tool: "exit_plan_mode".to_string(),
+            args: serde_json::json!({"approved": true}),
+            output: "Exited plan mode; user approved. Next turn will run in auto mode.".to_string(),
+            tool_result_fields: None,
+            status: "ok".to_string(),
+            duration_ms: 12,
+        }];
+
+        let merged = merge_edge_tool_rounds(Vec::new(), &consumed);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].request_id, consumed[0].request_id);
+        assert_eq!(merged[0].tool, consumed[0].tool);
+        assert_eq!(merged[0].args, consumed[0].args);
+        assert_eq!(merged[0].output, consumed[0].output);
+        assert_eq!(merged[0].status, consumed[0].status);
+        assert_eq!(merged[0].duration_ms, consumed[0].duration_ms);
+    }
+
+    #[test]
+    fn merge_edge_tool_rounds_deduplicates_by_request_id() {
+        let host = vec![EdgeToolExecResult {
+            request_id: "call-exit".to_string(),
+            tool: "exit_plan_mode".to_string(),
+            args: serde_json::json!({"approved": true}),
+            output: "host output".to_string(),
+            tool_result_fields: None,
+            status: "ok".to_string(),
+            duration_ms: 8,
+        }];
+        let consumed = vec![EdgeToolExecResult {
+            request_id: "call-exit".to_string(),
+            tool: "exit_plan_mode".to_string(),
+            args: serde_json::json!({"approved": true}),
+            output: "consumer output".to_string(),
+            tool_result_fields: None,
+            status: "ok".to_string(),
+            duration_ms: 9,
+        }];
+
+        let merged = merge_edge_tool_rounds(host.clone(), &consumed);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].request_id, host[0].request_id);
+        assert_eq!(merged[0].tool, host[0].tool);
+        assert_eq!(merged[0].args, host[0].args);
+        assert_eq!(merged[0].output, host[0].output);
+        assert_eq!(merged[0].status, host[0].status);
+        assert_eq!(merged[0].duration_ms, host[0].duration_ms);
     }
 
     #[tokio::test]
