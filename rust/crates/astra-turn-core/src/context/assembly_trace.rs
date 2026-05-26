@@ -76,6 +76,29 @@ impl Default for ContextAssemblyTrace {
     }
 }
 
+/// Normalize arbitrary memory content into a one-line preview suitable for
+/// observability surfaces.
+#[must_use]
+pub fn normalize_content_preview(content: &str) -> String {
+    content
+        .replace(['\r', '\n'], " ⏎ ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// First `max_chars` chars of [`normalize_content_preview`].
+#[must_use]
+pub fn preview_snippet(content: &str, max_chars: usize) -> String {
+    let normalized = normalize_content_preview(content);
+    let trimmed: String = normalized.chars().take(max_chars).collect();
+    if normalized.chars().count() > max_chars {
+        format!("{trimmed}…")
+    } else {
+        trimmed
+    }
+}
+
 // ─── System Prompt Breakdown ─────────────────────────────────────────────────
 
 /// Detailed breakdown of system prompt token allocation.
@@ -639,15 +662,10 @@ pub fn build_memory_trace_from_retrieval(
         .filter(|(content, _)| !astra_prompts::memory_proto::is_session_namespace_memory(content))
         .enumerate()
         .map(|(idx, (content, score))| {
-            let preview = if content.len() > 100 {
-                format!("{}...", &content[..content.floor_char_boundary(100)])
-            } else {
-                content.clone()
-            };
             MemorySelection {
                 memory_id: format!("mem-{}", idx),
                 memory_type: "semantic".to_string(),
-                content_preview: preview,
+                content_preview: preview_snippet(content, 100),
                 relevance_score: *score,
                 tokens: (content.len() / 4) as u32, // Rough estimate
                 source: MemorySource::Session,
@@ -747,5 +765,11 @@ mod tests {
             "[@pref/active] prefer Rust"
         );
         assert_eq!(trace.candidates_considered, 4);
+    }
+
+    #[test]
+    fn preview_snippet_normalizes_multiline_content() {
+        let preview = preview_snippet("# Session Memory\n## Session Title\nAstra", 80);
+        assert_eq!(preview, "# Session Memory ⏎ ## Session Title ⏎ Astra");
     }
 }

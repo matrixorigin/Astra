@@ -391,20 +391,14 @@ fn render_section(
                 }
             } else if !b.memory_focus.is_empty() {
                 // No selected memories this turn but retrieval
-                // still happened (e.g. everything rejected). Show
-                // the heading + retrieval detail so the user sees
-                // why memory came up empty.
+                // or prompt injection still happened. Show the
+                // heading plus a collapsed summary that preserves
+                // the distinction between retrieved and injected.
                 out.push(section_heading_for(Section::Memory, focused, expanded));
                 if expanded {
                     append_memory_focus(out, &b.memory_focus);
                 } else {
-                    out.push(Line::from(vec![
-                        Span::raw("    └ "),
-                        Span::styled(
-                            "no memories selected this turn".to_string(),
-                            Style::default().add_modifier(Modifier::DIM),
-                        ),
-                    ]));
+                    append_memory_focus_collapsed(out, &b.memory_focus);
                 }
                 out.push(Line::default());
             }
@@ -1132,7 +1126,7 @@ fn append_memory_section(
             ]
         } else {
             // Collapsed: single-line truncated preview.
-            let preview = truncate_preview(&m.preview, 60);
+            let preview = inline_preview(&m.preview, 60);
             vec![
                 Span::raw("    └ "),
                 Span::raw(format!("\"{preview}\"")),
@@ -1148,7 +1142,9 @@ fn append_memory_section(
         };
         out.push(Line::from(header));
         if expanded {
-            for line in wrap_text(m.preview.trim(), 66, EXPANDED_PREVIEW_ROWS) {
+            let normalized =
+                astra_turn_core::context_assembly_trace::normalize_content_preview(&m.preview);
+            for line in wrap_text(&normalized, 66, EXPANDED_PREVIEW_ROWS) {
                 out.push(Line::from(vec![
                     Span::raw("          "),
                     Span::styled(line, Style::default().add_modifier(Modifier::DIM)),
@@ -1168,6 +1164,15 @@ fn append_memory_section(
 fn append_memory_focus(out: &mut Vec<Line<'static>>, focus: &super::model::MemoryFocus) {
     if focus.is_empty() {
         return;
+    }
+    if !focus.has_retrieval_activity() && focus.has_prompt_injections() {
+        out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::styled(
+                "No retrieval-selected memories this turn.".to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
     }
     if !focus.query.is_empty() {
         out.push(Line::from(vec![
@@ -1227,26 +1232,25 @@ fn append_memory_focus(out: &mut Vec<Line<'static>>, focus: &super::model::Memor
             ]));
         }
     }
-    if !focus.injected.is_empty() {
+    if !focus.repository_injected.is_empty() {
         out.push(Line::from(vec![
             Span::raw("    └ "),
             Span::styled(
-                "Injected memories",
+                format!(
+                    "Prompt-injected repository memories ({})",
+                    focus.repository_injected.len()
+                ),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                "  (session + repository prompt context)",
-                Style::default().fg(Color::DarkGray),
-            ),
         ]));
-        for r in &focus.injected {
+        for r in &focus.repository_injected {
             out.push(Line::from(vec![
                 Span::raw("        └ "),
                 Span::styled(
                     format!("{}: ", r.source_label),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format!("\"{}\"", truncate_preview(&r.preview, 100))),
+                Span::raw(format!("\"{}\"", inline_preview(&r.preview, 100))),
                 Span::styled(
                     format!("   {} tokens", fmt_tokens(r.tokens)),
                     Style::default().add_modifier(Modifier::DIM),
@@ -1257,6 +1261,70 @@ fn append_memory_focus(out: &mut Vec<Line<'static>>, focus: &super::model::Memor
                 ),
             ]));
         }
+    }
+    if let Some(r) = focus.session_injected.as_ref() {
+        out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::styled(
+                "Prompt-injected session snapshot".to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        out.push(Line::from(vec![
+            Span::raw("        └ "),
+            Span::styled(
+                format!("{}: ", r.source_label),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("\"{}\"", inline_preview(&r.preview, 100))),
+            Span::styled(
+                format!("   {} tokens", fmt_tokens(r.tokens)),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                format!("  (rel {:.2})", r.relevance),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+}
+
+fn append_memory_focus_collapsed(out: &mut Vec<Line<'static>>, focus: &super::model::MemoryFocus) {
+    if focus.has_retrieval_activity() {
+        out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::styled(
+                "no retrieved memories selected this turn".to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
+    }
+    let session_count = usize::from(focus.session_injected.is_some());
+    let repository_count = focus.repository_injected.len();
+    if session_count > 0 || repository_count > 0 {
+        let mut parts = Vec::new();
+        if session_count > 0 {
+            parts.push("1 session snapshot".to_string());
+        }
+        if repository_count > 0 {
+            parts.push(format!(
+                "{repository_count} repository {}",
+                if repository_count == 1 {
+                    "memory"
+                } else {
+                    "memories"
+                }
+            ));
+        }
+        out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::styled(
+                "prompt injections:".to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(parts.join(" + "), Style::default().fg(Color::DarkGray)),
+        ]));
     }
 }
 
@@ -1893,6 +1961,10 @@ fn truncate_preview(s: &str, max_chars: usize) -> String {
     }
 }
 
+fn inline_preview(s: &str, max_chars: usize) -> String {
+    astra_turn_core::context_assembly_trace::preview_snippet(s, max_chars)
+}
+
 fn fmt_tokens(n: u32) -> String {
     if n < 1_000 {
         n.to_string()
@@ -2311,7 +2383,7 @@ mod tests {
             memory_type: "working".into(),
             tokens: 120,
             relevance_score: 1.0,
-            content_preview: "# Session Memory".into(),
+            content_preview: "# Session Memory\n## Session Title\nAstra self reflection".into(),
         });
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
@@ -2330,11 +2402,61 @@ mod tests {
         assert!(text.contains("42ms"), "latency missing: {text}");
         assert!(text.contains("Rejected (1)"), "rejected header: {text}");
         assert!(text.contains("below threshold"), "reason: {text}");
-        assert!(text.contains("Injected memories"), "memory header: {text}");
+        assert!(
+            text.contains("Prompt-injected repository memories (1)"),
+            "repo header: {text}"
+        );
         assert!(text.contains("Repository memory"), "repo label: {text}");
         assert!(text.contains("# Project rules"), "repo preview: {text}");
+        assert!(
+            text.contains("Prompt-injected session snapshot"),
+            "session header: {text}"
+        );
         assert!(text.contains("Session memory"), "session label: {text}");
-        assert!(text.contains("# Session Memory"), "session preview: {text}");
+        assert!(
+            text.contains("# Session Memory ⏎ ## Session Title"),
+            "session preview: {text}"
+        );
+    }
+
+    #[test]
+    fn memory_section_collapsed_distinguishes_prompt_only_injection() {
+        let mut t = trace(100_000, 0, 0, 0, 0, 0);
+        t.system_prompt.session_memory_injected = Some(MemoryInjection {
+            memory_id: "sess".into(),
+            memory_type: "working".into(),
+            tokens: 120,
+            relevance_score: 1.0,
+            content_preview: "# Session Memory".into(),
+        });
+        t.system_prompt.repository_memories = vec![MemoryInjection {
+            memory_id: "repo".into(),
+            memory_type: "repository".into(),
+            tokens: 80,
+            relevance_score: 0.85,
+            content_preview: "# Project rules".into(),
+        }];
+        let b = ContextBreakdown::from_trace(&t);
+        let state = ViewState {
+            focus: Some(Section::Memory),
+            expanded: None,
+            selected_item: 0,
+            drilled: false,
+        };
+        let text: String = build_lines_with(&b, 80, state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !text.contains("no memories selected this turn"),
+            "collapsed summary regressed: {text}"
+        );
+        assert!(
+            text.contains("prompt injections:")
+                && text.contains("1 session snapshot + 1 repository memory"),
+            "prompt-only summary missing: {text}"
+        );
     }
 
     #[test]

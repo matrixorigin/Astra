@@ -402,7 +402,7 @@ fn repository_memories_lifted_from_system_prompt() {
     let b = ContextBreakdown::from_trace(&t);
     let ids: Vec<&str> = b
         .memory_focus
-        .injected
+        .repository_injected
         .iter()
         .map(|r| r.memory_id.as_str())
         .collect();

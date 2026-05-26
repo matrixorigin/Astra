@@ -55,9 +55,10 @@ pub(crate) struct SessionMemoryStatusHint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionMemorySurfaceStatus {
     pub(crate) snapshot: String,
+    pub(crate) snapshot_provenance: Option<String>,
     pub(crate) extraction: Option<String>,
     pub(crate) prompt_injection: Option<String>,
-    pub(crate) relevant_recall: Option<String>,
+    pub(crate) repository_prompt_memories: Option<String>,
     pub(crate) user_preferences: Option<String>,
     pub(crate) remote_sync: Option<String>,
     pub(crate) last_local_refresh_at: Option<String>,
@@ -790,6 +791,9 @@ pub(crate) fn render_session_memory_surface_status(status: &SessionMemorySurface
         "Memory Status".to_string(),
         format!("- Current Session Snapshot: {}", status.snapshot),
     ];
+    if let Some(provenance) = status.snapshot_provenance.as_deref() {
+        lines.push(format!("- Snapshot Provenance: {provenance}"));
+    }
     if let Some(ts) = status.last_local_refresh_at.as_deref() {
         lines.push(format!("- Last Local Refresh: {ts}"));
     }
@@ -799,8 +803,8 @@ pub(crate) fn render_session_memory_surface_status(status: &SessionMemorySurface
     if let Some(injection) = status.prompt_injection.as_deref() {
         lines.push(format!("- Current Session Snapshot Injection: {injection}"));
     }
-    if let Some(recall) = status.relevant_recall.as_deref() {
-        lines.push(format!("- Relevant Recall: {recall}"));
+    if let Some(repo) = status.repository_prompt_memories.as_deref() {
+        lines.push(format!("- Repository Memory Injection: {repo}"));
     }
     if let Some(preferences) = status.user_preferences.as_deref() {
         lines.push(format!("- User Preferences: {preferences}"));
@@ -832,22 +836,29 @@ pub(crate) fn session_memory_surface_status(
             .unwrap_or_else(|| "not available".to_string()),
     };
     let extraction = latest_session_memory_status_hint(session_id).map(|hint| hint.summary);
+    let snapshot_provenance = metadata.as_ref().and_then(render_snapshot_provenance);
     let prompt_trace = latest_prompt_memory_trace(session_id);
     let prompt_injection = prompt_trace.as_ref().map(|trace| {
         let status = if trace.session_memory_present {
-            "injected"
+            "present"
         } else {
             "absent"
         };
         format!(
-            "{status} on turn {}; tokens={}",
+            "{status} on turn {}; {} tokens",
             trace.turn, trace.session_memory_tokens
         )
     });
-    let relevant_recall = prompt_trace.as_ref().map(|trace| {
+    let repository_prompt_memories = prompt_trace.as_ref().map(|trace| {
         format!(
-            "{} prompt-visible memories on turn {}",
-            trace.repository_memory_count, trace.turn
+            "{} repository {} on turn {}",
+            trace.repository_memory_count,
+            if trace.repository_memory_count == 1 {
+                "memory"
+            } else {
+                "memories"
+            },
+            trace.turn
         )
     });
     let user_preferences = prompt_trace.as_ref().and_then(|trace| {
@@ -870,9 +881,10 @@ pub(crate) fn session_memory_surface_status(
         });
     SessionMemorySurfaceStatus {
         snapshot,
+        snapshot_provenance,
         extraction,
         prompt_injection,
-        relevant_recall,
+        repository_prompt_memories,
         user_preferences,
         remote_sync,
         last_local_refresh_at: metadata
@@ -882,6 +894,41 @@ pub(crate) fn session_memory_surface_status(
             .as_ref()
             .map(|meta| meta.stable_memory_epoch)
             .filter(|epoch| *epoch > 0),
+    }
+}
+
+fn render_snapshot_provenance(
+    metadata: &astra_runtime::session_memory::runner::SessionMemoryArtifactMetadata,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(turn) = metadata.last_extracted_turn {
+        parts.push(format!("turn {turn}"));
+    }
+    if let Some(source) = metadata
+        .last_extraction_source
+        .as_deref()
+        .filter(|source| !source.trim().is_empty())
+    {
+        parts.push(format!("source {}", source.replace('_', " ")));
+    }
+    if let Some(writer) = metadata
+        .current_snapshot_source
+        .as_deref()
+        .filter(|writer| !writer.trim().is_empty())
+    {
+        parts.push(format!("writer {}", writer.replace('_', " ")));
+    }
+    if let Some(model) = metadata
+        .last_selector_model
+        .as_deref()
+        .filter(|model| !model.trim().is_empty())
+    {
+        parts.push(format!("selector {model}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
     }
 }
 
@@ -2166,11 +2213,15 @@ mod tests {
     fn format_session_memory_response_renders_surface_status_block() {
         let status = SessionMemorySurfaceStatus {
             snapshot: "local current-session artifact".to_string(),
+            snapshot_provenance: Some(
+                "turn 9 · source llm · writer background extraction · selector mini-judge"
+                    .to_string(),
+            ),
             extraction: Some(
                 "Latest extraction completed on turn 9 via the background extractor.".to_string(),
             ),
-            prompt_injection: Some("injected on turn 10; tokens=27".to_string()),
-            relevant_recall: Some("2 prompt-visible memories on turn 10".to_string()),
+            prompt_injection: Some("present on turn 10; 27 tokens".to_string()),
+            repository_prompt_memories: Some("2 repository memories on turn 10".to_string()),
             user_preferences: Some("200 prompt tokens on turn 10".to_string()),
             remote_sync: Some("Memoria sync complete at 2026-05-25T10:00:00+08:00".to_string()),
             last_local_refresh_at: Some("2026-05-25T10:00:00+08:00".to_string()),
@@ -2186,9 +2237,14 @@ mod tests {
         assert!(result.contains("Memory Status"));
         assert!(result.contains("Current Session Snapshot: local current-session artifact"));
         assert!(
-            result.contains("Current Session Snapshot Injection: injected on turn 10; tokens=27")
+            result.contains(
+                "Snapshot Provenance: turn 9 · source llm · writer background extraction · selector mini-judge"
+            )
         );
-        assert!(result.contains("Relevant Recall: 2 prompt-visible memories on turn 10"));
+        assert!(
+            result.contains("Current Session Snapshot Injection: present on turn 10; 27 tokens")
+        );
+        assert!(result.contains("Repository Memory Injection: 2 repository memories on turn 10"));
         assert!(result.contains("User Preferences: 200 prompt tokens on turn 10"));
         assert!(result.contains("Stable Memory Epoch: 1"));
     }

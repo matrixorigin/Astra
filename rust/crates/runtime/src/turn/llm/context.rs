@@ -105,7 +105,10 @@ fn session_memory_injection(
             .unwrap_or_else(|| "session_memory".into()),
         tokens: (entry.content.chars().count() as u32 / 4).saturating_add(1),
         relevance_score: 1.0,
-        content_preview: entry.content.chars().take(100).collect(),
+        content_preview: astra_turn_core::context_assembly_trace::preview_snippet(
+            &entry.content,
+            100,
+        ),
     })
 }
 

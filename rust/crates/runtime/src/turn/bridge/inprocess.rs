@@ -2538,7 +2538,10 @@ impl InProcessChatTurnBridge {
                                 memory_type: "hybrid_retrieval".into(),
                                 tokens: prompts::estimate_str_tokens(line) as u32,
                                 relevance_score: 0.0,
-                                content_preview: line.chars().take(100).collect(),
+                                content_preview:
+                                    astra_turn_core::context_assembly_trace::preview_snippet(
+                                        line, 100,
+                                    ),
                             }
                         })
                         .collect();
@@ -2551,7 +2554,10 @@ impl InProcessChatTurnBridge {
                             .unwrap_or_else(|| "session_memory".into()),
                         tokens: prompts::estimate_str_tokens(&entry.content) as u32,
                         relevance_score: 1.0,
-                        content_preview: entry.content.chars().take(100).collect(),
+                        content_preview: astra_turn_core::context_assembly_trace::preview_snippet(
+                            &entry.content,
+                            100,
+                        ),
                     }
                 });
                 let breakdown = prompts::build_system_prompt_trace(

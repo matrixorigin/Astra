@@ -90,26 +90,33 @@ pub(crate) struct CompactionEventItem {
 
 /// Extra detail for the Memory section.  Populated directly from
 /// `MemoryRetrievalTrace` — query, candidates considered, rejection
-/// list with reasons, retrieval latency. Plus memory injected
-/// directly into the system prompt (repository memory and current
-/// session memory), which is distinct from `memories` covering the
-/// retrieval pipeline selections.
+/// list with reasons, retrieval latency. Direct prompt injections are
+/// tracked separately from retrieval-selected memories so `/context`
+/// can distinguish "retrieved this turn" from "injected anyway."
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct MemoryFocus {
     pub query: String,
     pub candidates_considered: u32,
     pub retrieval_latency_ms: u64,
     pub rejected: Vec<MemoryRejectionItem>,
-    pub injected: Vec<InjectedMemoryItem>,
+    pub repository_injected: Vec<InjectedMemoryItem>,
+    pub session_injected: Option<InjectedMemoryItem>,
 }
 
 impl MemoryFocus {
+    pub fn has_retrieval_activity(&self) -> bool {
+        !self.query.is_empty()
+            || self.candidates_considered > 0
+            || self.retrieval_latency_ms > 0
+            || !self.rejected.is_empty()
+    }
+
+    pub fn has_prompt_injections(&self) -> bool {
+        !self.repository_injected.is_empty() || self.session_injected.is_some()
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.query.is_empty()
-            && self.candidates_considered == 0
-            && self.retrieval_latency_ms == 0
-            && self.rejected.is_empty()
-            && self.injected.is_empty()
+        !self.has_retrieval_activity() && !self.has_prompt_injections()
     }
 }
 
@@ -788,7 +795,7 @@ fn build_memory_focus(trace: &ContextAssemblyTrace) -> MemoryFocus {
             reason: render_rejection_reason(&r.rejection_reason),
         })
         .collect();
-    let mut injected: Vec<InjectedMemoryItem> = trace
+    let repository_injected: Vec<InjectedMemoryItem> = trace
         .system_prompt
         .repository_memories
         .iter()
@@ -802,13 +809,12 @@ fn build_memory_focus(trace: &ContextAssemblyTrace) -> MemoryFocus {
             preview: mi.content_preview.clone(),
         })
         .collect();
-    if let Some(mi) = trace
+    let session_injected = trace
         .system_prompt
         .session_memory_injected
         .as_ref()
         .filter(|mi| mi.tokens > 0)
-    {
-        injected.push(InjectedMemoryItem {
+        .map(|mi| InjectedMemoryItem {
             source_label: InjectedMemoryItem::LABEL_SESSION.to_string(),
             memory_id: mi.memory_id.clone(),
             memory_type: mi.memory_type.clone(),
@@ -816,13 +822,13 @@ fn build_memory_focus(trace: &ContextAssemblyTrace) -> MemoryFocus {
             relevance: mi.relevance_score,
             preview: mi.content_preview.clone(),
         });
-    }
     MemoryFocus {
         query: m.query.clone(),
         candidates_considered: m.candidates_considered,
         retrieval_latency_ms: m.retrieval_latency_ms,
         rejected,
-        injected,
+        repository_injected,
+        session_injected,
     }
 }
 
