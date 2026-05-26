@@ -360,12 +360,11 @@ pub fn budget_for_model(model: Option<&str>) -> ContextBudget {
 ///
 /// When `config_context_window` is provided (from `.models.yaml` or the DB),
 /// it takes precedence over the hardcoded lookup table. When `None`, falls
-/// back to the static lookup table keyed by model name.
+/// back to the shared astra-core context-window lookup keyed by model name.
 pub fn budget_for_model_with_override(
     model: Option<&str>,
     config_context_window: Option<u32>,
 ) -> ContextBudget {
-    // Dynamic override from model config — always wins.
     if let Some(cw) = config_context_window {
         let cw = cw as usize;
         return ContextBudget {
@@ -376,40 +375,29 @@ pub fn budget_for_model_with_override(
     }
 
     let name = model.unwrap_or("");
-
-    let (limit, reserve) = match name {
+    let lower = name.to_ascii_lowercase();
+    let limit = astra_core::runtime_limits::context_window_for_model(name)
+        .map(|cw| cw as usize)
+        .unwrap_or(128_000);
+    let reserve = match lower.as_str() {
         // OpenAI — GPT-5 family (256K context)
-        m if m.contains("gpt-5") => (256_000, 0.12),
-        // OpenAI — GPT-4o / GPT-4.1 (128K, 16K output)
-        m if m.contains("gpt-4o") || m.contains("gpt-4.1") => (128_000, 0.12),
-        m if m.contains("gpt-4-turbo") => (128_000, 0.12),
-        m if m.contains("gpt-3.5") => (16_000, 0.12),
-        // OpenAI — o1/o3 reasoning models (200K context)
-        m if m.contains("o1") || m.contains("o3") => (200_000, 0.15),
-        // Anthropic — Claude 4.6+ generation (1M context)
+        m if m.contains("gpt-5") => 0.12,
+        // OpenAI — GPT-4o / GPT-4.1 / GPT-4 Turbo (128K, 16K output)
+        m if m.contains("gpt-4o") || m.contains("gpt-4.1") || m.contains("gpt-4-turbo") => 0.12,
+        m if m.contains("gpt-3.5") => 0.12,
+        // Anthropic — Claude 4.6+/4.7 and Gemini / DeepSeek V4 prefer a smaller reserve.
         m if m.contains("opus-4-6")
             || m.contains("sonnet-4-6")
             || m.contains("haiku-4-6")
             || m.contains("opus-4-7")
             || m.contains("sonnet-4-7")
-            || m.contains("haiku-4-7") =>
+            || m.contains("haiku-4-7")
+            || m.contains("gemini")
+            || m.contains("deepseek-v4") =>
         {
-            (1_000_000, 0.10)
+            0.10
         }
-        // Anthropic — Claude older (128K context default)
-        m if m.contains("claude") => (128_000, 0.15),
-        // Google — Gemini (1M context)
-        m if m.contains("gemini") => (1_000_000, 0.10),
-        // DeepSeek V4 (1M context) — must precede generic deepseek arm
-        m if m.contains("deepseek-v4") => (1_000_000, 0.10),
-        // DeepSeek V3 / R1 (64K context)
-        m if m.contains("deepseek") => (64_000, 0.15),
-        // Moonshot / Kimi
-        m if m.contains("kimi") || m.contains("moonshot") => (128_000, 0.15),
-        // Qwen
-        m if m.contains("qwen") => (128_000, 0.15),
-        // Safe default
-        _ => (128_000, 0.15),
+        _ => 0.15,
     };
 
     ContextBudget {
