@@ -4744,10 +4744,16 @@ mod tests {
 
     #[test]
     fn build_effective_line_skill_dev_picks_up_external_edits() {
+        const OLD_BODY: &str = "skill body version one";
+        const NEW_BODY: &str = "skill body version two rewritten";
         let tmp = tempfile::tempdir().unwrap();
         let skill_dir = tmp.path().join("evolving");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: evolving\n---\nV1").unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: evolving\n---\n{OLD_BODY}"),
+        )
+        .unwrap();
 
         let state = SessionState {
             skill_dev: Some(super::super::SkillDevState {
@@ -4758,19 +4764,22 @@ mod tests {
         };
 
         let turn1 = build_effective_line("check", &state, &mut crate::ui_adapter::LineUiAdapter);
-        assert!(turn1.contains("V1"));
+        assert!(turn1.contains(OLD_BODY));
 
         // Simulate external edit between turns
         std::fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: evolving\n---\nV2 rewritten",
+            format!("---\nname: evolving\n---\n{NEW_BODY}"),
         )
         .unwrap();
 
         let turn2 =
             build_effective_line("check again", &state, &mut crate::ui_adapter::LineUiAdapter);
-        assert!(!turn2.contains("V1"), "should not contain old content");
-        assert!(turn2.contains("V2 rewritten"), "should contain new content");
+        assert!(
+            !turn2.contains(OLD_BODY),
+            "should not contain old skill body"
+        );
+        assert!(turn2.contains(NEW_BODY), "should contain new content");
     }
 
     #[test]
