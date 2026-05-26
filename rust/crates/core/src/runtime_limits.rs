@@ -182,7 +182,7 @@ pub fn context_window_for_model_with_override(
         return Some(16_000);
     }
     // OpenAI reasoning models
-    if lower.contains("o1") || lower.contains("o3") {
+    if has_model_token(&lower, "o1") || has_model_token(&lower, "o3") {
         return Some(200_000);
     }
     // Anthropic 4.6+ generation: 1M context window.
@@ -230,6 +230,12 @@ pub fn context_window_for_model_with_override(
         return Some(200_000);
     }
     None
+}
+
+fn has_model_token(model: &str, token: &str) -> bool {
+    model
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| part == token)
 }
 
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -307,7 +313,18 @@ mod tests {
         assert_eq!(context_window_for_model("gpt-5-turbo"), Some(256_000));
         assert_eq!(context_window_for_model("gpt-3.5-turbo"), Some(16_000));
         assert_eq!(context_window_for_model("o3-mini"), Some(200_000));
+        assert_eq!(context_window_for_model("openai/o1-preview"), Some(200_000));
         assert_eq!(context_window_for_model("claude-3.5-sonnet"), Some(128_000));
         assert_eq!(context_window_for_model("kimi-k2"), Some(128_000));
+    }
+
+    #[test]
+    fn context_window_does_not_misclassify_embedded_o1_or_o3_substrings() {
+        assert_eq!(
+            context_window_for_model("claude-opus-2025-v01"),
+            Some(128_000)
+        );
+        assert_eq!(context_window_for_model("deepseek-chat-v03"), Some(64_000));
+        assert_eq!(context_window_for_model("custom-vision-v03-beta"), None);
     }
 }
