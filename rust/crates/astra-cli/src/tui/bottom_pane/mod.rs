@@ -1144,8 +1144,9 @@ impl BottomPane {
             return;
         };
         use crate::tui::history_cell::HistoryCell;
+        use crate::tui::render::line_utils::sanitize_lines_for_terminal;
         use ratatui::widgets::{Paragraph, Widget, Wrap};
-        let lines = cell.display_lines(area.width);
+        let lines = sanitize_lines_for_terminal(cell.display_lines(area.width));
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .render(area, buf);

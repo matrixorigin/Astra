@@ -22,6 +22,7 @@ use ratatui::text::Line;
 
 use super::super::history_cell::HistoryCell;
 use super::{AppEvent, ChatWidget, TurnStats, UserEvent, WireEvent};
+use crate::tui::render::line_utils::sanitize_lines_for_terminal;
 use crate::tui::testing::render::{buffer_to_string, draw_widget};
 
 /// Render the widget's committed history as a single scrollback
@@ -33,7 +34,7 @@ fn render_history(w: &ChatWidget, width: u16) -> String {
         if i > 0 {
             all_lines.push(Line::default());
         }
-        all_lines.extend(cell.display_lines(width));
+        all_lines.extend(sanitize_lines_for_terminal(cell.display_lines(width)));
     }
     let height = (all_lines.len() as u16).max(1);
     let p =

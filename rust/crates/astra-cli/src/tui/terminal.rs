@@ -11,6 +11,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::text::Line;
 
 use super::custom_terminal;
+use super::render::line_utils::sanitize_lines_for_terminal;
 
 pub(crate) type CustomTerminal = custom_terminal::Terminal<CrosstermBackend<Stdout>>;
 
@@ -72,7 +73,8 @@ impl TerminalGuard {
     }
 
     pub fn queue_history_lines(&mut self, lines: Vec<Line<'static>>) {
-        self.pending_history.extend(lines);
+        self.pending_history
+            .extend(sanitize_lines_for_terminal(lines));
     }
 
     /// Draw the viewport — matches Codex tui.rs::draw() sequence:

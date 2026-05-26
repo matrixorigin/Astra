@@ -34,6 +34,7 @@ use super::draw::{active_viewport, do_draw};
 use super::event::{TuiEvent, TuiEventStream};
 use super::frame_requester::FrameRequester;
 use super::history_cell::HistoryCell;
+use super::render::line_utils::sanitize_lines_for_terminal;
 use super::task_status::TaskStatus;
 use super::terminal::TerminalGuard;
 use super::{
@@ -937,7 +938,7 @@ pub(crate) async fn run_tui_session(
                             let h = size.map(|s| s.height).unwrap_or(0);
                             let mut lines: Vec<ratatui::text::Line<'static>> = Vec::new();
                             for cell in chat_widget.history() {
-                                lines.extend(cell.display_lines(w));
+                                lines.extend(sanitize_lines_for_terminal(cell.display_lines(w)));
                                 lines.push(ratatui::text::Line::default());
                             }
                             if !lines.is_empty() {

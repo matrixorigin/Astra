@@ -453,10 +453,11 @@ fn truncate_by_width(s: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::render::line_utils::sanitize_lines_for_terminal;
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
 
     fn render(cell: &ToolCell, width: u16, height: u16) -> String {
-        let lines = cell.display_lines(width);
+        let lines = sanitize_lines_for_terminal(cell.display_lines(width));
         let p =
             ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         buffer_to_string(&draw_widget(p, width, height))
@@ -578,6 +579,21 @@ mod tests {
         assert!(out.contains("file-5"));
         assert!(!out.contains("file-6"), "row 6 should have been trimmed");
         assert!(out.contains("… +3 lines"));
+    }
+
+    #[test]
+    fn render_strips_unsafe_terminal_control_bytes_from_tool_text() {
+        let mut t = ok_tool("bash\x1b[31m", "printf '\x1b[31mboom\r\tok'", 8);
+        t.output_summary = Some("line-1\x1b[2J\nline-2\u{009b}1m".into());
+
+        let out = render(&t, 100, 6);
+        assert!(out.contains("bash[31m"));
+        assert!(out.contains("boom\tok"));
+        assert!(out.contains("line-1[2J"));
+        assert!(out.contains("line-21m"));
+        assert!(!out.contains('\x1b'));
+        assert!(!out.contains('\r'));
+        assert!(!out.contains('\u{9b}'));
     }
 
     // ── Progress signals ─────────────────────────────────────────
