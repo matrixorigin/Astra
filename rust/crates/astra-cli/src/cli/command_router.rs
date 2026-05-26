@@ -2941,30 +2941,58 @@ pub(super) async fn execute_cli_command(
     }
 }
 
-/// Compute exit code from StreamResult based on tool failures and force stops.
+/// Compute exit code from StreamResult using semantic exit classification.
+///
+/// Tool-call records carry an optional `exit_semantics` field (snake_case
+/// serialization of [`astra_tools::exit_semantics::ExitSemantics`]) that
+/// distinguishes real execution errors from domain-negative outcomes
+/// (grep no-match, diff differences, test failures). This function reads
+/// that field to avoid treating those as tool failures — a grep that
+/// finds nothing or a diff that reports differences is a successful tool
+/// execution, not an error the agent needs to recover from.
 fn compute_exit_code(sr: &StreamResult) -> ExitCode {
-    // Check for force stop (highest priority)
+    // ── Force stop (highest priority) ──────────────────────────────────
     for ve in &sr.verdict_events {
         if ve.force_stop {
             return ExitCode::ForceStop;
         }
     }
 
+    // ── Semantic classification of each tool call ──────────────────────
+    let is_error = |r: &astra_services::session_journal::ToolCallRecord| -> bool {
+        match r.exit_semantics.as_deref() {
+            // ExecutionError is a genuine tool failure (command crashed,
+            // permission denied, signal kill, unknown command, etc.)
+            Some("execution_error") => true,
+            // Success, InformationalFailure (grep no-match), and
+            // DomainNegative (diff differences, test failures) are all
+            // intentional domain outcomes — the tool worked correctly.
+            Some("success" | "informational_failure" | "domain_negative") => false,
+            // Unknown or missing semantics fall back to the legacy ok flag.
+            // That keeps malformed records from silently downgrading a real
+            // tool failure into success.
+            Some(_) | None => !r.ok,
+        }
+    };
+
     // Check for unrecovered tool failures. Agents self-correct by
     // retrying with the same or different tools (write_file fails →
-    // bash echo succeeds). Only fail if the LAST tool call failed —
-    // any successful tool call after a failure means the agent recovered.
-    let has_any_failure = sr.tool_call_records.iter().any(|r| !r.ok);
+    // bash echo succeeds). Only fail if the agent never recovered —
+    // i.e. the last error was not followed by a successful call.
+    let has_any_failure = sr.tool_call_records.iter().any(&is_error);
     if has_any_failure {
         let last_ok = sr
             .tool_call_records
             .iter()
             .rev()
-            .find(|r| r.ok)
-            .map(|_| true)
-            .unwrap_or(false);
-        let last_record_ok = sr.tool_call_records.last().map(|r| r.ok).unwrap_or(true);
-        if !last_ok || !last_record_ok {
+            .find(|r| !is_error(r))
+            .is_some();
+        let last_ok_explicit = sr
+            .tool_call_records
+            .last()
+            .map(|r| !is_error(r))
+            .unwrap_or(true);
+        if !last_ok || !last_ok_explicit {
             return ExitCode::ToolFailure;
         }
     }
@@ -4690,6 +4718,88 @@ mod exit_code_tests {
                 ..Default::default()
             });
         assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
+    }
+
+    fn tool_call_record(
+        name: &str,
+        ok: bool,
+        error: Option<&str>,
+        exit_semantics: Option<&str>,
+    ) -> astra_services::session_journal::ToolCallRecord {
+        astra_services::session_journal::ToolCallRecord {
+            name: name.to_string(),
+            ok,
+            ms: 100,
+            error: error.map(str::to_string),
+            exit_semantics: exit_semantics.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn exit_code_success_on_informational_failure_semantics() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records.push(tool_call_record(
+            "Bash",
+            false,
+            Some("grep returned 1"),
+            Some("informational_failure"),
+        ));
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+
+    #[test]
+    fn exit_code_success_on_domain_negative_semantics() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records.push(tool_call_record(
+            "Bash",
+            false,
+            Some("cargo test returned 1"),
+            Some("domain_negative"),
+        ));
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+
+    #[test]
+    fn exit_code_tool_failure_on_execution_error_semantics() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records.push(tool_call_record(
+            "Bash",
+            false,
+            Some("command not found"),
+            Some("execution_error"),
+        ));
+        assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
+    }
+
+    #[test]
+    fn exit_code_unknown_semantics_falls_back_to_legacy_failure() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records.push(tool_call_record(
+            "Bash",
+            false,
+            Some("unknown failure"),
+            Some("mystery_status"),
+        ));
+        assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
+    }
+
+    #[test]
+    fn exit_code_success_when_execution_error_is_followed_by_domain_negative() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records.push(tool_call_record(
+            "Bash",
+            false,
+            Some("permission denied"),
+            Some("execution_error"),
+        ));
+        sr.tool_call_records.push(tool_call_record(
+            "Bash",
+            false,
+            Some("git diff reported changes"),
+            Some("domain_negative"),
+        ));
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
     }
 
     #[test]

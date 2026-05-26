@@ -1611,8 +1611,21 @@ fn build_introspect_snapshot(
 
     let tool_errors = state.turn_guard.health.recent_errors(10);
 
+    // Compute token pressure using the same precise estimation as lifecycle.rs.
+    // Falls back to 0.0 when max_turn_input_tokens is 0 (unlimited legacy mode).
+    let token_pressure = if state.max_turn_input_tokens > 0 {
+        let fresh_estimate = crate::prompts::estimate_tokens_precise(
+            &state.messages,
+            state.pinned_tool_schema_tokens as usize,
+            0,
+        ) as u64;
+        fresh_estimate as f64 / state.max_turn_input_tokens as f64
+    } else {
+        0.0
+    };
+
     astra_turn_core::introspect::IntrospectSnapshot {
-        token_pressure: 0.0, // TODO: wire from pipeline_session.stats when available
+        token_pressure,
         cache_hit_ratio: cache_ratio,
         turns_completed: state.llm_rounds_completed,
         turns_remaining: state.remaining_turns as u32,
