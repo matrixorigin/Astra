@@ -1124,7 +1124,7 @@ async fn run_shell_post_hook(
 
     if let Some(error) = shell_hook_policy_error(command) {
         log_blocked_shell_hook("post-tool", command, &error, None);
-        return PostToolHookOutcome::Success(Some(format!("Error: {error}")));
+        return PostToolHookOutcome::OperationalFailure(error);
     }
 
     let input = serde_json::json!({
@@ -1653,10 +1653,7 @@ async fn run_shell_session_hook(
 
     if let Some(error) = shell_hook_policy_error(command) {
         log_blocked_shell_hook("session", command, &error, None);
-        return Some(SessionHookOutput {
-            context: Some(error),
-            env_vars: Vec::new(),
-        });
+        return None;
     }
 
     let input = serde_json::json!({
@@ -2577,7 +2574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn e2e_post_hook_unsafe_shell_command_returns_policy_error() {
+    async fn e2e_post_hook_unsafe_shell_command_is_blocked_by_policy() {
         let registry = ToolEventHookRegistry::new(vec![ToolEventHook {
             event: ToolEventKind::PostToolUse,
             matcher: "bash".into(),
@@ -2594,9 +2591,7 @@ mod tests {
         let result =
             evaluate_post_tool_hooks(&registry, "bash", &serde_json::json!({}), "original output")
                 .await;
-        let modified = result.expect("post hook should surface policy error");
-        assert!(modified.contains(SHELL_HOOK_POLICY_PREFIX));
-        assert!(modified.contains("credential path access"));
+        assert!(result.is_none());
     }
 
     #[tokio::test]
@@ -3295,6 +3290,26 @@ session_hooks:
             evaluate_session_hooks(&registry, SessionEvent::SessionStart, "s1", None).await;
         // Failed hook is skipped, no context
         assert!(output.context.is_none());
+    }
+
+    #[tokio::test]
+    async fn e2e_session_hook_unsafe_shell_command_is_ignored() {
+        let registry = SessionEventHookRegistry::new(vec![SessionEventHook {
+            event: SessionEvent::SessionStart,
+            action: HookAction::Shell {
+                command: "cat ~/.ssh/id_rsa".into(),
+            },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+
+        let output =
+            evaluate_session_hooks(&registry, SessionEvent::SessionStart, "s1", Some("hi")).await;
+        assert!(output.context.is_none());
+        assert!(output.env_vars.is_empty());
     }
 
     #[tokio::test]

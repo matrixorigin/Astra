@@ -1611,18 +1611,7 @@ fn build_introspect_snapshot(
 
     let tool_errors = state.turn_guard.health.recent_errors(10);
 
-    // Compute token pressure using the same precise estimation as lifecycle.rs.
-    // Falls back to 0.0 when max_turn_input_tokens is 0 (unlimited legacy mode).
-    let token_pressure = if state.max_turn_input_tokens > 0 {
-        let fresh_estimate = crate::prompts::estimate_tokens_precise(
-            &state.messages,
-            state.pinned_tool_schema_tokens as usize,
-            0,
-        ) as u64;
-        fresh_estimate as f64 / state.max_turn_input_tokens as f64
-    } else {
-        0.0
-    };
+    let token_pressure = introspect_token_pressure(state);
 
     astra_turn_core::introspect::IntrospectSnapshot {
         token_pressure,
@@ -1646,6 +1635,20 @@ fn build_introspect_snapshot(
         tool_errors,
         circuit_breaker: None, // populated by bridge when available
     }
+}
+
+fn introspect_token_pressure(state: &super::host::AgenticLoopState) -> f64 {
+    // Compute token pressure using the same precise estimation as lifecycle.rs.
+    // Falls back to 0.0 when max_turn_input_tokens is 0 (unlimited legacy mode).
+    if state.max_turn_input_tokens == 0 {
+        return 0.0;
+    }
+    let fresh_estimate = crate::prompts::estimate_tokens_precise(
+        &state.messages,
+        state.pinned_tool_schema_tokens as usize,
+        0,
+    ) as u64;
+    fresh_estimate as f64 / state.max_turn_input_tokens as f64
 }
 
 #[cfg(test)]
@@ -1757,6 +1760,33 @@ mod tests {
             build_runtime_session_quality_assessment("sess-9", 0.63, usize::MAX).step_count,
             i32::MAX
         );
+    }
+
+    #[test]
+    fn introspect_token_pressure_is_zero_in_unlimited_mode() {
+        let mut state = make_state();
+        state.max_turn_input_tokens = 0;
+        state.messages = vec![json!({"role": "user", "content": "hello world"})];
+        state.pinned_tool_schema_tokens = 50;
+        assert_eq!(introspect_token_pressure(&state), 0.0);
+    }
+
+    #[test]
+    fn introspect_token_pressure_uses_precise_estimate_when_bounded() {
+        let mut state = make_state();
+        state.messages = vec![
+            json!({"role": "system", "content": "system prompt"}),
+            json!({"role": "user", "content": "hello world"}),
+        ];
+        state.pinned_tool_schema_tokens = 120;
+        let expected = crate::prompts::estimate_tokens_precise(
+            &state.messages,
+            state.pinned_tool_schema_tokens as usize,
+            0,
+        ) as f64
+            / 10_000.0;
+        state.max_turn_input_tokens = 10_000;
+        assert!((introspect_token_pressure(&state) - expected).abs() < f64::EPSILON);
     }
 
     #[allow(dead_code)]

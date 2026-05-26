@@ -653,7 +653,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `get_result`: REQUIRES `action`, `agent_id`.\n\
          - `run_chain`: REQUIRES `action`, `steps`.\n\
          - `send_message`: REQUIRES `action`, `to`, `message`.\n\n\
-         For `spawn`, pass at least one non-empty field: `description` (short UI summary) or `prompt` (full child brief). If one is missing, Astra derives it from the other. Prefer sending both. Do NOT pass a top-level `task` field. Do NOT pass `agent_id` to spawn; Astra generates that runtime id for you. If you need a mailbox label, use `name`, but `name` is not valid for `get_result`.\n\n\
+         For `spawn`, pass at least one non-empty field: `description` (short UI summary) or `prompt` (full child brief). If one is missing, Astra derives it from the other. Prefer sending both. Do NOT pass a top-level `task` field. `agent_id` is ONLY for `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. If you need a mailbox label, use `name`, but `name` is not valid for `get_result`.\n\n\
          ## Spawn example\n\
          `agent(action='spawn', description='Audit auth flow', prompt='Read src/auth/* and report any token-handling bugs. Focus on session expiry and refresh logic. Return findings as a numbered list.', agent_type='general-purpose')`\n\n\
          ## Execution mode\n\
@@ -684,7 +684,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Task-complexity hint scaling the default budget when `max_turns` is absent. `light`≈10 turns, `normal`=agent default, `deep`=2× default. Use `deep` for review/refactor/multi-file tasks that routinely exhaust the default."},
                         "isolated": {"type": "boolean", "description": "Use isolated worktree (spawn)"},
                         "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
-                        "agent_id": {"type": "string", "description": "REQUIRED for action='get_result'. Must be the exact runtime-generated agent_id returned by a prior spawn, not the optional spawn name."},
+                        "agent_id": {"type": "string", "description": "ONLY for action='get_result'. Must be the exact runtime-generated agent_id returned by a prior spawn, not the optional spawn name. Never prefill this on spawn."},
                         "to": {"type": "string", "description": "REQUIRED for action='send_message'. Recipient agent_id, or '*' for broadcast."},
                         "message": {"description": "REQUIRED for action='send_message'. Message content."},
                         "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"]},
@@ -1202,7 +1202,8 @@ mod tests {
         let params = &agent["function"]["parameters"];
         assert_eq!(params["additionalProperties"], false);
         assert!(
-            desc.contains("Do NOT pass `agent_id` to spawn"),
+            desc.contains("`agent_id` is ONLY for `get_result`")
+                || desc.contains("never prefill it on `spawn`"),
             "agent description must explicitly forbid spawn-time agent_id misuse"
         );
         assert!(
@@ -1215,6 +1216,13 @@ mod tests {
                 .unwrap_or("")
                 .contains("Not the runtime agent_id"),
             "name field must say it is not the get_result identifier"
+        );
+        assert!(
+            params["properties"]["agent_id"]["description"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Never prefill this on spawn"),
+            "agent_id field must explicitly forbid spawn-time prefill"
         );
     }
 

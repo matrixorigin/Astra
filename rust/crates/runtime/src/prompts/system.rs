@@ -228,7 +228,8 @@ fn build_skill_listing_section_with_budget_and_caps(
              route through `agent(action='spawn', ...)` instead — emit N \
              separate `agent` calls in a single assistant message, each with \
              `action='spawn'`, top-level `prompt` for the full child brief \
-             (never top-level `task`), and `run_in_background: true`, then collect with \
+             (never top-level `task`), and `run_in_background: true`. Do not \
+             prefill `agent_id` on spawn. Then collect with \
              `agent(action='get_result', agent_id=...)` using the exact \
              `agent_id` returned by each spawn result (never the optional \
              spawn `name`). Skills usually run \

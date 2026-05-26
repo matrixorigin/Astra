@@ -2960,18 +2960,26 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
 
     // ── Semantic classification of each tool call ──────────────────────
     let is_error = |r: &astra_services::session_journal::ToolCallRecord| -> bool {
-        match r.exit_semantics.as_deref() {
+        match r
+            .exit_semantics
+            .as_deref()
+            .and_then(parse_exit_semantics_tag)
+        {
             // ExecutionError is a genuine tool failure (command crashed,
             // permission denied, signal kill, unknown command, etc.)
-            Some("execution_error") => true,
+            Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError) => true,
             // Success, InformationalFailure (grep no-match), and
             // DomainNegative (diff differences, test failures) are all
             // intentional domain outcomes — the tool worked correctly.
-            Some("success" | "informational_failure" | "domain_negative") => false,
+            Some(
+                astra_tools::exit_semantics::ExitSemantics::Success
+                | astra_tools::exit_semantics::ExitSemantics::InformationalFailure
+                | astra_tools::exit_semantics::ExitSemantics::DomainNegative,
+            ) => false,
             // Unknown or missing semantics fall back to the legacy ok flag.
             // That keeps malformed records from silently downgrading a real
             // tool failure into success.
-            Some(_) | None => !r.ok,
+            None => !r.ok,
         }
     };
 
@@ -2998,6 +3006,13 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
     }
 
     ExitCode::Success
+}
+
+fn parse_exit_semantics_tag(tag: &str) -> Option<astra_tools::exit_semantics::ExitSemantics> {
+    serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(serde_json::Value::String(
+        tag.to_string(),
+    ))
+    .ok()
 }
 
 fn error_kind_for_exit_code(exit_code: ExitCode) -> Option<&'static str> {

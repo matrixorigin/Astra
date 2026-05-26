@@ -1126,7 +1126,7 @@ fn append_memory_section(
             ]
         } else {
             // Collapsed: single-line truncated preview.
-            let preview = inline_preview(&m.preview, 60);
+            let preview = astra_turn_core::context_assembly_trace::preview_snippet(&m.preview, 60);
             vec![
                 Span::raw("    └ "),
                 Span::raw(format!("\"{preview}\"")),
@@ -1250,7 +1250,10 @@ fn append_memory_focus(out: &mut Vec<Line<'static>>, focus: &super::model::Memor
                     format!("{}: ", r.source_label),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format!("\"{}\"", inline_preview(&r.preview, 100))),
+                Span::raw(format!(
+                    "\"{}\"",
+                    astra_turn_core::context_assembly_trace::preview_snippet(&r.preview, 100)
+                )),
                 Span::styled(
                     format!("   {} tokens", fmt_tokens(r.tokens)),
                     Style::default().add_modifier(Modifier::DIM),
@@ -1276,7 +1279,10 @@ fn append_memory_focus(out: &mut Vec<Line<'static>>, focus: &super::model::Memor
                 format!("{}: ", r.source_label),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!("\"{}\"", inline_preview(&r.preview, 100))),
+            Span::raw(format!(
+                "\"{}\"",
+                astra_turn_core::context_assembly_trace::preview_snippet(&r.preview, 100)
+            )),
             Span::styled(
                 format!("   {} tokens", fmt_tokens(r.tokens)),
                 Style::default().add_modifier(Modifier::DIM),
@@ -1959,10 +1965,6 @@ fn truncate_preview(s: &str, max_chars: usize) -> String {
     } else {
         trimmed
     }
-}
-
-fn inline_preview(s: &str, max_chars: usize) -> String {
-    astra_turn_core::context_assembly_trace::preview_snippet(s, max_chars)
 }
 
 fn fmt_tokens(n: u32) -> String {

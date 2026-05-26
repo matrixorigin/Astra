@@ -503,6 +503,17 @@ fn preview_chars(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
 
+fn normalize_exit_semantics_tag(tag: &str) -> Option<String> {
+    let semantics = serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(
+        Value::String(tag.to_string()),
+    )
+    .ok()?;
+    serde_json::to_value(semantics)
+        .ok()?
+        .as_str()
+        .map(ToString::to_string)
+}
+
 fn build_bridge_tool_call_records(
     tool_calls: &[Value],
     tool_results: &[Value],
@@ -652,7 +663,7 @@ fn build_bridge_tool_call_records(
         let exit_semantics = tool_result
             .get("exit_semantics")
             .and_then(Value::as_str)
-            .map(ToString::to_string);
+            .and_then(normalize_exit_semantics_tag);
         records.push(ToolCallRecord {
             name: tool_name,
             ok,
