@@ -1296,6 +1296,45 @@ impl TurnEventBuffer {
         self.events.push(event);
     }
 
+    /// Record a lightweight trace span event in the journal.
+    ///
+    /// Use this for phase timing: `turn_start`, `context_assembly`,
+    /// `llm_call`, `tool_selection`, `tool_execution`, `turn_end`.
+    pub fn record_trace_span(
+        &mut self,
+        span_id: &str,
+        name: &str,
+        start_us: u64,
+        end_us: u64,
+        parent_span_id: Option<&str>,
+        attrs: Option<&std::collections::HashMap<String, String>>,
+    ) {
+        use std::collections::HashMap;
+        let event = JournalEvent::trace_span(
+            self.session_id.as_deref(),
+            Some(self.turn),
+            span_id,
+            parent_span_id,
+            name,
+            start_us,
+            end_us,
+            attrs,
+        );
+        self.events.push(event);
+    }
+
+    /// Record a trace span via builder — preferred API.
+    pub fn record_trace_span_v2(&mut self, builder: TraceSpanBuilder) {
+        let mut evt = builder
+            .session_id(self.session_id.as_deref())
+            .turn(Some(self.turn))
+            .build();
+        // base() may have already set session_id; let the builder override win
+        evt.session_id = self.session_id.clone();
+        evt.turn = Some(self.turn);
+        self.events.push(evt);
+    }
+
     /// Number of events collected so far.
     pub fn len(&self) -> usize {
         self.events.len()
