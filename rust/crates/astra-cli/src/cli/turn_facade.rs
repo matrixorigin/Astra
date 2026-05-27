@@ -19,6 +19,7 @@ pub(crate) struct BasicCliTurnOptions {
     pub(crate) append_system_prompt: Option<String>,
     pub(crate) cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
     pub(crate) approval_request_tx: Option<ApprovalRequestTx>,
+    pub(crate) disable_session_not_found_retry: bool,
 }
 
 fn build_basic_cli_turn_params<'a>(
@@ -39,8 +40,12 @@ fn build_basic_cli_turn_params<'a>(
     params
 }
 
-fn should_retry_without_session(error: &str, session_id: Option<&str>) -> bool {
-    session_id.is_some() && is_session_not_found_error(error)
+fn should_retry_without_session(
+    error: &str,
+    session_id: Option<&str>,
+    retry_disabled: bool,
+) -> bool {
+    !retry_disabled && session_id.is_some() && is_session_not_found_error(error)
 }
 
 pub(crate) async fn execute_basic_cli_turn<'a>(
@@ -63,7 +68,13 @@ pub(crate) async fn execute_basic_cli_turn<'a>(
         pre_loaded_messages,
     );
     match stream_chat_sse(params).await {
-        Err(err) if should_retry_without_session(&err.error, session_id) => {
+        Err(err)
+            if should_retry_without_session(
+                &err.error,
+                session_id,
+                options.disable_session_not_found_retry,
+            ) =>
+        {
             if let Err(clear_error) = clear_profile_last_session(profile) {
                 tracing::warn!(
                     error = %clear_error,
@@ -111,12 +122,23 @@ mod tests {
     fn retry_without_session_requires_not_found_error_and_session_id() {
         assert!(should_retry_without_session(
             "session not found: 1234",
-            Some("1234")
+            Some("1234"),
+            false
         ));
         assert!(!should_retry_without_session(
             "session not found: 1234",
-            None
+            None,
+            false
         ));
-        assert!(!should_retry_without_session("rate limited", Some("1234")));
+        assert!(!should_retry_without_session(
+            "session not found: 1234",
+            Some("1234"),
+            true
+        ));
+        assert!(!should_retry_without_session(
+            "rate limited",
+            Some("1234"),
+            false
+        ));
     }
 }

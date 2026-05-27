@@ -2172,6 +2172,18 @@ total_tokens_out: 500
     }
 
     #[test]
+    fn cli_chat_no_resume() {
+        let cli = Cli::try_parse_from(["astra", "chat", "--no-resume", "-m", "hello"]).unwrap();
+        match cli.command {
+            Some(Command::Chat(ref args)) => {
+                assert!(args.no_resume);
+                assert_eq!(args.message.as_deref(), Some("hello"));
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
     fn cli_chat_auto_approve() {
         let cli = Cli::try_parse_from(["astra", "chat", "-y"]).unwrap();
         match cli.command {

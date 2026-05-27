@@ -98,18 +98,20 @@ pub fn apply_settings_json(base: RuntimeConfig, json: &str) -> Result<RuntimeCon
 /// when the model is unknown or unspecified.
 ///
 /// Mirrors [`RuntimeLimits::effective_max_turn_input_tokens`] but reads
-/// the configured fallback from `RuntimeConfig` rather than the global
+/// the configured per-turn cap from `RuntimeConfig` rather than the global
 /// env-tuned singleton, because `/config` operates on a specific
 /// loaded config, not on `RuntimeLimits::global()`.
 pub fn effective_budget_for_model(config: &RuntimeConfig, model: Option<&str>) -> u64 {
     let configured = config.token_budget.max_turn_input_tokens as u64;
-    if let Some(window) = model.and_then(context_window_for_model) {
-        (window as f64 * 0.80) as u64
-    } else {
-        // Keep the local-limit fallback consistent with RuntimeLimits:
-        // env can override the configured value, so consult it too.
-        let env_limit = RuntimeLimits::global().max_turn_input_tokens;
-        if env_limit > 0 { env_limit } else { configured }
+    let model_budget = model
+        .and_then(context_window_for_model)
+        .map(|window| (window as f64 * 0.80) as u64);
+
+    match (model_budget, configured) {
+        (Some(budget), 0) => budget,
+        (Some(budget), cap) => budget.min(cap),
+        (None, 0) => RuntimeLimits::global().max_turn_input_tokens,
+        (None, cap) => cap,
     }
 }
 

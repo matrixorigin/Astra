@@ -2084,8 +2084,10 @@ pub(crate) async fn execute_cli_command(
             };
 
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let session_id = match args.session_id {
+            let explicit_session_id = args.session_id.clone();
+            let session_id = match explicit_session_id {
                 Some(session_id) => Some(session_id),
+                None if args.no_resume => None,
                 None => match cli_context.session_id.clone() {
                     Some(session_id) => Some(session_id),
                     None => validated_resumable_last_session_id(api, profile.as_deref()).await,
@@ -2226,6 +2228,7 @@ pub(crate) async fn execute_cli_command(
             let turn_options = crate::cli::turn_facade::BasicCliTurnOptions {
                 pre_loaded_messages: continuation_messages.take(),
                 append_system_prompt: args.append_system_prompt.clone(),
+                disable_session_not_found_retry: args.no_resume || args.session_id.is_some(),
                 ..Default::default()
             };
             let turn_start = std::time::Instant::now();

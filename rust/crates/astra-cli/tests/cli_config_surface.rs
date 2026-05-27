@@ -101,15 +101,14 @@ fn parse_settings_source_treats_leading_brace_as_inline() {
 // ─── B. effective-budget display ─────────────────────────────────────────
 
 #[test]
-fn effective_budget_for_sonnet_4_6_exceeds_config_default() {
-    // The whole point of the new budget logic: a 1M-window model is NOT
-    // clamped to the 200k config default. `/config` must expose this so
-    // users don't think their 1M model is stuck at 200k.
+fn effective_budget_for_sonnet_4_6_respects_config_cap() {
+    // A 1M-window provider can accept a very large prompt, but the agent's
+    // per-turn working budget is intentionally capped by config by default.
     let config = RuntimeConfig::default();
     let shown = effective_budget_for_model(&config, Some("claude-sonnet-4-6"));
-    assert!(
-        shown >= 600_000,
-        "Sonnet 4.6 effective budget must reflect its 1M window, got {shown}"
+    assert_eq!(
+        shown, config.token_budget.max_turn_input_tokens as u64,
+        "Sonnet 4.6 effective budget should respect the configured cap"
     );
 }
 

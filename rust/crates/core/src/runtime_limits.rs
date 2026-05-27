@@ -113,25 +113,24 @@ impl RuntimeLimits {
 
     /// Resolve the effective max_turn_input_tokens for a given model.
     ///
-    /// When the model has a known context window, the budget IS derived
-    /// from it (roughly 80% — the remaining ~20% covers output tokens and
-    /// protocol overhead). The configured `max_turn_input_tokens` is a
-    /// fallback for UNKNOWN models only, not a cap on known ones. Past
-    /// behaviour `effective.min(self.max_turn_input_tokens)` meant a
-    /// 1M-window Sonnet 4.6 was clamped to 200K — 80% of the real window
-    /// thrown away; on the other hand, letting the config be a floor would
-    /// cause a 128K-window GPT-4o to be pushed up to 200K when its real
-    /// ceiling is 128K. Neither direction of clamp is correct; the
-    /// model's window should win outright.
+    /// When the model has a known context window, derive the model-safe
+    /// ceiling from it (roughly 80% — the remaining ~20% covers output
+    /// tokens and protocol overhead), then cap it by the configured
+    /// per-turn working budget. This keeps provider capacity separate from
+    /// how much live history the agent should carry by default.
     ///
-    /// Callers that need to override a known model (lower the budget for
-    /// cost reasons, for example) should set `max_turn_input_tokens` on
-    /// the per-session `RuntimeConfig`, not via this global helper.
+    /// `max_turn_input_tokens = 0` keeps the legacy "unlimited" sentinel:
+    /// known models use their model-safe ceiling, unknown models stay
+    /// uncapped.
     pub fn effective_max_turn_input_tokens(&self, model: Option<&str>) -> u64 {
-        if let Some(window) = model.and_then(context_window_for_model) {
-            (window as f64 * 0.80) as u64
-        } else {
-            self.max_turn_input_tokens
+        let model_budget = model
+            .and_then(context_window_for_model)
+            .map(|window| (window as f64 * 0.80) as u64);
+
+        match (model_budget, self.max_turn_input_tokens) {
+            (Some(budget), 0) => budget,
+            (Some(budget), configured) => budget.min(configured),
+            (None, configured) => configured,
         }
     }
 }
@@ -326,5 +325,45 @@ mod tests {
         );
         assert_eq!(context_window_for_model("deepseek-chat-v03"), Some(64_000));
         assert_eq!(context_window_for_model("custom-vision-v03-beta"), None);
+    }
+
+    #[test]
+    fn effective_max_turn_input_tokens_caps_large_known_models() {
+        let limits = RuntimeLimits {
+            max_turn_input_tokens: 200_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            limits.effective_max_turn_input_tokens(Some("deepseek-v4-pro")),
+            200_000
+        );
+    }
+
+    #[test]
+    fn effective_max_turn_input_tokens_never_exceeds_small_model_window() {
+        let limits = RuntimeLimits {
+            max_turn_input_tokens: 200_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            limits.effective_max_turn_input_tokens(Some("deepseek-chat")),
+            51_200
+        );
+    }
+
+    #[test]
+    fn effective_max_turn_input_tokens_zero_keeps_model_ceiling() {
+        let limits = RuntimeLimits {
+            max_turn_input_tokens: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            limits.effective_max_turn_input_tokens(Some("deepseek-v4-pro")),
+            800_000
+        );
+        assert_eq!(
+            limits.effective_max_turn_input_tokens(Some("unknown-model")),
+            0
+        );
     }
 }

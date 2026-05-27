@@ -172,11 +172,9 @@ fn show_config() {
             .to_string()
             .yellow()
     );
-    // Effective-for-model line. The configured value above is one number;
-    // the actual budget a turn sees is model-dependent because 1M-window
-    // models (Sonnet 4.6 / Opus 4.6) read 80% of their window directly,
-    // bypassing the configured default. Surface both so operators stop
-    // assuming their Sonnet 4.6 is stuck at 200k.
+    // Effective-for-model line. The configured value above is a per-turn
+    // working cap; the model-specific value may be lower for small windows
+    // or equal to the cap for large-window models.
     let effective_model = active_model_for_display();
     let effective_budget = astra_config::config_overlay::effective_budget_for_model(
         &config,

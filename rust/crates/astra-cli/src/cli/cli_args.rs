@@ -334,6 +334,12 @@ pub(crate) struct ChatArgs {
     /// Existing session id to continue
     #[arg(long)]
     pub session_id: Option<String>,
+    /// Do not auto-resume the most recent session when running one-shot chat.
+    ///
+    /// This is useful for benchmark/scripted runs where every invocation must
+    /// start with an isolated server-created session.
+    #[arg(long)]
+    pub no_resume: bool,
     /// Model override
     #[arg(long)]
     pub model: Option<String>,
