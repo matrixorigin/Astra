@@ -154,6 +154,11 @@ impl EdgeRegisterRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EdgeHeartbeatRequest {
     pub edge_agent_id: String,
+    /// Number of in-flight tool requests on this edge executor.
+    /// Used by cloud to detect stalled edges (pending > 0 but no results
+    /// received for > 2 min → warning; no heartbeat for > 5 min → stale).
+    #[serde(default)]
+    pub pending_request_count: u32,
 }
 
 /// `POST /tasks/{id}/lease/{claim,release,renew}` — matches server lease handlers.

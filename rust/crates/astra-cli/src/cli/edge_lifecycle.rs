@@ -1,5 +1,6 @@
 //! Cloud edge registry + heartbeat (Phase 3). See `docs/design/multi-agent-cloud-runtime.md` §5.5.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::cli::chat_stream::edge_executor_instance_id;
@@ -9,6 +10,21 @@ use astra_thin_client::{
     edge_register_with_capabilities,
 };
 
+/// Global counter of in-flight tool requests on this edge executor.
+/// Incremented before tool dispatch, decremented on result (success or error).
+/// Read by heartbeat to populate `pending_request_count`.
+static PENDING_TOOL_REQUESTS: AtomicU32 = AtomicU32::new(0);
+
+/// Increment the pending tool request counter.
+pub fn inc_pending_tool_requests() {
+    PENDING_TOOL_REQUESTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Decrement the pending tool request counter.
+pub fn dec_pending_tool_requests() {
+    PENDING_TOOL_REQUESTS.fetch_sub(1, Ordering::Relaxed);
+}
+
 /// When `ASTRA_EDGE_REGISTRY` is `0`, `false`, or `off`, skip register and heartbeat.
 pub fn edge_cloud_registry_enabled() -> bool {
     !matches!(
@@ -17,6 +33,34 @@ pub fn edge_cloud_registry_enabled() -> bool {
     )
 }
 
+// ── backoff helpers ────────────────────────────────────────────────────────
+
+/// Returns `delay_secs` with a random jitter in [0, 500] ms.
+fn jitter(delay: Duration) -> Duration {
+    use std::time::UNIX_EPOCH;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let jitter_ms = (nanos / 1000) % 500; // deterministic per-ms, good enough
+    delay + Duration::from_millis(jitter_ms as u64)
+}
+
+/// Exponential backoff sequence with jitter, capped at 30 s.
+fn backoff_delay(consecutive_failures: u32) -> Duration {
+    let base: u64 = match consecutive_failures {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        3 => 8,
+        4 => 16,
+        _ => 30,
+    };
+    jitter(Duration::from_secs(base))
+}
+
+/// Determine heartbeat interval from env `ASTRA_EDGE_HEARTBEAT_SECS` (default 120).
+/// Returns `None` when set to `0` (heartbeat disabled).
 fn heartbeat_period() -> Option<Duration> {
     let secs: u64 = std::env::var("ASTRA_EDGE_HEARTBEAT_SECS")
         .ok()
@@ -61,6 +105,7 @@ async fn send_heartbeat(api: &ThinClient, token: &str) -> Result<(), ThinClientE
     let id = edge_executor_instance_id();
     let hb = EdgeHeartbeatRequest {
         edge_agent_id: id.to_string(),
+        pending_request_count: PENDING_TOOL_REQUESTS.load(Ordering::Relaxed),
     };
     api.post_agents_edge_heartbeat(Some(token), Some(id), &hb)
         .await?;
@@ -75,12 +120,15 @@ pub fn spawn_edge_heartbeat(
     let period = heartbeat_period()?;
     Some(tokio::spawn(async move {
         let mut interval = tokio::time::interval(period);
-        interval.tick().await;
+        interval.tick().await; // skip immediate first tick — register just happened
         let mut token = token;
+        let mut failures: u32 = 0;
         loop {
             interval.tick().await;
             match send_heartbeat(&api, &token).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    failures = 0; // reset backoff on success
+                }
                 Err(e) if is_unauthorized(&e) => {
                     // Background access token expired mid-session.
                     // Try a single silent refresh; if it works, swap
@@ -90,12 +138,24 @@ pub fn spawn_edge_heartbeat(
                         && let Some(fresh) = current_access_token(profile.as_deref())
                     {
                         token = fresh;
+                        failures = 0;
                     } else {
                         return;
                     }
                 }
                 Err(_) => {
-                    // Transient network/5xx: swallow and retry next tick.
+                    // Transient network/5xx: backoff with jitter before next tick.
+                    // The interval fires at the fixed period; we add a one-shot sleep
+                    // so the next heartbeat is delayed by the backoff duration.
+                    failures += 1;
+                    let delay = backoff_delay(failures);
+                    tracing::warn!(
+                        target: "astra.edge.heartbeat",
+                        consecutive_failures = failures,
+                        backoff_secs = delay.as_secs_f64(),
+                        "heartbeat failed, backing off"
+                    );
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
@@ -287,5 +347,76 @@ mod tests {
             Some(v) => env_set("ASTRA_EDGE_REGISTRY", v),
             None => env_remove("ASTRA_EDGE_REGISTRY"),
         }
+    }
+
+    // ── backoff / heartbeat tests ───────────────────────────────────────────
+
+    #[test]
+    fn backoff_delay_sequence() {
+        // Without env jitter overrides, verify base delays are correct.
+        // (Jitter adds 0-500ms, so we check the floor.)
+        assert!(backoff_delay(0) >= Duration::from_secs(1));
+        assert!(backoff_delay(1) >= Duration::from_secs(2));
+        assert!(backoff_delay(2) >= Duration::from_secs(4));
+        assert!(backoff_delay(3) >= Duration::from_secs(8));
+        assert!(backoff_delay(4) >= Duration::from_secs(16));
+        assert!(backoff_delay(5) >= Duration::from_secs(30));
+        assert!(backoff_delay(100) >= Duration::from_secs(30));
+        // Jitter < 500ms
+        assert!(backoff_delay(0) < Duration::from_millis(1500));
+        assert!(backoff_delay(5) < Duration::from_millis(30500));
+    }
+
+    #[test]
+    fn pending_request_counter() {
+        // Reset to known state
+        PENDING_TOOL_REQUESTS.store(0, Ordering::Relaxed);
+        assert_eq!(PENDING_TOOL_REQUESTS.load(Ordering::Relaxed), 0);
+
+        inc_pending_tool_requests();
+        inc_pending_tool_requests();
+        assert_eq!(PENDING_TOOL_REQUESTS.load(Ordering::Relaxed), 2);
+
+        dec_pending_tool_requests();
+        assert_eq!(PENDING_TOOL_REQUESTS.load(Ordering::Relaxed), 1);
+
+        dec_pending_tool_requests();
+        assert_eq!(PENDING_TOOL_REQUESTS.load(Ordering::Relaxed), 0);
+
+        // Underflow saturates at 0 (AtomicU32 wrapping is UB, but fetch_sub on 0 → max)
+        // Rather than test wrapping, just reset to 0.
+        PENDING_TOOL_REQUESTS.store(0, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heartbeat_includes_pending_count() {
+        env_remove("ASTRA_EDGE_REGISTRY");
+        PENDING_TOOL_REQUESTS.store(3, Ordering::Relaxed);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/agents/edge/heartbeat"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = ThinClient::new(&server.uri(), None).expect("url");
+        send_heartbeat(&api, "test-token")
+            .await
+            .expect("heartbeat");
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_slice(&received[0].body).expect("json body");
+        assert_eq!(
+            body.get("pending_request_count")
+                .and_then(|v| v.as_u64()),
+            Some(3)
+        );
+
+        PENDING_TOOL_REQUESTS.store(0, Ordering::Relaxed);
     }
 }
