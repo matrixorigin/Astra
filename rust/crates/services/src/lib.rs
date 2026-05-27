@@ -173,8 +173,9 @@ pub use marketplace_stats::{
 };
 pub use mcp_registry::{
     DatabaseMcpRegistryService, McpBindingRequestData, McpDiscoveredToolData, McpRegisterRecord,
-    McpRegisterRequestData, McpRegisteredToolRecord, McpRegistryService, McpRuntimeBindingRecord,
-    McpServerRequestData, UnconfiguredMcpRegistryService, mcp_schema_hash,
+    McpRegisterRequestData, McpRegisteredBindingRecord, McpRegisteredToolRecord,
+    McpRegistryService, McpRuntimeBindingRecord, McpServerRequestData,
+    UnconfiguredMcpRegistryService, mcp_binding_tool_namespace, mcp_schema_hash,
 };
 pub use models::{
     DatabaseModelService, ModelCreateRequestData, ModelListItem, ModelRecord, ModelService,

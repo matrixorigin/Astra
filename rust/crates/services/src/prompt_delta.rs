@@ -176,7 +176,7 @@ pub async fn persist_prompt_request(
             "INSERT INTO prompt_chunks
              (chunk_id, chunk_hash, chunk_kind, payload_json, created_at)
              VALUES (?, ?, ?, ?, NOW(6))
-             ON DUPLICATE KEY UPDATE chunk_hash = VALUES(chunk_hash)",
+             ON DUPLICATE KEY UPDATE payload_json = payload_json",
         )
         .bind(&chunk.chunk_id)
         .bind(&chunk.chunk_hash)

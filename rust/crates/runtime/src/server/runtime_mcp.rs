@@ -13,7 +13,8 @@ use astra_mcp::{
     sanitize_tool_name, tools_to_schemas_checked,
 };
 use astra_services::{
-    McpDiscoveredToolData, McpRegisterRequestData, McpRuntimeBindingRecord, mcp_schema_hash,
+    McpDiscoveredToolData, McpRegisterRequestData, McpRuntimeBindingRecord,
+    mcp_binding_tool_namespace, mcp_schema_hash,
 };
 use axum::{Json, http::StatusCode};
 use regex::Regex;
@@ -81,17 +82,17 @@ fn credential_transport(
 }
 
 fn server_config(
-    binding_alias: &str,
+    tool_namespace: &str,
     transport: &str,
     url: &str,
     description: Option<&str>,
     key_value: &Value,
 ) -> Result<McpServerConfig, (StatusCode, Json<ErrorResponse>)> {
-    let binding_alias = sanitize_tool_name(binding_alias.trim());
-    if binding_alias.is_empty() {
+    let tool_namespace = sanitize_tool_name(tool_namespace.trim());
+    if tool_namespace.is_empty() {
         return Err(mcp_error(
             StatusCode::BAD_REQUEST,
-            "binding.alias must not be empty after sanitization",
+            "MCP binding tool namespace must not be empty after sanitization",
             "mcp_binding_invalid",
         ));
     }
@@ -99,7 +100,12 @@ fn server_config(
     validate_url(url.trim())?;
     let credential = credential_transport(key_value)?;
     let transport = match transport.trim().to_ascii_lowercase().as_str() {
-        "sse" | "http" => Transport::Sse {
+        "sse" => Transport::Sse {
+            url: url.trim().to_string(),
+            auth_token: credential.auth_token,
+            headers: credential.headers,
+        },
+        "http" | "streamable_http" | "streamable-http" => Transport::StreamableHttp {
             url: url.trim().to_string(),
             auth_token: credential.auth_token,
             headers: credential.headers,
@@ -119,7 +125,7 @@ fn server_config(
     };
 
     Ok(McpServerConfig {
-        name: binding_alias,
+        name: tool_namespace,
         transport,
         description: description.unwrap_or_default().to_string(),
         enabled: true,
@@ -177,7 +183,7 @@ pub(crate) fn redact_mcp_error_text(raw: &str) -> String {
 }
 
 fn discovery_error(
-    alias: &str,
+    tool_namespace: &str,
     key_value: &Value,
     error: impl ToString,
 ) -> (StatusCode, Json<ErrorResponse>) {
@@ -185,7 +191,7 @@ fn discovery_error(
         StatusCode::BAD_GATEWAY,
         format!(
             "MCP discovery failed for binding '{}': {}",
-            alias,
+            tool_namespace,
             redact_known_secrets(&error.to_string(), key_value)
         ),
         "mcp_discovery_failed",
@@ -203,19 +209,20 @@ fn input_schema_value(tool: &McpTool) -> Value {
 }
 
 pub(crate) async fn discover_binding_tools(
+    binding_id: i64,
     request: &McpRegisterRequestData,
 ) -> Result<Vec<McpDiscoveredToolData>, (StatusCode, Json<ErrorResponse>)> {
-    let binding_alias = sanitize_tool_name(request.binding.alias.trim());
-    if binding_alias.is_empty() {
+    if binding_id <= 0 {
         return Err(mcp_error(
             StatusCode::BAD_REQUEST,
-            "binding.alias must not be empty after sanitization",
+            "binding_id must be positive",
             "mcp_binding_invalid",
         ));
     }
+    let tool_namespace = mcp_binding_tool_namespace(binding_id);
 
     let config = server_config(
-        &binding_alias,
+        &tool_namespace,
         &request.server.transport,
         &request.server.url,
         request.server.description.as_deref(),
@@ -225,9 +232,9 @@ pub(crate) async fn discover_binding_tools(
     manager
         .connect(config)
         .await
-        .map_err(|error| discovery_error(&binding_alias, &request.binding.key_value, error))?;
+        .map_err(|error| discovery_error(&tool_namespace, &request.binding.key_value, error))?;
 
-    let conn = manager.get(&binding_alias).ok_or_else(|| {
+    let conn = manager.get(&tool_namespace).ok_or_else(|| {
         mcp_error(
             StatusCode::BAD_GATEWAY,
             "MCP discovery failed after connection initialization",
@@ -235,7 +242,7 @@ pub(crate) async fn discover_binding_tools(
         )
     })?;
     let tools = conn.tools();
-    let schemas = tools_to_schemas_checked(&binding_alias, tools)
+    let schemas = tools_to_schemas_checked(&tool_namespace, tools)
         .map_err(|error| mcp_error(StatusCode::CONFLICT, error, "mcp_public_name_conflict"))?;
 
     let mut discovered = Vec::with_capacity(tools.len());
@@ -268,11 +275,11 @@ pub(crate) async fn discover_binding_tools(
 }
 
 fn cached_tool_schema(
-    binding_alias: &str,
+    tool_namespace: &str,
     tool: &McpDiscoveredToolData,
 ) -> Result<Value, (StatusCode, Json<ErrorResponse>)> {
     let schema = mcp_tool_schema_from_parts(
-        binding_alias,
+        tool_namespace,
         &tool.tool_name,
         tool.description.as_deref().unwrap_or_default(),
         tool.input_schema_json
@@ -285,7 +292,7 @@ fn cached_tool_schema(
             StatusCode::BAD_GATEWAY,
             format!(
                 "cached MCP tool catalog is inconsistent for binding '{}'",
-                binding_alias
+                tool_namespace
             ),
             "mcp_tools_missing",
         ));
@@ -317,13 +324,13 @@ pub(crate) async fn prepare_runtime_bundle(
         }
 
         let config = server_config(
-            &record.binding_alias,
+            &mcp_binding_tool_namespace(record.binding_id),
             &record.transport,
             &record.url,
             record.server_description.as_deref(),
             &record.key_value,
         )?;
-        let binding_alias = config.name.clone();
+        let tool_namespace = config.name.clone();
         manager.connect(config).await.map_err(|error| {
             mcp_error(
                 StatusCode::BAD_GATEWAY,
@@ -336,7 +343,7 @@ pub(crate) async fn prepare_runtime_bundle(
             )
         })?;
 
-        let conn = manager.get(&binding_alias).ok_or_else(|| {
+        let conn = manager.get(&tool_namespace).ok_or_else(|| {
             mcp_error(
                 StatusCode::BAD_GATEWAY,
                 format!(
@@ -365,7 +372,7 @@ pub(crate) async fn prepare_runtime_bundle(
                     "mcp_public_name_conflict",
                 ));
             }
-            schemas.push(cached_tool_schema(&binding_alias, tool)?);
+            schemas.push(cached_tool_schema(&tool_namespace, tool)?);
         }
     }
 
@@ -392,16 +399,16 @@ mod tests {
     fn cached_tool_schema_preserves_public_name() {
         let tool = McpDiscoveredToolData {
             tool_name: "query_sql".to_string(),
-            public_name: "mcp__jinpan_moi__query_sql".to_string(),
+            public_name: "mcp__binding_42__query_sql".to_string(),
             description: Some("Query SQL".to_string()),
             input_schema_json: Some(json!({"type": "object", "properties": {}})),
             output_schema_json: None,
             schema_hash: "hash".to_string(),
         };
-        let schema = cached_tool_schema("jinpan_moi", &tool).unwrap();
+        let schema = cached_tool_schema("binding_42", &tool).unwrap();
         assert_eq!(
             schema["function"]["name"].as_str(),
-            Some("mcp__jinpan_moi__query_sql")
+            Some("mcp__binding_42__query_sql")
         );
     }
 }

@@ -4,6 +4,7 @@
 //! schema conversion, and tool dispatch. Used by both the CLI (edge agent)
 //! and the server runtime.
 
+mod classic_sse;
 mod connection;
 mod error;
 mod manager;

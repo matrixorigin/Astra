@@ -1,4 +1,4 @@
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.94-bookworm AS builder
 
 WORKDIR /app
 
@@ -10,7 +10,7 @@ FROM debian:bookworm-slim
 
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/* \
-    && groupadd -r appgroup && useradd --system --no-create-home --shell /usr/sbin/nologin -g appgroup appuser
+    && groupadd -r appgroup && useradd --system --create-home --home-dir /home/appuser --shell /usr/sbin/nologin -g appgroup appuser
 COPY --from=builder /app/rust/target/release/astra-server /usr/local/bin/astra-server
 COPY --from=builder /app/rust/target/release/astra /usr/local/bin/astra
 COPY --from=builder /app/rust/target/release/astra-admin /usr/local/bin/astra-admin
@@ -20,6 +20,7 @@ RUN chown root:appgroup /app && chmod 1770 /app
 USER appuser
 
 EXPOSE 8000
+ENV HOME=/home/appuser
 ENV RUST_API_ADDR=0.0.0.0:8000
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \

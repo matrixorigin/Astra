@@ -26,8 +26,6 @@
 // Connection helpers are staged for upcoming MCP wiring; keep the surface without warning spam.
 #![allow(dead_code)]
 
-
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,14 +55,10 @@ use tokio::sync::RwLock;
 // ── Re-exports from the shared astra-mcp crate ──────────────────────────
 #[allow(unused_imports)]
 pub use astra_mcp::{
-    ConnectionState, McpError, McpServerConfig, RetryConfig, Transport,
-    MAX_DESCRIPTION_LENGTH, MAX_RESULT_CONTENT_LENGTH,
-    extract_result_text, extract_result_text_with_limit, is_dangerous_env_var,
-    mcp_tool_to_schema, sanitize_tool_name,
+    ConnectionState, MAX_DESCRIPTION_LENGTH, MAX_RESULT_CONTENT_LENGTH, McpError, McpServerConfig,
+    RetryConfig, Transport, extract_result_text, extract_result_text_with_limit,
+    is_dangerous_env_var, mcp_tool_to_schema, sanitize_tool_name,
 };
-
-
-
 
 /// Configuration for MCP sampling — allows the handler to forward
 /// `sampling/createMessage` requests to our LLM API.
@@ -1339,6 +1333,11 @@ async fn connect_once(
             url,
             auth_token,
             headers,
+        }
+        | Transport::StreamableHttp {
+            url,
+            auth_token,
+            headers,
         } => {
             connect_sse(
                 &config.name,
@@ -1679,14 +1678,11 @@ async fn fetch_tools_with_timeout(
     .map_err(McpError::Service)
 }
 
-
-
 /// Default timeout for MCP tool calls (seconds).
 const MCP_TOOL_CALL_TIMEOUT_SECS: u64 = 120;
 
 /// Default timeout for MCP server connection (seconds).
 const MCP_CONNECT_TIMEOUT_SECS: u64 = 30;
-
 
 #[cfg(test)]
 mod tests {
@@ -2287,7 +2283,7 @@ transport:
     }
 
     #[test]
-    fn sse_transport_http_alias() {
+    fn streamable_http_transport_http_alias() {
         let yaml = r#"
 name: http-server
 transport:
@@ -2296,7 +2292,7 @@ transport:
 "#;
         let config: McpServerConfig = serde_yaml_ng::from_str(yaml).unwrap();
         match &config.transport {
-            Transport::Sse {
+            Transport::StreamableHttp {
                 url,
                 auth_token,
                 headers,
@@ -2305,7 +2301,7 @@ transport:
                 assert!(auth_token.is_none());
                 assert!(headers.is_empty());
             }
-            _ => panic!("expected SSE transport"),
+            _ => panic!("expected StreamableHttp transport"),
         }
     }
 

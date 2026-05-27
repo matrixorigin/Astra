@@ -384,6 +384,23 @@ async fn add_index_if_missing(
     Ok(())
 }
 
+async fn drop_index_if_exists(
+    pool: &Pool<MySql>,
+    schema: &str,
+    table: &str,
+    index: &str,
+) -> Result<(), sqlx::Error> {
+    debug_assert!(
+        !table.contains('`') && !index.contains('`'),
+        "identifiers must not contain backticks"
+    );
+    if index_exists(pool, schema, table, index).await? {
+        let ddl = format!("ALTER TABLE `{table}` DROP INDEX `{index}`");
+        query(&ddl).execute(pool).await?;
+    }
+    Ok(())
+}
+
 fn sql_decode_error(message: impl Into<String>) -> sqlx::Error {
     sqlx::Error::Decode(Box::new(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -2186,18 +2203,42 @@ pub async fn ensure_core_schema(
             id BIGINT AUTO_INCREMENT PRIMARY KEY,
             owner_user_id VARCHAR(128) NOT NULL,
             mcp_id BIGINT NOT NULL,
-            alias VARCHAR(128) NOT NULL,
+            key_hash VARCHAR(128) NOT NULL,
             key_value_encrypted TEXT NOT NULL,
             comment TEXT NULL,
             is_active SMALLINT NOT NULL DEFAULT 1,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_mcp_bindings_owner_alias (owner_user_id, alias),
+            UNIQUE KEY uq_mcp_bindings_owner_mcp_key (owner_user_id, mcp_id, key_hash),
             INDEX idx_mcp_bindings_owner_active (owner_user_id, is_active, updated_at),
             INDEX idx_mcp_bindings_mcp_id (mcp_id)
         )",
     )
     .execute(&pool)
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "mcp_bindings",
+        "key_hash",
+        "ALTER TABLE mcp_bindings ADD COLUMN key_hash VARCHAR(128) NULL",
+    )
+    .await?;
+    drop_index_if_exists(
+        &pool,
+        &settings.database,
+        "mcp_bindings",
+        "uq_mcp_bindings_owner_alias",
+    )
+    .await?;
+    drop_column_if_exists(&pool, &settings.database, "mcp_bindings", "alias").await?;
+    add_index_if_missing(
+        &pool,
+        &settings.database,
+        "mcp_bindings",
+        "uq_mcp_bindings_owner_mcp_key",
+        "ALTER TABLE mcp_bindings ADD UNIQUE KEY uq_mcp_bindings_owner_mcp_key (owner_user_id, mcp_id, key_hash)",
+    )
     .await?;
 
     query(

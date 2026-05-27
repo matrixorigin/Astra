@@ -3816,7 +3816,7 @@ fn json_entry_to_mcp_config(
         .unwrap_or("stdio");
 
     let transport = match server_type {
-        "sse" | "http" => {
+        "sse" => {
             let url = entry
                 .get("url")
                 .and_then(|v| v.as_str())
@@ -3832,9 +3832,29 @@ fn json_entry_to_mcp_config(
                     .and_then(|v| v.as_object())
                     .map(|h| {
                         h.iter()
-                            .map(|(k, v)| {
-                                (k.clone(), v.as_str().unwrap_or("").to_string())
-                            })
+                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }
+        }
+        "http" | "streamable_http" | "streamable-http" => {
+            let url = entry
+                .get("url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("HTTP MCP server '{name}' missing `url`"))?;
+            astra_mcp::Transport::StreamableHttp {
+                url: url.to_string(),
+                auth_token: entry
+                    .get("auth_token")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                headers: entry
+                    .get("headers")
+                    .and_then(|v| v.as_object())
+                    .map(|h| {
+                        h.iter()
+                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
                             .collect()
                     })
                     .unwrap_or_default(),
@@ -3856,9 +3876,7 @@ fn json_entry_to_mcp_config(
                     .and_then(|v| v.as_object())
                     .map(|h| {
                         h.iter()
-                            .map(|(k, v)| {
-                                (k.clone(), v.as_str().unwrap_or("").to_string())
-                            })
+                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
                             .collect()
                     })
                     .unwrap_or_default(),
@@ -3881,9 +3899,7 @@ fn json_entry_to_mcp_config(
                     .and_then(|v| v.as_object())
                     .map(|h| {
                         h.iter()
-                            .map(|(k, v)| {
-                                (k.clone(), v.as_str().unwrap_or("").to_string())
-                            })
+                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
                             .collect()
                     })
                     .unwrap_or_default(),
@@ -3903,26 +3919,21 @@ fn json_entry_to_mcp_config(
 async fn mcp_test(name: &str, scope: &str) -> Result<(), String> {
     let path = mcp_json_path_for_scope(scope)?;
     let config = read_mcp_config(&path)?;
-    let entry =
-        find_server_entry(&config, name).ok_or_else(|| {
-            format!("Server '{name}' not found in {}", path.display())
-        })?;
+    let entry = find_server_entry(&config, name)
+        .ok_or_else(|| format!("Server '{name}' not found in {}", path.display()))?;
     let mcp_config = json_entry_to_mcp_config(name, entry)?;
 
-    eprintln!(
-        "  {} Connecting to {}...",
-        theme::icon_ok(),
-        name.magenta()
-    );
+    eprintln!("  {} Connecting to {}...", theme::icon_ok(), name.magenta());
 
     let mut manager = astra_mcp::McpClientManager::new();
-    let tool_count = manager.connect(mcp_config).await.map_err(|e| {
-        format!("Failed to connect to '{name}': {e}")
-    })?;
+    let tool_count = manager
+        .connect(mcp_config)
+        .await
+        .map_err(|e| format!("Failed to connect to '{name}': {e}"))?;
 
-    let conn = manager.get(name).ok_or_else(|| {
-        format!("Connected but cannot find '{name}'")
-    })?;
+    let conn = manager
+        .get(name)
+        .ok_or_else(|| format!("Connected but cannot find '{name}'"))?;
 
     eprintln!(
         "  {} Connected successfully ({} tools, uptime {}s)",
@@ -3938,10 +3949,7 @@ async fn mcp_test(name: &str, scope: &str) -> Result<(), String> {
     if !tools.is_empty() {
         eprintln!("\n  {}:", "Tools".bold());
         for tool in tools {
-            let desc = tool
-                .description
-                .as_deref()
-                .unwrap_or("");
+            let desc = tool.description.as_deref().unwrap_or("");
             let short_desc = if desc.len() > 80 {
                 format!("{}…", &desc[..desc.floor_char_boundary(80)])
             } else {
@@ -3956,7 +3964,11 @@ async fn mcp_test(name: &str, scope: &str) -> Result<(), String> {
         Ok(resources) if !resources.is_empty() => {
             eprintln!("\n  {}:", "Resources".bold());
             for r in &resources {
-                eprintln!("    {} → {}", r.raw.name.clone().magenta(), r.raw.uri.clone().dim());
+                eprintln!(
+                    "    {} → {}",
+                    r.raw.name.clone().magenta(),
+                    r.raw.uri.clone().dim()
+                );
             }
         }
         _ => {}
@@ -3970,16 +3982,15 @@ async fn mcp_test(name: &str, scope: &str) -> Result<(), String> {
 async fn mcp_ping(name: &str, scope: &str) -> Result<(), String> {
     let path = mcp_json_path_for_scope(scope)?;
     let config = read_mcp_config(&path)?;
-    let entry =
-        find_server_entry(&config, name).ok_or_else(|| {
-            format!("Server '{name}' not found in {}", path.display())
-        })?;
+    let entry = find_server_entry(&config, name)
+        .ok_or_else(|| format!("Server '{name}' not found in {}", path.display()))?;
     let mcp_config = json_entry_to_mcp_config(name, entry)?;
 
     let mut manager = astra_mcp::McpClientManager::new();
-    manager.connect(mcp_config).await.map_err(|e| {
-        format!("Failed to connect to '{name}': {e}")
-    })?;
+    manager
+        .connect(mcp_config)
+        .await
+        .map_err(|e| format!("Failed to connect to '{name}': {e}"))?;
 
     match manager.ping(name).await {
         Ok(latency) => {

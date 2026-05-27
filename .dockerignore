@@ -16,5 +16,8 @@ __pycache__
 .idea
 dist
 build
+target
+rust/target
+.runtime
 *.egg-info
 memoria/data/

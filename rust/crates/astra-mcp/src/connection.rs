@@ -22,6 +22,7 @@ use crate::error::McpError;
 use crate::types::{McpServerConfig, Transport};
 
 use super::{MCP_CONNECT_TIMEOUT_SECS, MCP_TOOL_CALL_TIMEOUT_SECS};
+use crate::classic_sse::ClassicSseTransport;
 use crate::tools::is_dangerous_env_var;
 
 // ── ChangeHandler ──────────────────────────────────────────────────────
@@ -36,7 +37,9 @@ struct ChangeHandler {
 }
 
 impl ChangeHandler {
-    fn new(roots: Arc<RwLock<Vec<Root>>>) -> (Self, Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>) {
+    fn new(
+        roots: Arc<RwLock<Vec<Root>>>,
+    ) -> (Self, Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>) {
         let tools = Arc::new(AtomicBool::new(false));
         let prompts = Arc::new(AtomicBool::new(false));
         let resources = Arc::new(AtomicBool::new(false));
@@ -234,7 +237,11 @@ impl McpConnection {
 
     pub async fn read_resource(&self, uri: &str) -> Result<String, McpError> {
         let params = ReadResourceRequestParams::new(uri.to_string());
-        let result = self.peer.read_resource(params).await.map_err(McpError::Service)?;
+        let result = self
+            .peer
+            .read_resource(params)
+            .await
+            .map_err(McpError::Service)?;
         let text = result
             .contents
             .into_iter()
@@ -377,13 +384,46 @@ async fn connect_once(config: &McpServerConfig) -> Result<McpConnection, McpErro
             url,
             auth_token,
             headers,
-        } => connect_sse(&config.name, url, auth_token.as_deref(), headers, config.clone(), roots).await,
+        } => {
+            connect_sse(
+                &config.name,
+                url,
+                auth_token.as_deref(),
+                headers,
+                config.clone(),
+                roots,
+            )
+            .await
+        }
+        Transport::StreamableHttp {
+            url,
+            auth_token,
+            headers,
+        } => {
+            connect_streamable_http(
+                &config.name,
+                url,
+                auth_token.as_deref(),
+                headers,
+                config.clone(),
+                roots,
+            )
+            .await
+        }
         Transport::Ws {
             url,
             auth_token,
             headers,
         } => {
-            connect_ws(&config.name, url, auth_token.as_deref(), headers, config.clone(), roots).await
+            connect_ws(
+                &config.name,
+                url,
+                auth_token.as_deref(),
+                headers,
+                config.clone(),
+                roots,
+            )
+            .await
         }
     }
 }
@@ -397,7 +437,9 @@ async fn connect_stdio(
     roots: Arc<RwLock<Vec<Root>>>,
 ) -> Result<McpConnection, McpError> {
     if command.is_empty() {
-        return Err(McpError::InvalidConfig("command cannot be empty".to_string()));
+        return Err(McpError::InvalidConfig(
+            "command cannot be empty".to_string(),
+        ));
     }
 
     let mut cmd = tokio::process::Command::new(&command[0]);
@@ -407,11 +449,7 @@ async fn connect_stdio(
     cmd.args(args);
     for (key, value) in env {
         if is_dangerous_env_var(key) {
-            tracing::warn!(
-                "MCP server '{}': blocked dangerous env var '{}'",
-                name,
-                key
-            );
+            tracing::warn!("MCP server '{}': blocked dangerous env var '{}'", name, key);
             continue;
         }
         cmd.env(key, value);
@@ -450,6 +488,51 @@ async fn connect_stdio(
 }
 
 async fn connect_sse(
+    name: &str,
+    url: &str,
+    auth_token: Option<&str>,
+    headers: &HashMap<String, String>,
+    config: McpServerConfig,
+    roots: Arc<RwLock<Vec<Root>>>,
+) -> Result<McpConnection, McpError> {
+    if url.is_empty() {
+        return Err(McpError::InvalidConfig("url cannot be empty".to_string()));
+    }
+
+    let transport = ClassicSseTransport::connect(name, url, http_header_map(auth_token, headers)?)
+        .await
+        .map_err(|e| McpError::Initialize(format!("SSE connect to {url}: {e}")))?;
+    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new(roots);
+    let running = tokio::time::timeout(
+        std::time::Duration::from_secs(MCP_CONNECT_TIMEOUT_SECS),
+        serve_client(handler, transport),
+    )
+    .await
+    .map_err(|_| {
+        McpError::Initialize(format!(
+            "{name}: SSE connection timed out after {MCP_CONNECT_TIMEOUT_SECS}s"
+        ))
+    })?
+    .map_err(|e| McpError::Initialize(format!("SSE connect to {url}: {e}")))?;
+
+    let peer = running.peer().clone();
+    let tools = fetch_tools_with_timeout(&peer, name).await?;
+
+    Ok(McpConnection {
+        name: name.to_string(),
+        peer,
+        tools,
+        connected_at: Some(Instant::now()),
+        config,
+        tools_changed,
+        prompts_changed,
+        resources_changed,
+        ws_bridge_handles: None,
+        _running: Some(running),
+    })
+}
+
+async fn connect_streamable_http(
     name: &str,
     url: &str,
     auth_token: Option<&str>,
@@ -497,7 +580,7 @@ async fn connect_sse(
             "{name}: SSE connection timed out after {MCP_CONNECT_TIMEOUT_SECS}s"
         ))
     })?
-    .map_err(|e| McpError::Initialize(format!("SSE connect to {url}: {e}")))?;
+    .map_err(|e| McpError::Initialize(format!("Streamable HTTP connect to {url}: {e}")))?;
 
     let peer = running.peer().clone();
     let tools = fetch_tools_with_timeout(&peer, name).await?;
@@ -514,6 +597,29 @@ async fn connect_sse(
         ws_bridge_handles: None,
         _running: Some(running),
     })
+}
+
+fn http_header_map(
+    auth_token: Option<&str>,
+    headers: &HashMap<String, String>,
+) -> Result<reqwest::header::HeaderMap, McpError> {
+    let mut out = reqwest::header::HeaderMap::new();
+    if let Some(token) = auth_token {
+        let value =
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| {
+                McpError::InvalidConfig(format!("invalid Authorization header value: {e}"))
+            })?;
+        out.insert(reqwest::header::AUTHORIZATION, value);
+    }
+    for (key, value) in headers {
+        let header_name = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+            .map_err(|e| McpError::InvalidConfig(format!("invalid header name '{key}': {e}")))?;
+        let header_value = reqwest::header::HeaderValue::from_str(value).map_err(|e| {
+            McpError::InvalidConfig(format!("invalid header value for '{key}': {e}"))
+        })?;
+        out.insert(header_name, header_value);
+    }
+    Ok(out)
 }
 
 async fn connect_ws(

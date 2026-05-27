@@ -45,8 +45,7 @@ impl McpClientManager {
         match connection::connect_to_server(config).await {
             Ok(conn) => {
                 let tool_count = conn.tools().len();
-                self.states
-                    .insert(name.clone(), ConnectionState::Connected);
+                self.states.insert(name.clone(), ConnectionState::Connected);
                 self.connections.insert(name, Arc::new(conn));
                 Ok(tool_count)
             }
@@ -116,9 +115,7 @@ impl McpClientManager {
         }
 
         if collision_count > 0 {
-            tracing::warn!(
-                "{collision_count} MCP tool(s) skipped due to name collisions"
-            );
+            tracing::warn!("{collision_count} MCP tool(s) skipped due to name collisions");
         }
         schemas
     }
@@ -209,8 +206,7 @@ impl McpClientManager {
                 let tool_count = conn.tools().len();
                 self.states
                     .insert(name.to_string(), ConnectionState::Connected);
-                self.connections
-                    .insert(name.to_string(), Arc::new(conn));
+                self.connections.insert(name.to_string(), Arc::new(conn));
                 Ok(tool_count)
             }
             Err(e) => {

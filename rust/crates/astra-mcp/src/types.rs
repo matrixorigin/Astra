@@ -13,9 +13,18 @@ pub enum Transport {
         #[serde(default)]
         env: HashMap<String, String>,
     },
-    /// HTTP SSE transport (MCP 2025-03-26 spec).
-    #[serde(alias = "sse", alias = "http")]
+    /// Classic HTTP SSE transport: GET opens an SSE stream, POST sends JSON-RPC to the endpoint event.
+    #[serde(alias = "sse")]
     Sse {
+        url: String,
+        #[serde(default)]
+        auth_token: Option<String>,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
+    /// Streamable HTTP transport (MCP 2025-03-26 spec).
+    #[serde(rename = "streamable_http", alias = "http", alias = "streamable-http")]
+    StreamableHttp {
         url: String,
         #[serde(default)]
         auth_token: Option<String>,
