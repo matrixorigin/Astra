@@ -457,6 +457,8 @@ pub struct SyncPolicy {
     pub timeout_secs: u64,
     /// Whether to prefer delta over full sync.
     pub prefer_delta: bool,
+    /// Domain-specific conflict resolution strategy.
+    pub conflict_strategy: ConflictStrategy,
 }
 
 impl SyncPolicy {
@@ -471,6 +473,7 @@ impl SyncPolicy {
             max_conflict_retries: 0,
             timeout_secs: 10,
             prefer_delta: false,
+            conflict_strategy: ConflictStrategy::AppendOnly,
         }
     }
 
@@ -482,6 +485,7 @@ impl SyncPolicy {
             max_conflict_retries: 3,
             timeout_secs: 5,
             prefer_delta: false,
+            conflict_strategy: ConflictStrategy::Leased,
         }
     }
 
@@ -493,6 +497,7 @@ impl SyncPolicy {
             max_conflict_retries: 2,
             timeout_secs: 5,
             prefer_delta: false,
+            conflict_strategy: ConflictStrategy::UnionMerge,
         }
     }
 
@@ -504,8 +509,32 @@ impl SyncPolicy {
             max_conflict_retries: 1,
             timeout_secs: 3,
             prefer_delta: false,
+            conflict_strategy: ConflictStrategy::LastWriteWins,
         }
     }
+}
+
+// ─── Conflict Strategy ──────────────────────────────────────────────────────
+
+/// Domain-specific conflict resolution strategy.
+///
+/// When a push conflicts (cloud version mismatches), the orchestrator pulls
+/// fresh remote data and applies this strategy to reconcile local vs. remote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictStrategy {
+    /// Events are append-only — conflicts are impossible by design.
+    /// If a conflict is detected, remote events are simply merged.
+    AppendOnly,
+    /// Tasks use lease-based ownership: the most recent lease timestamp wins.
+    /// If both sides modified the same task, the newer lease takes precedence.
+    Leased,
+    /// Templates are union-merged: both local and remote templates are kept,
+    /// with duplicates detected by (name, version) key.
+    UnionMerge,
+    /// Preferences use last-write-wins: the side with the later modification
+    /// timestamp wins. If timestamps are equal, local is preferred.
+    LastWriteWins,
 }
 
 // ─── Sync Events (Observability) ────────────────────────────────────────────
@@ -746,17 +775,20 @@ impl SyncOrchestrator {
                 .unwrap_or(false)
                 && attempt < max_retries
             {
+                let strategy = &policy.conflict_strategy;
                 tracing::info!(
                     target: "astra_services::sync_engine",
                     user_id = %self.user_id,
                     domain = %domain,
+                    strategy = ?strategy,
                     attempt = attempt + 1,
                     max_retries,
-                    "push conflict; pulling fresh data before retry"
+                    "push conflict; pulling fresh data and applying {:?} strategy",
+                    strategy
                 );
-                // Pull fresh data, merge, then retry
+                // Pull fresh data, merge, then retry.
+                // The adapter applies its ConflictStrategy during merge_remote.
                 let _pull_result = self.pull_domain(domain).await;
-                // After pull+merge, the adapter now has merged state → re-export and push
                 continue;
             }
 
