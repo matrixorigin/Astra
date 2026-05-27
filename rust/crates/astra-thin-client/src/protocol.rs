@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 /// `POST /chat/stream` body — superset of server `ChatRequest` plus optional edge fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -95,6 +96,24 @@ pub struct ToolResultRequest {
     pub output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Hash of the tool result content for idempotent deduplication.
+    /// Cloud can reject duplicate submissions (same request_id + result_hash)
+    /// and return 200 OK — the edge treats this as success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_hash: Option<String>,
+}
+
+impl ToolResultRequest {
+    /// Compute a content-based hash of the tool result (request_id + output).
+    /// Used for idempotent deduplication: cloud can detect and reject duplicate
+    /// submissions with the same request_id + hash without re-processing.
+    pub fn compute_result_hash(request_id: &str, output: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(request_id.as_bytes());
+        hasher.update(b":");
+        hasher.update(output.as_bytes());
+        hex::encode(hasher.finalize())
+    }
 }
 
 /// `POST /approval/respond` (§5.5).
@@ -159,6 +178,10 @@ pub struct EdgeHeartbeatRequest {
     /// received for > 2 min → warning; no heartbeat for > 5 min → stale).
     #[serde(default)]
     pub pending_request_count: u32,
+    /// Recently completed request IDs for deduplication on reconnection.
+    /// Cloud can skip re-issuing tool calls already completed by this edge.
+    #[serde(default)]
+    pub last_seen_request_ids: Vec<String>,
 }
 
 /// `POST /tasks/{id}/lease/{claim,release,renew}` — matches server lease handlers.

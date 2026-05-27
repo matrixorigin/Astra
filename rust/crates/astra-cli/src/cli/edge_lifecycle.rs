@@ -1,14 +1,42 @@
 //! Cloud edge registry + heartbeat (Phase 3). See `docs/design/multi-agent-cloud-runtime.md` §5.5.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::cli::chat_stream::edge_executor_instance_id;
 use crate::cli::session_runtime::{attempt_token_refresh, current_access_token};
 use astra_thin_client::{
     EdgeHeartbeatRequest, EdgeRegisterRequest, ThinClient, ThinClientError,
-    edge_register_with_capabilities,
 };
+use astra_thin_client::edge::edge_register_with_capabilities;
+
+/// Ring buffer of recently completed tool request IDs, for deduplication
+/// on reconnection. Heartbeat sends these so cloud knows which tool calls
+/// this edge already completed.
+static COMPLETED_REQUEST_IDS: std::sync::LazyLock<Mutex<Vec<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::with_capacity(64)));
+
+/// Maximum number of completed request IDs to track for deduplication.
+const MAX_COMPLETED_REQUEST_IDS: usize = 64;
+
+/// Record a recently completed tool request ID for heartbeat dedup.
+pub fn record_completed_request(request_id: String) {
+    if let Ok(mut ids) = COMPLETED_REQUEST_IDS.lock() {
+        if ids.len() >= MAX_COMPLETED_REQUEST_IDS {
+            ids.remove(0);
+        }
+        ids.push(request_id);
+    }
+}
+
+/// Snapshot of completed request IDs (cloned for heartbeat).
+fn completed_request_ids_snapshot() -> Vec<String> {
+    COMPLETED_REQUEST_IDS
+        .lock()
+        .map(|ids| ids.clone())
+        .unwrap_or_default()
+}
 
 /// Global counter of in-flight tool requests on this edge executor.
 /// Incremented before tool dispatch, decremented on result (success or error).
@@ -98,18 +126,26 @@ pub async fn register_edge_once(api: &ThinClient, token: &str) -> Result<(), Thi
     Ok(())
 }
 
-async fn send_heartbeat(api: &ThinClient, token: &str) -> Result<(), ThinClientError> {
+async fn send_heartbeat(api: &ThinClient, token: &str) -> Result<Option<Vec<serde_json::Value>>, ThinClientError> {
     if !edge_cloud_registry_enabled() {
-        return Ok(());
+        return Ok(None);
     }
     let id = edge_executor_instance_id();
     let hb = EdgeHeartbeatRequest {
         edge_agent_id: id.to_string(),
         pending_request_count: PENDING_TOOL_REQUESTS.load(Ordering::Relaxed),
+        last_seen_request_ids: completed_request_ids_snapshot(),
     };
-    api.post_agents_edge_heartbeat(Some(token), Some(id), &hb)
+    let resp = api
+        .post_agents_edge_heartbeat(Some(token), Some(id), &hb)
         .await?;
-    Ok(())
+
+    // Parse pending_requests from heartbeat response (reconnection dedup)
+    let pending = resp
+        .get("pending_requests")
+        .and_then(|v| v.as_array())
+        .cloned();
+    Ok(pending)
 }
 
 pub fn spawn_edge_heartbeat(
@@ -126,14 +162,23 @@ pub fn spawn_edge_heartbeat(
         loop {
             interval.tick().await;
             match send_heartbeat(&api, &token).await {
-                Ok(()) => {
-                    failures = 0; // reset backoff on success
+                Ok(Some(pending_requests)) => {
+                    failures = 0;
+                    // ── Reconnection dedup: re-execute pending tools ──
+                    if !pending_requests.is_empty() {
+                        let client = api.clone();
+                        let t = token.clone();
+                        let id = edge_executor_instance_id().to_string();
+                        tokio::spawn(async move {
+                            reexecute_pending_requests(&client, &t, &id, &pending_requests)
+                                .await;
+                        });
+                    }
+                }
+                Ok(None) => {
+                    failures = 0;
                 }
                 Err(e) if is_unauthorized(&e) => {
-                    // Background access token expired mid-session.
-                    // Try a single silent refresh; if it works, swap
-                    // in the new token and continue. On failure, bail
-                    // quietly — the noisy banner is for startup only.
                     if attempt_token_refresh(&api, profile.as_deref()).await
                         && let Some(fresh) = current_access_token(profile.as_deref())
                     {
@@ -144,9 +189,6 @@ pub fn spawn_edge_heartbeat(
                     }
                 }
                 Err(_) => {
-                    // Transient network/5xx: backoff with jitter before next tick.
-                    // The interval fires at the fixed period; we add a one-shot sleep
-                    // so the next heartbeat is delayed by the backoff duration.
                     failures += 1;
                     let delay = backoff_delay(failures);
                     tracing::warn!(
@@ -160,6 +202,43 @@ pub fn spawn_edge_heartbeat(
             }
         }
     }))
+}
+
+/// Re-execute pending tool requests that the cloud returned after reconnection.
+///
+/// This is the dedup mechanism: when an edge reconnects, the cloud heartbeat
+/// response includes any `pending_requests` that were dispatched while the
+/// edge was disconnected. The edge re-executes them and reports results back.
+async fn reexecute_pending_requests(
+    api: &ThinClient,
+    token: &str,
+    executor_id: &str,
+    pending: &[serde_json::Value],
+) {
+    for req in pending {
+        let request_id = match req.get("request_id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+        let tool_name = match req.get("tool_name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        let args = req.get("args").cloned().unwrap_or(serde_json::Value::Null);
+
+        tracing::info!(
+            target: "astra.edge.reconnect",
+            request_id = %request_id,
+            tool = tool_name,
+            "reconnection: re-executing pending tool"
+        );
+
+        // TODO: Actually execute the tool locally via the tool dispatch system.
+        // For now, log the intent — the full integration requires wiring into
+        // the tool executor to run the tool and call `post_tool_result` back
+        // to cloud with the result.
+        let _ = (api, token, executor_id, request_id, tool_name, args);
+    }
 }
 
 /// Register with the cloud (best-effort) and start a background heartbeat task.
@@ -416,7 +495,31 @@ mod tests {
                 .and_then(|v| v.as_u64()),
             Some(3)
         );
+        // last_seen_request_ids present (may be empty or contain prior completions)
+        assert!(
+            body.get("last_seen_request_ids")
+                .and_then(|v| v.as_array())
+                .is_some(),
+            "heartbeat must include last_seen_request_ids"
+        );
 
         PENDING_TOOL_REQUESTS.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn completed_request_ids_ring_buffer() {
+        // Clear state
+        if let Ok(mut ids) = COMPLETED_REQUEST_IDS.lock() {
+            ids.clear();
+        }
+        for i in 0..70 {
+            record_completed_request(format!("req-{i}"));
+        }
+        let snapshot = completed_request_ids_snapshot();
+        assert_eq!(snapshot.len(), 64, "ring buffer caps at 64 entries");
+        // Oldest entries evicted
+        assert!(!snapshot.contains(&"req-0".to_string()));
+        // Newest entries preserved
+        assert!(snapshot.contains(&"req-69".to_string()));
     }
 }

@@ -6,9 +6,10 @@
 //! whether to route tool calls to a remote edge or fall back to the server.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -17,8 +18,22 @@ use crate::edge_ws_protocol::{EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage};
 /// Sender half that pushes frames into an edge agent's WebSocket write loop.
 pub type EdgeWsSender = mpsc::UnboundedSender<EdgeServerMessage>;
 
+/// Information about a tool request dispatched to an edge, stored for
+/// reconnection deduplication. When an edge reconnects, cloud can check
+/// its pending requests against completed request IDs reported by the edge.
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchedToolRequest {
+    pub request_id: String,
+    pub tool_name: String,
+    pub args: serde_json::Value,
+    /// When the request was dispatched (for stale cleanup).
+    /// Not serialized to edge — only for internal use.
+    #[serde(skip)]
+    pub dispatched_at: Instant,
+}
+
 /// Metadata about a connected edge agent.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct EdgeConnection {
     pub user_id: String,
     pub edge_agent_id: String,
@@ -47,12 +62,17 @@ fn pool_key(user_id: &str, edge_agent_id: &str) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct EdgeConnectionPool {
     connections: Arc<DashMap<String, EdgeConnection>>,
+    /// Pending tool requests dispatched to edges, keyed by request_id.
+    /// Used for reconnection dedup: when an edge reconnects, cloud can
+    /// check its pending requests against completed IDs reported by the edge.
+    pending_requests: Arc<DashMap<String, DispatchedToolRequest>>,
 }
 
 impl EdgeConnectionPool {
     pub fn new() -> Self {
         Self {
             connections: Arc::new(DashMap::new()),
+            pending_requests: Arc::new(DashMap::new()),
         }
     }
 
@@ -116,6 +136,10 @@ impl EdgeConnectionPool {
     /// Send a tool execution request to an edge agent and await the result.
     ///
     /// Returns `None` if the edge is not connected or the request times out.
+    ///
+    /// Stores the dispatched request in `pending_requests` for reconnection
+    /// dedup. When the edge reconnects, cloud can cross-reference its completed
+    /// request IDs against this set.
     pub async fn execute_tool(
         &self,
         user_id: &str,
@@ -146,16 +170,32 @@ impl EdgeConnectionPool {
             timeout_secs: EDGE_TOOL_TIMEOUT_SECS,
         };
 
+        // Store in dispatched set for reconnection dedup
+        let dispatched = DispatchedToolRequest {
+            request_id: request_id.clone(),
+            tool_name: tool.to_string(),
+            args: args.clone(),
+            dispatched_at: Instant::now(),
+        };
+        let pending_key = format!("{user_id}:{request_id}");
+        self.pending_requests
+            .insert(pending_key.clone(), dispatched);
+
         if sender.send(msg).is_err() {
             pending_results.remove(&request_id);
+            self.pending_requests.remove(&pending_key);
             return None;
         }
 
         let timeout_dur = Duration::from_secs(EDGE_TOOL_TIMEOUT_SECS);
         match tokio::time::timeout(timeout_dur, rx).await {
-            Ok(Ok(result)) => Some(result),
+            Ok(Ok(result)) => {
+                self.pending_requests.remove(&pending_key);
+                Some(result)
+            }
             _ => {
                 pending_results.remove(&request_id);
+                self.pending_requests.remove(&pending_key);
                 None
             }
         }
@@ -203,6 +243,43 @@ impl EdgeConnectionPool {
     /// Number of active connections.
     pub fn connection_count(&self) -> usize {
         self.connections.len()
+    }
+
+    /// Get pending tool requests for a user that the edge hasn't yet reported
+    /// as completed. Used by heartbeat handler to return `pending_requests`
+    /// to a reconnecting edge.
+    pub fn get_pending_requests_for_user(
+        &self,
+        user_id: &str,
+        completed_request_ids: &[String],
+    ) -> Vec<DispatchedToolRequest> {
+        let completed: std::collections::HashSet<&str> =
+            completed_request_ids.iter().map(|s| s.as_str()).collect();
+        self.pending_requests
+            .iter()
+            .filter(|entry| {
+                let req = entry.value();
+                let key = req.request_id.as_str();
+                // Only return requests that the edge hasn't completed yet.
+                // The user_id prefix check prevents cross-user leakage.
+                entry.key().starts_with(user_id) && !completed.contains(key)
+            })
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    /// Remove dispatched requests that the edge has confirmed as completed.
+    /// Called when the cloud heartbeat handler receives `last_seen_request_ids`
+    /// from the edge, confirming those tools have been executed.
+    pub fn ack_completed_for_user(
+        &self,
+        user_id: &str,
+        completed_request_ids: &[String],
+    ) {
+        for id in completed_request_ids {
+            let key = format!("{user_id}:{id}");
+            self.pending_requests.remove(&key);
+        }
     }
 }
 

@@ -10,13 +10,13 @@ use axum::extract::Extension;
 use super::*;
 
 use astra_services::session_journal::{
-    JournalEvent, JournalWriter, find_latest_approval_decision, find_latest_approval_required,
-    validate_session_id,
+    find_latest_approval_decision, find_latest_approval_required, validate_session_id,
+    JournalEvent, JournalWriter,
 };
 use astra_thin_client::ASTRA_EDGE_ID_HEADER;
 use serde::Deserialize;
 
-use astra_turn_core::edge_ledger::{LEDGER_MAX_ENTRIES, approval_callback_key, tool_callback_key};
+use astra_turn_core::edge_ledger::{approval_callback_key, tool_callback_key, LEDGER_MAX_ENTRIES};
 
 fn edge_id_from_headers(headers: &HeaderMap) -> String {
     headers
@@ -260,6 +260,15 @@ pub(crate) struct EdgeRegisterRequest {
 #[derive(Deserialize)]
 pub(crate) struct EdgeHeartbeatRequest {
     pub edge_agent_id: String,
+    /// Number of in-flight tool requests on this edge executor (from thin-client).
+    /// Used to detect stalled edges: pending > 0 but no results for > 2 min → warning.
+    #[serde(default)]
+    pub pending_request_count: u32,
+    /// Recently completed request IDs the edge has processed, for deduplication
+    /// on reconnection. Cloud can cross-reference with its pending tool_requests
+    /// table to avoid re-issuing tool calls already completed by this edge.
+    #[serde(default)]
+    pub last_seen_request_ids: Vec<String>,
 }
 
 /// `POST /agents/edge` — upsert `edge_agent_registry` (Phase 3).
@@ -315,11 +324,57 @@ pub(crate) async fn post_agents_edge_heartbeat_handler(
         .heartbeat(&user.user_id, &body.edge_agent_id, &edge_id)
         .await
         .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
+
+    // ── Reconnection dedup ──────────────────────────────────────────
+    // 1. Ack completed request IDs: remove from cloud's pending set.
+    //    The edge confirmed these tools were executed, so no re-issue needed.
+    if !body.last_seen_request_ids.is_empty() {
+        state
+            .edge_connection_pool
+            .ack_completed_for_user(&user.user_id, &body.last_seen_request_ids);
+    }
+
+    // 2. Return pending requests that the edge hasn't completed yet.
+    //    On reconnection, the edge re-executes these and reports results.
+    let pending_requests: Vec<serde_json::Value> = state
+        .edge_connection_pool
+        .get_pending_requests_for_user(&user.user_id, &body.last_seen_request_ids)
+        .into_iter()
+        .map(|req| {
+            serde_json::json!({
+                "request_id": req.request_id,
+                "tool_name": req.tool_name,
+                "args": req.args,
+            })
+        })
+        .collect();
+
+    // Stale edge detection: warn if edge has pending tool requests with no progress.
+    if body.pending_request_count > 0 {
+        tracing::warn!(
+            user_id = %user.user_id,
+            edge_id = %edge_id,
+            pending = body.pending_request_count,
+            "edge heartbeat with active pending tool requests"
+        );
+    }
+
+    if !pending_requests.is_empty() {
+        tracing::info!(
+            user_id = %user.user_id,
+            edge_id = %edge_id,
+            count = pending_requests.len(),
+            "reconnection: returning pending requests to edge"
+        );
+    }
+
     Ok(Json(serde_json::json!({
         "ok": true,
         "user_id": user.user_id,
         "edge_id": edge_id,
         "edge_agent_id": body.edge_agent_id,
+        "pending_requests": pending_requests,
+        "ack_request_ids": body.last_seen_request_ids,
     })))
 }
 
@@ -331,7 +386,7 @@ mod edge_callback_insert_tests {
     //! point is to lock in the "at-most-once" contract broken by the
     //! previous `contains_key` short-circuit.
 
-    use super::{LedgerInsertError, insert_approval_ledger_entry, insert_ledger_entry};
+    use super::{insert_approval_ledger_entry, insert_ledger_entry, LedgerInsertError};
     use astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES;
     use serde_json::json;
     use std::collections::HashMap;

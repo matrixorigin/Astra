@@ -1161,11 +1161,16 @@ impl<'a> CliSseStreamHost<'a> {
             duration_ms,
         };
         self.edge_tool_round.push(result.clone());
+
+        // ── Reconnection dedup: record completed request ID ──
+        crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
+
         let body = astra_thin_client::ToolResultRequest {
             request_id: request_id.to_string(),
             status,
             output: Some(output),
             duration_ms: Some(duration_ms),
+            result_hash: None,
         };
         let _ = self.post_tool_result_with_auth_retry(&body).await;
         result
@@ -1724,7 +1729,10 @@ impl<'a> CliSseStreamHost<'a> {
             status: status.to_string(),
             output: Some(output),
             duration_ms: Some(duration_ms),
+            result_hash: None,
         };
+        // ── Reconnection dedup ──
+        crate::cli::edge_lifecycle::record_completed_request(req.request_id.clone());
         let _ = self.post_tool_result_with_auth_retry(&body).await;
 
         result
@@ -3289,7 +3297,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             status: status.clone(),
             output: Some(output),
             duration_ms: Some(duration_ms),
+            result_hash: None,
         };
+        // ── Reconnection dedup ──
+        crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
         let _ = self.post_tool_result_with_auth_retry(&body).await;
         self.edge_tool_round
             .last()
@@ -4014,7 +4025,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 status: status.to_string(),
                 output: Some(output),
                 duration_ms: Some(duration_ms),
+                result_hash: None,
             };
+            // ── Reconnection dedup ──
+            crate::cli::edge_lifecycle::record_completed_request(req.request_id.clone());
             if self.post_tool_result_with_auth_retry(&body).await {
                 break;
             }
@@ -7381,6 +7395,7 @@ mod tests {
             status: "ok".to_string(),
             output: Some("done".to_string()),
             duration_ms: Some(1),
+            result_hash: None,
         };
 
         let terminal_auth_failure = host.post_tool_result_with_auth_retry(&body).await;
