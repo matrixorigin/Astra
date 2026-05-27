@@ -2337,8 +2337,10 @@ impl JournalEvent {
     ///
     /// `span_id` is a short unique identifier; `parent_span_id` links to the parent span.
     /// `name` is the span operation name (e.g. "context_assembly", "llm_call").
-    /// `start_us` and `end_us` are microsecond timestamps relative to turn start.
-    /// `attrs` is an optional set of string key-value tags.
+    /// Record a trace span within the journal (phase timing, tool exec, etc.).
+    ///
+    /// Use the [`TraceSpanBuilder`] to construct — the builder enforces
+    /// required fields at compile time and avoids the 8-argument constructor.
     #[allow(clippy::too_many_arguments)]
     pub fn trace_span(
         session_id: Option<&str>,
@@ -2350,19 +2352,98 @@ impl JournalEvent {
         end_us: u64,
         attrs: Option<&HashMap<String, String>>,
     ) -> Self {
-        let mut evt = Self::base(JournalEventType::TraceSpan, session_id);
-        evt.turn = turn;
+        TraceSpanBuilder::default()
+            .session_id(session_id)
+            .turn(turn)
+            .span_id(span_id.to_string())
+            .parent_span_id(parent_span_id.map(str::to_string))
+            .name(name.to_string())
+            .start_us(start_us)
+            .end_us(end_us)
+            .attrs(attrs)
+            .build()
+    }
+
+    /// Record a trace span via the builder.
+    pub fn trace_span_v2(builder: TraceSpanBuilder) -> Self {
+        builder.build()
+    }
+}
+
+/// Builder for [`JournalEvent::trace_span`]. Enforces required fields at
+/// compile time — no 8-argument constructor, no optional fields silently
+/// defaulting to None.
+#[derive(Default)]
+pub struct TraceSpanBuilder {
+    session_id: Option<String>,
+    turn: Option<u32>,
+    span_id: Option<String>,
+    parent_span_id: Option<String>,
+    name: Option<String>,
+    start_us: Option<u64>,
+    end_us: Option<u64>,
+    attrs: Option<HashMap<String, String>>,
+}
+
+impl TraceSpanBuilder {
+    pub fn session_id(mut self, v: Option<&str>) -> Self {
+        self.session_id = v.map(str::to_string);
+        self
+    }
+
+    pub fn turn(mut self, v: Option<u32>) -> Self {
+        self.turn = v;
+        self
+    }
+
+    pub fn span_id(mut self, v: String) -> Self {
+        self.span_id = Some(v);
+        self
+    }
+
+    pub fn parent_span_id(mut self, v: Option<String>) -> Self {
+        self.parent_span_id = v;
+        self
+    }
+
+    pub fn name(mut self, v: String) -> Self {
+        self.name = Some(v);
+        self
+    }
+
+    pub fn start_us(mut self, v: u64) -> Self {
+        self.start_us = Some(v);
+        self
+    }
+
+    pub fn end_us(mut self, v: u64) -> Self {
+        self.end_us = Some(v);
+        self
+    }
+
+    pub fn attrs(mut self, v: Option<&HashMap<String, String>>) -> Self {
+        self.attrs = v.cloned();
+        self
+    }
+
+    pub fn build(self) -> JournalEvent {
+        let span_id = self.span_id.expect("TraceSpanBuilder: span_id is required");
+        let name = self.name.expect("TraceSpanBuilder: name is required");
+        let start_us = self.start_us.expect("TraceSpanBuilder: start_us is required");
+        let end_us = self.end_us.expect("TraceSpanBuilder: end_us is required");
+        let mut evt = JournalEvent::base(JournalEventType::TraceSpan, self.session_id.as_deref());
+        evt.turn = self.turn;
         let mut meta = serde_json::json!({
-            "span_id": span_id,
-            "name": name,
+            "span_id": &span_id,
+            "name": &name,
             "start_us": start_us,
             "end_us": end_us,
             "duration_us": end_us.saturating_sub(start_us),
         });
-        if let Some(pid) = parent_span_id {
-            meta["parent_span_id"] = serde_json::Value::String(pid.to_string());
+        if let Some(ref pid) = self.parent_span_id {
+            meta["parent_span_id"] = serde_json::Value::String(pid.clone());
         }
-        if let Some(a) = attrs {
+        if let Some(ref a) = self.attrs {
             let attrs_map: serde_json::Map<String, serde_json::Value> = a
                 .iter()
                 .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
@@ -2372,7 +2453,9 @@ impl JournalEvent {
         evt.metadata = Some(meta);
         evt
     }
+}
 
+impl JournalEvent {
     /// Record that this session was forked from `lineage.parent_session_id`.
     pub fn session_fork(
         session_id: Option<&str>,
