@@ -6261,7 +6261,7 @@ fn should_offload_blocking_tool(tool_name: &str) -> bool {
     }
 }
 
-async fn execute_with_metadata_responsive(
+pub(crate) async fn execute_with_metadata_responsive(
     executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
     tool_name: String,
     args: Value,

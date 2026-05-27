@@ -217,13 +217,19 @@ pub fn spawn_edge_heartbeat(
 ///
 /// This is the dedup mechanism: when an edge reconnects, the cloud heartbeat
 /// response includes any `pending_requests` that were dispatched while the
-/// edge was disconnected. The edge re-executes them and reports results back.
+/// edge was disconnected. The edge re-executes them and posts results back.
+///
+/// Creates a fresh `ToolExecutor` scoped to the current working directory for
+/// each batch — no global state, no dependency on the active SSE executor.
 async fn reexecute_pending_requests(
     api: &ThinClient,
     token: &str,
     executor_id: &str,
     pending: &[serde_json::Value],
 ) {
+    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(&project_root));
+
     for req in pending {
         let request_id = match req.get("request_id").and_then(|v| v.as_str()) {
             Some(id) => id.to_string(),
@@ -242,11 +248,49 @@ async fn reexecute_pending_requests(
             "reconnection: re-executing pending tool"
         );
 
-        // TODO: Actually execute the tool locally via the tool dispatch system.
-        // For now, log the intent — the full integration requires wiring into
-        // the tool executor to run the tool and call `post_tool_result` back
-        // to cloud with the result.
-        let _ = (api, token, executor_id, request_id, tool_name, args);
+        // Execute the tool locally and post the result back to cloud.
+        let outcome = crate::cli::stream_render::execute_with_metadata_responsive(
+            std::sync::Arc::clone(&executor),
+            tool_name.to_string(),
+            args,
+            None, // no cancel token for reconnection re-execution
+        )
+        .await;
+
+        let output = outcome.output;
+        let status = if outcome.is_error { "error" } else { "completed" };
+
+        let result_hash =
+            astra_thin_client::ToolResultRequest::compute_result_hash(&request_id, &output);
+        let body = astra_thin_client::ToolResultRequest {
+            request_id: request_id.clone(),
+            status: status.to_string(),
+            output: Some(output),
+            duration_ms: None,
+            result_hash: Some(result_hash),
+        };
+
+        match api
+            .post_tool_result(Some(token), Some(executor_id), &body)
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(
+                    target: "astra.edge.reconnect",
+                    request_id = %request_id,
+                    "reconnection: pending tool result posted successfully"
+                );
+                crate::cli::edge_lifecycle::record_completed_request(request_id);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "astra.edge.reconnect",
+                    request_id = %request_id,
+                    error = %e,
+                    "reconnection: failed to post pending tool result"
+                );
+            }
+        }
     }
 }
 
