@@ -910,6 +910,8 @@ pub enum JournalEventType {
     MemorySuppressed,
     /// Agent released a tool result from context (early eviction).
     ContextReleased,
+    /// Startup bootstrap phases completed (per-phase timestamps in metadata).
+    Bootstrap,
 }
 
 /// Why the gate rejected a session-memory extraction attempt.
@@ -2305,6 +2307,29 @@ impl JournalEvent {
     pub fn session_start(session_id: Option<&str>, model: Option<&str>) -> Self {
         let mut evt = Self::base(JournalEventType::SessionStart, session_id);
         evt.model = model.map(|s| s.to_string());
+        evt
+    }
+
+    /// Startup bootstrap event: records per-phase timestamps (microsecond precision).
+    ///
+    /// `phases` is an ordered list of `(phase_name, timestamp_us_since_process_start)` tuples.
+    /// Stored in `metadata.phases` as `[{name, us}]` and `metadata.total_us`.
+    pub fn bootstrap(
+        session_id: Option<&str>,
+        phases: &[(&str, u64)],
+        total_us: u64,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::Bootstrap, session_id);
+        let phase_entries: Vec<serde_json::Value> = phases
+            .iter()
+            .map(|(name, us)| {
+                serde_json::json!({"name": name, "us": us})
+            })
+            .collect();
+        evt.metadata = Some(serde_json::json!({
+            "phases": phase_entries,
+            "total_us": total_us,
+        }));
         evt
     }
 

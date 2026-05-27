@@ -745,6 +745,7 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::PipelineCompactionAudit => "pipeline_compaction_audit",
         JournalEventType::MemorySuppressed => "memory_suppressed",
         JournalEventType::ContextReleased => "context_released",
+        JournalEventType::Bootstrap => "bootstrap",
     }
     .to_string()
 }
@@ -798,11 +799,9 @@ mod tests {
             r#"{"verification":{"strictness":0.2,"min_strictness":0.6,"max_strictness":0.9}}"#,
         ));
 
-        assert!(
-            checks
-                .iter()
-                .any(|check| { check.name == "verification_bounds" && !check.ok })
-        );
+        assert!(checks
+            .iter()
+            .any(|check| { check.name == "verification_bounds" && !check.ok }));
     }
 
     #[tokio::test]
@@ -912,12 +911,10 @@ mod tests {
         assert_eq!(value["run"]["session_id"], session_id);
         assert_eq!(value["run"]["goal"], "finish the engine");
         assert_eq!(value["recent_steps"][0]["event_type"], "turn");
-        assert!(
-            value["environment"]["last_context_trace_preview"]
-                .as_str()
-                .unwrap()
-                .contains("turn-7")
-        );
+        assert!(value["environment"]["last_context_trace_preview"]
+            .as_str()
+            .unwrap()
+            .contains("turn-7"));
         assert_eq!(value["acceptance"]["ok"], true);
     }
 
@@ -1050,11 +1047,9 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["ok"], false);
         let checks = value["checks"].as_array().unwrap();
-        assert!(
-            checks
-                .iter()
-                .any(|check| { check["name"] == "journal_present" && check["ok"] == false })
-        );
+        assert!(checks
+            .iter()
+            .any(|check| { check["name"] == "journal_present" && check["ok"] == false }));
         assert!(checks.iter().any(|check| {
             check["name"] == "steps_present_when_journal_present" && check["ok"] == true
         }));

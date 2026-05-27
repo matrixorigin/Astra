@@ -1,4 +1,4 @@
-use super::{IdentityView, identity_view, to_json, verify_runtime_config};
+use super::{identity_view, to_json, verify_runtime_config, IdentityView};
 use astra_config::runtime_config::RuntimeConfig;
 use astra_runtime::self_model::ConstraintSet;
 use astra_runtime::tool_registry::ToolRegistry;
