@@ -1193,8 +1193,11 @@ pub struct LlmRoundRecord {
 /// Events are accumulated during a turn and flushed to the journal in a single
 /// IO operation when the turn completes. On interruption, `flush_interrupted`
 /// writes partial data without fsync.
+/// Max events before oldest are evicted (ring-buffer semantics).
+const TURN_EVENT_BUFFER_CAP: usize = 1000;
+
 pub struct TurnEventBuffer {
-    events: Vec<JournalEvent>,
+    events: std::collections::VecDeque<JournalEvent>,
     turn_start: std::time::Instant,
     session_id: Option<String>,
     turn: u32,
@@ -1211,12 +1214,20 @@ impl TurnEventBuffer {
     /// Start collecting events for a new turn at a specific round offset.
     pub fn begin_turn_with_round(session_id: Option<&str>, turn: u32, round: u32) -> Self {
         Self {
-            events: Vec::new(),
+            events: std::collections::VecDeque::new(),
             turn_start: std::time::Instant::now(),
             session_id: session_id.map(ToString::to_string),
             turn,
             round,
             batch_counter: 0,
+        }
+    }
+
+    /// Push event, evicting oldest if buffer is full (ring-buffer semantics).
+    fn push_event(&mut self, event: JournalEvent) {
+        self.events.push_back(event);
+        while self.events.len() > TURN_EVENT_BUFFER_CAP {
+            self.events.pop_front();
         }
     }
 
@@ -1286,14 +1297,14 @@ impl TurnEventBuffer {
             }
             evt.metadata = Some(serde_json::Value::Object(meta));
         }
-        self.events.push(evt);
+        self.push_event(evt);
         self.round += 1;
         self.batch_counter = 0;
     }
 
     /// Record a single event (generic).
     pub fn record(&mut self, event: JournalEvent) {
-        self.events.push(event);
+        self.push_event(event);
     }
 
     /// Record a lightweight trace span event in the journal.
@@ -1310,7 +1321,7 @@ impl TurnEventBuffer {
         attrs: Option<&std::collections::HashMap<String, String>>,
         trace_id: Option<&str>,
     ) {
-        use std::collections::HashMap;
+        
         let event = JournalEvent::trace_span(
             self.session_id.as_deref(),
             Some(self.turn),
@@ -1322,7 +1333,7 @@ impl TurnEventBuffer {
             attrs,
             trace_id,
         );
-        self.events.push(event);
+        self.push_event(event);
     }
 
     /// Record a trace span via builder — preferred API.
@@ -1334,7 +1345,7 @@ impl TurnEventBuffer {
         // base() may have already set session_id; let the builder override win
         evt.session_id = self.session_id.clone();
         evt.turn = Some(self.turn);
-        self.events.push(evt);
+        self.push_event(evt);
     }
 
     /// Number of events collected so far.
@@ -1352,7 +1363,7 @@ impl TurnEventBuffer {
         if self.events.is_empty() {
             return Ok(());
         }
-        writer.append_bulk(&self.events)?;
+        writer.append_bulk(self.events.make_contiguous())?;
         self.events.clear();
         Ok(())
     }
@@ -1368,14 +1379,14 @@ impl TurnEventBuffer {
                 obj.insert("partial".into(), serde_json::json!(true));
             }
         }
-        writer.append_bulk_no_sync(&self.events)?;
+        writer.append_bulk_no_sync(self.events.make_contiguous())?;
         self.events.clear();
         Ok(())
     }
 
     /// Drain collected events (for callers that persist elsewhere, e.g. DB).
     pub fn drain(&mut self) -> Vec<JournalEvent> {
-        std::mem::take(&mut self.events)
+        std::mem::take(&mut self.events).into()
     }
 }
 
