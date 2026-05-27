@@ -47,8 +47,17 @@ pub fn inc_pending_tool_requests() {
 }
 
 /// Decrement the pending tool request counter.
+/// Uses `fetch_update` to prevent underflow — a double-decrement bug
+/// (e.g. from a panic unwinding past the inc but triggering the dec twice)
+/// would otherwise wrap to ~4.29 billion and trigger spurious reconnect cycles.
 pub fn dec_pending_tool_requests() {
-    PENDING_TOOL_REQUESTS.fetch_sub(1, Ordering::Relaxed);
+    let _ = PENDING_TOOL_REQUESTS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+        if val > 0 {
+            Some(val - 1)
+        } else {
+            None
+        }
+    });
 }
 
 /// When `ASTRA_EDGE_REGISTRY` is `0`, `false`, or `off`, skip register and heartbeat.
