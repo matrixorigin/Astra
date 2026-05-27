@@ -446,6 +446,77 @@ impl SkillManifest {
         }
         issues
     }
+
+    /// Validate the manifest for required fields and well-formedness.
+    ///
+    /// Returns a list of validation errors. An empty list means the manifest is valid.
+    /// This is called explicitly on load — no implicit/magic activation.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+
+        // Name is required and must not contain path separators
+        if self.name.is_empty() {
+            errors.push("name is required".to_string());
+        } else if self.name.contains('/') || self.name.contains('\\') || self.name.contains("..") {
+            errors.push(format!(
+                "invalid skill name '{}': must not contain '/', '\\\\', or '..'",
+                self.name
+            ));
+        }
+
+        // Description is required
+        if self.description.is_empty() {
+            errors.push("description is required".to_string());
+        }
+
+        // Version must be at least 0.1.0 (non-zero)
+        if self.version.major == 0 && self.version.minor == 0 && self.version.patch == 0 {
+            errors.push(format!(
+                "version {}.{}.{} is invalid: must be >= 0.1.0",
+                self.version.major, self.version.minor, self.version.patch
+            ));
+        }
+
+        // allowed_tools should have valid tool names if specified
+        for tool in &self.allowed_tools {
+            if tool.is_empty() {
+                errors.push("allowed_tools contains an empty tool name".to_string());
+            }
+        }
+
+        // input_schema must be valid JSON Schema if provided
+        if let Some(ref schema) = self.input_schema {
+            if !schema.is_object() {
+                errors.push("input_schema must be a JSON object".to_string());
+            }
+        }
+
+        // output_schema must be valid JSON Schema if provided
+        if let Some(ref schema) = self.output_schema {
+            if !schema.is_object() {
+                errors.push("output_schema must be a JSON object".to_string());
+            }
+        }
+
+        // remote_url must be valid HTTP/HTTPS if provided
+        if let Some(ref url) = self.remote_url {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                errors.push(format!(
+                    "remote_url '{}' must start with http:// or https://",
+                    url
+                ));
+            }
+        }
+
+        // arguments must have non-empty names
+        for arg in &self.arguments {
+            if arg.name.is_empty() {
+                errors.push("arguments contain an argument with an empty name".to_string());
+            }
+        }
+
+        errors
+    }
 }
 
 /// A compatibility issue detected by `check_compatibility()`.
