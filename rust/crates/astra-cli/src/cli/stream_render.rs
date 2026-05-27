@@ -4039,7 +4039,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             // ── Reconnection dedup: record after posting result ──
             let _ = self.post_tool_result_with_auth_retry(&body).await;
             crate::cli::edge_lifecycle::record_completed_request(req.request_id.clone());
-            break;
         }
 
         // Clear batch progress when done.
