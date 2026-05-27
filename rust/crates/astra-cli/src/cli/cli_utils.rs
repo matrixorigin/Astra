@@ -1060,6 +1060,7 @@ mod tests {
         assert_eq!(resumable_last_session_id(None), None);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn validated_resumable_last_session_id_keeps_live_session() {
         let (_tmp, _guard) = isolated_sessions_dir();
@@ -1091,6 +1092,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn validated_resumable_last_session_id_drops_stale_404_session() {
         let (_tmp, _guard) = isolated_sessions_dir();
@@ -1121,6 +1123,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn validated_resumable_last_session_id_keeps_session_on_transient_server_error() {
         let (_tmp, _guard) = isolated_sessions_dir();

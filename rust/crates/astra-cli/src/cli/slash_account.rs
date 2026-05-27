@@ -102,6 +102,7 @@ mod tests {
     use super::*;
     use crate::cli::cli_utils::{CredentialsFile, Profile};
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn refresh_auth_runtime_replaces_stale_mailbox_state() {
         let _creds_dir = crate::tests::isolate_credentials();
@@ -203,6 +204,7 @@ mod tests {
         assert!(state.pending_idle_agent_messages.is_empty());
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn clear_local_auth_state_clears_credentials_and_runtime() {
         let _creds_dir = crate::tests::isolate_credentials();

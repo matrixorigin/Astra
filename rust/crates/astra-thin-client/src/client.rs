@@ -2007,6 +2007,7 @@ mod tests {
             status: "success".into(),
             output: Some("out".into()),
             duration_ms: Some(12),
+            result_hash: None,
         };
         let v = client
             .post_tool_result(Some("tok"), Some("edge-abc"), &body)

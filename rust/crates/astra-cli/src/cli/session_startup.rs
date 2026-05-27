@@ -689,6 +689,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn prune_stale_pending_recovery_clears_stale_last_session() {
         let (_tmp, _guard) = isolated_sessions_dir();
@@ -724,6 +725,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn prune_stale_pending_recovery_keeps_live_session() {
         let (_tmp, _guard) = isolated_sessions_dir();
@@ -753,6 +755,7 @@ mod tests {
         assert_eq!(state.pending_recovery.as_deref(), Some(session_id.as_str()));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn build_cli_session_memory_extractor_initializes_when_authenticated() {
         let _creds_guard = crate::tests::isolate_credentials();
@@ -776,6 +779,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn build_cli_session_memory_extractor_skips_when_auth_me_fails() {
         let _creds_guard = crate::tests::isolate_credentials();

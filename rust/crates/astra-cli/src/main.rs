@@ -452,6 +452,7 @@ mod tests {
     mod stats_tools_tests;
     // ── auth_flow ─────────────────────────────────────────────────────────
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn do_login_success() {
         let _creds_dir = isolate_credentials();
@@ -470,6 +471,7 @@ mod tests {
         assert_eq!(result.unwrap(), "tok-abc");
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn do_login_failure_returns_error() {
         let _creds_dir = isolate_credentials();
@@ -489,6 +491,7 @@ mod tests {
         assert!(result.unwrap_err().contains("401"));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn do_register_success() {
         let _creds_dir = isolate_credentials();
@@ -519,6 +522,7 @@ mod tests {
         assert_eq!(profile.refresh_token.as_deref(), Some("ref-new"));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn do_register_conflict_returns_error() {
         let _creds_dir = isolate_credentials();
@@ -546,6 +550,7 @@ mod tests {
 
     // ── slash commands with mock server ───────────────────────────────────
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn slash_clear_creates_new_session() {
         let _creds_dir = isolate_credentials();
@@ -671,6 +676,7 @@ mod tests {
 
     // ── command_router ────────────────────────────────────────────────────
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn execute_cli_health_command() {
         let _creds_dir = isolate_credentials();
@@ -896,6 +902,7 @@ mod tests {
 
     // ── Resume user verification ─────────────────────────────────────────────
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn resume_local_restore_rejects_unowned_session() {
         let _creds = isolate_credentials();
@@ -965,6 +972,7 @@ total_tokens_out: 3
 
     // ── Edge cases ───────────────────────────────────────────────────────────
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn resume_handles_malformed_workspace_yaml() {
         let _creds = isolate_credentials();
@@ -1005,6 +1013,7 @@ total_tokens_out: 3
         assert!(!result.restored_from_cloud);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn resume_handles_missing_workspace() {
         let _creds = isolate_credentials();
@@ -1036,6 +1045,7 @@ total_tokens_out: 3
 
     // ── Checkpoint listing ───────────────────────────────────────────────────
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn resume_lists_checkpoints_for_session() {
         let _creds = isolate_credentials();

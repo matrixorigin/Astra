@@ -447,6 +447,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn pending_request_counter() {
         // Reset to known state
         PENDING_TOOL_REQUESTS.store(0, Ordering::Relaxed);

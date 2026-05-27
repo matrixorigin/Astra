@@ -3,6 +3,7 @@ use crate::cli::cli_utils::{CredentialsFile, Profile};
 
 // ── auth_flow ─────────────────────────────────────────────────────────
 
+#[serial_test::serial]
 #[tokio::test]
 async fn do_login_success() {
     let _creds_dir = isolate_credentials();
@@ -21,6 +22,7 @@ async fn do_login_success() {
     assert_eq!(result.unwrap(), "tok-abc");
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn do_login_failure_returns_error() {
     let _creds_dir = isolate_credentials();
@@ -40,6 +42,7 @@ async fn do_login_failure_returns_error() {
     assert!(result.unwrap_err().contains("401"));
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn do_login_preserves_existing_memoria_api_key() {
     let _creds_dir = isolate_credentials();
@@ -75,6 +78,7 @@ async fn do_login_preserves_existing_memoria_api_key() {
     assert_eq!(profile.refresh_token.as_deref(), Some("ref-xyz"));
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn do_login_preserves_last_session_for_same_username() {
     let _creds_dir = isolate_credentials();
@@ -112,6 +116,7 @@ async fn do_login_preserves_last_session_for_same_username() {
     );
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn do_login_clears_last_session_for_different_username() {
     let _creds_dir = isolate_credentials();
@@ -149,6 +154,7 @@ async fn do_login_clears_last_session_for_different_username() {
     assert_eq!(profile.memoria_api_key.as_deref(), Some("mem-key"));
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn do_login_uses_astra_profile_when_cli_profile_absent() {
     let _creds_dir = isolate_credentials();
@@ -185,6 +191,7 @@ async fn do_login_uses_astra_profile_when_cli_profile_absent() {
     assert_eq!(creds.current_profile.as_deref(), Some("from-env"));
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn do_register_success() {
     let _creds_dir = isolate_credentials();
@@ -215,6 +222,7 @@ async fn do_register_success() {
     assert_eq!(profile.refresh_token.as_deref(), Some("ref-new"));
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn do_register_conflict_returns_error() {
     let _creds_dir = isolate_credentials();

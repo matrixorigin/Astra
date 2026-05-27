@@ -2,6 +2,7 @@ use super::*;
 
 // ── command_router ────────────────────────────────────────────────────
 
+#[serial_test::serial]
 #[tokio::test]
 async fn execute_cli_health_command() {
     let _creds_dir = isolate_credentials();

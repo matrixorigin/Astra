@@ -1162,17 +1162,17 @@ impl<'a> CliSseStreamHost<'a> {
         };
         self.edge_tool_round.push(result.clone());
 
-        // ── Reconnection dedup: record completed request ID ──
-        crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
-
+        let result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(request_id, &output);
         let body = astra_thin_client::ToolResultRequest {
             request_id: request_id.to_string(),
             status,
             output: Some(output),
             duration_ms: Some(duration_ms),
-            result_hash: None,
+            result_hash: Some(result_hash),
         };
+        // ── Reconnection dedup: record after posting result ──
         let _ = self.post_tool_result_with_auth_retry(&body).await;
+        crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
         result
     }
 }
@@ -1724,16 +1724,17 @@ impl<'a> CliSseStreamHost<'a> {
         };
         self.edge_tool_round.push(result.clone());
 
+        let result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(&req.request_id, &output);
         let body = astra_thin_client::ToolResultRequest {
             request_id: req.request_id.clone(),
             status: status.to_string(),
             output: Some(output),
             duration_ms: Some(duration_ms),
-            result_hash: None,
+            result_hash: Some(result_hash),
         };
-        // ── Reconnection dedup ──
-        crate::cli::edge_lifecycle::record_completed_request(req.request_id.clone());
+        // ── Reconnection dedup: record after posting result ──
         let _ = self.post_tool_result_with_auth_retry(&body).await;
+        crate::cli::edge_lifecycle::record_completed_request(req.request_id.clone());
 
         result
     }
@@ -2987,6 +2988,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             } else if tool == astra_turn_core::interaction_types::ASK_USER_TOOL_NAME {
                 self.ask_user_via_tui(args).await
             } else {
+                crate::cli::edge_lifecycle::inc_pending_tool_requests();
                 let mut outcome = execute_with_metadata_responsive(
                     std::sync::Arc::clone(&self.executor),
                     tool.to_string(),
@@ -2994,6 +2996,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     self.cancel_token.cloned(),
                 )
                 .await;
+                crate::cli::edge_lifecycle::dec_pending_tool_requests();
                 // If the sandbox denied the operation, prompt the user for
                 // authorization. On approval, temporarily expand the sandbox
                 // boundary and retry the tool.
@@ -3292,16 +3295,17 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             status: status.clone(),
             duration_ms,
         });
+        let result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(request_id, &output);
         let body = astra_thin_client::ToolResultRequest {
             request_id: request_id.to_string(),
             status: status.clone(),
             output: Some(output),
             duration_ms: Some(duration_ms),
-            result_hash: None,
+            result_hash: Some(result_hash),
         };
-        // ── Reconnection dedup ──
-        crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
+        // ── Reconnection dedup: record after posting result ──
         let _ = self.post_tool_result_with_auth_retry(&body).await;
+        crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
         self.edge_tool_round
             .last()
             .cloned()
@@ -4020,18 +4024,18 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             results[orig_idx] = Some(result);
 
             // Post tool result to cloud API.
+            let result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(&req.request_id, &output);
             let body = astra_thin_client::ToolResultRequest {
                 request_id: req.request_id.clone(),
                 status: status.to_string(),
                 output: Some(output),
                 duration_ms: Some(duration_ms),
-                result_hash: None,
+                result_hash: Some(result_hash),
             };
-            // ── Reconnection dedup ──
+            // ── Reconnection dedup: record after posting result ──
+            let _ = self.post_tool_result_with_auth_retry(&body).await;
             crate::cli::edge_lifecycle::record_completed_request(req.request_id.clone());
-            if self.post_tool_result_with_auth_retry(&body).await {
-                break;
-            }
+            break;
         }
 
         // Clear batch progress when done.

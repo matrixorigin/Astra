@@ -2074,6 +2074,7 @@ mod tests {
         assert!(!access_token_needs_refresh("not-a-jwt", now));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn fresh_access_token_refreshes_expired_saved_token() {
         let _g = isolate_credentials();
@@ -2110,6 +2111,7 @@ mod tests {
         assert_eq!(profile.refresh_token.as_deref(), Some("fresh-refresh"));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn fresh_access_token_keeps_valid_saved_token_without_refresh() {
         let _g = isolate_credentials();
@@ -2142,6 +2144,7 @@ mod tests {
         assert_eq!(profile.refresh_token.as_deref(), Some("refresh-old"));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn fresh_access_token_refreshes_profile_when_env_token_is_expired() {
         let _g = isolate_credentials();

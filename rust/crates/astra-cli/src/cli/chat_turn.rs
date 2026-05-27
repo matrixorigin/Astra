@@ -5554,6 +5554,7 @@ mod tests {
     /// asserting that the user line + partial response are pushed onto
     /// `state.history`, and that the journal records `user_interrupted`
     /// rather than the (often less useful) raw runtime error string.
+    #[serial_test::serial]
     #[tokio::test]
     async fn user_cancelled_turn_with_partial_text_preserves_user_line_in_history() {
         let (_tmp, _g) = isolated_sessions_dir();
@@ -5703,6 +5704,7 @@ mod tests {
     /// `apply_user_cancelled_turn` pushes a placeholder
     /// `[Interrupted by user before any response was produced]` so
     /// `history_as_messages` produces a coherent user/assistant alternation.
+    #[serial_test::serial]
     #[tokio::test]
     async fn user_cancelled_turn_without_partial_text_still_pushes_user_line_to_history() {
         let (_tmp, _g) = isolated_sessions_dir();

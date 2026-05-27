@@ -5628,6 +5628,7 @@ mod resume_tests {
         assert_eq!(serde_json::to_value(exported).unwrap(), approval_json);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn restore_journal_history_if_available_preserves_existing_history_when_journal_missing()
     {
@@ -5643,6 +5644,7 @@ mod resume_tests {
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn restore_journal_history_if_available_does_not_overwrite_cloud_history() {
         let (_tmp, _guard) = isolated_sessions_dir();
@@ -5662,6 +5664,7 @@ mod resume_tests {
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn restore_journal_history_if_available_prefers_local_when_more_entries() {
         let (_tmp, _guard) = isolated_sessions_dir();
@@ -5762,6 +5765,7 @@ mod resume_tests {
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn restore_without_csl_falls_back_to_journal() {
         let (_tmp, _guard) = isolated_sessions_dir();
@@ -5841,6 +5845,7 @@ mod resume_tests {
         assert_eq!(pairs[0].1, "", "non-string content becomes empty string");
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn restore_session_into_state_rejects_stale_remote_session_before_local_restore() {
         let (_tmp, _guard) = isolated_sessions_dir();
@@ -5877,6 +5882,7 @@ mod resume_tests {
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn restore_session_into_state_restores_live_remote_session_from_local_workspace() {
         let (_tmp, _guard) = isolated_sessions_dir();
@@ -5910,6 +5916,7 @@ mod resume_tests {
         assert_eq!(state.total_cache_creation_tokens, 3);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn apply_restored_session_uses_remote_cache_totals_without_local_journal() {
         let (_tmp, _guard) = isolated_sessions_dir();
@@ -5940,6 +5947,7 @@ mod resume_tests {
         assert_eq!(state.total_cache_creation_tokens, 11);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn restore_session_into_state_merges_session_memory_into_anchor() {
         let (_tmp, _guard) = isolated_sessions_dir();
@@ -6003,6 +6011,7 @@ mod resume_tests {
         assert!(anchor.contains("Add shutdown flush"), "{anchor}");
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn restore_session_into_state_treats_default_model_as_server_default() {
         let (_tmp, _guard) = isolated_sessions_dir();
@@ -6038,6 +6047,7 @@ mod resume_tests {
         assert_eq!(state.model, None);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn restore_session_into_state_surfaces_interrupted_plan_and_durable_lifecycle_summary() {
         let (_tmp, _guard) = isolated_sessions_dir();
