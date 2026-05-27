@@ -3,10 +3,6 @@
 //! Extended manifest format supports `tools:` section alongside existing
 //! tables, settings, secrets, and resources declarations.
 //!
-//! Uses legacy `SkillInstruction`/`SkillMetadata` types pending migration to
-//! `astra_skills::manifest` types.
-
-#![allow(deprecated)]
 //!
 //! Also supports SKILL.md files for detailed instructions.
 //!
@@ -43,7 +39,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::mcp_client::{McpServerConfig, RetryConfig, Transport};
-use crate::skill_instructions::{SkillInstruction, SkillMetadata, parse_skill_md};
+use astra_skills::loader::parse_skill_md;
+use astra_skills::manifest::SkillManifest;
 
 // ─── Manifest Types ─────────────────────────────────────────────────────────
 
@@ -228,32 +225,30 @@ pub struct LoadedSkill {
     pub path: std::path::PathBuf,
     /// Parsed manifest.
     pub manifest: ToolManifest,
-    /// Parsed SKILL.md instructions (if present).
-    pub instructions: Option<SkillInstruction>,
-    /// Metadata for quick access (Level 1).
-    pub metadata: SkillMetadata,
+    /// Parsed SKILL.md: (manifest from frontmatter, instruction body text).
+    pub skill_md: Option<(SkillManifest, String)>,
 }
 
 impl LoadedSkill {
-    /// Get the effective description (from instructions or manifest).
+    /// Get the effective description (from SKILL.md frontmatter or manifest).
     pub fn description(&self) -> &str {
-        self.instructions
+        self.skill_md
             .as_ref()
-            .map(|i| i.description.as_str())
+            .map(|(m, _)| m.description.as_str())
             .unwrap_or(&self.manifest.description)
     }
 
-    /// Get allowed tools (from SKILL.md).
+    /// Get allowed tools (from SKILL.md frontmatter).
     pub fn allowed_tools(&self) -> Vec<String> {
-        self.instructions
+        self.skill_md
             .as_ref()
-            .map(|i| i.allowed_tools.clone())
+            .map(|(m, _)| m.allowed_tools.clone())
             .unwrap_or_default()
     }
 
-    /// Get instruction text (Level 2 content).
+    /// Get instruction text (Level 2 content — the body after YAML frontmatter).
     pub fn instruction_text(&self) -> Option<&str> {
-        self.instructions.as_ref().map(|i| i.instructions.as_str())
+        self.skill_md.as_ref().map(|(_, body)| body.as_str())
     }
 
     /// Get MCP server configurations for this skill.
@@ -292,28 +287,14 @@ pub fn load_skill(skill_dir: &Path) -> Result<LoadedSkill, String> {
         ));
     }
 
-    // Try to load SKILL.md
-    let instructions = load_skill_instructions(&manifest, skill_dir);
-
-    // Build metadata
-    let metadata = if let Some(ref inst) = instructions {
-        SkillMetadata::from(inst)
-    } else {
-        SkillMetadata {
-            name: manifest.name.clone(),
-            description: manifest.description.clone(),
-            user_invocable: true,
-            metadata_tokens: (manifest.name.len() + manifest.description.len()) as u32 / 4,
-            ..Default::default()
-        }
-    };
+    // Try to load SKILL.md — returns (SkillManifest, instruction_body)
+    let skill_md = load_skill_instructions(&manifest, skill_dir);
 
     Ok(LoadedSkill {
         name: manifest.name.clone(),
         path: skill_dir.to_path_buf(),
         manifest,
-        instructions,
-        metadata,
+        skill_md,
     })
 }
 
@@ -327,7 +308,7 @@ fn escape_yaml_string(s: &str) -> String {
 }
 
 /// Load SKILL.md for a manifest (checks instructions_file or default SKILL.md).
-fn load_skill_instructions(manifest: &ToolManifest, skill_dir: &Path) -> Option<SkillInstruction> {
+fn load_skill_instructions(manifest: &ToolManifest, skill_dir: &Path) -> Option<(SkillManifest, String)> {
     // Check for inline instructions first
     if let Some(ref inline) = manifest.instructions {
         // Wrap inline instructions in frontmatter format
@@ -955,12 +936,12 @@ tools: []
 
         let skill = load_skill(&skill_dir).unwrap();
         assert_eq!(skill.name, "review");
-        assert!(skill.instructions.is_some());
+        assert!(skill.skill_md.is_some());
 
-        let inst = skill.instructions.as_ref().unwrap();
-        assert_eq!(inst.name, "code-review");
-        assert!(inst.user_invocable);
-        assert!(inst.instructions.contains("Follow these steps"));
+        let (md, body) = skill.skill_md.as_ref().unwrap();
+        assert_eq!(md.name, "code-review");
+        assert!(md.user_invocable);
+        assert!(body.contains("Follow these steps"));
     }
 
     #[test]
@@ -976,7 +957,7 @@ tools: []
         let skills = discover_skills(dir.path());
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "review");
-        assert!(skills[0].instructions.is_some());
+        assert!(skills[0].skill_md.is_some());
     }
 
     #[test]
@@ -990,9 +971,9 @@ tools: []
 
         let skill = load_skill(&skill_dir).unwrap();
         assert_eq!(skill.name, "kubernetes");
-        assert!(skill.instructions.is_none());
-        // Should still have metadata from manifest
-        assert_eq!(skill.metadata.name, "kubernetes");
+        assert!(skill.skill_md.is_none());
+        // Description available from manifest fallback
+        assert_eq!(skill.manifest.name, "kubernetes");
     }
 
     #[test]
@@ -1049,10 +1030,10 @@ tools: []
         let skill = load_skill(&skill_dir).unwrap();
         assert_eq!(skill.name, "vulnerable");
         // Should successfully parse despite special characters
-        assert!(skill.instructions.is_some());
-        let inst = skill.instructions.unwrap();
+        assert!(skill.skill_md.is_some());
+        let (md, _body) = skill.skill_md.unwrap();
         // Description should be properly escaped and parsed back
-        assert!(inst.description.contains("quote"));
+        assert!(md.description.contains("quote"));
     }
 
     #[test]
@@ -1199,10 +1180,10 @@ Apply the suggested changes carefully.
         assert_eq!(skill.mcp_servers().len(), 1);
 
         // Verify SKILL.md instructions loaded
-        assert!(skill.instructions.is_some());
-        let inst = skill.instructions.as_ref().unwrap();
-        assert_eq!(inst.allowed_tools.len(), 3);
-        assert!(inst.instructions.contains("Complete Skill Instructions"));
+        assert!(skill.skill_md.is_some());
+        let (md, body) = skill.skill_md.as_ref().unwrap();
+        assert_eq!(md.allowed_tools.len(), 3);
+        assert!(body.contains("Complete Skill Instructions"));
     }
 
     #[test]
@@ -1307,10 +1288,10 @@ SKILL.md instructions (not used when inline exists).
         let skill = load_skill(&skill_dir).unwrap();
 
         // Inline instructions take precedence over SKILL.md
-        assert!(skill.instructions.is_some());
-        let inst = skill.instructions.as_ref().unwrap();
-        assert!(inst.instructions.contains("Inline instructions"));
-        assert!(!inst.instructions.contains("not used"));
+        assert!(skill.skill_md.is_some());
+        let (_md, body) = skill.skill_md.as_ref().unwrap();
+        assert!(body.contains("Inline instructions"));
+        assert!(!body.contains("not used"));
     }
 
     #[test]
@@ -1343,9 +1324,9 @@ SKILL.md instructions loaded because no inline.
         let skill = load_skill(&skill_dir).unwrap();
 
         // SKILL.md should be loaded when no inline instructions exist
-        assert!(skill.instructions.is_some());
-        let inst = skill.instructions.as_ref().unwrap();
-        assert!(inst.instructions.contains("SKILL.md instructions"));
+        assert!(skill.skill_md.is_some());
+        let (_md, body) = skill.skill_md.as_ref().unwrap();
+        assert!(body.contains("SKILL.md instructions"));
     }
 
     #[test]
