@@ -1,5 +1,6 @@
 //! Cloud edge registry + heartbeat (Phase 3). See `docs/design/multi-agent-cloud-runtime.md` §5.5.
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -12,8 +13,8 @@ use astra_thin_client::{EdgeHeartbeatRequest, EdgeRegisterRequest, ThinClient, T
 /// Ring buffer of recently completed tool request IDs, for deduplication
 /// on reconnection. Heartbeat sends these so cloud knows which tool calls
 /// this edge already completed.
-static COMPLETED_REQUEST_IDS: std::sync::LazyLock<Mutex<Vec<String>>> =
-    std::sync::LazyLock::new(|| Mutex::new(Vec::with_capacity(64)));
+static COMPLETED_REQUEST_IDS: std::sync::LazyLock<Mutex<VecDeque<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(VecDeque::with_capacity(64)));
 
 /// Maximum number of completed request IDs to track for deduplication.
 const MAX_COMPLETED_REQUEST_IDS: usize = 64;
@@ -22,9 +23,9 @@ const MAX_COMPLETED_REQUEST_IDS: usize = 64;
 pub fn record_completed_request(request_id: String) {
     if let Ok(mut ids) = COMPLETED_REQUEST_IDS.lock() {
         if ids.len() >= MAX_COMPLETED_REQUEST_IDS {
-            ids.remove(0);
+            ids.pop_front();
         }
-        ids.push(request_id);
+        ids.push_back(request_id);
     }
 }
 
@@ -32,7 +33,7 @@ pub fn record_completed_request(request_id: String) {
 fn completed_request_ids_snapshot() -> Vec<String> {
     COMPLETED_REQUEST_IDS
         .lock()
-        .map(|ids| ids.clone())
+        .map(|ids| ids.iter().cloned().collect())
         .unwrap_or_default()
 }
 
