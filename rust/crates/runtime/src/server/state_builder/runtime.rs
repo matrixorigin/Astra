@@ -1,4 +1,5 @@
 use super::*;
+use crate::server::run::lifecycle::{AgenticRunLifecycleService, ServerSubRunExecutor};
 
 pub(super) async fn build_runtime_wiring(
     settings: &AppSettings,
@@ -13,14 +14,14 @@ pub(super) async fn build_runtime_wiring(
     let state_projection_store = Arc::new(astra_services::DatabaseStateProjectionStore::new(
         shared_pool.clone(),
     ));
-    let run_engine = crate::server::run_engine::RunEngine::new(run_store)
+    let run_engine = crate::server::run::engine::RunEngine::new(run_store)
         .with_projection_store(Arc::clone(&state_projection_store));
     recover_active_runs(&run_engine).await;
 
     let profile_registry = Arc::new(default_agent_profile_registry());
     let progress_broadcaster = Arc::new(crate::orchestration::ProgressBroadcaster::default());
     let delegation_tracker = Arc::new(
-        crate::server::delegation_engine::DelegationTracker::new()
+        crate::server::delegation::engine::DelegationTracker::new()
             .with_progress_broadcaster(Arc::clone(&progress_broadcaster)),
     );
     let user_id = astra_core::cli_user_id();
@@ -35,8 +36,8 @@ pub(super) async fn build_runtime_wiring(
     );
     let memory_extraction_service = matrix_rt.clone_memory_extraction_service();
 
-    let sub_run_executor: Arc<dyn crate::server::delegation_engine::SubRunExecutor> = {
-        let mut exec = super::run_lifecycle::ServerSubRunExecutor::new(
+    let sub_run_executor: Arc<dyn crate::server::delegation::engine::SubRunExecutor> = {
+        let mut exec = ServerSubRunExecutor::new(
             settings.matrixone.clone(),
             Arc::clone(run_encryptor),
             state.edge_callback_ledger.clone(),
@@ -50,7 +51,7 @@ pub(super) async fn build_runtime_wiring(
         Arc::new(exec)
     };
     let delegation_engine = Arc::new(
-        crate::server::delegation_engine::DelegationEngine::with_executor(
+        crate::server::delegation::engine::DelegationEngine::with_executor(
             Arc::new(tokio::sync::RwLock::new((*profile_registry).clone())),
             Arc::new(run_engine.clone()),
             delegation_tracker,
@@ -60,7 +61,7 @@ pub(super) async fn build_runtime_wiring(
     );
 
     let resource_governor = initialize_resource_governor(shared_pool).await;
-    let mut run_lifecycle = super::run_lifecycle::AgenticRunLifecycleService::new(
+    let mut run_lifecycle = AgenticRunLifecycleService::new(
         settings.matrixone.clone(),
         Arc::clone(run_encryptor),
         state.edge_callback_ledger.clone(),
@@ -94,7 +95,7 @@ pub(super) async fn build_runtime_wiring(
     })
 }
 
-async fn recover_active_runs(run_engine: &crate::server::run_engine::RunEngine) {
+async fn recover_active_runs(run_engine: &crate::server::run::engine::RunEngine) {
     match run_engine.recover_active_runs().await {
         Ok(recovered_runs) => {
             if !recovered_runs.is_empty() {

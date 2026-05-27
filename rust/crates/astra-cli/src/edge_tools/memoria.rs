@@ -625,7 +625,7 @@ pub async fn memoria_retrieve_lessons(
 /// Best-effort and loss-tolerant: lessons are sent one-by-one through the
 /// server proxy, but a failure on one lesson must not drop the rest.
 pub async fn memoria_store_lessons_fire_and_forget(
-    lessons: Vec<astra_runtime::lesson_synthesizer::ExtractedLesson>,
+    lessons: Vec<astra_runtime::learning::synthesizer::ExtractedLesson>,
     session_id: Option<String>,
 ) {
     if lessons.is_empty() {
@@ -719,17 +719,17 @@ mod tests {
 
         memoria_store_lessons_fire_and_forget(
             vec![
-                astra_runtime::lesson_synthesizer::ExtractedLesson {
+                astra_runtime::learning::synthesizer::ExtractedLesson {
                     memory_type: "working",
                     content: "lesson one".into(),
                     trust_tier: "T4",
                 },
-                astra_runtime::lesson_synthesizer::ExtractedLesson {
+                astra_runtime::learning::synthesizer::ExtractedLesson {
                     memory_type: "working",
                     content: "lesson two".into(),
                     trust_tier: "T4",
                 },
-                astra_runtime::lesson_synthesizer::ExtractedLesson {
+                astra_runtime::learning::synthesizer::ExtractedLesson {
                     memory_type: "working",
                     content: "lesson three".into(),
                     trust_tier: "T4",

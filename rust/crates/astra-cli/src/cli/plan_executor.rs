@@ -1056,17 +1056,16 @@ pub(super) struct BackgroundPlanContext {
     pub tool_health_entries: Vec<ToolHealthEntry>,
     pub unified_skill_registry: Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     pub skill_search: astra_core::SkillSearchSettings,
-    pub delegation_engine: Option<Arc<astra_runtime::server::delegation_engine::DelegationEngine>>,
+    pub delegation_engine: Option<Arc<astra_runtime::server::delegation::engine::DelegationEngine>>,
     pub messaging_metrics: Option<Arc<astra_messaging::MessagingMetrics>>,
     pub agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     pub root_mailbox: Option<astra_messaging::router::AgentMailbox>,
     pub root_agent_id: String,
     pub durable_task_state: Option<durable_bridge::DurableTaskState>,
     pub workspace_root: PathBuf,
-    pub observability_hub: Option<Arc<astra_runtime::observability_integration::ObservabilityHub>>,
-    pub observability_session: Option<
-        Arc<std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>>,
-    >,
+    pub observability_hub: Option<Arc<astra_runtime::observability::ObservabilityHub>>,
+    pub observability_session:
+        Option<Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>>,
     pub file_journal: Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>>,
     /// Session-scoped file-state cache — shared across subtask turns so
     /// read-before-write tracking persists.

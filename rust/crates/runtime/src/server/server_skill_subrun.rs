@@ -20,7 +20,7 @@ use astra_services::LlmTokenServiceConfig;
 
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
-use crate::turn::agentic_loop_host::{
+use crate::turn::agentic_loop::host::{
     AgenticLoopHost as _, AgenticLoopState, CancellationState, RequestConstraints, SkillState,
     StopHookState, TurnInteractionPolicy, run_agentic_loop_with_host,
 };
@@ -425,9 +425,14 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             },
             messaging: Default::default(),
             error_recovery: Default::default(),
-            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
-                astra_turn_core::pipeline_config::PipelineConfig::default(),
-            )),
+            pipeline_session: Some(
+                astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
+                    astra_turn_core::pipeline_config::PipelineConfig::default(),
+                    crate::turn::session_current_date::resolve_session_current_date(
+                        &self.session_id,
+                    ),
+                ),
+            ),
             message: task_context.to_string(),
             recent_tools: Vec::new(),
             task_profile: infer_task_execution_profile(task_context),
@@ -447,6 +452,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
             pinned_tool_schema_tokens: 0,
+            sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
             budget_wrapup_ignored_rounds: 0,

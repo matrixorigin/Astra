@@ -564,6 +564,13 @@ pub struct ToolCallRecord {
     /// produce a follow-the-instructions stub and returned a BLOCKED result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_locked_out: Option<bool>,
+    /// Exit-code semantic classification for this tool call.
+    /// Serialized from `ExitSemantics` enum (snake_case). When present,
+    /// downstream exit-code logic uses this to distinguish real errors
+    /// from domain-negative outcomes (grep no-match, diff differences,
+    /// test failures).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_semantics: Option<String>,
 }
 
 /// Tool call name sentinel used for assistant messages that had parallel tool
@@ -973,8 +980,9 @@ pub struct SessionMemoryExtractionBreadcrumbs {
     /// "why does this session have no L1" (possibly 0 messages).
     pub messages_count: Option<u32>,
     /// Selector model that was actually used (or would have been, if
-    /// the call failed before dispatch). Absent on pure-gate skips
-    /// and on rule-based fallbacks.
+    /// the call failed before dispatch). Absent on pure-gate skips and
+    /// on pure rule-based runs with no selector. Present on degraded
+    /// fallback writes when a selector existed but was unhealthy.
     pub selector_model: Option<String>,
     /// Final attempt count (1 = succeeded first try, 2 = recovered
     /// after one retry). Absent when no persist attempt occurred.
@@ -982,6 +990,12 @@ pub struct SessionMemoryExtractionBreadcrumbs {
     /// When the LLM fails before the final persist error, keep that
     /// upstream reason so the journal reflects the full failure chain.
     pub llm_reason: Option<SessionMemoryExtractionErrorReason>,
+    /// Short human-readable detail for the upstream LLM failure (for
+    /// example an HTTP status or provider error message snippet).
+    pub llm_detail: Option<String>,
+    /// Short human-readable detail for the final persist failure (for
+    /// example a backend validation or proxy error snippet).
+    pub persist_detail: Option<String>,
 }
 
 impl SessionMemoryExtractionOutcome {
@@ -1027,6 +1041,12 @@ impl SessionMemoryExtractionOutcome {
             }
             if let Some(llm_reason) = bc.llm_reason {
                 map.insert("llm_reason".into(), serde_json::json!(llm_reason));
+            }
+            if let Some(ref llm_detail) = bc.llm_detail {
+                map.insert("llm_detail".into(), serde_json::json!(llm_detail));
+            }
+            if let Some(ref persist_detail) = bc.persist_detail {
+                map.insert("persist_detail".into(), serde_json::json!(persist_detail));
             }
         }
         obj

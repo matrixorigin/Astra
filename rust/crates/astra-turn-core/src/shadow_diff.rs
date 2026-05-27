@@ -198,6 +198,8 @@ mod tests {
             self_model: None,
             deferred_tools_block: String::new(),
             skill_listing_block: String::new(),
+            current_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+            user_id: None,
         };
         let turn = TurnState {
             messages: vec![],

@@ -135,6 +135,12 @@ pub enum StreamEvent {
     AgentLive(astra_turn_core::agent_live_event::AgentLiveEvent),
     /// Local policy approved a tool without showing an interactive prompt.
     PermissionAutoApproved { tool: String, reason: String },
+    /// Explain report from the turn (debug / introspection data).
+    ExplainReport(Vec<serde_json::Value>),
+    /// Final explain-analyze DAG text rendered for non-TUI consumers.
+    ExplainText(String),
+    /// Verdict audit events from the turn.
+    VerdictReport(Vec<crate::VerdictEvent>),
 }
 
 pub type StreamEventTx = mpsc::UnboundedSender<StreamEvent>;
@@ -175,8 +181,8 @@ impl ApprovalResponse {
 
     pub fn always_scope(
         &self,
-        default_scope: astra_turn_core::permission_scope::AllowScope,
-    ) -> Option<astra_turn_core::permission_scope::AllowScope> {
+        default_scope: astra_turn_core::permission::scope::AllowScope,
+    ) -> Option<astra_turn_core::permission::scope::AllowScope> {
         match self {
             Self::AlwaysAllow => Some(default_scope),
             _ => None,
@@ -185,7 +191,7 @@ impl ApprovalResponse {
 
     pub fn match_target(
         &self,
-    ) -> Option<&astra_turn_core::permission_match_target::AllowMatchTarget> {
+    ) -> Option<&astra_turn_core::permission::match_target::AllowMatchTarget> {
         None
     }
 }
@@ -334,7 +340,7 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) plan_subtask_id: Option<&'a str>,
     /// Optional delegation engine for multi-agent coordination with verification gates.
     pub(crate) delegation_engine:
-        Option<Arc<astra_runtime::server::delegation_engine::DelegationEngine>>,
+        Option<Arc<astra_runtime::server::delegation::engine::DelegationEngine>>,
     /// Optional cancellation token for interrupting SSE streaming mid-flight.
     pub(crate) cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     /// Plan-only: set to `true` after HTTP 200 so the payload-phase stderr line spinner can exit
@@ -371,19 +377,17 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) discovered_skills: Option<&'a mut HashSet<String>>,
     /// Shared messaging metrics for inter-agent communication observability.
     pub(crate) messaging_metrics: Option<Arc<astra_messaging::MessagingMetrics>>,
-    /// Optional agent spawner for dynamic sub-agent creation via spawn_agent tool.
+    /// Optional agent spawner for dynamic sub-agent creation via `agent(action='spawn', ...)`.
     pub(crate) agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// Optional logical root agent ID for this top-level turn when agent spawning is enabled.
     pub(crate) root_agent_id: Option<&'a str>,
     /// Optional persistent top-level mailbox slot for cross-turn reply handling.
     pub(crate) root_mailbox_slot: Option<&'a mut Option<astra_messaging::router::AgentMailbox>>,
     /// Optional observability hub for M1-M6 integration (profiles, experiments, auto-tuning).
-    pub(crate) observability_hub:
-        Option<Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    pub(crate) observability_hub: Option<Arc<astra_runtime::observability::ObservabilityHub>>,
     /// Optional observability session for per-session tracking.
-    pub(crate) observability_session: Option<
-        Arc<std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>>,
-    >,
+    pub(crate) observability_session:
+        Option<Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>>,
     /// Session-scoped file edit journal — shared with ToolExecutors for undo support.
     pub(crate) file_journal: Option<
         std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>>,
@@ -468,14 +472,14 @@ pub(crate) struct BasicCliChatContext<'a> {
     pub unified_skill_registry: &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     pub skill_search: &'a astra_core::SkillSearchSettings,
     /// Optional agent spawner so `astra chat -m` (non-REPL one-shot)
-    /// can trigger the `spawn_agent` tool just like the interactive
-    /// REPL does. When `None`, spawn_agent returns "not available" —
+    /// can trigger `agent(action='spawn', ...)` just like the interactive
+    /// REPL does. When `None`, agent spawning returns "not available" —
     /// the previous behavior before the fix. Callers that want the
     /// fix set this via `initialize_multi_agent_runtime`-equivalent
     /// bootstrap before constructing the context.
     pub agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// Optional logical root agent id when `agent_spawner` is set.
-    /// Passed through to `sse_loop::mod` for `SpawnAgentContext`
+    /// Passed through to `sse_loop::mod` for `AgentActionContext`
     /// wiring. When `agent_spawner` is None this is ignored.
     pub root_agent_id: Option<&'a str>,
     /// Session-scoped task manager used by one-shot/headless paths that still
@@ -583,7 +587,7 @@ mod tests {
     //! bug. One-shot `chat -m` goes through
     //! `ChatTurnParams::basic_cli` without `run_chat_repl`; before
     //! the fix that helper hardcoded `agent_spawner: None`, so the
-    //! LLM's `spawn_agent` tool calls always returned "Agent
+    //! LLM's `agent(action='spawn', ...)` calls always returned "Agent
     //! spawning not available in this context".
     //!
     //! A full end-to-end test here would require mocking the
@@ -621,7 +625,7 @@ mod tests {
         // The structural AST contract the rest of the CLI relies
         // on: BasicCliChatContext exposes public `agent_spawner`
         // and `root_agent_id` fields. If these go away we can't
-        // wire one-shot chat to spawn_agent.
+        // wire one-shot chat to dynamic agent spawning.
         let src = include_str!("params.rs");
         assert!(src.contains("pub agent_spawner: Option<Arc<"));
         assert!(src.contains("pub root_agent_id: Option<&'a str>"));

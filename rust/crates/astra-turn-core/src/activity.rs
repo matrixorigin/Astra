@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::counter::count_persisted_turn_events;
+use crate::turn_metrics::count_persisted_turn_events;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionActivityUpdatePlan {

@@ -26,7 +26,7 @@ use astra_runtime::{
     SessionUpdateRequestData, TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter,
     TurnCoreEventWriter, TurnCorePersistOutcome, TurnCorePersistPlan, TurnHookDbPersistPlan,
     TurnHookDbWriter, TurnSessionActivityWriter, TurnToolEventPersistPlan, TurnToolEventWriter,
-    build_app, turn::bridge_inprocess::InProcessChatTurnBridge,
+    build_app, turn::bridge::inprocess::InProcessChatTurnBridge,
 };
 use astra_services::session_journal::{JournalEventType, journal_file_path, read_journal};
 use async_trait::async_trait;

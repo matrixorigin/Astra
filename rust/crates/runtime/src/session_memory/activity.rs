@@ -40,6 +40,7 @@ pub enum BackgroundActivity {
         session_id: String,
         turn: u32,
         reason: SessionMemoryExtractionErrorReason,
+        detail: Option<String>,
         duration_ms: u64,
     },
 }

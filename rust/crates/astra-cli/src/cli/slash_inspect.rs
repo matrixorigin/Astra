@@ -9,6 +9,12 @@ use super::*;
 pub(super) fn handle_inspect_command(arg: &str, state: &SessionState) {
     use astra_harness::SnapshotSink;
 
+    let trimmed = arg.trim();
+    if trimmed == "cache" {
+        print_cache(state);
+        return;
+    }
+
     let snapshot = match state.harness_sink.latest() {
         Some(s) => s,
         None => {
@@ -17,7 +23,6 @@ pub(super) fn handle_inspect_command(arg: &str, state: &SessionState) {
         }
     };
 
-    let trimmed = arg.trim();
     match trimmed {
         "" | "all" => print_full_snapshot(&snapshot),
         "budget" => print_budget(&snapshot),
@@ -46,7 +51,7 @@ pub(super) fn handle_inspect_command(arg: &str, state: &SessionState) {
                 format!("  Unknown /inspect subcommand: {other}").yellow()
             );
             eprintln!(
-                "  Usage: /inspect [budget|tools|context|json|diff|history N|trace|forensics|export path]"
+                "  Usage: /inspect [budget|tools|context|cache|json|diff|history N|trace|forensics|export path]"
             );
         }
     }
@@ -112,6 +117,22 @@ pub(super) fn format_snapshot_summary(s: &astra_harness::RuntimeSnapshot) -> Str
         ));
     }
     out
+}
+
+#[cfg(feature = "harness")]
+fn print_cache(state: &SessionState) {
+    let Some(session_id) = state.session_id.as_deref() else {
+        eprintln!(
+            "{}",
+            "  No active session. Start or resume a session first.".yellow()
+        );
+        return;
+    };
+    let rounds = super::slash_cache::load_cache_rounds(session_id);
+    eprintln!(
+        "{}",
+        super::slash_cache::render_cache_diagnosis(session_id, &rounds)
+    );
 }
 
 #[cfg(not(feature = "harness"))]

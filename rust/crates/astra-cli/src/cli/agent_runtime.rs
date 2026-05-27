@@ -15,7 +15,7 @@ fn attach_session_to_spawner(
 
 /// Build a fully-wired [`DynamicAgentSpawner`] without mutating a
 /// SessionState. Extracted from [`initialize_multi_agent_runtime`] so
-/// the one-shot `chat -m` code path can wire `spawn_agent` support
+/// the one-shot `chat -m` code path can wire dynamic sub-agent support
 /// into a `BasicCliChatContext` without constructing a full REPL
 /// state.
 ///
@@ -27,10 +27,10 @@ fn attach_session_to_spawner(
 ///   no-ops when the flag is off)
 ///
 /// Returns only the spawner + mailbox_router the caller needs to
-/// hand to `SpawnAgentContext`. The delegation engine is NOT
+/// hand to `AgentActionContext`. The delegation engine is NOT
 /// created here — REPL builds its own via
 /// `initialize_multi_agent_runtime` because the engine also wires
-/// parent agent routing. one-shot chat needs only spawn_agent.
+/// parent agent routing. one-shot chat needs only `agent(action='spawn', ...)`.
 pub(crate) async fn build_one_shot_spawner(
     api: &astra_thin_client::ThinClient,
     token: String,
@@ -44,7 +44,7 @@ pub(crate) async fn build_one_shot_spawner(
     let skill_resolver = build_turn_skill_resolver(unified_skill_registry).await;
 
     let tracker =
-        std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
+        std::sync::Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
     let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
     let mailbox_router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
         transport,
@@ -131,7 +131,7 @@ pub(crate) async fn initialize_multi_agent_runtime(
 
     let run_store = std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
     let tracker =
-        std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
+        std::sync::Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
     let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
     let mailbox_router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
         transport,
@@ -183,9 +183,11 @@ pub(crate) async fn initialize_multi_agent_runtime(
     let prefix_store: std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink> =
         std::sync::Arc::new(astra_turn_core::fork_prefix_store::InMemoryPrefixStore::new());
 
-    let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
+    let engine = astra_runtime::server::delegation::engine::DelegationEngine::with_executor(
         registry,
-        std::sync::Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store)),
+        std::sync::Arc::new(astra_runtime::server::run::engine::RunEngine::new(
+            run_store,
+        )),
         tracker,
         std::sync::Arc::new(delegate_executor),
     )

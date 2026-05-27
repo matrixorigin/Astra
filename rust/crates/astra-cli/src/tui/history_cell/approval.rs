@@ -241,7 +241,7 @@ impl ApprovalCell {
     /// Always button cannot persist a Project/User rule for
     /// this approval, or None when persistence is allowed.
     /// Mirrors the policy in
-    /// [`astra_turn_core::permission_scope::permitted_scopes`]
+    /// [`astra_turn_core::permission::scope::permitted_scopes`]
     /// using only the labels we render in the cell — keeps the
     /// view layer free of the engine's `RiskTag` enum.
     pub fn always_disabled_reason(&self) -> Option<&'static str> {
@@ -275,48 +275,48 @@ impl ApprovalCell {
     fn always_action_disabled(&self) -> bool {
         self.always_disabled_reason().is_some()
             || (!self.workspace_untrusted
-                && !self.scope_available(astra_turn_core::permission_scope::AllowScope::Project))
+                && !self.scope_available(astra_turn_core::permission::scope::AllowScope::Project))
     }
 
-    fn risk_tags_for_scope(&self) -> Vec<astra_turn_core::permission_engine::RiskTag> {
+    fn risk_tags_for_scope(&self) -> Vec<astra_turn_core::permission::engine::RiskTag> {
         self.risk_tag_labels
             .iter()
             .filter_map(|label| match label.as_str() {
-                "BashExecute" => Some(astra_turn_core::permission_engine::RiskTag::BashExecute),
+                "BashExecute" => Some(astra_turn_core::permission::engine::RiskTag::BashExecute),
                 "WritesOutsidePackage" => {
-                    Some(astra_turn_core::permission_engine::RiskTag::WritesOutsidePackage)
+                    Some(astra_turn_core::permission::engine::RiskTag::WritesOutsidePackage)
                 }
                 "WritesOutsideWorkspace" => {
-                    Some(astra_turn_core::permission_engine::RiskTag::WritesOutsideWorkspace)
+                    Some(astra_turn_core::permission::engine::RiskTag::WritesOutsideWorkspace)
                 }
                 "WritesSensitiveFile" => {
-                    Some(astra_turn_core::permission_engine::RiskTag::WritesSensitiveFile)
+                    Some(astra_turn_core::permission::engine::RiskTag::WritesSensitiveFile)
                 }
                 "NetworkExfiltration" => {
-                    Some(astra_turn_core::permission_engine::RiskTag::NetworkExfiltration)
+                    Some(astra_turn_core::permission::engine::RiskTag::NetworkExfiltration)
                 }
                 "CredentialAccess" => {
-                    Some(astra_turn_core::permission_engine::RiskTag::CredentialAccess)
+                    Some(astra_turn_core::permission::engine::RiskTag::CredentialAccess)
                 }
                 "GitDestructive" => {
-                    Some(astra_turn_core::permission_engine::RiskTag::GitDestructive)
+                    Some(astra_turn_core::permission::engine::RiskTag::GitDestructive)
                 }
                 "SqlDestructive" => {
-                    Some(astra_turn_core::permission_engine::RiskTag::SqlDestructive)
+                    Some(astra_turn_core::permission::engine::RiskTag::SqlDestructive)
                 }
                 "MCPUnknownCapability" => {
-                    Some(astra_turn_core::permission_engine::RiskTag::MCPUnknownCapability)
+                    Some(astra_turn_core::permission::engine::RiskTag::MCPUnknownCapability)
                 }
                 "WorkspaceUntrusted" => {
-                    Some(astra_turn_core::permission_engine::RiskTag::WorkspaceUntrusted)
+                    Some(astra_turn_core::permission::engine::RiskTag::WorkspaceUntrusted)
                 }
                 _ => None,
             })
             .collect()
     }
 
-    fn scope_context(&self) -> astra_turn_core::permission_scope::ScopeAvailabilityContext {
-        astra_turn_core::permission_scope::ScopeAvailabilityContext {
+    fn scope_context(&self) -> astra_turn_core::permission::scope::ScopeAvailabilityContext {
+        astra_turn_core::permission::scope::ScopeAvailabilityContext {
             risk_tags: self.risk_tags_for_scope(),
             source_agent_present: self.source_agent.is_some(),
             mcp_unknown_capability: self
@@ -330,8 +330,8 @@ impl ApprovalCell {
         }
     }
 
-    fn scope_available(&self, scope: astra_turn_core::permission_scope::AllowScope) -> bool {
-        astra_turn_core::permission_scope::permitted_scopes(&self.scope_context())
+    fn scope_available(&self, scope: astra_turn_core::permission::scope::AllowScope) -> bool {
+        astra_turn_core::permission::scope::permitted_scopes(&self.scope_context())
             .into_iter()
             .any(|entry| entry.scope == scope && entry.available)
     }

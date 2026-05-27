@@ -2,7 +2,10 @@ use super::super::*;
 
 pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
-        .route("/runs", get(run_handlers::list_runs_handler))
+        .route(
+            "/runs",
+            get(crate::server::run::handlers::list_runs_handler),
+        )
         .route(
             "/tasks",
             get(task_handlers::list_tasks_handler).post(task_handlers::create_task_handler),

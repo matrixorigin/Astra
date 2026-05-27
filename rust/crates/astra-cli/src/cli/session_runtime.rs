@@ -165,10 +165,39 @@ pub(super) struct PipelineModules {
     pub _skill_watcher: Option<astra_runtime::skills::watcher::SkillWatcherHandle>,
 }
 
+/// Format an [`McpError`] as a concise user-facing message without redundant
+/// server-name prefixes (we print the server name separately).
+fn format_mcp_error(error: &crate::mcp_client::McpError) -> String {
+    match error {
+        crate::mcp_client::McpError::InvalidConfig(msg) => format!("invalid configuration — {msg}"),
+        crate::mcp_client::McpError::Spawn(msg) => format!("failed to start — {msg}"),
+        crate::mcp_client::McpError::Initialize(msg) => {
+            // Initialize errors embed the server name ("xxx: <reason>");
+            // strip it since we already print the name in the output line.
+            if let Some((_name, rest)) = msg.split_once(": ") {
+                rest.to_string()
+            } else {
+                msg.clone()
+            }
+        }
+        crate::mcp_client::McpError::Service(e) => format!("service error — {e}"),
+        crate::mcp_client::McpError::ToolNotFound(tool) => format!("tool '{tool}' not found"),
+        crate::mcp_client::McpError::ServerNotConnected(name) => {
+            format!("server '{name}' is not connected")
+        }
+        crate::mcp_client::McpError::ConnectionLost(_name, reason) => {
+            format!("connection lost — {reason}")
+        }
+        crate::mcp_client::McpError::ReconnectionFailed(_name, attempts) => {
+            format!("all {attempts} reconnection attempts failed")
+        }
+    }
+}
+
 fn create_pipeline_modules_inner(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    _announce_skills: bool,
+    announce_skills: bool,
 ) -> PipelineModules {
     // Selector removed — the runtime now builds the turn-specific tool surface
     // directly from the local CLI catalog plus any mounted server/MCP schemas.
@@ -245,32 +274,73 @@ fn create_pipeline_modules_inner(
                 s.spawn(|| {
                     handle.block_on(async {
                         let mut manager = mgr.write().await;
+
+                        // Collect (name, Ok(()) | Err(msg)) for every server.
+                        let mut results: Vec<(String, Result<(), String>)> = Vec::new();
                         for config in mcp_configs {
                             let name = config.name.clone();
                             match manager.connect_and_discover_skills(config, &reg).await {
-                                Ok(n) if n > 0 => {
-                                    eprintln!(
-                                        "  {} Connected '{}' ({n} tool{})",
-                                        crossterm::style::Stylize::cyan("✓"),
-                                        name,
-                                        if n == 1 { "" } else { "s" }
-                                    );
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    eprintln!(
-                                        "  {} MCP server '{}' failed to connect: {}",
-                                        theme::icon_warn(),
-                                        name,
-                                        e
-                                    );
-                                }
+                                Ok(_) => results.push((name, Ok(()))),
+                                Err(e) => results.push((name, Err(format_mcp_error(&e)))),
+                            }
+                        }
+
+                        if announce_skills {
+                            // Count MCP tools per server (0 is fine — e.g. memoria).
+                            let mut tool_counts: std::collections::HashMap<String, usize> =
+                                std::collections::HashMap::new();
+                            for (server, _) in manager.all_tools() {
+                                *tool_counts.entry(server.to_string()).or_insert(0) += 1;
+                            }
+
+                            let ok: Vec<&str> = results
+                                .iter()
+                                .filter_map(|(n, r)| r.is_ok().then_some(n.as_str()))
+                                .collect();
+                            let failures: Vec<(&str, &str)> = results
+                                .iter()
+                                .filter_map(|(n, r)| {
+                                    r.as_ref().err().map(|e| (n.as_str(), e.as_str()))
+                                })
+                                .collect();
+
+                            // ✓ N MCP server(s) connected: name1 (12)  ·  name2  ·  name3 (5)
+                            if !ok.is_empty() {
+                                let list = ok
+                                    .iter()
+                                    .map(|name| {
+                                        match tool_counts.get(*name).copied().unwrap_or(0) {
+                                            0 => name.to_string(),
+                                            n => format!("{name} ({n})"),
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("  ·  ");
+                                eprintln!(
+                                    "  {} {} MCP server{} connected: {}",
+                                    theme::icon_ok(),
+                                    ok.len(),
+                                    if ok.len() == 1 { "" } else { "s" },
+                                    list,
+                                );
+                            }
+
+                            // ✗ bad-server: <reason>  (one line per failure)
+                            for (name, err) in &failures {
+                                eprintln!("  {} MCP '{}': {}", theme::icon_err(), name, err,);
                             }
                         }
                     })
                 })
                 .join()
-                .unwrap_or_else(|e| eprintln!("  ⚠ MCP connection thread panicked: {e:?}"))
+                .unwrap_or_else(|e| {
+                    if announce_skills {
+                        eprintln!(
+                            "  {} MCP connection thread panicked: {e:?}",
+                            theme::icon_err()
+                        )
+                    }
+                })
             });
         }
     }
@@ -609,7 +679,7 @@ pub(crate) fn initialize_session_state(
         .join(".astra")
         .join("observability");
     state.observability_hub = Some(std::sync::Arc::new(
-        astra_runtime::observability_integration::ObservabilityHub::with_storage(obs_path),
+        astra_runtime::observability::ObservabilityHub::with_storage(obs_path),
     ));
 
     // Create an early observability session so the very first turn can record
@@ -698,6 +768,8 @@ pub struct RestoredSessionState {
     pub recent_tools: Vec<String>,
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub total_cache_creation_tokens: u64,
 }
 
 /// Rebuild `(user_msg, assistant_msg)` history from the session journal.
@@ -736,6 +808,8 @@ fn restore_session_state_from_journal(session_id: &str) -> RestoredSessionState 
             .max(event.turn.unwrap_or(restored.turn.saturating_add(1)));
         restored.total_prompt_tokens += event.tokens_in.unwrap_or(0);
         restored.total_completion_tokens += event.tokens_out.unwrap_or(0);
+        restored.total_cache_read_tokens += event.cache_read_tokens.unwrap_or(0);
+        restored.total_cache_creation_tokens += event.cache_creation_tokens.unwrap_or(0);
         if let Some(tools_used) = event.tools_used {
             restored.recent_tools = tools_used;
         }
@@ -1277,6 +1351,7 @@ mod tests {
                     20,
                     90,
                 )
+                .with_cache_tokens(80, 10)
                 .with_tool_selection(
                     vec!["github_list_prs".into()],
                     vec![],
@@ -1293,6 +1368,8 @@ mod tests {
         );
         assert_eq!(restored.total_prompt_tokens, 200);
         assert_eq!(restored.total_completion_tokens, 50);
+        assert_eq!(restored.total_cache_read_tokens, 80);
+        assert_eq!(restored.total_cache_creation_tokens, 10);
         assert_eq!(restored.recent_tools, vec!["github_list_prs".to_string()]);
         assert_eq!(restored.history.len(), 2);
     }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::server::run::handlers;
 use astra_services::runs::SSE_HEARTBEAT_INTERVAL_SECS;
 
 pub(super) fn sse_json_response(events: Vec<serde_json::Value>) -> Response {
@@ -94,7 +95,7 @@ pub(super) fn sse_streaming_response(
                     .map(ToOwned::to_owned);
             }
 
-            let events = super::run_handlers::transform_stream_run_events_for_client_with_pending(
+            let events = handlers::transform_stream_run_events_for_client_with_pending(
                 &run_id,
                 vec![event],
                 &mut pending_run_error,

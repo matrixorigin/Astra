@@ -43,6 +43,8 @@ fn make_session_context() -> SessionContext {
         self_model: Some("Good at coding, struggles with design.".into()),
         deferred_tools_block: String::new(),
         skill_listing_block: String::new(),
+        current_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        user_id: Some("test-user".into()),
     }
 }
 
@@ -142,7 +144,7 @@ fn warm_start_from_serialized_stats() {
     let bytes = serialize_stats(&first_session.stats).expect("serialization should succeed");
     let restored_stats = deserialize_stats(&bytes).expect("deserialization should succeed");
 
-    let second_session = PipelineSession::with_warm_stats(config, restored_stats);
+    let second_session = PipelineSession::with_warm_stats(config, restored_stats, "2026-05-25");
     assert_eq!(second_session.stats.turns_executed, 5);
     assert!(second_session.stats.avg_cache_hit_ratio > 0.8);
 }

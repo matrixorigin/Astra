@@ -41,6 +41,7 @@ use super::history_cell::{
 };
 use super::transcript_jsonl;
 use super::turn_event::TurnEvent;
+use crate::VerdictEvent;
 
 /// Events the ChatWidget knows how to route. Grouped by origin so
 /// `handle_event` can scale to more variants without bloating a
@@ -135,6 +136,8 @@ pub(crate) enum WireEvent {
     /// Turn ended with an error. Error text gets humanised by
     /// `SystemCell::error` before storage.
     TurnError(String),
+    ExplainReport(Vec<serde_json::Value>),
+    VerdictReport(Vec<crate::VerdictEvent>),
 }
 
 /// Per-turn metrics the outer loop collects and hands to
@@ -854,6 +857,8 @@ impl ChatWidget {
             }
             WireEvent::TurnComplete(stats) => self.on_turn_complete(*stats),
             WireEvent::TurnError(msg) => self.on_turn_error(msg),
+            WireEvent::ExplainReport(items) => self.on_explain_report(items),
+            WireEvent::VerdictReport(items) => self.on_verdict_report(items),
         }
     }
 
@@ -1615,6 +1620,78 @@ impl ChatWidget {
         self.commit_cell(Box::new(SystemCell::error(msg)));
     }
 
+    fn on_explain_report(&mut self, items: Vec<serde_json::Value>) {
+        if items.is_empty() {
+            return;
+        }
+        let mut parts = Vec::new();
+        for item in &items {
+            let mut line = String::new();
+            if let Some(ms) = item.get("total_ms").and_then(|v| v.as_i64()) {
+                line.push_str(&format!("⏱ {:.1}s", ms as f64 / 1000.0));
+            }
+            if let Some(selected) = item.get("tools_selected").and_then(|v| v.as_u64()) {
+                if let Some(available) = item.get("tools_available").and_then(|v| v.as_u64()) {
+                    if !line.is_empty() {
+                        line.push_str(" | ");
+                    }
+                    line.push_str(&format!("🛠 {}/{} tools", selected, available));
+                }
+            }
+            if let Some(steps) = item.get("steps").and_then(|v| v.as_array()) {
+                if !line.is_empty() {
+                    line.push_str(" | ");
+                }
+                line.push_str(&format!("📋 {} steps", steps.len()));
+            }
+            if !line.is_empty() {
+                parts.push(line);
+                continue;
+            }
+            if let Some(content) = item.get("content").and_then(|v| v.as_str()) {
+                let content = content.trim();
+                if !content.is_empty() {
+                    parts.push(content.to_string());
+                }
+            }
+        }
+        if !parts.is_empty() {
+            let text = format!("Context Explain\n{}", parts.join("\n"));
+            self.commit_cell(Box::new(SystemCell::info(text)));
+        }
+    }
+
+    fn on_verdict_report(&mut self, items: Vec<VerdictEvent>) {
+        if items.is_empty() {
+            return;
+        }
+        let mut parts = Vec::new();
+        for item in &items {
+            let severity: &str = &item.severity;
+            let icon = match severity {
+                "error" => "❌",
+                "warn" => "⚠️",
+                _ => "ℹ️",
+            };
+            let mut desc = format!("{} severity={}", icon, severity);
+            if item.force_stop {
+                desc.push_str(" force_stop");
+            }
+            if item.total_errors > 0 {
+                desc.push_str(&format!(" errors={}", item.total_errors));
+            }
+            if item.nudge_count > 0 {
+                desc.push_str(&format!(" nudges={}", item.nudge_count));
+            }
+            if !item.avoid_tools.is_empty() {
+                desc.push_str(&format!(" avoid=[{}]", item.avoid_tools.join(", ")));
+            }
+            parts.push(desc);
+        }
+        let text = format!("Verdict report\n{}", parts.join("\n"));
+        self.commit_cell(Box::new(SystemCell::info(text)));
+    }
+
     // ── Invariant-preserving mutators ────────────────────────────
 
     /// Take the currently-live cell, finalise it, append to
@@ -1720,7 +1797,7 @@ fn agent_action_from_description(description: &str) -> Option<&'static str> {
     }
 }
 
-/// LEGACY label extractor — see [`agent_action_from_description`].
+/// Compatibility label extractor for journal replay / older task rows.
 fn agent_label_from_description(description: &str) -> String {
     description
         .strip_prefix("Spawn agent:")
@@ -2357,6 +2434,30 @@ mod tests {
             w.cancelled_task_ids.is_empty(),
             "turn complete must clear prior-turn cancelled ids: {:?}",
             w.cancelled_task_ids
+        );
+    }
+
+    #[test]
+    fn explain_report_with_content_fallback_commits_system_cell() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(WireEvent::ExplainReport(vec![
+            serde_json::json!(
+                {
+                    "type": "explain",
+                    "content": "why this happened"
+                }
+            ),
+        ])));
+
+        let sys = w
+            .history
+            .last()
+            .and_then(|cell| cell.as_any_ref().downcast_ref::<SystemCell>())
+            .expect("explain report should append a system cell");
+        assert!(
+            sys.message().contains("why this happened"),
+            "content fallback should render the explain text: {}",
+            sys.message()
         );
     }
 

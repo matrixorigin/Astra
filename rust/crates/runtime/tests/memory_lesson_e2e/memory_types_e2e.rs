@@ -228,7 +228,7 @@ fn none_mode_prompt_is_empty() {
 
 #[test]
 fn quality_gate_filters_extraction_output() {
-    use astra_runtime::lesson_synthesizer::is_high_quality_lesson;
+    use astra_runtime::learning::synthesizer::is_high_quality_lesson;
 
     // These should PASS the gate (10+ chars, no hedging)
     assert!(is_high_quality_lesson(
@@ -304,6 +304,8 @@ fn session_memory_extraction_journal_event_structure() {
         selector_model: Some("test-selector".to_string()),
         attempt: Some(1),
         llm_reason: None,
+        llm_detail: None,
+        persist_detail: None,
     };
     let evt = astra_services::session_journal::JournalEvent::session_memory_extraction(
         Some("sess-42"),

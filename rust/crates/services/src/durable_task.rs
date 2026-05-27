@@ -821,8 +821,8 @@ impl VerificationRunner {
     }
 
     /// Verify only lightweight (non-global-only) criteria for a subtask.
-    /// Skips `global_only` criteria and `LlmJudge` (not yet implemented).
-    /// Used during per-subtask verification in the REPL loop for fast feedback.
+    /// Skips `global_only` criteria for fast per-subtask feedback in the REPL loop.
+    /// `LlmJudge` criteria are now evaluated locally when an LLM judge is available.
     pub async fn verify_subtask_local(
         &self,
         subtask: &DurableSubtask,
@@ -841,9 +841,6 @@ impl VerificationRunner {
             .iter()
             .filter(|c| {
                 if skip_heavy && c.global_only {
-                    return false;
-                }
-                if skip_heavy && matches!(c.verifier, VerifierKind::LlmJudge { .. }) {
                     return false;
                 }
                 true
@@ -5729,7 +5726,9 @@ mod tests {
             fallback_chain: vec![],
             tags: vec![],
             request_body_overrides: None,
+            prompt_cache_capability: None,
             thinking_capability: None,
+            context_window: None,
         };
         let config = CloudLlmConfig::from_resolved(resolved);
         assert_eq!(config.model, "gpt-4o-mini");

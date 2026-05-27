@@ -113,7 +113,7 @@ fn analyze_turn(
     trace: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace,
     idx: usize,
     total_turns: usize,
-    fuzzy_events: &[astra_runtime::observability_integration::FuzzyMatchEvent],
+    fuzzy_events: &[astra_runtime::observability::FuzzyMatchEvent],
 ) -> Value {
     let tb = &trace.token_budget;
     let sp = &trace.system_prompt;
@@ -129,21 +129,15 @@ fn analyze_turn(
         .collect();
     let fuzzy_matches = turn_fuzzy_events
         .iter()
-        .filter(|event| {
-            event.outcome == astra_runtime::observability_integration::FuzzyMatchOutcome::Matched
-        })
+        .filter(|event| event.outcome == astra_runtime::observability::FuzzyMatchOutcome::Matched)
         .count();
     let fuzzy_ambiguous = turn_fuzzy_events
         .iter()
-        .filter(|event| {
-            event.outcome == astra_runtime::observability_integration::FuzzyMatchOutcome::Ambiguous
-        })
+        .filter(|event| event.outcome == astra_runtime::observability::FuzzyMatchOutcome::Ambiguous)
         .count();
     let fuzzy_not_found = turn_fuzzy_events
         .iter()
-        .filter(|event| {
-            event.outcome == astra_runtime::observability_integration::FuzzyMatchOutcome::NotFound
-        })
+        .filter(|event| event.outcome == astra_runtime::observability::FuzzyMatchOutcome::NotFound)
         .count();
 
     // System prompt sub-components
@@ -318,8 +312,8 @@ fn analyze_turn(
 /// Multi-turn session analysis with trends and aggregation.
 fn analyze_session(
     traces: &[astra_turn_core::context_assembly_trace::ContextAssemblyTrace],
-    timings: &[astra_runtime::observability_integration::TurnTiming],
-    fuzzy_events: &[astra_runtime::observability_integration::FuzzyMatchEvent],
+    timings: &[astra_runtime::observability::TurnTiming],
+    fuzzy_events: &[astra_runtime::observability::FuzzyMatchEvent],
 ) -> Value {
     use std::collections::BTreeMap;
 
@@ -398,26 +392,21 @@ fn analyze_session(
 
     let fuzzy_matched = fuzzy_events
         .iter()
-        .filter(|event| {
-            event.outcome == astra_runtime::observability_integration::FuzzyMatchOutcome::Matched
-        })
+        .filter(|event| event.outcome == astra_runtime::observability::FuzzyMatchOutcome::Matched)
         .count();
     let fuzzy_ambiguous = fuzzy_events
         .iter()
-        .filter(|event| {
-            event.outcome == astra_runtime::observability_integration::FuzzyMatchOutcome::Ambiguous
-        })
+        .filter(|event| event.outcome == astra_runtime::observability::FuzzyMatchOutcome::Ambiguous)
         .count();
     let fuzzy_not_found = fuzzy_events
         .iter()
-        .filter(|event| {
-            event.outcome == astra_runtime::observability_integration::FuzzyMatchOutcome::NotFound
-        })
+        .filter(|event| event.outcome == astra_runtime::observability::FuzzyMatchOutcome::NotFound)
         .count();
     let mut fuzzy_by_strategy = BTreeMap::<String, usize>::new();
-    for event in fuzzy_events.iter().filter(|event| {
-        event.outcome == astra_runtime::observability_integration::FuzzyMatchOutcome::Matched
-    }) {
+    for event in fuzzy_events
+        .iter()
+        .filter(|event| event.outcome == astra_runtime::observability::FuzzyMatchOutcome::Matched)
+    {
         *fuzzy_by_strategy.entry(event.strategy.clone()).or_default() += 1;
     }
 

@@ -2,7 +2,7 @@
 //!
 //! At session end we:
 //!
-//! 1. **Purge working memory** tied to the session (same as before).
+//! 1. **Purge working memory** tied to the session.
 //! 2. **Write an `episodic` memory** summarising what happened — derived
 //!    from [`SessionFacts`] (deterministic, no LLM call). Replaces the
 //!    retired L1b narrative protocol.
@@ -157,7 +157,6 @@ pub async fn run_session_end_governance(
             eprintln!("[session-end] Failed to purge working memory: {e}");
         }
     }
-
     // ── 2. Persist episodic summary ────────────────────────────────
     if let Some(overview) = build_episode_overview(facts) {
         match client.store_episode(session_id, &overview).await {

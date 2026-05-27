@@ -21,7 +21,7 @@ mod enabled {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::turn::agentic_loop_host::AgenticLoopState;
+    use crate::turn::agentic_loop::host::AgenticLoopState;
 
     pub struct HarnessSlot {
         pub kernel: Option<Arc<dyn HarnessKernel>>,
@@ -29,11 +29,12 @@ mod enabled {
         pub(crate) session_start_unix_millis: u64,
         pub(crate) session_ended: bool,
         /// Registry reference for cleanup on session end (prevents resource leak).
-        pub(crate) registry: Option<crate::server::harness_handlers::HarnessSinkRegistry>,
+        pub(crate) registry: Option<crate::server::harness::handlers::HarnessSinkRegistry>,
         /// Session ID used to unregister from the registry on cleanup.
         pub(crate) session_id_for_cleanup: Option<String>,
         /// Concrete server sink reference for deferred user_id injection.
-        pub(crate) server_sink: Option<Arc<crate::server::harness_server_sink::ServerSnapshotSink>>,
+        pub(crate) server_sink:
+            Option<Arc<crate::server::harness::server_sink::ServerSnapshotSink>>,
     }
 
     impl HarnessSlot {
@@ -244,7 +245,7 @@ mod enabled {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::turn::agentic_loop_host::tests::make_state;
+        use crate::turn::agentic_loop::host::tests::make_state;
         use astra_harness::{InMemorySnapshotSink, StandardKernel, verifiers::BudgetVerifier};
 
         #[test]

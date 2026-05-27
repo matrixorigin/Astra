@@ -134,6 +134,18 @@ fn apply_optional_yaml_fields(
             qobj.insert("wire_model_name".into(), serde_json::json!(wire));
         }
     }
+    if let Some(cache_capability) = yaml_json(entry, "prompt_cache_capability") {
+        if cache_capability.is_object() {
+            let quirks = obj.entry("quirks").or_insert_with(|| serde_json::json!({}));
+            if let Some(qobj) = quirks.as_object_mut() {
+                qobj.insert("prompt_cache_capability".into(), cache_capability);
+            }
+        } else {
+            eprintln!(
+                "warning: prompt_cache_capability must be a JSON object; ignoring non-object value"
+            );
+        }
+    }
     if let Some(overrides) = yaml_json(entry, "request_body_overrides") {
         if overrides.is_object() {
             let quirks = obj.entry("quirks").or_insert_with(|| serde_json::json!({}));
@@ -794,5 +806,32 @@ mod tests {
         );
         assert_eq!(payload["architecture"], "transformer");
         assert!(payload["pricing"]["prompt"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn create_payload_routes_prompt_cache_capability_into_quirks() {
+        let entry = yaml(
+            r#"
+            name: strict-openai-compatible
+            provider: openai
+            api_key: k
+            prompt_cache_capability:
+              protocol: strict_history_match
+              volatile_placement: current_user_only
+              reuse_scope: conversation_turns
+            "#,
+        );
+
+        let payload =
+            build_model_create_payload(&entry, "strict-openai-compatible", "openai", "k", None);
+
+        assert_eq!(
+            payload["quirks"]["prompt_cache_capability"],
+            serde_json::json!({
+                "protocol": "strict_history_match",
+                "volatile_placement": "current_user_only",
+                "reuse_scope": "conversation_turns",
+            })
+        );
     }
 }

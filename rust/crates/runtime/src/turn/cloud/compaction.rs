@@ -244,6 +244,9 @@ pub struct CompactResult {
     pub boundary: Option<CompactBoundary>,
     /// The tier that was applied.
     pub tier: CompactionTier,
+    /// Structured current-session memory routed separately through the
+    /// context pipeline instead of being injected as a synthetic history blob.
+    pub session_memory_context: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +356,7 @@ pub fn compact_tiered_with_result(
             messages: messages.to_vec(),
             boundary: None,
             tier,
+            session_memory_context: None,
         };
     }
 
@@ -388,6 +392,7 @@ pub fn compact_tiered_with_result(
             messages: messages.to_vec(),
             boundary: None,
             tier,
+            session_memory_context: None,
         };
     }
 
@@ -537,6 +542,7 @@ pub fn compact_tiered_with_result(
         messages: compacted,
         boundary: Some(boundary),
         tier,
+        session_memory_context: None,
     }
 }
 

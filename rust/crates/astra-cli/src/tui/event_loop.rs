@@ -18,8 +18,14 @@
 
 use std::{sync::Arc, time::Duration};
 
+#[cfg(test)]
+use astra_services::session_journal::ToolCallRecord;
+use astra_services::session_journal::{JournalEvent, JournalEventType};
+use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
+
+use crate::explain_dag::{ExplainTurnMeta, render_explain_dag};
 
 use super::app_event::TuiAppEvent;
 use super::bottom_pane::{BottomPane, BottomPaneAction};
@@ -28,6 +34,7 @@ use super::draw::{active_viewport, do_draw};
 use super::event::{TuiEvent, TuiEventStream};
 use super::frame_requester::FrameRequester;
 use super::history_cell::HistoryCell;
+use super::render::line_utils::sanitize_lines_for_terminal;
 use super::task_status::TaskStatus;
 use super::terminal::TerminalGuard;
 use super::{
@@ -102,11 +109,80 @@ fn render_history_batch_lines(
 fn surface_status_line_system_cell(event: &TuiAppEvent, chat_widget: &mut chat_widget::ChatWidget) {
     if let TuiAppEvent::PermissionAutoApproved { tool, reason } = event {
         chat_widget.commit_system(history_cell::system::SystemCell::info(
-            astra_turn_core::permission_notice::format_auto_approved_permission(tool, reason)
+            astra_turn_core::permission::notice::format_auto_approved_permission(tool, reason)
                 .trim()
                 .to_string(),
         ));
     };
+}
+
+fn context_trace_count(state: &crate::SessionState) -> usize {
+    state
+        .observability_session
+        .as_ref()
+        .map(|session| {
+            let guard = session.read().unwrap_or_else(|e| e.into_inner());
+            guard.context_traces.len()
+        })
+        .unwrap_or(0)
+}
+
+fn total_input_tokens(
+    fresh_prompt_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+) -> u64 {
+    fresh_prompt_tokens
+        .saturating_add(cache_read_tokens)
+        .saturating_add(cache_creation_tokens)
+}
+
+fn latest_context_trace_since(
+    state: &crate::SessionState,
+    baseline_cached_turn_id: Option<&str>,
+    baseline_count: usize,
+) -> Option<ContextAssemblyTrace> {
+    if let Some(trace) = state.latest_context_assembly_trace.as_ref()
+        && baseline_cached_turn_id != Some(trace.turn_id.as_str())
+    {
+        return Some(trace.clone());
+    }
+    let session = state.observability_session.as_ref()?;
+    let guard = session.read().unwrap_or_else(|e| e.into_inner());
+    (guard.context_traces.len() > baseline_count)
+        .then(|| guard.context_traces.last().cloned())
+        .flatten()
+}
+
+fn current_turn_event(state: &crate::SessionState) -> Option<&JournalEvent> {
+    state.last_turn_event.as_ref().filter(|event| {
+        event.event_type == JournalEventType::Turn && event.turn == Some(state.turn)
+    })
+}
+
+fn commit_explain_dag(
+    state: &crate::SessionState,
+    explain_items: &[serde_json::Value],
+    baseline_cached_turn_id: Option<&str>,
+    baseline_context_traces: usize,
+    chat_widget: &mut chat_widget::ChatWidget,
+) -> bool {
+    if state.explain == crate::ExplainMode::Off {
+        return false;
+    }
+    let trace = latest_context_trace_since(state, baseline_cached_turn_id, baseline_context_traces);
+    let turn_event = current_turn_event(state);
+    let meta = turn_event.map(ExplainTurnMeta::from_journal_event);
+    let Some(text) = render_explain_dag(
+        trace.as_ref(),
+        meta.as_ref(),
+        explain_items,
+        state.explain == crate::ExplainMode::Verbose,
+    ) else {
+        return false;
+    };
+    chat_widget.commit_system(history_cell::system::SystemCell::info(text));
+    true
 }
 
 fn reopen_agents_view(
@@ -426,7 +502,7 @@ fn refresh_footer_from_state(
         .session_id
         .as_ref()
         .map(|sid| sid[..8.min(sid.len())].to_string());
-    bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
+    bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
 }
 
 /// Replay a session's JSONL transcript into a fresh `ChatWidget`,
@@ -564,13 +640,18 @@ pub(crate) async fn run_tui_session(
     if let Some(ref sid) = state.session_id {
         bottom_pane.footer.session_id = Some(sid[..8.min(sid.len())].to_string());
     }
-    bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
+    bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
     // Lock-free observer of `perm_manager.mode()` so the inner-tick
     // path can refresh the status-line chip while the agentic loop
     // holds `&mut state`. Without this, mid-turn pivots
     // (`exit_plan_mode` flipping Plan → Auto on the next-turn
     // boundary) only land on screen when the outer select wakes up.
     let perm_mode_mirror = state.perm_manager.mode_mirror_handle();
+    // Wire the same mirror into the footer so every frame render
+    // reads the live mode from the atomic mirror rather than the
+    // cached `permission_mode` field. This eliminates the ~50 ms
+    // staleness window that the tick-based self-healing had.
+    bottom_pane.footer.set_mode_mirror(perm_mode_mirror.clone());
 
     // Load skill items for $ mention popup
     {
@@ -603,6 +684,14 @@ pub(crate) async fn run_tui_session(
             })
             .collect();
         bottom_pane.set_slash_items(slash_items);
+
+        // Seed dynamic MCP completions from any servers already connected at
+        // startup (e.g. from a resumed session or fast-connecting transports).
+        let mcp_extras = {
+            let mgr = state.mcp_manager.read().await;
+            crate::slash_mcp::build_mcp_extra_subcommands(&mgr)
+        };
+        bottom_pane.update_mcp_completions(mcp_extras);
     }
 
     // Install a filesystem-backed file provider for the `@`-mention menu,
@@ -849,7 +938,7 @@ pub(crate) async fn run_tui_session(
                             let h = size.map(|s| s.height).unwrap_or(0);
                             let mut lines: Vec<ratatui::text::Line<'static>> = Vec::new();
                             for cell in chat_widget.history() {
-                                lines.extend(cell.display_lines(w));
+                                lines.extend(sanitize_lines_for_terminal(cell.display_lines(w)));
                                 lines.push(ratatui::text::Line::default());
                             }
                             if !lines.is_empty() {
@@ -1226,6 +1315,17 @@ pub(crate) async fn run_tui_session(
                                         board_user_pin = None;
                                     }
                                     refresh_footer_from_state(&mut bottom_pane, &state);
+                                    // After any /mcp command refresh the dynamic
+                                    // server/tool completions so that a freshly
+                                    // added or removed server is immediately
+                                    // visible in the tab-completion menu.
+                                    if text.starts_with("/mcp") {
+                                        let mcp_extras = {
+                                            let mgr = state.mcp_manager.read().await;
+                                            crate::slash_mcp::build_mcp_extra_subcommands(&mgr)
+                                        };
+                                        bottom_pane.update_mcp_completions(mcp_extras);
+                                    }
                                     if let Some(before) = pre_plan_snapshot.as_ref() {
                                         commit_plan_transition_notice(
                                             &mut chat_widget,
@@ -1560,8 +1660,14 @@ pub(crate) async fn run_tui_session(
                                     let _pre_cost = state.total_session_cost;
                                     let pre_cache_read = state.total_cache_read_tokens;
                                     let pre_cache_creation = state.total_cache_creation_tokens;
+                                    let pre_cached_context_trace_turn_id = state
+                                        .latest_context_assembly_trace
+                                        .as_ref()
+                                        .map(|trace| trace.turn_id.clone());
+                                    let pre_context_trace_count = context_trace_count(&state);
                                     let mut turn_tool_count: u32 = 0;
                                     let mut turn_ttft: Option<std::time::Instant> = None;
+                                    let mut explain_items: Vec<serde_json::Value> = Vec::new();
                                     let mut ctrl_b_pressed = false;
                                     // Phase 3b.3c: prime the bash detach slot for this
                                     // turn. The bash runner takes the handle on entry;
@@ -1628,7 +1734,7 @@ pub(crate) async fn run_tui_session(
                                                                 // catches up.
                                                                 perm_mode_mirror.stage(next_mode);
                                                                 bottom_pane.footer.permission_mode =
-                                                                    Some(format!("{}", next_mode));
+                                                                    Some(next_mode);
                                                                 // Reflect the staged mode in the approval queue
                                                                 // immediately so the chip and pending count
                                                                 // agree. perm_manager.mode() will catch up at
@@ -1979,6 +2085,10 @@ pub(crate) async fn run_tui_session(
                                                         TuiAppEvent::ToolStarted { .. } => {
                                                             turn_tool_count += 1;
                                                         }
+                                                        TuiAppEvent::ExplainReport(items) if !items.is_empty() => {
+                                                            explain_items.extend(items.clone());
+                                                            continue;
+                                                        }
                                                         _ => {}
                                                     }
                                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
@@ -2055,6 +2165,15 @@ pub(crate) async fn run_tui_session(
                                 }
                                                  }
                                                 Some(req) = ask_user_rx.recv() => {
+                                                    // Draft transition: show a brief
+                                                    // indicator before the ask-user form
+                                                    // opens so the user isn't surprised by
+                                                    // a sudden modal.
+                                                    chat_widget.commit_system(
+                                                        crate::tui::history_cell::system::SystemCell::response(
+                                                            "🤔 The agent needs your input — opening question…",
+                                                        ),
+                                                    );
                                                     bottom_pane.enqueue_ask_user(req.prompt, req.response_tx);
                                                     frame_requester.schedule_frame();
                                                     {
@@ -2095,9 +2214,9 @@ pub(crate) async fn run_tui_session(
                                                     // here would clash. Catches turn-boundary
                                                     // pivots (e.g. exit_plan_mode → Auto) within
                                                     // one inner tick.
-                                                    let live_mode = format!("{}", perm_mode_mirror.current());
-                                                    if bottom_pane.footer.permission_mode.as_deref()
-                                                        != Some(live_mode.as_str())
+                                                    let live_mode = perm_mode_mirror.current();
+                                                    if bottom_pane.footer.permission_mode
+                                                        != Some(live_mode)
                                                     {
                                                         bottom_pane.footer.permission_mode = Some(live_mode);
                                                     }
@@ -2135,6 +2254,10 @@ pub(crate) async fn run_tui_session(
                                                     TuiAppEvent::ToolStarted { .. } => {
                                                         turn_tool_count += 1;
                                                     }
+                                                    TuiAppEvent::ExplainReport(items) if !items.is_empty() => {
+                                                        explain_items.extend(items.clone());
+                                                        continue;
+                                                    }
                                                     _ => {}
                                                 }
                                                 if let Some(new_ev) = chat_widget::translate(
@@ -2152,6 +2275,18 @@ pub(crate) async fn run_tui_session(
                                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
                                             }
                                         }
+                                    }
+
+                                    if turn_result.is_ok()
+                                        && commit_explain_dag(
+                                            &state,
+                                            &explain_items,
+                                            pre_cached_context_trace_turn_id.as_deref(),
+                                            pre_context_trace_count,
+                                            &mut chat_widget,
+                                        )
+                                    {
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
                                     }
 
                                     // Turn end — ChatWidget handles any
@@ -2193,7 +2328,7 @@ pub(crate) async fn run_tui_session(
                                     if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.clone()); }
                                     if let Some(ref s) = state.session_id { bottom_pane.footer.session_id = Some(s[..8.min(s.len())].to_string()); }
                                     bottom_pane.footer.token_usage = Some(format!("{}↑ {}↓", state.total_prompt_tokens, state.total_completion_tokens));
-                                    bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
+                                    bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
                                     // Footer "N% (Mk)" chip shows the CONTEXT WINDOW for
                                     // the most recent turn — i.e. how many input tokens
                                     // the model saw this turn, not cumulative session
@@ -2206,11 +2341,13 @@ pub(crate) async fn run_tui_session(
                                     let turn_completion = state.total_completion_tokens - pre_completion_tokens;
                                     let turn_cache_read = state.total_cache_read_tokens - pre_cache_read;
                                     let turn_cache_creation = state.total_cache_creation_tokens - pre_cache_creation;
-                                    // turn_prompt already includes cache_read and
-                                    // cache_creation tokens — no need to add them
-                                    // again.
+                                    let turn_input = total_input_tokens(
+                                        turn_prompt,
+                                        turn_cache_read,
+                                        turn_cache_creation,
+                                    );
                                     bottom_pane.footer.token_budget =
-                                        Some((turn_prompt, 200_000));
+                                        Some((turn_input, 200_000));
 
                                     // Turn summary: dispatch to ChatWidget,
                                     // which builds the TurnSummaryCell and
@@ -2224,7 +2361,7 @@ pub(crate) async fn run_tui_session(
                                         let ctx = chat_widget::TurnContext {
                                             elapsed_ms: Some(elapsed.as_millis() as u64),
                                             ttft_ms,
-                                            tokens_in: Some(turn_prompt + turn_cache_read + turn_cache_creation),
+                                            tokens_in: Some(turn_input),
                                             tokens_out: Some(turn_completion),
                                             // Drive the `💾 N%` segment:
                                             // hit rate = cache_read / total_input.
@@ -2538,6 +2675,9 @@ pub(crate) async fn run_tui_session(
                                                 items,
                                                 Some(format!("Select thinking mode for {base_model}:")),
                                             )
+                                            .with_footer_hint(
+                                                slash_dispatch::MODEL_THINKING_PICKER_FOOTER_HINT,
+                                            )
                                             .with_result_prefix(prefix);
                                             bottom_pane.push_view(Box::new(view));
                                         }
@@ -2671,7 +2811,7 @@ pub(crate) async fn run_tui_session(
                                     bottom_pane.sync_popups();
                                     // Update footer after view actions (model/permission may change)
                                     if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.clone()); }
-                                    bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
+                                    bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
                                     // Clear the deferred-flush flag for any
                                     // ViewCompleted-with-name path that fell
                                     // through to here without an explicit
@@ -2809,9 +2949,8 @@ pub(crate) async fn run_tui_session(
                 // happens to call `refresh_footer_from_state`. Cheap:
                 // a string format and an Option<u64> compare per 50ms.
                 let live_mode_enum = state.perm_manager.mode();
-                let live_mode = format!("{live_mode_enum}");
-                if bottom_pane.footer.permission_mode.as_deref() != Some(live_mode.as_str()) {
-                    bottom_pane.footer.permission_mode = Some(live_mode);
+                if bottom_pane.footer.permission_mode != Some(live_mode_enum) {
+                    bottom_pane.footer.permission_mode = Some(live_mode_enum);
                     // Mode just shifted (driven by host-side
                     // pull_mode_from_mirror after exit_plan_mode
                     // overlay or mid-turn Shift+Tab). Re-evaluate
@@ -3051,6 +3190,8 @@ fn handle_app_event(
         TuiAppEvent::AgentLive(_)
         | TuiAppEvent::AgentLiveBatch(_)
         | TuiAppEvent::StatusLine(_)
+        | TuiAppEvent::ExplainReport(_)
+        | TuiAppEvent::VerdictReport(_)
         | TuiAppEvent::PermissionAutoApproved { .. } => {}
         TuiAppEvent::TurnComplete | TuiAppEvent::TurnError(_) => {
             bottom_pane.set_task_status(TaskStatus::Idle);
@@ -3505,6 +3646,12 @@ mod tests {
     }
 
     #[test]
+    fn total_input_tokens_includes_cache_buckets_exactly_once() {
+        assert_eq!(total_input_tokens(1200, 800, 100), 2100);
+        assert_eq!(total_input_tokens(0, 5000, 0), 5000);
+    }
+
+    #[test]
     fn non_deferred_slash_dispatch_clears_pending_pair_state() {
         assert!(!next_pending_deferred_slash_flush(
             &slash_dispatch::SlashResult::Handled
@@ -3564,5 +3711,224 @@ mod tests {
             .collect();
         assert!(rendered[0].contains("/allow"));
         assert!(rendered[1].contains("Mode → auto"));
+    }
+
+    #[test]
+    fn render_explain_dag_formats_rounds_cache_and_batches() {
+        let mut trace = ContextAssemblyTrace {
+            turn_id: "turn-2".into(),
+            session_id: "sess-1".into(),
+            ..Default::default()
+        };
+        trace.system_prompt.total_tokens = 3943;
+        trace.token_budget.total_used = 7658;
+        trace.token_budget.max_tokens = 160_000;
+        trace.token_budget.history_tokens = 7;
+        trace.token_budget.tool_schema_tokens = 3708;
+        trace
+            .history
+            .turns_retained
+            .push(astra_turn_core::context_assembly_trace::TurnRetention {
+                turn_index: 0,
+                role: "assistant".into(),
+                tokens: 7,
+                has_tool_calls: false,
+            });
+        trace.memory.candidates_considered = 5;
+        trace.memory.retrieval_latency_ms = 51;
+        trace.tools.tools_available = 27;
+        trace.tools.selection_strategy = "registry".into();
+        trace
+            .tools
+            .tools_selected
+            .push(astra_turn_core::context_assembly_trace::ToolSelected {
+                tool_name: "bash".into(),
+                score: 1.0,
+                tokens: 243,
+                selection_factors: Vec::new(),
+            });
+        trace
+            .tools
+            .tools_selected
+            .push(astra_turn_core::context_assembly_trace::ToolSelected {
+                tool_name: "read_file".into(),
+                score: 0.9,
+                tokens: 128,
+                selection_factors: Vec::new(),
+            });
+        let mut turn_event = astra_services::session_journal::JournalEvent::turn(
+            Some("sess-1"),
+            2,
+            Some("gpt-5"),
+            "hi",
+            "done",
+            2,
+            10_023,
+            32,
+            2_930,
+        )
+        .with_cache_tokens(900, 200)
+        .with_tool_calls(vec![
+            ToolCallRecord {
+                tool_call_id: Some("call-1".into()),
+                name: "bash".into(),
+                ok: true,
+                ms: 3000,
+                batch_id: Some("parallel-1".into()),
+                parallel: Some(true),
+                round: Some(0),
+                start_offset_ms: Some(40),
+                args_preview: Some("{\"command\":\"git status\"}".into()),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                tool_call_id: Some("call-2".into()),
+                name: "read_file".into(),
+                ok: true,
+                ms: 48,
+                batch_id: Some("parallel-1".into()),
+                parallel: Some(true),
+                round: Some(0),
+                file_path: Some("README.md".into()),
+                ..Default::default()
+            },
+        ]);
+        turn_event.ttft_ms = Some(1900);
+        turn_event.context_ms = Some(88);
+        turn_event.memoria_ms = Some(51);
+        turn_event.total_llm_ms = Some(2930);
+        turn_event.total_tool_ms = Some(3048);
+        turn_event.llm_rounds = Some(1);
+        let explain_items = vec![serde_json::json!({
+            "total_ms": 2930,
+            "prompt_tokens": 10023,
+            "completion_tokens": 32,
+            "steps": [{
+                "step": "llm",
+                "duration_ms": 2930,
+                "in": 10023,
+                "cached_in": 900,
+                "cache_write": 200,
+                "out": 32,
+                "tool_calls": 2
+            }],
+            "routing": {
+                "intent": "default",
+                "confidence": 0.0,
+                "tier": 0,
+                "skipped": false,
+                "reason": ""
+            }
+        })];
+
+        let meta = ExplainTurnMeta::from_journal_event(&turn_event);
+        let text =
+            render_explain_dag(Some(&trace), Some(&meta), &explain_items, false).expect("text");
+        assert!(text.contains("Explain Analyze DAG — turn-2"));
+        assert!(text.contains("context_assembly ms=88ms budget=7658/160000 (4.8%)"));
+        assert!(text.contains(
+            "llm ms=2.9s fresh_in=10023 cache_read=900 cache_write=200 out=32 tool_calls=2"
+        ));
+        assert!(text.contains("batch[parallel-1] parallel tools=2"));
+        assert!(text.contains("bash ok ms=3.0s offset=40ms id=call-1"));
+        assert!(text.contains("read_file ok ms=48ms id=call-2 path=README.md"));
+    }
+
+    #[test]
+    fn commit_explain_dag_commits_trace_to_history() {
+        let mut state = crate::SessionState::default();
+        state.explain = crate::ExplainMode::On;
+        state.turn = 9;
+        state.latest_context_assembly_trace = Some(ContextAssemblyTrace {
+            turn_id: "turn-9".into(),
+            session_id: "sid-trace".into(),
+            token_budget: astra_turn_core::context_assembly_trace::TokenBudgetTrace {
+                total_used: 1024,
+                max_tokens: 4096,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        state.last_turn_event = Some(astra_services::session_journal::JournalEvent::turn(
+            Some("sid-trace"),
+            9,
+            Some("gpt-5"),
+            "hi",
+            "hello",
+            0,
+            12,
+            8,
+            1200,
+        ));
+        let mut widget = chat_widget::ChatWidget::new("");
+
+        assert!(commit_explain_dag(&state, &[], None, 0, &mut widget));
+
+        let sys = widget
+            .history()
+            .last()
+            .and_then(|cell| {
+                cell.as_any_ref()
+                    .downcast_ref::<history_cell::system::SystemCell>()
+            })
+            .expect("expected a committed system cell");
+        assert!(sys.message().contains("Explain Analyze DAG — turn-9"));
+    }
+
+    #[test]
+    fn commit_explain_dag_skips_unchanged_cached_trace() {
+        let mut state = crate::SessionState::default();
+        state.explain = crate::ExplainMode::On;
+        state.latest_context_assembly_trace = Some(ContextAssemblyTrace {
+            turn_id: "turn-9".into(),
+            session_id: "sid-trace".into(),
+            ..Default::default()
+        });
+        let mut widget = chat_widget::ChatWidget::new("");
+
+        assert!(!commit_explain_dag(
+            &state,
+            &[],
+            Some("turn-9"),
+            0,
+            &mut widget,
+        ));
+        assert!(widget.history().is_empty());
+    }
+
+    #[test]
+    fn commit_explain_dag_preserves_unknown_cache_write_marker() {
+        let mut state = crate::SessionState::default();
+        state.explain = crate::ExplainMode::On;
+        state.turn = 4;
+        state.last_turn_event = Some(astra_services::session_journal::JournalEvent::turn(
+            Some("sid-trace"),
+            4,
+            Some("gpt-5"),
+            "hi",
+            "hello",
+            0,
+            12,
+            8,
+            1200,
+        ));
+        state
+            .last_turn_event
+            .as_mut()
+            .expect("turn event")
+            .cache_read_tokens = Some(144);
+        let mut widget = chat_widget::ChatWidget::new("");
+
+        assert!(commit_explain_dag(&state, &[], None, 0, &mut widget));
+
+        let sys = widget
+            .history()
+            .last()
+            .and_then(|cell| {
+                cell.as_any_ref()
+                    .downcast_ref::<history_cell::system::SystemCell>()
+            })
+            .expect("expected a committed system cell");
+        assert!(sys.message().contains("cache_write=?"));
     }
 }

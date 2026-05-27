@@ -90,26 +90,33 @@ pub(crate) struct CompactionEventItem {
 
 /// Extra detail for the Memory section.  Populated directly from
 /// `MemoryRetrievalTrace` — query, candidates considered, rejection
-/// list with reasons, retrieval latency.  Plus `repository_memories`
-/// from the system prompt (distinct from `memories` which covers
-/// retrieval-pipeline selections) so `.astra/memories` files get
-/// their own rows.
+/// list with reasons, retrieval latency. Direct prompt injections are
+/// tracked separately from retrieval-selected memories so `/context`
+/// can distinguish "retrieved this turn" from "injected anyway."
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct MemoryFocus {
     pub query: String,
     pub candidates_considered: u32,
     pub retrieval_latency_ms: u64,
     pub rejected: Vec<MemoryRejectionItem>,
-    pub repository: Vec<RepositoryMemoryItem>,
+    pub repository_injected: Vec<InjectedMemoryItem>,
+    pub session_injected: Option<InjectedMemoryItem>,
 }
 
 impl MemoryFocus {
+    pub fn has_retrieval_activity(&self) -> bool {
+        !self.query.is_empty()
+            || self.candidates_considered > 0
+            || self.retrieval_latency_ms > 0
+            || !self.rejected.is_empty()
+    }
+
+    pub fn has_prompt_injections(&self) -> bool {
+        !self.repository_injected.is_empty() || self.session_injected.is_some()
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.query.is_empty()
-            && self.candidates_considered == 0
-            && self.retrieval_latency_ms == 0
-            && self.rejected.is_empty()
-            && self.repository.is_empty()
+        !self.has_retrieval_activity() && !self.has_prompt_injections()
     }
 }
 
@@ -122,12 +129,18 @@ pub(crate) struct MemoryRejectionItem {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RepositoryMemoryItem {
+pub(crate) struct InjectedMemoryItem {
+    pub source_label: String,
     pub memory_id: String,
     pub memory_type: String,
     pub tokens: u32,
     pub relevance: f64,
     pub preview: String,
+}
+
+impl InjectedMemoryItem {
+    pub(crate) const LABEL_REPOSITORY: &'static str = "Repository memory";
+    pub(crate) const LABEL_SESSION: &'static str = "Session memory";
 }
 
 /// A single bit from `PromptContextSignals` or `PromptGuidanceSignals`
@@ -782,12 +795,13 @@ fn build_memory_focus(trace: &ContextAssemblyTrace) -> MemoryFocus {
             reason: render_rejection_reason(&r.rejection_reason),
         })
         .collect();
-    let repository: Vec<RepositoryMemoryItem> = trace
+    let repository_injected: Vec<InjectedMemoryItem> = trace
         .system_prompt
         .repository_memories
         .iter()
         .filter(|mi: &&MemoryInjection| mi.tokens > 0)
-        .map(|mi| RepositoryMemoryItem {
+        .map(|mi| InjectedMemoryItem {
+            source_label: InjectedMemoryItem::LABEL_REPOSITORY.to_string(),
             memory_id: mi.memory_id.clone(),
             memory_type: mi.memory_type.clone(),
             tokens: mi.tokens,
@@ -795,12 +809,26 @@ fn build_memory_focus(trace: &ContextAssemblyTrace) -> MemoryFocus {
             preview: mi.content_preview.clone(),
         })
         .collect();
+    let session_injected = trace
+        .system_prompt
+        .session_memory_injected
+        .as_ref()
+        .filter(|mi| mi.tokens > 0)
+        .map(|mi| InjectedMemoryItem {
+            source_label: InjectedMemoryItem::LABEL_SESSION.to_string(),
+            memory_id: mi.memory_id.clone(),
+            memory_type: mi.memory_type.clone(),
+            tokens: mi.tokens,
+            relevance: mi.relevance_score,
+            preview: mi.content_preview.clone(),
+        });
     MemoryFocus {
         query: m.query.clone(),
         candidates_considered: m.candidates_considered,
         retrieval_latency_ms: m.retrieval_latency_ms,
         rejected,
-        repository,
+        repository_injected,
+        session_injected,
     }
 }
 

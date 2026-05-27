@@ -27,6 +27,36 @@ use crate::turn::cloud::memoria_compact::{
 };
 use crate::turn::prompt_cache::{PromptCacheConfig, apply_anthropic_cache_metadata};
 
+pub(crate) fn session_memory_entry_for_pipeline(
+    content: Option<&str>,
+    turn_number: u32,
+) -> Option<astra_turn_core::context_sources::MemoryEntry> {
+    let content = content?.trim();
+    if content.is_empty() {
+        return None;
+    }
+    Some(
+        astra_turn_core::context_sources::MemoryEntry::new(content)
+            .with_source("session_memory.compaction")
+            .with_freshness_turn(turn_number),
+    )
+}
+
+pub(crate) fn rerun_with_distinct_session_memory_entry<T>(
+    content: Option<&str>,
+    existing: Option<&astra_turn_core::context_sources::MemoryEntry>,
+    turn_number: u32,
+    rerun: impl FnOnce(astra_turn_core::context_sources::MemoryEntry) -> T,
+) -> Option<T> {
+    let entry = session_memory_entry_for_pipeline(content, turn_number)?;
+    if existing.is_some_and(|current| {
+        current.content_hash == entry.content_hash && current.content == entry.content
+    }) {
+        return None;
+    }
+    Some(rerun(entry))
+}
+
 /// Session-level context that Memoria compaction needs. Bundled into one
 /// struct so callers don't pass a long list of positional arguments — each
 /// field is named and independently testable.
@@ -135,9 +165,11 @@ impl<'a> MemoriaContext<'a> {
                     .unwrap_or(50)
             })
             .sum();
-        let mut all_msgs = system_messages.to_vec();
-        all_msgs.extend(messages.iter().cloned());
-        let cache_est = crate::prompts::estimate_tokens_cache_aware(&all_msgs, tool_schema_tokens);
+        let cache_est = crate::prompts::estimate_tokens_cache_aware_split(
+            system_messages,
+            messages,
+            tool_schema_tokens,
+        );
 
         let resolved = overrides.apply(ResolvedBudget {
             budget_chars: budget.effective_input_limit() * 4,
@@ -306,10 +338,11 @@ fn is_completion_signal(content: &str) -> bool {
 /// 5. Invoked-skill attachments (server path only).
 /// 6. Recent-file attachments (server path only).
 /// 7. `apply_anthropic_cache_metadata` (Anthropic path only).
+#[cfg(test)]
 pub(crate) fn assemble_llm_messages(
     system_messages: Vec<Value>,
     volatile_preamble: Vec<Value>,
-    drained_volatile: Vec<crate::turn::agentic_loop_host::VolatileInjection>,
+    drained_volatile: Vec<crate::turn::agentic_loop::host::VolatileInjection>,
     compacted_messages: Vec<Value>,
     attachments: &PostCompactAttachments<'_>,
     session_id: &str,
@@ -317,6 +350,42 @@ pub(crate) fn assemble_llm_messages(
     model_name: &str,
     cache_cfg: &PromptCacheConfig,
 ) -> Vec<Value> {
+    assemble_llm_messages_with_cache_capability(
+        system_messages,
+        volatile_preamble,
+        drained_volatile,
+        compacted_messages,
+        attachments,
+        session_id,
+        provider,
+        model_name,
+        None,
+        cache_cfg,
+    )
+}
+
+pub(crate) fn assemble_llm_messages_with_cache_capability(
+    system_messages: Vec<Value>,
+    volatile_preamble: Vec<Value>,
+    drained_volatile: Vec<crate::turn::agentic_loop::host::VolatileInjection>,
+    compacted_messages: Vec<Value>,
+    attachments: &PostCompactAttachments<'_>,
+    session_id: &str,
+    provider: &str,
+    model_name: &str,
+    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+    cache_cfg: &PromptCacheConfig,
+) -> Vec<Value> {
+    let cache_cap =
+        astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider_model(
+            cache_capability,
+            provider,
+            model_name,
+        );
+    let suppress_volatile = matches!(
+        cache_cap.volatile_placement,
+        astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
+    );
     let mut llm_messages = system_messages;
     llm_messages.extend(compacted_messages);
 
@@ -326,9 +395,13 @@ pub(crate) fn assemble_llm_messages(
     // `state.messages[]` for volatile content, so `messages[]` stays byte-
     // stable across rounds — the property Anthropic / DeepSeek prompt
     // caches rely on.
-    let mut volatile_preamble = volatile_preamble;
+    let mut volatile_preamble = if suppress_volatile {
+        Vec::new()
+    } else {
+        volatile_preamble
+    };
     let drained_text = render_drained_volatile(&drained_volatile);
-    if !drained_text.is_empty() {
+    if !suppress_volatile && !drained_text.is_empty() {
         volatile_preamble.push(serde_json::json!({
             "role": "user",
             "content": drained_text,
@@ -342,7 +415,7 @@ pub(crate) fn assemble_llm_messages(
     // Once zero producers call `state.messages.push(...)` with runtime
     // content, this pass becomes a no-op and can be removed.
     let harvested = consolidate_mid_history_volatile_injections(&mut llm_messages);
-    if !harvested.is_empty() {
+    if !suppress_volatile && !harvested.is_empty() {
         volatile_preamble.push(serde_json::json!({
             "role": "user",
             "content": harvested,
@@ -352,6 +425,7 @@ pub(crate) fn assemble_llm_messages(
     // Attach volatile content only at the true tail. Rewriting a historical
     // user message while assistant/tool messages trail it mutates mid-history
     // bytes and can zero prefix-cache hits on multi-round tool loops.
+    let mut synthetic_tail_start: Option<usize> = None;
     let mut synthetic_tail_end: Option<usize> = None;
     if !volatile_preamble.is_empty() {
         let volatile_text: String = volatile_preamble
@@ -374,6 +448,7 @@ pub(crate) fn assemble_llm_messages(
                     .unwrap_or("");
                 last_user["content"] = Value::String(format!("{volatile_text}\n\n{existing}"));
             } else if tail_role == Some("tool") {
+                synthetic_tail_start = Some(llm_messages.len());
                 llm_messages.push(serde_json::json!({
                     "role": "assistant",
                     "content": "Understood.",
@@ -386,6 +461,7 @@ pub(crate) fn assemble_llm_messages(
             } else {
                 // No tail user available — append one synthetic tail reminder
                 // instead of rewriting a historical user message.
+                synthetic_tail_start = Some(llm_messages.len());
                 llm_messages.push(serde_json::json!({"role": "user", "content": volatile_text}));
                 synthetic_tail_end = Some(llm_messages.len());
             }
@@ -413,12 +489,24 @@ pub(crate) fn assemble_llm_messages(
         llm_messages.extend(file_messages);
     }
 
-    // Skip annotation only when the tail is still the synthetic reminder
-    // (no real attachment landed after it). When attachments extend the
-    // message list past the synthetic tail, the real tail can be annotated.
-    let last_is_synthetic_tail = synthetic_tail_end.is_some_and(|end| end == llm_messages.len());
-    if cache_cfg.should_annotate() && !last_is_synthetic_tail {
-        apply_anthropic_cache_metadata(&mut llm_messages, cache_cfg, session_id);
+    // When the synthetic tail is still the final suffix (no attachments landed
+    // after it), place the message-level cache marker on the last REAL message
+    // before the synthetic assistant/user reminder pair. Otherwise the
+    // synthesized reminder would consume the only message marker and we'd fall
+    // back to caching just system+tools on every tool-loop round.
+    let synthetic_tail_is_final = synthetic_tail_end.is_some_and(|end| end == llm_messages.len());
+    if cache_cfg.should_annotate() {
+        if synthetic_tail_is_final {
+            if let Some(prefix_end) = synthetic_tail_start {
+                apply_anthropic_cache_metadata(
+                    &mut llm_messages[..prefix_end],
+                    cache_cfg,
+                    session_id,
+                );
+            }
+        } else {
+            apply_anthropic_cache_metadata(&mut llm_messages, cache_cfg, session_id);
+        }
     }
     llm_messages
 }
@@ -436,7 +524,7 @@ pub(crate) fn assemble_llm_messages(
 /// function preserves insertion order so if multiple kinds were queued
 /// they come out in the order they were produced.
 pub(crate) fn render_drained_volatile(
-    drained: &[crate::turn::agentic_loop_host::VolatileInjection],
+    drained: &[crate::turn::agentic_loop::host::VolatileInjection],
 ) -> String {
     let mut out = String::new();
     for inj in drained {
@@ -579,6 +667,10 @@ mod tests {
         PromptCacheConfig::latch("openai", "gpt-4")
     }
 
+    fn anthropic_cache_cfg() -> PromptCacheConfig {
+        PromptCacheConfig::latch("anthropic", "claude-sonnet-4")
+    }
+
     #[test]
     fn budget_overrides_default_is_all_none() {
         // Default means "use the context's model-derived budget knobs" — the
@@ -617,6 +709,36 @@ mod tests {
         assert_eq!(merged.keep_recent_turns, 4);
         assert_eq!(merged.current_tokens, 8_888);
         assert_eq!(merged.tier, CompactionTier::AggressivePrune);
+    }
+
+    #[test]
+    fn rerun_with_distinct_session_memory_entry_skips_identical_content() {
+        let current = session_memory_entry_for_pipeline(Some("same memory"), 7)
+            .expect("current session memory entry");
+        let rerun = rerun_with_distinct_session_memory_entry(
+            Some("same memory"),
+            Some(&current),
+            7,
+            |_| panic!("identical content should not rerun"),
+        );
+        assert!(rerun.is_none());
+    }
+
+    #[test]
+    fn rerun_with_distinct_session_memory_entry_keeps_changed_content() {
+        let current = session_memory_entry_for_pipeline(Some("old memory"), 7)
+            .expect("current session memory entry");
+        let rerun = rerun_with_distinct_session_memory_entry(
+            Some("new memory"),
+            Some(&current),
+            7,
+            |entry| entry,
+        )
+        .expect("changed session memory should rerun");
+        assert_eq!(
+            rerun,
+            session_memory_entry_for_pipeline(Some("new memory"), 7).expect("rerun entry")
+        );
     }
 
     #[test]
@@ -1127,6 +1249,131 @@ mod tests {
         assert!(
             tail_user.starts_with("<system-reminder>volatile</system-reminder>"),
             "volatile reminder should be appended as the true tail user"
+        );
+    }
+
+    #[test]
+    fn volatile_preamble_appends_tail_user_when_no_tail_user_exists() {
+        let system = vec![json!({"role": "system", "content": "sys"})];
+        let preamble = vec![
+            json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
+            json!({"role": "assistant", "content": "Understood."}),
+        ];
+        let compacted = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "tail assistant"}),
+        ];
+        let msgs = assemble_llm_messages(
+            system,
+            preamble,
+            Vec::new(),
+            compacted,
+            &PostCompactAttachments::default(),
+            "sid",
+            "openai",
+            "gpt-4",
+            &cache_cfg(),
+        );
+
+        assert_eq!(msgs[1]["content"], "hi");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["content"], "tail assistant");
+        assert_eq!(msgs[3]["role"], "user");
+        assert_eq!(
+            msgs[3]["content"], "<system-reminder>volatile</system-reminder>",
+            "non-tool tails should append a single synthetic reminder user without an extra assistant ack"
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_tail_marks_last_real_message_before_synthetic_suffix() {
+        let system = vec![json!({"role": "system", "content": "sys"})];
+        let preamble = vec![
+            json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
+            json!({"role": "assistant", "content": "Understood."}),
+        ];
+        let compacted = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": "tool output", "tool_call_id": "c1"}),
+        ];
+        let msgs = assemble_llm_messages(
+            system,
+            preamble,
+            Vec::new(),
+            compacted,
+            &PostCompactAttachments::default(),
+            "sid",
+            "anthropic",
+            "claude-sonnet-4",
+            &anthropic_cache_cfg(),
+        );
+
+        assert_eq!(msgs[3]["role"], "tool");
+        assert!(
+            astra_turn_core::context_serializer::message_has_cache_control(&msgs[3]),
+            "last real tool result must carry the message-level cache marker",
+        );
+        assert!(
+            !astra_turn_core::context_serializer::message_has_cache_control(&msgs[5]),
+            "synthetic tail user must stay unannotated",
+        );
+    }
+
+    #[test]
+    fn current_user_only_models_drop_volatile_entirely() {
+        let system = vec![json!({"role": "system", "content": "sys"})];
+        let preamble = vec![
+            json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
+            json!({"role": "assistant", "content": "Understood."}),
+        ];
+        let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::AlreadyFetched,
+            content: "## Already Fetched (do NOT re-read/re-grep these)\nFiles: foo.rs".into(),
+            round_index: 1,
+        }];
+        let compacted = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "tool", "content": "tool output", "tool_call_id": "c1"}),
+            json!({"role": "system", "content": "✓ 2 tools executed in parallel — excellent. Keep batching independent operations."}),
+        ];
+        let msgs = assemble_llm_messages(
+            system,
+            preamble,
+            drained,
+            compacted,
+            &PostCompactAttachments::default(),
+            "sid",
+            "openai",
+            "deepseek-v4-flash",
+            &cache_cfg(),
+        );
+        assert_eq!(msgs.len(), 4, "no synthetic volatile tail should remain");
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "hi");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[3]["role"], "tool");
+        assert!(
+            msgs.iter().all(|message| {
+                !message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .contains("Already Fetched")
+                    && !message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .contains("tools executed in parallel")
+                    && !message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .contains("<system-reminder>")
+            }),
+            "CurrentUserOnly providers must drop all volatile wire content"
         );
     }
 

@@ -44,7 +44,7 @@ pub struct RoundSnapshot {
     /// disabled). 0-indexed within `request.tools`.
     pub tool_cc_index: Option<u32>,
     /// Indices (within `request.messages`) that carry a `cache_control`
-    /// marker — the message-level rolling breakpoint positions.
+    /// marker — the message-level tail breakpoint positions.
     /// Empty for non-Anthropic providers.
     pub message_cc_indices: Vec<u32>,
     /// Indices of messages whose content contains known volatile
@@ -437,16 +437,15 @@ fn rule_cc_marker_frozen(rounds: &[RoundSnapshot]) -> Option<CacheFinding> {
                     severity: Severity::Critical,
                     narrative: format!(
                         "turn {turn}: message-level cache_control indices {frozen:?} \
-                         stayed identical across {} consecutive rounds while the \
-                         message count grew — the rolling breakpoint isn't advancing \
+                        stayed identical across {} consecutive rounds while the \
+                         message count grew — the tail breakpoint isn't advancing \
                          (agentic tool-loop regression).",
                         triggered.len(),
                     ),
                     actionable_fix:
-                        "Verify `find_cache_breakpoint_targets` takes the tool-loop branch \
-                         (tail = messages.len() - 1) when the conversation extends past \
-                         the last user message. The rolling invariant requires that round \
-                         N's tail index == round N+1's historical index."
+                        "Verify `find_message_cache_breakpoint_target` keeps walking to the \
+                         newest non-system tail when the conversation extends past the last \
+                         user message, while still skipping trailing system-only injections."
                             .into(),
                     triggered_on: triggered,
                 });
@@ -614,7 +613,7 @@ fn rule_cache_creation_waste(rounds: &[RoundSnapshot]) -> Option<CacheFinding> {
                      fill cost.)",
                     n = trigs.len(),
                 ),
-                actionable_fix: "Common causes: rolling breakpoint not advancing (check \
+                actionable_fix: "Common causes: tail breakpoint not advancing (check \
                      cc_marker_frozen first), mid-prefix volatile content, or \
                      tool-schema drift between rounds."
                     .into(),
@@ -1324,8 +1323,8 @@ mod tests {
         assert!(out.contains("⚠"), "warn icon missing: {out}");
         // Actionable fix text included.
         assert!(
-            out.contains("rolling breakpoint") || out.contains("Rolling"),
-            "fix text should mention rolling: {out}",
+            out.contains("tail breakpoint") || out.contains("tail"),
+            "fix text should mention the tail breakpoint: {out}",
         );
     }
 

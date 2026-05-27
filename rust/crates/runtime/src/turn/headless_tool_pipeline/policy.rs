@@ -1,6 +1,6 @@
 use astra_core::agent_warn;
 
-use super::super::agentic_headless_round::HeadlessStderrStyle;
+use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::super::permission_gate::{PermissionCheckResult, permission_denied_error_result};
 use super::*;
 use astra_turn_core::edge_prompt_context::make_args_preview;
@@ -601,7 +601,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 if !self.ctx.quiet {
                     self.ctx.term.emit_line(
                         HeadlessStderrStyle::Yellow,
-                        astra_turn_core::permission_notice::format_auto_approved_permission(
+                        astra_turn_core::permission::notice::format_auto_approved_permission(
                             &execution.name,
                             &reason,
                         ),

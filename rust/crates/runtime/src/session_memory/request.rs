@@ -3,6 +3,7 @@
 use serde_json::Value;
 
 use astra_turn_core::cloud_session_memory_extract::SessionMemoryExtractConfig;
+use astra_turn_types::session_facts::SessionFacts;
 
 /// Inputs for one extraction attempt. Owned so the whole bundle can
 /// cross a `tokio::spawn` boundary without borrowing from turn state.
@@ -10,6 +11,7 @@ use astra_turn_core::cloud_session_memory_extract::SessionMemoryExtractConfig;
 pub struct ExtractionRequest {
     pub session_id: String,
     pub messages: Vec<Value>,
+    pub session_facts: SessionFacts,
     pub current_tokens: usize,
     pub current_tool_calls: usize,
     pub had_error: bool,

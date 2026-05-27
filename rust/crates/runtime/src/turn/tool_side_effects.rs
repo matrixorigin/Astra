@@ -31,7 +31,7 @@ pub(crate) fn tool_name_invalidates_read_cache(name: &str) -> bool {
 
 /// True when a successful tool call should evict read-only idempotency cache
 /// entries. Argument-classified tools require their mutating argument form.
-pub(crate) fn tool_call_invalidates_read_cache(name: &str, args: Option<&Value>) -> bool {
+pub fn tool_call_invalidates_read_cache(name: &str, args: Option<&Value>) -> bool {
     if tool_name_invalidates_read_cache(name) {
         return true;
     }

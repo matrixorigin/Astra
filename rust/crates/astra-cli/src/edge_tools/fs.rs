@@ -56,7 +56,7 @@ impl ToolExecutor {
         &self,
         path: &Path,
         strategy: &str,
-        outcome: astra_runtime::observability_integration::FuzzyMatchOutcome,
+        outcome: astra_runtime::observability::FuzzyMatchOutcome,
     ) {
         let Some(session) = &self.observability_session else {
             return;
@@ -770,7 +770,7 @@ impl ToolExecutor {
                 self.record_fuzzy_match_event(
                     &path,
                     astra_tools::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED,
-                    astra_runtime::observability_integration::FuzzyMatchOutcome::Ambiguous,
+                    astra_runtime::observability::FuzzyMatchOutcome::Ambiguous,
                 );
                 return str_replace_fail(
                     &format!(
@@ -804,7 +804,7 @@ impl ToolExecutor {
                     self.record_fuzzy_match_event(
                         &path,
                         fuzzy_match.strategy,
-                        astra_runtime::observability_integration::FuzzyMatchOutcome::Matched,
+                        astra_runtime::observability::FuzzyMatchOutcome::Matched,
                     );
                     return unified_diff(&content, &new_content, &path);
                 }
@@ -869,7 +869,7 @@ impl ToolExecutor {
                         self.record_fuzzy_match_event(
                             &path,
                             fuzzy_match.strategy,
-                            astra_runtime::observability_integration::FuzzyMatchOutcome::Matched,
+                            astra_runtime::observability::FuzzyMatchOutcome::Matched,
                         );
                         return result;
                     }
@@ -880,7 +880,7 @@ impl ToolExecutor {
                 self.record_fuzzy_match_event(
                     &path,
                     astra_tools::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED,
-                    astra_runtime::observability_integration::FuzzyMatchOutcome::Ambiguous,
+                    astra_runtime::observability::FuzzyMatchOutcome::Ambiguous,
                 );
                 return str_replace_fail(
                     &format!(
@@ -893,7 +893,7 @@ impl ToolExecutor {
             self.record_fuzzy_match_event(
                 &path,
                 "none",
-                astra_runtime::observability_integration::FuzzyMatchOutcome::NotFound,
+                astra_runtime::observability::FuzzyMatchOutcome::NotFound,
             );
             return str_replace_not_found_hint(&content, old_str);
         }
@@ -901,7 +901,7 @@ impl ToolExecutor {
             self.record_fuzzy_match_event(
                 &path,
                 "exact",
-                astra_runtime::observability_integration::FuzzyMatchOutcome::Ambiguous,
+                astra_runtime::observability::FuzzyMatchOutcome::Ambiguous,
             );
             return str_replace_ambiguous_hint(&content, old_str, count);
         }
@@ -917,7 +917,7 @@ impl ToolExecutor {
             self.record_fuzzy_match_event(
                 &path,
                 "exact",
-                astra_runtime::observability_integration::FuzzyMatchOutcome::Matched,
+                astra_runtime::observability::FuzzyMatchOutcome::Matched,
             );
             return unified_diff(&content, &new_content, &path);
         }
@@ -998,7 +998,7 @@ impl ToolExecutor {
                 self.record_fuzzy_match_event(
                     &path,
                     "exact",
-                    astra_runtime::observability_integration::FuzzyMatchOutcome::Matched,
+                    astra_runtime::observability::FuzzyMatchOutcome::Matched,
                 );
                 result
             }

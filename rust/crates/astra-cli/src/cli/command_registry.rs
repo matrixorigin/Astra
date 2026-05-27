@@ -212,21 +212,35 @@ const SKILL_SUBCOMMANDS: &[(&str, &str)] = &[
 ];
 
 const MCP_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("add", "Add: /mcp add <name> <command> [args…]"),
+    ("help", "Show MCP commands with examples"),
+    ("list", "Overview: servers, tools, prompts, resources"),
+    ("servers", "Server details and tool counts"),
+    ("status", "Alias for /mcp list"),
+    ("tools", "All callable tools (or: tools <server>)"),
+    ("inspect", "Tool schema: /mcp inspect <server>:<tool>"),
+    ("prompts", "List prompt templates from MCP servers"),
+    ("resources", "List readable MCP resources"),
+    ("read", "Read a resource: /mcp read <server>:<uri>"),
+    ("ping", "Ping: /mcp ping [server]"),
+    ("history", "Recent MCP tool-call history"),
+    ("add", "Add server: /mcp add <name> <command> [args…]"),
+    ("remove", "Remove server: /mcp remove <name>"),
+    (
+        "prompt",
+        "Invoke prompt: /mcp prompt <server>:<name> [args]",
+    ),
     (
         "complete",
-        "Completions: /mcp complete <server>:prompt:<name> <arg> [value]",
+        "Arg completions: /mcp complete <server>:prompt:<name> <arg> [value]",
     ),
-    ("log-level", "Set level: /mcp log-level <server> <level>"),
-    ("ping", "Ping: /mcp ping [server]"),
-    ("prompt", "Invoke: /mcp prompt <server>:<name> [args]"),
-    ("prompts", "List available MCP prompts"),
-    ("remove", "Remove: /mcp remove <name>"),
-    ("resource", "Read: /mcp resource <server>:<uri>"),
-    ("resources", "List available MCP resources"),
-    ("servers", "Show server details and tools"),
-    ("status", "Show connection status table"),
-    ("subscribe", "Subscribe: /mcp subscribe <server>:<uri>"),
+    (
+        "log-level",
+        "Set log level: /mcp log-level <server> <level>",
+    ),
+    (
+        "subscribe",
+        "Subscribe to resource: /mcp subscribe <server>:<uri>",
+    ),
     (
         "unsubscribe",
         "Unsubscribe: /mcp unsubscribe <server>:<uri>",
@@ -243,9 +257,35 @@ const TASK_SUBCOMMANDS: &[(&str, &str)] = &[
 ];
 
 const MEMORY_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("inspect", "Inspect memory entry (needs id)"),
-    ("list", "List memories"),
-    ("search", "Search memories (needs query)"),
+    // ── Browse ──
+    ("list", "List memories grouped by type"),
+    ("ls", "Alias for list"),
+    ("search", "Search memories by content (needs query)"),
+    ("show", "Inspect one memory in detail (needs id)"),
+    ("inspect", "Alias for show (needs id)"),
+    ("stats", "Count memories by type"),
+    (
+        "dismiss",
+        "Lower retrieval score for matching memories (needs query)",
+    ),
+    ("help", "Show the full /memory help surface"),
+    // ── Session ──
+    ("session", "Show current session memory"),
+    ("edit", "Edit a session memory section (needs section)"),
+    // ── Manage ──
+    ("forget", "Delete a memory (needs id)"),
+    ("snapshot", "Create a memory checkpoint"),
+    ("rollback", "Restore to a memory checkpoint (needs name)"),
+    ("snapshots", "List all memory checkpoints"),
+    // ── Branches ──
+    ("branch", "Create an experiment memory branch (needs name)"),
+    ("checkout", "Switch to a memory branch (needs name)"),
+    ("merge", "Merge a branch back into main (needs name)"),
+    ("diff", "Preview branch or snapshot changes (needs name)"),
+    ("branches", "List all memory branches"),
+    // ── Analysis ──
+    ("reflect", "Analyze memory patterns"),
+    ("health", "Memory hygiene status"),
 ];
 
 const PROFILE_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -520,11 +560,11 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── Memory & tasks ────────────────────────────────────────────────────
     CommandMeta::new(
         "/memory",
-        "Memoria: list, search <q>, inspect <id>, …",
+        "Memoria: browse/search/stats in-panel; health pane; details/manage text-first",
         CommandGroup::MemoryTasks,
     )
     .with_subcommands(MEMORY_SUBCOMMANDS)
-    .with_arg_hint("[list|search <q>|inspect <id>]"),
+    .with_arg_hint("[list|ls|search <q>|stats|show <id>|session|help]"),
     CommandMeta::new(
         "/task",
         "Tasks: list, add, done, status, run <prompt>, result <id>",
@@ -573,11 +613,18 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
+        "/cache",
+        "Prompt-cache summary and diagnosis for the active session",
+        CommandGroup::Observability,
+    )
+    .with_arg_hint("[diagnosis|diag|detail]")
+    .with_tui_handler(TuiHandler::Fallback),
+    CommandMeta::new(
         "/inspect",
         "Harness snapshots and exports: budget, tools, context, diff, trace, …",
         CommandGroup::Observability,
     )
-    .with_arg_hint("[budget|tools|context|json|diff|history N|trace|forensics|export path]"),
+    .with_arg_hint("[budget|tools|context|cache|json|diff|history N|trace|forensics|export path]"),
     CommandMeta::new(
         "/stats",
         "Session analytics: overview, history, tools, cost, health, learning",
@@ -677,11 +724,21 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── MCP ───────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/mcp",
-        "MCP: status|servers|prompts|resources|add|remove|ping|complete|…",
+        "MCP: list|tools|inspect|prompts|resources|read|ping|add|remove|…",
         CommandGroup::Mcp,
     )
     .with_subcommands(MCP_SUBCOMMANDS)
-    .with_arg_hint("[status|servers|prompts|resources|add|remove|ping|…]")
+    .with_arg_hint("[subcommand]  e.g. tools, inspect <server>:<tool>")
+    .with_usage_examples(&[
+        "mcp list",
+        "mcp tools",
+        "mcp tools <server>",
+        "mcp inspect <server>:<tool>",
+        "mcp read <server>:<uri>",
+        "mcp ping [server]",
+        "mcp add <name> <command> [args…]",
+        "mcp remove <name>",
+    ])
     .with_tui_handler(TuiHandler::Fallback),
     // ── Team & account ───────────────────────────────────────────────────
     CommandMeta::new(

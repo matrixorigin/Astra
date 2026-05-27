@@ -115,9 +115,9 @@ pub(super) async fn completions_handler(
 
     // 3. Build upstream request
     let mut messages = request.messages;
-    crate::turn::llm_client::strip_empty_assistant_tool_calls(&mut messages);
+    crate::turn::llm::client::strip_empty_assistant_tool_calls(&mut messages);
     let upstream_name = resolved.upstream_model_name();
-    let body = crate::turn::llm_client::build_provider_request_body_with_overrides(
+    let body = crate::turn::llm::client::build_provider_request_body_with_overrides(
         &messages,
         &[],
         upstream_name,
@@ -129,7 +129,7 @@ pub(super) async fn completions_handler(
         resolved.request_body_overrides.as_ref(),
     );
 
-    let url = crate::turn::llm_client::llm_request_url_for_provider(
+    let url = crate::turn::llm::client::llm_request_url_for_provider(
         &resolved.base_url,
         &resolved.provider,
         upstream_name,
@@ -140,13 +140,13 @@ pub(super) async fn completions_handler(
 
     // 4. Forward to upstream LLM provider
     let mut req = client.post(&url).header("content-type", "application/json");
-    req = crate::turn::llm_client::apply_provider_auth(
+    req = crate::turn::llm::client::apply_provider_auth(
         req,
         &resolved.provider,
         &resolved.api_key,
         None,
     );
-    if crate::turn::llm_client::provider_uses_anthropic_messages(&resolved.provider) {
+    if crate::turn::llm::client::provider_uses_anthropic_messages(&resolved.provider) {
         req = req.header("anthropic-beta", "prompt-caching-2024-07-31");
     }
 
@@ -173,7 +173,7 @@ pub(super) async fn completions_handler(
     })?;
 
     // 5. Extract response and build OpenAI-compatible output
-    let parsed = crate::turn::llm_client::parse_nonstream_response_for_provider(
+    let parsed = crate::turn::llm::client::parse_nonstream_response_for_provider(
         &upstream,
         &resolved.provider,
         &resolved.model_name,
@@ -255,7 +255,7 @@ mod tests {
             serde_json::json!({"role": "assistant", "content": "Done.", "tool_calls": []}),
             serde_json::json!({"role": "user", "content": "hello"}),
         ];
-        crate::turn::llm_client::strip_empty_assistant_tool_calls(&mut messages);
+        crate::turn::llm::client::strip_empty_assistant_tool_calls(&mut messages);
         assert!(messages[0].get("tool_calls").is_none(), "{messages:?}");
     }
 

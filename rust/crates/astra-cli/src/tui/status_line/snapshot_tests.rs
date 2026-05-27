@@ -25,7 +25,7 @@ fn base_ctx() -> StatusContext {
     StatusContext {
         model: Some("sonnet-4.6".into()),
         cwd: Some("~/projects/astra".into()),
-        permission_mode: PermissionMode::Ask,
+        permission_mode: PermissionMode::Prompt,
         ..StatusContext::default()
     }
 }

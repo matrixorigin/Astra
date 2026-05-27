@@ -71,6 +71,7 @@ mod command_usage;
 mod context_dump;
 #[path = "cli/context_references.rs"]
 mod context_references;
+mod explain_dag;
 
 #[path = "cli/chat_turn.rs"]
 mod chat_turn;
@@ -80,6 +81,7 @@ mod delegate_subrun;
 mod diagnostic_log;
 #[path = "cli/diff_presenter.rs"]
 mod diff_presenter;
+mod diff_utils;
 #[path = "cli/durable_bridge.rs"]
 mod durable_bridge;
 #[path = "cli/edge_lifecycle.rs"]
@@ -149,6 +151,8 @@ mod slash_account;
 mod slash_agent;
 #[path = "cli/slash_bug.rs"]
 mod slash_bug;
+#[path = "cli/slash_cache.rs"]
+mod slash_cache;
 #[path = "cli/slash_config.rs"]
 mod slash_config;
 #[path = "cli/slash_debug.rs"]

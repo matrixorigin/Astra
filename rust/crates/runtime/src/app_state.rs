@@ -135,7 +135,7 @@ pub struct AppState {
     pub(crate) execution: ExecutionServicesState,
     pub(crate) admin: AdminState,
     pub(crate) chat_turn_bridge:
-        Option<Arc<crate::turn::bridge_inprocess::InProcessChatTurnBridge>>,
+        Option<Arc<crate::turn::bridge::inprocess::InProcessChatTurnBridge>>,
     pub(crate) chat_turn_bridge_secret: String,
     pub(crate) chat_turn_bridge_cache: Arc<tokio::sync::Mutex<SessionCache>>,
     pub memoria_base_url: String,
@@ -150,7 +150,7 @@ pub struct AppState {
     /// Multi-agent profile registry — defines agent tiers, delegation rules.
     pub(crate) agent_profile_registry: Arc<astra_services::AgentProfileRegistry>,
     /// Delegation engine — coordinates multi-agent runs.
-    pub(crate) delegation_engine: Option<Arc<crate::server::delegation_engine::DelegationEngine>>,
+    pub(crate) delegation_engine: Option<Arc<crate::server::delegation::engine::DelegationEngine>>,
     /// Team persistence store — CRUD for team definitions and execution history.
     pub(crate) team_store:
         Option<Arc<dyn astra_services::team_persistence::TeamPersistenceService>>,
@@ -170,12 +170,12 @@ pub struct AppState {
     /// pipeline so /metrics exposes a single source of truth.
     pub(crate) metrics_registry: Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>,
     #[cfg(feature = "harness")]
-    pub harness_registry: crate::server::harness_handlers::HarnessSinkRegistry,
+    pub harness_registry: crate::server::harness::handlers::HarnessSinkRegistry,
 }
 
 impl AppState {
     /// Shared §5.5 ledger (`POST /tools/result`, `POST /approval/respond`); same `Arc` as
-    /// [`InProcessChatTurnBridge`](crate::turn::bridge_inprocess::InProcessChatTurnBridge) when wired.
+    /// [`InProcessChatTurnBridge`](crate::turn::bridge::inprocess::InProcessChatTurnBridge) when wired.
     pub fn edge_callback_ledger(
         &self,
     ) -> Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>> {
@@ -260,7 +260,7 @@ impl AppState {
             cors_origins: None,
             metrics_registry: Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new()),
             #[cfg(feature = "harness")]
-            harness_registry: crate::server::harness_handlers::HarnessSinkRegistry::new(),
+            harness_registry: crate::server::harness::handlers::HarnessSinkRegistry::new(),
         }
     }
 
@@ -617,7 +617,7 @@ impl AppState {
 
     pub fn with_chat_turn_bridge(
         mut self,
-        chat_turn_bridge: Arc<crate::turn::bridge_inprocess::InProcessChatTurnBridge>,
+        chat_turn_bridge: Arc<crate::turn::bridge::inprocess::InProcessChatTurnBridge>,
     ) -> Self {
         self.chat_turn_bridge = Some(chat_turn_bridge);
         self
@@ -654,7 +654,7 @@ impl AppState {
 
     pub fn with_delegation_engine(
         mut self,
-        engine: Arc<crate::server::delegation_engine::DelegationEngine>,
+        engine: Arc<crate::server::delegation::engine::DelegationEngine>,
     ) -> Self {
         self.delegation_engine = Some(engine);
         self
@@ -690,7 +690,7 @@ impl AppState {
     /// Access the delegation engine (if configured).
     pub fn delegation_engine(
         &self,
-    ) -> Option<&Arc<crate::server::delegation_engine::DelegationEngine>> {
+    ) -> Option<&Arc<crate::server::delegation::engine::DelegationEngine>> {
         self.delegation_engine.as_ref()
     }
 }

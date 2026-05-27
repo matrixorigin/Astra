@@ -16,9 +16,9 @@ use astra_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
-    server::delegation_engine::{SubRunConfig, SubRunExecutor},
-    turn::agentic_loop_finalization::run_agentic_loop_with_host,
-    turn::agentic_loop_host::{
+    server::delegation::engine::{SubRunConfig, SubRunExecutor},
+    turn::agentic_loop::finalization::run_agentic_loop_with_host,
+    turn::agentic_loop::host::{
         AgenticLoopState, CancellationState, MessagingState, SkillState, StopHookState,
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
@@ -290,7 +290,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             // same as pre-fork-prefix. The probe helper inside
             // `on_turn_completed` early-returns on None, so a delegate
             // without resolved inheritance emits nothing, just like
-            // the spawn_agent path.
+            // the dynamic agent-spawn path.
             inherited_prefix: config.inherited_prefix.clone(),
             fork_cache_sink: self.fork_cache_sink.clone(),
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
@@ -396,7 +396,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
             max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
             stall: {
-                let mut s = astra_runtime::turn::agentic_loop_host::StallTrackingState::default();
+                let mut s = astra_runtime::turn::agentic_loop::host::StallTrackingState::default();
                 s.circuit_breaker = astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
                     astra_turn_core::loop_circuit_breaker::BreakerConfig {
                         absolute_max_rounds: 40,
@@ -433,14 +433,19 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 token: self.cancel_token.clone(),
             },
             error_recovery: Default::default(),
-            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
-                astra_turn_core::pipeline_config::PipelineConfig::default(),
-            )),
+            pipeline_session: Some(
+                astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
+                    astra_turn_core::pipeline_config::PipelineConfig::default(),
+                    astra_runtime::turn::session_current_date::resolve_session_current_date(
+                        &config.session_id,
+                    ),
+                ),
+            ),
             message: config.task.clone(),
             recent_tools: Vec::new(),
             task_profile,
             last_turn_policy:
-                astra_runtime::turn::agentic_loop_host::TurnInteractionPolicy::default(),
+                astra_runtime::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             api: self.api.clone(),
             api_token: self.token.clone(),
             delegation_engine: None,
@@ -455,6 +460,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
             pinned_tool_schema_tokens: 0,
+            sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
             budget_wrapup_ignored_rounds: 0,
@@ -501,7 +507,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         };
 
         match loop_result {
-            Ok(astra_runtime::turn::agentic_loop_host::AgenticLoopOutcome::Completed) => {
+            Ok(astra_runtime::turn::agentic_loop::host::AgenticLoopOutcome::Completed) => {
                 Ok(AgentResult {
                     agent_id,
                     run_id,
@@ -513,7 +519,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                     tool_calls,
                 })
             }
-            Ok(astra_runtime::turn::agentic_loop_host::AgenticLoopOutcome::Cancelled) => {
+            Ok(astra_runtime::turn::agentic_loop::host::AgenticLoopOutcome::Cancelled) => {
                 Ok(AgentResult {
                     agent_id,
                     run_id,
@@ -525,7 +531,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                     tool_calls,
                 })
             }
-            Ok(astra_runtime::turn::agentic_loop_host::AgenticLoopOutcome::Waiting(reason)) => {
+            Ok(astra_runtime::turn::agentic_loop::host::AgenticLoopOutcome::Waiting(reason)) => {
                 Ok(AgentResult {
                     agent_id,
                     run_id,
@@ -537,7 +543,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                     tool_calls,
                 })
             }
-            Ok(astra_runtime::turn::agentic_loop_host::AgenticLoopOutcome::Error(err)) => {
+            Ok(astra_runtime::turn::agentic_loop::host::AgenticLoopOutcome::Error(err)) => {
                 let failure_output = persist_failed_subrun(&mut state, &err);
                 Ok(AgentResult {
                     agent_id,

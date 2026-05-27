@@ -179,9 +179,10 @@ pub use mcp_registry::{
 };
 pub use models::{
     DatabaseModelService, ModelCreateRequestData, ModelListItem, ModelRecord, ModelService,
-    ModelUpdateRequestData, PricingData, QuirksData, ResolvedActiveLlmModel,
-    UnconfiguredModelService, resolve_active_llm_model, resolve_memory_model,
-    resolve_reasoning_model,
+    ModelUpdateRequestData, PricingData, PromptCacheCapabilityData, PromptCacheProtocolData,
+    PromptCacheReuseScopeData, PromptCacheVolatilePlacementData, QuirksData,
+    ResolvedActiveLlmModel, UnconfiguredModelService, prompt_cache_capability_from_models_yaml,
+    resolve_active_llm_model, resolve_memory_model, resolve_reasoning_model,
 };
 pub use multi_agent::{
     DatabaseEdgeRegistryService, DatabaseTaskLeaseService, EdgeAgentRecord, EdgeRegistryService,
@@ -271,6 +272,6 @@ pub use triggers::{
     DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService,
 };
 pub use workflows::{
-    DatabaseWorkflowService, UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem,
-    WorkflowRunRecord, WorkflowService,
+    UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem, WorkflowRunRecord,
+    WorkflowService,
 };

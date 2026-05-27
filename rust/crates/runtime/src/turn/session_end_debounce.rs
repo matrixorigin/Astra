@@ -172,7 +172,7 @@ mod tests {
     // ─── Caller-sequence integration tests ─────────────────────────────
     //
     // These lock the exact should_run/record/forget sequence used by
-    // `server::run_lifecycle::post_loop_memory_cleanup` (lines 98-147
+    // `server::crate::server::run::lifecycle::post_loop_memory_cleanup` (lines 98-147
     // and the final `forget` at the end of cleanup). Regressions in
     // the caller — e.g. recording on failure, skipping forget, or
     // reversing the order — will show up here rather than only in a
@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn caller_sequence_governance_failure_does_not_consume_window() {
         // Simulates: should_run=Run, governance returns Err, caller
-        // logs warn and SKIPS record (see run_lifecycle.rs ~132 vs 134).
+        // logs warn and SKIPS record (see server/run/lifecycle.rs).
         // Next turn must still get Run — a failed governance attempt
         // must not burn the 15-min window.
         let d = SessionEndDebouncer::with_interval(Duration::from_secs(60));
@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn caller_sequence_empty_session_id_is_noop_throughout() {
-        // run_lifecycle.rs: `if session_id.is_empty() { return; }` at the
+        // server/run/lifecycle.rs: `if session_id.is_empty() { return; }` at the
         // top of post_loop_memory_cleanup. But if a future refactor drops
         // that guard, the debouncer itself must still no-op cleanly for
         // every method in the caller sequence.

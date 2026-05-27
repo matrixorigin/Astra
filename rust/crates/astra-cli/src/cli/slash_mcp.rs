@@ -2,66 +2,323 @@ use super::*;
 use crate::manifest_loader::project_mcp_json_path;
 use crate::mcp_client::{ConnectionState, McpClientManager};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParsedMcpCommand<'a> {
+    Help,
+    Overview,
+    Servers,
+    Tools(Option<&'a str>),
+    Prompts,
+    Resources,
+    Read(Option<&'a str>),
+    History,
+    Inspect(Option<&'a str>),
+    Add(Option<&'a str>),
+    Remove(Option<&'a str>),
+    Subscribe(Option<&'a str>),
+    Unsubscribe(Option<&'a str>),
+    LogLevel(Option<&'a str>),
+    Prompt(Option<&'a str>),
+    Complete(Option<&'a str>),
+    Ping(Option<&'a str>),
+    Unknown(&'a str),
+}
+
+fn split_mcp_subcommand(text: &str) -> (&str, &str) {
+    let trimmed = text.trim();
+    match trimmed.find(char::is_whitespace) {
+        Some(pos) => (&trimmed[..pos], trimmed[pos..].trim()),
+        None => (trimmed, ""),
+    }
+}
+
+pub(crate) fn parse_mcp_command(arg: &str) -> ParsedMcpCommand<'_> {
+    let trimmed = arg.trim();
+    if trimmed.is_empty() {
+        return ParsedMcpCommand::Help;
+    }
+
+    let (sub, rest) = split_mcp_subcommand(trimmed);
+    match sub {
+        "help" => ParsedMcpCommand::Help,
+        "status" => ParsedMcpCommand::Overview,
+        "list" => {
+            if rest.is_empty() {
+                ParsedMcpCommand::Overview
+            } else {
+                let (category, tail) = split_mcp_subcommand(rest);
+                match category {
+                    "status" => ParsedMcpCommand::Overview,
+                    "servers" => {
+                        if tail.is_empty() {
+                            ParsedMcpCommand::Servers
+                        } else {
+                            ParsedMcpCommand::Unknown(trimmed)
+                        }
+                    }
+                    "tools" => ParsedMcpCommand::Tools((!tail.is_empty()).then_some(tail)),
+                    "prompts" => {
+                        if tail.is_empty() {
+                            ParsedMcpCommand::Prompts
+                        } else {
+                            ParsedMcpCommand::Unknown(trimmed)
+                        }
+                    }
+                    "resources" => {
+                        if tail.is_empty() {
+                            ParsedMcpCommand::Resources
+                        } else {
+                            ParsedMcpCommand::Unknown(trimmed)
+                        }
+                    }
+                    _ => ParsedMcpCommand::Unknown(trimmed),
+                }
+            }
+        }
+        "servers" => ParsedMcpCommand::Servers,
+        "tools" => ParsedMcpCommand::Tools((!rest.is_empty()).then_some(rest)),
+        "prompts" => ParsedMcpCommand::Prompts,
+        "resources" => ParsedMcpCommand::Resources,
+        "resource" | "read" => ParsedMcpCommand::Read((!rest.is_empty()).then_some(rest)),
+        "history" => ParsedMcpCommand::History,
+        "inspect" => ParsedMcpCommand::Inspect((!rest.is_empty()).then_some(rest)),
+        "add" => ParsedMcpCommand::Add((!rest.is_empty()).then_some(rest)),
+        "remove" => ParsedMcpCommand::Remove((!rest.is_empty()).then_some(rest)),
+        "subscribe" => ParsedMcpCommand::Subscribe((!rest.is_empty()).then_some(rest)),
+        "unsubscribe" => ParsedMcpCommand::Unsubscribe((!rest.is_empty()).then_some(rest)),
+        "log-level" => ParsedMcpCommand::LogLevel((!rest.is_empty()).then_some(rest)),
+        "prompt" => ParsedMcpCommand::Prompt((!rest.is_empty()).then_some(rest)),
+        "complete" => ParsedMcpCommand::Complete((!rest.is_empty()).then_some(rest)),
+        "ping" => ParsedMcpCommand::Ping((!rest.is_empty()).then_some(rest)),
+        _ => ParsedMcpCommand::Unknown(trimmed),
+    }
+}
+
+/// Build dynamic subcommand completions for `/mcp` from the live MCP manager.
+///
+/// Returns `(subcommand_suffix, description)` pairs that are injected into the
+/// slash menu's `extra_subcommands` so the user gets real server/tool names
+/// when they type `/mcp ` and press Tab. For example:
+///
+///   `("inspect github:list_prs",  "github · list_prs")`
+///   `("tools github",             "Tools on github")`
+///   `("ping github",              "Ping github")`
+///   `("remove github",            "Remove github server")`
+pub(crate) fn build_mcp_extra_subcommands(manager: &McpClientManager) -> Vec<(String, String)> {
+    let mut items: Vec<(String, String)> = Vec::new();
+
+    let servers: Vec<&str> = manager.connected_servers();
+    if servers.is_empty() {
+        return items;
+    }
+
+    // Per-server: tools <server>, ping <server>, remove <server>
+    for server in &servers {
+        items.push((format!("tools {server}"), format!("Tools on {server}")));
+        items.push((format!("ping {server}"), format!("Ping {server}")));
+        items.push((
+            format!("remove {server}"),
+            format!("Remove {server} server"),
+        ));
+        items.push((
+            format!("log-level {server}"),
+            format!("Set log level for {server}"),
+        ));
+    }
+
+    // Per tool: inspect <server>:<tool>
+    for (server, tool) in manager.all_tools() {
+        items.push((
+            format!("inspect {server}:{}", tool.name),
+            format!("{server} · {}", tool.name),
+        ));
+    }
+
+    items
+}
+
+pub(crate) fn resolve_protocol_tool_query<'a>(
+    manager: &'a McpClientManager,
+    query: &str,
+) -> Result<(&'a str, &'a rmcp::model::Tool), String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("Usage: /mcp inspect <server>:<tool>  ·  try `/mcp tools` first.".into());
+    }
+
+    if let Some((server, tool_name)) = query.split_once(':') {
+        if let Some((resolved_server, tool)) = manager
+            .all_tools()
+            .into_iter()
+            .find(|(resolved_server, tool)| *resolved_server == server && tool.name == tool_name)
+        {
+            return Ok((resolved_server, tool));
+        }
+        if manager.get(server).is_none() {
+            return Err(format!(
+                "Server '{server}' not found. Try `/mcp list` or `/mcp servers`."
+            ));
+        }
+        return Err(format!(
+            "Tool '{tool_name}' not found on server '{server}'. Try `/mcp tools {server}`."
+        ));
+    }
+
+    let exact: Vec<(&str, &rmcp::model::Tool)> = manager
+        .all_tools()
+        .into_iter()
+        .filter(|(_, tool)| tool.name == query)
+        .collect();
+    match exact.len() {
+        1 => return Ok(exact[0]),
+        n if n > 1 => {
+            let locations = exact
+                .iter()
+                .map(|(server, _)| (*server).to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "Tool '{query}' exists on multiple servers ({locations}). Use `/mcp inspect <server>:<tool>`."
+            ));
+        }
+        _ => {}
+    }
+
+    let sanitized: Vec<(&str, &rmcp::model::Tool)> = manager
+        .all_tools()
+        .into_iter()
+        .filter(|(server, tool)| {
+            crate::mcp_client::sanitize_tool_name(&format!("mcp_{server}_{}", tool.name)) == query
+        })
+        .collect();
+    match sanitized.len() {
+        1 => Ok(sanitized[0]),
+        n if n > 1 => Err(format!(
+            "Tool id '{query}' is ambiguous across {n} servers. Use `/mcp inspect <server>:<tool>`."
+        )),
+        _ => Err(format!(
+            "Tool '{query}' not found. Try `/mcp tools` or `/mcp tools <server>`."
+        )),
+    }
+}
+
 fn eprint_server_not_found(name: &str) {
     eprintln!("  {} Server '{}' not found", theme::icon_warn(), name);
-    eprintln!("  {}", "Use /mcp servers to see connected servers".dim());
+    eprintln!(
+        "  {}",
+        "Use /mcp list or /mcp servers to see connected servers".dim()
+    );
+}
+
+async fn show_help(state: &SessionState) {
+    let manager = state.mcp_manager.read().await;
+    let count = manager.connection_count();
+
+    eprintln!("{}", "  MCP commands".bold().magenta());
+    if count == 0 {
+        eprintln!(
+            "{}",
+            "  No MCP servers connected yet. Add one with /mcp add <name> <command> [args...]"
+                .dim()
+        );
+    } else {
+        eprintln!(
+            "{}",
+            format!("  {count} server(s) connected. Start with /mcp list.").dim()
+        );
+    }
+    eprintln!(
+        "{}",
+        "  /mcp list                 overview of connected servers".dim()
+    );
+    eprintln!(
+        "{}",
+        "  /mcp tools [server]       list callable tools (best first step)".dim()
+    );
+    eprintln!(
+        "{}",
+        "  /mcp inspect <server>:<tool>  show tool parameters".dim()
+    );
+    eprintln!(
+        "{}",
+        "  /mcp prompts              list prompt templates exposed by MCP servers".dim()
+    );
+    eprintln!(
+        "{}",
+        "  /mcp resources            list readable resources".dim()
+    );
+    eprintln!("{}", "  /mcp read <server>:<uri>  read one resource".dim());
+    eprintln!("{}", "  /mcp ping [server]        connectivity check".dim());
+    eprintln!(
+        "{}",
+        "  Advanced: add, remove, prompt, complete, log-level, subscribe, unsubscribe, history"
+            .dim()
+    );
 }
 
 /// Retention: fallback handler for `/mcp` — called from slash_router.rs.
-/// In TUI mode this is shadowed by TuiHandler::Selector (McpView).
+/// In TUI mode, common read-only forms are handled natively by
+/// `tui::slash_dispatch`; advanced mutating forms still fall back here.
 /// Kept for headless / non-interactive execution paths.
 #[allow(dead_code)]
 pub(super) async fn handle_mcp_command(arg: &str, state: &mut SessionState) -> Result<(), String> {
-    let sub = arg.trim();
-
-    match sub {
-        "" | "status" => show_status(state).await,
-        "servers" => show_servers(state).await,
-        "prompts" => show_prompts(state).await,
-        "resources" => show_resources(state).await,
-        s if s.starts_with("add ") => handle_mcp_add(&s[4..]).await,
-        "add" => {
+    match parse_mcp_command(arg) {
+        ParsedMcpCommand::Help => show_help(state).await,
+        ParsedMcpCommand::Overview => show_status(state).await,
+        ParsedMcpCommand::Servers => show_servers(state).await,
+        ParsedMcpCommand::Prompts => show_prompts(state).await,
+        ParsedMcpCommand::Resources => show_resources(state).await,
+        ParsedMcpCommand::Tools(None) => show_tools(state).await,
+        ParsedMcpCommand::Tools(Some(server)) => show_tools_for_server(server, state).await,
+        ParsedMcpCommand::History => show_history(state).await,
+        ParsedMcpCommand::Inspect(Some(tool_name)) => show_inspect(tool_name, state).await,
+        ParsedMcpCommand::Inspect(None) => {
+            eprintln!("{}", "  Usage: /mcp inspect <server>:<tool>".dim());
+            eprintln!("{}", "  Example: /mcp inspect github:list_prs".dim());
+        }
+        ParsedMcpCommand::Add(Some(rest)) => handle_mcp_add(rest).await,
+        ParsedMcpCommand::Add(None) => {
             eprintln!("{}", "  Usage: /mcp add <name> <command> [args...]".dim());
             eprintln!(
                 "{}",
                 "  Example: /mcp add github npx @modelcontextprotocol/server-github".dim()
             );
         }
-        s if s.starts_with("remove ") => handle_mcp_remove(&s[7..]).await,
-        "remove" => {
+        ParsedMcpCommand::Remove(Some(name)) => handle_mcp_remove(name).await,
+        ParsedMcpCommand::Remove(None) => {
             eprintln!("{}", "  Usage: /mcp remove <name>".dim());
         }
-        s if s.starts_with("resource ") => handle_mcp_resource_read(&s[9..], state).await,
-        "resource" => {
-            eprintln!("{}", "  Usage: /mcp resource <server>:<uri>".dim());
+        ParsedMcpCommand::Read(Some(spec)) => handle_mcp_resource_read(spec, state).await,
+        ParsedMcpCommand::Read(None) => {
+            eprintln!("{}", "  Usage: /mcp read <server>:<uri>".dim());
         }
-        s if s.starts_with("subscribe ") => handle_mcp_subscribe(&s[10..], state).await,
-        "subscribe" => {
+        ParsedMcpCommand::Subscribe(Some(spec)) => handle_mcp_subscribe(spec, state).await,
+        ParsedMcpCommand::Subscribe(None) => {
             eprintln!("{}", "  Usage: /mcp subscribe <server>:<uri>".dim());
         }
-        s if s.starts_with("unsubscribe ") => handle_mcp_unsubscribe(&s[12..], state).await,
-        "unsubscribe" => {
+        ParsedMcpCommand::Unsubscribe(Some(spec)) => handle_mcp_unsubscribe(spec, state).await,
+        ParsedMcpCommand::Unsubscribe(None) => {
             eprintln!("{}", "  Usage: /mcp unsubscribe <server>:<uri>".dim());
         }
-        s if s.starts_with("log-level ") => handle_mcp_log_level(&s[10..], state).await,
-        "log-level" => {
+        ParsedMcpCommand::LogLevel(Some(spec)) => handle_mcp_log_level(spec, state).await,
+        ParsedMcpCommand::LogLevel(None) => {
             eprintln!("{}", "  Usage: /mcp log-level <server> <level>".dim());
             eprintln!(
                 "{}",
                 "  Levels: debug, info, notice, warning, error, critical, alert, emergency".dim()
             );
         }
-        s if s.starts_with("prompt ") => {
-            handle_mcp_prompt_invoke(arg, state).await?;
+        ParsedMcpCommand::Prompt(Some(rest)) => {
+            handle_mcp_prompt_invoke(&format!("prompt {rest}"), state).await?;
         }
-        "prompt" => {
+        ParsedMcpCommand::Prompt(None) => {
             eprintln!(
                 "{}",
                 "  Usage: /mcp prompt <server>:<name> [arg1 arg2 ...]".dim()
             );
         }
-        s if s.starts_with("complete ") => handle_mcp_complete(&s[9..], state).await,
-        "complete" => {
+        ParsedMcpCommand::Complete(Some(rest)) => handle_mcp_complete(rest, state).await,
+        ParsedMcpCommand::Complete(None) => {
             eprintln!(
                 "{}",
                 "  Usage: /mcp complete <server>:<prompt|resource> <arg_name> [partial_value]"
@@ -77,24 +334,14 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &mut SessionState) -> R
                 "    /mcp complete myserver:resource:file://path arg val".dim()
             );
         }
-        s if s.starts_with("ping ") => handle_mcp_ping(Some(&s[5..]), state).await,
-        "ping" => handle_mcp_ping(None, state).await,
-        _ => {
+        ParsedMcpCommand::Ping(server) => handle_mcp_ping(server, state).await,
+        ParsedMcpCommand::Unknown(sub) => {
             eprintln!(
                 "  {} Unknown subcommand: {}",
                 theme::icon_warn(),
                 sub.yellow()
             );
-            eprintln!(
-                "  {} status {} add {} remove {} servers {} prompts {} resources {} ping",
-                "Use:".dim(),
-                "│".dim(),
-                "│".dim(),
-                "│".dim(),
-                "│".dim(),
-                "│".dim(),
-                "│".dim()
-            );
+            eprintln!("{}", "  Try /mcp help for the core commands.".dim());
         }
     }
 
@@ -111,30 +358,78 @@ async fn show_status(state: &SessionState) {
             "{}",
             "  Use /mcp add <name> <command> or configure .astra/mcp.json".dim()
         );
-        return;
+    } else {
+        eprintln!(
+            "{}",
+            format!("  Servers: {count} connected").bold().magenta()
+        );
+        let mut caps = Vec::new();
+        if manager.has_sampling() {
+            caps.push("sampling");
+        }
+        caps.push("elicitation");
+        eprintln!("  {}", format!("Capabilities: {}", caps.join(", ")).dim());
+        let roots = manager.roots().read().await;
+        if !roots.is_empty() {
+            let names: Vec<&str> = roots
+                .iter()
+                .map(|r| r.name.as_deref().unwrap_or(&r.uri))
+                .collect();
+            eprintln!("  {}", format!("Roots: {}", names.join(", ")).dim());
+        }
+
+        // Tool summary
+        let tools = manager.all_tools();
+        let total_tools = tools.len();
+        let schemas = manager.all_tool_schemas().len();
+        eprintln!(
+            "  {}",
+            format!("MCP Tools: {total_tools} ({schemas} schemas for LLM injection)").dim()
+        );
+        eprintln!(
+            "  {}",
+            "Try: /mcp tools [server] · /mcp prompts · /mcp resources".dim()
+        );
+
+        // Per-server breakdown
+        let servers = manager.connected_servers();
+        for name in &servers {
+            if let Some(conn) = manager.get(name) {
+                let tc = conn.tools().len();
+                eprintln!("  {}", format!("    {name}: {tc} tools").dim());
+            }
+        }
+
+        eprintln!();
+        print_server_table(&manager);
     }
 
-    eprintln!(
-        "{}",
-        format!("  Servers: {count} connected").bold().magenta()
-    );
-    let mut caps = Vec::new();
-    if manager.has_sampling() {
-        caps.push("sampling");
+    // Memoria health check (independent of MCP servers)
+    let memoria_status = crate::edge_tools::memoria::memoria_health().await;
+    match memoria_status {
+        Ok(body) => {
+            let short = body.lines().next().unwrap_or(&body);
+            let truncated = if short.len() > 80 {
+                format!("{}…", &short[..short.floor_char_boundary(80)])
+            } else {
+                short.to_string()
+            };
+            eprintln!(
+                "  {} {} {}",
+                "Memoria:".bold(),
+                "✓".green(),
+                truncated.dim()
+            );
+        }
+        Err(e) => {
+            let truncated = if e.len() > 60 {
+                format!("{}…", &e[..e.floor_char_boundary(60)])
+            } else {
+                e.to_string()
+            };
+            eprintln!("  {} {} {}", "Memoria:".bold(), "✗".red(), truncated.dim());
+        }
     }
-    caps.push("elicitation");
-    eprintln!("  {}", format!("Capabilities: {}", caps.join(", ")).dim());
-    let roots = manager.roots().read().await;
-    if !roots.is_empty() {
-        let names: Vec<&str> = roots
-            .iter()
-            .map(|r| r.name.as_deref().unwrap_or(&r.uri))
-            .collect();
-        eprintln!("  {}", format!("Roots: {}", names.join(", ")).dim());
-    }
-    eprintln!();
-
-    print_server_table(&manager);
 }
 
 async fn show_servers(state: &SessionState) {
@@ -224,6 +519,10 @@ async fn show_prompts(state: &SessionState) {
             .bold()
             .magenta()
     );
+    eprintln!(
+        "{}",
+        "  Invoke one with /mcp prompt <server>:<name> [args...]".dim()
+    );
     eprintln!();
 
     for (server, prompt) in &prompts {
@@ -284,6 +583,7 @@ async fn show_resources(state: &SessionState) {
             .bold()
             .magenta()
     );
+    eprintln!("{}", "  Read one with /mcp read <server>:<uri>".dim());
     eprintln!();
 
     for (server, resource) in &resources {
@@ -310,15 +610,402 @@ async fn show_resources(state: &SessionState) {
     }
 }
 
-/// `/mcp resource <server>:<uri>` — read an MCP resource by URI.
+/// `/mcp history` — show recent MCP tool call history from all connected servers.
+async fn show_history(state: &SessionState) {
+    let manager = state.mcp_manager.read().await;
+
+    if manager.connection_count() == 0 {
+        eprintln!("{}", "  No MCP servers connected.".dim());
+        return;
+    }
+
+    // Collect all log entries from all servers, sorted by timestamp (newest first)
+    let mut entries: Vec<crate::mcp_client::CallLogEntry> = Vec::new();
+    for name in manager.server_names() {
+        if let Some(conn) = manager.get_connection(name) {
+            let log = conn.call_log.read().await;
+            entries.extend(log.iter().cloned());
+        }
+    }
+    entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    if entries.is_empty() {
+        eprintln!("{}", "  No MCP tool calls recorded yet.".dim());
+        return;
+    }
+
+    eprintln!(
+        "{}",
+        format!(
+            "  MCP Call History: {} entries (newest first)",
+            entries.len()
+        )
+        .bold()
+        .magenta()
+    );
+    eprintln!(
+        "  {}",
+        format!(
+            "{:<22} {:<30} {:<15} {:<10} {}",
+            "TIMESTAMP", "TOOL", "SERVER", "LATENCY", "STATUS"
+        )
+        .dim()
+    );
+
+    for entry in &entries {
+        let status_str = if entry.success {
+            theme::success("✓ OK")
+        } else {
+            theme::error("✗ FAIL")
+        };
+        let latency = format!("{}ms", entry.latency_ms);
+        eprintln!(
+            "  {:<22} {:<30} {:<15} {:<10} {}",
+            entry.timestamp.as_str().dim(),
+            entry.tool.as_str().yellow(),
+            entry.server.as_str().dim(),
+            latency.dim(),
+            status_str,
+        );
+        if let Some(ref err) = entry.error {
+            eprintln!("  {:>22} {}", " ".dim(), theme::error(err));
+        }
+    }
+    eprintln!();
+}
+
+/// `/mcp tools` — list all MCP tools from all connected servers.
+async fn show_tools(state: &SessionState) {
+    let manager = state.mcp_manager.read().await;
+
+    if manager.connection_count() == 0 {
+        eprintln!("{}", "  No MCP servers connected.".dim());
+        return;
+    }
+
+    let tools: Vec<(&str, &rmcp::model::Tool)> = manager.all_tools();
+
+    if tools.is_empty() {
+        eprintln!(
+            "{}",
+            "  No tools available from connected MCP servers.".dim()
+        );
+        return;
+    }
+
+    eprintln!(
+        "{}",
+        format!("  MCP Tools: {} available", tools.len())
+            .bold()
+            .magenta()
+    );
+    eprintln!(
+        "{}",
+        "  Inspect one with /mcp inspect <server>:<tool>".dim()
+    );
+
+    for (server, tool) in &tools {
+        let desc = tool.description.as_deref().unwrap_or("");
+        let short_desc = if desc.len() > 80 {
+            format!("{}…", &desc[..desc.floor_char_boundary(80)])
+        } else {
+            desc.to_string()
+        };
+
+        eprintln!();
+        eprintln!(
+            "  {} {} {}",
+            format!("{server}:{}", tool.name).bold(),
+            "─".dim(),
+            short_desc.dim(),
+        );
+
+        // Show parameter schema if available
+        let schema = &*tool.input_schema;
+        if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+            let required: Vec<&str> = schema
+                .get("required")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            for (param_name, param_schema) in props {
+                let req_mark = if required.contains(&param_name.as_str()) {
+                    "*"
+                } else {
+                    " "
+                };
+                let ptype = param_schema
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("any");
+                let pdesc = param_schema
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                eprintln!(
+                    "  {}     {} {} {}",
+                    " ".dim(),
+                    req_mark.bold(),
+                    format!("{param_name}: {ptype}").yellow(),
+                    pdesc.dim(),
+                );
+            }
+        }
+    }
+    eprintln!();
+}
+
+/// `/mcp tools <server>` — list tools from a specific server.
+async fn show_tools_for_server(server_name: &str, state: &SessionState) {
+    let server_name = server_name.trim();
+    let manager = state.mcp_manager.read().await;
+
+    let conn = match manager.get(server_name) {
+        Some(c) => c,
+        None => {
+            eprint_server_not_found(server_name);
+            return;
+        }
+    };
+
+    let tools = conn.tools();
+
+    if tools.is_empty() {
+        eprintln!(
+            "{}",
+            format!("  No tools available from server '{server_name}'.").dim()
+        );
+        return;
+    }
+
+    eprintln!(
+        "{}",
+        format!("  Tools from {server_name}: {} available", tools.len())
+            .bold()
+            .magenta()
+    );
+    eprintln!(
+        "{}",
+        format!("  Inspect one with /mcp inspect {server_name}:<tool>").dim()
+    );
+
+    for tool in tools {
+        let desc = tool.description.as_deref().unwrap_or("");
+        let short_desc = if desc.len() > 80 {
+            format!("{}…", &desc[..desc.floor_char_boundary(80)])
+        } else {
+            desc.to_string()
+        };
+
+        eprintln!();
+        eprintln!(
+            "  {} {}",
+            tool.name.clone().bold().magenta(),
+            short_desc.dim(),
+        );
+
+        // Show parameter schema if available
+        let schema = &*tool.input_schema;
+        if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+            let required: Vec<&str> = schema
+                .get("required")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            for (param_name, param_schema) in props {
+                let req_mark = if required.contains(&param_name.as_str()) {
+                    "*"
+                } else {
+                    " "
+                };
+                let ptype = param_schema
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("any");
+                let pdesc = param_schema
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                eprintln!(
+                    "  {}     {} {} {}",
+                    " ".dim(),
+                    req_mark.bold(),
+                    format!("{param_name}: {ptype}").yellow(),
+                    pdesc.dim(),
+                );
+            }
+        }
+    }
+    eprintln!();
+}
+
+/// `/mcp inspect <server>:<tool>` — show full JSON schema for a specific MCP tool.
+async fn show_inspect(tool_name: &str, state: &SessionState) {
+    let tool_name = tool_name.trim();
+
+    if tool_name.is_empty() {
+        eprintln!("{}", "  Usage: /mcp inspect <server>:<tool>".dim());
+        return;
+    }
+
+    // 1) Check MCP protocol tools (from connected MCP servers)
+    let manager = state.mcp_manager.read().await;
+    let protocol_error = match resolve_protocol_tool_query(&manager, tool_name) {
+        Ok((server, tool)) => {
+            show_mcp_protocol_tool_schema(&tool.name, server, tool);
+            return;
+        }
+        Err(message) => message,
+    };
+
+    // 2) Check built-in mcp_memoria_* tools
+    for meta in astra_turn_core::tool::registry::meta::TOOL_CATALOG {
+        if meta.name == tool_name
+            || format!("mcp_{}", meta.name) == tool_name
+            || format!("mcp_memoria_{}", meta.name) == tool_name
+        {
+            show_builtin_tool_info(meta);
+            return;
+        }
+    }
+
+    if manager.connection_count() > 0 {
+        eprintln!("  {}", protocol_error.yellow());
+    } else {
+        eprintln!(
+            "  {} Tool '{}' not found",
+            theme::icon_warn(),
+            tool_name.yellow()
+        );
+    }
+    eprintln!(
+        "  {}",
+        "Use /mcp tools or /mcp tools <server>, then inspect with /mcp inspect <server>:<tool>"
+            .dim()
+    );
+}
+
+/// Display detailed schema for an MCP protocol tool.
+fn show_mcp_protocol_tool_schema(name: &str, server: &str, tool: &rmcp::model::Tool) {
+    let desc = tool.description.as_deref().unwrap_or("(no description)");
+
+    eprintln!();
+    eprintln!(
+        "  {} {} {}",
+        "Tool:".bold(),
+        format!("{server}:{name}").bold().magenta(),
+        "[MCP protocol]".to_string().dim(),
+    );
+    eprintln!("  {} {}", "Description:".bold(), desc.dim());
+    eprintln!();
+
+    let schema = &*tool.input_schema;
+    let prop_count = schema
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .map(|p| p.len())
+        .unwrap_or(0);
+
+    eprintln!(
+        "  {} {} parameter(s)",
+        "Parameters:".bold(),
+        prop_count.to_string().yellow(),
+    );
+
+    if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+        let required: Vec<&str> = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+
+        for (param_name, param_schema) in props {
+            let req_mark = if required.contains(&param_name.as_str()) {
+                "*"
+            } else {
+                " "
+            };
+            let ptype = param_schema
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("any");
+            let pdesc = param_schema
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let enum_vals = param_schema
+                .get("enum")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+
+            eprintln!();
+            eprintln!(
+                "  {} {} {}",
+                req_mark.bold(),
+                param_name.clone().bold().yellow(),
+                format!(": {ptype}").dim(),
+            );
+            if !enum_vals.is_empty() {
+                eprintln!("  {} {}", "      enum:".dim(), enum_vals.dim());
+            }
+            if !pdesc.is_empty() {
+                eprintln!("  {} {}", "      desc:".dim(), pdesc.dim());
+            }
+        }
+    }
+
+    if prop_count == 0 {
+        eprintln!("  {}", "  (no parameters)".dim());
+    }
+
+    eprintln!();
+}
+
+/// Display info for a built-in tool (from TOOL_CATALOG).
+fn show_builtin_tool_info(meta: &astra_turn_core::tool::registry::meta::ToolMeta) {
+    eprintln!();
+    eprintln!(
+        "  {} {} {}",
+        "Tool:".bold(),
+        meta.name.bold().magenta(),
+        "[built-in]".to_string().dim(),
+    );
+    eprintln!("  {} {}", "Description:".bold(), meta.description.dim());
+    eprintln!(
+        "  {} {:?}",
+        "Intents:".bold(),
+        format!("{:?}", meta.intents).dim(),
+    );
+    eprintln!(
+        "  {} {:?}",
+        "Scope:".bold(),
+        format!("{:?}", meta.scope).dim(),
+    );
+    eprintln!(
+        "  {} {}",
+        "Schema tokens:".bold(),
+        meta.schema_tokens.to_string().yellow(),
+    );
+    eprintln!(
+        "  {}",
+        "  Note: built-in tools use auto-generated schemas; use /mcp list for LLM injection count"
+            .dim(),
+    );
+    eprintln!();
+}
+
+/// `/mcp read <server>:<uri>` — read an MCP resource by URI.
 async fn handle_mcp_resource_read(arg: &str, state: &SessionState) {
     let rest = arg.trim();
     if rest.is_empty() {
-        eprintln!("{}", "  Usage: /mcp resource <server>:<uri>".dim());
-        eprintln!(
-            "{}",
-            "  Example: /mcp resource github:file:///README.md".dim()
-        );
+        eprintln!("{}", "  Usage: /mcp read <server>:<uri>".dim());
+        eprintln!("{}", "  Example: /mcp read github:file:///README.md".dim());
         return;
     }
 
@@ -1012,7 +1699,7 @@ async fn handle_mcp_complete(arg: &str, state: &SessionState) {
 
 /// Handle `/mcp ping [server]` — ping one server or all.
 async fn handle_mcp_ping(server: Option<&str>, state: &SessionState) {
-    let manager = state.mcp_manager.read().await;
+    let mut manager = state.mcp_manager.write().await;
 
     if manager.connection_count() == 0 {
         eprintln!("{}", "  No MCP servers connected.".dim());
@@ -1039,6 +1726,39 @@ async fn handle_mcp_ping(server: Option<&str>, state: &SessionState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_mcp_command_defaults_to_help() {
+        assert_eq!(parse_mcp_command(""), ParsedMcpCommand::Help);
+        assert_eq!(parse_mcp_command("help"), ParsedMcpCommand::Help);
+    }
+
+    #[test]
+    fn parse_mcp_command_supports_list_aliases() {
+        assert_eq!(parse_mcp_command("list"), ParsedMcpCommand::Overview);
+        assert_eq!(parse_mcp_command("status"), ParsedMcpCommand::Overview);
+        assert_eq!(
+            parse_mcp_command("list tools github"),
+            ParsedMcpCommand::Tools(Some("github"))
+        );
+        assert_eq!(parse_mcp_command("list prompts"), ParsedMcpCommand::Prompts);
+        assert_eq!(
+            parse_mcp_command("list resources"),
+            ParsedMcpCommand::Resources
+        );
+    }
+
+    #[test]
+    fn parse_mcp_command_supports_read_alias() {
+        assert_eq!(
+            parse_mcp_command("read github:file:///README.md"),
+            ParsedMcpCommand::Read(Some("github:file:///README.md"))
+        );
+        assert_eq!(
+            parse_mcp_command("resource github:file:///README.md"),
+            ParsedMcpCommand::Read(Some("github:file:///README.md"))
+        );
+    }
 
     #[test]
     fn format_duration_seconds() {

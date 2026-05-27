@@ -1,4 +1,5 @@
 use super::*;
+use astra_runtime::turn::tool_side_effects::tool_call_invalidates_read_cache;
 use astra_services::session_journal::{JournalEvent, JournalWriter};
 use astra_tools::git_gix::{git_worktree_is_clean, head_short};
 use astra_turn_core::chat_turn_sse_dispatch::{
@@ -76,8 +77,8 @@ fn tool_output_event_text(tool: &str, output: &str) -> String {
 
 // CLI formatting utilities
 use super::cli_formatting::{
-    colorize_diff_summary, extract_cli_diff_block, format_byte_size, format_duration_suffix,
-    github_repo_display, shorten_path, truncate_line,
+    colorize_diff_summary, compact_unified_diff_preview, extract_cli_diff_block, format_byte_size,
+    format_duration_suffix, github_repo_display, shorten_path, truncate_line,
 };
 
 // Effects module types
@@ -133,7 +134,7 @@ fn approval_stale_revalidation_error(
 fn approval_batch_group_key(
     tool: &str,
     args: &Value,
-    risk_tags: &[astra_turn_core::permission_engine::RiskTag],
+    risk_tags: &[astra_turn_core::permission::engine::RiskTag],
 ) -> astra_turn_core::approval_batch_group::ApprovalBatchGroupKey {
     let side_effect_label =
         match astra_turn_core::cloud_approval_policy::cloud_gated_tool_kind_with_args(
@@ -153,8 +154,8 @@ fn approval_batch_group_key(
 }
 
 fn push_risk_tag(
-    tags: &mut Vec<astra_turn_core::permission_engine::RiskTag>,
-    tag: astra_turn_core::permission_engine::RiskTag,
+    tags: &mut Vec<astra_turn_core::permission::engine::RiskTag>,
+    tag: astra_turn_core::permission::engine::RiskTag,
 ) {
     if !tags.contains(&tag) {
         tags.push(tag);
@@ -181,13 +182,13 @@ fn approval_scope_context_for_tool(
     args: &Value,
     source_agent_present: bool,
     workspace_untrusted: bool,
-) -> astra_turn_core::permission_scope::ScopeAvailabilityContext {
-    use astra_turn_core::permission_engine::RiskTag;
-    use astra_turn_core::permission_memory_profile::{
+) -> astra_turn_core::permission::scope::ScopeAvailabilityContext {
+    use astra_turn_core::permission::engine::RiskTag;
+    use astra_turn_core::permission::memory_profile::{
         PersistentMemoryBlock, permission_memory_profile,
     };
 
-    let mut ctx = astra_turn_core::permission_scope::ScopeAvailabilityContext {
+    let mut ctx = astra_turn_core::permission::scope::ScopeAvailabilityContext {
         source_agent_present,
         workspace_untrusted,
         ..Default::default()
@@ -214,7 +215,7 @@ fn approval_scope_context_for_tool(
     push_risk_tag(&mut ctx.risk_tags, base_tag);
 
     if let Some(path) = args.get("path").and_then(|v| v.as_str())
-        && astra_turn_core::permission_redact::matches_sensitive_path(path)
+        && astra_turn_core::permission::redact::matches_sensitive_path(path)
     {
         push_risk_tag(&mut ctx.risk_tags, RiskTag::WritesSensitiveFile);
     }
@@ -249,14 +250,14 @@ fn approval_scope_context_for_tool(
 }
 
 fn approval_has_stable_memory_target(tool: &str, args: &Value) -> bool {
-    astra_turn_core::permission_memory_profile::permission_memory_profile(tool, args)
+    astra_turn_core::permission::memory_profile::permission_memory_profile(tool, args)
         .has_stable_target
 }
 
 fn approval_default_always_scope(
-    ctx: &astra_turn_core::permission_scope::ScopeAvailabilityContext,
-) -> astra_turn_core::permission_scope::AllowScope {
-    use astra_turn_core::permission_scope::{AllowScope, permitted_scopes};
+    ctx: &astra_turn_core::permission::scope::ScopeAvailabilityContext,
+) -> astra_turn_core::permission::scope::AllowScope {
+    use astra_turn_core::permission::scope::{AllowScope, permitted_scopes};
 
     let scopes = permitted_scopes(ctx);
     let is_available = |target| {
@@ -283,27 +284,27 @@ fn approval_memory_preview(tool: &str, args: &Value, scope_label: Option<&str>) 
         .map(|label| format!("under `{label}/`"))
         .unwrap_or_else(|| "in this workspace".to_string());
 
-    astra_turn_core::permission_match_target::remember_preview(tool, args, &location)
+    astra_turn_core::permission::match_target::remember_preview(tool, args, &location)
 }
 
 fn audit_scope_for_always(
-    scope: astra_turn_core::permission_scope::AllowScope,
-) -> astra_turn_core::permission_audit::AllowScope {
+    scope: astra_turn_core::permission::scope::AllowScope,
+) -> astra_turn_core::permission::audit::AllowScope {
     match scope {
-        astra_turn_core::permission_scope::AllowScope::OnceThisCall => {
-            astra_turn_core::permission_audit::AllowScope::OnceThisCall
+        astra_turn_core::permission::scope::AllowScope::OnceThisCall => {
+            astra_turn_core::permission::audit::AllowScope::OnceThisCall
         }
-        astra_turn_core::permission_scope::AllowScope::RestOfTurn => {
-            astra_turn_core::permission_audit::AllowScope::RestOfTurn
+        astra_turn_core::permission::scope::AllowScope::RestOfTurn => {
+            astra_turn_core::permission::audit::AllowScope::RestOfTurn
         }
-        astra_turn_core::permission_scope::AllowScope::RestOfSession => {
-            astra_turn_core::permission_audit::AllowScope::RestOfSession
+        astra_turn_core::permission::scope::AllowScope::RestOfSession => {
+            astra_turn_core::permission::audit::AllowScope::RestOfSession
         }
-        astra_turn_core::permission_scope::AllowScope::Project => {
-            astra_turn_core::permission_audit::AllowScope::Project
+        astra_turn_core::permission::scope::AllowScope::Project => {
+            astra_turn_core::permission::audit::AllowScope::Project
         }
-        astra_turn_core::permission_scope::AllowScope::User => {
-            astra_turn_core::permission_audit::AllowScope::User
+        astra_turn_core::permission::scope::AllowScope::User => {
+            astra_turn_core::permission::audit::AllowScope::User
         }
     }
 }
@@ -320,11 +321,11 @@ enum ApprovalMemoryAction {
 
 fn approval_memory_action(
     response: &super::chat_stream::ApprovalResponse,
-    always_scope: astra_turn_core::permission_scope::AllowScope,
+    always_scope: astra_turn_core::permission::scope::AllowScope,
     stale_revalidation_passed: bool,
 ) -> ApprovalMemoryAction {
     use super::chat_stream::ApprovalResponse;
-    use astra_turn_core::permission_scope::AllowScope;
+    use astra_turn_core::permission::scope::AllowScope;
 
     if response.is_approved() && !stale_revalidation_passed {
         return ApprovalMemoryAction::RecordDenySession;
@@ -348,20 +349,21 @@ fn approval_memory_action(
 
 fn persist_scoped_allow_rule(
     pm: &mut crate::permission_manager::PermissionManager,
-    target: astra_turn_core::permission_audit::PersistTarget,
+    target: astra_turn_core::permission::audit::PersistTarget,
     tool: &str,
     args: &Value,
-    match_target: Option<&astra_turn_core::permission_match_target::AllowMatchTarget>,
+    match_target: Option<&astra_turn_core::permission::match_target::AllowMatchTarget>,
     save_warning_tx: Option<&super::chat_stream::StreamEventTx>,
 ) {
-    let default_target = astra_turn_core::permission_match_target::default_match_target(tool, args);
+    let default_target =
+        astra_turn_core::permission::match_target::default_match_target(tool, args);
     let match_target = match_target.unwrap_or(&default_target);
     let location = match target {
-        astra_turn_core::permission_audit::PersistTarget::Project => "in this workspace",
-        astra_turn_core::permission_audit::PersistTarget::User => "for this user",
+        astra_turn_core::permission::audit::PersistTarget::Project => "in this workspace",
+        astra_turn_core::permission::audit::PersistTarget::User => "for this user",
     };
     let remember_preview =
-        astra_turn_core::permission_match_target::remember_preview(tool, args, location);
+        astra_turn_core::permission::match_target::remember_preview(tool, args, location);
     pm.record_approval_with_match_target(tool, args, match_target, true);
     let rule = crate::permission_manager::PermissionManager::make_allow_rule_with_match_target(
         tool,
@@ -369,13 +371,13 @@ fn persist_scoped_allow_rule(
         match_target,
     );
     match target {
-        astra_turn_core::permission_audit::PersistTarget::Project => pm.add_allow_rule(&rule),
-        astra_turn_core::permission_audit::PersistTarget::User => pm.add_user_allow_rule(&rule),
+        astra_turn_core::permission::audit::PersistTarget::Project => pm.add_allow_rule(&rule),
+        astra_turn_core::permission::audit::PersistTarget::User => pm.add_user_allow_rule(&rule),
     }
     if let Some(err) = pm.take_last_save_error() {
         let target_label = match target {
-            astra_turn_core::permission_audit::PersistTarget::Project => ".kiro/permissions.json",
-            astra_turn_core::permission_audit::PersistTarget::User => "~/.astra/permissions.json",
+            astra_turn_core::permission::audit::PersistTarget::Project => ".kiro/permissions.json",
+            astra_turn_core::permission::audit::PersistTarget::User => "~/.astra/permissions.json",
         };
         astra_core::agent_warn!(
             "permission",
@@ -394,10 +396,11 @@ fn apply_approval_memory_action(
     action: ApprovalMemoryAction,
     tool: &str,
     args: &Value,
-    match_target: Option<&astra_turn_core::permission_match_target::AllowMatchTarget>,
+    match_target: Option<&astra_turn_core::permission::match_target::AllowMatchTarget>,
     save_warning_tx: Option<&super::chat_stream::StreamEventTx>,
 ) {
-    let default_target = astra_turn_core::permission_match_target::default_match_target(tool, args);
+    let default_target =
+        astra_turn_core::permission::match_target::default_match_target(tool, args);
     let match_target = match_target.unwrap_or(&default_target);
     match action {
         ApprovalMemoryAction::None => {}
@@ -413,7 +416,7 @@ fn apply_approval_memory_action(
         ApprovalMemoryAction::PersistProjectRule => {
             persist_scoped_allow_rule(
                 pm,
-                astra_turn_core::permission_audit::PersistTarget::Project,
+                astra_turn_core::permission::audit::PersistTarget::Project,
                 tool,
                 args,
                 Some(match_target),
@@ -423,7 +426,7 @@ fn apply_approval_memory_action(
         ApprovalMemoryAction::PersistUserRule => {
             persist_scoped_allow_rule(
                 pm,
-                astra_turn_core::permission_audit::PersistTarget::User,
+                astra_turn_core::permission::audit::PersistTarget::User,
                 tool,
                 args,
                 Some(match_target),
@@ -529,6 +532,14 @@ impl EdgeToolCache {
             max_identical_calls,
         }
     }
+
+    fn reset_read_only_after_workspace_mutation(&mut self) {
+        self.output_cache.clear();
+        self.call_counts.retain(|sig, _| {
+            let tool_name = sig.split_once(':').map_or(sig.as_str(), |(name, _)| name);
+            !READ_ONLY_TOOLS.contains(&tool_name)
+        });
+    }
 }
 
 fn path_mtime_ms(path: &Path) -> u128 {
@@ -589,8 +600,7 @@ pub(super) struct EdgeSseContext<'a> {
     /// (see `AutoTuningEngine::should_disable_streaming_speculation`). `None`
     /// for tests and non-observable contexts; production supplies it from
     /// `CliAgenticLoopHost`.
-    pub observability_hub:
-        Option<std::sync::Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    pub observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
 }
 
 // ─── CLI SSE stream host ─────────────────────────────────────────────────────
@@ -668,8 +678,7 @@ struct CliSseStreamHost<'a> {
     streaming_tool_exec:
         Option<std::sync::Arc<astra_turn_core::streaming_tool_exec::StreamingToolExecutor>>,
     /// Optional ObservabilityHub for streaming-speculation metric reporting.
-    observability_hub:
-        Option<std::sync::Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
     /// Set when posting edge-side tool or approval results receives 401.
     auth_failure: bool,
 }
@@ -2643,12 +2652,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     // language. The persisted rule remains an internal
                     // detail; the UI must not leak `Bash(...:*)` or
                     // other permissions.json DSL.
-                    if always_scope == astra_turn_core::permission_scope::AllowScope::Project {
+                    if always_scope == astra_turn_core::permission::scope::AllowScope::Project {
                         // Include the package root when available so
                         // the user understands the memory boundary.
                         let cwd = std::env::current_dir().unwrap_or_default();
                         let scope_label =
-                            astra_turn_core::permission_cwd_root::nearest_package_root(&cwd, None)
+                            astra_turn_core::permission::cwd_root::nearest_package_root(&cwd, None)
                                 .as_deref()
                                 .map(|p| {
                                     cwd.strip_prefix(p)
@@ -2687,21 +2696,21 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     if t == "bash" {
                         if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
                             if let Some(script_path) =
-                                astra_turn_core::permission_script_preview::looks_like_local_script(
+                                astra_turn_core::permission::script_preview::looks_like_local_script(
                                     cmd,
                                 )
                             {
                                 let cwd = std::env::current_dir()
                                     .unwrap_or_else(|_| std::path::PathBuf::from("."));
                                 if let Ok(preview) =
-                                    astra_turn_core::permission_script_preview::build_script_preview(
+                                    astra_turn_core::permission::script_preview::build_script_preview(
                                         &script_path,
                                         &cwd,
                                     )
                                 {
                                     if preview.has_destructive_hit
                                         && !metadata.risk_tags.contains(
-                                            &astra_turn_core::permission_engine::RiskTag::BashExecute,
+                                            &astra_turn_core::permission::engine::RiskTag::BashExecute,
                                         )
                                     {
                                         // Already pushed above
@@ -2836,14 +2845,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             .map(audit_scope_for_always);
                         let match_target = response.match_target().cloned().or_else(|| {
                             response.always_scope(always_scope).map(|_| {
-                                astra_turn_core::permission_match_target::default_match_target(
+                                astra_turn_core::permission::match_target::default_match_target(
                                     &t, args,
                                 )
                             })
                         });
-                        astra_turn_core::permission_audit::record_resolved_for_session(
+                        astra_turn_core::permission::audit::record_resolved_for_session(
                             self.executor.active_session_id().as_deref(),
-                            astra_turn_core::permission_audit::ApprovalResolvedEvent {
+                            astra_turn_core::permission::audit::ApprovalResolvedEvent {
                                 timestamp_ms,
                                 correlation_id,
                                 request_key,
@@ -2945,7 +2954,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 } else {
                     "Error: skill resolver not available".to_string()
                 }
-            } else if tool == astra_runtime::turn::agentic_loop_host::DELEGATE_TOOL_NAME {
+            } else if tool == astra_runtime::turn::agentic_loop::host::DELEGATE_TOOL_NAME {
                 // Delegate calls are intercepted at Step 3b of the agentic loop
                 // (partition_and_execute_delegations) where the delegation engine
                 // runs sub-agents. Return a deferred acknowledgment so the server
@@ -3020,15 +3029,15 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         resp_rx.await.unwrap_or(ApprovalResponse::Deny)
                                     };
                                     let selected_scope = response.always_scope(
-                                        astra_turn_core::permission_scope::AllowScope::Project,
+                                        astra_turn_core::permission::scope::AllowScope::Project,
                                     );
                                     match selected_scope {
-                                        Some(astra_turn_core::permission_scope::AllowScope::Project) => {
+                                        Some(astra_turn_core::permission::scope::AllowScope::Project) => {
                                             // Persistent: writes a tool-level allow
                                             // rule to settings for future sessions.
                                             let rule = crate::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
                                             let remember_preview =
-                                                astra_turn_core::permission_match_target::remember_preview(
+                                                astra_turn_core::permission::match_target::remember_preview(
                                                     &sandbox_tool_key,
                                                     &guard_args,
                                                     "in this workspace",
@@ -3050,16 +3059,16 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                             pm.trust_sandbox_root_from_reason(sandbox_msg);
                                         }
                                         Some(
-                                            astra_turn_core::permission_scope::AllowScope::RestOfSession,
+                                            astra_turn_core::permission::scope::AllowScope::RestOfSession,
                                         ) => {
                                             pm.trust_sandbox_root_from_reason(sandbox_msg);
                                         }
                                         Some(
-                                            astra_turn_core::permission_scope::AllowScope::User,
+                                            astra_turn_core::permission::scope::AllowScope::User,
                                         ) => {
                                             let rule = crate::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
                                             let remember_preview =
-                                                astra_turn_core::permission_match_target::remember_preview(
+                                                astra_turn_core::permission::match_target::remember_preview(
                                                     &sandbox_tool_key,
                                                     &guard_args,
                                                     "for this user",
@@ -3081,17 +3090,17 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                             pm.trust_sandbox_root_from_reason(sandbox_msg);
                                         }
                                         Some(
-                                            astra_turn_core::permission_scope::AllowScope::OnceThisCall
-                                            | astra_turn_core::permission_scope::AllowScope::RestOfTurn,
+                                            astra_turn_core::permission::scope::AllowScope::OnceThisCall
+                                            | astra_turn_core::permission::scope::AllowScope::RestOfTurn,
                                         )
                                         | None => {}
                                     }
                                     if matches!(
                                         selected_scope,
                                         Some(
-                                            astra_turn_core::permission_scope::AllowScope::Project
-                                                | astra_turn_core::permission_scope::AllowScope::RestOfSession
-                                                | astra_turn_core::permission_scope::AllowScope::User
+                                            astra_turn_core::permission::scope::AllowScope::Project
+                                                | astra_turn_core::permission::scope::AllowScope::RestOfSession
+                                                | astra_turn_core::permission::scope::AllowScope::User
                                         )
                                     ) {
                                         pm.record_approval(&sandbox_tool_key, Some(args), true);
@@ -3193,7 +3202,16 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             self.active_turn_rollback = None;
         }
 
-        // Store successful cacheable tool results for cross-turn dedup.
+        // Mutation tools: clear cached read-only outputs before processing
+        // the result. Disjoint from the read-only branch below.
+        if allowed && status != "error" && tool_call_invalidates_read_cache(tool, Some(args)) {
+            // A successful mutation changes the workspace baseline, so cached
+            // read-only outputs and duplicate-call counts are no longer valid.
+            // Keep mutation-tool counters so runaway write loops still trip the
+            // identical-call guard.
+            self.tool_cache.reset_read_only_after_workspace_mutation();
+        }
+        // Read-only tools: populate output cache for cross-turn dedup.
         if allowed
             && status != "error"
             && READ_ONLY_TOOLS.contains(&tool)
@@ -4182,6 +4200,7 @@ pub(super) struct StreamRenderState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolOutputSummaryKind {
     Error,
+    Diff,
     Structural,
     Preview,
 }
@@ -4190,6 +4209,32 @@ enum ToolOutputSummaryKind {
 struct ToolOutputSummary {
     kind: ToolOutputSummaryKind,
     text: String,
+}
+
+fn format_terminal_tool_summary(tool: &str, summary: &ToolOutputSummary, warning: bool) -> String {
+    let rendered = if matches!(summary.kind, ToolOutputSummaryKind::Diff)
+        && matches!(tool, "write_file" | "str_replace" | "multi_edit")
+    {
+        colorize_diff_summary(&summary.text)
+    } else {
+        match summary.kind {
+            ToolOutputSummaryKind::Diff => summary.text.clone(),
+            ToolOutputSummaryKind::Preview | ToolOutputSummaryKind::Structural => {
+                if warning {
+                    format!("{}", summary.text.as_str().yellow())
+                } else {
+                    format!("{}", summary.text.as_str().dim())
+                }
+            }
+            ToolOutputSummaryKind::Error => format!("{}", summary.text.as_str().red()),
+        }
+    };
+
+    rendered
+        .lines()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ── Tool completion icon + output-summary sentinels (shared by `format_output_summary`) ──
@@ -5031,20 +5076,6 @@ impl StreamRenderState {
                     _ => None,
                 }
             }
-            "spawn_agent" => {
-                let description = args.get("description").and_then(Value::as_str);
-                let agent_type = args.get("agent_type").and_then(Value::as_str);
-                match (description, agent_type) {
-                    (Some(description), Some(agent_type)) => Some(format!(
-                        "{} ({})",
-                        truncate_line(description, 28),
-                        truncate_line(agent_type, 12)
-                    )),
-                    (Some(description), None) => Some(truncate_line(description, 40)),
-                    (None, Some(agent_type)) => Some(truncate_line(agent_type, 24)),
-                    _ => None,
-                }
-            }
             "diagnose" => {
                 let category = args.get("category").and_then(Value::as_str);
                 let verbose = args.get("verbose").and_then(Value::as_bool);
@@ -5231,24 +5262,15 @@ impl StreamRenderState {
                 .unwrap_or_else(|| "failed".to_string());
             format!("    {}", err_msg.red())
         } else if is_warning {
-            // Show warning context in yellow.
-            match output_summary {
-                Some(summary) => match summary.kind {
-                    ToolOutputSummaryKind::Preview
-                    | ToolOutputSummaryKind::Structural
-                    | ToolOutputSummaryKind::Error => format!("    {}", summary.text.yellow()),
-                },
-                None => String::new(),
-            }
+            output_summary
+                .as_ref()
+                .map(|summary| format_terminal_tool_summary(tool, summary, true))
+                .unwrap_or_default()
         } else {
-            match output_summary {
-                Some(summary) => match summary.kind {
-                    ToolOutputSummaryKind::Preview
-                    | ToolOutputSummaryKind::Structural
-                    | ToolOutputSummaryKind::Error => format!("    {}", summary.text.dim()),
-                },
-                None => String::new(),
-            }
+            output_summary
+                .as_ref()
+                .map(|summary| format_terminal_tool_summary(tool, summary, false))
+                .unwrap_or_default()
         };
         if self.md.is_some() {
             self.stop_tool_stderr_running();
@@ -5317,23 +5339,15 @@ impl StreamRenderState {
                 .unwrap_or_else(|| "failed".to_string());
             format!("    {}", err_msg.red())
         } else if is_warning {
-            match output_summary {
-                Some(summary) => match summary.kind {
-                    ToolOutputSummaryKind::Preview
-                    | ToolOutputSummaryKind::Structural
-                    | ToolOutputSummaryKind::Error => format!("    {}", summary.text.yellow()),
-                },
-                None => String::new(),
-            }
+            output_summary
+                .as_ref()
+                .map(|summary| format_terminal_tool_summary(tool, summary, true))
+                .unwrap_or_default()
         } else {
-            match output_summary {
-                Some(summary) => match summary.kind {
-                    ToolOutputSummaryKind::Preview
-                    | ToolOutputSummaryKind::Structural
-                    | ToolOutputSummaryKind::Error => format!("    {}", summary.text.dim()),
-                },
-                None => String::new(),
-            }
+            output_summary
+                .as_ref()
+                .map(|summary| format_terminal_tool_summary(tool, summary, false))
+                .unwrap_or_default()
         };
 
         let mut out_lines = 1usize;
@@ -5362,6 +5376,10 @@ impl StreamRenderState {
     ) -> Option<ToolOutputSummary> {
         let structural = |text: String| ToolOutputSummary {
             kind: ToolOutputSummaryKind::Structural,
+            text,
+        };
+        let diff_summary = |text: String| ToolOutputSummary {
+            kind: ToolOutputSummaryKind::Diff,
             text,
         };
         let preview = |text: String| ToolOutputSummary {
@@ -5510,9 +5528,9 @@ impl StreamRenderState {
                 // str_replace: sentinel-wrapped diff; write_file: JSON `_cli_unified_diff` (same as headless preview).
                 let diff_block = extract_cli_diff_block(output);
                 if let Some(ref diff) = diff_block {
-                    let colored = colorize_diff_summary(diff.as_ref(), 5);
-                    if !colored.is_empty() {
-                        return Some(structural(colored));
+                    let preview = compact_unified_diff_preview(diff.as_ref(), 5);
+                    if !preview.is_empty() {
+                        return Some(diff_summary(preview));
                     }
                 }
                 // Fallback: check if output itself looks like a diff
@@ -5520,9 +5538,9 @@ impl StreamRenderState {
                     .lines()
                     .any(|l| l.starts_with("+++ ") || l.starts_with("--- "))
                 {
-                    let colored = colorize_diff_summary(output, 5);
-                    if !colored.is_empty() {
-                        return Some(structural(colored));
+                    let preview = compact_unified_diff_preview(output, 5);
+                    if !preview.is_empty() {
+                        return Some(diff_summary(preview));
                     }
                 }
                 if tool == "write_file"
@@ -6247,6 +6265,18 @@ async fn execute_with_metadata_responsive(
     }
 }
 
+fn is_agent_control_preview(preview: &str) -> bool {
+    [
+        "Spawn agent:",
+        "Get agent result:",
+        "Send message:",
+        "Running chain:",
+        "Delegating:",
+    ]
+    .iter()
+    .any(|prefix| preview.starts_with(prefix))
+}
+
 /// Human-friendly tool description from a `ToolCallRecord`'s name + args_preview.
 /// Mirrors `format_tool_description_with_output` but works without full args JSON.
 pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<&str>) -> String {
@@ -6298,9 +6328,15 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "github" => format!("GitHub: {preview}"),
         "session" => format!("Session: {preview}"),
         "mo" => format!("MO: {preview}"),
-        "agent" => format!("Agent: {preview}"),
+        "agent" => {
+            if is_agent_control_preview(preview) {
+                preview.to_string()
+            } else {
+                format!("Agent: {preview}")
+            }
+        }
         "introspect" => "Introspecting…".to_string(),
-        // Legacy individual names
+        // Legacy individual names for journal replay / old sessions.
         "github_get_pr" => format!("Getting PR: {preview}"),
         "github_list_prs" => format!("Listing PRs: {preview}"),
         "github_get_issue" => format!("Getting issue: {preview}"),
@@ -6316,8 +6352,6 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "rollback_database_snapshots" => format!("Revert DB snapshots: {preview}"),
         "rollback_turn_actions" => format!("Rollback turn actions: {preview}"),
         "send_message" => format!("Send message: {preview}"),
-        "spawn_agent" => format!("Spawn agent: {preview}"),
-        "get_agent_result" => format!("Get agent result: {preview}"),
         "diagnose" => format!("Diagnose: {preview}"),
         "env" => format!("Env: {preview}"),
         "notebook_edit" => format!("Notebook edit: {preview}"),
@@ -6444,7 +6478,7 @@ pub(super) async fn consume_turn_sse(
     let idle = stream_idle_timeout();
     let (
         mut sse_result,
-        edge_tool_round,
+        host_edge_tool_round,
         mut md_renderer,
         lines_written,
         _pending_xml_buffer,
@@ -6497,6 +6531,7 @@ pub(super) async fn consume_turn_sse(
         (result, Vec::new(), md, lw, String::new(), false, None)
     };
     apply_edge_auth_failure_result(&mut sse_result.accum, auth_failure);
+    let edge_tool_round = merge_edge_tool_rounds(host_edge_tool_round, &sse_result.tool_results);
 
     let mut result = TurnResult {
         core: sse_result.accum,
@@ -6563,6 +6598,33 @@ pub(super) fn dispatch_turn_event_block(
 ) {
     let effects = dispatch_chat_turn_sse_event_block(block, &mut result.core, pending_edge);
     apply_sse_render_effects(effects, render, policy);
+}
+
+fn merge_edge_tool_rounds(
+    host_round: Vec<EdgeToolExecResult>,
+    consumed_tool_results: &[EdgeToolExecResult],
+) -> Vec<EdgeToolExecResult> {
+    if consumed_tool_results.is_empty() {
+        return host_round;
+    }
+
+    let mut merged = host_round;
+    let mut seen_request_ids: std::collections::HashSet<String> = merged
+        .iter()
+        .map(|result| result.request_id.clone())
+        .collect();
+
+    // Host wins on duplicate request_id; if consumed has the same id
+    // multiple times (unlikely but not enforced upstream), only the
+    // first unseen occurrence is appended — later duplicates are
+    // silently dropped.
+    for result in consumed_tool_results {
+        if seen_request_ids.insert(result.request_id.clone()) {
+            merged.push(result.clone());
+        }
+    }
+
+    merged
 }
 
 /// Append `<skill-loaded name="..."/>` to a successful skill result.
@@ -6728,7 +6790,7 @@ mod tests {
 
     #[test]
     fn approval_batch_group_key_carries_risk_tags_for_accept_all_gate() {
-        use astra_turn_core::permission_engine::RiskTag;
+        use astra_turn_core::permission::engine::RiskTag;
 
         let safe = approval_batch_group_key(
             "read_file",
@@ -6750,18 +6812,18 @@ mod tests {
 
     #[test]
     fn approval_default_always_scope_prefers_project_for_benign_request() {
-        let ctx = astra_turn_core::permission_scope::ScopeAvailabilityContext::default();
+        let ctx = astra_turn_core::permission::scope::ScopeAvailabilityContext::default();
 
         assert_eq!(
             approval_default_always_scope(&ctx),
-            astra_turn_core::permission_scope::AllowScope::Project
+            astra_turn_core::permission::scope::AllowScope::Project
         );
     }
 
     #[test]
     fn approval_default_always_scope_uses_session_for_non_persistent_risks() {
-        use astra_turn_core::permission_engine::RiskTag;
-        use astra_turn_core::permission_scope::{AllowScope, ScopeAvailabilityContext};
+        use astra_turn_core::permission::engine::RiskTag;
+        use astra_turn_core::permission::scope::{AllowScope, ScopeAvailabilityContext};
 
         let sensitive = ScopeAvailabilityContext {
             risk_tags: vec![RiskTag::WritesSensitiveFile],
@@ -6794,8 +6856,8 @@ mod tests {
 
     #[test]
     fn approval_scope_context_tags_git_safety_as_non_persistent_risk() {
-        use astra_turn_core::permission_engine::RiskTag;
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::engine::RiskTag;
+        use astra_turn_core::permission::scope::AllowScope;
 
         let ctx = approval_scope_context_for_tool(
             "bash",
@@ -6813,7 +6875,7 @@ mod tests {
 
     #[test]
     fn approval_scope_context_allows_always_for_cd_wrapped_single_command() {
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::scope::AllowScope;
 
         let ctx = approval_scope_context_for_tool(
             "bash",
@@ -6831,7 +6893,7 @@ mod tests {
 
     #[test]
     fn approval_scope_context_allows_always_for_cd_wrapped_cargo_build() {
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::scope::AllowScope;
 
         let ctx = approval_scope_context_for_tool(
             "bash",
@@ -6849,7 +6911,7 @@ mod tests {
 
     #[test]
     fn approval_scope_context_allows_always_for_cd_wrapped_cargo_test() {
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::scope::AllowScope;
 
         let ctx = approval_scope_context_for_tool(
             "bash",
@@ -6867,7 +6929,7 @@ mod tests {
 
     #[test]
     fn approval_scope_context_allows_always_for_read_only_pipe_chain() {
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::scope::AllowScope;
 
         let ctx = approval_scope_context_for_tool(
             "bash",
@@ -6885,7 +6947,7 @@ mod tests {
 
     #[test]
     fn approval_scope_context_allows_always_for_quoted_grep_regex() {
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::scope::AllowScope;
 
         let ctx = approval_scope_context_for_tool(
             "bash",
@@ -6933,7 +6995,7 @@ mod tests {
 
     #[test]
     fn approval_scope_context_blocks_persistent_memory_without_command_shape() {
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::scope::AllowScope;
 
         let ctx = approval_scope_context_for_tool("bash", &serde_json::json!({}), false, false);
 
@@ -6943,7 +7005,7 @@ mod tests {
 
     #[test]
     fn approval_scope_context_allows_exact_memory_for_interpreter_command() {
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::scope::AllowScope;
 
         let ctx = approval_scope_context_for_tool(
             "bash",
@@ -6966,7 +7028,7 @@ mod tests {
 
     #[test]
     fn approval_default_always_scope_uses_turn_for_unsound_rule_shapes() {
-        use astra_turn_core::permission_scope::{AllowScope, ScopeAvailabilityContext};
+        use astra_turn_core::permission::scope::{AllowScope, ScopeAvailabilityContext};
 
         let compound = ScopeAvailabilityContext {
             is_compound_command: true,
@@ -6990,7 +7052,7 @@ mod tests {
     #[test]
     fn approval_memory_action_does_not_remember_allow_once() {
         use super::chat_stream::ApprovalResponse;
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::scope::AllowScope;
 
         assert_eq!(
             approval_memory_action(&ApprovalResponse::AllowOnce, AllowScope::Project, true),
@@ -7001,7 +7063,7 @@ mod tests {
     #[test]
     fn approval_memory_action_maps_always_scope_to_storage_effect() {
         use super::chat_stream::ApprovalResponse;
-        use astra_turn_core::permission_scope::AllowScope;
+        use astra_turn_core::permission::scope::AllowScope;
 
         assert_eq!(
             approval_memory_action(&ApprovalResponse::AlwaysAllow, AllowScope::Project, true),
@@ -7840,6 +7902,21 @@ mod tests {
     #[test]
     fn format_meta_tool_preview_display_names() {
         assert_eq!(
+            format_tool_display_from_preview(
+                "agent",
+                Some("Spawn agent: reviewer-A (code-review)")
+            ),
+            "Spawn agent: reviewer-A (code-review)"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("agent", Some("Get agent result: reviewer@abc12345")),
+            "Get agent result: reviewer@abc12345"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("agent", Some("Send message: agent-2: Need review")),
+            "Send message: agent-2: Need review"
+        );
+        assert_eq!(
             format_tool_display_from_preview("send_message", Some("agent-2: Need review")),
             "Send message: agent-2: Need review"
         );
@@ -8187,6 +8264,29 @@ diff --git a/src/a.rs b/src/a.rs\n\
         assert!(summary.text.contains("+1"));
         assert!(summary.text.contains("-1"));
         assert!(summary.text.contains("src/a.rs"));
+    }
+
+    #[test]
+    fn str_replace_output_summary_keeps_raw_diff_preview_for_tui_rendering() {
+        let r = StreamRenderState::new();
+        let output = "\
+<<<ASTRA_UNIFIED_DIFF>>>\n\
+--- a/src/hello.py\n\
++++ b/src/hello.py\n\
+@@ -1,2 +1,3 @@\n\
+-print(\"old\")\n\
++print(\"new\")\n\
++print(\"more\")\n\
+<<<END_ASTRA_UNIFIED_DIFF>>>";
+        let summary = r
+            .format_output_summary("str_replace", output, "ok")
+            .expect("summary");
+        assert_eq!(summary.kind, ToolOutputSummaryKind::Diff);
+        assert!(summary.text.contains("--- a/src/hello.py"));
+        assert!(summary.text.contains("+++ b/src/hello.py"));
+        assert!(summary.text.contains("@@ -1,2 +1,3 @@"));
+        assert!(summary.text.contains("+print(\"new\")"));
+        assert!(!summary.text.contains('\x1b'));
     }
 
     #[test]
@@ -9507,6 +9607,198 @@ diff --git a/src/a.rs b/src/a.rs\n\
     }
 
     #[tokio::test]
+    async fn successful_write_file_clears_cross_turn_read_cache_and_call_counts() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let file = temp.path().join("cached.txt");
+        std::fs::write(&file, "v1\n").expect("seed");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut tool_cache = EdgeToolCache::new(2);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: std::sync::Arc::clone(&executor),
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+            },
+            80,
+            false,
+        );
+
+        let read_args = serde_json::json!({"path": "cached.txt"});
+        let initial = host
+            .execute_tool("cache-read-1", "read_file", &read_args)
+            .await;
+        assert!(initial.output.contains("v1"), "{}", initial.output);
+        let read_sig = tool_dedup_signature("read_file", &read_args);
+        let write_sig = tool_dedup_signature(
+            "write_file",
+            &serde_json::json!({"path": "cached.txt", "content": "v2\n"}),
+        );
+        let timestamp_ms = path_mtime_ms(&file);
+        host.tool_cache.output_cache.insert(
+            read_sig.clone(),
+            EdgeToolCacheEntry {
+                output: "v1\n".to_string(),
+                status: "success".to_string(),
+                validation: EdgeToolCacheValidation::FileMtime {
+                    path: file.clone(),
+                    timestamp_ms,
+                },
+            },
+        );
+        host.tool_cache.call_counts.insert(read_sig.clone(), 2);
+
+        let write = host
+            .execute_tool(
+                "cache-write-1",
+                "write_file",
+                &serde_json::json!({"path": "cached.txt", "content": "v2\n"}),
+            )
+            .await;
+        assert_eq!(write.status, "success", "{}", write.output);
+        assert!(
+            host.tool_cache.output_cache.is_empty(),
+            "successful write_file must clear stale read cache"
+        );
+        assert!(
+            !host.tool_cache.call_counts.contains_key(&read_sig),
+            "successful write_file must reset stale read duplicate-call counters"
+        );
+        assert_eq!(
+            host.tool_cache.call_counts.get(&write_sig),
+            Some(&1),
+            "successful write_file must preserve mutation-tool counters"
+        );
+
+        let reread = host
+            .execute_tool("cache-read-2", "read_file", &read_args)
+            .await;
+        assert!(reread.output.contains("v2"), "{}", reread.output);
+        assert_eq!(host.tool_cache.call_counts.get(&read_sig), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn successful_str_replace_clears_cross_turn_read_cache_and_call_counts() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let file = temp.path().join("cached.txt");
+        std::fs::write(&file, "alpha\n").expect("seed");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut tool_cache = EdgeToolCache::new(2);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: std::sync::Arc::clone(&executor),
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+            },
+            80,
+            false,
+        );
+
+        let read_args = serde_json::json!({"path": "cached.txt"});
+        let initial = host
+            .execute_tool("cache-read-alpha", "read_file", &read_args)
+            .await;
+        assert!(initial.output.contains("alpha"), "{}", initial.output);
+        let read_sig = tool_dedup_signature("read_file", &read_args);
+        let replace_sig = tool_dedup_signature(
+            "str_replace",
+            &serde_json::json!({
+                "path": "cached.txt",
+                "old_str": "alpha",
+                "new_str": "omega"
+            }),
+        );
+        let timestamp_ms = path_mtime_ms(&file);
+        host.tool_cache.output_cache.insert(
+            read_sig.clone(),
+            EdgeToolCacheEntry {
+                output: "alpha\n".to_string(),
+                status: "success".to_string(),
+                validation: EdgeToolCacheValidation::FileMtime {
+                    path: file.clone(),
+                    timestamp_ms,
+                },
+            },
+        );
+        host.tool_cache.call_counts.insert(read_sig.clone(), 2);
+
+        let replace = host
+            .execute_tool(
+                "cache-replace-1",
+                "str_replace",
+                &serde_json::json!({
+                    "path": "cached.txt",
+                    "old_str": "alpha",
+                    "new_str": "omega"
+                }),
+            )
+            .await;
+        assert_eq!(replace.status, "success", "{}", replace.output);
+        assert!(
+            host.tool_cache.output_cache.is_empty(),
+            "successful str_replace must clear stale read cache"
+        );
+        assert!(
+            !host.tool_cache.call_counts.contains_key(&read_sig),
+            "successful str_replace must reset stale read duplicate-call counters"
+        );
+        assert_eq!(
+            host.tool_cache.call_counts.get(&replace_sig),
+            Some(&1),
+            "successful str_replace must preserve mutation-tool counters"
+        );
+
+        let reread = host
+            .execute_tool("cache-read-3", "read_file", &read_args)
+            .await;
+        assert!(reread.output.contains("omega"), "{}", reread.output);
+        assert_eq!(host.tool_cache.call_counts.get(&read_sig), Some(&1));
+    }
+
+    #[tokio::test]
     async fn edge_tool_cache_reuses_git_show_when_head_is_unchanged() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -9828,6 +10120,59 @@ diff --git a/src/a.rs b/src/a.rs\n\
             "{}",
             result.output
         );
+    }
+
+    #[test]
+    fn merge_edge_tool_rounds_recovers_missing_host_result() {
+        let consumed = vec![EdgeToolExecResult {
+            request_id: "call-exit".to_string(),
+            tool: "exit_plan_mode".to_string(),
+            args: serde_json::json!({"approved": true}),
+            output: "Exited plan mode; user approved. Next turn will run in auto mode.".to_string(),
+            tool_result_fields: None,
+            status: "ok".to_string(),
+            duration_ms: 12,
+        }];
+
+        let merged = merge_edge_tool_rounds(Vec::new(), &consumed);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].request_id, consumed[0].request_id);
+        assert_eq!(merged[0].tool, consumed[0].tool);
+        assert_eq!(merged[0].args, consumed[0].args);
+        assert_eq!(merged[0].output, consumed[0].output);
+        assert_eq!(merged[0].status, consumed[0].status);
+        assert_eq!(merged[0].duration_ms, consumed[0].duration_ms);
+    }
+
+    #[test]
+    fn merge_edge_tool_rounds_deduplicates_by_request_id() {
+        let host = vec![EdgeToolExecResult {
+            request_id: "call-exit".to_string(),
+            tool: "exit_plan_mode".to_string(),
+            args: serde_json::json!({"approved": true}),
+            output: "host output".to_string(),
+            tool_result_fields: None,
+            status: "ok".to_string(),
+            duration_ms: 8,
+        }];
+        let consumed = vec![EdgeToolExecResult {
+            request_id: "call-exit".to_string(),
+            tool: "exit_plan_mode".to_string(),
+            args: serde_json::json!({"approved": true}),
+            output: "consumer output".to_string(),
+            tool_result_fields: None,
+            status: "ok".to_string(),
+            duration_ms: 9,
+        }];
+
+        let merged = merge_edge_tool_rounds(host.clone(), &consumed);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].request_id, host[0].request_id);
+        assert_eq!(merged[0].tool, host[0].tool);
+        assert_eq!(merged[0].args, host[0].args);
+        assert_eq!(merged[0].output, host[0].output);
+        assert_eq!(merged[0].status, host[0].status);
+        assert_eq!(merged[0].duration_ms, host[0].duration_ms);
     }
 
     #[tokio::test]

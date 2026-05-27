@@ -25,10 +25,12 @@ pub(crate) struct SlashItem {
     pub name: &'static str,
     /// One-line description shown beside the name.
     pub description: &'static str,
-    /// Optional sub-tokens surfaced once the user types a trailing
-    /// space. Matches the `(token, description)` shape in the
-    /// command registry so the two stay trivially in sync.
+    /// Static sub-tokens surfaced once the user types a trailing space.
+    /// Matches the `(token, description)` shape in the command registry.
     pub subcommands: &'static [(&'static str, &'static str)],
+    /// Dynamic sub-tokens injected at runtime (e.g. MCP server/tool names).
+    /// Merged with `subcommands` when the menu is constructed.
+    pub extra_subcommands: Vec<(String, String)>,
     /// Optional short aliases (without leading `/`), e.g. `["h"]` for `/help`.
     pub aliases: &'static [&'static str],
     /// Frequency hint — higher means "show sooner on ties".
@@ -47,6 +49,7 @@ impl Default for SlashItem {
             name: "",
             description: "",
             subcommands: &[],
+            extra_subcommands: Vec::new(),
             aliases: &[],
             usage_boost: 0,
             group: None,
@@ -63,6 +66,7 @@ impl SlashItem {
             name,
             description,
             subcommands: &[],
+            extra_subcommands: Vec::new(),
             aliases: &[],
             usage_boost: 0,
             group: None,
@@ -100,17 +104,17 @@ fn derive_mode(buffer: &str, items: &[SlashItem]) -> Mode {
             let cmd_tok = &body[..sp];
             let after = body[sp..].trim_start();
             let parent = format!("/{cmd_tok}");
-            let has_subs = items
-                .iter()
-                .any(|it| it.name == parent && !it.subcommands.is_empty());
+            let has_subs = items.iter().any(|it| {
+                it.name == parent
+                    && (!it.subcommands.is_empty() || !it.extra_subcommands.is_empty())
+            });
             if has_subs {
                 Mode::Subcommand {
                     parent,
-                    token: after
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                        .to_ascii_lowercase(),
+                    // Keep the full suffix so multi-word subcommand names
+                    // like "inspect github:list_prs" can be filtered by
+                    // typing "/mcp inspect git".
+                    token: after.to_ascii_lowercase(),
                 }
             } else {
                 Mode::Command {
@@ -262,18 +266,29 @@ impl SlashMenu {
         let prebuilt_subs: Vec<Vec<SlashItem>> = items
             .iter()
             .map(|item| {
-                item.subcommands
-                    .iter()
-                    .map(|(sub_name, sub_desc)| {
-                        let full: &'static str =
-                            Box::leak(format!("{} {sub_name}", item.name).into_boxed_str());
-                        SlashItem {
-                            name: full,
-                            description: sub_desc,
-                            ..Default::default()
-                        }
-                    })
-                    .collect()
+                // Static subcommands from the compile-time registry.
+                let static_items = item.subcommands.iter().map(|(sub_name, sub_desc)| {
+                    let full: &'static str =
+                        Box::leak(format!("{} {sub_name}", item.name).into_boxed_str());
+                    SlashItem {
+                        name: full,
+                        description: sub_desc,
+                        ..Default::default()
+                    }
+                });
+                // Dynamic subcommands injected at runtime (e.g. connected MCP
+                // server names and tool identifiers).
+                let dynamic_items = item.extra_subcommands.iter().map(|(sub_name, sub_desc)| {
+                    let full: &'static str =
+                        Box::leak(format!("{} {sub_name}", item.name).into_boxed_str());
+                    let desc: &'static str = Box::leak(sub_desc.clone().into_boxed_str());
+                    SlashItem {
+                        name: full,
+                        description: desc,
+                        ..Default::default()
+                    }
+                });
+                static_items.chain(dynamic_items).collect()
             })
             .collect();
         let mut s = Self {
@@ -358,12 +373,19 @@ impl SlashMenu {
                 self.sub_filtered = if token.is_empty() {
                     (0..prebuilt.len()).collect()
                 } else {
+                    let parent_prefix = format!("{parent} ");
                     let mut scored: Vec<(usize, u32)> = prebuilt
                         .iter()
                         .enumerate()
                         .filter_map(|(i, item)| {
-                            let sub_name = item.name.rsplit(' ').next().unwrap_or("");
-                            score_token(token, sub_name).map(|s| (i, s))
+                            // Match the full suffix (e.g. "tools github") so that
+                            // multi-word dynamic entries like "inspect server:tool"
+                            // are reachable by typing the full prefix.
+                            let sub_suffix = item
+                                .name
+                                .strip_prefix(parent_prefix.as_str())
+                                .unwrap_or(item.name);
+                            score_token(token, sub_suffix).map(|s| (i, s))
                         })
                         .collect();
                     scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));

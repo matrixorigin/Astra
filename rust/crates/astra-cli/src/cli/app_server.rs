@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use std::io::{BufRead, Write};
+use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -397,6 +398,7 @@ async fn run_turn(
     );
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let skill_search = astra_core::SkillSearchSettings::default();
+    let explain_mode = explain_mode_from_params(&params)?;
     let unified_skill_registry = astra_runtime::skills::default_unified_registry();
     let agent_spawner = crate::agent_runtime::build_one_shot_spawner(
         &ctx.api,
@@ -424,7 +426,7 @@ async fn run_turn(
         message: &message,
         model: model.as_deref(),
         provider: None,
-        explain: ExplainMode::Off,
+        explain: explain_mode,
         render_md: false,
         verbose_mode: false,
         render_policy: crate::stream_render::RenderPolicy::Silent,
@@ -467,8 +469,8 @@ async fn run_turn(
     };
     drop(chat_ctx);
     drop(approval_tx);
-    let _ = event_task.await;
-    let _ = approval_task.await;
+    join_or_abort_app_server_task(event_task, Duration::from_millis(250)).await;
+    join_or_abort_app_server_task(approval_task, Duration::from_millis(250)).await;
     deny_pending_approvals_for_turn(&state, &turn_id).await;
     let mut sr = match result {
         Ok(sr) => sr,
@@ -488,6 +490,13 @@ async fn run_turn(
         .await;
     write_turn_result(&writer, &thread_id, &turn_id, &sr).await?;
     Ok(())
+}
+
+async fn join_or_abort_app_server_task<T>(mut task: tokio::task::JoinHandle<T>, timeout: Duration) {
+    if tokio::time::timeout(timeout, &mut task).await.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 fn extract_turn_message(params: &Value) -> Option<String> {
@@ -529,6 +538,28 @@ fn developer_instructions(params: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string)
+}
+
+fn explain_mode_from_params(params: &Value) -> Result<ExplainMode, String> {
+    let Some(raw) = params.get("explain") else {
+        return Ok(ExplainMode::Off);
+    };
+    if let Some(enabled) = raw.as_bool() {
+        return Ok(if enabled {
+            ExplainMode::On
+        } else {
+            ExplainMode::Off
+        });
+    }
+    let Some(raw) = raw.as_str().map(str::trim) else {
+        return Err("explain must be a boolean or string".to_string());
+    };
+    match raw {
+        "off" | "false" => Ok(ExplainMode::Off),
+        "on" | "true" => Ok(ExplainMode::On),
+        "verbose" => Ok(ExplainMode::Verbose),
+        _ => Err(format!("unsupported explain mode `{raw}`")),
+    }
 }
 
 fn permission_mode_from_params(
@@ -693,73 +724,56 @@ async fn write_turn_result(
 }
 
 async fn write_stream_notification(writer: &JsonWriter, event: StreamEvent) -> Result<(), String> {
+    let Some((method, params)) = stream_event_notification(&event) else {
+        return Ok(());
+    };
+    write_notification(writer, method, params).await
+}
+
+fn stream_event_notification(event: &StreamEvent) -> Option<(&'static str, Value)> {
     match event {
-        StreamEvent::Token(delta) if !delta.is_empty() => {
-            write_notification(
-                writer,
-                "item/agentMessage/delta",
-                serde_json::json!({"delta": delta}),
-            )
-            .await
-        }
-        StreamEvent::Thinking(true) => {
-            write_notification(
-                writer,
-                "item/started",
-                serde_json::json!({"item": {"type": "reasoning"}}),
-            )
-            .await
-        }
-        StreamEvent::Thinking(false) => {
-            write_notification(
-                writer,
-                "item/completed",
-                serde_json::json!({"item": {"type": "reasoning"}}),
-            )
-            .await
-        }
-        StreamEvent::ThinkingChunk(text) if !text.is_empty() => {
-            write_notification(
-                writer,
-                "item/reasoning/textDelta",
-                serde_json::json!({"delta": text}),
-            )
-            .await
-        }
+        StreamEvent::Token(delta) if !delta.is_empty() => Some((
+            "item/agentMessage/delta",
+            serde_json::json!({"delta": delta}),
+        )),
+        StreamEvent::Thinking(true) => Some((
+            "item/started",
+            serde_json::json!({"item": {"type": "reasoning"}}),
+        )),
+        StreamEvent::Thinking(false) => Some((
+            "item/completed",
+            serde_json::json!({"item": {"type": "reasoning"}}),
+        )),
+        StreamEvent::ThinkingChunk(text) if !text.is_empty() => Some((
+            "item/reasoning/textDelta",
+            serde_json::json!({"delta": text}),
+        )),
         StreamEvent::ToolStarted {
             name, description, ..
-        } => {
-            write_notification(
-                writer,
-                "item/started",
-                serde_json::json!({
-                    "item": {
-                        "type": "dynamicToolCall",
-                        "tool": name,
-                        "name": name,
-                        "arguments": {"description": description},
-                        "input": {"description": description},
-                    }
-                }),
-            )
-            .await
-        }
-        StreamEvent::AgentControlStarted { action, label, .. } => {
-            write_notification(
-                writer,
-                "item/started",
-                serde_json::json!({
-                    "item": {
-                        "type": "dynamicToolCall",
-                        "tool": action,
-                        "name": action,
-                        "arguments": {"description": label},
-                        "input": {"description": label},
-                    }
-                }),
-            )
-            .await
-        }
+        } => Some((
+            "item/started",
+            serde_json::json!({
+                "item": {
+                    "type": "dynamicToolCall",
+                    "tool": name,
+                    "name": name,
+                    "arguments": {"description": description},
+                    "input": {"description": description},
+                }
+            }),
+        )),
+        StreamEvent::AgentControlStarted { action, label, .. } => Some((
+            "item/started",
+            serde_json::json!({
+                "item": {
+                    "type": "dynamicToolCall",
+                    "tool": action,
+                    "name": action,
+                    "arguments": {"description": label},
+                    "input": {"description": label},
+                }
+            }),
+        )),
         StreamEvent::ToolCompleted {
             name, duration_ms, ..
         }
@@ -767,22 +781,22 @@ async fn write_stream_notification(writer: &JsonWriter, event: StreamEvent) -> R
             action: name,
             duration_ms,
             ..
-        } => {
-            write_notification(
-                writer,
-                "item/completed",
-                serde_json::json!({
-                    "item": {
-                        "type": "dynamicToolCall",
-                        "tool": name,
-                        "name": name,
-                        "durationMs": duration_ms,
-                    }
-                }),
-            )
-            .await
-        }
-        _ => Ok(()),
+        } => Some((
+            "item/completed",
+            serde_json::json!({
+                "item": {
+                    "type": "dynamicToolCall",
+                    "tool": name,
+                    "name": name,
+                    "durationMs": duration_ms,
+                }
+            }),
+        )),
+        StreamEvent::ExplainText(text) if !text.trim().is_empty() => Some((
+            "turn/explain",
+            serde_json::json!({"format": "dag", "text": text}),
+        )),
+        _ => None,
     }
 }
 
@@ -932,5 +946,54 @@ mod tests {
                 .unwrap(),
             PermissionMode::Auto
         );
+    }
+
+    #[test]
+    fn explain_mode_from_params_accepts_verbose() {
+        let params = serde_json::json!({"explain": "verbose"});
+        assert_eq!(
+            explain_mode_from_params(&params).unwrap(),
+            ExplainMode::Verbose
+        );
+    }
+
+    #[test]
+    fn explain_mode_from_params_accepts_bool_true() {
+        let params = serde_json::json!({"explain": true});
+        assert_eq!(explain_mode_from_params(&params).unwrap(), ExplainMode::On);
+    }
+
+    #[test]
+    fn explain_mode_from_params_defaults_off() {
+        let params = serde_json::json!({});
+        assert_eq!(explain_mode_from_params(&params).unwrap(), ExplainMode::Off);
+    }
+
+    #[test]
+    fn explain_mode_from_params_rejects_invalid_string() {
+        let params = serde_json::json!({"explain": "laser"});
+        assert!(explain_mode_from_params(&params).is_err());
+    }
+
+    #[test]
+    fn stream_event_notification_maps_explain_text() {
+        let (method, params) = stream_event_notification(&StreamEvent::ExplainText(
+            "Explain Analyze DAG — turn-1".into(),
+        ))
+        .expect("notification");
+        assert_eq!(method, "turn/explain");
+        assert_eq!(params["format"], "dag");
+        assert_eq!(params["text"], "Explain Analyze DAG — turn-1");
+    }
+
+    #[tokio::test]
+    async fn join_or_abort_app_server_task_does_not_wait_for_open_channel() {
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let task = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let started = std::time::Instant::now();
+
+        join_or_abort_app_server_task(task, Duration::from_millis(10)).await;
+
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

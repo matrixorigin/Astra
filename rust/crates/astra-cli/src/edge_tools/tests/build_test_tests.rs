@@ -274,8 +274,8 @@ async fn run_build_test_auto_fix_creates_report() {
 use crate::edge_tools::shell::apply_build_test_outcome_to_session;
 use astra_tools::build_test::BuildTestResult;
 
-fn make_session() -> astra_runtime::observability_integration::ObservabilitySession {
-    astra_runtime::observability_integration::ObservabilitySession::new_simple("tier1-test-session")
+fn make_session() -> astra_runtime::observability::ObservabilitySession {
+    astra_runtime::observability::ObservabilitySession::new_simple("tier1-test-session")
 }
 
 #[test]

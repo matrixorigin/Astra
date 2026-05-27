@@ -80,6 +80,9 @@ jobs:
           workspaces: rust
           shared-key: ci-test-${{ github.base_ref || github.ref_name }}
           save-if: false
+      - name: Prebuild mock MCP server
+        if: matrix.segment == 'non-edge'
+        run: cargo build --manifest-path rust/Cargo.toml -p astra-cli --bin mock_mcp_server
       - name: "Test astra-cli (${{ matrix.segment }})"
         env:
           NEXTEST_FILTER: ${{ matrix.filter }}

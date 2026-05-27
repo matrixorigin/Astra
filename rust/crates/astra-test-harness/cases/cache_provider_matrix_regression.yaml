@@ -11,6 +11,7 @@ description: |
 prompt: |
   Reply READY. Do not call tools.
 capability: custom:cache
+required_cache_scope: conversation_turns
 difficulty: 1
 weight: 1.0
 timeout_seconds: 180

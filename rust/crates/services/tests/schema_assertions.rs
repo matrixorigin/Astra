@@ -35,6 +35,133 @@ fn web_traceability_agent_events_schema_source_contract() {
     );
 }
 
+#[test]
+fn schema_rationalization_source_contract() {
+    let storage_source = include_str!("../src/storage.rs");
+    let prompt_source = include_str!("../src/prompt_delta.rs");
+    let harness_source = include_str!("../src/harness.rs");
+    let workflow_source = include_str!("../src/workflows.rs");
+
+    for removed in [
+        "CREATE TABLE IF NOT EXISTS prompt_chunks",
+        "CREATE TABLE IF NOT EXISTS harness_sources",
+        "CREATE TABLE IF NOT EXISTS harness_decisions",
+        "CREATE TABLE IF NOT EXISTS wf_definitions",
+        "CREATE TABLE IF NOT EXISTS wf_runs",
+        "CREATE TABLE IF NOT EXISTS skill_marketplace_stats",
+        "CREATE TABLE IF NOT EXISTS skill_quality_reports",
+    ] {
+        assert!(
+            !storage_source.contains(removed),
+            "storage bootstrap must not recreate removed table: {removed}"
+        );
+    }
+
+    assert!(
+        !prompt_source.contains("INSERT INTO prompt_chunks"),
+        "prompt persistence must not write a dead prompt_chunks table"
+    );
+    assert!(
+        !harness_source.contains("INSERT INTO harness_sources"),
+        "harness citations must use the original source ids directly"
+    );
+    assert!(
+        !harness_source.contains("INSERT INTO harness_decisions"),
+        "harness decisions must live in current entities, not a write-only audit table"
+    );
+    assert!(
+        !workflow_source.contains("DatabaseWorkflowService"),
+        "workflow persistence must not keep a dead database-backed implementation around"
+    );
+    for removed_sql in ["wf_definitions", "wf_runs"] {
+        assert!(
+            !workflow_source.contains(removed_sql),
+            "workflow module must not reference removed workflow tables: {removed_sql}"
+        );
+    }
+
+    let marketplace_source = include_str!("../src/marketplace_stats.rs");
+    for removed in ["skill_marketplace_stats", "skill_quality_reports"] {
+        assert!(
+            !marketplace_source.contains(removed),
+            "marketplace stats service must use unified skill_metrics storage instead of {removed}"
+        );
+    }
+    assert!(
+        marketplace_source.contains("skill_metrics"),
+        "marketplace stats service must use the unified skill_metrics table"
+    );
+    assert!(
+        !prompt_source.contains("payload_json, previous_chunk_hash"),
+        "prompt deltas must not persist unread payload_json blobs"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+async fn schema_rationalization_runtime_contract() {
+    let pool = common::setup_pool().await;
+    let schema = current_schema(&pool).await;
+
+    for removed in [
+        "prompt_chunks",
+        "harness_sources",
+        "harness_decisions",
+        "wf_definitions",
+        "wf_runs",
+        "skill_marketplace_stats",
+        "skill_quality_reports",
+    ] {
+        assert!(
+            !table_exists(&pool, &schema, removed).await,
+            "removed table must stay dropped: {removed}"
+        );
+    }
+
+    let prompt_deltas = column_names(&pool, &schema, "prompt_deltas").await;
+    assert!(
+        !prompt_deltas.iter().any(|column| column == "payload_json"),
+        "prompt_deltas must not keep unread payload_json"
+    );
+
+    let skill_metrics = column_names(&pool, &schema, "skill_metrics").await;
+    assert!(
+        skill_metrics.iter().any(|column| column == "metric_slot"),
+        "skill_metrics must carry metric_slot to scope aggregate uniqueness"
+    );
+    assert_eq!(
+        unique_key_columns(&pool, &schema, "skill_metrics", "uq_skill_metrics_slot").await,
+        ["skill_name", "metric_type", "metric_slot"],
+        "skill_metrics must enforce one aggregate slot per skill without collapsing report rows"
+    );
+
+    for table in [
+        "harness_items",
+        "harness_skill_drafts",
+        "harness_skill_rules",
+    ] {
+        let columns = column_names(&pool, &schema, table).await;
+        assert!(
+            columns
+                .iter()
+                .any(|column| column == "decision_history_json"),
+            "{table} must retain inline decision history"
+        );
+    }
+
+    let citation_columns = column_names(&pool, &schema, "harness_citations").await;
+    for expected in [
+        "source_snapshot_ref",
+        "source_content_hash",
+        "source_metadata_json",
+    ] {
+        assert!(
+            citation_columns.iter().any(|column| column == expected),
+            "harness_citations missing {expected}"
+        );
+    }
+}
+
 async fn current_schema(pool: &astra_core::SharedPool) -> String {
     let row = sqlx::query("SELECT DATABASE() AS db")
         .fetch_one(pool.get())

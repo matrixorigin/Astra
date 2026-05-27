@@ -60,7 +60,7 @@
 
 use std::collections::HashSet;
 
-use super::agentic_loop_host::{
+use super::agentic_loop::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, run_agentic_loop_with_host,
 };
 
@@ -185,8 +185,8 @@ impl Default for LoopDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::turn::agentic_headless_round::HeadlessStderrStyle;
-    use crate::turn::agentic_loop_host::HostTurnResult;
+    use crate::turn::agentic::headless_round::HeadlessStderrStyle;
+    use crate::turn::agentic_loop::host::HostTurnResult;
     use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
     use astra_pipeline::step_recorder::StepRecorder;
     use astra_text_utils::semantic_dedup::SemanticDedup;
@@ -319,7 +319,7 @@ mod tests {
             message: message.to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
-            last_turn_policy: crate::turn::agentic_loop_host::TurnInteractionPolicy::default(),
+            last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://localhost:1", None).unwrap(),
             api_token: "test".to_string(),
             delegation_engine: None,
@@ -334,6 +334,7 @@ mod tests {
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
             pinned_tool_schema_tokens: 0,
+            sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
             budget_wrapup_ignored_rounds: 0,

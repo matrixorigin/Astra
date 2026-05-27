@@ -51,6 +51,8 @@ fn build_sources() -> (
             self_model: Some("Senior Rust agent.".into()),
             deferred_tools_block: String::new(),
             skill_listing_block: String::new(),
+            current_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+            user_id: None,
         },
         TurnState {
             messages: vec![serde_json::json!({"role": "user", "content": "hello"})],

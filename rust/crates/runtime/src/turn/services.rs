@@ -1,4 +1,4 @@
-use crate::storage::{
+use crate::data_layer::storage::{
     insert_trace_event, load_agent_event_count, upsert_agent_session_event_count,
 };
 use crate::*;
@@ -470,7 +470,7 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
             .execute(&mut *tx)
             .await
             .map_err(|error| error.to_string())?;
-            crate::storage::insert_agent_event_edges(
+            crate::data_layer::storage::insert_agent_event_edges(
                 &mut *tx,
                 &event.event_id,
                 event.parent_event_id.as_deref(),

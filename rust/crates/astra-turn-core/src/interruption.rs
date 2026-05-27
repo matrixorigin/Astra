@@ -222,13 +222,24 @@ impl InterruptionRecord {
             ResumeAction::CompactAndRetry => " Context will be compacted before retry.".to_string(),
             ResumeAction::StartNewSession => " Please start a new session.".to_string(),
         };
+        let cause_note = match kind {
+            InterruptionKind::BudgetExhausted
+            | InterruptionKind::TokenBudgetExceeded
+            | InterruptionKind::CumulativeBudgetExceeded => summary
+                .stall_signal
+                .as_deref()
+                .and_then(summarize_stall_signal_for_user)
+                .map(|s| format!(" Cause: {}.", s.cause)),
+            _ => None,
+        }
+        .unwrap_or_default();
         match kind {
             InterruptionKind::EmptyCompletion => format!(
                 "[{}] The run ended without a final answer.{tool_note}{checkpoint_note}{action_note}",
                 kind.label()
             ),
             _ => format!(
-                "[{kind}]{tool_note}{checkpoint_note}{action_note}",
+                "[{kind}]{tool_note}{checkpoint_note}{cause_note}{action_note}",
                 kind = kind.label()
             ),
         }
@@ -255,6 +266,74 @@ fn parse_kv_stall_signal(signal: &str) -> std::collections::BTreeMap<&str, &str>
         .filter_map(|segment| segment.split_once('='))
         .map(|(key, value)| (key.trim(), value.trim()))
         .collect()
+}
+
+struct StallSummary {
+    cause: String,
+    correction: String,
+}
+
+fn summarize_stall_signal_for_user(signal: &str) -> Option<StallSummary> {
+    if signal.starts_with("single_tool_streak=") {
+        let streak = signal.trim_start_matches("single_tool_streak=");
+        return Some(StallSummary {
+            cause: format!(
+                "the run stayed in one-tool-per-round mode for {streak} consecutive rounds"
+            ),
+            correction: format!(
+                "batch independent calls (different files / greps / reads) \
+                 into a single parallel round instead of another {streak}-round \
+                 single-tool streak"
+            ),
+        });
+    }
+    if signal.starts_with("exploration_family=") {
+        let kv = parse_kv_stall_signal(signal);
+        if let (Some(family), Some(streak)) = (kv.get("exploration_family"), kv.get("streak")) {
+            let (family_hint_cause, family_hint_correction) = match *family {
+                "read" => (
+                    "kept reopening files already in context",
+                    "kept reopening files that were already in context",
+                ),
+                "search" => (
+                    "kept expanding search instead of converging",
+                    "kept expanding search instead of converging on a target",
+                ),
+                "diff" => (
+                    "kept diff-scanning without switching to action",
+                    "kept diff-scanning without switching to synthesis or action",
+                ),
+                _ => ("stayed inside one exploratory lane", ""),
+            };
+            let cause = format!(
+                "the run stayed in the {family} exploration family for {streak} consecutive rounds and {family_hint_cause}"
+            );
+            let correction = if family_hint_correction.is_empty() {
+                format!(
+                    "synthesize what is already known after {streak} consecutive {family} exploration rounds, \
+                     and switch tool families only if one specific fact is still missing"
+                )
+            } else {
+                format!(
+                    "reuse the evidence already gathered after {streak} consecutive {family} exploration rounds where the run {family_hint_correction}, \
+                     and only fetch one specific missing fact if you still cannot finish"
+                )
+            };
+            return Some(StallSummary { cause, correction });
+        }
+    }
+    if signal.starts_with("redundant_reads=") {
+        let count = signal.trim_start_matches("redundant_reads=");
+        return Some(StallSummary {
+            cause: format!(
+                "the run re-read overlapping file ranges {count} time(s) without any intervening edit"
+            ),
+            correction:
+                "reuse the file content already in context instead of reopening overlapping ranges"
+                    .to_string(),
+        });
+    }
+    None
 }
 
 /// Build a system-level resume guidance message from a persisted interruption record.
@@ -333,46 +412,9 @@ pub fn build_resume_guidance_with_context(
                   Avoid exploratory tool calls — focus on delivering a result.\n",
             );
             if let Some(sig) = stall_signal {
-                if sig.starts_with("single_tool_streak=") {
-                    let streak = sig.trim_start_matches("single_tool_streak=");
-                    writeln!(
-                        guidance,
-                        "  Cause: the previous run used exactly ONE tool per round for {streak} \
-                         consecutive rounds, which exhausted the per-turn round budget. On \
-                         resume, batch independent calls (different files / greps / reads) \
-                         into a single parallel round instead."
-                    )
-                    .ok();
-                } else if sig.starts_with("exploration_family=") {
-                    let kv = parse_kv_stall_signal(sig);
-                    if let (Some(family), Some(streak)) =
-                        (kv.get("exploration_family"), kv.get("streak"))
-                    {
-                        let family_hint = match *family {
-                            "read" => "kept reopening files that were already in context",
-                            "search" => "kept expanding search instead of converging on a target",
-                            "diff" => "kept diff-scanning without switching to synthesis or action",
-                            other => {
-                                guidance.push_str(&format!(
-                                    "  Cause: the previous run stayed inside the same {other} exploration family for {streak} consecutive rounds. \
-                                     On resume, synthesize what is already known and switch tool families only if one specific fact is still missing.\n"
-                                ));
-                                ""
-                            }
-                        };
-                        if !family_hint.is_empty() {
-                            guidance.push_str(&format!(
-                                "  Cause: the previous run stayed inside the same {family} exploration family for {streak} consecutive rounds and {family_hint}. \
-                                 On resume, reuse the evidence already gathered and only fetch one specific missing fact if you still cannot finish.\n"
-                            ));
-                        }
-                    }
-                } else if sig.starts_with("redundant_reads=") {
-                    let count = sig.trim_start_matches("redundant_reads=");
-                    guidance.push_str(&format!(
-                        "  Cause: the previous run re-read overlapping file ranges {count} time(s) without any intervening edit. \
-                         On resume, reuse the file content already in context instead of reopening the same ranges.\n"
-                    ));
+                if let Some(ss) = summarize_stall_signal_for_user(sig) {
+                    writeln!(guidance, "  Cause: {}.", ss.cause).ok();
+                    writeln!(guidance, "  Correction: {}.", ss.correction).ok();
                 }
             }
             if let Some(detail) = interruption_json
@@ -750,6 +792,29 @@ mod tests {
         );
         assert!(record.user_message.contains("without a final answer"));
         assert!(record.user_message.contains("continue"));
+    }
+
+    #[test]
+    fn budget_exhausted_user_message_surfaces_stall_cause() {
+        let record = InterruptionRecord::new(
+            InterruptionKind::BudgetExhausted,
+            ResumeAction::ContinueImmediately,
+            InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 20,
+                turns_completed: 14,
+                remaining_turns: 0,
+                error_detail: None,
+                stall_signal: Some("redundant_reads=5".to_string()),
+            },
+        );
+        assert!(record.user_message.contains("Cause:"));
+        assert!(
+            record
+                .user_message
+                .contains("re-read overlapping file ranges 5 time(s)")
+        );
+        assert!(record.user_message.contains("You can continue"));
     }
 
     // ── resume guidance tests ──

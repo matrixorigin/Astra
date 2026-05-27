@@ -177,6 +177,30 @@ mod tests {
     }
 
     #[test]
+    fn initialized_token_growth_without_tool_growth_runs() {
+        let state = SessionMemoryState {
+            initialized: true,
+            tokens_at_last_extraction: 12_000,
+            tool_calls_at_last_extraction: 5,
+            last_extraction_time: None,
+        };
+        let decision = evaluate(&state, "sess-1", 17_500, 5, false, &cfg());
+        assert_eq!(decision, GateDecision::Run);
+    }
+
+    #[test]
+    fn initialized_tool_growth_without_token_growth_runs() {
+        let state = SessionMemoryState {
+            initialized: true,
+            tokens_at_last_extraction: 12_000,
+            tool_calls_at_last_extraction: 5,
+            last_extraction_time: None,
+        };
+        let decision = evaluate(&state, "sess-1", 12_500, 10, false, &cfg());
+        assert_eq!(decision, GateDecision::Run);
+    }
+
+    #[test]
     fn past_init_gate_with_room_to_run_fires_run() {
         let state = SessionMemoryState::default();
         let decision = evaluate(&state, "sess-1", 50_000, 10, false, &cfg());

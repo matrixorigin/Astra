@@ -14,12 +14,10 @@ fn parse_task_json(response: &str) -> Value {
 
 fn executor_with_session() -> (
     ToolExecutor,
-    std::sync::Arc<
-        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-    >,
+    std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
 ) {
     let session = std::sync::Arc::new(std::sync::RwLock::new(
-        astra_runtime::observability_integration::ObservabilitySession::new_simple("test-session"),
+        astra_runtime::observability::ObservabilitySession::new_simple("test-session"),
     ));
     let exe = ToolExecutor::new(std::env::temp_dir()).with_observability_session(session.clone());
     (exe, session)
@@ -29,9 +27,7 @@ fn executor_with_persisted_session() -> (
     tempfile::TempDir,
     JournalDirGuard,
     ToolExecutor,
-    std::sync::Arc<
-        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-    >,
+    std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     String,
 ) {
     let tmp = tempfile::tempdir().unwrap();
@@ -45,7 +41,7 @@ fn executor_with_persisted_session() -> (
     );
     session_workspace::write_workspace(&ws).unwrap();
     let session = std::sync::Arc::new(std::sync::RwLock::new(
-        astra_runtime::observability_integration::ObservabilitySession::new_simple("test-session"),
+        astra_runtime::observability::ObservabilitySession::new_simple("test-session"),
     ));
     let exe = ToolExecutor::new(tmp.path())
         .with_active_session_id(session_id.clone())
@@ -147,6 +143,112 @@ async fn self_mod_persists_config_and_tool_preferences() {
     assert!(ws.tuned_config_json.is_some());
 }
 
+#[test]
+fn switching_to_session_without_workspace_clears_self_mod_preferences() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(tmp.path());
+    let session_id = "prefs-source-session".to_string();
+    let mut ws = session_workspace::WorkspaceMetadata::with_context(
+        &session_id,
+        "gpt-5.4",
+        "/repo",
+        Some("main"),
+    );
+    ws.pinned_tools = vec!["bash".to_string()];
+    ws.deprioritized_tools = vec!["web_fetch".to_string()];
+    session_workspace::write_workspace(&ws).unwrap();
+
+    let session = std::sync::Arc::new(std::sync::RwLock::new(
+        astra_runtime::observability::ObservabilitySession::new_simple("test-session"),
+    ));
+    let exe = ToolExecutor::new(tmp.path())
+        .with_active_session_id(session_id)
+        .with_observability_session(session);
+    let model = exe.build_self_model_snapshot().unwrap();
+    assert!(
+        model
+            .capabilities
+            .pinned_tools
+            .contains(&"bash".to_string())
+    );
+    assert!(
+        model
+            .capabilities
+            .deprioritized_tools
+            .contains(&"web_fetch".to_string())
+    );
+
+    exe.set_active_session_id("prefs-empty-session");
+
+    let model = exe.build_self_model_snapshot().unwrap();
+    assert!(
+        model.capabilities.pinned_tools.is_empty(),
+        "session switch without workspace must clear pinned tool carry-over"
+    );
+    assert!(
+        model.capabilities.deprioritized_tools.is_empty(),
+        "session switch without workspace must clear deprioritized tool carry-over"
+    );
+}
+
+#[tokio::test]
+async fn switching_sessions_clears_session_scoped_self_model_context() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(tmp.path());
+    let session = std::sync::Arc::new(std::sync::RwLock::new(
+        astra_runtime::observability::ObservabilitySession::new_simple("test-session"),
+    ));
+    let exe = ToolExecutor::new(tmp.path())
+        .with_active_session_id("context-source-session")
+        .with_observability_session(session);
+
+    let lessons = vec![astra_runtime::self_model::LessonHint {
+        kind: astra_services::LessonKind::PromptShape,
+        trigger_signal: "stale review context".into(),
+        action: "reload branch-specific context first".into(),
+        workload_tag: Some("code-review".into()),
+        compact: None,
+    }];
+    let cause = astra_skills::auto_invoke::AutoInvokeCause::SessionStalls { count: 2 };
+    let diag = astra_skills::auto_invoke::SkillDiagnosis::new(
+        "analyze_session",
+        &cause,
+        "stalled on prior branch",
+        ["refresh branch-local context".to_string()],
+        None,
+    );
+    let feedback = astra_runtime::self_model::TurnQualityFeedback {
+        turn: 3,
+        findings: vec!["Previous session reused stale guidance".into()],
+        recommended_action: "Clear session-scoped hints on session switch.".into(),
+    };
+
+    exe.set_session_lessons(lessons);
+    exe.set_latest_skill_diagnosis(Some(diag));
+    exe.set_latest_turn_quality_feedback(Some(feedback));
+
+    let before = exe.build_self_model_snapshot().unwrap();
+    assert!(!before.lessons.is_empty());
+    assert!(before.skill_diagnosis.is_some());
+    assert!(before.turn_quality_feedback.is_some());
+
+    exe.set_active_session_id("context-dest-session");
+
+    let after = exe.build_self_model_snapshot().unwrap();
+    assert!(
+        after.lessons.is_empty(),
+        "session-scoped lessons must not bleed into another session"
+    );
+    assert!(
+        after.skill_diagnosis.is_none(),
+        "latest skill diagnosis must not bleed into another session"
+    );
+    assert!(
+        after.turn_quality_feedback.is_none(),
+        "latest turn quality feedback must not bleed into another session"
+    );
+}
+
 #[tokio::test]
 async fn prioritize_tool_preserves_existing_state_when_persist_fails() {
     let tmp = tempfile::tempdir().unwrap();
@@ -162,7 +264,7 @@ async fn prioritize_tool_preserves_existing_state_when_persist_fails() {
     session_workspace::write_workspace(&ws).unwrap();
 
     let session = std::sync::Arc::new(std::sync::RwLock::new(
-        astra_runtime::observability_integration::ObservabilitySession::new_simple("test-session"),
+        astra_runtime::observability::ObservabilitySession::new_simple("test-session"),
     ));
     let exe = ToolExecutor::new(tmp.path())
         .with_active_session_id(session_id.clone())
@@ -209,7 +311,7 @@ async fn deprioritize_tool_preserves_existing_state_when_persist_fails() {
     session_workspace::write_workspace(&ws).unwrap();
 
     let session = std::sync::Arc::new(std::sync::RwLock::new(
-        astra_runtime::observability_integration::ObservabilitySession::new_simple("test-session"),
+        astra_runtime::observability::ObservabilitySession::new_simple("test-session"),
     ));
     let exe = ToolExecutor::new(tmp.path())
         .with_active_session_id(session_id.clone())

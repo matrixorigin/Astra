@@ -225,7 +225,10 @@ mod tests {
             _: String,
             _: SkillRegisterRequestData,
         ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!()
+            Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(ErrorResponse::new("register_skill not available")),
+            ))
         }
 
         async fn list_skills(
@@ -306,7 +309,10 @@ mod tests {
             _: String,
             _: String,
         ) -> Result<SkillInfoRecord, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!()
+            Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(ErrorResponse::new("get_skill_info not available")),
+            ))
         }
 
         async fn list_skill_versions(
@@ -314,7 +320,10 @@ mod tests {
             _: String,
             _: String,
         ) -> Result<Vec<SkillVersionRecord>, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!()
+            Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(ErrorResponse::new("list_skill_versions not available")),
+            ))
         }
 
         async fn get_skill_status(
@@ -322,7 +331,10 @@ mod tests {
             _: String,
             _: u32,
         ) -> Result<SkillStatusRecord, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!()
+            Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(ErrorResponse::new("get_skill_status not available")),
+            ))
         }
 
         async fn publish_skill(
@@ -330,7 +342,10 @@ mod tests {
             _: String,
             _: SkillPublishRequestData,
         ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!()
+            Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(ErrorResponse::new("publish_skill not available")),
+            ))
         }
 
         async fn unpublish_skill(
@@ -338,7 +353,10 @@ mod tests {
             _: String,
             _: String,
         ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!()
+            Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(ErrorResponse::new("unpublish_skill not available")),
+            ))
         }
     }
 

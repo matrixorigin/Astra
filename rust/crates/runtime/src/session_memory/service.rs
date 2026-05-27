@@ -3,14 +3,13 @@
 //!
 //! Produces one unified artifact per turn: an L1 markdown document
 //! persisted to Memoria under the [`SESSION_MEMORY_PREFIX`] convention,
-//! keyed on `session_id`. Writes go through
-//! (legacy `persist_l1`, removed in wip-3)
-//! — same path as the pre-existing bridge write, now the only path.
+//! keyed on `session_id`. CLI edge-cloud mode can additionally require a
+//! local `session-memory.md` refresh before the extraction is considered
+//! successful for current-session UX.
 //!
-//! Read-side consumers (compaction injection,
-//! `run_lifecycle::session_end_governance`, `session_cleanup`) all
-//! read from Memoria by prefix, so there's exactly one storage and one
-//! schema.
+//! Read-side consumers still share one schema. The durable store remains
+//! Memoria; the optional local artifact is only the CLI edge mode's
+//! current-session read model.
 //!
 //! Ownership model:
 //!
@@ -39,7 +38,7 @@ use astra_services::session_journal::{
 };
 use astra_turn_core::cloud_session_memory_extract::SessionMemoryState;
 
-use crate::memory_relevance::LlmConnParams;
+use crate::memory_hooks::relevance::LlmConnParams;
 use crate::turn::cloud::memoria_compact::MemoriaClient;
 
 use super::activity::{BackgroundActivity, BackgroundActivityBroker};
@@ -50,7 +49,10 @@ use super::observatory::{
     ExtractionTrigger, SessionMemoryObservatory, clip_preview,
 };
 use super::request::{ExtractionRequest, SpawnDecision};
-use super::runner::{ExtractionArtifacts, run_extraction};
+use super::runner::{
+    ExtractionArtifacts, persist_local_session_memory_artifact,
+    persist_local_session_memory_metadata, run_extraction,
+};
 
 type LocalJournalEventSink = dyn Fn(&JournalEvent) + Send + Sync + 'static;
 
@@ -145,6 +147,10 @@ fn should_force_shutdown_refresh(messages: &[Value], current_tokens: usize) -> b
 #[async_trait]
 pub trait SelectorParamsResolver: Send + Sync + std::fmt::Debug {
     async fn resolve(&self) -> Option<LlmConnParams>;
+
+    async fn resolve_candidates(&self) -> Vec<LlmConnParams> {
+        self.resolve().await.into_iter().collect()
+    }
 }
 
 /// Always returns the same params. Unit tests.
@@ -164,7 +170,7 @@ impl SelectorParamsResolver for ConstSelectorResolver {
 
 /// Per-process background extraction coordinator. Build once at
 /// server/CLI boot, hold an [`Arc`] on
-/// [`crate::turn::agentic_loop_host::AgenticLoopState`].
+/// [`crate::turn::agentic_loop::host::AgenticLoopState`].
 pub struct MemoryExtractionService {
     selector_resolver: Arc<dyn SelectorParamsResolver>,
     memoria_client: Arc<dyn MemoriaClient>,
@@ -210,6 +216,7 @@ pub struct MemoryExtractionService {
     /// payloads or cache hashes by construction.
     observatory: Option<Arc<SessionMemoryObservatory>>,
     local_event_sink: Option<Arc<LocalJournalEventSink>>,
+    require_local_current_snapshot: bool,
 }
 
 impl std::fmt::Debug for MemoryExtractionService {
@@ -247,6 +254,7 @@ impl MemoryExtractionService {
             session_states: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             observatory: None,
             local_event_sink: None,
+            require_local_current_snapshot: false,
         }
     }
 
@@ -268,10 +276,62 @@ impl MemoryExtractionService {
         self
     }
 
+    /// Require a successful local `session-memory.md` refresh before the
+    /// extraction counts as success. CLI edge-cloud mode enables this so
+    /// `/memory session` reflects the same current-session artifact the
+    /// extractor just wrote; web/cloud runtimes leave it off because their
+    /// current-session read model is server-side.
+    pub fn with_local_current_snapshot(mut self) -> Self {
+        self.require_local_current_snapshot = true;
+        self
+    }
+
     /// Read-only handle to the observatory. `None` when the service
     /// was built without one. Callers: `introspect`, tests.
     pub fn observatory(&self) -> Option<&Arc<SessionMemoryObservatory>> {
         self.observatory.as_ref()
+    }
+
+    fn write_required_local_snapshot(&self, session_id: &str, content: &str) -> Result<(), String> {
+        if !self.require_local_current_snapshot {
+            return Ok(());
+        }
+        persist_local_session_memory_artifact(session_id, content)
+    }
+
+    fn persist_success_metadata(
+        &self,
+        session_id: &str,
+        turn: u32,
+        source: SessionMemoryExtractionSource,
+        selector_model: Option<&str>,
+    ) {
+        if !self.require_local_current_snapshot {
+            return;
+        }
+        let mut metadata =
+            super::runner::load_local_session_memory_metadata(session_id).unwrap_or_default();
+        metadata.session_id = session_id.to_string();
+        metadata.current_snapshot_source = Some("background_extraction".to_string());
+        metadata.last_extracted_turn = Some(turn);
+        metadata.last_extraction_source = Some(
+            match source {
+                SessionMemoryExtractionSource::Llm => "llm",
+                SessionMemoryExtractionSource::RuleFallback => "rule_fallback",
+            }
+            .to_string(),
+        );
+        metadata.last_remote_sync_status = Some("memoria_synced".to_string());
+        metadata.last_remote_sync_at = Some(chrono::Utc::now().to_rfc3339());
+        metadata.last_remote_sync_detail = None;
+        metadata.last_selector_model = selector_model.map(str::to_string);
+        if let Err(error) = persist_local_session_memory_metadata(session_id, &metadata) {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %error,
+                "failed to persist local session-memory metadata after successful extraction"
+            );
+        }
     }
 
     /// Live circuit breaker snapshot, for introspect. Cheap — no locks
@@ -396,6 +456,8 @@ impl MemoryExtractionService {
             selector_model: None,
             attempt: None,
             llm_reason: None,
+            llm_detail: None,
+            persist_detail: None,
         };
 
         enum Admission {
@@ -440,7 +502,7 @@ impl MemoryExtractionService {
         // both evaluate a stale pre-extraction state and the second can
         // spawn after the first worker has already completed.
         let admission = {
-            let mut map = match self.session_states.lock() {
+            let map = match self.session_states.lock() {
                 Ok(m) => m,
                 Err(p) => p.into_inner(),
             };
@@ -513,8 +575,6 @@ impl MemoryExtractionService {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if set.insert(req.session_id.clone()) {
-                            let entry = map.entry(req.session_id.clone()).or_default();
-                            entry.mark_extracted(req.current_tokens, req.current_tool_calls);
                             Admission::Spawn {
                                 trigger: trig,
                                 memoria_admit,
@@ -663,49 +723,43 @@ impl MemoryExtractionService {
             );
         }
 
-        let selector_params = self.selector_resolver.resolve().await;
-        let selector_healthy = match selector_params.as_ref() {
-            Some(p) => self.health.is_healthy(&p.model_name),
-            None => false,
-        };
-
-        if selector_params.is_some() && !selector_healthy {
-            let model_name = selector_params.as_ref().map(|p| p.model_name.clone());
-            let bc = SessionMemoryExtractionBreadcrumbs {
+        let selector_candidates = self.selector_resolver.resolve_candidates().await;
+        let resolved_selector_model = selector_candidates
+            .first()
+            .map(|candidate| candidate.model_name.clone());
+        let effective_selectors: Vec<LlmConnParams> = selector_candidates
+            .into_iter()
+            .filter(|candidate| self.health.is_healthy(&candidate.model_name))
+            .collect();
+        if resolved_selector_model.is_some() && effective_selectors.is_empty() {
+            let cooldown_breadcrumbs = SessionMemoryExtractionBreadcrumbs {
                 messages_count: Some(messages_count),
-                selector_model: model_name.clone(),
+                selector_model: resolved_selector_model.clone(),
                 attempt: None,
                 llm_reason: None,
+                llm_detail: None,
+                persist_detail: None,
             };
             self.emit_skip_event(
                 Some(&session_id),
                 turn,
                 SessionMemoryExtractionSkipReason::SelectorCooldown,
-                &bc,
+                &cooldown_breadcrumbs,
             );
             self.record_skipped(
                 Some(&session_id),
                 turn,
                 trigger,
-                "selector_cooldown",
-                model_name,
+                skip_reason_label(SessionMemoryExtractionSkipReason::SelectorCooldown),
+                resolved_selector_model.clone(),
             );
-            return;
         }
-
-        if selector_healthy && selector_params.is_some() {
+        if !effective_selectors.is_empty() {
             self.broker.emit(BackgroundActivity::Started {
                 session_id: session_id.clone(),
                 turn,
             });
         }
-
-        let effective_selector = if selector_healthy {
-            selector_params
-        } else {
-            None
-        };
-        let params_for_health = effective_selector.as_ref().map(|p| p.model_name.clone());
 
         // Fetch current L1 so the extraction prompt can build on it.
         // Any retrieve failure (Memoria offline, auth) → treat as no
@@ -719,7 +773,8 @@ impl MemoryExtractionService {
             turn as usize,
             req.current_tokens,
             &current_memory,
-            effective_selector.as_ref(),
+            &req.session_facts,
+            &effective_selectors,
             LLM_TIMEOUT,
             EXTRACTION_MAX_OUTPUT_TOKENS,
         )
@@ -751,6 +806,7 @@ impl MemoryExtractionService {
                 ExtractionArtifacts::PersistFailed {
                     error_reason,
                     llm_error_reason,
+                    ..
                 } => {
                     if let Some(llm_error_reason) = llm_error_reason {
                         format!(
@@ -769,23 +825,84 @@ impl MemoryExtractionService {
             );
         }
 
-        // Model name surfaced in events is what the worker actually
-        // attempted — not what the resolver gave us, since LLM-path
-        // source==Llm means the selector was both resolved and healthy.
-        let selector_model_used = params_for_health.clone();
-
         match artifacts {
             ExtractionArtifacts::Persisted {
                 source,
                 bytes_written,
                 store_attempt,
                 content,
+                selector_model,
+                failed_candidates,
             } => {
+                self.record_selector_failures(&failed_candidates);
                 // Memoria accepted a write → breaker closes (or stays
                 // closed) and the consecutive-failure counter resets.
                 if let Some(g) = probe_guard.take() {
                     g.record_success();
                 }
+                // LLM source proved this selector model is reachable; lift
+                // any sticky failure (including a terminal flag) so an
+                // operator who restored access mid-process doesn't have
+                // to restart to recover.
+                if matches!(source, SessionMemoryExtractionSource::Llm)
+                    && let Some(name) = selector_model.as_deref()
+                {
+                    self.health.clear(name);
+                }
+                let selector_model_for_obs = match source {
+                    SessionMemoryExtractionSource::Llm => selector_model.clone(),
+                    SessionMemoryExtractionSource::RuleFallback => selector_model
+                        .clone()
+                        .or_else(|| resolved_selector_model.clone()),
+                };
+                if let Err(error) = self.write_required_local_snapshot(&session_id, &content) {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %error,
+                        "session_memory persisted remotely but could not refresh the required local current-session snapshot"
+                    );
+                    let bc = SessionMemoryExtractionBreadcrumbs {
+                        messages_count: Some(messages_count),
+                        selector_model: selector_model_for_obs.clone(),
+                        attempt: Some(store_attempt),
+                        llm_reason: None,
+                        llm_detail: None,
+                        persist_detail: Some(error.clone()),
+                    };
+                    self.emit_error_event(
+                        Some(&session_id),
+                        turn,
+                        SessionMemoryExtractionErrorReason::WriteFailed,
+                        duration_ms,
+                        &bc,
+                    );
+                    self.broker.emit(BackgroundActivity::Errored {
+                        session_id: session_id.clone(),
+                        turn,
+                        reason: SessionMemoryExtractionErrorReason::WriteFailed,
+                        detail: Some(error),
+                        duration_ms,
+                    });
+                    self.record_extraction_outcome(
+                        &session_id,
+                        turn,
+                        trigger,
+                        selector_model_for_obs,
+                        ObsExtractionOutcome::PersistFailed {
+                            reason: SessionMemoryExtractionErrorReason::WriteFailed.into(),
+                            llm_reason: None,
+                        },
+                        Vec::new(),
+                        String::new(),
+                        latency,
+                    );
+                    return;
+                }
+                self.mark_session_extracted(
+                    &session_id,
+                    req.current_tokens,
+                    req.current_tool_calls,
+                );
                 self.broker.emit(BackgroundActivity::Finished {
                     session_id: session_id.clone(),
                     turn,
@@ -794,12 +911,11 @@ impl MemoryExtractionService {
                 });
                 let bc = SessionMemoryExtractionBreadcrumbs {
                     messages_count: Some(messages_count),
-                    selector_model: match source {
-                        SessionMemoryExtractionSource::Llm => selector_model_used.clone(),
-                        SessionMemoryExtractionSource::RuleFallback => None,
-                    },
+                    selector_model: selector_model_for_obs.clone(),
                     attempt: Some(store_attempt),
                     llm_reason: None,
+                    llm_detail: None,
+                    persist_detail: None,
                 };
                 self.emit_success_event(
                     Some(&session_id),
@@ -809,82 +925,156 @@ impl MemoryExtractionService {
                     duration_ms,
                     &bc,
                 );
-                let (sections, preview) = summarize_persisted_content(&content);
+                self.persist_success_metadata(
+                    &session_id,
+                    turn,
+                    source,
+                    selector_model_for_obs.as_deref(),
+                );
+                let preview = summarize_persisted_content(&content);
                 self.record_extraction_outcome(
                     &session_id,
                     turn,
                     trigger,
-                    match source {
-                        SessionMemoryExtractionSource::Llm => selector_model_used.clone(),
-                        SessionMemoryExtractionSource::RuleFallback => None,
-                    },
+                    selector_model_for_obs,
                     ObsExtractionOutcome::Persisted {
                         source: source.into(),
                         bytes_written,
                         store_attempt,
                     },
-                    sections,
+                    Vec::new(),
                     preview,
                     latency,
                 );
             }
             ExtractionArtifacts::LlmFailedPersistedFallback {
                 error_reason,
+                error_detail,
                 bytes_written,
                 store_attempt,
                 content,
+                selector_model,
+                failed_candidates,
             } => {
-                if let Some(name) = params_for_health.as_deref() {
-                    self.health.mark_failed(name);
-                }
+                self.record_selector_failures(&failed_candidates);
                 // Memoria persist still succeeded on this branch, so
                 // the circuit breaker resets. Only the LLM selector
                 // model is marked unhealthy.
                 if let Some(g) = probe_guard.take() {
                     g.record_success();
                 }
-                // LLM failed but rule-based content did land. Record
-                // both the error (for observability) and the write (so
-                // the broker reflects that memory is up-to-date, just
-                // via fallback).
+                if let Err(error) = self.write_required_local_snapshot(&session_id, &content) {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %error,
+                        "session_memory fallback persisted remotely but could not refresh the required local current-session snapshot"
+                    );
+                    let bc = SessionMemoryExtractionBreadcrumbs {
+                        messages_count: Some(messages_count),
+                        selector_model: selector_model.clone(),
+                        attempt: Some(store_attempt),
+                        llm_reason: Some(error_reason),
+                        llm_detail: error_detail.clone(),
+                        persist_detail: Some(error.clone()),
+                    };
+                    self.emit_error_event(
+                        Some(&session_id),
+                        turn,
+                        SessionMemoryExtractionErrorReason::WriteFailed,
+                        duration_ms,
+                        &bc,
+                    );
+                    self.broker.emit(BackgroundActivity::Errored {
+                        session_id: session_id.clone(),
+                        turn,
+                        reason: SessionMemoryExtractionErrorReason::WriteFailed,
+                        detail: Some(error),
+                        duration_ms,
+                    });
+                    self.record_extraction_outcome(
+                        &session_id,
+                        turn,
+                        trigger,
+                        selector_model.clone(),
+                        ObsExtractionOutcome::PersistFailed {
+                            reason: SessionMemoryExtractionErrorReason::WriteFailed.into(),
+                            llm_reason: Some(error_reason.into()),
+                        },
+                        Vec::new(),
+                        String::new(),
+                        latency,
+                    );
+                    return;
+                }
+                self.mark_session_extracted(
+                    &session_id,
+                    req.current_tokens,
+                    req.current_tool_calls,
+                );
+                // LLM failed but rule-based content did land. Surface
+                // the error live, but record the journal outcome as a
+                // successful fallback write so postmortems stop reading
+                // this branch as "nothing was persisted".
                 let bc = SessionMemoryExtractionBreadcrumbs {
                     messages_count: Some(messages_count),
-                    selector_model: selector_model_used.clone(),
+                    selector_model: selector_model.clone(),
                     attempt: Some(store_attempt),
-                    llm_reason: None,
+                    llm_reason: Some(error_reason),
+                    llm_detail: error_detail.clone(),
+                    persist_detail: None,
                 };
-                self.emit_error_event(Some(&session_id), turn, error_reason, duration_ms, &bc);
+                self.emit_success_event(
+                    Some(&session_id),
+                    turn,
+                    SessionMemoryExtractionSource::RuleFallback,
+                    bytes_written,
+                    duration_ms,
+                    &bc,
+                );
+                self.persist_success_metadata(
+                    &session_id,
+                    turn,
+                    SessionMemoryExtractionSource::RuleFallback,
+                    selector_model.as_deref(),
+                );
+                self.broker.emit(BackgroundActivity::Errored {
+                    session_id: session_id.clone(),
+                    turn,
+                    reason: error_reason,
+                    detail: error_detail.clone(),
+                    duration_ms,
+                });
                 self.broker.emit(BackgroundActivity::Finished {
                     session_id: session_id.clone(),
                     turn,
                     source: SessionMemoryExtractionSource::RuleFallback,
                     duration_ms,
                 });
-                let (sections, preview) = summarize_persisted_content(&content);
+                let preview = summarize_persisted_content(&content);
                 self.record_extraction_outcome(
                     &session_id,
                     turn,
                     trigger,
-                    selector_model_used.clone(),
+                    selector_model.clone(),
                     ObsExtractionOutcome::LlmFailedFallbackPersisted {
                         reason: error_reason.into(),
                         bytes_written,
                         store_attempt,
                     },
-                    sections,
+                    Vec::new(),
                     preview,
                     latency,
                 );
             }
             ExtractionArtifacts::PersistFailed {
                 error_reason,
+                persist_error_detail,
                 llm_error_reason,
+                llm_error_detail,
+                selector_model,
+                failed_candidates,
             } => {
-                if llm_error_reason.is_some()
-                    && let Some(name) = params_for_health.as_deref()
-                {
-                    self.health.mark_failed(name);
-                }
+                self.record_selector_failures(&failed_candidates);
                 // Memoria persist failed → breaker counts it. Enough
                 // consecutive failures trip the breaker and skip
                 // future `maybe_spawn` until the cooldown elapses.
@@ -893,26 +1083,31 @@ impl MemoryExtractionService {
                 }
                 let bc = SessionMemoryExtractionBreadcrumbs {
                     messages_count: Some(messages_count),
-                    selector_model: selector_model_used.clone(),
+                    selector_model: selector_model.clone(),
                     // `attempt` is unavailable on PersistFailed since
                     // run_extraction doesn't surface partial-attempt
                     // counts when nothing landed; use None so the
                     // field is omitted rather than misleadingly 0.
                     attempt: None,
                     llm_reason: llm_error_reason,
+                    llm_detail: llm_error_detail.clone(),
+                    persist_detail: persist_error_detail.clone(),
                 };
                 self.emit_error_event(Some(&session_id), turn, error_reason, duration_ms, &bc);
                 self.broker.emit(BackgroundActivity::Errored {
                     session_id: session_id.clone(),
                     turn,
                     reason: error_reason,
+                    detail: persist_error_detail
+                        .clone()
+                        .or_else(|| llm_error_detail.clone()),
                     duration_ms,
                 });
                 self.record_extraction_outcome(
                     &session_id,
                     turn,
                     trigger,
-                    selector_model_used.clone(),
+                    selector_model.clone(),
                     ObsExtractionOutcome::PersistFailed {
                         reason: error_reason.into(),
                         llm_reason: llm_error_reason.map(Into::into),
@@ -998,31 +1193,85 @@ fn skip_reason_label(reason: SessionMemoryExtractionSkipReason) -> &'static str 
     }
 }
 
-/// Stub narrative summary — L1 protocol is gone, so no sections are available.
-fn summarize_persisted_content(content: &str) -> (Vec<String>, String) {
-    (Vec::new(), clip_preview(content))
+fn summarize_persisted_content(content: &str) -> String {
+    astra_prompts::memory_proto::MemoryEntry::parse(content)
+        .filter(|entry| entry.ns == astra_prompts::memory_proto::NS_SESSION)
+        .map(|entry| clip_preview(&entry.overview_view()))
+        .unwrap_or_else(|| clip_preview(content))
+}
+
+fn is_terminal_selector_failure(detail: Option<&str>) -> bool {
+    let Some(detail) = detail else {
+        return false;
+    };
+    let lower = detail.to_ascii_lowercase();
+    // "unsupported countries, regions, or territories" is a strict superset
+    // of "unsupported countries"; one substring suffices for both phrasings.
+    lower.contains("access to anthropic models is not allowed")
+        || lower.contains("unsupported countries")
 }
 
 impl MemoryExtractionService {
-    async fn load_current_memory(&self, session_id: &str) -> String {
-        let query = format!(
-            "{} {} session memory",
-            super::runner::SESSION_MEMORY_PREFIX,
-            session_id
-        );
-        let Ok(memories) = self
-            .memoria_client
-            .retrieve_ext(&query, Some(session_id), 5, true)
-            .await
-        else {
-            return String::new();
+    pub async fn current_session_memory_entry_for_pipeline(
+        &self,
+        session_id: &str,
+        turn_number: u32,
+    ) -> Option<astra_turn_core::context_sources::MemoryEntry> {
+        let content = if self.require_local_current_snapshot {
+            super::runner::load_current_session_memory_preferring_local(
+                self.memoria_client.as_ref(),
+                session_id,
+            )
+            .await?
+        } else {
+            super::runner::load_current_session_memory(self.memoria_client.as_ref(), session_id)
+                .await?
         };
-        memories
-            .iter()
-            .find_map(|memory| {
-                super::runner::decode_session_memory_entry(&memory.content, session_id)
-            })
+        crate::turn::wire_assembly::session_memory_entry_for_pipeline(Some(&content), turn_number)
+    }
+
+    fn record_selector_failure(&self, model_name: &str, detail: Option<&str>) {
+        if is_terminal_selector_failure(detail) {
+            self.health.mark_terminal_failure(model_name);
+        } else {
+            self.health.mark_failed(model_name);
+        }
+    }
+
+    fn record_selector_failures(&self, failures: &[super::runner::LlmCandidateFailure]) {
+        for failure in failures {
+            self.record_selector_failure(&failure.model_name, failure.detail.as_deref());
+        }
+    }
+
+    fn mark_session_extracted(
+        &self,
+        session_id: &str,
+        current_tokens: usize,
+        current_tool_calls: usize,
+    ) {
+        let mut map = self
+            .session_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.entry(session_id.to_string())
+            .or_default()
+            .mark_extracted(current_tokens, current_tool_calls);
+    }
+
+    async fn load_current_memory(&self, session_id: &str) -> String {
+        if self.require_local_current_snapshot {
+            super::runner::load_current_session_memory_preferring_local(
+                self.memoria_client.as_ref(),
+                session_id,
+            )
+            .await
             .unwrap_or_default()
+        } else {
+            super::runner::load_current_session_memory(self.memoria_client.as_ref(), session_id)
+                .await
+                .unwrap_or_default()
+        }
     }
 
     // ── event emission helpers ────────────────────────────────────────
@@ -1244,10 +1493,28 @@ mod tests {
         TestCtx { svc, rx, memoria }
     }
 
+    fn build_ctx_with_local_snapshot(selector: Option<LlmConnParams>) -> TestCtx {
+        let (ingestion, rx) = IngestionSender::for_tests(256);
+        let broker = Arc::new(BackgroundActivityBroker::new());
+        let memoria = Arc::new(CapturingMemoria::default());
+        let svc = Arc::new(
+            MemoryExtractionService::new(
+                Arc::new(ConstSelectorResolver(selector)),
+                Arc::clone(&memoria) as Arc<dyn MemoriaClient>,
+                ingestion,
+                "test-user",
+                broker,
+            )
+            .with_local_current_snapshot(),
+        );
+        TestCtx { svc, rx, memoria }
+    }
+
     fn sample_req(session_id: &str, tokens: usize, had_error: bool) -> ExtractionRequest {
         ExtractionRequest {
             session_id: session_id.to_string(),
             messages: vec![json!({"role": "user", "content": "hello world"})],
+            session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             current_tokens: tokens,
             current_tool_calls: 0,
             had_error,
@@ -1263,6 +1530,7 @@ mod tests {
                 json!({"role": "user", "content": "Need a cache-safe session memory design that still captures shutdown summaries for short sessions and resumed work."}),
                 json!({"role": "assistant", "content": "I removed the legacy extractor, fixed the model poisoning bug, and am wiring a final shutdown flush plus resume recap next."}),
             ],
+            session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             current_tokens: tokens,
             current_tool_calls: 0,
             had_error: false,
@@ -1347,6 +1615,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_extraction_writes_local_session_memory_artifact() {
+        use astra_services::SessionArtifactStore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let ctx = build_ctx_with_local_snapshot(None);
+        let sid = format!("local-session-memory-{}", nanos());
+        let req = meaningful_shutdown_req(&sid, 600);
+
+        assert_eq!(
+            ctx.svc.maybe_spawn_shutdown_flush(req),
+            SpawnDecision::Spawned
+        );
+        let leftover = ctx.svc.wait_for_pending(Duration::from_secs(2)).await;
+        assert_eq!(leftover, 0);
+
+        let path = astra_services::local_session_artifact_store()
+            .session_path(&sid, "session-memory.md")
+            .unwrap();
+        let body = std::fs::read_to_string(&path).expect("session-memory.md");
+        assert!(
+            body.contains("# Session Memory"),
+            "expected local session-memory artifact after successful extraction, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_extraction_without_local_snapshot_mode_skips_local_artifact_refresh() {
+        use astra_services::SessionArtifactStore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let ctx = build_ctx(None);
+        let sid = format!("remote-only-session-memory-{}", nanos());
+        let req = meaningful_shutdown_req(&sid, 600);
+
+        assert_eq!(
+            ctx.svc.maybe_spawn_shutdown_flush(req),
+            SpawnDecision::Spawned
+        );
+        let leftover = ctx.svc.wait_for_pending(Duration::from_secs(2)).await;
+        assert_eq!(leftover, 0);
+        assert_eq!(ctx.memoria.stored.lock().unwrap().len(), 1);
+
+        let path = astra_services::local_session_artifact_store()
+            .session_path(&sid, "session-memory.md")
+            .unwrap();
+        assert!(
+            !path.exists(),
+            "non-CLI mode should not require or materialize a local session-memory artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn required_local_snapshot_failure_surfaces_write_failed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let mut ctx = build_ctx_with_local_snapshot(None);
+        let sid = "bad/session-id";
+        let req = meaningful_shutdown_req(sid, 600);
+
+        assert_eq!(
+            ctx.svc.maybe_spawn_shutdown_flush(req),
+            SpawnDecision::Spawned
+        );
+        let leftover = ctx.svc.wait_for_pending(Duration::from_secs(2)).await;
+        assert_eq!(leftover, 0);
+        assert_eq!(ctx.memoria.stored.lock().unwrap().len(), 1);
+
+        let events = collect_extraction_events(&mut ctx.rx);
+        assert!(events.iter().any(|event| {
+            let metadata = event.metadata.as_ref().unwrap();
+            metadata["outcome"] == "errored" && metadata["reason"] == "write_failed"
+        }));
+        assert!(
+            ctx.svc.peek_state(sid).is_none(),
+            "current-session success state must not advance when the required local snapshot failed"
+        );
+    }
+
+    #[tokio::test]
     async fn shutdown_flush_skips_trivial_session() {
         let ctx = build_ctx(None);
         let req = ExtractionRequest {
@@ -1355,6 +1704,7 @@ mod tests {
                 json!({"role": "user", "content": "hi"}),
                 json!({"role": "assistant", "content": "hello"}),
             ],
+            session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             current_tokens: 12,
             current_tool_calls: 0,
             had_error: false,
@@ -1527,6 +1877,40 @@ mod tests {
         (svc, rx, broker)
     }
 
+    #[derive(Debug)]
+    struct OrderedSelectorResolver(Vec<LlmConnParams>);
+
+    #[async_trait]
+    impl SelectorParamsResolver for OrderedSelectorResolver {
+        async fn resolve(&self) -> Option<LlmConnParams> {
+            self.0.first().cloned()
+        }
+
+        async fn resolve_candidates(&self) -> Vec<LlmConnParams> {
+            self.0.clone()
+        }
+    }
+
+    fn build_ctx_with_resolver(
+        resolver: Arc<dyn SelectorParamsResolver>,
+        memoria: Arc<dyn MemoriaClient>,
+    ) -> (
+        Arc<MemoryExtractionService>,
+        tokio::sync::mpsc::Receiver<IngestionEvent>,
+        Arc<BackgroundActivityBroker>,
+    ) {
+        let (ingestion, rx) = IngestionSender::for_tests(256);
+        let broker = Arc::new(BackgroundActivityBroker::new());
+        let svc = Arc::new(MemoryExtractionService::new(
+            resolver,
+            memoria,
+            ingestion,
+            "test-user",
+            Arc::clone(&broker),
+        ));
+        (svc, rx, broker)
+    }
+
     #[tokio::test]
     async fn store_failure_emits_write_failed_event() {
         let memoria = Arc::new(ScriptedMemoria {
@@ -1548,6 +1932,7 @@ mod tests {
                 }
                 let m = evt.metadata.as_ref().unwrap();
                 if m["outcome"] == "errored" && m["reason"] == "write_failed" {
+                    assert_eq!(m["persist_detail"], "store down");
                     saw_write_failed = true;
                 }
             }
@@ -1556,6 +1941,31 @@ mod tests {
             }
         }
         assert!(saw_write_failed, "expected errored{{write_failed}} event");
+    }
+
+    #[tokio::test]
+    async fn persist_failure_does_not_advance_debounce_state() {
+        let memoria = Arc::new(ScriptedMemoria {
+            store_fail_permanently: true,
+            ..ScriptedMemoria::new()
+        });
+        let (svc, _rx, _broker) =
+            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
+        let sid = format!("retry-after-fail-{}", nanos());
+        let req = sample_req(&sid, 50_000, false);
+
+        assert_eq!(svc.maybe_spawn(req.clone()), SpawnDecision::Spawned);
+        svc.wait_for_pending(Duration::from_secs(5)).await;
+
+        assert!(
+            svc.peek_state(&sid).is_none(),
+            "failed persistence must not mark the session as freshly extracted"
+        );
+        assert_eq!(
+            svc.maybe_spawn(req),
+            SpawnDecision::Spawned,
+            "same counters should remain retryable after a failed attempt"
+        );
     }
 
     #[tokio::test]
@@ -1575,18 +1985,17 @@ mod tests {
 
     #[tokio::test]
     async fn selector_cooldown_fires_after_llm_failure() {
-        // This test exercises the health-map side of the service:
-        // after the runner reports an LLM error, `selector_healthy`
-        // should flip the next attempt into SelectorCooldown.
-        // Because we can't easily mock an LLM failure inline (runner
-        // hits real http), directly mark the selector unhealthy on the
-        // service's health map and verify maybe_spawn's next run emits
-        // the cooldown skip event.
+        // An unhealthy selector should no longer leave session memory
+        // empty. We degrade to the deterministic rule-fallback path and
+        // persist a session-memory snapshot instead of skipping the whole run.
         let selector_params = LlmConnParams {
             base_url: "https://nope.invalid".to_string(),
             api_key: "k".to_string(),
             model_name: "cheap-selector".to_string(),
+            wire_model_name: None,
             provider: "test".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
         };
         let memoria = Arc::new(CapturingMemoria::default());
         let (svc, mut rx, _broker) = build_ctx_with_memoria(
@@ -1603,29 +2012,104 @@ mod tests {
         assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut saw_cooldown = false;
-        while Instant::now() < deadline && !saw_cooldown {
+        let mut saw_cooldown_skip = false;
+        let mut saw_fallback_extract = false;
+        while Instant::now() < deadline && !(saw_cooldown_skip && saw_fallback_extract) {
             while let Ok(evt) = rx.try_recv() {
                 if evt.event_type != "session_memory_extraction" {
                     continue;
                 }
                 let m = evt.metadata.as_ref().unwrap();
-                if m["outcome"] == "skipped" && m["reason"] == "selector_cooldown" {
-                    saw_cooldown = true;
+                if m["outcome"] == "skipped"
+                    && m["reason"] == "selector_cooldown"
+                    && m["selector_model"] == selector_params.model_name
+                {
+                    saw_cooldown_skip = true;
+                }
+                if m["outcome"] == "extracted"
+                    && m["source"] == "rule_fallback"
+                    && m["selector_model"] == selector_params.model_name
+                {
+                    saw_fallback_extract = true;
                 }
             }
-            if !saw_cooldown {
+            if !(saw_cooldown_skip && saw_fallback_extract) {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
         assert!(
-            saw_cooldown,
-            "unhealthy selector must emit skipped{{selector_cooldown}} event"
+            saw_cooldown_skip,
+            "unhealthy selector must still emit skipped{{reason=selector_cooldown}}"
         );
         assert!(
-            memoria.stored.lock().unwrap().is_empty(),
-            "cooldown must prevent any store"
+            saw_fallback_extract,
+            "unhealthy selector must degrade to extracted{{source=rule_fallback}}"
         );
+        assert!(
+            !memoria.stored.lock().unwrap().is_empty(),
+            "cooldown must still persist fallback memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn selector_cooldown_skips_to_next_healthy_candidate() {
+        let first = LlmConnParams {
+            base_url: "https://nope.invalid".to_string(),
+            api_key: "k".to_string(),
+            model_name: "selector-first".to_string(),
+            wire_model_name: None,
+            provider: "test".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
+        };
+        let second = LlmConnParams {
+            model_name: "selector-second".to_string(),
+            ..first.clone()
+        };
+        let memoria = Arc::new(CapturingMemoria::default());
+        let (svc, mut rx, _broker) = build_ctx_with_resolver(
+            Arc::new(OrderedSelectorResolver(vec![first.clone(), second.clone()])),
+            Arc::clone(&memoria) as Arc<dyn MemoriaClient>,
+        );
+        svc.health.mark_failed(&first.model_name);
+
+        let sid = format!("next-candidate-{}", nanos());
+        let req = sample_req(&sid, 50_000, false);
+        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut attempted_second = false;
+        while Instant::now() < deadline && !attempted_second {
+            while let Ok(evt) = rx.try_recv() {
+                if evt.event_type != "session_memory_extraction" {
+                    continue;
+                }
+                let metadata = evt.metadata.as_ref().unwrap();
+                if metadata["outcome"] == "extracted"
+                    && metadata["source"] == "rule_fallback"
+                    && metadata["selector_model"] == second.model_name
+                {
+                    attempted_second = true;
+                }
+            }
+            if !attempted_second {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        assert!(
+            attempted_second,
+            "service should skip the cooled-down selector and attempt the next healthy candidate"
+        );
+    }
+
+    #[test]
+    fn unsupported_region_errors_are_terminal_selector_failures() {
+        let detail = r#"http 502: {"detail":"Upstream LLM HTTP 400 Bad Request: {\"message\":\"Access to Anthropic models is not allowed from unsupported countries, regions, or territories.\"}"}"#;
+        assert!(is_terminal_selector_failure(Some(detail)));
+        assert!(!is_terminal_selector_failure(Some(
+            "http 502: upstream timeout"
+        )));
+        assert!(!is_terminal_selector_failure(None));
     }
 
     // ── concurrency / edge cases ─────────────────────────────────────
@@ -1860,19 +2344,13 @@ mod tests {
         );
     }
 
-    /// Regression for the probe-slot leak on the `selector_cooldown`
-    /// early-return inside `run_one`: if `admit()` returned
-    /// `HalfOpenProbe` (so `probe_in_flight = true`) and the worker
-    /// then bails because the LLM selector is cooling down, the
-    /// breaker must still release its probe slot so the next
-    /// eligible caller can perform the real recovery probe.
-    ///
-    /// Before the `ProbeGuard` RAII fix, the worker called only
-    /// `release_in_flight` on that branch — `probe_in_flight` stayed
-    /// true forever, `admit()` returned `Open` until process
-    /// restart.
+    /// Regression for the old `selector_cooldown` early-return inside
+    /// `run_one`: once the Memoria breaker admitted a half-open probe,
+    /// the degraded fallback path must still settle that probe
+    /// cleanly. A successful fallback write should close the breaker,
+    /// not leak the probe slot or leave it tripped.
     #[tokio::test]
-    async fn half_open_probe_released_when_run_one_bails_on_selector_cooldown() {
+    async fn half_open_probe_closes_when_selector_cooldown_falls_back() {
         // A successful-Memoria client so the trip below is exclusively
         // driven by `record_failure` we call directly (no network in
         // the test).
@@ -1881,7 +2359,10 @@ mod tests {
             base_url: "https://nope.invalid".to_string(),
             api_key: "k".to_string(),
             model_name: "cheap-selector-leak".to_string(),
+            wire_model_name: None,
             provider: "test".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
         };
         let (ingestion, _rx) = IngestionSender::for_tests(256);
         let broker = Arc::new(BackgroundActivityBroker::new());
@@ -1907,8 +2388,8 @@ mod tests {
             "fixture pre-condition: breaker must be tripped"
         );
 
-        // 2. Mark the selector unhealthy so `run_one` will hit the
-        //    `selector_cooldown` branch.
+        // 2. Mark the selector unhealthy so `run_one` will degrade to
+        //    the rule-fallback path instead of attempting the LLM.
         svc.health.mark_failed(&selector_params.model_name);
 
         // 3. Wait past cooldown so the next `admit()` returns
@@ -1916,20 +2397,20 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(70)).await;
 
         // 4. Fire maybe_spawn. The sync path admits (HalfOpenProbe),
-        //    spawns run_one; run_one hits selector_cooldown early
-        //    return. ProbeGuard::drop must release the probe slot.
+        //    spawns run_one; run_one stores fallback memory and records
+        //    success, which should close the breaker.
         let sid = format!("probe-leak-{}", nanos());
         let req = sample_req(&sid, 20_000, false);
         assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
         svc.wait_for_pending(Duration::from_secs(2)).await;
 
-        // 5. Assertion: the breaker must be back to admitting a
-        //    probe — the slot was released, not consumed.
+        // 5. Assertion: the breaker must now be closed because the
+        //    fallback path succeeded through Memoria.
         let admit_after = svc.memoria_health.admit();
         assert_eq!(
             admit_after,
-            crate::session_memory::health::MemoriaAdmit::HalfOpenProbe,
-            "probe slot must be released after selector_cooldown early-return; got {admit_after:?}"
+            crate::session_memory::health::MemoriaAdmit::Closed,
+            "successful fallback during selector cooldown should close the breaker; got {admit_after:?}"
         );
     }
 
@@ -2030,6 +2511,7 @@ mod tests {
         let req = ExtractionRequest {
             session_id: sid,
             messages: vec![json!({"role": "user", "content": "x"})],
+            session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             current_tokens: 1_000,
             current_tool_calls: 0,
             had_error: false,

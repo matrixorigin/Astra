@@ -4,18 +4,22 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
             "/models",
-            post(models::create_model_handler).get(models::list_models_handler),
+            post(data_layer::models::create_model_handler)
+                .get(data_layer::models::list_models_handler),
         )
-        .route("/models/memory", get(models::get_memory_model_handler))
+        .route(
+            "/models/memory",
+            get(data_layer::models::get_memory_model_handler),
+        )
         .route(
             "/models/{model_name}",
-            get(models::get_model_handler)
-                .put(models::update_model_handler)
-                .delete(models::delete_model_handler),
+            get(data_layer::models::get_model_handler)
+                .put(data_layer::models::update_model_handler)
+                .delete(data_layer::models::delete_model_handler),
         )
         .route(
             "/models/{model_name}/check",
-            post(models::check_model_handler),
+            post(data_layer::models::check_model_handler),
         )
         .route(
             "/skills",
@@ -60,69 +64,69 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/skills/{skill_name}/config/validate",
-            get(skill_config::validate_config_handler),
+            get(config_admin::skill::validate_config_handler),
         )
         .route(
             "/skills/{skill_name}/config",
-            get(skill_config::get_effective_config_handler),
+            get(config_admin::skill::get_effective_config_handler),
         )
         .route(
             "/skills/{skill_name}/config/{setting_name}",
-            axum::routing::put(skill_config::set_setting_handler)
-                .delete(skill_config::delete_setting_handler),
+            axum::routing::put(config_admin::skill::set_setting_handler)
+                .delete(config_admin::skill::delete_setting_handler),
         )
         .route(
             "/skills/{skill_name}/resources",
-            get(skill_config::list_resources_handler),
+            get(config_admin::skill::list_resources_handler),
         )
         .route(
             "/skills/{skill_name}/resources/{resource_key}",
-            axum::routing::put(skill_config::bind_resource_handler)
-                .delete(skill_config::unbind_resource_handler),
+            axum::routing::put(config_admin::skill::bind_resource_handler)
+                .delete(config_admin::skill::unbind_resource_handler),
         )
         .route(
             "/marketplace/install",
-            post(marketplace::install_skill_handler),
+            post(crate::service_handlers::marketplace::install_skill_handler),
         )
         .route(
             "/marketplace/uninstall",
-            post(marketplace::uninstall_skill_handler),
+            post(crate::service_handlers::marketplace::uninstall_skill_handler),
         )
         .route(
             "/marketplace/upgrade",
-            post(marketplace::upgrade_skill_handler),
+            post(crate::service_handlers::marketplace::upgrade_skill_handler),
         )
         .route(
             "/marketplace/rollback",
-            post(marketplace::rollback_skill_handler),
+            post(crate::service_handlers::marketplace::rollback_skill_handler),
         )
         .route(
             "/marketplace/installed",
-            get(marketplace::list_installed_handler),
+            get(crate::service_handlers::marketplace::list_installed_handler),
         )
         .route(
             "/marketplace/credentials",
-            post(marketplace::save_credential_handler)
-                .delete(marketplace::delete_credential_handler),
+            post(crate::service_handlers::marketplace::save_credential_handler)
+                .delete(crate::service_handlers::marketplace::delete_credential_handler),
         )
         .route(
             "/marketplace/skills/{skill_name}/publish",
-            post(marketplace::publish_skill_handler),
+            post(crate::service_handlers::marketplace::publish_skill_handler),
         )
         .route(
             "/marketplace/skills/{skill_name}/deprecate",
-            post(marketplace::deprecate_skill_handler),
+            post(crate::service_handlers::marketplace::deprecate_skill_handler),
         )
         .route(
             "/marketplace/quality-report",
-            post(marketplace::submit_quality_report_handler),
+            post(crate::service_handlers::marketplace::submit_quality_report_handler),
         )
         .route(
             "/marketplace/stats/{skill_name}",
-            get(marketplace::get_skill_stats_handler),
+            get(crate::service_handlers::marketplace::get_skill_stats_handler),
         )
         .route(
             "/marketplace/search",
-            get(marketplace::search_marketplace_handler),
+            get(crate::service_handlers::marketplace::search_marketplace_handler),
         )
 }

@@ -15,6 +15,7 @@ description: |
 prompt: |
   Read the first 10 lines of Cargo.toml. Reply with the package name only.
 capability: custom:cache
+required_cache_scope: conversation_turns
 difficulty: 2
 weight: 1.0
 timeout_seconds: 180

@@ -68,9 +68,7 @@ pub(super) fn build_core_state(
     .with_trigger_service(Arc::new(
         DatabaseTriggerService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
-    .with_workflow_service(Arc::new(
-        DatabaseWorkflowService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
+    .with_workflow_service(Arc::new(UnconfiguredWorkflowService))
     .with_sandbox_service(Arc::new(
         DatabaseSandboxService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))

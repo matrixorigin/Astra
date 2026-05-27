@@ -16,16 +16,16 @@ pub use astra_prompts::skills::{
 };
 pub use context::{
     CacheAwareEstimate, CompactConfig, CompactionTier, ContextBudget, DEFAULT_SYSTEM_PROMPT_TOKENS,
-    budget_for_model, capped_output_tokens, estimate_str_tokens, estimate_tokens,
-    estimate_tokens_cache_aware, estimate_tokens_precise,
+    budget_for_model, budget_for_model_with_override, capped_output_tokens, estimate_str_tokens,
+    estimate_tokens, estimate_tokens_cache_aware, estimate_tokens_cache_aware_split,
+    estimate_tokens_precise,
 };
 pub use system::{
-    AgentRuntimeContext, CacheScope, LOW_CONFIDENCE_THRESHOLD, PARALLEL_BATCHING_NUDGE_THRESHOLD,
-    PromptOverrides, PromptSection, PromptTokenBucket, ROUND_BUDGET_HARD_LIMIT,
-    ROUND_BUDGET_THRESHOLD, STALL_NUDGE, SYSTEM_PROMPT_BASE, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
-    SystemPromptBuilder, apply_overrides, build_deferred_tools_section,
-    build_deferred_tools_section_with_budget, build_main_system_prompt,
-    build_main_system_prompt_with_style, build_pipeline_static_sections,
+    CacheScope, LOW_CONFIDENCE_THRESHOLD, PARALLEL_BATCHING_NUDGE_THRESHOLD, PromptOverrides,
+    PromptSection, PromptTokenBucket, ROUND_BUDGET_HARD_LIMIT, ROUND_BUDGET_THRESHOLD, STALL_NUDGE,
+    SYSTEM_PROMPT_BASE, SYSTEM_PROMPT_DYNAMIC_BOUNDARY, SystemPromptBuilder, apply_overrides,
+    build_deferred_tools_section, build_deferred_tools_section_with_budget,
+    build_main_system_prompt, build_main_system_prompt_with_style, build_pipeline_static_sections,
     build_skill_listing_section, build_skill_listing_section_for_model,
     build_skill_listing_section_with_caps, build_system_prompt_sections,
     build_system_prompt_sections_with_style, build_system_prompt_trace, default_overrides_dir,
@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn budget_for_model_claude() {
         let b = budget_for_model(Some("claude-3.5-sonnet"));
-        assert_eq!(b.model_limit, 200_000);
+        assert_eq!(b.model_limit, 128_000);
     }
 
     #[test]

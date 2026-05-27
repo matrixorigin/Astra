@@ -5,7 +5,7 @@ use astra_services::session_journal::ToolCallRecord;
 use astra_thin_client::ThinClient;
 use serde_json::{Map, Value};
 
-use super::agentic_headless_round::{HeadlessRoundTerminal, PermissionSyncHandle};
+use super::agentic::headless_round::{HeadlessRoundTerminal, PermissionSyncHandle};
 use astra_pipeline::step_protocol::{IdempotencyKey, InMemoryIdempotencyCache};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
@@ -56,7 +56,7 @@ pub fn admissible_tool_names_from_visible(
 
 /// Like [`admissible_tool_names_from_visible`] but also admits names from
 /// an `extras` list — used to surface runtime-injected schemas (`skill`,
-/// `spawn_agent`, `web_search`, `task`, `notify`, `ask_user`) and
+/// `web_search`, `task`, `notify`, `ask_user`) and
 /// plugin-registered MCP tools that don't live in the static
 /// `TOOL_CATALOG`. Without this escape hatch the validator would reject
 /// tool calls for names the executor can dispatch.
@@ -386,7 +386,7 @@ mod tests {
     use serde_json::json;
 
     use crate::skills::hooks::{HookAction, ToolEventHook, ToolEventHookRegistry, ToolEventKind};
-    use crate::turn::agentic_headless_round::NoopHeadlessTerminal;
+    use crate::turn::agentic::headless_round::NoopHeadlessTerminal;
     use astra_pipeline::step_protocol::CachedToolResult;
     use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 

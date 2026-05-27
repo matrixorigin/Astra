@@ -63,19 +63,29 @@ impl std::fmt::Debug for PoolSelectorResolver {
 
 #[async_trait::async_trait]
 impl crate::session_memory::SelectorParamsResolver for PoolSelectorResolver {
-    async fn resolve(&self) -> Option<crate::memory_relevance::LlmConnParams> {
+    async fn resolve(&self) -> Option<crate::memory_hooks::relevance::LlmConnParams> {
+        self.resolve_candidates().await.into_iter().next()
+    }
+
+    async fn resolve_candidates(&self) -> Vec<crate::memory_hooks::relevance::LlmConnParams> {
         let settings = self.pool.settings();
         let pool = self.pool.get();
         let resolved =
-            astra_services::models::resolve_memory_model(settings, &self.encryptor, Some(pool))
+            astra_services::models::resolve_memory_models(settings, &self.encryptor, Some(pool))
                 .await
-                .ok()?;
-        Some(crate::memory_relevance::LlmConnParams {
-            base_url: resolved.base_url,
-            api_key: resolved.api_key,
-            model_name: resolved.model_name,
-            provider: resolved.provider,
-        })
+                .unwrap_or_default();
+        resolved
+            .into_iter()
+            .map(|model| crate::memory_hooks::relevance::LlmConnParams {
+                base_url: model.base_url,
+                api_key: model.api_key,
+                model_name: model.model_name,
+                wire_model_name: model.wire_model_name,
+                provider: model.provider,
+                request_body_overrides: model.request_body_overrides,
+                thinking_capability: model.thinking_capability,
+            })
+            .collect()
     }
 }
 
@@ -221,18 +231,23 @@ impl MatrixCloudRuntime {
 
     /// Resolve the cheapest memory-tagged model from the registry.
     /// Returns `None` if no encryptor is configured or resolution fails.
-    pub async fn resolve_memory_model(&self) -> Option<crate::memory_relevance::LlmConnParams> {
+    pub async fn resolve_memory_model(
+        &self,
+    ) -> Option<crate::memory_hooks::relevance::LlmConnParams> {
         let enc = self.encryptor.as_ref()?;
         let settings = self.shared_pool.settings();
         let pool = self.shared_pool.get();
         let resolved = astra_services::models::resolve_memory_model(settings, enc, Some(pool))
             .await
             .ok()?;
-        Some(crate::memory_relevance::LlmConnParams {
+        Some(crate::memory_hooks::relevance::LlmConnParams {
             base_url: resolved.base_url,
             api_key: resolved.api_key,
             model_name: resolved.model_name,
+            wire_model_name: resolved.wire_model_name,
             provider: resolved.provider,
+            request_body_overrides: resolved.request_body_overrides,
+            thinking_capability: resolved.thinking_capability,
         })
     }
 

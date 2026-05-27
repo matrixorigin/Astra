@@ -26,6 +26,17 @@ fn parse_permission_mode_arg(value: &str) -> Result<String, String> {
         .map(|mode| mode.to_string())
 }
 
+fn parse_explain_mode_arg(value: &str) -> Result<crate::ExplainMode, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" => Ok(crate::ExplainMode::On),
+        "off" | "false" => Ok(crate::ExplainMode::Off),
+        "verbose" => Ok(crate::ExplainMode::Verbose),
+        other => Err(format!(
+            "invalid explain mode `{other}` (expected on, off, or verbose)"
+        )),
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "astra")]
 #[command(about = "AI agent CLI — run `astra` for interactive chat")]
@@ -326,9 +337,15 @@ pub(crate) struct ChatArgs {
     /// Model override
     #[arg(long)]
     pub model: Option<String>,
-    /// Enable explain mode
-    #[arg(long, default_value_t = false)]
-    pub explain: bool,
+    /// Enable explain mode (`--explain` => on, `--explain verbose` => verbose)
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "on",
+        value_name = "MODE",
+        value_parser = parse_explain_mode_arg
+    )]
+    pub explain: Option<crate::ExplainMode>,
     /// Auto-approve tool calls
     #[arg(short = 'y', long = "auto-approve", default_value_t = false)]
     pub auto_approve: bool,

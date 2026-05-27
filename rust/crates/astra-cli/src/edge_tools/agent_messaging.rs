@@ -416,7 +416,7 @@ pub async fn handle_send_message_tool(
 mod tests {
     use super::*;
     use astra_messaging::{AgentMailboxRouter, InProcessTransport, types::AgentAddress};
-    use astra_runtime::server::delegation_engine::DelegationTracker;
+    use astra_runtime::server::delegation::engine::DelegationTracker;
     use std::sync::Arc;
 
     #[test]

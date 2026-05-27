@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use astra_services::SessionArtifactStore;
 
-use super::super::agentic_headless_round::HeadlessStderrStyle;
+use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::*;
 use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::headless_tool_assembly::{

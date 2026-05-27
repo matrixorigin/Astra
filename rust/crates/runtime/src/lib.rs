@@ -35,30 +35,36 @@ use crate::bridge::{
 
 // ── Internal modules: HTTP handlers (crate-visible only) ─────────────────────
 
-pub(crate) mod admin_config_handlers;
-pub(crate) mod agents;
-pub mod branches;
-pub(crate) mod context;
-pub mod data_versioning;
-pub(crate) mod decisions;
-pub(crate) mod events;
-pub mod jobs;
-pub mod marketplace;
+pub mod config_admin;
+pub(crate) mod data_layer;
 pub mod messaging;
-pub(crate) mod models;
+
 pub mod orchestration;
-pub mod replay;
-pub mod sandbox;
-pub mod skill_config;
+pub(crate) mod service_handlers;
 pub mod skills;
-pub mod triggers;
-pub(crate) mod workflows;
+
+// ── Backward-compatible module re-exports (moved into service_handlers/) ──────
+//
+// `agents` and `context` are still consumed as bare module names from
+// `server/router_builder/*` via `use super::*;`. Keep them as crate-private
+// re-exports until those call sites migrate to the canonical
+// `service_handlers::{agents,context}` paths.
+pub(crate) mod agents {
+    pub use crate::service_handlers::agents::*;
+}
+pub(crate) mod context {
+    pub use crate::service_handlers::context::*;
+}
+
+// ── self_model (the self_model/ directory) ──────────────────────────────────
+#[path = "self_model/mod.rs"]
+pub mod self_model;
+
+pub use self_model::introspection;
 
 // ── Internal modules: runtime storage helpers ────────────────────────────────
 
-pub(crate) mod storage;
-
-pub(crate) use storage::{
+pub(crate) use data_layer::storage::{
     ensure_core_schema, insert_core_turn_event, insert_tool_turn_event, insert_turn_decision_audit,
     insert_turn_skill_selection, resolve_active_skill_versions, update_snapshot_llm_ids,
     update_turn_skill_selection_version,
@@ -72,24 +78,18 @@ pub mod bash_intent;
 pub mod bridge;
 pub mod capabilities;
 pub mod evaluation;
-pub mod guardrail_tuning;
-pub mod introspection;
-pub mod lesson_checkpoint;
-pub mod lesson_extractor;
-pub mod lesson_synthesizer;
+pub mod learning;
 pub mod matrix_cloud_runtime;
-pub mod memoria_insights;
-pub mod memory_relevance;
-pub mod observability_integration;
+pub mod memory_hooks;
+pub mod observability;
 pub mod pipeline;
 pub use astra_plan as plan;
-pub use astra_sandbox as tool_sandbox;
 pub mod prompts;
-pub mod self_model;
 pub mod server;
 pub mod session_memory;
 pub mod tool_registry;
 pub mod turn;
+pub use astra_sandbox as tool_sandbox;
 
 // ── Re-exports: core primitives ──────────────────────────────────────────────
 
@@ -213,8 +213,8 @@ pub use astra_services::{
     },
     triggers::{DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService},
     workflows::{
-        DatabaseWorkflowService, UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem,
-        WorkflowRunRecord, WorkflowService,
+        UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem, WorkflowRunRecord,
+        WorkflowService,
     },
 };
 
@@ -245,12 +245,12 @@ pub use introspection::{
 // ── Re-exports: server ───────────────────────────────────────────────────────
 
 pub use server::build_test_router;
-pub use server::delegation_engine::{
+pub use server::delegation::engine::{
     CheckpointGate, DefaultQualityGate, DelegationEngine, DelegationTracker, GateVerdict,
     QualityThresholds, VerificationGate,
 };
-pub use server::run_engine::RunEngine;
-pub use server::run_lifecycle::AgenticRunLifecycleService;
+pub use server::run::engine::RunEngine;
+pub use server::run::lifecycle::AgenticRunLifecycleService;
 pub use server::{build_app, build_server_state, serve};
 
 // ── Re-exports: orchestration ────────────────────────────────────────────────
@@ -297,7 +297,6 @@ pub use astra_turn_core::{
     },
     cloud_summary::{HttpSummaryClient, LlmConnParams, SummaryLlmClient, SummaryResponse},
     complete::build_turn_complete_event,
-    counter::count_persisted_turn_events,
     execution_state::normalize_execution_state,
     explain::build_explain_event,
     history::{
@@ -310,7 +309,6 @@ pub use astra_turn_core::{
         LlmResponsePersistPlan, PersistEventPayload, build_llm_response_persist_plan,
         build_tool_call_event_payload, build_tool_result_event_payload,
     },
-    quality::build_tool_result_quality_event_payload,
     response_guard::{is_prompt_leaked, is_repetition_loop},
     retrieval::{
         RETRIEVAL_BUDGET_CHARS, enhanced_extraction, format_retrieved_events, rule_based_extraction,
@@ -330,6 +328,8 @@ pub use astra_turn_core::{
     task::classify_task,
     tool_args_repair::try_repair_tool_args,
     tool_selection::{plan_tool_subset_for_result_turn, resolve_preferred_tool_status},
+    turn_metrics::build_tool_result_quality_event_payload,
+    turn_metrics::count_persisted_turn_events,
     view::{
         RetrievalPlan, build_recent_retrieval_tail, compose_retrieval_view,
         extract_latest_user_query, plan_retrieval_inputs,

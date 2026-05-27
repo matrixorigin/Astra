@@ -15,14 +15,14 @@ use astra_turn_core::cloud_approval_policy::{
     CloudGatedToolKind, bash_command_approval_reason, cloud_gated_tool_kind,
     cloud_gated_tool_kind_with_args,
 };
-use astra_turn_core::permission_engine::{
+use astra_turn_core::permission::engine::{
     DecisionEnvelope, DecisionSource, HardDecision, allow_rule_preview,
     allow_rule_preview_for_match_target,
 };
-use astra_turn_core::permission_match_target::{
+use astra_turn_core::permission::match_target::{
     AllowMatchTarget, default_match_target, fingerprint_for_match_target,
 };
-use astra_turn_core::permission_memory_profile::resolved_write_path;
+use astra_turn_core::permission::memory_profile::resolved_write_path;
 use astra_turn_core::tool_argument_hints::{
     command_hint_from_args, path_hint_from_args, permission_prompt_display_label,
 };
@@ -367,14 +367,14 @@ fn sensitive_path_match(args: &serde_json::Value) -> Option<String> {
     if let Some(path) = path_hint_from_args(args)
         && !path.is_empty()
         && (is_dangerous_file_path(&path)
-            || astra_turn_core::permission_redact::matches_sensitive_path(&path))
+            || astra_turn_core::permission::redact::matches_sensitive_path(&path))
     {
         return Some(path);
     }
     if let Some(cmd) = command_hint_from_args(args)
         && !cmd.is_empty()
         && (is_dangerous_file_path(cmd)
-            || astra_turn_core::permission_redact::matches_sensitive_path(cmd))
+            || astra_turn_core::permission::redact::matches_sensitive_path(cmd))
     {
         return Some(cmd.to_string());
     }
@@ -396,8 +396,8 @@ fn sensitive_path_match(args: &serde_json::Value) -> Option<String> {
 // `PermissionDecision` (renamed to `GateOutcome` in P1) because its
 // shape (Allow / Deny / NeedApproval) is genuinely different from
 // turn-core's `PermissionDecision` (Approve / Deny / Escalate).
-pub(super) use astra_turn_core::permission_types::PermissionMode;
-pub(super) use astra_turn_core::permission_types::PermissionRule;
+pub(super) use astra_turn_core::permission::types::PermissionMode;
+pub(super) use astra_turn_core::permission::types::PermissionRule;
 
 /// Atomic encoding of [`PermissionMode`] for the lock-free mirror
 /// the TUI inner-tick path consumes. Keeps the mapping local and
@@ -446,6 +446,15 @@ impl PermissionModeMirror {
             encode_mode_for_mirror(mode),
             std::sync::atomic::Ordering::Release,
         );
+    }
+
+    /// Test-only constructor: build a mirror from a pre-encoded u8.
+    /// Use `encode_mode_for_mirror` to get the correct encoding.
+    #[cfg(test)]
+    pub(crate) fn from_encoded(encoded: u8) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(encoded)),
+        }
     }
 }
 
@@ -760,7 +769,7 @@ impl PermissionSettings {
 
     fn validate_rules(&self, path: &Path) -> Result<(), PermissionSettingsLoadError> {
         for rule in self.allow.iter().chain(self.deny.iter()) {
-            if let Err(err) = astra_turn_core::permission_rule_grammar::parse_rule_v2(rule) {
+            if let Err(err) = astra_turn_core::permission::rule_grammar::parse_rule_v2(rule) {
                 return Err(PermissionSettingsLoadError::InvalidRule {
                     path: path.to_path_buf(),
                     rule: rule.clone(),
@@ -785,7 +794,7 @@ impl PermissionSettings {
         // structured. We clone-and-stamp so `save` stays
         // `&self`-compatible with the existing call sites.
         let mut to_serialize = self.clone();
-        to_serialize.grammar_version = astra_turn_core::permission_rule_grammar::GRAMMAR_VERSION;
+        to_serialize.grammar_version = astra_turn_core::permission::rule_grammar::GRAMMAR_VERSION;
 
         // If this is the first time we're stamping a v2 over a
         // pre-existing v1 file, write a `.v1.bak.json` sibling
@@ -1594,7 +1603,7 @@ impl PermissionManager {
     fn is_inherited_allowed_with_context(
         &self,
         tool_name: &str,
-        ctx: &astra_turn_core::permission_types::RuleMatchContext,
+        ctx: &astra_turn_core::permission::types::RuleMatchContext,
     ) -> bool {
         if let Some(ref inherited) = self.inherited {
             inherited.is_allowed_with_context(tool_name, ctx)
@@ -1615,7 +1624,7 @@ impl PermissionManager {
     fn is_inherited_denied_with_context(
         &self,
         tool_name: &str,
-        ctx: &astra_turn_core::permission_types::RuleMatchContext,
+        ctx: &astra_turn_core::permission::types::RuleMatchContext,
     ) -> bool {
         if let Some(ref inherited) = self.inherited {
             inherited.is_denied_with_context(tool_name, ctx)
@@ -2085,7 +2094,7 @@ impl PermissionManager {
 
     /// Check persistent deny rules (inherited + project + user, bypass-immune).
     fn check_deny_rules(&self, name: &str, args: &serde_json::Value) -> bool {
-        let ctx = astra_turn_core::permission_types::RuleMatchContext::from_tool_args(name, args);
+        let ctx = astra_turn_core::permission::types::RuleMatchContext::from_tool_args(name, args);
         // Check inherited deny rules first (from parent agent)
         if self.is_inherited_denied_with_context(name, &ctx) {
             return true;
@@ -2101,7 +2110,7 @@ impl PermissionManager {
 
     /// Check persistent allow rules: inherited first, then project-level, then user-level.
     fn check_allow_rules(&self, name: &str, args: &serde_json::Value) -> bool {
-        let ctx = astra_turn_core::permission_types::RuleMatchContext::from_tool_args(name, args);
+        let ctx = astra_turn_core::permission::types::RuleMatchContext::from_tool_args(name, args);
         // Check inherited allow rules first (from parent agent)
         if self.is_inherited_allowed_with_context(name, &ctx) {
             return true;
@@ -2113,7 +2122,7 @@ impl PermissionManager {
         })
     }
 
-    fn evaluation_context(&self) -> astra_turn_core::permission_types::PermissionSyncContext {
+    fn evaluation_context(&self) -> astra_turn_core::permission::types::PermissionSyncContext {
         let mut inherited = self
             .inherited
             .clone()
@@ -2133,7 +2142,7 @@ impl PermissionManager {
         }
         inherited.fingerprinted_overrides = self.combined_overrides_for_evaluation().to_json();
 
-        astra_turn_core::permission_types::PermissionSyncContext::new(inherited)
+        astra_turn_core::permission::types::PermissionSyncContext::new(inherited)
     }
 
     fn evaluate_permission_envelope(
@@ -2142,7 +2151,7 @@ impl PermissionManager {
         args: &serde_json::Value,
     ) -> DecisionEnvelope {
         let ctx = self.evaluation_context();
-        astra_turn_core::permission_engine::evaluate_permission(name, args, &ctx)
+        astra_turn_core::permission::engine::evaluate_permission(name, args, &ctx)
     }
 
     /// Check if a file path targets a dangerous location.
@@ -2298,7 +2307,7 @@ impl PermissionManager {
         // path-less detail the line-level redactor still runs.
         let detail = detail.map(|d| {
             let path = args.get("path").and_then(|v| v.as_str());
-            astra_turn_core::permission_redact::redact_for_approval_display(&d, path).display
+            astra_turn_core::permission::redact::redact_for_approval_display(&d, path).display
         });
 
         (header, detail)
@@ -2395,7 +2404,7 @@ impl PermissionManager {
                 } else {
                     "in this session"
                 };
-                let remember_preview = astra_turn_core::permission_match_target::remember_preview(
+                let remember_preview = astra_turn_core::permission::match_target::remember_preview(
                     tool, &rule_args, location,
                 );
                 if sensitive_path_match(&rule_args).is_some() {
@@ -2473,17 +2482,17 @@ impl PermissionManager {
 
     fn remember_allow_rule_in_memory(
         &mut self,
-        target: astra_turn_core::permission_audit::PersistTarget,
+        target: astra_turn_core::permission::audit::PersistTarget,
         rule_text: &str,
     ) {
         match target {
-            astra_turn_core::permission_audit::PersistTarget::Project => {
+            astra_turn_core::permission::audit::PersistTarget::Project => {
                 if !self.settings.allow.iter().any(|rule| rule == rule_text) {
                     self.settings.allow.push(rule_text.to_string());
                     self.cached_allow = self.settings.parsed_allow_rules();
                 }
             }
-            astra_turn_core::permission_audit::PersistTarget::User => {
+            astra_turn_core::permission::audit::PersistTarget::User => {
                 if !self
                     .user_settings
                     .allow
@@ -2501,14 +2510,14 @@ impl PermissionManager {
         &self,
         timestamp_ms: u64,
         correlation_id: String,
-        target: astra_turn_core::permission_audit::PersistTarget,
+        target: astra_turn_core::permission::audit::PersistTarget,
         rule_text: String,
         saved: bool,
         failure_reason: Option<String>,
     ) {
-        astra_turn_core::permission_audit::record_persisted_for_session(
+        astra_turn_core::permission::audit::record_persisted_for_session(
             self.active_session_id(),
-            astra_turn_core::permission_audit::RulePersistedEvent {
+            astra_turn_core::permission::audit::RulePersistedEvent {
                 timestamp_ms,
                 correlation_id,
                 target,
@@ -2634,7 +2643,7 @@ impl PermissionManager {
     /// takes effect immediately; callers must inspect `last_save_error()`
     /// and notify the user that persistence failed.
     pub(super) fn add_allow_rule(&mut self, rule: &str) {
-        use astra_turn_core::permission_audit::PersistTarget;
+        use astra_turn_core::permission::audit::PersistTarget;
 
         let rule_text = rule.to_string();
         if self.settings.allow.contains(&rule_text) {
@@ -2707,7 +2716,7 @@ impl PermissionManager {
     }
 
     fn add_user_allow_rule_with_home(&mut self, rule: &str, home: Option<&Path>) {
-        use astra_turn_core::permission_audit::PersistTarget;
+        use astra_turn_core::permission::audit::PersistTarget;
 
         let rule_text = rule.to_string();
         if self.user_settings.allow.contains(&rule_text) {
@@ -3008,7 +3017,7 @@ impl PermissionManager {
                 } else {
                     "in this session"
                 };
-                let remember_preview = astra_turn_core::permission_match_target::remember_preview(
+                let remember_preview = astra_turn_core::permission::match_target::remember_preview(
                     name, args, location,
                 );
                 let persist_error = self.take_last_save_error();
@@ -3078,7 +3087,7 @@ impl PermissionManager {
         }
 
         let envelope = self.evaluate_permission_envelope(name, args);
-        astra_turn_core::permission_audit::record_evaluated_envelope_for_session(
+        astra_turn_core::permission::audit::record_evaluated_envelope_for_session(
             self.active_session_id(),
             name,
             args,
@@ -3350,7 +3359,7 @@ impl PermissionManager {
 /// Outcome of a non-blocking permission gate evaluation.
 ///
 /// Issue #326 P1 / R1 §1: this used to be called `PermissionDecision`,
-/// which collided with `astra_turn_core::permission_types::PermissionDecision`
+/// which collided with `astra_turn_core::permission::types::PermissionDecision`
 /// (a different shape: Approve / Deny / Escalate). The CLI gate
 /// produces a different envelope (Allow / Deny / NeedApproval) — the
 /// turn-core type is for callbacks inside the runtime, this one is
@@ -5440,21 +5449,21 @@ mod tests {
         // npm test (and variants with flags) → still allowed
         assert!(test_rule.matches_with_context(
             "bash",
-            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+            &astra_turn_core::permission::types::RuleMatchContext::from_tool_args(
                 "bash",
                 &serde_json::json!({"command": "npm test"})
             )
         ));
         assert!(test_rule.matches_with_context(
             "bash",
-            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+            &astra_turn_core::permission::types::RuleMatchContext::from_tool_args(
                 "bash",
                 &serde_json::json!({"command": "npm test --verbose"})
             )
         ));
         assert!(test_rule.matches_with_context(
             "bash",
-            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+            &astra_turn_core::permission::types::RuleMatchContext::from_tool_args(
                 "bash",
                 &serde_json::json!({"command": "npm test -- --grep auth"})
             )
@@ -5464,7 +5473,7 @@ mod tests {
         assert!(
             !test_rule.matches_with_context(
                 "bash",
-                &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                &astra_turn_core::permission::types::RuleMatchContext::from_tool_args(
                     "bash",
                     &serde_json::json!({"command": "npm run deploy"})
                 )
@@ -5474,7 +5483,7 @@ mod tests {
         assert!(
             !test_rule.matches_with_context(
                 "bash",
-                &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                &astra_turn_core::permission::types::RuleMatchContext::from_tool_args(
                     "bash",
                     &serde_json::json!({"command": "npm run deploy:prod"})
                 )
@@ -5497,7 +5506,7 @@ mod tests {
         let commit_rule = PermissionRule::parse(&commit_rule_str);
         assert!(commit_rule.matches_with_context(
             "bash",
-            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+            &astra_turn_core::permission::types::RuleMatchContext::from_tool_args(
                 "bash",
                 &serde_json::json!({"command": "git commit -m 'fix'"})
             )
@@ -5505,7 +5514,7 @@ mod tests {
         assert!(
             !commit_rule.matches_with_context(
                 "bash",
-                &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                &astra_turn_core::permission::types::RuleMatchContext::from_tool_args(
                     "bash",
                     &serde_json::json!({"command": "git push --force origin main"})
                 )
@@ -5523,21 +5532,21 @@ mod tests {
         let parsed = PermissionRule::parse(&rule);
         assert!(parsed.matches_with_context(
             "write_file",
-            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+            &astra_turn_core::permission::types::RuleMatchContext::from_tool_args(
                 "write_file",
                 &args
             )
         ));
         assert!(parsed.matches_with_context(
             "str_replace",
-            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+            &astra_turn_core::permission::types::RuleMatchContext::from_tool_args(
                 "str_replace",
                 &args
             )
         ));
         assert!(!parsed.matches_with_context(
             "write_file",
-            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+            &astra_turn_core::permission::types::RuleMatchContext::from_tool_args(
                 "write_file",
                 &serde_json::json!({"path": "/tmp/foo-other"})
             )
@@ -5764,7 +5773,7 @@ mod tests {
         assert_eq!(reloaded.settings.deny, vec!["Bash(rm:*)"]);
         assert_eq!(
             reloaded.settings.grammar_version,
-            astra_turn_core::permission_rule_grammar::GRAMMAR_VERSION
+            astra_turn_core::permission::rule_grammar::GRAMMAR_VERSION
         );
     }
 

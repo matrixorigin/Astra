@@ -1,8 +1,7 @@
 use std::time::Instant;
 
-use astra_services::session_workspace::ContextTraceSignal;
-#[cfg(test)]
-use astra_services::session_workspace::{ContextTraceBudgetSignal, ContextTraceToolSelection};
+use astra_services::session_workspace::ContextTraceBudgetSignal;
+use astra_services::session_workspace::{ContextTraceSignal, ContextTraceToolSelection};
 use astra_text_utils::str_preview::truncate_str;
 use astra_tools::task_mgmt::SessionTask;
 
@@ -19,6 +18,17 @@ fn enqueue_ingestion(_state: &SessionState, _event: &session_journal::JournalEve
 /// Public wrapper for enqueue_ingestion — used by main.rs for session_end.
 pub(super) fn enqueue_ingestion_pub(state: &SessionState, event: &session_journal::JournalEvent) {
     enqueue_ingestion(state, event);
+}
+
+fn cache_pending_context_assembly_trace(state: &mut SessionState, trace_json: &serde_json::Value) {
+    match serde_json::from_value::<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>(
+        trace_json.clone(),
+    ) {
+        Ok(trace) => state.latest_context_assembly_trace = Some(trace),
+        Err(err) => {
+            astra_core::agent_warn!("context_trace", "failed to cache context trace: {err}")
+        }
+    }
 }
 
 /// Map a runtime stall event's `stall_type` string to the journal confidence.
@@ -601,11 +611,11 @@ fn maybe_checkpoint_lessons(state: &mut SessionState) {
         .as_ref()
         .and_then(|arc| arc.read().ok())
     {
-        Some(guard) => astra_runtime::lesson_extractor::summarise_from_runtime(
+        Some(guard) => astra_runtime::learning::extractor::summarise_from_runtime(
             &state.tool_health_entries,
             Some(&*guard),
         ),
-        None => astra_runtime::lesson_extractor::summarise_from_runtime(
+        None => astra_runtime::learning::extractor::summarise_from_runtime(
             &state.tool_health_entries,
             None,
         ),
@@ -627,10 +637,10 @@ fn maybe_checkpoint_lessons(state: &mut SessionState) {
     // Basic quality gate (hedging + length). Template blocklist NOT applied
     // here — these are deterministic template lessons, not LLM output.
     // Promoted to semantic T3 at session end via final checkpoint flush.
-    let memoria_lessons: Vec<astra_runtime::lesson_synthesizer::ExtractedLesson> = delta
+    let memoria_lessons: Vec<astra_runtime::learning::synthesizer::ExtractedLesson> = delta
         .into_iter()
-        .filter(|l| astra_runtime::lesson_synthesizer::is_high_quality_lesson(&l.action))
-        .map(|l| astra_runtime::lesson_synthesizer::ExtractedLesson {
+        .filter(|l| astra_runtime::learning::synthesizer::is_high_quality_lesson(&l.action))
+        .map(|l| astra_runtime::learning::synthesizer::ExtractedLesson {
             memory_type: "working",
             content: format!("💡 LESSON: {}", l.action),
             trust_tier: "T4",
@@ -650,7 +660,7 @@ fn maybe_checkpoint_lessons(state: &mut SessionState) {
 async fn filter_lessons_by_relevance(
     user_message: &str,
     lessons: Vec<astra_runtime::self_model::LessonHint>,
-    params: Option<&astra_runtime::memory_relevance::LlmConnParams>,
+    params: Option<&astra_runtime::memory_hooks::relevance::LlmConnParams>,
 ) -> Vec<astra_runtime::self_model::LessonHint> {
     let Some(params) = params else {
         return lessons;
@@ -658,7 +668,8 @@ async fn filter_lessons_by_relevance(
 
     let texts: Vec<String> = lessons.iter().map(|l| l.action.clone()).collect();
     let filtered =
-        astra_runtime::memory_relevance::filter_memories(&params, user_message, &texts).await;
+        astra_runtime::memory_hooks::relevance::filter_memories(&params, user_message, &texts)
+            .await;
 
     if filtered.len() == texts.len() {
         return lessons;
@@ -681,6 +692,8 @@ async fn maybe_load_memory_model_params(
     #[derive(serde::Deserialize)]
     struct MemoryModelWire {
         model_name: String,
+        #[serde(default)]
+        candidate_thinking_capabilities: Vec<Option<String>>,
     }
 
     if state.memory_model_params.is_some() {
@@ -699,12 +712,22 @@ async fn maybe_load_memory_model_params(
     };
     match serde_json::from_str::<MemoryModelWire>(&body) {
         Ok(response) => {
-            state.memory_model_params = Some(astra_runtime::memory_relevance::LlmConnParams {
-                base_url: format!("{}/v1", ctx.api.api_origin()),
-                api_key: token.to_string(),
-                model_name: response.model_name,
-                provider: "openai".to_string(),
-            });
+            state.memory_model_params =
+                Some(astra_runtime::memory_hooks::relevance::LlmConnParams {
+                    base_url: format!("{}/v1", ctx.api.api_origin()),
+                    api_key: token.to_string(),
+                    model_name: response.model_name,
+                    wire_model_name: None,
+                    provider: "openai".to_string(),
+                    request_body_overrides: None,
+                    thinking_capability: response
+                        .candidate_thinking_capabilities
+                        .into_iter()
+                        .next()
+                        .flatten()
+                        .as_deref()
+                        .and_then(|s| astra_services::models::ThinkingCapability::from_db(Some(s))),
+                });
         }
         Err(error) => {
             tracing::warn!("memory model decode failed: {error}");
@@ -1259,7 +1282,7 @@ async fn run_chat_turn(
         // future so partial text reaches the success/failure pipeline.
         //
         // Drain budget: 10s. Cancel handling at round boundaries is fast
-        // (25ms poll loop in agentic_loop_lifecycle.rs:434-462), but
+        // (25ms poll loop in runtime::turn::agentic_loop::lifecycle), but
         // try_write_heavy_checkpoint serialises full state to disk —
         // hundreds of KB on long sessions, several seeks under fsync
         // pressure. 10s leaves headroom without freezing the REPL.
@@ -1788,6 +1811,9 @@ fn commit_turn_journal_workspace_and_sidecars(
 ) {
     // Capture stall flag before entering the journal borrow scope.
     let has_stalls = !result.stall_events.is_empty();
+    if let Some((_internal_turn, trace_json)) = &result.pending_context_assembly_trace {
+        cache_pending_context_assembly_trace(state, trace_json);
+    }
 
     if let Some(journal) = state.journal.as_ref() {
         // Flush turn observability events (llm_round, tool timing) before the turn summary.
@@ -1896,7 +1922,12 @@ fn commit_turn_journal_workspace_and_sidecars(
         if let Some(sid) = state.session_id.as_deref()
             && let Ok(mut ws) = astra_services::session_workspace::read_workspace(sid)
         {
-            ws.record_turn(result.prompt_tokens, result.completion_tokens);
+            ws.record_turn(
+                result.prompt_tokens,
+                result.completion_tokens,
+                result.cache_read_tokens,
+                result.cache_creation_tokens,
+            );
 
             // Persist plan state to workspace for session resume
             sync_plan_fields_to_workspace(state, &mut ws);
@@ -3205,7 +3236,7 @@ fn initialize_journal(state: &mut SessionState, session_id: &str) {
     // This enables TurnTraceCollector creation in the agentic loop.
     if state.observability_session.is_none() {
         state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(
-            astra_runtime::observability_integration::ObservabilitySession::new_simple(session_id),
+            astra_runtime::observability::ObservabilitySession::new_simple(session_id),
         )));
         apply_pending_adaptive_state(state);
     }
@@ -3588,10 +3619,92 @@ pub(super) fn apply_pending_adaptive_state(state: &mut SessionState) {
     }
 }
 
+fn context_trace_signal_from_trace(
+    trace: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace,
+) -> ContextTraceSignal {
+    let tool_selection = (!trace.tools.selection_strategy.is_empty()
+        || !trace.tools.tools_selected.is_empty()
+        || trace.tools.tools_available > 0)
+        .then(|| ContextTraceToolSelection {
+            tools_available: trace.tools.tools_available,
+            selected_tools: trace
+                .tools
+                .tools_selected
+                .iter()
+                .map(|tool| tool.tool_name.clone())
+                .collect(),
+            selection_scope: "latest_round".to_string(),
+            rejected_tools: trace.tools.tools_rejected.len(),
+            strategy: trace.tools.selection_strategy.clone(),
+            confidence: trace.tools.selection_confidence,
+            latency_ms: trace.tools.selection_latency_ms,
+        });
+    let memory = (!trace.memory.query.trim().is_empty()
+        || !trace.memory.memories_selected.is_empty()
+        || trace.memory.candidates_considered > 0)
+        .then(
+            || astra_services::session_workspace::ContextTraceMemorySignal {
+                query: trace.memory.query.trim().chars().take(160).collect(),
+                candidates_considered: trace.memory.candidates_considered,
+                selected_memory_ids: trace
+                    .memory
+                    .memories_selected
+                    .iter()
+                    .map(|memory| memory.memory_id.clone())
+                    .collect(),
+                total_tokens: trace.memory.total_tokens,
+                latency_ms: trace.memory.retrieval_latency_ms,
+            },
+        );
+    let history = (trace.history.total_turns_available > 0
+        || !trace.history.turns_retained.is_empty()
+        || !trace.history.turns_compressed.is_empty()
+        || !trace.history.turns_dropped.is_empty())
+    .then_some(
+        astra_services::session_workspace::ContextTraceHistorySignal {
+            total_turns_available: trace.history.total_turns_available,
+            retained_turns: trace.history.turns_retained.len(),
+            compressed_turns: trace.history.turns_compressed.len(),
+            dropped_turns: trace.history.turns_dropped.len(),
+            compression_ratio: trace.history.compression_ratio,
+            tokens_before: trace.history.tokens_before,
+            tokens_after: trace.history.tokens_after,
+        },
+    );
+    let budget = (trace.token_budget.max_tokens > 0 || trace.token_budget.total_used > 0)
+        .then_some(ContextTraceBudgetSignal {
+            max_tokens: trace.token_budget.max_tokens,
+            total_used: trace.token_budget.total_used,
+            budget_pressure: trace.token_budget.budget_pressure,
+            compression_triggered: trace.token_budget.compression_triggered,
+        });
+
+    ContextTraceSignal {
+        turn_id: trace.turn_id.clone(),
+        captured_at: Some(chrono::DateTime::<chrono::Utc>::from(trace.timestamp).to_rfc3339()),
+        tool_selection,
+        memory,
+        history,
+        budget,
+        timing: None,
+        explanations: trace
+            .explanations
+            .iter()
+            .filter_map(|explanation| {
+                let trimmed = explanation.reasoning.trim();
+                (!trimmed.is_empty()).then(|| trimmed.chars().take(200).collect::<String>())
+            })
+            .collect(),
+    }
+}
+
 fn latest_context_trace_signal(state: &SessionState) -> Option<ContextTraceSignal> {
+    if let Some(trace) = state.latest_context_assembly_trace.as_ref() {
+        return Some(context_trace_signal_from_trace(trace));
+    }
     let obs = state.observability_session.as_ref()?;
     let guard = obs.read().ok()?;
-    astra_runtime::observability_integration::latest_context_trace_signal(&guard)
+    astra_runtime::observability::latest_context_trace_signal(&guard)
 }
 
 fn sync_context_trace_to_workspace(
@@ -3881,11 +3994,9 @@ mod tests {
 
     fn poisoned_observability_session(
         session_id: &str,
-    ) -> std::sync::Arc<
-        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-    > {
+    ) -> std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>> {
         let session = std::sync::Arc::new(std::sync::RwLock::new(
-            astra_runtime::observability_integration::ObservabilitySession::new_simple(session_id),
+            astra_runtime::observability::ObservabilitySession::new_simple(session_id),
         ));
         let poisoned = session.clone();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3938,7 +4049,7 @@ mod tests {
         // (which triggers a model retry) and NOT to is_auth_error (which would
         // wrongly send the user to /login).
         // Upstream emit sites:
-        //   - rust/crates/runtime/src/turn/llm_client.rs (~L2485): the literal
+        //   - rust/crates/runtime/src/turn/llm/client.rs (~L2485): the literal
         //     "LLM provider authentication failed" classified-error message.
         //   - "[auth] LLM provider" prefix used by upstream agent_warn! emits.
         let provider_msg = "LLM provider authentication failed";
@@ -4178,8 +4289,7 @@ mod tests {
     #[test]
     fn sync_context_trace_copies_latest_trace_into_workspace() {
         let mut state = SessionState::default();
-        let mut obs =
-            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-trace");
+        let mut obs = astra_runtime::observability::ObservabilitySession::new_simple("sid-trace");
         obs.context_traces
             .push(astra_turn_core::context_assembly_trace::ContextAssemblyTrace {
                 turn_id: "turn-3".into(),
@@ -4634,10 +4744,16 @@ mod tests {
 
     #[test]
     fn build_effective_line_skill_dev_picks_up_external_edits() {
+        const OLD_BODY: &str = "skill body version one";
+        const NEW_BODY: &str = "skill body version two rewritten";
         let tmp = tempfile::tempdir().unwrap();
         let skill_dir = tmp.path().join("evolving");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: evolving\n---\nV1").unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: evolving\n---\n{OLD_BODY}"),
+        )
+        .unwrap();
 
         let state = SessionState {
             skill_dev: Some(super::super::SkillDevState {
@@ -4648,19 +4764,22 @@ mod tests {
         };
 
         let turn1 = build_effective_line("check", &state, &mut crate::ui_adapter::LineUiAdapter);
-        assert!(turn1.contains("V1"));
+        assert!(turn1.contains(OLD_BODY));
 
         // Simulate external edit between turns
         std::fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: evolving\n---\nV2 rewritten",
+            format!("---\nname: evolving\n---\n{NEW_BODY}"),
         )
         .unwrap();
 
         let turn2 =
             build_effective_line("check again", &state, &mut crate::ui_adapter::LineUiAdapter);
-        assert!(!turn2.contains("V1"), "should not contain old content");
-        assert!(turn2.contains("V2 rewritten"), "should contain new content");
+        assert!(
+            !turn2.contains(OLD_BODY),
+            "should not contain old skill body"
+        );
+        assert!(turn2.contains(NEW_BODY), "should contain new content");
     }
 
     #[test]
@@ -5772,19 +5891,27 @@ mod tests {
             "finish_reason": "tool_calls",
         }));
         result.turn_observability_events = vec![llm_round];
-        result.pending_context_assembly_trace = Some((
-            99,
-            serde_json::json!({
-                "turn_id": "turn-99",
-                "tools": {
-                    "tools_selected": [
-                        {"tool_name": "git_diff"},
-                        {"tool_name": "read_file"}
-                    ]
-                },
-                "token_budget": {"total_used": 12_345}
-            }),
-        ));
+        let mut trace = astra_turn_core::context_assembly_trace::ContextAssemblyTrace {
+            turn_id: "turn-99".into(),
+            session_id: sid.clone(),
+            ..Default::default()
+        };
+        trace.tools.tools_selected = vec![
+            astra_turn_core::context_assembly_trace::ToolSelected {
+                tool_name: "git_diff".into(),
+                score: 0.0,
+                tokens: 0,
+                selection_factors: Vec::new(),
+            },
+            astra_turn_core::context_assembly_trace::ToolSelected {
+                tool_name: "read_file".into(),
+                score: 0.0,
+                tokens: 0,
+                selection_factors: Vec::new(),
+            },
+        ];
+        trace.token_budget.total_used = 12_345;
+        result.pending_context_assembly_trace = Some((99, trace.to_json_value()));
 
         let learning = analyze_chat_turn_learning("continue", state.turn, &[], &result);
         commit_turn_journal_workspace_and_sidecars(
@@ -5838,6 +5965,12 @@ mod tests {
             assembly_event.metadata.as_ref().unwrap()["total_tokens"],
             12_345
         );
+        let cached_trace = state
+            .latest_context_assembly_trace
+            .as_ref()
+            .expect("cached context trace");
+        assert_eq!(cached_trace.turn_id, "turn-99");
+        assert_eq!(cached_trace.token_budget.total_used, 12_345);
     }
 
     #[test]
@@ -7319,9 +7452,7 @@ mod tests {
         // state.latest_skill_diagnosis for the next turn.
         let mut state = SessionState::default();
         let session = std::sync::Arc::new(std::sync::RwLock::new(
-            astra_runtime::observability_integration::ObservabilitySession::new_simple(
-                "p8-turn-end",
-            ),
+            astra_runtime::observability::ObservabilitySession::new_simple("p8-turn-end"),
         ));
         {
             let mut g = session.write().unwrap();
@@ -7353,9 +7484,7 @@ mod tests {
         // the cooldown state would be lost.
         let mut state = SessionState::default();
         let session = std::sync::Arc::new(std::sync::RwLock::new(
-            astra_runtime::observability_integration::ObservabilitySession::new_simple(
-                "p8-cooldown",
-            ),
+            astra_runtime::observability::ObservabilitySession::new_simple("p8-cooldown"),
         ));
         {
             let mut g = session.write().unwrap();
@@ -7390,9 +7519,7 @@ mod tests {
         // staying flat (criterion "session_stalls_delta <= 0" satisfied).
         let mut state = SessionState::default();
         let session = std::sync::Arc::new(std::sync::RwLock::new(
-            astra_runtime::observability_integration::ObservabilitySession::new_simple(
-                "r1-tracker",
-            ),
+            astra_runtime::observability::ObservabilitySession::new_simple("r1-tracker"),
         ));
         {
             let mut g = session.write().unwrap();

@@ -138,10 +138,18 @@ async fn memory_proxy_call(
             );
             if error.contains("not configured") {
                 error_response(StatusCode::SERVICE_UNAVAILABLE, &error)
+            } else if let Some(status) = parse_memoria_forward_status(&error) {
+                error_response(status, &error)
             } else {
                 internal_error(&error)
             }
         })
+}
+
+fn parse_memoria_forward_status(error: &str) -> Option<StatusCode> {
+    let suffix = error.strip_prefix("Memoria error ")?;
+    let code = suffix.split_whitespace().next()?.parse::<u16>().ok()?;
+    StatusCode::from_u16(code).ok()
 }
 
 fn should_inject_memory_proxy_identity(endpoint: &str) -> bool {
@@ -569,8 +577,9 @@ pub(super) async fn memoria_proxy_consolidate_handler(
 mod tests {
     use super::{
         apply_memoria_management_identity, apply_memory_proxy_identity,
-        should_inject_memory_proxy_identity,
+        parse_memoria_forward_status, should_inject_memory_proxy_identity,
     };
+    use axum::http::StatusCode;
     use serde_json::json;
 
     #[test]
@@ -620,5 +629,20 @@ mod tests {
         assert_eq!(out["user_id"].as_str(), Some("real-user"));
         assert!(out.get("session_id").is_none());
         assert_eq!(out["name"].as_str(), Some("snap-1"));
+    }
+
+    #[test]
+    fn parse_memoria_forward_status_extracts_downstream_http_code() {
+        assert_eq!(
+            parse_memoria_forward_status(
+                "Memoria error 422 Unprocessable Entity: Invalid memory type: session_memory"
+            ),
+            Some(StatusCode::UNPROCESSABLE_ENTITY)
+        );
+        assert_eq!(
+            parse_memoria_forward_status("Memoria error 500 Internal Server Error: boom"),
+            Some(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert_eq!(parse_memoria_forward_status("random error"), None);
     }
 }

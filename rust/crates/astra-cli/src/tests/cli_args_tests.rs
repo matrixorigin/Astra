@@ -293,6 +293,45 @@ fn cli_chat_auto_approve() {
 }
 
 #[test]
+fn cli_chat_explain_flag_defaults_to_on() {
+    let cli = Cli::try_parse_from(["astra", "chat", "--explain"]).unwrap();
+    match cli.command {
+        Some(Command::Chat(ref args)) => {
+            assert_eq!(args.explain, Some(ExplainMode::On));
+        }
+        _ => panic!("expected Chat command"),
+    }
+}
+
+#[test]
+fn cli_chat_explain_flag_accepts_verbose_mode() {
+    let cli = Cli::try_parse_from(["astra", "chat", "--explain", "verbose"]).unwrap();
+    match cli.command {
+        Some(Command::Chat(ref args)) => {
+            assert_eq!(args.explain, Some(ExplainMode::Verbose));
+        }
+        _ => panic!("expected Chat command"),
+    }
+}
+
+#[test]
+fn cli_chat_explain_flag_accepts_explicit_off() {
+    let cli = Cli::try_parse_from(["astra", "chat", "--explain", "off"]).unwrap();
+    match cli.command {
+        Some(Command::Chat(ref args)) => {
+            assert_eq!(args.explain, Some(ExplainMode::Off));
+        }
+        _ => panic!("expected Chat command"),
+    }
+}
+
+#[test]
+fn cli_chat_explain_flag_rejects_invalid_mode() {
+    let result = Cli::try_parse_from(["astra", "chat", "--explain", "laser"]);
+    assert!(result.is_err(), "invalid explain mode should be rejected");
+}
+
+#[test]
 fn cli_chat_permission_mode() {
     let cli = Cli::try_parse_from(["astra", "chat", "--permission-mode", "auto"]).unwrap();
     match cli.command {

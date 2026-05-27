@@ -7,8 +7,8 @@
 //!   1. The 4-breakpoint Anthropic budget is respected across
 //!      system + tools + messages combined.
 //!   2. Long message histories still fit the budget — message-level markers
-//!      are capped at the rolling-scheme's 2 (historical + tail), leaving
-//!      room for system + tools.
+//!      stay capped at Claude Code's single-tail breakpoint, leaving room
+//!      for system + tools.
 //!   3. Model change within the anthropic family does not churn the
 //!      cacheable prefix (same tools + same provider family → same hash,
 //!      and model id is observable in the captured request).
@@ -23,7 +23,7 @@
 use std::sync::{Arc, Mutex};
 
 use astra_runtime::server::server_loop_host::{CapturedLlmRequest, ServerAgenticLoopHostBuilder};
-use astra_runtime::turn::agentic_loop_host::make_test_loop_state;
+use astra_runtime::turn::agentic_loop::host::make_test_loop_state;
 use astra_runtime::{FernetTokenEncryptor, MatrixOneSettings};
 use serde_json::{Value, json};
 
@@ -129,18 +129,12 @@ async fn anthropic_total_cache_breakpoints_respect_four_budget() {
 
 // ── J-2: long message history still fits the budget ─────────────────────────
 //
-// Earlier versions capped at ≤1 breakpoint. The rolling scheme from
-// `14410ade fix(cache): rolling 2-breakpoint for message history prefix reuse`
-// emits TWO: one on the message just before the penultimate user (the
-// "historical" anchor, stable across turns) and one on the message just
-// before the last user (the "tail" anchor). The cross-round invariant is
-// that today's tail-index equals tomorrow's historical-index, and that's
-// what makes Anthropic's prefix cache hit through the conversation
-// history. 2 markers is the CORRECT answer, and Anthropic's 4-marker
-// budget accommodates it.
+// Claude Code semantics keep exactly one message-level breakpoint per
+// Anthropic/Bedrock request regardless of history length. Long histories
+// must not accidentally reintroduce a second "historical" marker.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
-async fn long_message_history_emits_rolling_two_breakpoints() {
+async fn long_message_history_emits_single_message_breakpoint() {
     unsafe { std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED") };
     let capture = Arc::new(Mutex::new(Vec::new()));
     let mut host = build_host_with_tools(
@@ -168,11 +162,9 @@ async fn long_message_history_emits_rolling_two_breakpoints() {
     let g = capture.lock().unwrap();
     let c = &g[0];
     let msg_bps: usize = c.messages.iter().map(count_cache_control).sum();
-    // 2 breakpoints is the correct rolling-scheme output; must never exceed
-    // Anthropic's 4-marker total budget (leaving room for tools + system).
-    assert!(
-        (1..=2).contains(&msg_bps),
-        "rolling scheme emits 1 or 2 message breakpoints, got {msg_bps}"
+    assert_eq!(
+        msg_bps, 1,
+        "Claude Code semantics require exactly one message breakpoint, got {msg_bps}"
     );
 }
 

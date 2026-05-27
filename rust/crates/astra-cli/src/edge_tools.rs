@@ -86,6 +86,7 @@ pub fn cli_default_capabilities(
         .with(Capability::GitHubAuth)
         .with(Capability::LSPServer)
         .with(Capability::SkillsCatalog)
+        .with(Capability::PlanLifecycle)
         .with_if(has_agent_spawner, Capability::AgentSpawner)
 }
 
@@ -603,8 +604,8 @@ pub struct ToolExecutor {
     /// (server mode, headless tests) — bash there runs through the
     /// legacy reader.
     pub(crate) bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
-    /// Optional agent spawning context for the `spawn_agent` tool.
-    pub spawn_context: Option<agent_spawning::SpawnAgentContext>,
+    /// Optional agent spawning context for `agent(action='spawn'|'get_result')`.
+    pub spawn_context: Option<agent_spawning::AgentActionContext>,
     /// Optional shared context cache for cross-agent knowledge sharing.
     /// Used by share_context and query_context tools.
     pub context_cache: Option<std::sync::Arc<astra_runtime::orchestration::SharedContextCache>>,
@@ -616,9 +617,7 @@ pub struct ToolExecutor {
     /// Provides access to per-turn context assembly traces, timing data,
     /// drift detection, and decision explanations.
     pub observability_session: Option<
-        std::sync::Arc<
-            std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-        >,
+        std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     >,
     /// Budget-adaptive introspection snapshot, updated each turn by the
     /// execution phase. The `introspect` tool reads this to return runtime
@@ -691,6 +690,11 @@ pub struct ToolExecutor {
     /// loop's borrow of `perm_manager`.
     pending_permission_mode_change:
         std::sync::Mutex<Option<crate::permission_manager::PermissionMode>>,
+    /// One-shot schema boost for the next agentic round. Used by
+    /// `exit_plan_mode` so the model immediately regains the core
+    /// edit tools (`bash` / `read_file` / `write_file` /
+    /// `str_replace`) after the user approves execution.
+    pending_round_tool_boost: std::sync::Mutex<Option<Vec<String>>>,
 }
 
 impl ToolExecutor {
@@ -784,6 +788,7 @@ impl ToolExecutor {
             ask_user_request_tx: std::sync::Mutex::new(None),
             plan_review_request_tx: std::sync::Mutex::new(None),
             pending_permission_mode_change: std::sync::Mutex::new(None),
+            pending_round_tool_boost: std::sync::Mutex::new(None),
         }
     }
 
@@ -819,8 +824,17 @@ impl ToolExecutor {
             .and_then(|mut g| g.take())
     }
 
+    /// Drain a one-shot list of tool names that should be force-injected into
+    /// the next agentic round's schema selection.
+    pub fn take_pending_round_tool_boost(&self) -> Option<Vec<String>> {
+        self.pending_round_tool_boost
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+    }
+
     /// Set the spawn context for agent spawning.
-    pub fn with_spawn_context(mut self, ctx: agent_spawning::SpawnAgentContext) -> Self {
+    pub fn with_spawn_context(mut self, ctx: agent_spawning::AgentActionContext) -> Self {
         self.spawn_context = Some(ctx);
         self
     }
@@ -871,7 +885,7 @@ impl ToolExecutor {
     pub fn with_observability_session(
         mut self,
         session: std::sync::Arc<
-            std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
+            std::sync::RwLock<astra_runtime::observability::ObservabilitySession>,
         >,
     ) -> Self {
         self.observability_session = Some(session);
@@ -919,13 +933,17 @@ impl ToolExecutor {
 
     pub fn set_active_session_id(&self, session_id: impl Into<String>) {
         let session_id = session_id.into();
-        if let Ok(ws) = astra_services::session_workspace::read_workspace(&session_id) {
-            if let Ok(mut pinned) = self.self_mod_pinned_tools.lock() {
-                *pinned = ws.pinned_tools.clone();
-            }
-            if let Ok(mut deprioritized) = self.self_mod_deprioritized_tools.lock() {
-                *deprioritized = ws.deprioritized_tools.clone();
-            }
+        let session_changed = self.active_session_id().as_deref() != Some(session_id.as_str());
+        let (pinned_tools, deprioritized_tools) =
+            match astra_services::session_workspace::read_workspace(&session_id) {
+                Ok(ws) => (ws.pinned_tools, ws.deprioritized_tools),
+                Err(_) => (Vec::new(), Vec::new()),
+            };
+        if let Ok(mut pinned) = self.self_mod_pinned_tools.lock() {
+            *pinned = pinned_tools;
+        }
+        if let Ok(mut deprioritized) = self.self_mod_deprioritized_tools.lock() {
+            *deprioritized = deprioritized_tools;
         }
         // File-edit checkpoint persistence: on session-id set, rebind the
         // journal to an auto-persist directory keyed by session.
@@ -984,6 +1002,23 @@ impl ToolExecutor {
                     }
                     journal.enable_persistence(dir);
                 }
+            }
+        }
+        if session_changed {
+            if let Ok(mut pending_mode) = self.pending_permission_mode_change.lock() {
+                *pending_mode = None;
+            }
+            if let Ok(mut pending_boost) = self.pending_round_tool_boost.lock() {
+                *pending_boost = None;
+            }
+            if let Ok(mut lessons) = self.session_lessons.lock() {
+                lessons.clear();
+            }
+            if let Ok(mut diag) = self.latest_skill_diagnosis.lock() {
+                *diag = None;
+            }
+            if let Ok(mut feedback) = self.latest_turn_quality_feedback.lock() {
+                *feedback = None;
             }
         }
         if let Ok(mut guard) = self.active_session_id.lock() {
@@ -1597,6 +1632,25 @@ impl ToolExecutor {
         }
     }
 
+    fn stage_pending_round_tool_boost(&self, tools: &[&str]) {
+        if let Ok(mut slot) = self.pending_round_tool_boost.lock() {
+            *slot = Some(tools.iter().map(|name| (*name).to_string()).collect());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_stage_pending_round_tool_boost_for_test(&self, tools: &[&str]) {
+        self.stage_pending_round_tool_boost(tools);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_stage_pending_permission_mode_change_for_test(
+        &self,
+        mode: crate::permission_manager::PermissionMode,
+    ) {
+        self.stage_pending_permission_mode_change(mode);
+    }
+
     async fn exit_plan_mode_remote(&self, args: &Value) -> String {
         // `exit_plan_mode` has two structurally different sources of
         // truth depending on how plan mode was entered:
@@ -1720,6 +1774,12 @@ impl ToolExecutor {
             self.set_plan_mode_authoring_cache_for_active_session(false)
                 .await;
             self.stage_pending_permission_mode_change(next_mode);
+            self.stage_pending_round_tool_boost(&[
+                "bash",
+                "read_file",
+                "write_file",
+                "str_replace",
+            ]);
             let mode_suffix = format!(" Next turn will run in {next_mode} mode.");
             format!(
                 "Exited plan mode. plan_id={resolved_plan_id} is approved; write tools unlocked.{mode_suffix}"
@@ -1762,6 +1822,12 @@ impl ToolExecutor {
             self.set_plan_mode_authoring_cache_for_active_session(false)
                 .await;
             self.stage_pending_permission_mode_change(next_mode);
+            self.stage_pending_round_tool_boost(&[
+                "bash",
+                "read_file",
+                "write_file",
+                "str_replace",
+            ]);
             let plan_suffix = match plan_markdown {
                 Some(plan) if !plan.is_empty() => {
                     format!(" Plan recorded:\n{plan}")
@@ -2001,7 +2067,7 @@ impl ToolExecutor {
             .unwrap_or_else(|| astra_text_utils::str_preview::truncate_line(&prompt, 60));
 
         let Some(ctx) = self.spawn_context.as_ref() else {
-            return "Error: background_agent requires agent spawning context; use the spawn_agent tool when available".to_string();
+            return "Error: background_agent requires agent spawning context; use `agent(action='spawn', ...)` when available".to_string();
         };
 
         let mut spawn_args = json!({
@@ -2017,7 +2083,7 @@ impl ToolExecutor {
             spawn_args["model"] = json!(model);
         }
 
-        agent_spawning::handle_spawn_agent_tool(&spawn_args, Some(ctx)).await
+        agent_spawning::handle_agent_spawn_action(&spawn_args, Some(ctx)).await
     }
 
     async fn task_output(&self, args: &Value) -> String {
@@ -2664,15 +2730,32 @@ impl ToolExecutor {
     fn render_session_memory_introspect(&self) -> String {
         use std::fmt::Write as _;
 
+        let surface_status = self
+            .active_session_id()
+            .filter(|sid| !sid.is_empty())
+            .map(|sid| {
+                let record = crate::slash_memory::load_local_session_memory(&sid);
+                crate::slash_memory::session_memory_surface_status(&sid, record.as_ref())
+            });
+        let surface_block = surface_status
+            .as_ref()
+            .map(crate::slash_memory::render_session_memory_surface_status)
+            .filter(|block| !block.trim().is_empty());
         let journal_fallback = self.render_session_memory_journal_fallback();
+        let journal_pipeline = self
+            .active_session_id()
+            .filter(|sid| !sid.is_empty())
+            .and_then(|sid| astra_services::session_journal::read_journal(&sid).ok())
+            .and_then(|events| Self::render_session_memory_pipeline_traces(&events));
         let Some(obs) = self.session_memory_observatory.as_ref() else {
-            return journal_fallback.unwrap_or_else(|| {
+            let body = journal_fallback.unwrap_or_else(|| {
                 "# session-memory observatory\n\n\
-                    No observatory attached to this runtime. This is expected \
-                    for offline CLI or legacy test modes; production servers \
-                    attach one so extractions + injections are traceable here."
+                     No observatory attached to this runtime. This is expected \
+                     for offline CLI or legacy test modes; production servers \
+                     attach one so extractions + injections are traceable here."
                     .to_string()
             });
+            return Self::prepend_session_memory_surface_status(surface_block.as_deref(), &body);
         };
 
         let ext = obs.extractions_snapshot();
@@ -2681,9 +2764,15 @@ impl ToolExecutor {
             && inj.is_empty()
             && let Some(fallback) = journal_fallback
         {
-            return fallback;
+            return Self::prepend_session_memory_surface_status(
+                surface_block.as_deref(),
+                &fallback,
+            );
         }
         let mut out = String::from("# session-memory observatory\n\n");
+        if let Some(block) = surface_block.as_deref() {
+            writeln!(out, "{block}\n").ok();
+        }
 
         writeln!(
             out,
@@ -2781,6 +2870,10 @@ impl ToolExecutor {
             if inj.len() > 4 {
                 writeln!(out, "… ({} older records elided)", inj.len() - 4).ok();
             }
+        }
+
+        if let Some(pipeline) = journal_pipeline {
+            writeln!(out, "\n{pipeline}").ok();
         }
 
         out
@@ -2891,24 +2984,39 @@ impl ToolExecutor {
                     .and_then(|m| m.get("reason"))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("-");
+                let source = meta
+                    .and_then(|m| m.get("source"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("-");
                 let model = meta
                     .and_then(|m| m.get("selector_model"))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("-");
+                let llm_reason = meta
+                    .and_then(|m| m.get("llm_reason"))
+                    .and_then(serde_json::Value::as_str);
+                let llm_detail = meta
+                    .and_then(|m| m.get("llm_detail"))
+                    .and_then(serde_json::Value::as_str);
                 let messages = meta
                     .and_then(|m| m.get("messages_count"))
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0);
-                writeln!(
-                    out,
-                    "- t{} {} reason={} model={} messages={}",
-                    event.turn.unwrap_or(0),
-                    outcome,
-                    reason,
-                    model,
-                    messages
-                )
-                .ok();
+                let mut line = format!("- t{} {}", event.turn.unwrap_or(0), outcome,);
+                if source != "-" {
+                    line.push_str(&format!(" source={source}"));
+                }
+                if reason != "-" {
+                    line.push_str(&format!(" reason={reason}"));
+                }
+                if let Some(llm_reason) = llm_reason {
+                    line.push_str(&format!(" llm_reason={llm_reason}"));
+                }
+                if let Some(llm_detail) = llm_detail {
+                    line.push_str(&format!(" llm_detail={llm_detail}"));
+                }
+                line.push_str(&format!(" model={model} messages={messages}"));
+                writeln!(out, "{line}").ok();
             }
             if extractions.len() > 8 {
                 writeln!(out, "… ({} older records elided)", extractions.len() - 8).ok();
@@ -2939,7 +3047,85 @@ impl ToolExecutor {
                 "\nnote: session_end is missing, so any shutdown-time session-memory flush did not run.\n",
             );
         }
+        if let Some(pipeline) = Self::render_session_memory_pipeline_traces(&events) {
+            writeln!(out, "\n{pipeline}").ok();
+        }
         Some(out)
+    }
+
+    fn render_session_memory_pipeline_traces(
+        events: &[astra_services::session_journal::JournalEvent],
+    ) -> Option<String> {
+        use std::fmt::Write as _;
+
+        let traces: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.event_type
+                    == astra_services::session_journal::JournalEventType::ContextAssemblyRecorded
+            })
+            .filter_map(Self::render_session_memory_pipeline_trace_line)
+            .collect();
+        if traces.is_empty() {
+            return None;
+        }
+
+        let mut out = String::from("## turn-pipeline session memory (newest last)\n");
+        let tail = traces.iter().rev().take(6).collect::<Vec<_>>();
+        for line in tail.into_iter().rev() {
+            writeln!(out, "{line}").ok();
+        }
+        if traces.len() > 6 {
+            writeln!(out, "… ({} older records elided)", traces.len() - 6).ok();
+        }
+        Some(out)
+    }
+
+    fn render_session_memory_pipeline_trace_line(
+        event: &astra_services::session_journal::JournalEvent,
+    ) -> Option<String> {
+        let trace = event.context_assembly_trace.as_ref()?;
+        let system_prompt = trace.get("system_prompt")?;
+        let session_memory = system_prompt.get("session_memory_injected");
+        let selected = trace
+            .get("memory")
+            .and_then(|memory| memory.get("memories_selected"))
+            .and_then(serde_json::Value::as_array)
+            .map(|entries| entries.len())
+            .unwrap_or(0);
+        let turn = event.turn.unwrap_or(0);
+
+        let Some(session_memory) = session_memory.filter(|value| !value.is_null()) else {
+            return Some(format!(
+                "- t{turn} session_memory=absent retrieved_memories={selected}"
+            ));
+        };
+
+        let source = session_memory
+            .get("memory_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        let tokens = session_memory
+            .get("tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let preview = session_memory
+            .get("content_preview")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .replace('\n', " ⏎ ");
+        let preview: String = preview.chars().take(80).collect();
+
+        Some(format!(
+            "- t{turn} session_memory=present source={source} tokens={tokens} retrieved_memories={selected} preview=\"{preview}\""
+        ))
+    }
+
+    fn prepend_session_memory_surface_status(surface_block: Option<&str>, body: &str) -> String {
+        match surface_block.filter(|block| !block.trim().is_empty()) {
+            Some(block) => format!("{block}\n\n{body}"),
+            None => body.to_string(),
+        }
     }
 
     /// `introspect(subtopic="cache")` — scan recent `llm_capture_*.json`
@@ -3321,7 +3507,7 @@ impl ToolExecutor {
                         .and_then(Value::as_str)
                         .unwrap_or("status");
                     match action {
-                        "status" => git_gix::git_status(&self.project_root),
+                        "status" => git_gix::git_status(&self.project_root, args),
                         "diff" => git_gix::git_diff(
                             &self.project_root,
                             args,
@@ -3346,12 +3532,13 @@ impl ToolExecutor {
                         "stash" => self.git_stash(args),
                         "checkout_file" => self.git_checkout_file(args),
                         "worktree" => self.git_worktree(args),
+                        "push" => git_gix::git_push(&self.project_root, args),
                         _ => format!(
-                            "Error: unknown git action '{action}'. Use one of: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree"
+                            "Error: unknown git action '{action}'. Use one of: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree, push"
                         ),
                     }
                 }
-                "git_status" => git_gix::git_status(&self.project_root),
+                "git_status" => git_gix::git_status(&self.project_root, args),
                 "git_diff" => git_gix::git_diff(
                     &self.project_root,
                     args,
@@ -3534,14 +3721,14 @@ impl ToolExecutor {
                             }
                         }
                         "spawn" => {
-                            agent_spawning::handle_spawn_agent_tool(
+                            agent_spawning::handle_agent_spawn_action(
                                 args,
                                 self.spawn_context.as_ref(),
                             )
                             .await
                         }
                         "get_result" => {
-                            agent_spawning::handle_get_agent_result_tool(
+                            agent_spawning::handle_agent_get_result_action(
                                 args,
                                 self.spawn_context.as_ref(),
                             )
@@ -3684,7 +3871,7 @@ impl ToolExecutor {
                 }
                 "share_context" => self.share_context(args),
                 "query_context" => self.query_context(args),
-                astra_runtime::turn::agentic_loop_host::DELEGATE_TOOL_NAME => {
+                astra_runtime::turn::agentic_loop::host::DELEGATE_TOOL_NAME => {
                     "Delegation request acknowledged. The delegation engine will execute \
                 this request and provide results in the next round."
                         .to_string()
@@ -4501,8 +4688,8 @@ mod tests {
             "bare executor must report AgentSpawner inactive; got {out}"
         );
         assert!(
-            inactive.contains(&"PlanLifecycle"),
-            "PlanLifecycle is server-owned on the CLI; got {out}"
+            !inactive.contains(&"PlanLifecycle"),
+            "local CLI exposes client-backed plan lifecycle wrappers, so PlanLifecycle must stay active; got {out}"
         );
 
         let dropped = parsed["tools_dropped_by_capability"]
@@ -5318,6 +5505,8 @@ mod tests {
             selector_model: Some("haiku".to_string()),
             attempt: Some(1),
             llm_reason: None,
+            llm_detail: None,
+            persist_detail: None,
         };
         writer
             .append(&astra_services::session_journal::JournalEvent::session_memory_extraction(
@@ -5347,6 +5536,89 @@ mod tests {
         assert!(out.contains("errored reason=llm_error"), "{out}");
         assert!(
             out.contains("last_turn_error: t2 [cancelled] user_interrupted"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn introspect_session_memory_journal_shows_fallback_recovery_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = "sess-introspect-fallback";
+        let writer = astra_services::session_journal::JournalWriter::new(session_id).unwrap();
+        let breadcrumbs = astra_services::session_journal::SessionMemoryExtractionBreadcrumbs {
+            messages_count: Some(7),
+            selector_model: Some("haiku".to_string()),
+            attempt: Some(1),
+            llm_reason: Some(
+                astra_services::session_journal::SessionMemoryExtractionErrorReason::LlmError,
+            ),
+            llm_detail: Some("http 502: upstream model gateway timed out".to_string()),
+            persist_detail: None,
+        };
+        writer
+            .append(&astra_services::session_journal::JournalEvent::session_memory_extraction(
+                Some(session_id),
+                3,
+                180,
+                astra_services::session_journal::SessionMemoryExtractionOutcome::Extracted {
+                    source: astra_services::session_journal::SessionMemoryExtractionSource::RuleFallback,
+                    bytes_written: 42,
+                },
+                &breadcrumbs,
+            ))
+            .unwrap();
+
+        let executor = test_executor().with_active_session_id(session_id);
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        assert!(out.contains("extracted source=rule_fallback"), "{out}");
+        assert!(out.contains("llm_reason=llm_error"), "{out}");
+        assert!(
+            out.contains("llm_detail=http 502: upstream model gateway timed out"),
+            "{out}"
+        );
+        assert!(out.contains("model=haiku"), "{out}");
+    }
+
+    #[test]
+    fn introspect_session_memory_journal_surfaces_turn_pipeline_injection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = "sess-introspect-pipeline";
+        let writer = astra_services::session_journal::JournalWriter::new(session_id).unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::context_assembly_recorded(
+                    Some(session_id),
+                    4,
+                    serde_json::json!({
+                        "system_prompt": {
+                            "session_memory_injected": {
+                                "memory_id": "session-memory",
+                                "memory_type": "session_memory_llm",
+                                "tokens": 27,
+                                "relevance_score": 1.0,
+                                "content_preview": "Session memory injected into current turn"
+                            }
+                        },
+                        "memory": {
+                            "memories_selected": [
+                                {"memory_id": "old-1"},
+                                {"memory_id": "old-2"}
+                            ]
+                        }
+                    }),
+                ),
+            )
+            .unwrap();
+
+        let executor = test_executor().with_active_session_id(session_id);
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        assert!(out.contains("## turn-pipeline session memory"), "{out}");
+        assert!(
+            out.contains(
+                "t4 session_memory=present source=session_memory_llm tokens=27 retrieved_memories=2"
+            ),
             "{out}"
         );
     }

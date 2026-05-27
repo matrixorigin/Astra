@@ -2,7 +2,7 @@ pub use astra_turn_core::turn_trace_collector::*;
 
 #[cfg(test)]
 mod tests {
-    use crate::observability_integration::{ObservabilityHub, on_context_assembled};
+    use crate::observability::{ObservabilityHub, on_context_assembled};
     use astra_turn_core::turn_trace_collector::TurnTraceCollector;
 
     #[test]

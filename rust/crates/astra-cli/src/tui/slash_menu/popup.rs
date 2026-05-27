@@ -608,6 +608,7 @@ mod tests {
             name: "/memory",
             description: "Memory operations",
             subcommands: SUBS,
+            extra_subcommands: Vec::new(),
             aliases: &[],
             usage_boost: 0,
             group: Some(CommandGroup::MemoryTasks),

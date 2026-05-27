@@ -38,7 +38,8 @@ fn emergent_context_restored_into_session() {
     let restored: astra_turn_core::pipeline_session::PipelineSessionSnapshot =
         serde_json::from_value(json).unwrap();
 
-    let sess2 = PipelineSession::from_snapshot(PipelineConfig::default(), restored);
+    let sess2 =
+        PipelineSession::from_snapshot(PipelineConfig::default(), restored, sess.current_date());
     assert!(!sess2.emergent.is_empty());
     assert_eq!(
         sess2.emergent.discovered_skills[0].value.skill_name,

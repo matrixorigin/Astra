@@ -385,7 +385,7 @@ const TOOL_STUB_DEFS: &[ToolStubDef] = &[
     ToolStubDef {
         name: "bash",
         signature: "command, timeout=None",
-        docstring: "Run a shell command (subject to shell hardening). Returns {output, exit_code}.",
+        docstring: "Run a shell command (subject to shell hardening). Returns the tool's text output; failures raise RuntimeError.",
         args_expr: r#"{"command": command, "timeout": timeout}"#,
     },
 ];
@@ -479,7 +479,7 @@ _AUTH_TOKEN = os.environ["ASTRA_RPC_AUTH_TOKEN"]
 
 
 def _call(tool_name, args):
-    """Send an RPC request to the agent and return the result.
+    """Send an RPC request to the agent and return plain text output.
 
     Uses a fresh socket per call so disconnection mid-request does not
     corrupt a shared connection. The try/finally guarantees the socket
@@ -510,7 +510,8 @@ def _call(tool_name, args):
     result = json.loads(raw)
     if result.get("error"):
         raise RuntimeError(result["error"])
-    return result["output"]
+    output = result.get("output")
+    return "" if output is None else str(output)
 
 "#,
     );
@@ -628,7 +629,9 @@ pub fn build_run_script_schema(
         format!(
             "Python code to execute. Import tools with \
              `from astra_tools import {example}, ...` and print your \
-             final result to stdout."
+             final result to stdout. Tool functions are synchronous — call \
+             them directly (no `await`). They return text output and raise \
+             `RuntimeError` on tool failure."
         )
     };
 
@@ -638,8 +641,9 @@ pub fn build_run_script_schema(
          need to filter/reduce large outputs before they enter context, \
          need conditional branching, or need to loop.\n\n\
          {available_block}\n\n\
-         Tool calls are async: `result = await tool_name(param=value)`. \
-         Each call returns a dict with the tool's output fields.\n\n\
+         Tool bindings are synchronous Python functions: \
+         `output = tool_name(param=value)` (no `await`). They return text \
+         output and raise `RuntimeError` on failure.\n\n\
          Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script.\n\n\
          {mode_note}\n\n\
          Also available (built-in, no import needed):\n  \
@@ -1262,6 +1266,10 @@ mod tests {
                     let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
                     ToolResult::text(format!("match: {pattern}"))
                 }
+                "bash" => {
+                    let command = args.get("command").and_then(Value::as_str).unwrap_or("");
+                    ToolResult::text(format!("ran: {command}"))
+                }
                 _ => ToolResult::error(format!("Unknown tool: {name}")),
             }
         }
@@ -1807,6 +1815,35 @@ mod tests {
         assert!(stub.contains("socket.AF_UNIX"));
         assert!(stub.contains("sock.connect("));
         assert!(stub.contains("sock.shutdown("));
+    }
+
+    #[test]
+    fn stub_returns_plain_text_output() {
+        let enabled: HashSet<String> = ["bash"].iter().map(|s| s.to_string()).collect();
+        let stub = generate_python_stub(&enabled);
+        assert!(!stub.contains("class ToolOutput("));
+        // Use an explicit None check so falsy non-None outputs (0, False,
+        // empty list/string) are preserved as their str() form instead of
+        // collapsing to "".
+        assert!(stub.contains("output = result.get(\"output\")"));
+        assert!(stub.contains("return \"\" if output is None else str(output)"));
+    }
+
+    #[test]
+    fn schema_describes_sync_text_contract() {
+        let enabled: HashSet<String> = ["bash"].iter().map(|s| s.to_string()).collect();
+        let schema =
+            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        let desc = schema["function"]["description"].as_str().unwrap();
+        let script_desc = schema["function"]["parameters"]["properties"]["script"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(desc.contains("synchronous Python functions"), "{desc}");
+        assert!(desc.contains("no `await`"), "{desc}");
+        assert!(desc.contains("return text output"), "{desc}");
+        assert!(!desc.contains("Each call returns a dict"), "{desc}");
+        assert!(script_desc.contains("synchronous"), "{script_desc}");
+        assert!(script_desc.contains("no `await`"), "{script_desc}");
     }
 
     // R4.8: tool name in `_call("name", ...)` is JSON-encoded (double-quoted)
@@ -2375,6 +2412,29 @@ raise ValueError("boom")
             "expected empty-output notice, got: {}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(feature = "python_tests"), ignore)]
+    async fn live_bash_returns_plain_text_string() {
+        if !python3_available() {
+            return;
+        }
+        let exec = MockToolExecutor::new();
+        let config = RunScriptConfig {
+            timeout: Duration::from_secs(10),
+            mode: ExecutionMode::Strict,
+            allowed_tools: ["bash"].iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let script = r#"
+from astra_tools import bash
+
+result = bash("echo compat")
+print(result, end="")
+"#;
+        let result = run_script(script, &config, &exec).await.unwrap();
+        assert_eq!(result, "ran: echo compat");
     }
 
     // T32: script that prints only to stderr and exits nonzero — stdout

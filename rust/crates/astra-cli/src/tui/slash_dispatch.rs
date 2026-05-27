@@ -5,6 +5,7 @@
 //! produce output render to scrollback. Unrecognized or complex commands
 //! fall back to `with_restored()` which temporarily exits the TUI.
 
+use crate::ExplainMode;
 use crate::command_registry;
 use crate::command_registry::TuiHandler;
 use crate::session_state::SessionState;
@@ -158,6 +159,8 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 }
             }
         }
+
+        "/mcp" => handle_mcp_dispatch(args, ctx).await,
 
         "/plan" => {
             let trimmed = args.trim();
@@ -337,7 +340,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 }
                 "trace" => {
                     use crate::tui::bottom_pane::info_view::InfoView;
-                    let lines = astra_turn_core::permission_audit::format_snapshot_lines(50);
+                    let lines = astra_turn_core::permission::audit::format_snapshot_lines(50);
                     ctx.bottom_pane
                         .push_view(Box::new(InfoView::from_plain("Permission Trace", lines)));
                     SlashResult::Handled
@@ -348,7 +351,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                         ctx.show_error("Missing export path".to_string());
                         return SlashResult::Handled;
                     }
-                    let lines = astra_turn_core::permission_audit::snapshot_redacted_jsonl_lines();
+                    let lines = astra_turn_core::permission::audit::snapshot_redacted_jsonl_lines();
                     let body = if lines.is_empty() {
                         String::new()
                     } else {
@@ -372,8 +375,22 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         }
 
         // ── State commands → with_restored (share full logic with non-TUI) ──
-        "/clear" | "/undo" | "/redo" | "/compact" | "/explain" | "/reflect" => {
-            SlashResult::Fallback
+        "/clear" | "/undo" | "/redo" | "/compact" | "/reflect" => SlashResult::Fallback,
+
+        // ── Explain ─────────────────────────────────────────────────
+        "/explain" => {
+            ctx.state.explain = match ctx.state.explain {
+                ExplainMode::Off => ExplainMode::On,
+                ExplainMode::On => ExplainMode::Verbose,
+                ExplainMode::Verbose => ExplainMode::Off,
+            };
+            let label = match ctx.state.explain {
+                ExplainMode::Off => "off",
+                ExplainMode::On => "on",
+                ExplainMode::Verbose => "verbose",
+            };
+            ctx.show_response(format!("Explain mode: {label}"));
+            SlashResult::Handled
         }
 
         // ── Inspect (TUI-native) ────────────────────────────────────
@@ -383,6 +400,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         //   `/inspect budget`         → token budget breakdown
         //   `/inspect tools`          → tool call dashboard
         //   `/inspect context`        → context window snapshot
+        //   `/inspect cache`          → per-round cache diagnosis
         //   `/inspect json`           → raw snapshot as JSON
         //   `/inspect diff`           → state diff vs start-of-session
         //   `/inspect history [N]`    → recent turn history
@@ -916,12 +934,72 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 return SlashResult::Handled;
             };
 
-            let (query, top_k) = match route {
-                MemoryCommandRoute::Search(query) => (query, 20),
-                MemoryCommandRoute::List => {
-                    ("user preferences knowledge plans tasks".to_string(), 20)
+            if args.trim() == "session" {
+                let Some(session_id) = ctx.state.session_id.as_deref() else {
+                    ctx.show_error("No active session yet.".into());
+                    return SlashResult::Handled;
+                };
+                match crate::slash_memory::load_current_session_memory(ctx.api, &token, session_id)
+                    .await
+                {
+                    Ok(record) => {
+                        let body = record
+                            .as_ref()
+                            .map(|memory| memory.body.as_str())
+                            .unwrap_or_default();
+                        let hint = if body.trim().is_empty() {
+                            crate::slash_memory::latest_session_memory_status_hint(session_id)
+                        } else {
+                            None
+                        };
+                        let summary = record.as_ref().and_then(|memory| memory.summary.as_deref());
+                        let status = crate::slash_memory::session_memory_surface_status(
+                            session_id,
+                            record.as_ref(),
+                        );
+                        ctx.show_response(crate::slash_memory::format_session_memory_response(
+                            summary,
+                            body,
+                            Some(session_id),
+                            hint.as_ref().map(|hint| hint.summary.as_str()),
+                            Some(&status),
+                        ));
+                    }
+                    Err(e) => ctx.show_error(format!("Session memory failed: {e}")),
                 }
-                MemoryCommandRoute::Inspect(_) => return SlashResult::Fallback,
+                return SlashResult::Handled;
+            }
+
+            if route == MemoryCommandRoute::Health {
+                use crate::tui::bottom_pane::info_view::InfoView;
+
+                match crate::edge_tools::memoria::memoria_health().await {
+                    Ok(body) => {
+                        let lines = crate::slash_memory::memory_health_lines(&body);
+                        ctx.bottom_pane.push_view(Box::new(
+                            InfoView::from_plain("Memory Health", lines)
+                                .with_reopen("/memory health"),
+                        ));
+                    }
+                    Err(e) => ctx.show_error(format!("Memory health failed: {e}")),
+                }
+                return SlashResult::Handled;
+            }
+
+            let (query, top_k, stats_view) = match route {
+                MemoryCommandRoute::Search(query) => (query, 20, false),
+                MemoryCommandRoute::List => (
+                    crate::slash_memory::MEMORY_BROWSE_QUERY.to_string(),
+                    crate::slash_memory::MEMORY_BROWSE_TOP_K,
+                    false,
+                ),
+                MemoryCommandRoute::Stats => (
+                    crate::slash_memory::MEMORY_BROWSE_QUERY.to_string(),
+                    crate::slash_memory::MEMORY_STATS_TOP_K,
+                    true,
+                ),
+                MemoryCommandRoute::Fallback => return SlashResult::Fallback,
+                MemoryCommandRoute::Health => unreachable!("handled above"),
             };
 
             let payload = serde_json::json!({
@@ -933,34 +1011,64 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     let body = r.text().await.unwrap_or_default();
                     match serde_json::from_str::<Vec<serde_json::Value>>(&body) {
                         Ok(arr) if !arr.is_empty() => {
+                            if stats_view {
+                                use crate::tui::bottom_pane::info_view::InfoView;
+
+                                let lines = crate::slash_memory::memory_stats_lines(&arr);
+                                ctx.bottom_pane.push_view(Box::new(
+                                    InfoView::from_plain("Memory Stats", lines)
+                                        .with_reopen("/memory stats"),
+                                ));
+                                return SlashResult::Handled;
+                            }
+                            let mut hidden_session_entries = 0usize;
                             let items: Vec<SelectionItem> = arr
                                 .iter()
-                                .map(|m| {
+                                .filter_map(|m| {
                                     let content =
                                         m.get("content").and_then(|v| v.as_str()).unwrap_or("?");
+                                    if crate::slash_memory::is_session_proto(content) {
+                                        hidden_session_entries += 1;
+                                        return None;
+                                    }
                                     let id = m
                                         .get("memory_id")
                                         .or(m.get("id"))
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
                                     let short_id = &id[..std::cmp::min(8, id.len())];
-                                    let mtype = m
-                                        .get("memory_type")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("?");
-                                    let preview: String = content.chars().take(80).collect();
-                                    SelectionItem {
-                                        name: format!("[{mtype}] {preview}"),
+                                    Some(SelectionItem {
+                                        name: crate::slash_memory::format_memory_entry_line(m),
                                         description: Some(format!("id:{short_id}")),
                                         is_current: false,
-                                    }
+                                    })
                                 })
                                 .collect();
+                            if items.is_empty() {
+                                let mut message = "No non-session memories found.".to_string();
+                                if hidden_session_entries > 0 {
+                                    message.push_str(" Use /memory session to view session state.");
+                                }
+                                ctx.show_info(message);
+                                return SlashResult::Handled;
+                            }
                             let header = format!(
-                                "Memory — {} result{} for: {}",
+                                "Memory — {} result{} for: {}{}",
                                 items.len(),
                                 if items.len() == 1 { "" } else { "s" },
-                                query
+                                query,
+                                if hidden_session_entries > 0 {
+                                    format!(
+                                        " ({hidden_session_entries} session entr{} hidden)",
+                                        if hidden_session_entries == 1 {
+                                            "y"
+                                        } else {
+                                            "ies"
+                                        }
+                                    )
+                                } else {
+                                    String::new()
+                                }
                             );
                             ctx.bottom_pane.push_view(Box::new(
                                 ListSelectionView::new(items, Some(header))
@@ -1141,8 +1249,8 @@ pub(crate) fn build_panels_cheat_sheet_lines() -> Vec<String> {
             "type to filter · Enter select · Esc close",
         ),
         (
-            "/memory [list|search <q>|inspect <id>]",
-            "browse, search, and inspect episodic and semantic memories",
+            "/memory [list|search <q>|show <id>|session|help]",
+            "browse/search/stats in-panel; other subcommands stay text-first",
             "↑↓ navigate · Enter select · Esc close",
         ),
         (
@@ -1355,7 +1463,7 @@ pub(crate) fn handle_view_result(
         }
         "Trace" => {
             use crate::tui::bottom_pane::info_view::InfoView;
-            let lines = astra_turn_core::permission_audit::format_snapshot_lines(50);
+            let lines = astra_turn_core::permission::audit::format_snapshot_lines(50);
             bottom_pane.push_view(Box::new(
                 InfoView::from_plain("Permission Trace", lines).with_reopen("/allow trace"),
             ));
@@ -1684,6 +1792,607 @@ fn split_sub(text: &str) -> (&str, &str) {
     }
 }
 
+async fn handle_mcp_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashResult {
+    use crate::slash_mcp::ParsedMcpCommand as Cmd;
+
+    match crate::slash_mcp::parse_mcp_command(args) {
+        Cmd::Help => {
+            ctx.show_response(mcp_help_text(ctx.state).await);
+            SlashResult::Handled
+        }
+        Cmd::Overview => {
+            ctx.show_response(mcp_overview_text(ctx.state).await);
+            SlashResult::Handled
+        }
+        Cmd::Servers => {
+            ctx.show_response(mcp_servers_text(ctx.state).await);
+            SlashResult::Handled
+        }
+        Cmd::Tools(server) => {
+            ctx.show_response(mcp_tools_text(ctx.state, server).await);
+            SlashResult::Handled
+        }
+        Cmd::Prompts => {
+            ctx.show_response(mcp_prompts_text(ctx.state).await);
+            SlashResult::Handled
+        }
+        Cmd::Resources => {
+            ctx.show_response(mcp_resources_text(ctx.state).await);
+            SlashResult::Handled
+        }
+        Cmd::Read(Some(spec)) => {
+            ctx.show_response(mcp_read_text(ctx.state, spec).await);
+            SlashResult::Handled
+        }
+        Cmd::Read(None) => {
+            ctx.show_error("Usage: /mcp read <server>:<uri>".into());
+            SlashResult::Handled
+        }
+        Cmd::History => {
+            ctx.show_response(mcp_history_text(ctx.state).await);
+            SlashResult::Handled
+        }
+        Cmd::Inspect(Some(query)) => {
+            ctx.show_response(mcp_inspect_text(ctx.state, query).await);
+            SlashResult::Handled
+        }
+        Cmd::Inspect(None) => {
+            ctx.show_error(
+                "Usage: /mcp inspect <server>:<tool>  ·  try `/mcp tools` first.".into(),
+            );
+            SlashResult::Handled
+        }
+        Cmd::Ping(server) => {
+            ctx.show_response(mcp_ping_text(ctx.state, server).await);
+            SlashResult::Handled
+        }
+        Cmd::Add(Some(_)) => mcp_fallback_notice(ctx, "add"),
+        Cmd::Add(None) => {
+            ctx.show_error("Usage: /mcp add <name> <command> [args…]".into());
+            SlashResult::Handled
+        }
+        Cmd::Remove(Some(_)) => mcp_fallback_notice(ctx, "remove"),
+        Cmd::Remove(None) => {
+            ctx.show_error("Usage: /mcp remove <name>".into());
+            SlashResult::Handled
+        }
+        Cmd::Subscribe(Some(_)) => mcp_fallback_notice(ctx, "subscribe"),
+        Cmd::Subscribe(None) => {
+            ctx.show_error("Usage: /mcp subscribe <server>:<uri>".into());
+            SlashResult::Handled
+        }
+        Cmd::Unsubscribe(Some(_)) => mcp_fallback_notice(ctx, "unsubscribe"),
+        Cmd::Unsubscribe(None) => {
+            ctx.show_error("Usage: /mcp unsubscribe <server>:<uri>".into());
+            SlashResult::Handled
+        }
+        Cmd::LogLevel(Some(_)) => mcp_fallback_notice(ctx, "log-level"),
+        Cmd::LogLevel(None) => {
+            ctx.show_error("Usage: /mcp log-level <server> <level>".into());
+            SlashResult::Handled
+        }
+        Cmd::Prompt(Some(_)) => mcp_fallback_notice(ctx, "prompt"),
+        Cmd::Prompt(None) => {
+            ctx.show_error("Usage: /mcp prompt <server>:<name> [args…]".into());
+            SlashResult::Handled
+        }
+        Cmd::Complete(Some(_)) => mcp_fallback_notice(ctx, "complete"),
+        Cmd::Complete(None) => {
+            ctx.show_error("Usage: /mcp complete <server>:<prompt|resource> <arg> [value]".into());
+            SlashResult::Handled
+        }
+        Cmd::Unknown(sub) => {
+            ctx.show_error(format!(
+                "Unknown `/mcp` subcommand: `{sub}`. Try `/mcp help`."
+            ));
+            SlashResult::Handled
+        }
+    }
+}
+
+fn mcp_fallback_notice(ctx: &mut DispatchContext<'_>, subcommand: &str) -> SlashResult {
+    ctx.show_info(format!(
+        "`/mcp {subcommand}` still uses terminal fallback. Core discovery commands (`/mcp list`, `/mcp tools`, `/mcp prompts`, `/mcp resources`, `/mcp read`, `/mcp inspect`, `/mcp ping`) are native in TUI."
+    ));
+    SlashResult::Fallback
+}
+
+async fn mcp_help_text(state: &SessionState) -> String {
+    let count = state.mcp_manager.read().await.connection_count();
+    let mut lines = vec!["MCP commands".to_string()];
+    if count == 0 {
+        lines.push("No MCP servers connected yet.".into());
+        lines.push("Add one with: /mcp add <name> <command> [args…]".into());
+    } else {
+        lines.push(format!(
+            "{count} server(s) connected. Start with `/mcp list`."
+        ));
+    }
+    lines.push("/mcp list                 overview of connected servers".into());
+    lines.push("/mcp tools [server]       list callable tools".into());
+    lines.push("/mcp inspect <server>:<tool>  show tool parameters".into());
+    lines.push("/mcp prompts              list prompt templates".into());
+    lines.push("/mcp resources            list readable resources".into());
+    lines.push("/mcp read <server>:<uri>  read one resource".into());
+    lines.push("/mcp ping [server]        connectivity check".into());
+    lines.push(
+        "Advanced: /mcp add, remove, prompt, complete, log-level, subscribe, unsubscribe, history"
+            .into(),
+    );
+    lines.join("\n")
+}
+
+fn mcp_no_servers_text() -> String {
+    "No MCP servers connected.\nAdd one with: /mcp add <name> <command> [args…]\nThen use `/mcp list` or `/mcp tools`.".into()
+}
+
+fn mcp_format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+fn mcp_state_text(state: crate::mcp_client::ConnectionState) -> &'static str {
+    match state {
+        crate::mcp_client::ConnectionState::Connected => "connected",
+        crate::mcp_client::ConnectionState::Connecting => "connecting",
+        crate::mcp_client::ConnectionState::Reconnecting => "reconnecting",
+        crate::mcp_client::ConnectionState::Disconnected => "disconnected",
+        crate::mcp_client::ConnectionState::Failed => "failed",
+    }
+}
+
+fn mcp_trim_text(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let end = text
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+    format!("{}…", &text[..end])
+}
+
+fn mcp_truncate_block(text: &str, max_lines: usize, max_chars_per_line: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = lines
+        .iter()
+        .take(max_lines)
+        .map(|line| mcp_trim_text(line, max_chars_per_line))
+        .collect::<Vec<_>>();
+    if lines.len() > max_lines {
+        out.push(format!("… (+{} more lines)", lines.len() - max_lines));
+    }
+    out.join("\n")
+}
+
+async fn mcp_overview_text(state: &SessionState) -> String {
+    let manager = state.mcp_manager.read().await;
+    let count = manager.connection_count();
+    if count == 0 {
+        return mcp_no_servers_text();
+    }
+
+    let tools = manager.all_tools().len();
+    let prompts = manager.all_prompts().await.len();
+    let resources = manager.all_resources().await.len();
+    let mut capabilities = vec!["elicitation"];
+    if manager.has_sampling() {
+        capabilities.insert(0, "sampling");
+    }
+
+    let mut lines = vec![
+        "MCP overview".into(),
+        format!("Servers: {count} connected"),
+        format!("Capabilities: {}", capabilities.join(", ")),
+        format!("Tools: {tools}  ·  Prompts: {prompts}  ·  Resources: {resources}"),
+    ];
+
+    let roots = manager.roots().read().await;
+    if !roots.is_empty() {
+        let names = roots
+            .iter()
+            .map(|root| root.name.clone().unwrap_or_else(|| root.uri.clone()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("Roots: {names}"));
+    }
+    drop(roots);
+
+    lines.push(String::new());
+    lines.push("Servers".into());
+
+    let mut servers = manager.connected_servers();
+    servers.sort_unstable();
+    for name in servers {
+        if let Some(conn) = manager.get(name) {
+            let state_text = mcp_state_text(
+                manager
+                    .server_state(name)
+                    .unwrap_or(crate::mcp_client::ConnectionState::Connected),
+            );
+            let uptime = conn
+                .uptime()
+                .map(mcp_format_duration)
+                .unwrap_or_else(|| "n/a".into());
+            lines.push(format!(
+                "- {name} — {state_text} · {} tools · uptime {uptime}",
+                conn.tools().len()
+            ));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Next: /mcp tools [server] · /mcp prompts · /mcp resources".into());
+    lines.join("\n")
+}
+
+async fn mcp_servers_text(state: &SessionState) -> String {
+    let manager = state.mcp_manager.read().await;
+    if manager.connection_count() == 0 {
+        return mcp_no_servers_text();
+    }
+
+    let mut lines = vec!["MCP servers".into()];
+    let mut servers = manager.connected_servers();
+    servers.sort_unstable();
+    for name in servers {
+        if let Some(conn) = manager.get(name) {
+            let state_text = mcp_state_text(
+                manager
+                    .server_state(name)
+                    .unwrap_or(crate::mcp_client::ConnectionState::Connected),
+            );
+            let uptime = conn
+                .uptime()
+                .map(mcp_format_duration)
+                .unwrap_or_else(|| "n/a".into());
+            let preview = conn
+                .tools()
+                .iter()
+                .take(4)
+                .map(|tool| tool.name.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!(
+                "- {name} — {state_text} · {} tools · uptime {uptime}",
+                conn.tools().len()
+            ));
+            if !preview.is_empty() {
+                let more = conn.tools().len().saturating_sub(4);
+                if more > 0 {
+                    lines.push(format!("  tools: {preview}, … (+{more} more)"));
+                } else {
+                    lines.push(format!("  tools: {preview}"));
+                }
+            }
+        }
+    }
+    lines.push(String::new());
+    lines.push("Inspect one server's tools: /mcp tools <server>".into());
+    lines.join("\n")
+}
+
+async fn mcp_tools_text(state: &SessionState, server: Option<&str>) -> String {
+    let manager = state.mcp_manager.read().await;
+    if manager.connection_count() == 0 {
+        return mcp_no_servers_text();
+    }
+
+    let mut lines = Vec::new();
+    match server.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(server_name) => {
+            let Some(conn) = manager.get(server_name) else {
+                return format!(
+                    "Server '{server_name}' not found.\nTry `/mcp list` or `/mcp servers`."
+                );
+            };
+            lines.push(format!(
+                "MCP tools from {server_name} ({})",
+                conn.tools().len()
+            ));
+            for tool in conn.tools() {
+                let desc = tool.description.as_deref().unwrap_or("(no description)");
+                lines.push(format!("- {} — {}", tool.name, mcp_trim_text(desc, 90)));
+            }
+            lines.push(String::new());
+            lines.push(format!("Inspect one: /mcp inspect {server_name}:<tool>"));
+        }
+        None => {
+            let mut tools = manager
+                .all_tools()
+                .into_iter()
+                .map(|(server_name, tool)| {
+                    (
+                        server_name.to_string(),
+                        tool.name.to_string(),
+                        tool.description
+                            .as_deref()
+                            .map(|text| mcp_trim_text(text, 90))
+                            .unwrap_or_else(|| "(no description)".into()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            tools.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            lines.push(format!("MCP tools ({})", tools.len()));
+            for (server_name, tool_name, desc) in tools {
+                lines.push(format!("- {server_name}:{tool_name} — {desc}"));
+            }
+            lines.push(String::new());
+            lines.push("Inspect one: /mcp inspect <server>:<tool>".into());
+        }
+    }
+    lines.join("\n")
+}
+
+async fn mcp_prompts_text(state: &SessionState) -> String {
+    let manager = state.mcp_manager.read().await;
+    if manager.connection_count() == 0 {
+        return mcp_no_servers_text();
+    }
+
+    let mut prompts = manager.all_prompts().await;
+    if prompts.is_empty() {
+        return "No MCP prompts available from connected servers.".into();
+    }
+    prompts.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.name.cmp(&b.1.name)));
+
+    let mut lines = vec![format!("MCP prompts ({})", prompts.len())];
+    for (server_name, prompt) in prompts {
+        let args = prompt
+            .arguments
+            .as_ref()
+            .map(|args| {
+                args.iter()
+                    .map(|arg| {
+                        if arg.required.unwrap_or(false) {
+                            format!("<{}>", arg.name)
+                        } else {
+                            format!("[{}]", arg.name)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        let desc = prompt
+            .description
+            .as_deref()
+            .map(|text| mcp_trim_text(text, 90))
+            .unwrap_or_else(|| "(no description)".into());
+        if args.is_empty() {
+            lines.push(format!("- {server_name}:{} — {desc}", prompt.name));
+        } else {
+            lines.push(format!("- {server_name}:{} {args} — {desc}", prompt.name));
+        }
+    }
+    lines.push(String::new());
+    lines.push("Run one: /mcp prompt <server>:<name> [args…]".into());
+    lines.join("\n")
+}
+
+async fn mcp_resources_text(state: &SessionState) -> String {
+    let manager = state.mcp_manager.read().await;
+    if manager.connection_count() == 0 {
+        return mcp_no_servers_text();
+    }
+
+    let mut resources = manager.all_resources().await;
+    if resources.is_empty() {
+        return "No MCP resources available from connected servers.".into();
+    }
+    resources.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.raw.uri.cmp(&b.1.raw.uri)));
+
+    let mut lines = vec![format!("MCP resources ({})", resources.len())];
+    for (server_name, resource) in resources {
+        let mime = resource.raw.mime_type.as_deref().unwrap_or("unknown");
+        let desc = resource
+            .description
+            .as_deref()
+            .map(|text| mcp_trim_text(text, 80))
+            .unwrap_or_default();
+        if desc.is_empty() {
+            lines.push(format!("- {server_name}:{} [{mime}]", resource.raw.uri));
+        } else {
+            lines.push(format!(
+                "- {server_name}:{} [{mime}] — {desc}",
+                resource.raw.uri
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.push("Read one: /mcp read <server>:<uri>".into());
+    lines.join("\n")
+}
+
+async fn mcp_read_text(state: &SessionState, spec: &str) -> String {
+    let spec = spec.trim();
+    let (server_name, uri) = match spec.split_once(':') {
+        Some((server_name, uri)) if !server_name.is_empty() && !uri.is_empty() => {
+            (server_name, uri)
+        }
+        _ => return "Usage: /mcp read <server>:<uri>".into(),
+    };
+
+    let conn = {
+        let manager = state.mcp_manager.read().await;
+        if manager.connection_count() == 0 {
+            return mcp_no_servers_text();
+        }
+        match manager.get(server_name) {
+            Some(conn) => conn,
+            None => {
+                return format!(
+                    "Server '{server_name}' not found.\nTry `/mcp list` or `/mcp servers`."
+                );
+            }
+        }
+    };
+
+    match conn.read_resource(uri).await {
+        Ok(content) if content.trim().is_empty() => {
+            format!("{server_name}:{uri}\n(empty resource)")
+        }
+        Ok(content) => format!(
+            "{server_name}:{uri}\n\n{}",
+            mcp_truncate_block(&content, 40, 140)
+        ),
+        Err(error) => format!("Failed to read '{uri}' from '{server_name}': {error}"),
+    }
+}
+
+async fn mcp_history_text(state: &SessionState) -> String {
+    let manager = state.mcp_manager.read().await;
+    if manager.connection_count() == 0 {
+        return mcp_no_servers_text();
+    }
+
+    let mut entries = Vec::new();
+    for name in manager.server_names() {
+        if let Some(conn) = manager.get_connection(name) {
+            let log = conn.call_log.read().await;
+            entries.extend(log.iter().cloned());
+        }
+    }
+    if entries.is_empty() {
+        return "No MCP tool calls recorded yet.\nUse an MCP tool, then run `/mcp history` again."
+            .into();
+    }
+    entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    let mut lines = vec![format!("MCP call history ({})", entries.len())];
+    for entry in entries.into_iter().take(20) {
+        let status = if entry.success { "ok" } else { "fail" };
+        lines.push(format!(
+            "- {} · {}:{} · {}ms · {status}",
+            entry.timestamp, entry.server, entry.tool, entry.latency_ms
+        ));
+        if let Some(error) = entry.error {
+            lines.push(format!("  error: {}", mcp_trim_text(&error, 120)));
+        }
+    }
+    lines.join("\n")
+}
+
+fn mcp_protocol_tool_text(server: &str, tool: &rmcp::model::Tool) -> String {
+    let mut lines = vec![
+        format!("Tool: {server}:{}", tool.name),
+        format!(
+            "Description: {}",
+            tool.description.as_deref().unwrap_or("(no description)")
+        ),
+    ];
+    let schema = &*tool.input_schema;
+    if let Some(props) = schema.get("properties").and_then(|value| value.as_object()) {
+        let required = schema
+            .get("required")
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if props.is_empty() {
+            lines.push("Parameters: none".into());
+        } else {
+            lines.push("Parameters:".into());
+            for (name, param_schema) in props {
+                let required_marker = if required.contains(&name.as_str()) {
+                    "required"
+                } else {
+                    "optional"
+                };
+                let param_type = param_schema
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("any");
+                let desc = param_schema
+                    .get("description")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                if desc.is_empty() {
+                    lines.push(format!("- {name}: {param_type} ({required_marker})"));
+                } else {
+                    lines.push(format!(
+                        "- {name}: {param_type} ({required_marker}) — {}",
+                        mcp_trim_text(desc, 100)
+                    ));
+                }
+            }
+        }
+    } else {
+        lines.push("Parameters: none".into());
+    }
+    lines.join("\n")
+}
+
+fn mcp_builtin_tool_text(meta: &astra_turn_core::tool::registry::meta::ToolMeta) -> String {
+    [
+        format!("Tool: {}", meta.name),
+        format!("Description: {}", meta.description),
+        format!("Scope: {:?}", meta.scope),
+        format!("Intents: {:?}", meta.intents),
+        format!("Schema tokens: {}", meta.schema_tokens),
+    ]
+    .join("\n")
+}
+
+async fn mcp_inspect_text(state: &SessionState, query: &str) -> String {
+    let manager = state.mcp_manager.read().await;
+    match crate::slash_mcp::resolve_protocol_tool_query(&manager, query) {
+        Ok((server, tool)) => mcp_protocol_tool_text(server, tool),
+        Err(protocol_error) => {
+            for meta in astra_turn_core::tool::registry::meta::TOOL_CATALOG {
+                if meta.name == query
+                    || format!("mcp_{}", meta.name) == query
+                    || format!("mcp_memoria_{}", meta.name) == query
+                {
+                    return mcp_builtin_tool_text(meta);
+                }
+            }
+            protocol_error
+        }
+    }
+}
+
+async fn mcp_ping_text(state: &SessionState, server: Option<&str>) -> String {
+    let mut manager = state.mcp_manager.write().await;
+    if manager.connection_count() == 0 {
+        return mcp_no_servers_text();
+    }
+
+    match server.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => match manager.ping(name).await {
+            Ok(duration) => format!("✓ {name}: {:.1}ms", duration.as_secs_f64() * 1000.0),
+            Err(error) => format!("✗ {name}: {error}"),
+        },
+        None => {
+            let mut results = manager.ping_all().await;
+            if results.is_empty() {
+                return "No MCP servers connected.".into();
+            }
+            results.sort_by(|a, b| a.0.cmp(&b.0));
+            results
+                .into_iter()
+                .map(|(name, result)| match result {
+                    Ok(duration) => format!("✓ {name}: {:.1}ms", duration.as_secs_f64() * 1000.0),
+                    Err(error) => format!("✗ {name}: {error}"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigCommandRoute {
     Panel,
@@ -1710,7 +2419,9 @@ fn config_command_route(args: &str) -> Result<ConfigCommandRoute, &'static str> 
 enum MemoryCommandRoute {
     List,
     Search(String),
-    Inspect(String),
+    Stats,
+    Health,
+    Fallback,
 }
 
 fn memory_command_route(args: &str) -> Result<MemoryCommandRoute, &'static str> {
@@ -1721,10 +2432,11 @@ fn memory_command_route(args: &str) -> Result<MemoryCommandRoute, &'static str> 
 
     let (sub, rest) = split_sub(trimmed);
     match sub {
-        "list" if rest.is_empty() => Ok(MemoryCommandRoute::List),
+        "list" | "ls" if rest.is_empty() => Ok(MemoryCommandRoute::List),
         "search" if !rest.is_empty() => Ok(MemoryCommandRoute::Search(rest.to_string())),
-        "inspect" if !rest.is_empty() => Ok(MemoryCommandRoute::Inspect(rest.to_string())),
-        _ => Err("Unknown subcommand. Try: list, search <query>, inspect <id>."),
+        "stats" | "count" if rest.is_empty() => Ok(MemoryCommandRoute::Stats),
+        "health" if rest.is_empty() => Ok(MemoryCommandRoute::Health),
+        _ => Ok(MemoryCommandRoute::Fallback),
     }
 }
 
@@ -1732,8 +2444,8 @@ fn inspect_command_supported(args: &str) -> Result<(), String> {
     let sub = args.trim();
     match sub {
         "" => Ok(()),
-        "budget" | "tools" | "context" | "json" | "diff" | "history" | "trace" | "forensics"
-        | "export" => Ok(()),
+        "budget" | "tools" | "context" | "cache" | "json" | "diff" | "history" | "trace"
+        | "forensics" | "export" => Ok(()),
         _ => Err(format!("Unknown `/inspect` subcommand: `{sub}`.")),
     }
 }
@@ -1756,11 +2468,15 @@ pub(crate) const FORK_PICK_SENTINEL: &str = "__fork__\n";
 /// thinking modes.  Kept public(crate) so the mod.rs arm can
 /// strip it symmetrically with the other sentinels.
 pub(crate) const MODEL_PICK_SENTINEL: &str = "__model_pick__\n";
+pub(crate) const MODEL_PICKER_FOOTER_HINT: &str =
+    "Type to filter | Enter to choose | Some models then ask for thinking mode | Esc to go back";
 /// Sentinel prefix for the thinking-mode picker. Payload format is
 /// `__model_thinking__\n<base_model>\n<thinking_label>`.  The
 /// handler composes `base + thinking_suffix_for(label)` and sets
 /// `state.model`.
 pub(crate) const MODEL_THINKING_SENTINEL: &str = "__model_thinking__\n";
+pub(crate) const MODEL_THINKING_PICKER_FOOTER_HINT: &str =
+    "Type to filter | Enter to finish model selection | Esc to go back";
 
 /// `/model` with no args (or `list`) — fetch the catalog and push
 /// the picker.  The picker emits `MODEL_PICK_SENTINEL + <name>`; the
@@ -1800,6 +2516,7 @@ fn push_model_picker(ctx: &mut DispatchContext<'_>, models: Vec<String>) -> bool
         false
     } else {
         let view = ListSelectionView::new(items, Some("Select model:".into()))
+            .with_footer_hint(MODEL_PICKER_FOOTER_HINT)
             .with_result_prefix(MODEL_PICK_SENTINEL);
         ctx.bottom_pane.push_view(Box::new(view));
         true
@@ -2685,7 +3402,8 @@ mod panels_tests {
 #[cfg(test)]
 mod routing_tests {
     use super::{
-        CONTEXT_USAGE_MESSAGE, ConfigCommandRoute, MemoryCommandRoute, config_command_route,
+        CONTEXT_USAGE_MESSAGE, ConfigCommandRoute, MODEL_PICKER_FOOTER_HINT,
+        MODEL_THINKING_PICKER_FOOTER_HINT, MemoryCommandRoute, config_command_route,
         inspect_command_supported, memory_command_route,
     };
 
@@ -2714,23 +3432,51 @@ mod routing_tests {
     }
 
     #[test]
-    fn memory_route_distinguishes_list_search_and_inspect() {
+    fn model_picker_footer_warns_about_thinking_follow_up() {
+        assert!(MODEL_PICKER_FOOTER_HINT.contains("thinking mode"));
+        assert!(MODEL_THINKING_PICKER_FOOTER_HINT.contains("finish model selection"));
+    }
+
+    #[test]
+    fn memory_route_uses_panel_for_list_search_and_fallback_for_full_domain_commands() {
         assert_eq!(memory_command_route(""), Ok(MemoryCommandRoute::List));
         assert_eq!(memory_command_route("list"), Ok(MemoryCommandRoute::List));
+        assert_eq!(memory_command_route("ls"), Ok(MemoryCommandRoute::List));
         assert_eq!(
             memory_command_route("search auth preferences"),
             Ok(MemoryCommandRoute::Search("auth preferences".into()))
         );
         assert_eq!(
+            memory_command_route("show mem_123"),
+            Ok(MemoryCommandRoute::Fallback)
+        );
+        assert_eq!(
             memory_command_route("inspect mem_123"),
-            Ok(MemoryCommandRoute::Inspect("mem_123".into()))
+            Ok(MemoryCommandRoute::Fallback)
+        );
+        assert_eq!(
+            memory_command_route("search"),
+            Ok(MemoryCommandRoute::Fallback)
+        );
+        assert_eq!(memory_command_route("stats"), Ok(MemoryCommandRoute::Stats));
+        assert_eq!(
+            memory_command_route("health"),
+            Ok(MemoryCommandRoute::Health)
+        );
+        assert_eq!(
+            memory_command_route("session"),
+            Ok(MemoryCommandRoute::Fallback)
+        );
+        assert_eq!(
+            memory_command_route("help"),
+            Ok(MemoryCommandRoute::Fallback)
         );
     }
 
     #[test]
     fn inspect_route_accepts_known_subcommands_and_rejects_unknown_ones() {
         for form in [
-            "", "budget", "tools", "context", "json", "diff", "history", "trace",
+            "", "budget", "tools", "context", "cache", "json", "diff", "history", "trace",
         ] {
             assert!(
                 inspect_command_supported(form).is_ok(),
@@ -2749,6 +3495,31 @@ mod routing_tests {
             CONTEXT_USAGE_MESSAGE,
             "Usage: /context — open the context panel\n       /context dump [path] — write a JSON snapshot."
         );
+    }
+}
+
+#[cfg(test)]
+mod mcp_ux_tests {
+    use super::{mcp_help_text, mcp_no_servers_text};
+
+    #[tokio::test]
+    async fn mcp_help_mentions_core_commands() {
+        let state = crate::session_state::SessionState::default();
+        let text = mcp_help_text(&state).await;
+        assert!(text.contains("/mcp list"), "missing list help: {text}");
+        assert!(text.contains("/mcp tools"), "missing tools help: {text}");
+        assert!(text.contains("/mcp read"), "missing read help: {text}");
+        assert!(
+            text.contains("/mcp inspect"),
+            "missing inspect help: {text}"
+        );
+    }
+
+    #[test]
+    fn mcp_no_servers_text_guides_user_to_add_then_list() {
+        let text = mcp_no_servers_text();
+        assert!(text.contains("/mcp add"), "missing add guidance: {text}");
+        assert!(text.contains("/mcp list"), "missing list guidance: {text}");
     }
 }
 
@@ -2975,7 +3746,7 @@ mod view_result_tests {
         let mut chat_widget = ChatWidget::new("");
 
         handle_view_result(
-            "[working] [@session/memory] foo",
+            "[working] [@session/active] foo",
             &mut state,
             &mut bottom_pane,
             &mut chat_widget,

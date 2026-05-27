@@ -359,12 +359,17 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "git",
-                "description": "Git operations. Actions: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree.\n\n\
+                "description": "Git operations. Actions: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree, push.\n\n\
          ## Diff modes\n\
          - **Default (no flags)**: worktree vs index — shows UNSTAGED changes only (like `git diff`)\n\
-         - **staged=true**: index vs HEAD — shows `git add`ed changes (like `git diff --staged`)\n\
-         - **ref=<commit/branch/tag>**: compares that ref vs worktree\n\
-         - **ref + base_ref**: range diff base_ref..ref\n\n\
+         - **staged=true**: index vs HEAD — shows `git add`ed changes (like `git diff --staged`)\n\n\
+         ## Status\n\
+         - **Default**: shows `git status --porcelain` (all unstaged + untracked)\n\
+         - **staged=true**: shows staged changes only (like `git diff --staged`)\n\n\
+         ## Push\n\
+         - push requires explicit `remote` and `branch`\n\
+         - `force_with_lease=true` enables `--force-with-lease` (safer than bare --force)\n\
+         - `set_upstream=true` sets upstream tracking (`-u`)\n\n\
          ## Limits\n\
          - diff output capped at 40 KB; show output at 16 KB\n\
          - log / file_history `n` max: 500 (auto-throttled); log_search `n` default 200\n\
@@ -375,7 +380,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["status","diff","log","show","blame","file_history","log_search","contributors","commit","revert_commit","stash","checkout_file","worktree"],
+                            "enum": ["status","diff","log","show","blame","file_history","log_search","contributors","commit","revert_commit","stash","checkout_file","worktree","push"],
                             "description": "Git operation to perform"
                         },
                         "path": {
@@ -437,6 +442,22 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "stash_ref": {
                             "type": "string",
                             "description": "Exact stash selector or OID. Used by: stash with sub_action=apply. Takes precedence over index."
+                        },
+                        "remote": {
+                            "type": "string",
+                            "description": "Remote name (e.g. 'origin'). Used by: push (required)."
+                        },
+                        "branch": {
+                            "type": "string",
+                            "description": "Target branch name. Used by: push (required)."
+                        },
+                        "force_with_lease": {
+                            "type": "boolean",
+                            "description": "Use --force-with-lease (safer than bare --force). Used by: push. Default false."
+                        },
+                        "set_upstream": {
+                            "type": "boolean",
+                            "description": "Set upstream tracking (-u). Used by: push. Default false."
                         }
                     },
                     "required": ["action"],
@@ -447,7 +468,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "log_search": ["query"],
                         "stash": ["sub_action"],
                         "checkout_file": ["path", "ref"],
-                        "worktree": ["sub_action"]
+                        "worktree": ["sub_action"],
+                        "push": ["remote", "branch"]
                     }
                 }
             }
@@ -631,7 +653,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `get_result`: REQUIRES `action`, `agent_id`.\n\
          - `run_chain`: REQUIRES `action`, `steps`.\n\
          - `send_message`: REQUIRES `action`, `to`, `message`.\n\n\
-         For `spawn`, pass at least one non-empty field: `description` (short UI summary) or `prompt` (full child brief). If one is missing, Astra derives it from the other. Prefer sending both. Do NOT pass a top-level `task` field. Do NOT pass `agent_id` to spawn; Astra generates that runtime id for you. If you need a mailbox label, use `name`, but `name` is not valid for `get_result`.\n\n\
+         For `spawn`, pass at least one non-empty field: `description` (short UI summary) or `prompt` (full child brief). If one is missing, Astra derives it from the other. Prefer sending both. Do NOT pass a top-level `task` field. `agent_id` is ONLY for `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. If you need a mailbox label, use `name`, but `name` is not valid for `get_result`.\n\n\
          ## Spawn example\n\
          `agent(action='spawn', description='Audit auth flow', prompt='Read src/auth/* and report any token-handling bugs. Focus on session expiry and refresh logic. Return findings as a numbered list.', agent_type='general-purpose')`\n\n\
          ## Execution mode\n\
@@ -662,7 +684,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Task-complexity hint scaling the default budget when `max_turns` is absent. `light`≈10 turns, `normal`=agent default, `deep`=2× default. Use `deep` for review/refactor/multi-file tasks that routinely exhaust the default."},
                         "isolated": {"type": "boolean", "description": "Use isolated worktree (spawn)"},
                         "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
-                        "agent_id": {"type": "string", "description": "REQUIRED for action='get_result'. Must be the exact runtime-generated agent_id returned by a prior spawn, not the optional spawn name."},
+                        "agent_id": {"type": "string", "description": "ONLY for action='get_result'. Must be the exact runtime-generated agent_id returned by a prior spawn, not the optional spawn name. Never prefill this on spawn."},
                         "to": {"type": "string", "description": "REQUIRED for action='send_message'. Recipient agent_id, or '*' for broadcast."},
                         "message": {"description": "REQUIRED for action='send_message'. Message content."},
                         "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"]},
@@ -1180,7 +1202,8 @@ mod tests {
         let params = &agent["function"]["parameters"];
         assert_eq!(params["additionalProperties"], false);
         assert!(
-            desc.contains("Do NOT pass `agent_id` to spawn"),
+            desc.contains("`agent_id` is ONLY for `get_result`")
+                || desc.contains("never prefill it on `spawn`"),
             "agent description must explicitly forbid spawn-time agent_id misuse"
         );
         assert!(
@@ -1193,6 +1216,13 @@ mod tests {
                 .unwrap_or("")
                 .contains("Not the runtime agent_id"),
             "name field must say it is not the get_result identifier"
+        );
+        assert!(
+            params["properties"]["agent_id"]["description"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Never prefill this on spawn"),
+            "agent_id field must explicitly forbid spawn-time prefill"
         );
     }
 

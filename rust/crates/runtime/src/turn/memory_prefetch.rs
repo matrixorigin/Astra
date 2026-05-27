@@ -594,7 +594,13 @@ pub(crate) fn build_memory_entries(merged_lines: &[String]) -> Vec<ContextMemory
 /// Tagged entries (`[@namespace/type] body`) always pass even if short —
 /// the namespace already asserts the entry carries structured meaning.
 fn is_memory_worthy(trimmed: &str) -> bool {
-    // Always keep structured-tagged entries.
+    if astra_prompts::memory_proto::is_session_namespace_memory(trimmed) {
+        return false;
+    }
+
+    // Always keep structured-tagged entries except session-memory
+    // protocol rows, which are injected through the dedicated
+    // session-memory lane rather than generic cross-session recall.
     if trimmed.starts_with("[@") && trimmed.contains("/") && trimmed.contains("]") {
         return true;
     }
@@ -1276,6 +1282,19 @@ mod tests {
     }
 
     #[test]
+    fn build_memory_section_drops_structured_session_namespace_entries() {
+        let lines = vec![
+            "[@session/active] session_id=other\nrecent work".to_string(),
+            "[@session/memory] session_id=legacy\nlegacy body".to_string(),
+            "[@pref/active] prefer Rust".to_string(),
+        ];
+        let section = build_memory_section(&lines).expect("pref entry survives");
+        assert!(!section.contains("[@session/active]"), "got: {section}");
+        assert!(!section.contains("[@session/memory]"), "got: {section}");
+        assert!(section.contains("prefer Rust"), "got: {section}");
+    }
+
+    #[test]
     fn build_memory_entries_preserves_rank_as_relevance() {
         let lines = vec![
             "[@pref/active] prefer Rust".to_string(),
@@ -1290,6 +1309,17 @@ mod tests {
         );
         assert!(entries[0].content.contains("Preferences"));
         assert_eq!(entries[0].source.as_deref(), Some("memoria.prefetch"));
+    }
+
+    #[test]
+    fn build_memory_entries_drop_structured_session_namespace_entries() {
+        let lines = vec![
+            "[@session/active] current session memory".to_string(),
+            "[@pref/active] prefer Rust".to_string(),
+        ];
+        let entries = build_memory_entries(&lines);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].content.contains("prefer Rust"));
     }
 
     // ── Low-signal fragment filter ────────────────────────────────────

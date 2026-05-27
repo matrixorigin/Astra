@@ -13,6 +13,7 @@ use crate::criteria::{Criterion, CriterionSeverity, evaluate_deterministic_with_
 use crate::digest::DigestCollector;
 use crate::exec::CaseExecutor;
 use crate::judger::{Judger, evaluate_judger};
+use crate::model_profiles::{ModelReuseSupport, load_profiles};
 use crate::report::{CaseRunReport, StepResult, SuiteReport};
 use crate::runner::{RunOutcome, RunnerConfig, resolve_models};
 use crate::session_capture::{SessionCapture, load_session};
@@ -302,6 +303,14 @@ impl<'a> SuiteRunner<'a> {
     }
 
     async fn run_one(&self, case: &Case, model: &str) -> CaseRunReport {
+        if let Some(report) = self.skip_for_unsupported_cache_scope(case, model) {
+            eprintln!(
+                "[astra-test] [PASS] {} × {} (skipped: unsupported cache scope)",
+                case.name, model
+            );
+            return report;
+        }
+
         // Run setup command if specified. Non-zero exit aborts the case.
         if let Some(ref cmd) = case.setup_cmd {
             let mut setup_cmd = tokio::process::Command::new("sh");
@@ -384,6 +393,7 @@ impl<'a> SuiteRunner<'a> {
                     },
                     timeout_seconds: step.timeout_seconds.unwrap_or(case.timeout_seconds),
                     capability: None,
+                    required_cache_scope: None,
                     difficulty: None,
                     weight: 1.0,
                     steps: vec![],
@@ -616,6 +626,57 @@ impl<'a> SuiteRunner<'a> {
             has_warnings: passed && !all_passed,
         }
     }
+
+    fn skip_for_unsupported_cache_scope(&self, case: &Case, model: &str) -> Option<CaseRunReport> {
+        let required = case.required_cache_scope?;
+        let profiles = load_profiles(self.runner_cfg.working_dir.as_deref());
+        let reuse_support = profiles
+            .get(model)
+            .map(|profile| profile.reuse_support)
+            .unwrap_or(ModelReuseSupport::Unknown);
+        if reuse_support.supports(required) {
+            return None;
+        }
+
+        let detail = format!(
+            "skipped: model metadata reports prompt-cache reuse_scope={reuse_support:?}, \
+             but case requires {required:?}"
+        );
+        let criteria = case
+            .criteria
+            .iter()
+            .cloned()
+            .map(|criterion| crate::criteria::CriterionResult {
+                severity: crate::criteria::criterion_severity(&criterion),
+                criterion,
+                passed: true,
+                detail: detail.clone(),
+                full_detail: None,
+                score: None,
+            })
+            .collect();
+        Some(CaseRunReport {
+            case_name: case.name.clone(),
+            model: model.to_string(),
+            passed: true,
+            run_index: 0,
+            capability: case.capability.clone(),
+            weight: case.weight,
+            difficulty: case.difficulty,
+            outcome: RunOutcome::new(model)
+                .with_exit_code(0)
+                .with_text(detail.clone())
+                .with_stderr(detail.clone()),
+            criteria,
+            steps: Vec::new(),
+            session: None,
+            reproducer: None,
+            digest: None,
+            digest_error: None,
+            failure_class: None,
+            has_warnings: true,
+        })
+    }
 }
 
 fn is_rate_limited(outcome: &crate::runner::RunOutcome) -> bool {
@@ -630,6 +691,7 @@ fn is_rate_limited(outcome: &crate::runner::RunOutcome) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::case::PromptCacheReuseScope;
     use crate::criteria::Criterion;
     use crate::exec::test_support::FakeExecutor;
     use crate::judger::JudgerScore;
@@ -649,6 +711,7 @@ mod tests {
             extra_cli_args: vec![],
             timeout_seconds: 60,
             capability: None,
+            required_cache_scope: None,
             difficulty: None,
             weight: 1.0,
             steps: vec![],
@@ -735,6 +798,59 @@ mod tests {
         let report = runner.run_all(&cases).await;
         assert_eq!(report.total(), 2);
         assert_eq!(report.passed(), 2);
+    }
+
+    #[tokio::test]
+    async fn unsupported_conversation_scope_is_skip_passed_from_model_metadata() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join(".models.yaml"),
+            r#"
+- name: kimi-k2.6
+  provider: openai
+  prompt_cache_capability:
+    protocol: openai_auto_prefix
+    volatile_placement: tail_suffix
+    reuse_scope: intra_turn_rounds
+"#,
+        )
+        .expect("write models yaml");
+
+        let exec = FakeExecutor::new();
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let mut cfg = RunnerConfig::new(PathBuf::from("astra"))
+            .with_fallback_models(vec!["kimi-k2.6".into()]);
+        cfg.working_dir = Some(tmp.path().to_path_buf());
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+
+        let mut case = case_with("cache-prefix", vec![Criterion::ExitCode { code: 0 }]);
+        case.required_cache_scope = Some(PromptCacheReuseScope::ConversationTurns);
+        let report = runner.run_all(&[case]).await;
+        assert_eq!(report.total(), 1);
+        assert_eq!(report.passed(), 1);
+        assert_eq!(exec.calls.lock().unwrap().len(), 0, "executor must not run");
+        assert!(
+            report.runs[0]
+                .outcome
+                .text
+                .contains("skipped: model metadata reports"),
+            "{:#?}",
+            report.runs[0].outcome
+        );
+        assert!(report.runs[0].has_warnings);
     }
 
     #[tokio::test]

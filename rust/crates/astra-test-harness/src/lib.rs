@@ -47,6 +47,7 @@ pub mod digest;
 pub mod eval;
 pub mod exec;
 pub mod judger;
+pub mod model_profiles;
 pub mod pipeline_analysis;
 pub mod preflight;
 pub mod report;

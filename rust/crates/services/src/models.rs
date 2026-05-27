@@ -3,6 +3,7 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sqlx::{Row, query};
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::auth::FernetTokenEncryptor;
@@ -60,13 +61,103 @@ pub struct QuirksData {
     /// column — so adding it required no DB migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_model_name: Option<String>,
+    /// Explicit prompt-cache behavior for this concrete model deployment.
+    ///
+    /// OpenAI-compatible transport does not imply OpenAI-compatible cache
+    /// semantics. Storing this in `quirks_json` lets operators classify a
+    /// deployment once (provider + endpoint + upstream model) without baking
+    /// model-name guesses into runtime hot paths. `reuse_scope` captures how far
+    /// cache reuse actually survives (`conversation_turns` vs `intra_turn_rounds`)
+    /// so harness/runtime/CLI can adapt behavior without model-name branches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_capability: Option<PromptCacheCapabilityData>,
     /// Additional top-level request body fields to merge into outbound
     /// provider payloads for this model row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_body_overrides: Option<Map<String, Value>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheProtocolData {
+    #[serde(alias = "MarkerExplicit")]
+    MarkerExplicit,
+    #[serde(alias = "BedrockCachePoint")]
+    BedrockCachePoint,
+    #[serde(alias = "OpenAiAutoPrefix")]
+    #[serde(alias = "openai_auto_prefix")]
+    OpenAiAutoPrefix,
+    #[serde(alias = "StrictHistoryMatch")]
+    StrictHistoryMatch,
+    #[serde(alias = "None")]
+    None,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheVolatilePlacementData {
+    #[serde(alias = "MarkerIsolated")]
+    MarkerIsolated,
+    #[serde(alias = "TailSuffix")]
+    TailSuffix,
+    #[serde(alias = "CurrentUserOnly")]
+    CurrentUserOnly,
+    #[serde(alias = "Free")]
+    Free,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheReuseScopeData {
+    #[serde(alias = "ConversationTurns")]
+    ConversationTurns,
+    #[serde(alias = "IntraTurnRounds")]
+    IntraTurnRounds,
+}
+
+impl PromptCacheReuseScopeData {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConversationTurns => "conversation_turns",
+            Self::IntraTurnRounds => "intra_turn_rounds",
+        }
+    }
+
+    #[must_use]
+    pub fn supports(self, required: Self) -> bool {
+        match (self, required) {
+            (Self::ConversationTurns, _) => true,
+            (Self::IntraTurnRounds, Self::IntraTurnRounds) => true,
+            (Self::IntraTurnRounds, Self::ConversationTurns) => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptCacheCapabilityData {
+    pub protocol: PromptCacheProtocolData,
+    pub volatile_placement: PromptCacheVolatilePlacementData,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse_scope: Option<PromptCacheReuseScopeData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsYamlPromptCacheEntry {
+    name: String,
+    #[serde(default)]
+    prompt_cache_capability: Option<PromptCacheCapabilityData>,
+    #[serde(default)]
+    quirks: Option<ModelsYamlPromptCacheQuirks>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ModelsYamlPromptCacheQuirks {
+    #[serde(default)]
+    prompt_cache_capability: Option<PromptCacheCapabilityData>,
+}
+
+#[derive(Clone, PartialEq)]
 pub struct ModelCreateRequestData {
     pub name: String,
     pub provider: String,
@@ -84,7 +175,28 @@ pub struct ModelCreateRequestData {
     pub quirks: Option<QuirksData>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+impl std::fmt::Debug for ModelCreateRequestData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelCreateRequestData")
+            .field("name", &self.name)
+            .field("provider", &self.provider)
+            .field("api_key", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("description", &self.description)
+            .field("context_window", &self.context_window)
+            .field("max_completion_tokens", &self.max_completion_tokens)
+            .field("input_modalities", &self.input_modalities)
+            .field("output_modalities", &self.output_modalities)
+            .field("supported_parameters", &self.supported_parameters)
+            .field("pricing", &self.pricing)
+            .field("architecture", &self.architecture)
+            .field("tags", &self.tags)
+            .field("quirks", &self.quirks)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub struct ModelUpdateRequestData {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
@@ -100,6 +212,27 @@ pub struct ModelUpdateRequestData {
     pub tags: Option<Vec<String>>,
     pub is_active: Option<bool>,
     pub quirks: Option<QuirksData>,
+}
+
+impl std::fmt::Debug for ModelUpdateRequestData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelUpdateRequestData")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("base_url", &self.base_url)
+            .field("provider", &self.provider)
+            .field("description", &self.description)
+            .field("context_window", &self.context_window)
+            .field("max_completion_tokens", &self.max_completion_tokens)
+            .field("input_modalities", &self.input_modalities)
+            .field("output_modalities", &self.output_modalities)
+            .field("supported_parameters", &self.supported_parameters)
+            .field("pricing", &self.pricing)
+            .field("architecture", &self.architecture)
+            .field("tags", &self.tags)
+            .field("is_active", &self.is_active)
+            .field("quirks", &self.quirks)
+            .finish()
+    }
 }
 
 /// Thinking capability of a model, determined by provider-aware probe.
@@ -199,7 +332,10 @@ pub struct ModelListItem {
 }
 
 /// Decrypted credentials for the active (or preferred) row in `infra_llm_models`.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `Debug` is implemented manually to keep `api_key` out of any log line —
+/// any future `tracing::debug!(?model)` would otherwise leak the raw key.
+#[derive(Clone, PartialEq)]
 pub struct ResolvedActiveLlmModel {
     /// Local model name used for routing, telemetry, fallback_chain lookups,
     /// and capture-file labels. Unique per row.
@@ -217,8 +353,30 @@ pub struct ResolvedActiveLlmModel {
     pub fallback_chain: Vec<String>,
     pub tags: Vec<String>,
     pub request_body_overrides: Option<Map<String, Value>>,
+    pub prompt_cache_capability: Option<PromptCacheCapabilityData>,
     /// Probe-determined thinking capability. NULL if unprobed.
     pub thinking_capability: Option<ThinkingCapability>,
+    /// Context window size from model config (`.models.yaml` or DB).
+    /// `None` means use the hardcoded fallback table.
+    pub context_window: Option<u32>,
+}
+
+impl std::fmt::Debug for ResolvedActiveLlmModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedActiveLlmModel")
+            .field("model_name", &self.model_name)
+            .field("wire_model_name", &self.wire_model_name)
+            .field("api_key", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("provider", &self.provider)
+            .field("fallback_chain", &self.fallback_chain)
+            .field("tags", &self.tags)
+            .field("request_body_overrides", &self.request_body_overrides)
+            .field("prompt_cache_capability", &self.prompt_cache_capability)
+            .field("thinking_capability", &self.thinking_capability)
+            .field("context_window", &self.context_window)
+            .finish()
+    }
 }
 
 impl ResolvedActiveLlmModel {
@@ -231,6 +389,42 @@ impl ResolvedActiveLlmModel {
     pub fn upstream_model_name(&self) -> &str {
         self.wire_model_name.as_deref().unwrap_or(&self.model_name)
     }
+}
+
+fn models_yaml_path(working_dir: Option<&Path>) -> Option<PathBuf> {
+    let start = match working_dir {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().ok()?,
+    };
+    let start = if start.is_dir() {
+        start
+    } else {
+        start.parent()?.to_path_buf()
+    };
+    start
+        .ancestors()
+        .map(|dir| dir.join(".models.yaml"))
+        .find(|path| path.is_file())
+}
+
+#[must_use]
+pub fn prompt_cache_capability_from_models_yaml(
+    model_name: &str,
+    working_dir: Option<&Path>,
+) -> Option<PromptCacheCapabilityData> {
+    let path = models_yaml_path(working_dir)?;
+    let yaml = std::fs::read_to_string(path).ok()?;
+    let entries: Vec<ModelsYamlPromptCacheEntry> = serde_yaml_ng::from_str(&yaml).ok()?;
+    entries.into_iter().find_map(|entry| {
+        if entry.name != model_name {
+            return None;
+        }
+        entry.prompt_cache_capability.or_else(|| {
+            entry
+                .quirks
+                .and_then(|quirks| quirks.prompt_cache_capability)
+        })
+    })
 }
 
 fn build_resolved_active_llm_from_row(
@@ -281,7 +475,10 @@ fn build_resolved_active_llm_from_row(
 
     let fallback_chain = quirks.fallback_chain;
     let wire_model_name = quirks.wire_model_name;
+    let prompt_cache_capability = quirks.prompt_cache_capability;
     let request_body_overrides = quirks.request_body_overrides;
+
+    let context_window: Option<i32> = row.try_get("context_window").ok().flatten();
 
     Ok(ResolvedActiveLlmModel {
         model_name,
@@ -292,7 +489,9 @@ fn build_resolved_active_llm_from_row(
         fallback_chain,
         tags,
         request_body_overrides,
+        prompt_cache_capability,
         thinking_capability,
+        context_window: context_window.map(|cw| cw as u32),
     })
 }
 
@@ -685,19 +884,109 @@ pub async fn resolve_reasoning_model(
     build_resolved_active_llm_from_row(&rows[best_idx], encryptor)
 }
 
-/// Resolve the cheapest model tagged `"selector"` for memory-related
-/// decisions (relevance filtering, lesson synthesis, L1b extraction).
+fn row_has_selector_tag(row: &sqlx::mysql::MySqlRow) -> bool {
+    let tags_json: String = row
+        .try_get("tags_json")
+        .unwrap_or_else(|_| "[]".to_string());
+    tags_json.contains("\"selector\"")
+}
+
+fn row_thinking_capability(row: &sqlx::mysql::MySqlRow) -> Option<ThinkingCapability> {
+    let thinking_cap_str: Option<String> = row.try_get("thinking_capability").ok().flatten();
+    ThinkingCapability::from_db(thinking_cap_str.as_deref())
+}
+
+/// Priority tiers for model sorting in the memory-selector chain.
 ///
-/// 1. Cheapest active model tagged `"selector"`.
-/// 2. Fallback: cheapest active model overall.
+/// Lower value = higher preference. Sorted by:
+/// 1. `selector`-tagged models (`has_selector_tag = true`) always preferred over
+///    general models.
+/// 2. Within each tier, models compatible with `thinking=off` are preferred over
+///    models that only support thinking modes.
+/// 3. Models with unknown capability (capability is `None`, or `Both` which
+///    means "supports both on/off but we haven't concretely probed it") sit
+///    in the middle — preferred over known thinking-only, but behind known
+///    off-compatible.
+fn memory_model_priority(
+    has_selector_tag: bool,
+    thinking_capability: Option<ThinkingCapability>,
+) -> u8 {
+    // Both is treated as off-compatible because it means the model supports
+    // thinking=off.  It is also treated as "not incompatible" so that a
+    // `Both` model sorts *ahead* of a known thinking-only model but *behind*
+    // a model we know is explicitly off-compatible (i.e. `None` with proven
+    // off support).
+    let off_compatible = matches!(
+        thinking_capability,
+        Some(ThinkingCapability::Both | ThinkingCapability::None)
+    );
+    let incompatible = matches!(
+        thinking_capability,
+        Some(ThinkingCapability::EffortOnly | ThinkingCapability::NativeOnly)
+    );
+    // (has_selector_tag, off_compatible, incompatible):
+    //   false,false means unknown/unprobed capability (including None option).
+    match (has_selector_tag, off_compatible, incompatible) {
+        (true, true, _) => 0,       // selector + known off-compatible
+        (true, false, false) => 1,  // selector + unknown capability
+        (false, true, _) => 2,      // general + known off-compatible
+        (false, false, false) => 3, // general + unknown capability
+        (true, false, true) => 4,   // selector + thinking-only (worst within selector)
+        (false, false, true) => 5,  // general + thinking-only (worst overall)
+    }
+}
+
+fn rank_memory_model_candidate_indices(rows: &[sqlx::mysql::MySqlRow]) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..rows.len()).collect();
+    indices.sort_by(|left, right| {
+        let left_row = &rows[*left];
+        let right_row = &rows[*right];
+        let left_priority = memory_model_priority(
+            row_has_selector_tag(left_row),
+            row_thinking_capability(left_row),
+        );
+        let right_priority = memory_model_priority(
+            row_has_selector_tag(right_row),
+            row_thinking_capability(right_row),
+        );
+        left_priority
+            .cmp(&right_priority)
+            .then_with(|| {
+                let left_pricing: String = left_row
+                    .try_get("pricing_json")
+                    .unwrap_or_else(|_| "{}".to_string());
+                let right_pricing: String = right_row
+                    .try_get("pricing_json")
+                    .unwrap_or_else(|_| "{}".to_string());
+                score_completion(&left_pricing)
+                    .partial_cmp(&score_completion(&right_pricing))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                let left_name: String = left_row.try_get("model_name").unwrap_or_default();
+                let right_name: String = right_row.try_get("model_name").unwrap_or_default();
+                left_name.cmp(&right_name)
+            })
+    });
+    indices
+}
+
+/// Resolve ordered candidates for memory-related decisions (relevance
+/// filtering, lesson synthesis, L1b extraction).
 ///
-/// Callers use `thinking_capability` from the resolved model to decide
-/// whether to apply thinking suppression.
-pub async fn resolve_memory_model(
+/// Ordering prioritizes:
+/// 1. `"selector"`-tagged models that are known to support `thinking=off`
+/// 2. unprobed selector-tagged models
+/// 3. non-selector models that are known to support `thinking=off`
+/// 4. unprobed non-selector models
+/// 5. thinking-only models as a last resort
+///
+/// Within each bucket, cheaper completion pricing wins.
+pub async fn resolve_memory_models(
     matrixone: &MatrixOneSettings,
     encryptor: &FernetTokenEncryptor,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
-) -> Result<ResolvedActiveLlmModel, String> {
+) -> Result<Vec<ResolvedActiveLlmModel>, String> {
     let pool = acquire_pool(pool, matrixone).await?;
 
     let rows = sqlx::query(&format!(
@@ -711,41 +1000,23 @@ pub async fn resolve_memory_model(
         return Err("No active LLM model configured.".to_string());
     }
 
-    let selector_rows: Vec<usize> = rows
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| {
-            let tags_json: String = row
-                .try_get("tags_json")
-                .unwrap_or_else(|_| "[]".to_string());
-            tags_json.contains("\"selector\"")
-        })
-        .map(|(i, _)| i)
-        .collect();
+    rank_memory_model_candidate_indices(&rows)
+        .into_iter()
+        .map(|index| build_resolved_active_llm_from_row(&rows[index], encryptor))
+        .collect()
+}
 
-    let pick_cheapest_in = |indices: &[usize]| -> usize {
-        let entries: Vec<(String, String)> = indices
-            .iter()
-            .map(|&i| {
-                let name: String = rows[i].try_get("model_name").unwrap_or_default();
-                let pricing: String = rows[i]
-                    .try_get("pricing_json")
-                    .unwrap_or_else(|_| "{}".to_string());
-                (name, pricing)
-            })
-            .collect();
-        let local_best = rank_cheapest_index(&entries);
-        indices[local_best]
-    };
-
-    let best_idx = if !selector_rows.is_empty() {
-        pick_cheapest_in(&selector_rows)
-    } else {
-        let all_indices: Vec<usize> = (0..rows.len()).collect();
-        pick_cheapest_in(&all_indices)
-    };
-
-    build_resolved_active_llm_from_row(&rows[best_idx], encryptor)
+/// Resolve the best memory-model candidate.
+pub async fn resolve_memory_model(
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    pool: Option<&sqlx::Pool<sqlx::MySql>>,
+) -> Result<ResolvedActiveLlmModel, String> {
+    resolve_memory_models(matrixone, encryptor, pool)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "No active LLM model configured.".to_string())
 }
 
 /// Return the index of the cheapest entry by `pricing.completion`.
@@ -2205,6 +2476,13 @@ mod tests {
     }
 
     #[test]
+    fn alias_exact_match_beats_deepseek_alias_substring_overlap() {
+        let active = names(&["deepseek-v4-flash", "deepseek-v4-flash-anthropic"]);
+        let hit = resolve_model_alias("deepseek-v4-flash", &active).unwrap();
+        assert_eq!(hit, "deepseek-v4-flash");
+    }
+
+    #[test]
     fn alias_unknown_name_reports_not_found_with_candidates() {
         let active = names(&["qwen-flash", "MiniMax-M2.7"]);
         let err = resolve_model_alias("gpt-5", &active).unwrap_err();
@@ -2568,7 +2846,9 @@ mod tests {
             fallback_chain: vec![],
             tags: vec![],
             request_body_overrides: None,
+            prompt_cache_capability: None,
             thinking_capability: None,
+            context_window: None,
         };
         assert_eq!(r.upstream_model_name(), "deepseek-v4-pro");
         // The local name is still reachable for routing / metrics.
@@ -2586,7 +2866,9 @@ mod tests {
             fallback_chain: vec![],
             tags: vec![],
             request_body_overrides: None,
+            prompt_cache_capability: None,
             thinking_capability: None,
+            context_window: None,
         };
         assert_eq!(r.upstream_model_name(), "claude-sonnet-4-6");
     }
@@ -2624,6 +2906,50 @@ mod tests {
             q.request_body_overrides
                 .as_ref()
                 .and_then(|m| m.get("context_management"))
+        );
+    }
+
+    #[test]
+    fn quirks_prompt_cache_capability_round_trips_through_json() {
+        let q = QuirksData {
+            prompt_cache_capability: Some(PromptCacheCapabilityData {
+                protocol: PromptCacheProtocolData::StrictHistoryMatch,
+                volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
+                reuse_scope: Some(PromptCacheReuseScopeData::ConversationTurns),
+            }),
+            ..QuirksData::default()
+        };
+
+        let json = serde_json::to_string(&q).unwrap();
+        assert!(json.contains("prompt_cache_capability"));
+        assert!(json.contains("strict_history_match"));
+        assert!(json.contains("current_user_only"));
+        assert!(json.contains("conversation_turns"));
+        let restored: QuirksData = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.prompt_cache_capability, q.prompt_cache_capability);
+    }
+
+    #[test]
+    fn quirks_prompt_cache_capability_accepts_legacy_variant_names() {
+        let q: QuirksData = serde_json::from_str(
+            r#"{
+                "prompt_cache_capability": {
+                    "protocol": "StrictHistoryMatch",
+                    "volatile_placement": "CurrentUserOnly",
+                    "reuse_scope": "IntraTurnRounds"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            q.prompt_cache_capability,
+            Some(PromptCacheCapabilityData {
+                protocol: PromptCacheProtocolData::StrictHistoryMatch,
+                volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
+                reuse_scope: Some(PromptCacheReuseScopeData::IntraTurnRounds),
+            })
         );
     }
 
@@ -2692,6 +3018,11 @@ mod tests {
             system_as_user_prefix: true,
             fallback_chain: vec!["claude-haiku".into(), "gpt-4o-mini".into()],
             wire_model_name: Some("deepseek-v4-pro".into()),
+            prompt_cache_capability: Some(PromptCacheCapabilityData {
+                protocol: PromptCacheProtocolData::StrictHistoryMatch,
+                volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
+                reuse_scope: Some(PromptCacheReuseScopeData::IntraTurnRounds),
+            }),
             request_body_overrides: Some(Map::from_iter([(
                 "context_management".into(),
                 serde_json::json!({"edits": [{"type": "clear_tool_uses_20250919"}]}),
@@ -2700,6 +3031,63 @@ mod tests {
         let json = serde_json::to_string(&q).unwrap();
         let restored: QuirksData = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, q);
+    }
+
+    #[test]
+    fn prompt_cache_reuse_scope_supports_intra_turn_fallback() {
+        assert!(
+            PromptCacheReuseScopeData::ConversationTurns
+                .supports(PromptCacheReuseScopeData::IntraTurnRounds)
+        );
+        assert!(
+            !PromptCacheReuseScopeData::IntraTurnRounds
+                .supports(PromptCacheReuseScopeData::ConversationTurns)
+        );
+    }
+
+    #[test]
+    fn prompt_cache_capability_from_models_yaml_reads_top_level_and_walks_ancestors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let nested = repo.join("rust").join("crates").join("astra-cli");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            repo.join(".models.yaml"),
+            r#"
+- name: kimi-k2.6
+  prompt_cache_capability:
+    protocol: openai_auto_prefix
+    volatile_placement: tail_suffix
+    reuse_scope: intra_turn_rounds
+- name: deepseek-v4-flash
+  quirks:
+    prompt_cache_capability:
+      protocol: strict_history_match
+      volatile_placement: current_user_only
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            prompt_cache_capability_from_models_yaml("kimi-k2.6", Some(&nested)),
+            Some(PromptCacheCapabilityData {
+                protocol: PromptCacheProtocolData::OpenAiAutoPrefix,
+                volatile_placement: PromptCacheVolatilePlacementData::TailSuffix,
+                reuse_scope: Some(PromptCacheReuseScopeData::IntraTurnRounds),
+            })
+        );
+        assert_eq!(
+            prompt_cache_capability_from_models_yaml("deepseek-v4-flash", Some(&nested)),
+            Some(PromptCacheCapabilityData {
+                protocol: PromptCacheProtocolData::StrictHistoryMatch,
+                volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
+                reuse_scope: None,
+            })
+        );
+        assert_eq!(
+            prompt_cache_capability_from_models_yaml("missing", Some(&nested)),
+            None
+        );
     }
 
     #[test]
@@ -3115,6 +3503,59 @@ mod tests {
         assert_eq!(
             selector_entries[best].0, "qwen-flash",
             "cheapest selector should be qwen-flash"
+        );
+    }
+
+    #[test]
+    fn memory_model_priority_prefers_nonthinking_selector() {
+        assert!(
+            memory_model_priority(true, Some(ThinkingCapability::None))
+                < memory_model_priority(true, Some(ThinkingCapability::EffortOnly))
+        );
+        assert!(
+            memory_model_priority(true, Some(ThinkingCapability::Both))
+                < memory_model_priority(true, Some(ThinkingCapability::NativeOnly))
+        );
+    }
+
+    #[test]
+    fn memory_model_priority_prefers_general_nonthinking_over_selector_thinking_only() {
+        assert!(
+            memory_model_priority(false, Some(ThinkingCapability::None))
+                < memory_model_priority(true, Some(ThinkingCapability::EffortOnly))
+        );
+    }
+
+    #[test]
+    fn memory_model_priority_unknown_capability_sits_between_off_and_thinking_only() {
+        // No capability info (None) -> priority 1 (selector) or 3 (general).
+        // It should be worse than known-off-compatible but better than thinking-only.
+        let unknown_selector = memory_model_priority(true, None);
+        let unknown_general = memory_model_priority(false, None);
+        let off_selector = memory_model_priority(true, Some(ThinkingCapability::None));
+        let off_general = memory_model_priority(false, Some(ThinkingCapability::None));
+        let thinking_selector = memory_model_priority(true, Some(ThinkingCapability::EffortOnly));
+        let thinking_general = memory_model_priority(false, Some(ThinkingCapability::NativeOnly));
+
+        // Unknown is worse (higher number) than known off-compatible.
+        assert!(off_selector < unknown_selector);
+        assert!(off_general < unknown_general);
+
+        // Unknown is better (lower number) than known thinking-only.
+        assert!(unknown_selector < thinking_selector);
+        assert!(unknown_general < thinking_general);
+    }
+
+    #[test]
+    fn memory_model_priority_both_equals_none_for_sorting() {
+        // Both and None (the value) both mean off-compatible — same priority tier.
+        assert_eq!(
+            memory_model_priority(true, Some(ThinkingCapability::Both)),
+            memory_model_priority(true, Some(ThinkingCapability::None)),
+        );
+        assert_eq!(
+            memory_model_priority(false, Some(ThinkingCapability::Both)),
+            memory_model_priority(false, Some(ThinkingCapability::None)),
         );
     }
 

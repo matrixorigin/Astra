@@ -206,7 +206,7 @@ pub(crate) async fn handle_slash_command(
                     eprintln!(
                         "  {} {}",
                         theme::icon_ok(),
-                        format!("Model set to: {model_with_suffix}").green()
+                        format!("Set model to {model_with_suffix}").green()
                     );
                 } else {
                     eprintln!("{}", "  Cancelled.".dim());
@@ -289,7 +289,7 @@ pub(crate) async fn handle_slash_command(
                 &state.runtime_config,
                 Some(base_model),
             );
-            eprintln!("{}", format!("  \u{2713}  Model set to: {}", arg).green());
+            eprintln!("{}", format!("  \u{2713}  Set model to {}", arg).green());
             if let Some(ref j) = state.journal {
                 let _ = j.append(&session_journal::JournalEvent::config_change(
                     state.session_id.as_deref(),
@@ -324,6 +324,10 @@ pub(crate) async fn handle_slash_command(
         },
 
         "/debug" => handle_debug_command(arg, state),
+
+        "/cache" => {
+            slash_cache::handle_cache_command(arg, state);
+        }
 
         "/inspect" => {
             slash_inspect::handle_inspect_command(arg, state);
@@ -439,7 +443,7 @@ pub(crate) async fn handle_slash_command(
                     ),
                 },
                 "trace" => {
-                    for line in astra_turn_core::permission_audit::format_snapshot_lines(50) {
+                    for line in astra_turn_core::permission::audit::format_snapshot_lines(50) {
                         eprintln!("{line}");
                     }
                 }
@@ -449,7 +453,7 @@ pub(crate) async fn handle_slash_command(
                         eprintln!("  {} Missing export path", theme::icon_warn());
                     } else {
                         let lines =
-                            astra_turn_core::permission_audit::snapshot_redacted_jsonl_lines();
+                            astra_turn_core::permission::audit::snapshot_redacted_jsonl_lines();
                         let body = if lines.is_empty() {
                             String::new()
                         } else {

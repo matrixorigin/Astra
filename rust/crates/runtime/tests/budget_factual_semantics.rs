@@ -133,7 +133,7 @@ fn compact_resume_directive_stays_factual_not_adversarial() {
 
 #[test]
 fn adaptive_budget_reduction_is_opt_in_not_default() {
-    // The 85% → reduce-budget path in agentic_adaptive_tuning is a
+    // The 85% → reduce-budget path in agentic::adaptive_tuning is a
     // self-defeating loop: at high pressure it LOWERS the ceiling the
     // next turn must fit under, which raises the probability of another
     // high-pressure event, which lowers the ceiling again. Default off;

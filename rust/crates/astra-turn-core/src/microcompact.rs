@@ -66,6 +66,21 @@ impl Default for ProviderCacheStrategy {
 }
 
 impl ProviderCacheStrategy {
+    #[must_use]
+    pub fn from_cache_capability(capability: crate::cache_placement::CacheCapability) -> Self {
+        match capability.protocol {
+            crate::cache_placement::CacheProtocol::MarkerExplicit
+            | crate::cache_placement::CacheProtocol::BedrockCachePoint => Self {
+                prompt_cache_protocol: PromptCacheProtocol::AnthropicCacheControl,
+                compact_strategy: CompactStrategy::Minimal,
+                supports_cache_control: true,
+            },
+            crate::cache_placement::CacheProtocol::OpenAiAutoPrefix
+            | crate::cache_placement::CacheProtocol::StrictHistoryMatch
+            | crate::cache_placement::CacheProtocol::None => Self::default(),
+        }
+    }
+
     /// Derive provider cache capabilities from a provider or model hint.
     ///
     /// This is intentionally capability-shaped rather than placeholder-shaped:
@@ -117,6 +132,17 @@ impl ProviderCacheStrategy {
         }
         model.map(Self::from_provider_hint).unwrap_or_default()
     }
+
+    #[must_use]
+    pub fn from_explicit_or_provider_model(
+        explicit: Option<crate::cache_placement::CacheCapability>,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Self {
+        explicit
+            .map(Self::from_cache_capability)
+            .unwrap_or_else(|| Self::from_provider_and_model(provider, model))
+    }
 }
 
 impl CompactStrategy {
@@ -129,6 +155,16 @@ impl CompactStrategy {
     /// Derive strategy from explicit provider plus model fallback.
     pub fn from_provider_and_model(provider: Option<&str>, model: Option<&str>) -> Self {
         ProviderCacheStrategy::from_provider_and_model(provider, model).compact_strategy
+    }
+
+    #[must_use]
+    pub fn from_explicit_or_provider_model(
+        explicit: Option<crate::cache_placement::CacheCapability>,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Self {
+        ProviderCacheStrategy::from_explicit_or_provider_model(explicit, provider, model)
+            .compact_strategy
     }
 }
 
@@ -261,7 +297,7 @@ impl ToolCallMaps {
 const PERSISTED_TAG: &str = "<persisted-output>";
 
 fn is_compactable_tool_name(name: &str) -> bool {
-    crate::tool_categories::registry().is_compactable(name)
+    crate::tool::categories::registry().is_compactable(name)
 }
 
 /// How many recent compactable tool results to keep intact.
@@ -416,7 +452,7 @@ pub fn compact_tool_results_adaptive_with_persistence_protected_prefix(
 pub fn compact_tool_results_state_aware(
     messages: &mut [Value],
     pressure: f64,
-    facts: &crate::cloud_session_facts::SessionFacts,
+    facts: &crate::cloud::session_facts::SessionFacts,
     pin_turns: u32,
     strategy: CompactStrategy,
 ) -> CompactStats {
@@ -429,7 +465,7 @@ pub fn compact_tool_results_state_aware(
 pub fn compact_tool_results_state_aware_with_persistence(
     messages: &mut [Value],
     pressure: f64,
-    facts: &crate::cloud_session_facts::SessionFacts,
+    facts: &crate::cloud::session_facts::SessionFacts,
     pin_turns: u32,
     strategy: CompactStrategy,
     session_dir: Option<&std::path::Path>,
@@ -448,7 +484,7 @@ pub fn compact_tool_results_state_aware_with_persistence(
 pub fn compact_tool_results_state_aware_with_persistence_protected_prefix(
     messages: &mut [Value],
     pressure: f64,
-    facts: &crate::cloud_session_facts::SessionFacts,
+    facts: &crate::cloud::session_facts::SessionFacts,
     pin_turns: u32,
     strategy: CompactStrategy,
     session_dir: Option<&std::path::Path>,
@@ -470,7 +506,7 @@ pub fn compact_tool_results_state_aware_with_persistence_protected_prefix(
 fn compact_tool_results_with_pin_list(
     messages: &mut [Value],
     config: &AdaptiveCompactConfig,
-    facts: &crate::cloud_session_facts::SessionFacts,
+    facts: &crate::cloud::session_facts::SessionFacts,
     pin_turns: u32,
     strategy: CompactStrategy,
     session_dir: Option<&std::path::Path>,
@@ -552,9 +588,10 @@ fn compact_tool_results_with_pin_list(
                     .or_else(|| messages[idx].get("name").and_then(Value::as_str))
                     .unwrap_or("unknown")
                     .to_string();
-                let persisted = crate::tool_result_storage::maybe_persist_tool_result_unconditional(
-                    dir, &call_id, &tool_name, &content,
-                );
+                let persisted =
+                    crate::tool::result::storage::maybe_persist_tool_result_unconditional(
+                        dir, &call_id, &tool_name, &content,
+                    );
                 if !persisted {
                     // Disk write failed — do not clear; keep the content in memory.
                     continue;
@@ -768,9 +805,10 @@ fn compact_tool_results_with_persistence(
                     .or_else(|| messages[idx].get("name").and_then(Value::as_str))
                     .unwrap_or("unknown")
                     .to_string();
-                let persisted = crate::tool_result_storage::maybe_persist_tool_result_unconditional(
-                    dir, &call_id, &tool_name, &content,
-                );
+                let persisted =
+                    crate::tool::result::storage::maybe_persist_tool_result_unconditional(
+                        dir, &call_id, &tool_name, &content,
+                    );
                 if !persisted {
                     continue;
                 }
@@ -854,6 +892,25 @@ mod tests {
         assert_eq!(estimate_tokens(""), 0);
         // Short content rounds down
         assert_eq!(estimate_tokens("abc"), 0);
+    }
+
+    #[test]
+    fn explicit_cache_capability_overrides_provider_model_strategy() {
+        let strategy = ProviderCacheStrategy::from_explicit_or_provider_model(
+            Some(crate::cache_placement::CacheCapability {
+                protocol: crate::cache_placement::CacheProtocol::MarkerExplicit,
+                volatile_placement: crate::cache_placement::VolatilePlacement::MarkerIsolated,
+                reuse_scope: Some(crate::cache_placement::CacheReuseScope::ConversationTurns),
+            }),
+            Some("openai"),
+            Some("proxy-claude"),
+        );
+        assert_eq!(
+            strategy.prompt_cache_protocol,
+            PromptCacheProtocol::AnthropicCacheControl
+        );
+        assert_eq!(strategy.compact_strategy, CompactStrategy::Minimal);
+        assert!(strategy.supports_cache_control);
     }
 
     // ── Count-based compaction ───────────────────────────────────────────
@@ -1990,7 +2047,7 @@ mod tests {
 
     #[test]
     fn state_aware_pins_active_files() {
-        use crate::cloud_session_facts::{FileEntry, SessionFacts};
+        use crate::cloud::session_facts::{FileEntry, SessionFacts};
         let mut facts = SessionFacts {
             turn: 10,
             ..Default::default()
@@ -2083,7 +2140,7 @@ mod tests {
 
     #[test]
     fn state_aware_with_empty_facts_behaves_like_normal() {
-        use crate::cloud_session_facts::SessionFacts;
+        use crate::cloud::session_facts::SessionFacts;
         let facts = SessionFacts::default(); // no active files
 
         let mut msgs: Vec<Value> = Vec::new();
@@ -2263,7 +2320,7 @@ mod tests {
             tool_result("c2", &big),
         ];
 
-        let facts = crate::cloud_session_facts::SessionFacts::default();
+        let facts = crate::cloud::session_facts::SessionFacts::default();
         // pressure 0.95 → keep=1, so c1 gets compacted
         compact_tool_results_state_aware(&mut messages, 0.95, &facts, 5, Default::default());
 
@@ -2561,7 +2618,7 @@ mod tests {
                 continue;
             }
             let call_id = msg["tool_call_id"].as_str().unwrap();
-            let recovered = crate::tool_result_storage::read_persisted_result(&dir, call_id);
+            let recovered = crate::tool::result::storage::read_persisted_result(&dir, call_id);
             assert!(
                 recovered.is_some(),
                 "cleared result for {call_id} must have been persisted to disk"

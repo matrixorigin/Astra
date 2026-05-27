@@ -12,6 +12,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Clear, Paragraph, Widget};
 
 use super::bottom_pane::{BottomPane, footer::Footer};
+use super::render::line_utils::sanitize_lines_for_terminal;
 use super::render::renderable::{FlexRenderable, Renderable, RenderableItem};
 use super::task_board_observer::TaskBoardObserver;
 use super::terminal::TerminalGuard;
@@ -169,7 +170,7 @@ pub(crate) fn active_viewport(
     };
 
     let active = chat_widget.active_cell().and_then(|cell| {
-        let lines = cell.display_lines(inner_w);
+        let lines = sanitize_lines_for_terminal(cell.display_lines(inner_w));
         if lines.is_empty() {
             None
         } else {

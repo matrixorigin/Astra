@@ -298,7 +298,7 @@ pub struct SpawnRunResult {
 
 /// Trait for executing spawned agent runs.
 ///
-/// Similar to `SubRunExecutor` but specifically for spawn_agent.
+/// Similar to `SubRunExecutor` but specifically for dynamic agent spawning.
 /// CLI layer implements this to run the agentic loop.
 #[async_trait]
 pub trait SpawnAgentExecutor: Send + Sync {
@@ -337,7 +337,7 @@ pub struct DynamicAgentSpawner {
     background_abort_handles: Arc<RwLock<HashMap<String, tokio::task::AbortHandle>>>,
     /// Agent IDs spawned in background mode, for result collection after drain.
     background_agent_ids: Arc<std::sync::Mutex<Vec<String>>>,
-    /// Completion notifiers: get_agent_result awaits these instead of polling.
+    /// Completion notifiers: `agent(action='get_result')` awaits these instead of polling.
     completion_notifiers: Arc<RwLock<HashMap<String, Arc<tokio::sync::Notify>>>>,
     /// Optional fork-prefix store for cache inheritance across
     /// parent/child spawns. When `None` (default), spawn behavior is
@@ -581,7 +581,7 @@ impl DynamicAgentSpawner {
 
     /// Spawn a new agent from the given specification.
     ///
-    /// This is called by the `spawn_agent` tool handler.
+    /// This is called by the `agent(action='spawn')` handler.
     pub async fn spawn(
         &self,
         input: SpawnAgentInput,
@@ -1005,6 +1005,7 @@ impl DynamicAgentSpawner {
                                 error: run_result
                                     .error
                                     .unwrap_or_else(|| "agent run failed".to_string()),
+                                duration_ms,
                             }),
                             _ => Ok(SpawnAgentOutput::Completed {
                                 agent_id,
@@ -1036,7 +1037,10 @@ impl DynamicAgentSpawner {
                         .await;
                         self.unregister_mailbox(&agent_id).await;
 
-                        Ok(SpawnAgentOutput::Failed { error: e })
+                        Ok(SpawnAgentOutput::Failed {
+                            error: e,
+                            duration_ms: 0,
+                        })
                     }
                 }
             } else {
@@ -1677,7 +1681,7 @@ pub enum SpawnError {
 /// "reconstruct failed" event here; currently the failure is silent
 /// because no sink is wired through at this layer.
 ///
-/// Visibility: `pub(crate)` so `server::delegation_engine` can
+/// Visibility: `pub(crate)` so `server::delegation::engine` can
 /// share the same helper — delegate path wires fork-prefix exactly
 /// the same way the spawner does (Bug B step 2).
 pub(crate) fn build_inherited_child_prefix(
@@ -1801,7 +1805,7 @@ fn create_agent_worktree(parent_dir: &std::path::Path, run_id: &str) -> Result<P
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::delegation_engine::DelegationTracker;
+    use crate::server::delegation::engine::DelegationTracker;
     use astra_messaging::in_process::InProcessTransport;
     use astra_messaging::router::AgentMailboxRouter;
     use astra_messaging::types::{AgentMessage, MessagePayload, MessageTarget};
@@ -2276,7 +2280,7 @@ mod tests {
         let result = spawner.spawn(input, &context).await.unwrap();
         assert!(matches!(
             result,
-            SpawnAgentOutput::Failed { ref error } if error == "boom"
+            SpawnAgentOutput::Failed { ref error, .. } if error == "boom"
         ));
     }
 

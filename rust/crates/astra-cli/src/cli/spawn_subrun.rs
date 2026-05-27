@@ -13,8 +13,8 @@ use astra_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
-    turn::agentic_loop_finalization::run_agentic_loop_with_host,
-    turn::agentic_loop_host::{
+    turn::agentic_loop::finalization::run_agentic_loop_with_host,
+    turn::agentic_loop::host::{
         AgenticLoopOutcome, AgenticLoopState, CancellationState, MessagingState, SkillState,
         StopHookState,
     },
@@ -270,7 +270,7 @@ fn stream_event_to_agent_live_kind(
         }
         StreamEvent::StatusLine(text) => Some(AgentLiveEventKind::Status(text)),
         StreamEvent::PermissionAutoApproved { tool, reason } => Some(AgentLiveEventKind::Status(
-            astra_turn_core::permission_notice::format_auto_approved_permission(&tool, &reason)
+            astra_turn_core::permission::notice::format_auto_approved_permission(&tool, &reason)
                 .trim()
                 .to_string(),
         )),
@@ -283,7 +283,11 @@ fn stream_event_to_agent_live_kind(
         StreamEvent::ToolOutput { name, lines, bytes } => Some(AgentLiveEventKind::Status(
             format!("{name} streaming: {lines} lines, {bytes} bytes"),
         )),
-        StreamEvent::Thinking(_) | StreamEvent::AgentLive(_) => None,
+        StreamEvent::Thinking(_)
+        | StreamEvent::AgentLive(_)
+        | StreamEvent::ExplainReport(_)
+        | StreamEvent::ExplainText(_)
+        | StreamEvent::VerdictReport(_) => None,
     }
 }
 
@@ -665,14 +669,19 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 token: self.cancel_token.clone(),
             },
             error_recovery: Default::default(),
-            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
-                astra_turn_core::pipeline_config::PipelineConfig::default(),
-            )),
+            pipeline_session: Some(
+                astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
+                    astra_turn_core::pipeline_config::PipelineConfig::default(),
+                    astra_runtime::turn::session_current_date::resolve_session_current_date(
+                        self.active_session_id.as_deref().unwrap_or(""),
+                    ),
+                ),
+            ),
             message: config.task.clone(),
             recent_tools: Vec::new(),
             task_profile,
             last_turn_policy:
-                astra_runtime::turn::agentic_loop_host::TurnInteractionPolicy::default(),
+                astra_runtime::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             api: self.api.clone(),
             api_token: token.clone(),
             delegation_engine: None,
@@ -687,6 +696,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
             pinned_tool_schema_tokens: 0,
+            sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
             budget_wrapup_ignored_rounds: 0,

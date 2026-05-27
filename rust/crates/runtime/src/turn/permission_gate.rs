@@ -12,7 +12,7 @@ use crate::orchestration::permission_sync::{
     PermissionRequest, PermissionResponse, PermissionSyncContext, PermissionUpdate,
 };
 use astra_messaging::router::AgentMailbox;
-use astra_turn_core::permission_engine::{DecisionSource, HardDecision, evaluate_permission};
+use astra_turn_core::permission::engine::{DecisionSource, HardDecision, evaluate_permission};
 use astra_turn_core::tool_argument_hints::normalize_llm_function_arguments;
 
 /// Result of a permission check.
@@ -68,7 +68,7 @@ pub async fn check_tool_permission(
     let prompt = {
         let ctx_guard = ctx.read().await;
         let envelope = evaluate_permission(tool_name, &normalized_args, &ctx_guard);
-        astra_turn_core::permission_audit::record_evaluated_envelope(
+        astra_turn_core::permission::audit::record_evaluated_envelope(
             tool_name,
             &normalized_args,
             &envelope,
@@ -256,7 +256,7 @@ mod tests {
     use crate::orchestration::permission_sync::{
         InheritedPermissions, PermissionMode, PermissionResponseMessaging, PermissionRule,
     };
-    use astra_turn_core::permission_types::RuleMatchContext;
+    use astra_turn_core::permission::types::RuleMatchContext;
     use std::collections::HashSet;
 
     fn is_allowed(result: &PermissionCheckResult) -> bool {
@@ -609,7 +609,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_actions_request_parent_even_when_tool_is_allowed() {
-        use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
+        use crate::server::delegation::engine::{DelegationTracker, SubRunRecord, SubRunState};
         use astra_messaging::in_process::InProcessTransport;
         use astra_messaging::router::AgentMailboxRouter;
         use astra_messaging::types::AgentAddress;
@@ -690,7 +690,7 @@ mod tests {
 
     #[tokio::test]
     async fn requests_parent_and_applies_updates() {
-        use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
+        use crate::server::delegation::engine::{DelegationTracker, SubRunRecord, SubRunState};
         use astra_messaging::in_process::InProcessTransport;
         use astra_messaging::router::AgentMailboxRouter;
         use astra_messaging::types::AgentAddress;
@@ -960,7 +960,7 @@ mod tests {
 
     #[tokio::test]
     async fn denied_rules_do_not_request_parent() {
-        use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
+        use crate::server::delegation::engine::{DelegationTracker, SubRunRecord, SubRunState};
         use astra_messaging::in_process::InProcessTransport;
         use astra_messaging::router::AgentMailboxRouter;
         use astra_messaging::types::AgentAddress;

@@ -24,7 +24,7 @@ use astra_runtime::orchestration::{
     PermissionRequestHandler, PermissionResponseMessaging, PermissionRule, PermissionSyncContext,
     PermissionUpdate,
 };
-use astra_runtime::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
+use astra_runtime::server::delegation::engine::{DelegationTracker, SubRunRecord, SubRunState};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 

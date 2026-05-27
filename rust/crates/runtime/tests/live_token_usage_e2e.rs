@@ -42,7 +42,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use astra_runtime::turn::bedrock_eventstream::FrameDecoder;
+use astra_runtime::turn::bedrock::eventstream::FrameDecoder;
 use astra_runtime::turn::token_usage::{TokenUsage, UsageDialect, extract_usage};
 use futures_util::StreamExt;
 use serde_json::{Value, json};

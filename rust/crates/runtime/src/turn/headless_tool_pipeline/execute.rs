@@ -1,8 +1,8 @@
 use std::time::Instant;
 
-use super::super::agentic_headless_round::HeadlessStderrStyle;
+use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::*;
-use crate::turn::agentic_loop_tool_support::edge_tool_status_exit_code;
+use crate::turn::agentic_loop::tool_support::edge_tool_status_exit_code;
 use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::headless_tool_assembly::READ_ONLY_TOOLS;
 use astra_turn_core::headless_tool_postprocess::{

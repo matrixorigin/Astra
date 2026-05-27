@@ -49,6 +49,16 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
             _ => ToolIdempotency::NonIdempotent,
         },
 
+        // Consolidated `git` tool: read-only subcommands are safe to retry;
+        // mutating/unknown actions are conservative.
+        "git" => match args.and_then(|a| a.get("action")).and_then(Value::as_str) {
+            Some(
+                "status" | "diff" | "log" | "show" | "blame" | "file_history" | "log_search"
+                | "contributors",
+            ) => ToolIdempotency::PureRead,
+            _ => ToolIdempotency::NonIdempotent,
+        },
+
         // Pure read tools — safe to re-execute
         "read_file"
         | "file_read"
@@ -99,7 +109,6 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
         | "session_history_around"
         | "mo_query"
         | "get_agent_info"
-        | "get_agent_result"
         | "reflect"
         | "context_analysis"
         | "diagnose"
@@ -195,6 +204,42 @@ mod tests {
             classify_tool_idempotency("memory", Some(&json!({ "action": "nuke" }))),
             ToolIdempotency::NonIdempotent
         );
+    }
+
+    #[test]
+    fn consolidated_git_action_aware() {
+        for action in [
+            "status",
+            "diff",
+            "log",
+            "show",
+            "blame",
+            "file_history",
+            "log_search",
+            "contributors",
+        ] {
+            assert_eq!(
+                classify_tool_idempotency("git", Some(&json!({ "action": action }))),
+                ToolIdempotency::PureRead,
+                "git(action={action}) should be PureRead"
+            );
+        }
+        for action in [
+            "commit",
+            "revert_commit",
+            "stash",
+            "checkout_file",
+            "worktree",
+            "push",
+            "unknown",
+        ] {
+            assert_eq!(
+                classify_tool_idempotency("git", Some(&json!({ "action": action }))),
+                ToolIdempotency::NonIdempotent,
+                "git(action={action}) should be NonIdempotent"
+            );
+        }
+        assert_eq!(classify("git"), ToolIdempotency::NonIdempotent);
     }
 
     #[test]

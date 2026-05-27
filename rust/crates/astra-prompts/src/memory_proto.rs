@@ -174,6 +174,22 @@ pub const NS_INSIGHT: &str = "insight";
 pub const NS_KNOWLEDGE: &str = "knowledge";
 pub const NS_LESSON: &str = "lesson";
 pub const NS_FEEDBACK: &str = "feedback";
+pub const NS_SESSION: &str = "session";
+
+/// Returns `true` when `content` is a `[@session/…]` tagged memory entry.
+///
+/// Session-namespace entries are injected through a dedicated session-memory
+/// lane rather than generic cross-session recall. Both the memory prefetch
+/// filter and the assembly-trace builder use this check so entries don't
+/// leak into the prompt through the wrong channel.
+///
+/// Uses `MemoryEntry::parse` as the authoritative check (handles leading
+/// whitespace, exact namespace matching), falling back to a fast prefix
+/// scan for entries that don't parse.
+pub fn is_session_namespace_memory(content: &str) -> bool {
+    MemoryEntry::parse(content).is_some_and(|entry| entry.ns == NS_SESSION)
+        || content.trim_start().starts_with("[@session/")
+}
 
 // ── Status values ────────────────────────────────────────────────
 pub const ST_PENDING: &str = "pending";
@@ -197,6 +213,7 @@ pub fn ns_to_memory_type(ns: &str) -> &'static str {
         NS_KNOWLEDGE => memory_ns::to_memory_type(memory_ns::KNOWLEDGE),
         NS_LESSON => "semantic",
         NS_FEEDBACK => "semantic",
+        NS_SESSION => "working",
         _ => "semantic",
     }
 }
@@ -545,11 +562,16 @@ impl MemoryEntry {
 
     /// Format for display in CLI (one-line summary).
     pub fn display_line(&self) -> String {
-        let body_preview: String = self
-            .body
+        let preview_source = self
+            .compact_view()
             .lines()
             .next()
-            .unwrap_or("")
+            .unwrap_or(self.compact_view());
+        let body_preview: String = self
+            .compact_view()
+            .lines()
+            .next()
+            .unwrap_or(preview_source)
             .chars()
             .take(80)
             .collect();
@@ -626,6 +648,7 @@ pub fn format_for_llm(contents: &[&str]) -> String {
         (NS_TASK, "Tasks"),
         (NS_INSIGHT, "Insights"),
         (NS_EPISODE, "Recent Context"),
+        (NS_SESSION, "Session State"),
         (NS_SWAP, "Archived Context"),
     ];
 
@@ -687,6 +710,7 @@ mod tests {
         assert_eq!(ns_to_memory_type(NS_KNOWLEDGE), "semantic");
         assert_eq!(ns_to_memory_type(NS_LESSON), "semantic");
         assert_eq!(ns_to_memory_type(NS_FEEDBACK), "semantic");
+        assert_eq!(ns_to_memory_type(NS_SESSION), "working");
     }
 
     #[test]
@@ -908,6 +932,21 @@ mod tests {
         let line = e.display_line();
         assert!(line.len() < 200); // truncated to 80 chars + prefix
         assert!(line.starts_with("[fact/semantic]"));
+    }
+
+    #[test]
+    fn display_line_prefers_abstract_layer_over_detail() {
+        let e = MemoryEntry::new_layered(
+            "session",
+            "active",
+            "Abstract session summary",
+            Some("Overview paragraph"),
+            Some("{\"detail\":true}"),
+        );
+        assert_eq!(
+            e.display_line(),
+            "[session/active] Abstract session summary"
+        );
     }
 
     #[test]

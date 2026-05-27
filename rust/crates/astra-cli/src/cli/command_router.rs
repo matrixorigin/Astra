@@ -380,10 +380,12 @@ fn maybe_wire_delegation_engine(
     let _ = agent_loader::load_and_merge(&project_root, &mut registry);
     let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
     let run_store = std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
-    let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
+    let engine = astra_runtime::server::delegation::engine::DelegationEngine::with_executor(
         registry,
-        std::sync::Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store)),
-        std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new()),
+        std::sync::Arc::new(astra_runtime::server::run::engine::RunEngine::new(
+            run_store,
+        )),
+        std::sync::Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new()),
         std::sync::Arc::new(executor),
     );
     state.delegation_engine = Some(std::sync::Arc::new(engine));
@@ -1758,7 +1760,7 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
             ),
         },
         "trace" => {
-            for line in astra_turn_core::permission_audit::format_snapshot_lines(50) {
+            for line in astra_turn_core::permission::audit::format_snapshot_lines(50) {
                 eprintln!("{line}");
             }
         }
@@ -1768,7 +1770,7 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
                 eprintln!("  {} Missing export path", theme::icon_warn());
                 return;
             }
-            let lines = astra_turn_core::permission_audit::snapshot_redacted_jsonl_lines();
+            let lines = astra_turn_core::permission::audit::snapshot_redacted_jsonl_lines();
             let body = if lines.is_empty() {
                 String::new()
             } else {
@@ -1912,7 +1914,7 @@ pub(super) async fn execute_cli_command(
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 skill_search: &skill_search,
                 // Non-Chat (Message-style) path — legacy single-shot
-                // invocation without spawn_agent support. Keep
+                // invocation without dynamic sub-agent support. Keep
                 // pre-fix behavior; extend later if this path needs
                 // spawning too.
                 agent_spawner: None,
@@ -2367,11 +2369,7 @@ pub(super) async fn execute_cli_command(
                     )
                 }
             };
-            let explain_mode = if args.explain {
-                ExplainMode::On
-            } else {
-                ExplainMode::Off
-            };
+            let explain_mode = args.explain.unwrap_or(ExplainMode::Off);
 
             // --json implies --quiet
             let quiet = args.quiet || args.json;
@@ -2387,9 +2385,9 @@ pub(super) async fn execute_cli_command(
             };
 
             // Bug-A fix: build a DynamicAgentSpawner so `astra chat -m`
-            // can service spawn_agent tool calls, matching the REPL
+            // can service `agent(action='spawn', ...)`, matching the REPL
             // path. Without this, one-shot LLM invocations that try
-            // to spawn_agent hit "Agent spawning not available in
+            // to spawn hit "Agent spawning not available in
             // this context." — discovered during real-world MiniMax
             // verification. Mirrors the REPL's
             // `initialize_multi_agent_runtime` wiring via the
@@ -2412,7 +2410,7 @@ pub(super) async fn execute_cli_command(
 
             // Keep a clone of the Arc so we can drain background
             // spawned children before process exit — otherwise
-            // background tasks (the default spawn_agent mode) get
+            // background tasks (the default background-agent mode) get
             // aborted when main returns, which silently drops any
             // ForkCacheEvent / child telemetry they would have
             // emitted on their first response.
@@ -2512,7 +2510,7 @@ pub(super) async fn execute_cli_command(
 
             // Drain any background-spawned child agents before
             // returning. Without this, background tasks (the
-            // default spawn_agent mode) are aborted when main
+            // default background-agent mode) are aborted when main
             // returns, which silently drops any ForkCacheEvent /
             // child output they would have emitted. Deadline is
             // bounded so a misbehaving child can't hang the CLI;
@@ -2943,35 +2941,78 @@ pub(super) async fn execute_cli_command(
     }
 }
 
-/// Compute exit code from StreamResult based on tool failures and force stops.
+/// Compute exit code from StreamResult using semantic exit classification.
+///
+/// Tool-call records carry an optional `exit_semantics` field (snake_case
+/// serialization of [`astra_tools::exit_semantics::ExitSemantics`]) that
+/// distinguishes real execution errors from domain-negative outcomes
+/// (grep no-match, diff differences, test failures). This function reads
+/// that field to avoid treating those as tool failures — a grep that
+/// finds nothing or a diff that reports differences is a successful tool
+/// execution, not an error the agent needs to recover from.
 fn compute_exit_code(sr: &StreamResult) -> ExitCode {
-    // Check for force stop (highest priority)
+    // ── Force stop (highest priority) ──────────────────────────────────
     for ve in &sr.verdict_events {
         if ve.force_stop {
             return ExitCode::ForceStop;
         }
     }
 
+    // ── Semantic classification of each tool call ──────────────────────
+    let is_error = |r: &astra_services::session_journal::ToolCallRecord| -> bool {
+        match r
+            .exit_semantics
+            .as_deref()
+            .and_then(parse_exit_semantics_tag)
+        {
+            // ExecutionError is a genuine tool failure (command crashed,
+            // permission denied, signal kill, unknown command, etc.)
+            Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError) => true,
+            // Success, InformationalFailure (grep no-match), and
+            // DomainNegative (diff differences, test failures) are all
+            // intentional domain outcomes — the tool worked correctly.
+            Some(
+                astra_tools::exit_semantics::ExitSemantics::Success
+                | astra_tools::exit_semantics::ExitSemantics::InformationalFailure
+                | astra_tools::exit_semantics::ExitSemantics::DomainNegative,
+            ) => false,
+            // Unknown or missing semantics fall back to the legacy ok flag.
+            // That keeps malformed records from silently downgrading a real
+            // tool failure into success.
+            None => !r.ok,
+        }
+    };
+
     // Check for unrecovered tool failures. Agents self-correct by
     // retrying with the same or different tools (write_file fails →
-    // bash echo succeeds). Only fail if the LAST tool call failed —
-    // any successful tool call after a failure means the agent recovered.
-    let has_any_failure = sr.tool_call_records.iter().any(|r| !r.ok);
+    // bash echo succeeds). Only fail if the agent never recovered —
+    // i.e. the last error was not followed by a successful call.
+    let has_any_failure = sr.tool_call_records.iter().any(&is_error);
     if has_any_failure {
         let last_ok = sr
             .tool_call_records
             .iter()
             .rev()
-            .find(|r| r.ok)
-            .map(|_| true)
-            .unwrap_or(false);
-        let last_record_ok = sr.tool_call_records.last().map(|r| r.ok).unwrap_or(true);
-        if !last_ok || !last_record_ok {
+            .find(|r| !is_error(r))
+            .is_some();
+        let last_ok_explicit = sr
+            .tool_call_records
+            .last()
+            .map(|r| !is_error(r))
+            .unwrap_or(true);
+        if !last_ok || !last_ok_explicit {
             return ExitCode::ToolFailure;
         }
     }
 
     ExitCode::Success
+}
+
+fn parse_exit_semantics_tag(tag: &str) -> Option<astra_tools::exit_semantics::ExitSemantics> {
+    serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(serde_json::Value::String(
+        tag.to_string(),
+    ))
+    .ok()
 }
 
 fn error_kind_for_exit_code(exit_code: ExitCode) -> Option<&'static str> {
@@ -4914,6 +4955,88 @@ mod exit_code_tests {
                 ..Default::default()
             });
         assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
+    }
+
+    fn tool_call_record(
+        name: &str,
+        ok: bool,
+        error: Option<&str>,
+        exit_semantics: Option<&str>,
+    ) -> astra_services::session_journal::ToolCallRecord {
+        astra_services::session_journal::ToolCallRecord {
+            name: name.to_string(),
+            ok,
+            ms: 100,
+            error: error.map(str::to_string),
+            exit_semantics: exit_semantics.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn exit_code_success_on_informational_failure_semantics() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records.push(tool_call_record(
+            "Bash",
+            false,
+            Some("grep returned 1"),
+            Some("informational_failure"),
+        ));
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+
+    #[test]
+    fn exit_code_success_on_domain_negative_semantics() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records.push(tool_call_record(
+            "Bash",
+            false,
+            Some("cargo test returned 1"),
+            Some("domain_negative"),
+        ));
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+
+    #[test]
+    fn exit_code_tool_failure_on_execution_error_semantics() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records.push(tool_call_record(
+            "Bash",
+            false,
+            Some("command not found"),
+            Some("execution_error"),
+        ));
+        assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
+    }
+
+    #[test]
+    fn exit_code_unknown_semantics_falls_back_to_legacy_failure() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records.push(tool_call_record(
+            "Bash",
+            false,
+            Some("unknown failure"),
+            Some("mystery_status"),
+        ));
+        assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
+    }
+
+    #[test]
+    fn exit_code_success_when_execution_error_is_followed_by_domain_negative() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records.push(tool_call_record(
+            "Bash",
+            false,
+            Some("permission denied"),
+            Some("execution_error"),
+        ));
+        sr.tool_call_records.push(tool_call_record(
+            "Bash",
+            false,
+            Some("git diff reported changes"),
+            Some("domain_negative"),
+        ));
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
     }
 
     #[test]

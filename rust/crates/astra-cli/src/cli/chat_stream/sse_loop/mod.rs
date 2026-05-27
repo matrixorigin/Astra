@@ -21,8 +21,8 @@ use astra_runtime::{
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
     tool_registry::ToolRegistry,
-    turn::agentic_loop_finalization::run_agentic_loop_with_host,
-    turn::agentic_loop_host::{
+    turn::agentic_loop::finalization::run_agentic_loop_with_host,
+    turn::agentic_loop::host::{
         AgenticLoopState, CancellationState, ErrorRecoveryState, MessagingState, SkillState,
         StallTrackingState, StopHookState, TelemetryState,
     },
@@ -36,9 +36,11 @@ use astra_runtime::{
     turn::turn_guard::TurnGuard,
 };
 
-use crate::{StreamResult, cli_utils::terminal_width_usize, edge_tools};
+use crate::{ExplainMode, StreamResult, cli_utils::terminal_width_usize, edge_tools};
 
 use super::ChatTurnParams;
+use super::StreamEvent;
+use super::explain_reports;
 use agentic_sse_loop::{
     StreamLoopSidecarEprint, StreamResultBuild, build_stream_result, eprint_stream_loop_sidecars,
     resolved_tool_metrics,
@@ -133,7 +135,7 @@ async fn finalize_root_mailbox(
 
 fn extend_restricted_with_blocked_tools(
     _restricted: &mut HashSet<String>,
-    _observability_hub: Option<&Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    _observability_hub: Option<&Arc<astra_runtime::observability::ObservabilityHub>>,
 ) {
     // Pattern-library / evolution-driven tool blocking was removed along with
     // the self-evolution subsystem. The function is retained as a no-op so
@@ -160,7 +162,7 @@ pub(crate) async fn stream_chat_sse(
     // Stable run_id for this turn — shared by:
     //   1. state.current_run_id (so on_turn_completed captures the
     //      parent prefix keyed on this id)
-    //   2. SpawnAgentContext.run_id (so the spawner's resolver looks
+    //   2. AgentActionContext.run_id (so the spawner's resolver looks
     //      up the same key)
     // Pre-fix these were different ("ephemeral" vs None), so the
     // parent capture never happened and fork-cache probes were dead.
@@ -261,7 +263,7 @@ pub(crate) async fn stream_chat_sse(
         } else {
             ex
         };
-        // Wire spawn_agent tool context when spawner is available.
+        // Wire `agent(action='spawn'|'get_result')` context when a spawner is available.
         // The run_id MUST match what state.current_run_id uses so that
         // on_turn_completed captures the parent prefix under the same
         // key the spawner resolves against. Previously this was
@@ -271,7 +273,7 @@ pub(crate) async fn stream_chat_sse(
         // nothing. Generating a stable UUID here and threading it into
         // both sites closes the gap.
         if let Some(ref spawner) = p.agent_spawner {
-            let spawn_ctx = edge_tools::agent_spawning::SpawnAgentContext {
+            let spawn_ctx = edge_tools::agent_spawning::AgentActionContext {
                 run_id: parent_turn_run_id.clone(),
                 agent_id: root_agent_id.to_string(),
                 current_model: p.model.map(str::to_string),
@@ -361,19 +363,10 @@ pub(crate) async fn stream_chat_sse(
     // Install MCP schemas on the edge executor so `tool_search(select:NAME)`
     // can resolve plugin tool schemas by name.
     executor.set_plugin_schemas(mcp_plugin_schemas);
-    let mut registry = ToolRegistry::new_runtime_surface(all_schemas.clone());
-    // G3: when a DynamicAgentSpawner is wired, force-pin spawn_agent's
-    // schema so the tfidf selector always surfaces it. Without this,
-    // spawn_agent sits in all_schemas but TOOL_CATALOG has no entry
-    // for it — so resolve_pinned skips it and tfidf can't score it,
-    // leaving spawn_agent invisible to the LLM even when calls to it
-    // would succeed. Mirrors the lifecycle-level delegate injection
-    // pattern (`agentic_loop_lifecycle.rs:279`) but gated on the CLI
-    // side because the spawner is a CLI-level dependency.
-    maybe_pin_spawn_agent_schema(&mut registry, p.agent_spawner.is_some());
+    let registry = ToolRegistry::new_runtime_surface(all_schemas.clone());
     let pinned_schema_tokens = registry.total_pinned_token_cost() as u64;
-    // Build valid_tool_names from the registry (includes dynamically injected
-    // spawn_agent/get_agent_result), not from the pre-injection all_schemas vec.
+    // Build valid_tool_names from the registry's runtime surface rather than
+    // reusing the pre-filtered schema vec directly.
     let valid_tool_names: HashSet<String> = registry.all_schema_names().into_iter().collect();
 
     // --allowed-tools: if set, restrict to only the specified tools
@@ -508,7 +501,7 @@ pub(crate) async fn stream_chat_sse(
         is_plan_subtask: p.is_plan_subtask,
         plan_subtask_id: p.plan_subtask_id,
         plan_assemble_line_release: p.plan_assemble_line_release.clone(),
-        stream_event_tx: p.stream_event_tx,
+        stream_event_tx: p.stream_event_tx.clone(),
         approval_request_tx: p.approval_request_tx,
         ask_user_request_tx: p.ask_user_request_tx,
         plan_review_request_tx: p.plan_review_request_tx,
@@ -665,9 +658,10 @@ pub(crate) async fn stream_chat_sse(
             circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
                 circuit_breaker_config,
             ),
-            guardrail_tuner: astra_runtime::guardrail_tuning::GuardrailTuner::default(),
+            guardrail_tuner: astra_runtime::config_admin::guardrail::GuardrailTuner::default(),
             guardrail_tuner_records_cursor: 0,
             forced_completion_soft_stop: false,
+            forced_task_board_completion_gate: false,
         },
         telemetry: TelemetryState {
             explain_turns: Vec::new(),
@@ -711,6 +705,8 @@ pub(crate) async fn stream_chat_sse(
             workspace_root_hint: Some(project_root.to_string_lossy().into_owned()),
             forward_headers: std::collections::HashMap::new(),
             llm_token_service: None,
+            task_board_monitor: p.task_manager.clone(),
+            task_board_snapshot: Default::default(),
         },
         messaging: MessagingState {
             mailbox: root_mailbox,
@@ -730,23 +726,20 @@ pub(crate) async fn stream_chat_sse(
         },
         pipeline_session: Some({
             let config = astra_turn_core::pipeline_config::PipelineConfig::default();
-            match p.pipeline_state.as_ref().and_then(|v| {
-                serde_json::from_value::<astra_turn_core::pipeline_session::PipelineSessionSnapshot>(
-                    v.clone(),
-                ).ok()
-            }) {
-                Some(snapshot) => {
-                    astra_turn_core::pipeline_session::PipelineSession::from_snapshot(
-                        config, snapshot,
-                    )
-                }
-                None => astra_turn_core::pipeline_session::PipelineSession::new(config),
-            }
+            let session_current_date =
+                astra_runtime::turn::session_current_date::resolve_session_current_date(
+                    p.session_id.unwrap_or(""),
+                );
+            astra_turn_core::pipeline_session_serde::restore_or_new_with_current_date(
+                config,
+                p.pipeline_state.as_ref(),
+                &session_current_date,
+            )
         }),
         message: p.message.to_string(),
         recent_tools: p.recent_tools.to_vec(),
         task_profile,
-        last_turn_policy: astra_runtime::turn::agentic_loop_host::TurnInteractionPolicy::default(),
+        last_turn_policy: astra_runtime::turn::agentic_loop::host::TurnInteractionPolicy::default(),
         api: p.api.clone(),
         api_token: p.token.to_string(),
         delegation_engine: p.delegation_engine,
@@ -761,6 +754,7 @@ pub(crate) async fn stream_chat_sse(
         consecutive_context_window_errors: 0,
         compaction_effectiveness: Default::default(),
         pinned_tool_schema_tokens: pinned_schema_tokens,
+        sticky_tool_schemas: Vec::new(),
         max_turn_input_tokens: RuntimeLimits::global().effective_max_turn_input_tokens(p.model),
         budget_wrapup_injected: false,
         budget_wrapup_ignored_rounds: 0,
@@ -882,6 +876,17 @@ pub(crate) async fn stream_chat_sse(
         start,
         model: p.model,
         explain_turns: &state.telemetry.explain_turns,
+        pending_context_assembly_trace: state
+            .telemetry
+            .pending_context_assembly_trace
+            .as_ref()
+            .map(|(_, trace_json)| trace_json),
+        tool_call_records: &state.stall.tool_call_records,
+        assistant_output: &state.final_text,
+        ttft_ms: state.telemetry.first_ttft_ms,
+        context_ms: state.telemetry.first_context_assembly_ms,
+        memoria_ms: state.telemetry.first_memoria_ms,
+        llm_rounds: Some(state.llm_rounds_completed),
         verdict_events: &state.stall.verdict_events,
         has_any_usage: state.has_any_usage,
         total_prompt: state.total_prompt,
@@ -890,6 +895,63 @@ pub(crate) async fn stream_chat_sse(
         total_completion: state.total_completion,
         current_session_id: state.current_session_id.as_deref(),
     });
+
+    // Forward explain / verdict to TUI stream (if wired).
+    if let Some(ref tx) = p.stream_event_tx {
+        let explain_turns = state.telemetry.explain_turns.clone();
+        let verdict_events = state.stall.verdict_events.clone();
+        let _ = tx.send(StreamEvent::ExplainReport(explain_turns));
+        if p.explain != ExplainMode::Off {
+            let tool_count = resolved_tool_metrics(
+                0,
+                std::iter::empty::<String>(),
+                &state.stall.tool_call_records,
+            )
+            .0;
+            let meta = crate::explain_dag::ExplainTurnMeta {
+                turn_label: None,
+                duration_ms: Some(start.elapsed().as_millis() as u64),
+                ttft_ms: state.telemetry.first_ttft_ms,
+                context_ms: state.telemetry.first_context_assembly_ms,
+                memoria_ms: state.telemetry.first_memoria_ms,
+                total_llm_ms: None,
+                total_tool_ms: Some(
+                    state
+                        .stall
+                        .tool_call_records
+                        .iter()
+                        .filter(|record| !record.is_synthetic_placeholder())
+                        .map(|record| record.ms)
+                        .sum(),
+                ),
+                prompt_tokens: Some(state.total_prompt),
+                completion_tokens: Some(state.total_completion),
+                cache_read_tokens: Some(state.total_cache_read),
+                cache_creation_tokens: Some(state.total_cache_creation),
+                tool_count: Some(tool_count),
+                llm_rounds: Some(state.llm_rounds_completed),
+                routing_domain_hint: None,
+                assistant_output: Some(&state.final_text),
+                tool_call_records: &state.stall.tool_call_records,
+                selection_strategy: None,
+                selection_confidence: None,
+                selected_tools: Vec::new(),
+            };
+            if let Some(text) = explain_reports::render_explain_report_text(
+                &state.telemetry.explain_turns,
+                Some(&meta),
+                state
+                    .telemetry
+                    .pending_context_assembly_trace
+                    .as_ref()
+                    .map(|(_, trace_json)| trace_json),
+                p.explain == ExplainMode::Verbose,
+            ) {
+                let _ = tx.send(StreamEvent::ExplainText(text));
+            }
+        }
+        let _ = tx.send(StreamEvent::VerdictReport(verdict_events));
+    }
 
     let final_messages = std::mem::take(&mut state.messages);
 
@@ -947,30 +1009,13 @@ fn load_turn_messages(
     openai_messages_from_repl_history(history, current_message)
 }
 
-/// Conditionally force-pin the `spawn_agent` schema into the registry
-/// so the tfidf selector always surfaces it when a spawner is wired.
-///
-/// Rationale: `spawn_agent` sits in `all_tool_schemas()` (so the edge
-/// knows how to dispatch it) but has no entry in `TOOL_CATALOG` —
-/// which is the metadata table tfidf uses for scoring + pinning. As
-/// a result, the selector can't score it and `resolve_pinned` skips
-/// it. The only way it becomes visible to the LLM is `registry.upsert_schema`,
-/// which defaults to pinned. Models then see spawn_agent every turn
-/// exactly when it's callable (spawner present) and never when it's
-/// not — no dead schema, no wasted tokens.
-fn maybe_pin_spawn_agent_schema(_registry: &mut ToolRegistry, _spawner_wired: bool) {
-    // No-op: spawn/get_result/send_message are now actions within the
-    // consolidated `agent` schema (in all_tool_schemas). No separate
-    // schema injection needed.
-}
-
 #[cfg(test)]
 mod tests {
     use super::circuit_breaker_config_from_tool_selection;
     use super::detect_turn_hook_sets;
     use super::extend_restricted_with_blocked_tools;
     use super::normalize_turn_model;
-    use astra_runtime::observability_integration::ObservabilityHub;
+    use astra_runtime::observability::ObservabilityHub;
     use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
     use std::collections::HashSet;
     use std::path::Path;
@@ -1166,41 +1211,5 @@ hooks:
         let mut restricted = HashSet::new();
         extend_restricted_with_blocked_tools(&mut restricted, Some(&hub));
         assert!(restricted.is_empty());
-    }
-
-    // ── G3: spawn_agent visibility gate ──
-    //
-    // Regression for the tool-selector gap: without a catalog entry,
-    // spawn_agent was invisible to the LLM even when the CLI had a
-    // spawner wired. `maybe_pin_spawn_agent_schema` makes the schema
-    // visible iff the spawner is wired, so the model sees it exactly
-    // when calls would succeed.
-
-    // spawn_agent is now subsumed into the consolidated `agent` tool.
-    // maybe_pin_spawn_agent_schema is a no-op — no separate schema injection needed.
-    #[test]
-    fn maybe_pin_spawn_agent_schema_is_noop_always() {
-        use super::maybe_pin_spawn_agent_schema;
-        use crate::edge_tools;
-        use astra_runtime::tool_registry::ToolRegistry;
-
-        let mut registry = ToolRegistry::new(edge_tools::all_tool_schemas());
-        let before: std::collections::HashSet<String> = registry
-            .pinned_schemas()
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect();
-
-        maybe_pin_spawn_agent_schema(&mut registry, true);
-        let after: std::collections::HashSet<String> = registry
-            .pinned_schemas()
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect();
-
-        assert_eq!(
-            before, after,
-            "maybe_pin_spawn_agent_schema is now a no-op (spawn is an agent action)"
-        );
     }
 }

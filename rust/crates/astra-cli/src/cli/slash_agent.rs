@@ -180,7 +180,7 @@ async fn show_list(ctx: &AgentCommandContext) {
         );
         eprintln!(
             "  {}",
-            "Use spawn_agent or delegate to start multi-agent work.".dim()
+            "Use `agent(action='spawn', ...)` or delegate to start multi-agent work.".dim()
         );
         eprintln!();
         return;
@@ -870,7 +870,7 @@ fn show_help() {
     eprintln!();
     eprintln!(
         "  {}",
-        "Spawned agents come from spawn_agent; delegations come from the delegate tool.".dim()
+        "Spawned agents come from `agent(action='spawn', ...)`; delegations come from the delegate tool.".dim()
     );
     eprintln!(
         "  {}",
@@ -1879,7 +1879,7 @@ mod tests {
     use astra_runtime::orchestration::{
         SpawnAgentInput, SpawnContext, SpawnedAgentInfo, SpawnedAgentMetrics,
     };
-    use astra_runtime::server::delegation_engine::DelegationTracker;
+    use astra_runtime::server::delegation::engine::DelegationTracker;
     use astra_services::session_journal::JournalEvent;
     use std::path::PathBuf;
     use std::sync::Arc;

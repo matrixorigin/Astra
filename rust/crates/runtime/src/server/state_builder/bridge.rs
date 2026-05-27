@@ -10,7 +10,7 @@ pub(super) fn attach_chat_turn_bridge(
     let edge_callback_ledger = state.edge_callback_ledger.clone();
     state
         .with_chat_turn_bridge(Arc::new(
-            turn::bridge_inprocess::InProcessChatTurnBridge::new(
+            turn::bridge::inprocess::InProcessChatTurnBridge::new(
                 settings.matrixone.clone(),
                 Arc::clone(bridge_encryptor),
             )
@@ -31,6 +31,8 @@ pub(super) fn spawn_runtime_sweepers(shared_pool: SharedPool) {
     // `completed` rows auto-archive weekly; long-retained
     // `archived` rows GC after 90 days. All three are idle when
     // the table has no qualifying rows, so cost stays near-zero.
-    super::super::session_todo_sweeper::spawn_session_todo_stale_sweeper(shared_pool.clone());
-    super::super::session_todo_sweeper::spawn_session_todo_archive_sweeper(shared_pool);
+    super::super::session::session_todo_sweeper::spawn_session_todo_stale_sweeper(
+        shared_pool.clone(),
+    );
+    super::super::session::session_todo_sweeper::spawn_session_todo_archive_sweeper(shared_pool);
 }

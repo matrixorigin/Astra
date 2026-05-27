@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::cloud_approval_policy::{
+use super::cloud::approval_policy::{
     CloudGatedToolKind, bash_command_is_read_only, cloud_gated_tool_kind_with_args,
 };
-use super::tool_result_semantics::is_resource_limit_output;
+use crate::tool::result::semantics::is_resource_limit_output;
 use astra_sandbox::{CommandRisk, analyze_command_risks};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -628,6 +628,108 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             ActionCategory::Destructive,
             task_stop_compensation_summary(),
         ),
+        "git" => match string_arg(&normalized_args, "action")
+            .map(|action| action.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some(
+                "status" | "diff" | "log" | "show" | "blame" | "file_history" | "log_search"
+                | "contributors",
+            ) => ActionCompensationProfile::read(true),
+            Some("commit") => ActionCompensationProfile::compensated(
+                false,
+                ActionCategory::Execute,
+                false,
+                CompensationKind::GitRevertCommit,
+                "use `rollback_turn_actions` with scope=`current_turn` during the turn to revert the recorded commit when it is still the current HEAD tail, or call `git` with action=`revert_commit` and the returned commit_sha for an explicit compensating revert commit".to_string(),
+            ),
+            Some("revert_commit") => ActionCompensationProfile::manual(
+                false,
+                ActionCategory::Execute,
+                "git revert_commit creates a new compensating commit; undo it by reverting the new revert commit if needed",
+            ),
+            Some("checkout_file") => ActionCompensationProfile::compensated(
+                true,
+                ActionCategory::Destructive,
+                true,
+                CompensationKind::RestoreOrDeleteFile,
+                restore_file_compensation_summary(string_arg(&normalized_args, "path"), true),
+            ),
+            Some("stash") => match string_arg(&normalized_args, "sub_action")
+                .map(|action| action.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("list") => ActionCompensationProfile::read(true),
+                Some("push" | "save") => ActionCompensationProfile::compensated(
+                    true,
+                    ActionCategory::Execute,
+                    false,
+                    CompensationKind::GitApplyStash,
+                    "use `rollback_turn_actions` with scope=`current_turn` to re-apply the recorded stash for the turn, or re-apply the captured stash with `git` using action=`stash`, sub_action=`apply`, and the returned stash_ref"
+                        .to_string(),
+                ),
+                Some("apply") => ActionCompensationProfile::manual(
+                    false,
+                    ActionCategory::Destructive,
+                    "git stash apply mutates the working tree; capture a fresh stash or commit first if you may need to undo it",
+                ),
+                Some("pop" | "drop") => ActionCompensationProfile::manual(
+                    false,
+                    ActionCategory::Destructive,
+                    "git stash pop/drop mutates the stash stack and working tree; no automatic rollback is registered",
+                ),
+                _ => ActionCompensationProfile::manual(
+                    false,
+                    ActionCategory::Execute,
+                    "git stash action is unknown or not yet modeled for automatic rollback",
+                ),
+            },
+            Some("worktree") => match string_arg(&normalized_args, "sub_action")
+                .map(|action| action.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("list" | "ls") => ActionCompensationProfile::read(true),
+                Some("enter") => ActionCompensationProfile::compensated(
+                    true,
+                    ActionCategory::Execute,
+                    false,
+                    CompensationKind::GitRestoreWorktree,
+                    "use `rollback_turn_actions` with scope=`current_turn` during the turn to remove the recorded worktree and restore the session root while it is still clean; otherwise leave with `git` action=`worktree`, sub_action=`exit` or remove it manually".to_string(),
+                ),
+                Some("add" | "create") => ActionCompensationProfile::compensated(
+                    true,
+                    ActionCategory::Execute,
+                    false,
+                    CompensationKind::GitRestoreWorktree,
+                    "use `rollback_turn_actions` with scope=`current_turn` during the turn to remove the recorded clean worktree; if it has since changed, remove it manually with `git` action=`worktree`, sub_action=`remove` and the recorded path".to_string(),
+                ),
+                Some("exit") => ActionCompensationProfile::manual(
+                    false,
+                    ActionCategory::Execute,
+                    "git worktree exit restores the original session root; re-enter the worktree or recreate it manually if you need to return",
+                ),
+                Some("remove" | "rm" | "delete") => ActionCompensationProfile::manual(
+                    false,
+                    ActionCategory::Destructive,
+                    "git worktree remove can delete the worktree and optionally its branch; restore it by recreating the worktree or branch manually if needed",
+                ),
+                _ => ActionCompensationProfile::manual(
+                    false,
+                    ActionCategory::Execute,
+                    "git worktree action is unknown or not yet modeled for automatic rollback",
+                ),
+            },
+            Some("push") => ActionCompensationProfile::manual(
+                false,
+                ActionCategory::Execute,
+                "git push mutates remote refs; coordinate with the remote branch owner or push a corrective commit/ref update if it must be undone",
+            ),
+            _ => ActionCompensationProfile::manual(
+                false,
+                ActionCategory::Execute,
+                "git action is unknown or not yet modeled for automatic rollback",
+            ),
+        },
         "git_commit" => ActionCompensationProfile::compensated(
             false,
             ActionCategory::Execute,
@@ -1205,6 +1307,28 @@ mod tests {
     }
 
     #[test]
+    fn consolidated_git_profiles_are_action_aware() {
+        let read = tool_action_profile("git", &json!({"action": "status"}));
+        assert_eq!(read.category, ActionCategory::Read);
+        assert!(!tool_requires_explicit_approval(
+            "git",
+            &json!({"action": "status"})
+        ));
+
+        let push = tool_action_profile(
+            "git",
+            &json!({"action": "push", "remote": "origin", "branch": "feature/x"}),
+        );
+        assert_eq!(push.category, ActionCategory::Execute);
+        assert!(!push.bounded);
+        assert!(!push.reversible);
+        assert!(tool_requires_explicit_approval(
+            "git",
+            &json!({"action": "push", "remote": "origin", "branch": "feature/x"})
+        ));
+    }
+
+    #[test]
     fn rename_symbol_uses_turn_rollback_hint() {
         let profile = tool_action_profile(
             "rename_symbol",
@@ -1319,6 +1443,7 @@ mod tests {
                     json!({"path": "tmp.txt", "old_str": "a", "new_str": "b"})
                 }
                 "git_commit" => json!({"message": "x"}),
+                "git" => json!({"action": "push", "remote": "origin", "branch": "main"}),
                 "git_revert_commit" => json!({"commit_sha": "abc123"}),
                 "git_stash" => json!({"action": "push"}),
                 "github_create_issue" => json!({"owner": "o", "repo": "r", "title": "t"}),
@@ -1335,7 +1460,7 @@ mod tests {
             }
         }
 
-        for &tool_name in crate::cloud_approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS.iter() {
+        for &tool_name in crate::cloud::approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS.iter() {
             let profile = tool_action_profile(tool_name, &sample_args(tool_name));
             assert_ne!(
                 profile.category,

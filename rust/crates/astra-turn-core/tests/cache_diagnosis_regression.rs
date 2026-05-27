@@ -178,7 +178,7 @@ fn d0640d3d_fixture_triggers_session_specific_rules() {
 
 /// Gold-standard negative fixture — session `462c485e` (2026-05-08) captured
 /// a clean 5-round Bedrock run where every cache invariant held:
-/// rolling breakpoint advanced round-to-round, tool_cc sat on the last
+/// tail breakpoint advanced round-to-round, tool_cc sat on the last
 /// tool, and cache_read was a flat 8426 tokens across all 5 rounds.
 ///
 /// **No rule should fire on this fixture.** It's the negative counterpart

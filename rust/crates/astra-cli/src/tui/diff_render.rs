@@ -7,6 +7,8 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::diff_utils::parse_hunk_header;
+
 use super::color::is_light;
 use super::render::highlight::highlight_code_to_lines;
 use super::terminal_palette::default_bg;
@@ -32,7 +34,7 @@ fn add_style() -> Style {
     if is_light_bg() {
         Style::default().fg(LIGHT_ADD_FG).bg(LIGHT_ADD_BG)
     } else {
-        Style::default().fg(DARK_ADD_FG)
+        Style::default().fg(DARK_ADD_FG).bg(DARK_ADD_BG)
     }
 }
 
@@ -41,7 +43,7 @@ fn del_style() -> Style {
     if is_light_bg() {
         Style::default().fg(LIGHT_DEL_FG).bg(LIGHT_DEL_BG)
     } else {
-        Style::default().fg(DARK_DEL_FG)
+        Style::default().fg(DARK_DEL_FG).bg(DARK_DEL_BG)
     }
 }
 
@@ -195,21 +197,6 @@ fn diff_header_language(header: &str) -> Option<String> {
         .extension()
         .and_then(|ext| ext.to_str())
         .map(ToOwned::to_owned)
-}
-
-/// Parse hunk header `@@ -old_start,old_count +new_start,new_count @@`
-fn parse_hunk_header(header: &str) -> Option<(u32, u32)> {
-    let parts: Vec<&str> = header.split_whitespace().collect();
-    let mut old_start = 0u32;
-    let mut new_start = 0u32;
-    for part in &parts {
-        if let Some(s) = part.strip_prefix('-') {
-            old_start = s.split(',').next()?.parse().ok()?;
-        } else if let Some(s) = part.strip_prefix('+') {
-            new_start = s.split(',').next()?.parse().ok()?;
-        }
-    }
-    Some((old_start.saturating_sub(1), new_start.saturating_sub(1)))
 }
 
 #[cfg(test)]

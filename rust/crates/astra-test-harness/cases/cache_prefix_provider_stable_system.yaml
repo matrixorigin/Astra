@@ -17,6 +17,7 @@ prompt: |
 models:
   - deepseek-v4-pro
 capability: custom:cache
+required_cache_scope: conversation_turns
 difficulty: 2
 weight: 1.0
 timeout_seconds: 60

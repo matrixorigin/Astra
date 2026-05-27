@@ -142,6 +142,12 @@ fn event_to_json(event: &StreamEvent) -> String {
         StreamEvent::PermissionAutoApproved { tool, reason } => {
             serde_json::json!({"type": "permission_auto_approved", "tool": tool, "reason": reason})
         }
+        StreamEvent::ExplainText(text) => {
+            serde_json::json!({"type": "explain", "format": "dag", "text": text})
+        }
+        StreamEvent::ExplainReport(_) | StreamEvent::VerdictReport(_) => {
+            serde_json::json!({"type": "ignored"})
+        }
     };
     serde_json::to_string(&value).unwrap_or_default()
 }
@@ -164,6 +170,17 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "thinking");
         assert_eq!(v["active"], true);
+    }
+
+    #[test]
+    fn explain_text_event_serializes() {
+        let json = event_to_json(&StreamEvent::ExplainText(
+            "Explain Analyze DAG — turn-1".into(),
+        ));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "explain");
+        assert_eq!(v["format"], "dag");
+        assert_eq!(v["text"], "Explain Analyze DAG — turn-1");
     }
 
     #[test]

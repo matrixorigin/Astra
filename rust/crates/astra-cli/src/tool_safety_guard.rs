@@ -2,7 +2,6 @@ use astra_runtime::tool_registry::ToolChain;
 use astra_turn_core::cloud_approval_policy::{
     CloudGatedToolKind, bash_command_is_read_only, cloud_gated_tool_kind_with_args,
 };
-use astra_turn_core::safety_middleware::{SafetyMiddlewareDecision, evaluate_tool_safety_request};
 use astra_turn_core::stall::{
     SERVER_STALL_WINDOW, detect_server_stall, record_server_tool_signatures,
 };
@@ -31,11 +30,13 @@ impl ToolSafetyGuard {
         }
     }
 
-    pub(crate) fn check_dispatch(name: &str, args: &Value) -> Result<(), String> {
-        match evaluate_tool_safety_request(name, args) {
-            SafetyMiddlewareDecision::Allow => Ok(()),
-            SafetyMiddlewareDecision::Deny(reason) => Err(reason),
-        }
+    /// Safety checks are now handled by [`evaluate_permission`] (Step 2) which
+    /// respects [`PermissionMode::Auto`]. This function is a pass-through to
+    /// avoid double-evaluating the safety middleware.
+    pub(crate) fn check_dispatch(_name: &str, _args: &Value) -> Result<(), String> {
+        // Safety checks delegate to evaluate_permission (engine.rs Step 2),
+        // which is mode-aware (auto mode relaxes shell obfuscation rules).
+        Ok(())
     }
 
     pub(crate) fn check_chain(chain: &ToolChain) -> Result<(), String> {
@@ -205,8 +206,12 @@ mod tests {
 
     #[test]
     fn check_request_blocks_obfuscated_shell_command() {
-        let decision =
-            ToolSafetyGuard::check_request(None, "bash", &json!({"command": "eval \"$PAYLOAD\""}));
+        let mut pm = crate::permission_manager::PermissionManager::new(false);
+        let decision = ToolSafetyGuard::check_request(
+            Some(&mut pm),
+            "bash",
+            &json!({"command": "eval \"$PAYLOAD\""}),
+        );
 
         match decision {
             crate::permission_manager::PermissionDecision::Deny(reason) => {

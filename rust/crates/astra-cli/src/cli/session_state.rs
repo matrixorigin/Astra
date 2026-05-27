@@ -203,6 +203,9 @@ pub(crate) struct SessionState {
     pub last_turn_interrupted: bool,
     /// Last turn's journal event — for /turn command display.
     pub last_turn_event: Option<session_journal::JournalEvent>,
+    /// Full context-assembly trace from the last successfully committed turn.
+    pub latest_context_assembly_trace:
+        Option<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>,
     /// Unified skill registry (single source of truth for all skill resolution).
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// Session-scoped skill quality tracker for learning loop.
@@ -227,7 +230,7 @@ pub(crate) struct SessionState {
     /// the user is authenticated. Falls back to stub creation during plan execution
     /// if not already initialized.
     pub delegation_engine:
-        Option<std::sync::Arc<astra_runtime::server::delegation_engine::DelegationEngine>>,
+        Option<std::sync::Arc<astra_runtime::server::delegation::engine::DelegationEngine>>,
     /// Team coordination registry for multi-agent team patterns.
     pub team_registry: slash_team::TeamRegistry,
     /// Shared team persistence service (in-memory or API-backed).
@@ -298,11 +301,11 @@ pub(crate) struct SessionState {
     /// Incremental lesson extraction at natural breakpoints (corrections,
     /// stalls, plan completion). Tracks which lessons have already been
     /// recorded this session to prevent double-recording.
-    pub lesson_checkpointer: astra_runtime::lesson_checkpoint::LessonCheckpointer,
+    pub lesson_checkpointer: astra_runtime::learning::checkpoint::LessonCheckpointer,
 
     /// Resolved memory model connection parameters (cached at first use).
     /// Used for memory relevance filtering with the cheapest model from the registry.
-    pub memory_model_params: Option<astra_runtime::memory_relevance::LlmConnParams>,
+    pub memory_model_params: Option<astra_runtime::memory_hooks::relevance::LlmConnParams>,
     /// Background session-memory.md extraction coordinator. `None` means
     /// the current CLI path has no API-backed extraction service.
     pub session_memory_extractor:
@@ -341,14 +344,11 @@ pub(crate) struct SessionState {
     // ── Observability (M1-M6) ──
     /// Global observability hub for M1-M6 integration (profiles, experiments, auto-tuning).
     /// Created at REPL startup, shared across sessions.
-    pub observability_hub:
-        Option<std::sync::Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    pub observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
     /// Per-session observability context for tracing, drift detection, and timing.
     /// Created when a session starts, reset on `/session new`.
     pub observability_session: Option<
-        std::sync::Arc<
-            std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-        >,
+        std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     >,
     /// Adaptive state restored from workspace, applied when ObservabilitySession is created.
     pub pending_adaptive_state: Option<PersistedAdaptiveState>,
@@ -497,6 +497,7 @@ impl Default for SessionState {
             current_plan_subtask_id: None,
             last_turn_interrupted: false,
             last_turn_event: None,
+            latest_context_assembly_trace: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
             skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
             skill_search: astra_core::SkillSearchSettings::default(),
@@ -528,7 +529,7 @@ impl Default for SessionState {
             dead_letter_queue: Some(std::sync::Arc::new(
                 astra_messaging::dead_letter::DeadLetterQueue::new(),
             )),
-            agent_spawner: None, // Created lazily when spawn_agent is first used
+            agent_spawner: None, // Created lazily when agent spawning is first used
             root_mailbox: None,
             pending_idle_agent_messages: Vec::new(),
             redo_stack: Vec::new(),
@@ -538,7 +539,7 @@ impl Default for SessionState {
             drift_original_query: None,
             session_lessons: Vec::new(),
             session_lessons_loaded: false,
-            lesson_checkpointer: astra_runtime::lesson_checkpoint::LessonCheckpointer::new(),
+            lesson_checkpointer: astra_runtime::learning::checkpoint::LessonCheckpointer::new(),
             memory_model_params: None,
             session_memory_extractor: None,
             auto_invoke_handler: None,

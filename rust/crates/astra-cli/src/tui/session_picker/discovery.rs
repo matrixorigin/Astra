@@ -282,18 +282,13 @@ mod tests {
     use super::*;
     use astra_services::{session_journal::JournalDirGuard, session_workspace};
 
-    fn with_tmp_home<F: FnOnce(&std::path::Path)>(f: F) {
-        use std::env;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = env::var("HOME").ok();
-        unsafe {
-            env::set_var("HOME", tmp.path());
-        }
+    fn with_tmp_sessions_dir<F: FnOnce(&std::path::Path)>(f: F) {
+        let cwd = std::env::current_dir().expect("current dir");
+        let tmp = tempfile::Builder::new()
+            .prefix("session-picker-discovery-")
+            .tempdir_in(&cwd)
+            .expect("tempdir in cwd");
         f(tmp.path());
-        match prev {
-            Some(v) => unsafe { env::set_var("HOME", v) },
-            None => unsafe { env::remove_var("HOME") },
-        }
     }
 
     fn write_picker_session(
@@ -316,9 +311,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn fs_source_reads_cost_from_latest_transcript_turn_summary() {
-        with_tmp_home(|home| {
-            let sessions_dir = home.join(".astra").join("sessions");
-            let _guard = JournalDirGuard::new(&sessions_dir);
+        with_tmp_sessions_dir(|sessions_dir| {
+            let _guard = JournalDirGuard::new(sessions_dir);
             let sid = "sessmeta123";
             let _ws = write_picker_session(&sessions_dir, sid);
 
@@ -349,9 +343,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn fs_source_uses_last_non_empty_transcript_cost() {
-        with_tmp_home(|home| {
-            let sessions_dir = home.join(".astra").join("sessions");
-            let _guard = JournalDirGuard::new(&sessions_dir);
+        with_tmp_sessions_dir(|sessions_dir| {
+            let _guard = JournalDirGuard::new(sessions_dir);
             let sid = "sessmeta456";
             let _ws = write_picker_session(&sessions_dir, sid);
 

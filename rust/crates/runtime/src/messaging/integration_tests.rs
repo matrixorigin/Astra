@@ -7,7 +7,7 @@
 mod tests {
     use std::sync::Arc;
 
-    use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
+    use crate::server::delegation::engine::{DelegationTracker, SubRunRecord, SubRunState};
     use astra_messaging::in_process::InProcessTransport;
     use astra_messaging::router::{AgentMailbox, AgentMailboxRouter};
     use astra_messaging::send_tool;

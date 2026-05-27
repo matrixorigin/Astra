@@ -101,6 +101,9 @@ rust/.cargo/*
 !rust/.cargo/audit.toml
 
 
+# Benchmarks (local SWE-bench workspaces, runs, reports)
+benchmarks/
+
 # insta-rs runtime artifacts (only the canonical .snap is tracked)
 *.snap.new
 .insta/

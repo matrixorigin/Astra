@@ -125,11 +125,21 @@ pub enum VolatilePlacement {
     Free,
 }
 
+/// How far prompt-cache reuse survives for this provider/model path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CacheReuseScope {
+    /// Cache can survive across later user turns when the stable prefix matches.
+    ConversationTurns,
+    /// Cache reuse is only reliable across additional LLM rounds within the same turn.
+    IntraTurnRounds,
+}
+
 /// The combined classification the runtime consumes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CacheCapability {
     pub protocol: CacheProtocol,
     pub volatile_placement: VolatilePlacement,
+    pub reuse_scope: Option<CacheReuseScope>,
 }
 
 impl CacheCapability {
@@ -146,30 +156,91 @@ impl CacheCapability {
             "anthropic" => Self {
                 protocol: CacheProtocol::MarkerExplicit,
                 volatile_placement: VolatilePlacement::MarkerIsolated,
+                reuse_scope: None,
             },
+            // Bedrock multiplexes Anthropic Claude (cachePoint marker
+            // semantics) and non-Claude families (Nova, Titan, Cohere)
+            // that do NOT support Anthropic-style cache_control. Mirror
+            // the runtime's authoritative classification in
+            // `runtime::turn::prompt_cache::provider_cache_policy_for`
+            // and the substring detection used by
+            // `microcompact::ProviderCacheStrategy::from_provider_hint`
+            // (`claude` / `anthropic`) — when those checks miss, fall
+            // back to `None` so the volatile placement pipeline emits
+            // the simple stable-text system block both classifiers
+            // agree on. Without this guard, Nova traffic was getting an
+            // Anthropic-shaped multi-block system message (no
+            // cache_control to back it up) instead of the prefix-cache-
+            // friendly text shape `microcompact` expects.
+            "bedrock" if model_lower.contains("claude") || model_lower.contains("anthropic") => {
+                Self {
+                    protocol: CacheProtocol::BedrockCachePoint,
+                    volatile_placement: VolatilePlacement::MarkerIsolated,
+                    reuse_scope: None,
+                }
+            }
             "bedrock" => Self {
-                protocol: CacheProtocol::BedrockCachePoint,
-                volatile_placement: VolatilePlacement::MarkerIsolated,
+                protocol: CacheProtocol::None,
+                volatile_placement: VolatilePlacement::Free,
+                reuse_scope: None,
             },
             // Vendor-specific: MiniMax is a known strict-history provider
             // (see session 986a553e regression). Detect via model-id
             // substring so e.g. `MiniMax-M2.7` or future `MiniMax-M3`
             // variants served under provider=openai still get the right
             // placement.
-            "openai" if model_lower.contains("minimax") => Self {
-                protocol: CacheProtocol::StrictHistoryMatch,
-                volatile_placement: VolatilePlacement::CurrentUserOnly,
-            },
+            //
+            // DeepSeek v4 on the OpenAI-compatible MOI gateway showed the
+            // same operational symptom under harness/live sessions
+            // (`cache_provider_matrix_regression`, session
+            // eeea6ec6-cb33-46b5-9932-b2d34a081b0a): once the volatile tail
+            // expanded to the "long" reminder shape, the next round's
+            // `cached_input_tokens` collapsed from ~10k to 0 even though the
+            // stable prefix before the tail was unchanged. Treating those
+            // models as `TailSuffix` reintroduces avoidable cache misses; the
+            // safer contract is the same total volatile suppression we use for
+            // other strict-history providers.
+            "openai"
+                if model_lower.contains("minimax")
+                    || matches!(
+                        model_lower.as_str(),
+                        "deepseek-v4-flash" | "deepseek-v4-pro"
+                    ) =>
+            {
+                Self {
+                    protocol: CacheProtocol::StrictHistoryMatch,
+                    volatile_placement: VolatilePlacement::CurrentUserOnly,
+                    reuse_scope: None,
+                }
+            }
             "openai" => Self {
                 protocol: CacheProtocol::OpenAiAutoPrefix,
                 volatile_placement: VolatilePlacement::TailSuffix,
+                reuse_scope: None,
             },
             // Unknown providers: conservative — no cache assumed.
             _ => Self {
                 protocol: CacheProtocol::None,
                 volatile_placement: VolatilePlacement::Free,
+                reuse_scope: None,
             },
         }
+    }
+
+    /// Resolve capability from explicit model metadata when available,
+    /// otherwise fall back to provider/model heuristics.
+    #[must_use]
+    pub fn from_explicit_or_provider_model(
+        explicit: Option<Self>,
+        provider: &str,
+        model: &str,
+    ) -> Self {
+        explicit.unwrap_or_else(|| Self::for_provider_and_model(provider, model))
+    }
+
+    #[must_use]
+    pub fn prefers_intra_turn_batching(&self) -> bool {
+        matches!(self.reuse_scope, Some(CacheReuseScope::IntraTurnRounds))
     }
 
     /// Shortcut used by call sites that only care whether volatile
@@ -216,6 +287,55 @@ mod tests {
     }
 
     #[test]
+    fn bedrock_non_claude_models_skip_marker_protocol() {
+        // Non-Claude Bedrock models (Nova, Titan, Cohere) do NOT support
+        // Anthropic-style cache_control markers — see
+        // `bridge_provider_policy_keeps_non_claude_bedrock_prefix_only`
+        // in `runtime::turn::prompt_cache::tests`. Routing them through
+        // `BedrockCachePoint` here disagrees with
+        // `microcompact::ProviderCacheStrategy::from_provider_and_model`,
+        // which correctly falls back to `Prefix`. The two classifiers
+        // are consumed by the same volatile placement / system layout
+        // logic, so the disagreement leaks Anthropic-shaped multi-block
+        // system content into Nova traffic. Conservative: treat
+        // non-Claude Bedrock as Free placement so the runtime emits the
+        // simpler stable-text system block both classifiers agree on.
+        let nova = CacheCapability::for_provider_and_model("bedrock", "us.amazon.nova-micro-v1:0");
+        assert_eq!(nova.protocol, CacheProtocol::None);
+        assert_eq!(nova.volatile_placement, VolatilePlacement::Free);
+
+        let titan = CacheCapability::for_provider_and_model("bedrock", "amazon.titan-text-v1");
+        assert_eq!(titan.protocol, CacheProtocol::None);
+        assert_eq!(titan.volatile_placement, VolatilePlacement::Free);
+
+        let cohere = CacheCapability::for_provider_and_model("bedrock", "cohere.command-r-plus");
+        assert_eq!(cohere.protocol, CacheProtocol::None);
+        assert_eq!(cohere.volatile_placement, VolatilePlacement::Free);
+    }
+
+    #[test]
+    fn explicit_capability_overrides_provider_model_fallback() {
+        let explicit = CacheCapability {
+            protocol: CacheProtocol::StrictHistoryMatch,
+            volatile_placement: VolatilePlacement::CurrentUserOnly,
+            reuse_scope: Some(CacheReuseScope::ConversationTurns),
+        };
+
+        let c =
+            CacheCapability::from_explicit_or_provider_model(Some(explicit), "openai", "gpt-4o");
+
+        assert_eq!(c, explicit);
+    }
+
+    #[test]
+    fn missing_explicit_capability_preserves_openai_default() {
+        let c = CacheCapability::from_explicit_or_provider_model(None, "openai", "gpt-4o");
+
+        assert_eq!(c.protocol, CacheProtocol::OpenAiAutoPrefix);
+        assert_eq!(c.volatile_placement, VolatilePlacement::TailSuffix);
+    }
+
+    #[test]
     fn openai_provider_gets_tail_suffix() {
         let c = CacheCapability::for_provider_and_model("openai", "gpt-4o");
         assert_eq!(c.protocol, CacheProtocol::OpenAiAutoPrefix);
@@ -238,6 +358,20 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_v4_flash_openai_routes_to_current_user_only() {
+        let c = CacheCapability::for_provider_and_model("openai", "deepseek-v4-flash");
+        assert_eq!(c.protocol, CacheProtocol::StrictHistoryMatch);
+        assert_eq!(c.volatile_placement, VolatilePlacement::CurrentUserOnly);
+    }
+
+    #[test]
+    fn deepseek_v4_pro_openai_routes_to_current_user_only() {
+        let c = CacheCapability::for_provider_and_model("openai", "DEEPSEEK-V4-PRO");
+        assert_eq!(c.protocol, CacheProtocol::StrictHistoryMatch);
+        assert_eq!(c.volatile_placement, VolatilePlacement::CurrentUserOnly);
+    }
+
+    #[test]
     fn unknown_provider_defaults_to_none_and_free() {
         let c = CacheCapability::for_provider_and_model("some-new-vendor", "model-xyz");
         assert_eq!(c.protocol, CacheProtocol::None);
@@ -256,6 +390,7 @@ mod tests {
         let minimax = CacheCapability {
             protocol: CacheProtocol::StrictHistoryMatch,
             volatile_placement: VolatilePlacement::CurrentUserOnly,
+            reuse_scope: None,
         };
         for round in 0..=10 {
             assert!(
@@ -270,6 +405,7 @@ mod tests {
         let anthropic = CacheCapability {
             protocol: CacheProtocol::MarkerExplicit,
             volatile_placement: VolatilePlacement::MarkerIsolated,
+            reuse_scope: None,
         };
         // Marker providers are safe every round — the marker isolates
         // volatile content from cache.
@@ -283,6 +419,7 @@ mod tests {
         let openai = CacheCapability {
             protocol: CacheProtocol::OpenAiAutoPrefix,
             volatile_placement: VolatilePlacement::TailSuffix,
+            reuse_scope: None,
         };
         // Tail-suffix providers can safely re-append volatile every
         // round since the churn lives at the end. OpenAI's auto-prefix
@@ -290,6 +427,16 @@ mod tests {
         for round in 0..=20 {
             assert!(openai.should_inject_volatile_on_round(round));
         }
+    }
+
+    #[test]
+    fn intra_turn_reuse_scope_prefers_batching() {
+        let capability = CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::TailSuffix,
+            reuse_scope: Some(CacheReuseScope::IntraTurnRounds),
+        };
+        assert!(capability.prefers_intra_turn_batching());
     }
 
     #[test]

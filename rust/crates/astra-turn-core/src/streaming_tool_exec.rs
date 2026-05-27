@@ -26,7 +26,7 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinHandle;
 
 use super::parallel_tool_exec::{ToolExecResult, ToolExecutorFn, is_read_only_tool_with_args};
-use super::permission_types::PermissionDecision;
+use super::permission::types::PermissionDecision;
 
 /// Environment variable gating speculative streaming execution.
 /// Set to `1` to enable; default (unset) keeps pre-speculation behavior.

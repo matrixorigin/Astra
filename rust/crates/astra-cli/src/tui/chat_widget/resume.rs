@@ -49,6 +49,7 @@ mod tests {
     use crate::tui::history_cell::{
         HistoryCell, assistant::AssistantCell, turn_summary::TurnSummaryCell, user::UserCell,
     };
+    use crate::tui::render::line_utils::sanitize_lines_for_terminal;
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
     use crate::tui::transcript_jsonl;
     use crate::tui::turn_event::TurnEvent;
@@ -78,7 +79,7 @@ mod tests {
             if i > 0 {
                 all_lines.push(Line::default());
             }
-            all_lines.extend(cell.display_lines(width));
+            all_lines.extend(sanitize_lines_for_terminal(cell.display_lines(width)));
         }
         let height = (all_lines.len() as u16).max(1);
         let p = ratatui::widgets::Paragraph::new(all_lines)

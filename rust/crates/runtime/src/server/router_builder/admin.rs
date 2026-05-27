@@ -48,13 +48,13 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
         )
         .route(
             "/admin/config",
-            get(admin_config_handlers::list_admin_config_handler),
+            get(config_admin::admin_config::list_admin_config_handler),
         )
         .route(
             "/admin/config/{key}",
-            get(admin_config_handlers::get_admin_config_handler)
-                .put(admin_config_handlers::set_admin_config_handler)
-                .delete(admin_config_handlers::delete_admin_config_handler),
+            get(config_admin::admin_config::get_admin_config_handler)
+                .put(config_admin::admin_config::set_admin_config_handler)
+                .delete(config_admin::admin_config::delete_admin_config_handler),
         )
         .route(
             "/admin/resources/limits/{user_id}",
@@ -68,7 +68,7 @@ fn admin_harness_routes(state: AppState) -> Router<AppState> {
     Router::new()
         .route(
             "/sessions",
-            get(harness_handlers::list_active_harness_sessions),
+            get(crate::server::harness::handlers::list_active_harness_sessions),
         )
         .with_state(state)
 }

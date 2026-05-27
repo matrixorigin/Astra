@@ -1,6 +1,6 @@
 //! Step recorder `Plan` phase after `/chat` payload assembly.
 
-use crate::tool_registry_report::SelectionReport;
+use crate::tool::registry::report::SelectionReport;
 use astra_pipeline::step_recorder::StepRecorder;
 
 /// Mirrors the `prepare_chat_turn_payload` tail that calls [`StepRecorder::record_plan`].

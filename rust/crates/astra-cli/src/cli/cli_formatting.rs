@@ -1,11 +1,13 @@
 //! CLI output formatting utilities.
 //!
 //! Helper functions for formatting CLI output: truncation, path shortening,
-//! byte sizes, durations, and diff colorization.
+//! byte sizes, durations, and diff previews/colorization.
 
-use crossterm::style::Stylize;
+use crossterm::style::{Color, Stylize, style};
 use serde_json::Value;
 use std::borrow::Cow;
+
+use crate::diff_utils::parse_hunk_header;
 
 pub use astra_text_utils::str_preview::{github_repo_display, shorten_path, truncate_line};
 
@@ -29,66 +31,160 @@ pub fn extract_cli_diff_block(output: &str) -> Option<Cow<'_, str>> {
     Some(Cow::Owned(diff.to_string()))
 }
 
+const MAX_COLORIZED_DIFF_LINES: usize = 500;
+const MAX_COLORIZED_DIFF_CHANGED_LINES: usize = 200;
+
 /// Colorize a unified diff into a compact summary with green +lines and red -lines.
 /// Shows context around changes for better understanding.
-pub fn colorize_diff_summary(diff: &str, max_lines: usize) -> String {
+pub fn colorize_diff_summary(diff: &str) -> String {
+    let owned_preview;
+    let diff = if diff.lines().count() > MAX_COLORIZED_DIFF_LINES {
+        owned_preview = compact_unified_diff_preview(diff, MAX_COLORIZED_DIFF_CHANGED_LINES);
+        owned_preview.as_str()
+    } else {
+        diff
+    };
+
     let mut parts = Vec::new();
-    let mut shown = 0usize;
-    let mut total_add = 0usize;
-    let mut total_del = 0usize;
-
-    // Extract the file path from diff header
-    let mut file_path: Option<&str> = None;
-    for line in diff.lines() {
-        if let Some(path) = line.strip_prefix("+++ b/") {
-            file_path = Some(path);
-            break;
-        }
-    }
-
-    // Add file header if found
-    if let Some(path) = file_path {
-        let short = shorten_path(path, 50);
-        parts.push(format!("{}", short.dim()));
-    }
+    let mut old_line = 0u32;
+    let mut new_line = 0u32;
 
     for line in diff.lines() {
-        if line.starts_with('+') && !line.starts_with("+++ ") {
-            total_add += 1;
-            if shown < max_lines {
-                // Green + with highlighted code
-                let code = &line[1..]; // Skip the '+' prefix
-                let highlighted = highlight_code_line(code);
-                parts.push(format!("{}{}", "+".green(), highlighted));
-                shown += 1;
+        if line.starts_with("@@") {
+            if let Some((old_start, new_start)) = parse_hunk_header(line) {
+                old_line = old_start;
+                new_line = new_start;
             }
-        } else if line.starts_with('-') && !line.starts_with("--- ") {
-            total_del += 1;
-            if shown < max_lines {
-                // Red - with dimmed code (deleted)
-                let code = &line[1..]; // Skip the '-' prefix
-                parts.push(format!("{}{}", "-".red(), code.dim()));
-                shown += 1;
-            }
+            parts.push(format!("{}", line.cyan()));
+            continue;
         }
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            let rendered = line
+                .strip_prefix("--- a/")
+                .or_else(|| line.strip_prefix("+++ b/"))
+                .map(|path| shorten_path(path, 60))
+                .unwrap_or_else(|| line.to_string());
+            parts.push(format!("{}", rendered.dim().bold()));
+            continue;
+        }
+        if let Some(code) = line.strip_prefix('+') {
+            new_line += 1;
+            let prefix = format!("{:>4} + ", new_line);
+            let body = format!("{prefix}{code}");
+            parts.push(format!(
+                "{}",
+                style(body).with(Color::Black).on(Color::DarkGreen)
+            ));
+            continue;
+        }
+        if let Some(code) = line.strip_prefix('-') {
+            old_line += 1;
+            let prefix = format!("{:>4} - ", old_line);
+            let body = format!("{prefix}{code}");
+            parts.push(format!(
+                "{}",
+                style(body).with(Color::White).on(Color::DarkRed)
+            ));
+            continue;
+        }
+        if line.starts_with(' ') {
+            old_line += 1;
+            new_line += 1;
+            let prefix = format!("{:>4}   ", new_line);
+            parts.push(format!("{}{}", prefix.dim(), &line[1..].dim()));
+            continue;
+        }
+        parts.push(format!("{}", line.dim()));
     }
-    let remaining = (total_add + total_del).saturating_sub(max_lines);
-    if remaining > 0 {
-        parts.push(format!(
-            "{}",
-            format!("… +{remaining} more ({total_add}+ {total_del}-)").dim(),
-        ));
-    } else if total_add > 0 || total_del > 0 {
-        // Show total counts on the last line
-        parts.push(format!("{}", format!("{total_add}+ {total_del}-").dim(),));
-    }
-    if parts.is_empty() {
-        return String::new();
-    }
-    parts.join("\n    ")
+
+    parts.join("\n")
 }
 
-/// Format byte size as human-friendly string.
+fn is_diff_change_line(line: &str) -> bool {
+    (line.starts_with('+') && !line.starts_with("+++ "))
+        || (line.starts_with('-') && !line.starts_with("--- "))
+}
+
+/// Build a compact unified-diff preview that keeps file/hunk headers plus the
+/// first N changed lines, then appends an accurate folded-count marker.
+pub fn compact_unified_diff_preview(diff: &str, max_changed_lines: usize) -> String {
+    if max_changed_lines == 0 {
+        return String::new();
+    }
+
+    let total_changed = diff
+        .lines()
+        .filter(|line| is_diff_change_line(line))
+        .count();
+    if total_changed == 0 {
+        return String::new();
+    }
+
+    let mut preview = Vec::new();
+    let mut pending_file_headers: Vec<&str> = Vec::new();
+    let mut pending_hunk_header: Option<&str> = None;
+    let mut file_headers_emitted = false;
+    let mut hunk_header_emitted = false;
+    let mut shown_changed = 0usize;
+
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") || line.starts_with("index ") {
+            continue;
+        }
+
+        if line.starts_with("--- ") {
+            pending_file_headers.clear();
+            pending_file_headers.push(line);
+            pending_hunk_header = None;
+            file_headers_emitted = false;
+            hunk_header_emitted = false;
+            continue;
+        }
+
+        if line.starts_with("+++ ") {
+            pending_file_headers.push(line);
+            file_headers_emitted = false;
+            continue;
+        }
+
+        if line.starts_with("@@") {
+            pending_hunk_header = Some(line);
+            hunk_header_emitted = false;
+            continue;
+        }
+
+        if !is_diff_change_line(line) {
+            continue;
+        }
+
+        if shown_changed >= max_changed_lines {
+            continue;
+        }
+
+        if !file_headers_emitted {
+            preview.extend(pending_file_headers.iter().map(|line| (*line).to_string()));
+            file_headers_emitted = true;
+        }
+        if !hunk_header_emitted {
+            if let Some(header) = pending_hunk_header {
+                preview.push(header.to_string());
+            }
+            hunk_header_emitted = true;
+        }
+
+        preview.push(line.to_string());
+        shown_changed += 1;
+    }
+
+    let remaining = total_changed.saturating_sub(shown_changed);
+    if remaining > 0 {
+        preview.push(format!("… +{remaining} more changed lines"));
+    }
+
+    preview.join("\n")
+}
+
+/// Format a byte count at human scale (B, KiB, MiB, GiB).
 pub fn format_byte_size(bytes: usize) -> String {
     if bytes < 1024 {
         format!("{bytes}B")
@@ -360,6 +456,86 @@ mod tests {
         .to_string();
         let got = extract_cli_diff_block(&out).expect("diff");
         assert_eq!(got.as_ref(), diff_body);
+    }
+
+    #[test]
+    fn compact_unified_diff_preview_keeps_headers_and_correct_fold_count() {
+        let diff = "\
+diff --git a/src/a.rs b/src/a.rs\n\
+--- a/src/a.rs\n\
++++ b/src/a.rs\n\
+@@ -10,3 +10,4 @@\n\
+-old1\n\
++new1\n\
+-old2\n\
++new2\n\
++new3\n";
+        let preview = compact_unified_diff_preview(diff, 3);
+        assert_eq!(
+            preview,
+            "\
+--- a/src/a.rs\n\
++++ b/src/a.rs\n\
+@@ -10,3 +10,4 @@\n\
+-old1\n\
++new1\n\
+-old2\n\
+… +2 more changed lines"
+        );
+    }
+
+    #[test]
+    fn colorize_diff_summary_renders_line_numbers_from_hunks() {
+        let preview = "\
+--- a/src/a.rs\n\
++++ b/src/a.rs\n\
+@@ -41,2 +41,2 @@\n\
+-old\n\
++new";
+        let rendered = colorize_diff_summary(preview);
+        let stripped = strip_ansi(&rendered);
+        assert!(stripped.contains("src/a.rs"));
+        assert!(stripped.contains("@@ -41,2 +41,2 @@"));
+        assert!(stripped.contains("  41 - old"), "{stripped}");
+        assert!(stripped.contains("  41 + new"), "{stripped}");
+    }
+
+    #[test]
+    fn colorize_diff_summary_hard_caps_large_input_in_release_builds() {
+        let mut diff = String::from("--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,1 +1,300 @@\n");
+        for i in 0..600 {
+            diff.push_str(&format!("+line-{i}\n"));
+        }
+
+        let rendered = colorize_diff_summary(&diff);
+        let stripped = strip_ansi(&rendered);
+        assert!(stripped.contains("… +400 more changed lines"), "{stripped}");
+        assert!(!stripped.contains("line-599"), "{stripped}");
+    }
+
+    #[test]
+    fn compact_unified_diff_preview_handles_multiple_files() {
+        let diff = "\
+diff --git a/src/a.rs b/src/a.rs\n\
+--- a/src/a.rs\n\
++++ b/src/a.rs\n\
+@@ -1,1 +1,1 @@\n\
+-old-a\n\
++new-a\n\
+diff --git a/src/b.rs b/src/b.rs\n\
+--- a/src/b.rs\n\
++++ b/src/b.rs\n\
+@@ -10,1 +10,2 @@\n\
+-old-b\n\
++new-b\n\
++new-b2\n";
+        let preview = compact_unified_diff_preview(diff, 3);
+        assert!(preview.contains("--- a/src/a.rs"));
+        assert!(preview.contains("+++ b/src/a.rs"));
+        assert!(preview.contains("--- a/src/b.rs"));
+        assert!(preview.contains("+++ b/src/b.rs"));
+        assert!(preview.contains("-old-b"));
+        assert!(preview.contains("… +2 more changed lines"));
     }
 
     #[test]

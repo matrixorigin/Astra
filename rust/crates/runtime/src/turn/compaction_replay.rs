@@ -15,7 +15,7 @@
 //!
 //! The pipeline's `RecoveryState` is informed of PTL errors and compaction
 //! outcomes via `record_ptl_error()` / `record_reactive_compact()` in
-//! `agentic_loop_execution_phase.rs`, ensuring the planner can escalate its
+//! `agentic_loop::execution_phase.rs`, ensuring the planner can escalate its
 //! own tier on the next turn.
 //!
 //! Design: tiered escalation (default → aggressive → emergency) gated by
@@ -156,7 +156,7 @@ impl CompactionEffectivenessTracker {
     }
 
     /// Build a summary for telemetry — emitted into the heavy-checkpoint
-    /// `compaction_state` blob (see `agentic_loop_finalization`) and the
+    /// `compaction_state` blob (see `agentic_loop::finalization`) and the
     /// run-lifecycle `compaction_tracker` field.
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
@@ -210,7 +210,7 @@ pub(crate) fn try_compact_for_retry_tiered(
     //
     // Using `prompts::estimate_tokens` (which walks content + tool_calls and
     // adds per-message + fixed overhead) keeps this in sync with the
-    // pre-request pressure estimate in `agentic_loop_lifecycle` so a
+    // pre-request pressure estimate in `agentic_loop::lifecycle` so a
     // CompactAndRetry triggered precisely by large tool_calls is not
     // silently skipped.
     let measured =

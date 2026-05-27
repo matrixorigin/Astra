@@ -88,6 +88,12 @@ enum PreToolHookOutcome {
     OperationalFailure(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PostToolHookOutcome {
+    Success(Option<String>),
+    OperationalFailure(String),
+}
+
 impl PreToolDecision {
     pub fn from_json_contract(
         value: &serde_json::Value,
@@ -819,14 +825,49 @@ pub async fn evaluate_pre_tool_hooks(
                 registry.note_hook_success(hook_index);
                 astra_core::session_env_overlay::set(key, value);
             }
-            HookAction::Custom { id, .. } => {
-                registry.note_hook_success(hook_index);
-                tracing::warn!(
-                    target: "hook",
-                    "Custom hook '{}' matched tool '{}' — not yet implemented",
-                    id,
-                    tool_name
-                );
+            HookAction::Custom { id, config } => {
+                // Custom hooks delegate to shell execution when config
+                // carries a `command` key, otherwise they pass through.
+                if let Some(config) = config
+                    && let Some(cmd) = config.get("command").and_then(|v| v.as_str())
+                {
+                    let outcome =
+                        run_shell_pre_hook(cmd, tool_name, tool_args, hook.timeout_secs).await;
+                    match outcome {
+                        PreToolHookOutcome::Decision(decision) => {
+                            registry.note_hook_success(hook_index);
+                            if let PreToolDecision::Allow = &decision {
+                                // no-op: proceed to next hook
+                            } else {
+                                return decision;
+                            }
+                        }
+                        PreToolHookOutcome::OperationalFailure(reason) => {
+                            let tripped = registry.note_hook_failure(hook_index);
+                            if tripped {
+                                tracing::error!(
+                                    target: "hook",
+                                    "PreToolUse custom hook '{}' (id={}) for '{}' tripped its circuit breaker after {} consecutive failures: {}",
+                                    hook_index,
+                                    id,
+                                    tool_name,
+                                    TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT,
+                                    reason
+                                );
+                                continue;
+                            }
+                            return PreToolDecision::Block(reason);
+                        }
+                    }
+                } else {
+                    registry.note_hook_success(hook_index);
+                    tracing::info!(
+                        target: "hook",
+                        "Custom hook '{}' matched tool '{}' — no command in config, passing through",
+                        id,
+                        tool_name
+                    );
+                }
             }
         }
     }
@@ -847,14 +888,14 @@ pub async fn evaluate_post_tool_hooks(
     tool_args: &serde_json::Value,
     tool_output: &str,
 ) -> Option<String> {
-    let hooks = registry.matching(ToolEventKind::PostToolUse, tool_name);
+    let hooks = registry.matching_indexed(ToolEventKind::PostToolUse, tool_name);
     if hooks.is_empty() {
         return None;
     }
 
     let mut current_output = tool_output.to_string();
 
-    for hook in hooks {
+    for (hook_index, hook) in hooks {
         // Async hooks: fire-and-forget in background
         if hook.is_async {
             let action = hook.action.clone();
@@ -869,46 +910,116 @@ pub async fn evaluate_post_tool_hooks(
         }
 
         match &hook.action {
-            HookAction::Shell { command } => {
-                if let Some(modified) = run_shell_post_hook(
-                    command,
-                    tool_name,
-                    tool_args,
-                    &current_output,
-                    hook.timeout_secs,
-                )
-                .await
-                {
-                    current_output = modified;
+            HookAction::Shell { command } => match run_shell_post_hook(
+                command,
+                tool_name,
+                tool_args,
+                &current_output,
+                hook.timeout_secs,
+            )
+            .await
+            {
+                PostToolHookOutcome::Success(modified) => {
+                    registry.note_hook_success(hook_index);
+                    if let Some(modified) = modified {
+                        current_output = modified;
+                    }
                 }
-            }
+                PostToolHookOutcome::OperationalFailure(reason) => {
+                    let tripped = registry.note_hook_failure(hook_index);
+                    if tripped {
+                        tracing::error!(
+                            target: "hook",
+                            "PostToolUse hook {} for '{}' tripped its circuit breaker after {} consecutive failures: {}",
+                            hook_index,
+                            tool_name,
+                            TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT,
+                            reason
+                        );
+                    }
+                }
+            },
             HookAction::Http {
                 url,
                 headers,
                 timeout_secs,
-            } => {
-                if let Some(modified) = run_http_post_hook(
-                    url,
-                    headers,
-                    tool_name,
-                    tool_args,
-                    &current_output,
-                    *timeout_secs,
-                )
-                .await
+            } => match run_http_post_hook(
+                url,
+                headers,
+                tool_name,
+                tool_args,
+                &current_output,
+                *timeout_secs,
+            )
+            .await
+            {
+                PostToolHookOutcome::Success(modified) => {
+                    registry.note_hook_success(hook_index);
+                    if let Some(modified) = modified {
+                        current_output = modified;
+                    }
+                }
+                PostToolHookOutcome::OperationalFailure(reason) => {
+                    let tripped = registry.note_hook_failure(hook_index);
+                    if tripped {
+                        tracing::error!(
+                            target: "hook",
+                            "PostToolUse HTTP hook {} for '{}' tripped its circuit breaker after {} consecutive failures: {}",
+                            hook_index,
+                            tool_name,
+                            TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT,
+                            reason
+                        );
+                    }
+                }
+            },
+            HookAction::Custom { id, config } => {
+                // Custom hooks delegate to shell execution when config
+                // carries a `command` key, otherwise they pass through.
+                if let Some(config) = config
+                    && let Some(cmd) = config.get("command").and_then(|v| v.as_str())
                 {
-                    current_output = modified;
+                    match run_shell_post_hook(
+                        cmd,
+                        tool_name,
+                        tool_args,
+                        &current_output,
+                        hook.timeout_secs,
+                    )
+                    .await
+                    {
+                        PostToolHookOutcome::Success(modified) => {
+                            registry.note_hook_success(hook_index);
+                            if let Some(modified) = modified {
+                                current_output = modified;
+                            }
+                        }
+                        PostToolHookOutcome::OperationalFailure(reason) => {
+                            let tripped = registry.note_hook_failure(hook_index);
+                            if tripped {
+                                tracing::error!(
+                                    target: "hook",
+                                    "PostToolUse custom hook '{}' (id={}) for '{}' tripped its circuit breaker after {} consecutive failures: {}",
+                                    hook_index,
+                                    id,
+                                    tool_name,
+                                    TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT,
+                                    reason
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    registry.note_hook_success(hook_index);
+                    tracing::info!(
+                        target: "hook",
+                        "PostToolUse custom hook '{}' for '{}' — no command in config, passing through",
+                        id,
+                        tool_name
+                    );
                 }
             }
-            HookAction::Custom { id, .. } => {
-                tracing::warn!(
-                    target: "hook",
-                    "PostToolUse custom hook '{}' for '{}' — not yet implemented",
-                    id,
-                    tool_name
-                );
-            }
-            _ => {}
+            _ => registry.note_hook_success(hook_index),
         }
     }
 
@@ -1007,13 +1118,13 @@ async fn run_shell_post_hook(
     tool_args: &serde_json::Value,
     tool_output: &str,
     timeout_secs: u32,
-) -> Option<String> {
+) -> PostToolHookOutcome {
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
     if let Some(error) = shell_hook_policy_error(command) {
         log_blocked_shell_hook("post-tool", command, &error, None);
-        return Some(format!("Error: {error}"));
+        return PostToolHookOutcome::OperationalFailure(error);
     }
 
     let input = serde_json::json!({
@@ -1033,7 +1144,9 @@ async fn run_shell_post_hook(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(target: "hook", "Failed to spawn post-hook '{}': {}", command, e);
-            return None;
+            return PostToolHookOutcome::OperationalFailure(format!(
+                "Hook '{command}' failed to spawn: {e}"
+            ));
         }
     };
 
@@ -1055,11 +1168,26 @@ async fn run_shell_post_hook(
         (buf, status)
     };
 
-    match tokio::time::timeout(timeout, read_fut).await {
+    let wait_result = tokio::time::timeout(timeout, read_fut).await;
+    match wait_result {
         Ok((buf, Ok(status))) if status.success() => parse_post_hook_output(&buf),
-        _ => {
+        Ok((_, Ok(status))) => PostToolHookOutcome::OperationalFailure(format!(
+            "Hook '{}' exited with status {}",
+            command,
+            status.code().unwrap_or(-1)
+        )),
+        Ok((_, Err(e))) => {
+            tracing::warn!(target: "hook", "Post-hook I/O error for '{}': {}", command, e);
+            PostToolHookOutcome::OperationalFailure(format!(
+                "Hook '{command}' failed during I/O: {e}"
+            ))
+        }
+        Err(_) => {
             let _ = child.kill().await;
-            None
+            PostToolHookOutcome::OperationalFailure(format!(
+                "Hook '{}' timed out after {}s",
+                command, timeout_secs
+            ))
         }
     }
 }
@@ -1087,17 +1215,19 @@ fn parse_pre_hook_output(stdout: &[u8]) -> PreToolHookOutcome {
 }
 
 /// Parse stdout from a PostToolUse shell hook for output modification.
-fn parse_post_hook_output(stdout: &[u8]) -> Option<String> {
+fn parse_post_hook_output(stdout: &[u8]) -> PostToolHookOutcome {
     let text = String::from_utf8_lossy(stdout);
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return None;
+        return PostToolHookOutcome::Success(None);
     }
 
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        v.get("output").and_then(|o| o.as_str()).map(String::from)
+        PostToolHookOutcome::Success(v.get("output").and_then(|o| o.as_str()).map(String::from))
     } else {
-        None
+        PostToolHookOutcome::OperationalFailure(
+            "invalid post-tool hook contract: stdout was not JSON".into(),
+        )
     }
 }
 
@@ -1131,7 +1261,7 @@ async fn run_http_post_hook(
     tool_args: &serde_json::Value,
     tool_output: &str,
     timeout_secs: u32,
-) -> Option<String> {
+) -> PostToolHookOutcome {
     let payload = serde_json::json!({
         "hook_event": "post_tool_use",
         "tool_name": tool_name,
@@ -1141,7 +1271,7 @@ async fn run_http_post_hook(
 
     match http_post_json(url, headers, &payload, timeout_secs).await {
         Some(body) => parse_post_hook_output(body.as_bytes()),
-        None => None,
+        None => PostToolHookOutcome::OperationalFailure(format!("HTTP hook '{url}' failed")),
     }
 }
 
@@ -1455,13 +1585,34 @@ pub async fn evaluate_session_hooks(
             HookAction::SetEnv { key, value } => {
                 output.env_vars.push((key.clone(), value.clone()));
             }
-            HookAction::Custom { id, .. } => {
-                tracing::warn!(
-                    target: "hook",
-                    "Custom session hook '{}' for {:?} — not yet implemented",
-                    id,
-                    event
-                );
+            HookAction::Custom { id, config } => {
+                // Custom hooks delegate to shell execution when config
+                // carries a `command` key, otherwise they pass through.
+                if let Some(config) = config
+                    && let Some(cmd) = config.get("command").and_then(|v| v.as_str())
+                {
+                    if let Some(result) = run_shell_session_hook(
+                        cmd,
+                        event,
+                        session_id,
+                        user_message,
+                        hook.timeout_secs,
+                    )
+                    .await
+                    {
+                        if let Some(ctx) = result.context {
+                            contexts.push(ctx);
+                        }
+                        output.env_vars.extend(result.env_vars);
+                    }
+                } else {
+                    tracing::info!(
+                        target: "hook",
+                        "Custom session hook '{}' for {:?} — no command in config, passing through",
+                        id,
+                        event
+                    );
+                }
             }
             HookAction::Http {
                 url,
@@ -1502,10 +1653,7 @@ async fn run_shell_session_hook(
 
     if let Some(error) = shell_hook_policy_error(command) {
         log_blocked_shell_hook("session", command, &error, None);
-        return Some(SessionHookOutput {
-            context: Some(error),
-            env_vars: Vec::new(),
-        });
+        return None;
     }
 
     let input = serde_json::json!({
@@ -2426,7 +2574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn e2e_post_hook_unsafe_shell_command_returns_policy_error() {
+    async fn e2e_post_hook_unsafe_shell_command_is_blocked_by_policy() {
         let registry = ToolEventHookRegistry::new(vec![ToolEventHook {
             event: ToolEventKind::PostToolUse,
             matcher: "bash".into(),
@@ -2443,9 +2591,61 @@ mod tests {
         let result =
             evaluate_post_tool_hooks(&registry, "bash", &serde_json::json!({}), "original output")
                 .await;
-        let modified = result.expect("post hook should surface policy error");
-        assert!(modified.contains(SHELL_HOOK_POLICY_PREFIX));
-        assert!(modified.contains("credential path access"));
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn e2e_post_custom_hook_invalid_contract_trips_circuit_breaker() {
+        let hit_dir = tempfile::tempdir().unwrap();
+        let hit_log = hit_dir.path().join("hit.log");
+        let command = format!(
+            "cd {} && printf 'definitely-not-json'; printf 'hit\\n' >> hit.log",
+            hit_dir.path().display()
+        );
+        let registry = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PostToolUse,
+            matcher: "bash".into(),
+            action: HookAction::Custom {
+                id: "custom-post".into(),
+                config: Some(serde_json::json!({ "command": command })),
+            },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+
+        let count_hits = || {
+            std::fs::read_to_string(&hit_log)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+
+        for expected_hits in 1..=TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT as usize {
+            let result =
+                evaluate_post_tool_hooks(&registry, "bash", &serde_json::json!({}), "original")
+                    .await;
+            assert!(result.is_none());
+            assert_eq!(count_hits(), expected_hits);
+        }
+
+        for _ in 0..TOOL_HOOK_CIRCUIT_BREAKER_SKIP_MATCHES {
+            let result =
+                evaluate_post_tool_hooks(&registry, "bash", &serde_json::json!({}), "original")
+                    .await;
+            assert!(result.is_none());
+        }
+        assert_eq!(count_hits(), TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT as usize);
+
+        let retried =
+            evaluate_post_tool_hooks(&registry, "bash", &serde_json::json!({}), "original").await;
+        assert!(retried.is_none());
+        assert_eq!(
+            count_hits(),
+            TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT as usize + 1
+        );
     }
 
     #[tokio::test]
@@ -3090,6 +3290,26 @@ session_hooks:
             evaluate_session_hooks(&registry, SessionEvent::SessionStart, "s1", None).await;
         // Failed hook is skipped, no context
         assert!(output.context.is_none());
+    }
+
+    #[tokio::test]
+    async fn e2e_session_hook_unsafe_shell_command_is_ignored() {
+        let registry = SessionEventHookRegistry::new(vec![SessionEventHook {
+            event: SessionEvent::SessionStart,
+            action: HookAction::Shell {
+                command: "cat ~/.ssh/id_rsa".into(),
+            },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+
+        let output =
+            evaluate_session_hooks(&registry, SessionEvent::SessionStart, "s1", Some("hi")).await;
+        assert!(output.context.is_none());
+        assert!(output.env_vars.is_empty());
     }
 
     #[tokio::test]

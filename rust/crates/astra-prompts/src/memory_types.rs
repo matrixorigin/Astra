@@ -91,6 +91,9 @@ impl MemoryCategory {
 /// taxonomy are mapped; V1 primitives pass through unchanged.
 ///
 /// Single source of truth — called by both CLI and server dispatch.
+pub const SUPPORTED_MEMORIA_TYPES: &[&str] =
+    &["semantic", "profile", "procedural", "episodic", "working"];
+
 pub fn normalize_memoria_type(raw: &str) -> &str {
     match raw {
         "user" => "profile",
@@ -99,6 +102,10 @@ pub fn normalize_memoria_type(raw: &str) -> &str {
         "episode" => "episodic",
         other => other,
     }
+}
+
+pub fn is_supported_memoria_type(raw: &str) -> bool {
+    SUPPORTED_MEMORIA_TYPES.contains(&normalize_memoria_type(raw))
 }
 
 /// Encode content with category prefix.
@@ -366,6 +373,13 @@ mod tests {
         assert_eq!(normalize_memoria_type("working"), "working");
         assert_eq!(normalize_memoria_type("episodic"), "episodic");
         assert_eq!(normalize_memoria_type("tool_result"), "tool_result");
+    }
+
+    #[test]
+    fn supported_memoria_types_reject_invalid_session_memory_type() {
+        assert!(is_supported_memoria_type("working"));
+        assert!(is_supported_memoria_type("episode"));
+        assert!(!is_supported_memoria_type("session_memory"));
     }
 
     // ── Memoria mapping ──

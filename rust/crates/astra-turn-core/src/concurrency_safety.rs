@@ -1,6 +1,6 @@
 //! Concurrency-safety registry for **dynamic / MCP tools**.
 //!
-//! Static tools are classified by [`crate::tool_categories::classify`]
+//! Static tools are classified by [`crate::tool::categories::classify`]
 //! which is args-aware and authoritative. This module provides a
 //! process-wide registry for tools discovered at runtime (MCP servers,
 //! plugins) that are not in the static tool table.
@@ -77,7 +77,7 @@ impl ConcurrencySafetyRegistry {
 
     /// Create an empty registry for MCP / dynamic tool registrations.
     ///
-    /// Static tools are classified by [`crate::tool_categories::classify`]
+    /// Static tools are classified by [`crate::tool::categories::classify`]
     /// which is consulted first by the parallel executor. This registry
     /// is only a fallback for dynamically discovered tools.
     pub fn bootstrap_default() -> Self {

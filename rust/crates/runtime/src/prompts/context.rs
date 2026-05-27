@@ -133,6 +133,34 @@ pub struct CacheAwareEstimate {
     pub volatile_tokens: usize,
 }
 
+fn estimate_message_batch_tokens(messages: &[serde_json::Value]) -> usize {
+    const PER_MESSAGE_OVERHEAD: usize = 4;
+    messages
+        .iter()
+        .map(|m| estimate_single_message_tokens(m) + PER_MESSAGE_OVERHEAD)
+        .sum()
+}
+
+/// Estimate tokens with cache-awareness when the caller already has separate
+/// stable-prefix and volatile-tail slices and wants to avoid cloning them into
+/// one temporary vector.
+pub fn estimate_tokens_cache_aware_split(
+    stable_messages: &[serde_json::Value],
+    volatile_messages: &[serde_json::Value],
+    tool_schema_tokens: usize,
+) -> CacheAwareEstimate {
+    let stable_tokens = estimate_message_batch_tokens(stable_messages);
+    let volatile_tokens = estimate_message_batch_tokens(volatile_messages);
+    let cache_eligible = stable_tokens + tool_schema_tokens;
+    let total = cache_eligible + volatile_tokens;
+
+    CacheAwareEstimate {
+        total_tokens: total,
+        cache_eligible_tokens: cache_eligible,
+        volatile_tokens,
+    }
+}
+
 /// Estimate tokens with cache-awareness, separating stable prefix from
 /// volatile conversation tokens.
 ///
@@ -146,26 +174,14 @@ pub fn estimate_tokens_cache_aware(
     messages: &[serde_json::Value],
     tool_schema_tokens: usize,
 ) -> CacheAwareEstimate {
-    const PER_MESSAGE_OVERHEAD: usize = 4;
-
-    let (system_tokens, volatile_tokens) = if messages.is_empty() {
-        (0, 0)
+    if let Some((system_message, volatile_messages)) = messages.split_first() {
+        estimate_tokens_cache_aware_split(
+            std::slice::from_ref(system_message),
+            volatile_messages,
+            tool_schema_tokens,
+        )
     } else {
-        let sys = estimate_single_message_tokens(&messages[0]) + PER_MESSAGE_OVERHEAD;
-        let vol: usize = messages[1..]
-            .iter()
-            .map(|m| estimate_single_message_tokens(m) + PER_MESSAGE_OVERHEAD)
-            .sum();
-        (sys, vol)
-    };
-
-    let cache_eligible = system_tokens + tool_schema_tokens;
-    let total = cache_eligible + volatile_tokens;
-
-    CacheAwareEstimate {
-        total_tokens: total,
-        cache_eligible_tokens: cache_eligible,
-        volatile_tokens,
+        estimate_tokens_cache_aware_split(&[], &[], tool_schema_tokens)
     }
 }
 
@@ -335,30 +351,53 @@ impl Default for ContextBudget {
 }
 
 /// Return a ContextBudget tuned for a known model name.
+/// Convenience wrapper around [`budget_for_model_with_override`].
 pub fn budget_for_model(model: Option<&str>) -> ContextBudget {
-    let name = model.unwrap_or("");
+    budget_for_model_with_override(model, None)
+}
 
-    let (limit, reserve) = match name {
+/// Return a ContextBudget tuned for a known model name.
+///
+/// When `config_context_window` is provided (from `.models.yaml` or the DB),
+/// it takes precedence over the hardcoded lookup table. When `None`, falls
+/// back to the shared astra-core context-window lookup keyed by model name.
+pub fn budget_for_model_with_override(
+    model: Option<&str>,
+    config_context_window: Option<u32>,
+) -> ContextBudget {
+    if let Some(cw) = config_context_window {
+        let cw = cw as usize;
+        return ContextBudget {
+            model_limit: cw,
+            output_reserve_ratio: if cw >= 128_000 { 0.10 } else { 0.15 },
+            ..Default::default()
+        };
+    }
+
+    let name = model.unwrap_or("");
+    let lower = name.to_ascii_lowercase();
+    let limit = astra_core::runtime_limits::context_window_for_model(name)
+        .map(|cw| cw as usize)
+        .unwrap_or(128_000);
+    let reserve = match lower.as_str() {
         // OpenAI — GPT-5 family (256K context)
-        m if m.contains("gpt-5") => (256_000, 0.12),
-        // OpenAI — GPT-4o / GPT-4.1 (128K, 16K output)
-        m if m.contains("gpt-4o") || m.contains("gpt-4.1") => (128_000, 0.12),
-        m if m.contains("gpt-4-turbo") => (128_000, 0.12),
-        m if m.contains("gpt-3.5") => (16_000, 0.12),
-        // OpenAI — o1/o3 reasoning models (200K context)
-        m if m.contains("o1") || m.contains("o3") => (200_000, 0.15),
-        // Anthropic — Claude (200K context, large output window)
-        m if m.contains("claude") => (200_000, 0.20),
-        // Google — Gemini (1M context)
-        m if m.contains("gemini") => (1_000_000, 0.10),
-        // DeepSeek (64K context)
-        m if m.contains("deepseek") => (64_000, 0.15),
-        // Moonshot / Kimi
-        m if m.contains("kimi") || m.contains("moonshot") => (128_000, 0.15),
-        // Qwen
-        m if m.contains("qwen") => (128_000, 0.15),
-        // Safe default
-        _ => (128_000, 0.15),
+        m if m.contains("gpt-5") => 0.12,
+        // OpenAI — GPT-4o / GPT-4.1 / GPT-4 Turbo (128K, 16K output)
+        m if m.contains("gpt-4o") || m.contains("gpt-4.1") || m.contains("gpt-4-turbo") => 0.12,
+        m if m.contains("gpt-3.5") => 0.12,
+        // Anthropic — Claude 4.6+/4.7 and Gemini / DeepSeek V4 prefer a smaller reserve.
+        m if m.contains("opus-4-6")
+            || m.contains("sonnet-4-6")
+            || m.contains("haiku-4-6")
+            || m.contains("opus-4-7")
+            || m.contains("sonnet-4-7")
+            || m.contains("haiku-4-7")
+            || m.contains("gemini")
+            || m.contains("deepseek-v4") =>
+        {
+            0.10
+        }
+        _ => 0.15,
     };
 
     ContextBudget {
@@ -430,8 +469,8 @@ mod tests {
     #[test]
     fn effective_input_limit_claude() {
         let b = budget_for_model(Some("claude-3.5-sonnet"));
-        // 200_000 * (1 - 0.20) = 160_000
-        assert_eq!(b.effective_input_limit(), 160_000);
+        // 128_000 * (1 - 0.15) = 108_800
+        assert_eq!(b.effective_input_limit(), 108_800);
     }
 
     #[test]
@@ -496,6 +535,25 @@ mod tests {
         ];
         let est = estimate_tokens_cache_aware(&messages, 0);
         assert_eq!(est.volatile_tokens, 49);
+    }
+
+    #[test]
+    fn cache_aware_split_matches_joined_estimate() {
+        let stable = vec![msg(&"s".repeat(320))];
+        let volatile = vec![msg(&"u".repeat(180)), msg(&"a".repeat(96))];
+        let mut joined = stable.clone();
+        joined.extend(volatile.clone());
+        let schema_tokens = 123;
+
+        let split = estimate_tokens_cache_aware_split(&stable, &volatile, schema_tokens);
+        let joined_est = estimate_tokens_cache_aware(&joined, schema_tokens);
+
+        assert_eq!(split.total_tokens, joined_est.total_tokens);
+        assert_eq!(
+            split.cache_eligible_tokens,
+            joined_est.cache_eligible_tokens
+        );
+        assert_eq!(split.volatile_tokens, joined_est.volatile_tokens);
     }
 
     // ---------------------------------------------------------------
@@ -591,10 +649,30 @@ mod tests {
     }
 
     #[test]
-    fn model_claude() {
+    fn model_claude_legacy() {
         let b = budget_for_model(Some("claude-3-opus"));
-        assert_eq!(b.model_limit, 200_000);
-        assert!((b.output_reserve_ratio - 0.20).abs() < f64::EPSILON);
+        assert_eq!(b.model_limit, 128_000);
+        assert!((b.output_reserve_ratio - 0.15).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn model_claude_4_6_gets_1m() {
+        let b = budget_for_model(Some("claude-sonnet-4-6"));
+        assert_eq!(b.model_limit, 1_000_000);
+        assert!((b.output_reserve_ratio - 0.10).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn model_claude_4_7_gets_1m() {
+        let b = budget_for_model(Some("claude-opus-4-7"));
+        assert_eq!(b.model_limit, 1_000_000);
+    }
+
+    #[test]
+    fn model_deepseek_v4_gets_1m() {
+        let b = budget_for_model(Some("deepseek-v4-pro"));
+        assert_eq!(b.model_limit, 1_000_000);
+        assert!((b.output_reserve_ratio - 0.10).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -607,6 +685,44 @@ mod tests {
     #[test]
     fn model_qwen() {
         let b = budget_for_model(Some("qwen-turbo"));
+        assert_eq!(b.model_limit, 128_000);
+    }
+
+    // ---------------------------------------------------------------
+    // 4b. Dynamic override from model config
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn override_wins_over_hardcoded() {
+        // deepseek-chat is hardcoded at 64K, override should win
+        let b = budget_for_model_with_override(Some("deepseek-chat"), Some(1_000_000));
+        assert_eq!(b.model_limit, 1_000_000);
+        assert!((b.output_reserve_ratio - 0.10).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn override_for_unknown_model() {
+        let b = budget_for_model_with_override(Some("my-custom-model"), Some(256_000));
+        assert_eq!(b.model_limit, 256_000);
+        assert!((b.output_reserve_ratio - 0.10).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn override_small_window_gets_small_reserve() {
+        let b = budget_for_model_with_override(Some("small-model"), Some(32_000));
+        assert_eq!(b.model_limit, 32_000);
+        assert!((b.output_reserve_ratio - 0.15).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn no_override_falls_back_to_hardcoded() {
+        let b = budget_for_model_with_override(Some("deepseek-chat"), None);
+        assert_eq!(b.model_limit, 64_000);
+    }
+
+    #[test]
+    fn no_override_unknown_falls_back_to_default() {
+        let b = budget_for_model_with_override(Some("totally-unknown-model"), None);
         assert_eq!(b.model_limit, 128_000);
     }
 
@@ -1282,8 +1398,8 @@ mod tests {
         let b = ContextBudget::from_runtime_config(&config, Some("claude-3.5-sonnet"));
 
         // Model-specific values should be applied
-        assert_eq!(b.model_limit, 200_000); // Claude
-        assert!((b.output_reserve_ratio - 0.20).abs() < f64::EPSILON);
+        assert_eq!(b.model_limit, 128_000); // Claude
+        assert!((b.output_reserve_ratio - 0.15).abs() < f64::EPSILON);
 
         // RuntimeConfig values should be applied
         assert!((b.compact_threshold - 0.6).abs() < f64::EPSILON);

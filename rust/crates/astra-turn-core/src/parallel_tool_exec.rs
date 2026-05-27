@@ -85,7 +85,7 @@ pub fn parse_tool_args(tc: &Value) -> Option<Value> {
 /// Falls back to the process-wide [`crate::concurrency_safety`] registry
 /// for MCP / dynamic tools not in the static table.
 pub fn is_read_only_tool(tool_name: &str) -> bool {
-    if crate::tool_categories::classify_name(tool_name).parallelizable {
+    if crate::tool::categories::classify_name(tool_name).parallelizable {
         return true;
     }
     crate::concurrency_safety::global_is_parallelizable(tool_name)
@@ -94,7 +94,7 @@ pub fn is_read_only_tool(tool_name: &str) -> bool {
 /// Args-aware variant: classify a tool call as parallelizable, inspecting
 /// the command argument for shell tools.
 pub fn is_read_only_tool_with_args(tool_name: &str, args: Option<&Value>) -> bool {
-    if crate::tool_categories::classify(tool_name, args).parallelizable {
+    if crate::tool::categories::classify(tool_name, args).parallelizable {
         return true;
     }
     crate::concurrency_safety::global_is_parallelizable(tool_name)
@@ -102,7 +102,7 @@ pub fn is_read_only_tool_with_args(tool_name: &str, args: Option<&Value>) -> boo
 
 /// Iterate the canonical read-only tool names from the central registry.
 pub fn read_only_tool_names() -> Vec<&'static str> {
-    crate::tool_categories::registry().read_only_names()
+    crate::tool::categories::registry().read_only_names()
 }
 
 /// Partition tool calls into (read_only, mutating) groups, preserving

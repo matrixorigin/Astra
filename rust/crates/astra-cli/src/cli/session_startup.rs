@@ -41,25 +41,66 @@ struct CliSessionMemorySelectorResolver {
 
 #[async_trait::async_trait]
 impl astra_runtime::session_memory::SelectorParamsResolver for CliSessionMemorySelectorResolver {
-    async fn resolve(&self) -> Option<astra_runtime::memory_relevance::LlmConnParams> {
+    async fn resolve(&self) -> Option<astra_runtime::memory_hooks::relevance::LlmConnParams> {
+        self.resolve_candidates().await.into_iter().next()
+    }
+
+    async fn resolve_candidates(
+        &self,
+    ) -> Vec<astra_runtime::memory_hooks::relevance::LlmConnParams> {
         #[derive(serde::Deserialize)]
         struct MemoryModelWire {
             model_name: String,
+            #[serde(default)]
+            candidate_model_names: Vec<String>,
+            #[serde(default)]
+            candidate_thinking_capabilities: Vec<Option<String>>,
         }
 
-        let token = session_runtime::fresh_access_token(&self.api, self.profile.as_deref()).await?;
+        let Some(token) =
+            session_runtime::fresh_access_token(&self.api, self.profile.as_deref()).await
+        else {
+            return Vec::new();
+        };
         let body = self
             .api
             .get_authed_path_text(&token, astra_thin_client::paths::model_memory())
             .await
-            .ok()?;
-        let response = serde_json::from_str::<MemoryModelWire>(&body).ok()?;
-        Some(astra_runtime::memory_relevance::LlmConnParams {
-            base_url: format!("{}/v1", self.api.api_origin()),
-            api_key: token,
-            model_name: response.model_name,
-            provider: "openai".to_string(),
-        })
+            .ok();
+        let Some(body) = body else {
+            return Vec::new();
+        };
+        let response = serde_json::from_str::<MemoryModelWire>(&body).ok();
+        let Some(response) = response else {
+            return Vec::new();
+        };
+        let model_names = if response.candidate_model_names.is_empty() {
+            vec![response.model_name]
+        } else {
+            response.candidate_model_names
+        };
+        let thinking_caps = if response.candidate_thinking_capabilities.is_empty() {
+            vec![None]
+        } else {
+            response.candidate_thinking_capabilities
+        };
+        model_names
+            .into_iter()
+            .zip(thinking_caps.into_iter().chain(std::iter::repeat(None)))
+            .map(|(model_name, thinking_cap_str)| {
+                astra_runtime::memory_hooks::relevance::LlmConnParams {
+                    base_url: format!("{}/v1", self.api.api_origin()),
+                    api_key: token.clone(),
+                    model_name,
+                    wire_model_name: None,
+                    provider: "openai".to_string(),
+                    request_body_overrides: None,
+                    thinking_capability: thinking_cap_str
+                        .as_deref()
+                        .and_then(|s| astra_services::models::ThinkingCapability::from_db(Some(s))),
+                }
+            })
+            .collect()
     }
 }
 
@@ -339,6 +380,7 @@ async fn build_cli_session_memory_extractor(
     let service = astra_runtime::session_memory::MemoryExtractionService::new(
         selector, memoria, ingestion, me.user_id, broker,
     )
+    .with_local_current_snapshot()
     .with_local_event_sink(build_cli_session_memory_event_sink());
     Some(std::sync::Arc::new(service))
 }
@@ -376,7 +418,7 @@ pub(crate) async fn complete_session_startup(
     if state.perm_manager.mode() == permission_manager::PermissionMode::Auto {
         eprintln!(
             "{}",
-            "  ⚠ Auto-approve mode: all tool calls will execute without confirmation.".yellow()
+            "  🔓 Auto-approve is ON — tools execute without confirmation.".dim()
         );
     }
 
@@ -398,21 +440,8 @@ pub(crate) async fn complete_session_startup(
     {
         const SESSION_TTL_DAYS: u64 = 30;
         const JOURNAL_COMPRESS_DAYS: u64 = 7;
-        let maint =
+        let _maint =
             session_journal::run_session_maintenance(SESSION_TTL_DAYS, JOURNAL_COMPRESS_DAYS);
-        if maint.sessions_deleted > 0 || maint.journals_compressed > 0 {
-            let mut parts = Vec::new();
-            if maint.sessions_deleted > 0 {
-                parts.push(format!(
-                    "{} expired sessions removed",
-                    maint.sessions_deleted
-                ));
-            }
-            if maint.journals_compressed > 0 {
-                parts.push(format!("{} journals compressed", maint.journals_compressed));
-            }
-            eprintln!("  {} {}", theme::icon_ok(), parts.join(", ").dim());
-        }
     }
 
     // Load persisted skill quality data from previous sessions
@@ -445,14 +474,6 @@ pub(crate) async fn complete_session_startup(
         let mut tracker = tool_registry::ToolQualityTracker::new();
         if !persisted_quality.is_empty() {
             tracker.merge(&persisted_quality);
-            eprintln!(
-                "{}",
-                format!(
-                    "  ✓ Restored tool quality ({} tools tracked)",
-                    persisted_quality.len()
-                )
-                .dim()
-            );
         }
         std::sync::Arc::new(std::sync::Mutex::new(tracker))
     };
@@ -471,16 +492,6 @@ pub(crate) async fn complete_session_startup(
             astra_turn_core::tool_health_persistence::load_tool_health(profile_name);
         state.synced_tool_health_entries =
             astra_turn_core::tool_health_persistence::load_synced_tool_health(profile_name);
-        if !cross_session_health_entries.is_empty() {
-            eprintln!(
-                "{}",
-                format!(
-                    "  ✓ Restored tool health ({} tools tracked)",
-                    cross_session_health_entries.len()
-                )
-                .dim()
-            );
-        }
         let cloud_pull_result = try_cloud_pull(profile_name).await;
         let pref_keys = try_cloud_pull_preferences(state).await;
         (cross_session_health_entries, cloud_pull_result, pref_keys)
