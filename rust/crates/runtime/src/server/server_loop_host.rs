@@ -2054,15 +2054,17 @@ impl ServerAgenticLoopHost {
     /// Compute the tool schemas visible for the current turn after applying
     /// health-based restrictions. This is the server-path equivalent of the
     /// CLI's deny-at-assembly behavior.
+    ///
+    /// IMPORTANT: request-level allowlists may prune schemas here, but
+    /// skill-scoped `allowed_tools` must NOT. Skill restrictions are enforced in
+    /// `tool_interception` at runtime so prompt-visible tool definitions stay
+    /// cache-stable across turns.
     fn filtered_turn_tools(&self, restricted_tools: &HashSet<String>) -> Vec<Value> {
         filter_tool_schemas_by_excluded_names(self.edge_tools.clone(), restricted_tools)
     }
 
-    fn effective_allowlist_restrictions(&self, state: &AgenticLoopState) -> HashSet<String> {
-        // Only request_constraints (delegation-scoped) restricts tools.
-        // skills.allowed_tools is additive — it ensures skill-referenced tools
-        // are visible to the model, but never blocks other tools.
-        let Some(ref allowed) = state.skills.request_constraints.allowed_tools else {
+    fn request_allowlist_restrictions(&self, state: &AgenticLoopState) -> HashSet<String> {
+        let Some(allowed) = state.skills.request_constraints.allowed_tools.as_ref() else {
             return HashSet::new();
         };
 
@@ -2118,7 +2120,7 @@ impl ServerAgenticLoopHost {
             );
         }
         let mut effective_restricted = state.restricted_tools.clone();
-        effective_restricted.extend(self.effective_allowlist_restrictions(state));
+        effective_restricted.extend(self.request_allowlist_restrictions(state));
         // Boosted tools are never hidden, even if they landed in the restricted
         // set earlier (e.g., via stall-based deprioritization).
         for boosted in &state.boosted_tools {
@@ -2529,7 +2531,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             );
         }
         let mut effective_restricted = state.restricted_tools.clone();
-        effective_restricted.extend(self.effective_allowlist_restrictions(state));
+        effective_restricted.extend(self.request_allowlist_restrictions(state));
         let interaction_mode = self.turn_interaction_mode();
         effective_restricted.extend(interaction_scoped_tool_restrictions(interaction_mode));
         for boosted in &state.boosted_tools {
@@ -3187,7 +3189,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         if !state.widen_selection_pending {
             merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut effective_restricted);
         }
-        effective_restricted.extend(self.effective_allowlist_restrictions(state));
+        effective_restricted.extend(self.request_allowlist_restrictions(state));
         let interaction_mode = self.turn_interaction_mode();
         effective_restricted.extend(interaction_scoped_tool_restrictions(interaction_mode));
         for boosted in &state.boosted_tools {
@@ -5206,7 +5208,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_turn_tools_respects_request_constraints_ignores_skill_allowlist() {
+    fn visible_turn_tools_only_apply_request_allowlists() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -5223,8 +5225,17 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        // Skill only lists bash — but this is additive, not restrictive
+        state.session_turn = 1;
         state.skills.allowed_tools = Some(["bash".to_string()].into_iter().collect());
+        state.skills.invoked.insert(
+            "review-changes".into(),
+            crate::turn::skill_tool::InvokedSkill {
+                name: "review-changes".into(),
+                content: String::new(),
+                invoked_at_turn: 1,
+                reentry_count: 0,
+            },
+        );
 
         let visible = host.visible_turn_tools(&mut state);
         let visible_names: HashSet<&str> = visible
@@ -5236,10 +5247,11 @@ mod tests {
             })
             .collect();
 
-        // Both tools visible: request_constraints allows both,
-        // skill allowed_tools does NOT restrict read_file
+        // Request allowlists still hide tools from the prompt-visible schema.
         assert!(visible_names.contains("bash"));
         assert!(visible_names.contains("read_file"));
+        // Request allowlists still hide tools outside the delegation contract.
+        assert!(!visible_names.contains("str_replace"));
     }
 
     #[test]
@@ -6398,7 +6410,7 @@ mod tests {
         );
     }
 
-    // ── Additive skill allowed_tools tests ─────────────────────────────────
+    // ── Prompt-visible tool schema / skill runtime-policy tests ────────────
 
     fn sample_edge_tools_full() -> Vec<Value> {
         vec![
@@ -6445,11 +6457,11 @@ mod tests {
         ]
     }
 
-    /// Core scenario: a review skill declares allowed_tools = [bash, read_file, grep]
-    /// but str_replace and write_file must still be visible — allowed_tools is
-    /// additive (ensures listed tools are present), not restrictive.
+    /// Core invariant: skill allowed_tools must not prune the prompt-visible
+    /// schema. Runtime enforcement happens later in tool interception so prompt
+    /// cache prefixes stay stable.
     #[test]
-    fn skill_allowed_tools_does_not_restrict_write_tools() {
+    fn skill_allowed_tools_do_not_prune_prompt_visible_tools() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -6460,12 +6472,22 @@ mod tests {
         .build();
 
         let mut state = create_test_state();
+        state.session_turn = 1;
         // Simulate: review skill activated with read-only allowed_tools
         state.skills.allowed_tools = Some(
             ["bash", "read_file", "grep"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+        );
+        state.skills.invoked.insert(
+            "review-changes".into(),
+            crate::turn::skill_tool::InvokedSkill {
+                name: "review-changes".into(),
+                content: String::new(),
+                invoked_at_turn: 1,
+                reentry_count: 0,
+            },
         );
 
         let visible = host.visible_turn_tools(&mut state);
@@ -6478,7 +6500,7 @@ mod tests {
             })
             .collect();
 
-        // ALL tools must remain visible — allowed_tools is additive, not restrictive
+        // Skill allowlists no longer prune the visible schema.
         assert!(
             visible_names.contains(&"bash"),
             "skill-listed tool must be visible"
@@ -6493,19 +6515,18 @@ mod tests {
         );
         assert!(
             visible_names.contains(&"str_replace"),
-            "write tools must NOT be restricted by skill allowed_tools"
+            "write tools stay visible; runtime interception enforces skill restrictions"
         );
         assert!(
             visible_names.contains(&"write_file"),
-            "write tools must NOT be restricted by skill allowed_tools"
+            "write tools stay visible; runtime interception enforces skill restrictions"
         );
     }
 
-    /// After a review skill sets allowed_tools, a subsequent turn (user says
-    /// "fix the issues") must see all tools — the skill's allowed_tools must
-    /// not leak restrictively into the next turn.
+    /// After a skill sets allowed_tools, later turns should keep the same
+    /// prompt-visible tool set until another skill activation replaces it.
     #[test]
-    fn skill_allowed_tools_does_not_restrict_across_turns() {
+    fn skill_allowed_tools_do_not_prune_prompt_schemas_across_turns() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -6517,16 +6538,27 @@ mod tests {
 
         let mut state = create_test_state();
         // Turn 1: review skill active
+        state.session_turn = 1;
         state.skills.allowed_tools = Some(
             ["bash", "read_file", "grep"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
         );
+        state.skills.invoked.insert(
+            "review-changes".into(),
+            crate::turn::skill_tool::InvokedSkill {
+                name: "review-changes".into(),
+                content: String::new(),
+                invoked_at_turn: 1,
+                reentry_count: 0,
+            },
+        );
         let _turn1 = host.visible_turn_tools(&mut state);
 
-        // Turn 2: user says "fix it" — skill is still active (allowed_tools persists)
-        // but write tools must be available
+        // Turn 2: the loaded skill still governs the session until another
+        // activation replaces it, so the prompt-visible tool set stays stable.
+        state.session_turn = 2;
         let visible = host.visible_turn_tools(&mut state);
         let visible_names: Vec<&str> = visible
             .iter()
@@ -6539,11 +6571,11 @@ mod tests {
 
         assert!(
             visible_names.contains(&"str_replace"),
-            "turn 2 must have write tools despite skill allowed_tools persisting"
+            "turn 2 should still advertise write tools so prompt-visible schemas stay cache-stable"
         );
         assert!(
             visible_names.contains(&"write_file"),
-            "turn 2 must have write tools despite skill allowed_tools persisting"
+            "turn 2 should still advertise write tools so prompt-visible schemas stay cache-stable"
         );
     }
 
@@ -6594,9 +6626,10 @@ mod tests {
 
     /// Combined scenario: delegation constrains to [bash, read_file, grep, str_replace]
     /// AND a review skill has allowed_tools = [bash, read_file, grep].
-    /// Only request_constraints should restrict; skill allowed_tools should not.
+    /// The prompt-visible schema honors only request constraints. Skill
+    /// restrictions are enforced later by runtime interception.
     #[test]
-    fn request_constraints_restrict_but_skill_allowed_tools_do_not() {
+    fn prompt_schema_honors_request_allowlist_but_not_skill_allowlist() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -6607,6 +6640,7 @@ mod tests {
         .build();
 
         let mut state = create_test_state();
+        state.session_turn = 1;
         // Delegation allows: bash, read_file, grep, str_replace (but NOT write_file)
         state.skills.request_constraints.allowed_tools = Some(
             ["bash", "read_file", "grep", "str_replace"]
@@ -6621,6 +6655,15 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect(),
         );
+        state.skills.invoked.insert(
+            "review-changes".into(),
+            crate::turn::skill_tool::InvokedSkill {
+                name: "review-changes".into(),
+                content: String::new(),
+                invoked_at_turn: 1,
+                reentry_count: 0,
+            },
+        );
 
         let visible = host.visible_turn_tools(&mut state);
         let visible_names: Vec<&str> = visible
@@ -6632,10 +6675,12 @@ mod tests {
             })
             .collect();
 
-        // str_replace: allowed by request_constraints, not in skill allowed_tools → VISIBLE
+        // str_replace: allowed by request_constraints, but not by the active
+        // review skill. It stays visible for prompt-cache stability; runtime
+        // interception blocks it if the model tries to execute it.
         assert!(
             visible_names.contains(&"str_replace"),
-            "str_replace allowed by delegation and must not be restricted by skill"
+            "skill allowlist must not narrow prompt-visible schemas"
         );
         // write_file: NOT in request_constraints → restricted by delegation
         assert!(

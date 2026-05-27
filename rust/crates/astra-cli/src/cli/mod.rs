@@ -84,6 +84,7 @@ pub mod session_runtime;
 pub mod session_startup;
 pub mod session_state;
 pub mod session_todo_client;
+pub mod skill_catalog;
 pub mod skill_subrun;
 pub mod slash_account;
 pub mod slash_agent;

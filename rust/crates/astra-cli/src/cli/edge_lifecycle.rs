@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::cli::chat_stream::edge_executor_instance_id;
 use crate::cli::session_runtime::{attempt_token_refresh, current_access_token};
@@ -23,26 +23,13 @@ struct ReplayExecutorRegistration {
 
 /// Process-scoped edge lifecycle state shared by the heartbeat loop and all
 /// edge-side SSE hosts within this CLI process.
+#[derive(Default)]
 struct EdgeLifecycleContext {
     completed_request_ids: Mutex<VecDeque<String>>,
     pending_tool_requests: AtomicU32,
     replay_in_flight: AtomicBool,
     registered_worktree_path: Mutex<Option<PathBuf>>,
     replay_registration: Mutex<ReplayExecutorRegistration>,
-    jitter_clock: Instant,
-}
-
-impl Default for EdgeLifecycleContext {
-    fn default() -> Self {
-        Self {
-            completed_request_ids: Mutex::new(VecDeque::with_capacity(MAX_COMPLETED_REQUEST_IDS)),
-            pending_tool_requests: AtomicU32::new(0),
-            replay_in_flight: AtomicBool::new(false),
-            registered_worktree_path: Mutex::new(None),
-            replay_registration: Mutex::new(ReplayExecutorRegistration::default()),
-            jitter_clock: Instant::now(),
-        }
-    }
 }
 
 impl EdgeLifecycleContext {
@@ -119,7 +106,20 @@ impl EdgeLifecycleContext {
     }
 
     fn jitter(&self, delay: Duration) -> Duration {
-        let jitter_ms = (self.jitter_clock.elapsed().as_millis() % 500) as u64;
+        // Per-call entropy from the wall clock's nanosecond residue. The previous
+        // shape used `self.jitter_clock.elapsed().as_millis() % 500`, which was
+        // deterministic at any heartbeat period that's a multiple of 500ms (e.g.
+        // the default 120s) — the modulo always landed on 0, defeating the
+        // thundering-herd mitigation it was meant to provide.
+        //
+        // SystemTime is good enough here: we only need ~9 bits of entropy and
+        // the cost is one syscall. Deliberately not introducing a `rand`
+        // dependency just for jitter.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        let jitter_ms = nanos % 500;
         delay + Duration::from_millis(jitter_ms)
     }
 
@@ -704,6 +704,27 @@ mod tests {
         // Jitter < 500ms
         assert!(backoff_delay(0) < Duration::from_millis(1500));
         assert!(backoff_delay(5) < Duration::from_millis(30500));
+    }
+
+    /// Regression: the old jitter implementation used
+    /// `(jitter_clock.elapsed().as_millis() % 500)`, which was deterministic
+    /// at any heartbeat period that was a multiple of 500ms (the default 120s
+    /// landed on `jitter_ms == 0` every cycle). Sample 16 calls and assert at
+    /// least two distinct jitter values — a defective constant-jitter would
+    /// always return the same one.
+    #[test]
+    fn jitter_varies_across_calls() {
+        let mut samples = std::collections::HashSet::new();
+        for _ in 0..16 {
+            samples.insert(jitter(Duration::from_secs(0)).as_millis());
+            // Spin briefly so SystemTime nanos advance (~µs resolution suffices).
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        assert!(
+            samples.len() >= 2,
+            "jitter must vary across calls (saw {} unique values)",
+            samples.len()
+        );
     }
 
     #[test]

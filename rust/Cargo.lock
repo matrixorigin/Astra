@@ -332,6 +332,7 @@ dependencies = [
 name = "astra-messaging"
 version = "0.1.0"
 dependencies = [
+ "astra-text-utils",
  "async-trait",
  "chrono",
  "serde",

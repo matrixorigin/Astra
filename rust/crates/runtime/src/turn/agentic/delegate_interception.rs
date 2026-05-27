@@ -14,6 +14,8 @@ pub(crate) const DELEGATE_TOOL_NAME: &str = "delegate";
 pub(crate) const FORWARD_HEADERS_CONTEXT_KEY: &str = "__astra_forward_headers";
 pub(crate) const REQUEST_ALLOWED_TOOLS_CONTEXT_KEY: &str = "__astra_request_allowed_tools";
 pub(crate) const REQUEST_ALLOWED_SKILLS_CONTEXT_KEY: &str = "__astra_request_allowed_skills";
+pub(crate) const REQUEST_ALLOWED_SKILL_SOURCES_CONTEXT_KEY: &str =
+    "__astra_request_allowed_skill_sources";
 
 pub(crate) struct DelegationInterceptionResult {
     pub(crate) effective_tool_calls: Vec<Value>,
@@ -716,16 +718,32 @@ pub(crate) fn parse_coordination_pattern(
     }
 }
 
-fn merge_request_allowlist_into_delegation_request(
+/// Splice an allowlist into the cross-process delegation context as a sorted
+/// JSON string array.
+///
+/// Generic over the element type so callers can pass `HashSet<String>` for
+/// `allowed_tools` / `allowed_skills` and `HashSet<SkillSourceKind>` for
+/// `allowed_skill_sources` directly — the previous shape forced a manual
+/// `to_string()` round-trip at the caller, which lost type information at
+/// the boundary and left no way to add a new typed allowlist axis without
+/// finding the round-trip code.
+///
+/// The output is still a JSON `Array<String>` because [`DelegationRequest`]
+/// crosses a process boundary with no shared schema; the receiver re-parses
+/// each entry through `T::from_str` (or whatever the receiver-side typed
+/// allowlist parser uses).
+fn merge_request_allowlist_into_delegation_request<T>(
     request: &mut astra_services::coordination::DelegationRequest,
     key: &str,
-    allowlist: Option<&HashSet<String>>,
-) {
+    allowlist: Option<&HashSet<T>>,
+) where
+    T: std::fmt::Display,
+{
     let Some(allowlist) = allowlist else {
         request.context.remove(key);
         return;
     };
-    let mut values = allowlist.iter().cloned().collect::<Vec<_>>();
+    let mut values: Vec<String> = allowlist.iter().map(|item| item.to_string()).collect();
     values.sort();
     request.context.insert(
         key.to_string(),
@@ -791,6 +809,11 @@ pub(crate) async fn partition_and_execute_delegations(
                         &mut request,
                         REQUEST_ALLOWED_SKILLS_CONTEXT_KEY,
                         request_constraints.allowed_skills.as_ref(),
+                    );
+                    merge_request_allowlist_into_delegation_request(
+                        &mut request,
+                        REQUEST_ALLOWED_SKILL_SOURCES_CONTEXT_KEY,
+                        request_constraints.allowed_skill_sources.as_ref(),
                     );
                     let pattern_name = coordination_pattern_name(&request.pattern).to_string();
                     let scenario_name =

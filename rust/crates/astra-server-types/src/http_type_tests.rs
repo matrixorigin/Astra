@@ -916,6 +916,7 @@ fn chat_request_into_data_maps_all_fields() {
         }),
         skill_search: Some(astra_core::SkillSearchSettings::default()),
         allow_skills: None,
+        allow_skill_sources: None,
         allow_tools: None,
         context: Some(ctx.clone()),
         execution_budget: Some(ExecutionBudget {
@@ -987,6 +988,7 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         llm_token_service: None,
         skill_search: None,
         allow_skills: None,
+        allow_skill_sources: None,
         allow_tools: None,
         context: None,
         execution_budget: None,

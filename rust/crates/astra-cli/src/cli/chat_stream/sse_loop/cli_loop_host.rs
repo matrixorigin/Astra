@@ -34,6 +34,45 @@ use crate::cli::chat_stream::sse_loop::agentic_loop_turn::{
     ChatTurnSseFetchRequest, PrepareTurnTelemetry, fetch_chat_turn_sse,
 };
 
+use astra_runtime::tool_sandbox::SandboxPolicy;
+
+/// RAII guard for the executor's sandbox policy slot.
+///
+/// On drop, the slot is restored to whatever it held when [`SandboxPolicyGuard::install`]
+/// was called — including the early-return path of `?` propagation, which was the
+/// regression that motivated the guard. The previous shape (manual save / manual
+/// restore) leaked the active policy into subsequent turns whenever `fetch_chat_turn_sse`
+/// returned an `Err` before the restore line.
+struct SandboxPolicyGuard<'a> {
+    slot: &'a std::sync::RwLock<Option<SandboxPolicy>>,
+    saved: Option<SandboxPolicy>,
+}
+
+impl<'a> SandboxPolicyGuard<'a> {
+    /// Replace the slot with `next` (or restore the previous value if `next` is `None`)
+    /// and return a guard that resets to whatever the slot held before the call when
+    /// it goes out of scope.
+    fn install(
+        slot: &'a std::sync::RwLock<Option<SandboxPolicy>>,
+        next: Option<SandboxPolicy>,
+    ) -> Self {
+        let mut write = slot.write().unwrap_or_else(|e| e.into_inner());
+        let saved = write.take();
+        // If `next` is None we keep the previous policy (no skill activation this turn).
+        // If `next` is Some, it replaces the previous policy for the duration of the guard.
+        *write = next.or_else(|| saved.clone());
+        drop(write);
+        Self { slot, saved }
+    }
+}
+
+impl Drop for SandboxPolicyGuard<'_> {
+    fn drop(&mut self) {
+        let mut write = self.slot.write().unwrap_or_else(|e| e.into_inner());
+        *write = self.saved.take();
+    }
+}
+
 /// CLI host for the runtime agentic loop.
 ///
 /// Holds all CLI-specific dependencies; the runtime loop calls `execute_turn()`
@@ -373,15 +412,23 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             .filter(|content| !content.trim().is_empty())
             .collect::<Vec<_>>();
 
-        // Skill allowed_tools is additive — it ensures skill-referenced tools
-        // are visible to the model via schema injection, but never restricts
-        // other tools. Only interaction-scoped restrictions apply here.
         let interaction_mode = self.turn_interaction_mode();
         let interaction_scoped_restrictions =
             interaction_scoped_tool_restrictions(interaction_mode);
         state
             .restricted_tools
             .extend(interaction_scoped_restrictions.iter().cloned());
+        // Request-level allowlists may prune the prompt-visible schema in CLI
+        // mode. Skill-level `allowed_tools` must not: those are enforced later
+        // in runtime interception so the advertised tool schema remains stable
+        // across turns for prompt-cache efficiency.
+        let request_scoped_restrictions = request_allowlist_restriction_names(
+            &self.all_schemas,
+            state.skills.request_constraints.allowed_tools.as_ref(),
+        );
+        state
+            .restricted_tools
+            .extend(request_scoped_restrictions.iter().cloned());
 
         // Plan-mode restrictions follow the same turn-scoped pattern:
         // computed at the start of the turn from the current
@@ -401,26 +448,13 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             .extend(plan_scoped_restrictions.iter().cloned());
 
         // Propagate skill sandbox policy to the tool executor for this turn.
-        // Saved/restored so it doesn't persist after the skill deactivates.
-        let prev_sandbox = self
-            .executor
-            .sandbox_policy
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(ref policy) = state.skills.sandbox_policy {
-            *self
-                .executor
-                .sandbox_policy
-                .write()
-                .unwrap_or_else(|e| e.into_inner()) = Some(policy.clone());
-        } else {
-            *self
-                .executor
-                .sandbox_policy
-                .write()
-                .unwrap_or_else(|e| e.into_inner()) = prev_sandbox.clone();
-        }
+        // The guard restores the previous policy on drop — including on the
+        // `?` early-return path below — so a turn that errored out cannot leak
+        // a skill-scoped policy into subsequent turns.
+        let _sandbox_guard = SandboxPolicyGuard::install(
+            &self.executor.sandbox_policy,
+            state.skills.sandbox_policy.clone(),
+        );
         self.executor.set_send_message_context(
             state
                 .messaging
@@ -516,16 +550,16 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         for name in &interaction_scoped_restrictions {
             state.restricted_tools.remove(name);
         }
+        for name in &request_scoped_restrictions {
+            state.restricted_tools.remove(name);
+        }
         for name in &plan_scoped_restrictions {
             state.restricted_tools.remove(name);
         }
 
-        // Restore previous sandbox policy after the turn.
-        *self
-            .executor
-            .sandbox_policy
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = prev_sandbox;
+        // The sandbox policy is restored automatically when `_sandbox_guard`
+        // drops at the end of this scope — including the `?` early-return on
+        // `turn_result?` below.
 
         // Sync latest approval overrides into state for checkpoint persistence.
         state.approval_overrides = self.perm_manager.export_session_overrides();
@@ -977,6 +1011,29 @@ fn plan_mode_restriction_names(
     })
 }
 
+fn request_allowlist_restriction_names(
+    schemas: &[serde_json::Value],
+    request_allowed: Option<&HashSet<String>>,
+) -> HashSet<String> {
+    let effective_allowed =
+        astra_turn_core::tool_allowlist::compute_effective_allowlist(request_allowed, None);
+    let Some(allowed) = effective_allowed else {
+        return HashSet::new();
+    };
+
+    schemas
+        .iter()
+        .filter_map(|schema| {
+            schema
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .filter(|name| !allowed.contains(*name))
+        .map(str::to_string)
+        .collect()
+}
+
 fn looks_plan_shaped(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     // Markdown plan headers — strongest signal.
@@ -1382,6 +1439,36 @@ mod tests {
         assert!(!plan_on.contains("grep"));
         assert!(!plan_on.contains("exit_plan_mode"));
         assert!(!plan_on.contains("enter_plan_mode"));
+    }
+
+    #[test]
+    fn request_allowlist_restriction_names_hides_non_request_tools() {
+        let schemas = vec![
+            schema("git"),
+            schema("read_file"),
+            schema("str_replace"),
+            schema("write_file"),
+        ];
+        let request_allowed = HashSet::from(["git".to_string(), "read_file".to_string()]);
+
+        let restricted = request_allowlist_restriction_names(&schemas, Some(&request_allowed));
+
+        assert!(!restricted.contains("git"));
+        assert!(!restricted.contains("read_file"));
+        assert!(restricted.contains("str_replace"));
+        assert!(restricted.contains("write_file"));
+    }
+
+    #[test]
+    fn request_allowlist_restriction_names_normalizes_names() {
+        let schemas = vec![schema("git"), schema("read_file"), schema("str_replace")];
+        let request_allowed = HashSet::from([" Git ".to_string(), "READ_FILE".to_string()]);
+
+        let restricted = request_allowlist_restriction_names(&schemas, Some(&request_allowed));
+
+        assert!(!restricted.contains("git"));
+        assert!(!restricted.contains("read_file"));
+        assert!(restricted.contains("str_replace"));
     }
 
     #[test]

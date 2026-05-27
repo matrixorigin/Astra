@@ -19,6 +19,10 @@ use crate::cli::project_instructions::*;
 use crate::cli::session_runtime;
 use crate::cli::session_runtime::*;
 use crate::cli::session_state::*;
+use crate::cli::skill_catalog::{
+    SkillCatalogFilter, list_skill_record_from_registry, load_skill_record_from_registry,
+    normalize_source_filter,
+};
 use crate::cli::slash_bug::*;
 use crate::cli::slash_debug::*;
 use crate::cli::slash_info::*;
@@ -2475,30 +2479,41 @@ pub(crate) async fn execute_cli_command(
         }
 
         Some(Command::Skill(SkillCmd::List(args))) => {
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let q = vec![
-                ("limit", args.limit.to_string()),
-                ("offset", args.offset.to_string()),
-            ];
-            let body = api
-                .get_skills_query_text(&token, &q)
-                .await
-                .map_err(map_thin_err)?;
+            let pipeline_modules = create_pipeline_modules_quiet(api, profile.as_deref());
+            let filter = SkillCatalogFilter {
+                query: (!args.query.is_empty()).then(|| args.query.join(" ").to_lowercase()),
+                source: args
+                    .source
+                    .as_deref()
+                    .map(normalize_source_filter)
+                    .transpose()?,
+                category: args
+                    .category
+                    .as_ref()
+                    .map(|category| category.to_lowercase()),
+            };
+            let body = serde_json::to_string(&list_skill_record_from_registry(
+                &pipeline_modules.unified_skill_registry,
+                &filter,
+                args.limit,
+                args.offset,
+            ))
+            .map_err(|source| format!("failed to serialize skill list: {source}"))?;
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }
 
         Some(Command::Skill(SkillCmd::Show(args))) => {
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let q: Vec<(&str, String)> = if let Some(ref version) = args.version {
-                vec![("version", version.clone())]
-            } else {
-                vec![]
-            };
-            let body = api
-                .get_skill_query_text(&token, &args.skill_id, &q)
-                .await
-                .map_err(map_thin_err)?;
+            let pipeline_modules = create_pipeline_modules_quiet(api, profile.as_deref());
+            let body = serde_json::to_string(
+                &load_skill_record_from_registry(
+                    &pipeline_modules.unified_skill_registry,
+                    &args.skill_id,
+                    args.version.as_deref(),
+                )
+                .await?,
+            )
+            .map_err(|source| format!("failed to serialize skill record: {source}"))?;
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }

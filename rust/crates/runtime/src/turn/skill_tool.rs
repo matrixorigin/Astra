@@ -148,7 +148,20 @@ pub struct InvokedSkill {
     pub name: String,
     /// Full instructions returned on first invocation.
     pub content: String,
-    /// Turn number when the skill was first invoked.
+    /// Turn number captured at activation time, **before** the LLM turn that
+    /// triggered the activation has committed.
+    ///
+    /// Semantics:
+    /// - Counts session turns 1-based (`AgenticLoopState::current_session_turn_number`).
+    /// - Captured *during* turn N — there is no off-by-one with the turn the
+    ///   user observes; the field stores N, the same number the next system
+    ///   prompt will report.
+    /// - Subsequent rounds within the same turn that re-resolve the same skill
+    ///   keep this value (those increment `reentry_count` instead).
+    /// - Pre-routing activations (before any LLM round runs) also store turn
+    ///   N, where N is the turn that will *consume* the skill output. This
+    ///   matches how the skill listing's `Reverse(invoked_at_turn)` sort
+    ///   surfaces "most recent" without having to special-case round 0.
     pub invoked_at_turn: u32,
     /// Number of times the model re-invoked this skill after the initial load.
     /// Used to escalate the short-circuit message so repeated re-entry is
@@ -168,6 +181,205 @@ const DISCOVER_SKILLS_MAX_RESULTS: usize = 8;
 const LARGE_SKILL_CATALOG_WARNING_THRESHOLD: usize = 50;
 static LARGE_SKILL_CATALOG_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
 static IGNORED_SKILL_SEARCH_SETTINGS_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
+pub const DEFAULT_AUTO_ROUTE_MIN_SCORE: usize = 20;
+pub const DEFAULT_AUTO_ROUTE_MIN_MARGIN: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutoRoutingConfig {
+    pub min_score: usize,
+    pub min_margin: usize,
+}
+
+impl Default for AutoRoutingConfig {
+    fn default() -> Self {
+        Self {
+            min_score: DEFAULT_AUTO_ROUTE_MIN_SCORE,
+            min_margin: DEFAULT_AUTO_ROUTE_MIN_MARGIN,
+        }
+    }
+}
+
+impl AutoRoutingConfig {
+    pub const fn new(min_score: usize, min_margin: usize) -> Self {
+        Self {
+            min_score,
+            min_margin,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SkillSurfacingPolicy {
+    pub allowed_names: Option<HashSet<String>>,
+    pub allowed_sources: Option<HashSet<SkillSourceKind>>,
+}
+
+impl SkillSurfacingPolicy {
+    pub fn is_unrestricted(&self) -> bool {
+        self.allowed_names.is_none() && self.allowed_sources.is_none()
+    }
+
+    fn allowed_names(&self) -> Option<&HashSet<String>> {
+        self.allowed_names.as_ref()
+    }
+
+    fn allowed_sources(&self) -> Option<&HashSet<SkillSourceKind>> {
+        self.allowed_sources.as_ref()
+    }
+
+    fn allows<T: SkillFilterable>(&self, skill: &T) -> bool {
+        if let Some(allowed_sources) = self.allowed_sources() {
+            if !allowed_sources.contains(skill.source()) {
+                return false;
+            }
+        }
+        if let Some(allowed_names) = self.allowed_names() {
+            if !normalized_skill_names(skill)
+                .into_iter()
+                .any(|candidate| allowed_names.contains(&candidate))
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Joint trait that the policy filter relies on: identity (name + aliases)
+/// plus origin (source kind). Implemented identically for `SkillToolInfo`
+/// (catalog rows) and `ResolvedSkill` (post-resolution view).
+trait SkillFilterable {
+    fn primary_name(&self) -> &str;
+    fn aliases(&self) -> &[String];
+    fn source(&self) -> &SkillSourceKind;
+}
+
+impl SkillFilterable for SkillToolInfo {
+    fn primary_name(&self) -> &str {
+        &self.name
+    }
+
+    fn aliases(&self) -> &[String] {
+        &self.aliases
+    }
+
+    fn source(&self) -> &SkillSourceKind {
+        &self.source
+    }
+}
+
+impl SkillFilterable for ResolvedSkill {
+    fn primary_name(&self) -> &str {
+        &self.name
+    }
+
+    fn aliases(&self) -> &[String] {
+        &self.aliases
+    }
+
+    fn source(&self) -> &SkillSourceKind {
+        &self.source
+    }
+}
+
+fn normalized_skill_names<T: SkillFilterable>(skill: &T) -> Vec<String> {
+    std::iter::once(skill.primary_name())
+        .chain(skill.aliases().iter().map(String::as_str))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+struct PolicyScopedSkillResolver {
+    inner: Arc<dyn SkillResolver>,
+    policy: SkillSurfacingPolicy,
+    visible_skills: Vec<SkillToolInfo>,
+}
+
+impl PolicyScopedSkillResolver {
+    fn new(inner: Arc<dyn SkillResolver>, policy: SkillSurfacingPolicy) -> Result<Self, String> {
+        let mut visible_skills = Vec::new();
+        let mut matched = HashSet::new();
+
+        for skill in inner.available_skills() {
+            if !policy.allows(&skill) {
+                continue;
+            }
+            if let Some(allowed_names) = policy.allowed_names() {
+                matched.extend(
+                    normalized_skill_names(&skill)
+                        .into_iter()
+                        .filter(|name| allowed_names.contains(name)),
+                );
+            }
+            visible_skills.push(skill);
+        }
+
+        if let Some(allowed_names) = policy.allowed_names() {
+            let mut unmatched = allowed_names
+                .difference(&matched)
+                .cloned()
+                .collect::<Vec<_>>();
+            unmatched.sort();
+            if !unmatched.is_empty() {
+                // Use the wire field name in the message so HTTP responses
+                // are unambiguous about which input was rejected — pre-refactor
+                // tests asserted on this prefix.
+                return Err(format!(
+                    "allow_skills contains unknown entries: {}",
+                    unmatched.join(", ")
+                ));
+            }
+        }
+
+        Ok(Self {
+            inner,
+            policy,
+            visible_skills,
+        })
+    }
+}
+
+impl SkillResolver for PolicyScopedSkillResolver {
+    fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
+        let resolved = self.inner.resolve(name)?;
+        if self.policy.allows(&resolved) {
+            Ok(resolved)
+        } else {
+            Err(crate::skills::SkillError::PermissionDenied(format!(
+                "skill '{}' is not allowed by the active surfacing policy",
+                resolved.name
+            )))
+        }
+    }
+
+    fn available_skills(&self) -> Vec<SkillToolInfo> {
+        self.visible_skills.clone()
+    }
+}
+
+pub fn apply_skill_surfacing_policy(
+    resolver: Option<Arc<dyn SkillResolver>>,
+    policy: &SkillSurfacingPolicy,
+) -> Result<Option<Arc<dyn SkillResolver>>, String> {
+    if policy.is_unrestricted() {
+        return Ok(resolver);
+    }
+
+    let Some(inner) = resolver else {
+        return if matches!(policy.allowed_names.as_ref(), Some(names) if !names.is_empty())
+            || matches!(policy.allowed_sources.as_ref(), Some(sources) if !sources.is_empty())
+        {
+            Err("skill surfacing policy was provided, but no skills are configured".into())
+        } else {
+            Ok(None)
+        };
+    };
+    Ok(Some(Arc::new(PolicyScopedSkillResolver::new(
+        inner,
+        policy.clone(),
+    )?)))
+}
 
 // `DEFAULT_SKILL_LISTING_BUDGET` was removed — its only consumer,
 // `format_skills_within_budget`, is now test-only scaffolding that no
@@ -423,18 +635,27 @@ pub fn discover_skills_tool_schema() -> Value {
 
 /// True if this tool call targets `discover_skills` (legacy name) or
 /// the consolidated `skill {action: "discover"}` form.
+///
+/// Tool name comparison is case-insensitive to stay aligned with
+/// `astra_turn_core::tool_allowlist::normalize_tool_name`, which the runtime
+/// allowlist gate uses. Without this alignment a mixed-case `"Skill"` from an
+/// LLM would pass the allowlist (which lowercases) but fail this detector,
+/// silently turning a skill call into an unknown-tool dispatch.
 pub fn is_discover_skills_call(tool_call: &Value) -> bool {
-    let name = tool_call
+    let raw_name = tool_call
         .get("function")
         .and_then(|f| f.get("name"))
         .and_then(Value::as_str);
-    if name == Some(DISCOVER_SKILLS_TOOL_NAME) {
+    let normalized = raw_name.and_then(astra_turn_core::tool_allowlist::normalize_tool_name);
+    let Some(name) = normalized.as_deref() else {
+        return false;
+    };
+    if name == DISCOVER_SKILLS_TOOL_NAME {
         return true;
     }
     // Consolidated form: skill {action: "discover", query: "..."}
-    if name == Some(SKILL_TOOL_NAME) {
-        let args = extract_tool_args(tool_call);
-        if let Some(args) = args {
+    if name == SKILL_TOOL_NAME {
+        if let Some(args) = extract_tool_args(tool_call) {
             if args.get("action").and_then(Value::as_str) == Some("discover") {
                 return true;
             }
@@ -455,6 +676,87 @@ impl astra_tools::relevance_score::Scoreable for SkillScoreAdapter<'_> {
     }
     fn score_extra(&self) -> Option<&str> {
         self.0.when_to_use.as_deref()
+    }
+}
+
+fn normalized_skill_text(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut last_was_space = true;
+    for ch in text.chars().flat_map(char::to_lowercase) {
+        if ch.is_alphanumeric() {
+            normalized.push(ch);
+            last_was_space = false;
+        } else if !last_was_space {
+            normalized.push(' ');
+            last_was_space = true;
+        }
+    }
+    normalized.trim().to_string()
+}
+
+fn contains_token_subsequence(haystack: &str, needle: &str) -> bool {
+    let haystack_tokens: Vec<&str> = haystack.split_whitespace().collect();
+    let needle_tokens: Vec<&str> = needle.split_whitespace().collect();
+    if needle_tokens.is_empty() {
+        return false;
+    }
+
+    let mut start = 0usize;
+    for token in needle_tokens {
+        let Some(found) = haystack_tokens[start..]
+            .iter()
+            .position(|candidate| *candidate == token)
+        else {
+            return false;
+        };
+        start += found + 1;
+    }
+    true
+}
+
+/// Deterministically select a skill for direct pre-routing when the user query
+/// is already an unambiguous match for one surfaced skill.
+///
+/// This is intentionally conservative: it prefers exact phrase matches on the
+/// canonical name / aliases, otherwise requires both a minimum relevance score
+/// and a margin over the next candidate.
+pub fn select_auto_routed_skill(query: &str, catalog: &[SkillToolInfo]) -> Option<String> {
+    select_auto_routed_skill_with_config(query, catalog, AutoRoutingConfig::default())
+}
+
+pub fn select_auto_routed_skill_with_config(
+    query: &str,
+    catalog: &[SkillToolInfo],
+    config: AutoRoutingConfig,
+) -> Option<String> {
+    let query = query.trim();
+    if query.is_empty() || catalog.is_empty() {
+        return None;
+    }
+
+    let query_lower = normalized_skill_text(query);
+    let adapters: Vec<SkillScoreAdapter> = catalog.iter().map(SkillScoreAdapter).collect();
+    let ranked = astra_tools::relevance_score::rank_by_relevance(&adapters, &query_lower, 2);
+    let (top_idx, top_score) = ranked.first().copied()?;
+    let top_skill = &catalog[top_idx];
+    let runner_up = ranked.get(1).map(|(_, score)| *score).unwrap_or(0);
+
+    let exact_phrase_match = std::iter::once(&top_skill.name)
+        .chain(top_skill.aliases.iter())
+        .map(|name| normalized_skill_text(name))
+        .any(|needle| {
+            query_lower == needle
+                || (needle.contains(' ') && query_lower.contains(&needle))
+                || (needle.contains(' ') && contains_token_subsequence(&query_lower, &needle))
+        });
+
+    if exact_phrase_match
+        || (top_score >= config.min_score
+            && top_score.saturating_sub(runner_up) >= config.min_margin)
+    {
+        Some(top_skill.name.clone())
+    } else {
+        None
     }
 }
 
@@ -574,6 +876,8 @@ pub fn skill_tool_schema_v2() -> Value {
             "name": SKILL_TOOL_NAME,
             "description":
                 "Execute a skill from the <available_skills> system listing. \
+                 When the user's request matches an available skill, call this \
+                 tool before any other tool or substantive response. \
                  `skill_name` is the canonical name or alias. `task` is optional \
                  extra context; omit to use the current conversation. On seeing \
                  `<skill-loaded name=\"...\"/>` in a tool result, follow that \
@@ -604,11 +908,15 @@ pub fn skill_tool_schema_v2() -> Value {
 // `build_skill_listing_section` (CacheScope::Session) in prompts/system.rs.
 
 /// Check if a tool call is a skill invocation.
+///
+/// Case-insensitive — see [`is_discover_skills_call`] for the rationale.
 pub fn is_skill_call(tool_call: &Value) -> bool {
     tool_call
         .get("function")
         .and_then(|f| f.get("name"))
         .and_then(Value::as_str)
+        .and_then(astra_turn_core::tool_allowlist::normalize_tool_name)
+        .as_deref()
         == Some(SKILL_TOOL_NAME)
 }
 
@@ -667,6 +975,30 @@ pub async fn execute_skill_inline(
     )
     .await
     .output
+}
+
+pub async fn execute_skill_direct(
+    resolver: &dyn SkillResolver,
+    executor: Option<&Arc<dyn SkillExecutor>>,
+    skill_name: &str,
+    task_hint: &str,
+    composition_ctx: Option<&crate::skills::composition::CompositionContext>,
+    skill_ctx: &SkillContext,
+) -> SkillCallResult {
+    execute_skill(
+        resolver,
+        executor,
+        skill_name,
+        task_hint,
+        composition_ctx,
+        skill_ctx,
+    )
+    .await
+}
+
+pub fn append_skill_loaded_marker(result: &str, skill_name: &str) -> String {
+    let safe_name = astra_text_utils::xml_escape::xml_escape_attr(skill_name);
+    format!("{result}\n\n<skill-loaded name=\"{safe_name}\"/>")
 }
 
 // ─── Skill execution ─────────────────────────────────────────────────────────
@@ -923,14 +1255,7 @@ pub async fn partition_and_execute_skills(
                     .map(|v| v.all_required_passed)
                     .unwrap_or(skill_success);
                 let result = if effective_success {
-                    // Escape XML attribute reserved characters in skill_name.
-                    let safe_name = skill_name
-                        .replace('&', "&amp;")
-                        .replace('<', "&lt;")
-                        .replace('>', "&gt;")
-                        .replace('"', "&quot;")
-                        .replace('\'', "&apos;");
-                    format!("{}\n\n<skill-loaded name=\"{}\"/>", skill_output, safe_name)
+                    append_skill_loaded_marker(&skill_output, skill_name)
                     // Contract: skill body MUST precede the <skill-loaded> marker.
                     // Locked by web_agent_e2e.rs::skill_resolve_round_trip_carries_instructions_to_next_turn
                     // (body_idx < marker_idx assertion). Do NOT reorder without updating that test.
@@ -1976,6 +2301,9 @@ fn build_activation(skill: &ResolvedSkill) -> SkillActivation {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
     use super::*;
 
     /// Stub resolver for tests.
@@ -2047,6 +2375,254 @@ mod tests {
                 ),
             ],
         }
+    }
+
+    #[test]
+    fn empty_skill_surfacing_policy_denies_all() {
+        let resolver: Arc<dyn SkillResolver> = Arc::new(stub_resolver());
+        let policy = SkillSurfacingPolicy {
+            allowed_names: Some(HashSet::new()),
+            allowed_sources: Some(HashSet::new()),
+        };
+
+        let filtered = apply_skill_surfacing_policy(Some(Arc::clone(&resolver)), &policy)
+            .expect("empty policy should not fail")
+            .expect("resolver should be preserved");
+
+        assert!(
+            filtered.available_skills().is_empty(),
+            "explicit empty allowlists should deny all surfaced skills"
+        );
+    }
+
+    #[test]
+    fn skill_surfacing_policy_combines_name_and_source_filters_with_and_semantics() {
+        struct MixedSourceResolver;
+
+        impl SkillResolver for MixedSourceResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
+                match name {
+                    "code-review" => Ok(ResolvedSkill {
+                        name: "code-review".into(),
+                        instructions: "review".into(),
+                        model: None,
+                        max_tokens: None,
+                        allowed_tools: vec![],
+                        execution_context: ExecutionContext::Inline,
+                        hooks: crate::skills::hooks::SkillHooks::default(),
+                        skill_dir: None,
+                        source: SkillSourceKind::Database,
+                        success_criteria: Vec::new(),
+                        composition: None,
+                        input_schema: None,
+                        output_schema: None,
+                        remote_url: None,
+                        forward_headers: vec![],
+                        required_headers: vec![],
+                        aliases: vec![],
+                        effort: None,
+                        agent_type: None,
+                        trust_tier: crate::skills::manifest::TrustTier::Community,
+                    }),
+                    other => Err(crate::skills::SkillError::NotFound(other.to_string())),
+                }
+            }
+
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![
+                    SkillToolInfo {
+                        name: "code-review".into(),
+                        description: "review".into(),
+                        source: SkillSourceKind::Database,
+                        ..Default::default()
+                    },
+                    SkillToolInfo {
+                        name: "test-writer".into(),
+                        description: "tests".into(),
+                        source: SkillSourceKind::Local,
+                        ..Default::default()
+                    },
+                ]
+            }
+        }
+
+        let resolver: Arc<dyn SkillResolver> = Arc::new(MixedSourceResolver);
+        let policy = SkillSurfacingPolicy {
+            allowed_names: Some(HashSet::from(["code-review".to_string()])),
+            allowed_sources: Some(HashSet::from([SkillSourceKind::Database])),
+        };
+
+        let filtered = apply_skill_surfacing_policy(Some(Arc::clone(&resolver)), &policy)
+            .expect("policy should construct")
+            .expect("resolver should be preserved");
+
+        let visible = filtered.available_skills();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].name, "code-review");
+    }
+
+    /// Pin the AND-intersection contract across the four interesting policy
+    /// shapes so a future refactor can't silently flip to union semantics.
+    /// (The previous coverage was a single `code-review/Database` happy-path
+    /// row; this extension catches mismatched name/source pairs.)
+    #[test]
+    fn skill_surfacing_policy_intersection_matrix() {
+        fn make_resolver() -> Arc<dyn SkillResolver> {
+            struct R;
+            impl SkillResolver for R {
+                fn resolve(&self, _: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
+                    Err(crate::skills::SkillError::NotFound(String::new()))
+                }
+                fn available_skills(&self) -> Vec<SkillToolInfo> {
+                    vec![
+                        SkillToolInfo {
+                            name: "code-review".into(),
+                            description: "review".into(),
+                            source: SkillSourceKind::Database,
+                            ..Default::default()
+                        },
+                        SkillToolInfo {
+                            name: "test-writer".into(),
+                            description: "tests".into(),
+                            source: SkillSourceKind::Local,
+                            ..Default::default()
+                        },
+                    ]
+                }
+            }
+            Arc::new(R)
+        }
+
+        // Case 1: name filter excludes a row that source filter would have allowed.
+        // Catalog: code-review/Database, test-writer/Local
+        // Policy: name=test-writer, source=Local => only test-writer
+        let policy = SkillSurfacingPolicy {
+            allowed_names: Some(HashSet::from(["test-writer".to_string()])),
+            allowed_sources: Some(HashSet::from([SkillSourceKind::Local])),
+        };
+        let visible = apply_skill_surfacing_policy(Some(make_resolver()), &policy)
+            .expect("constructs")
+            .expect("preserves resolver")
+            .available_skills();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].name, "test-writer");
+
+        // Case 2: name+source mismatch — name allows code-review but it's
+        // in Database, while source filter only allows Local. Empty set.
+        // (Previously we would have *expected* an error from `apply_skill_surfacing_policy`
+        // on unknown names; here `code-review` *exists* in the catalog so it's a
+        // mismatch, not an unknown entry, and the result is just empty.)
+        let policy = SkillSurfacingPolicy {
+            allowed_names: Some(HashSet::from(["code-review".to_string()])),
+            allowed_sources: Some(HashSet::from([SkillSourceKind::Local])),
+        };
+        let result = apply_skill_surfacing_policy(Some(make_resolver()), &policy);
+        // The AND intersection visibly omits code-review (source mismatch); the
+        // name "code-review" did appear in catalog, so allowed_names is satisfied
+        // — but `allows()` rejects the row because source filter excludes it.
+        // PolicyScopedSkillResolver tracks `matched` based on `allowed_names` only,
+        // so an unmatched name surfaces as an error here.
+        assert!(
+            result.is_err(),
+            "name-only matched but source rejected → unmatched name surfaces"
+        );
+
+        // Case 3: source-only filter (no name filter) — both rows of the matching
+        // source pass through.
+        let policy = SkillSurfacingPolicy {
+            allowed_names: None,
+            allowed_sources: Some(HashSet::from([SkillSourceKind::Local])),
+        };
+        let visible = apply_skill_surfacing_policy(Some(make_resolver()), &policy)
+            .expect("constructs")
+            .expect("preserves resolver")
+            .available_skills();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].name, "test-writer");
+
+        // Case 4: both filters None → unrestricted (function returns the
+        // resolver verbatim, not a wrapped one).
+        let policy = SkillSurfacingPolicy {
+            allowed_names: None,
+            allowed_sources: None,
+        };
+        let visible = apply_skill_surfacing_policy(Some(make_resolver()), &policy)
+            .expect("constructs")
+            .expect("preserves resolver")
+            .available_skills();
+        assert_eq!(visible.len(), 2);
+    }
+
+    #[test]
+    fn auto_route_skill_prefers_exact_phrase_match() {
+        let catalog = vec![
+            SkillToolInfo {
+                name: "review-changes".into(),
+                description: "Review the current branch diff".into(),
+                aliases: vec!["review changes".into()],
+                ..Default::default()
+            },
+            SkillToolInfo {
+                name: "optimize-prompt".into(),
+                description: "Shrink prompts".into(),
+                aliases: vec!["prompt optimization".into()],
+                ..Default::default()
+            },
+        ];
+
+        let selected = select_auto_routed_skill("review changes on current branch", &catalog);
+
+        assert_eq!(selected.as_deref(), Some("review-changes"));
+    }
+
+    #[test]
+    fn auto_route_skill_matches_token_subsequence_queries() {
+        let catalog = vec![SkillToolInfo {
+            name: "review-changes".into(),
+            description: "Review the current branch diff".into(),
+            aliases: vec!["review changes".into()],
+            ..Default::default()
+        }];
+
+        let selected = select_auto_routed_skill("review code changes", &catalog);
+
+        assert_eq!(selected.as_deref(), Some("review-changes"));
+    }
+
+    #[test]
+    fn auto_route_skill_stays_conservative_for_ambiguous_query() {
+        let catalog = vec![
+            SkillToolInfo {
+                name: "review-changes".into(),
+                description: "Review the current branch diff".into(),
+                aliases: vec!["review changes".into()],
+                ..Default::default()
+            },
+            SkillToolInfo {
+                name: "review-code".into(),
+                description: "Review code quality and tests".into(),
+                aliases: vec!["code review".into()],
+                ..Default::default()
+            },
+        ];
+
+        let selected = select_auto_routed_skill("please help me review this", &catalog);
+
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn auto_route_thresholds_are_configurable() {
+        let catalog = vec![SkillToolInfo {
+            name: "review-changes".into(),
+            description: "Review the current branch diff".into(),
+            ..Default::default()
+        }];
+
+        let selected =
+            select_auto_routed_skill_with_config("diff", &catalog, AutoRoutingConfig::new(1, 0));
+
+        assert_eq!(selected.as_deref(), Some("review-changes"));
     }
 
     // Legacy `schema_has_correct_structure` tested `skill_tool_schema`'s
@@ -2481,6 +3057,34 @@ mod tests {
     fn is_skill_call_rejects_missing_function() {
         let malformed = serde_json::json!({"id": "x"});
         assert!(!is_skill_call(&malformed));
+    }
+
+    #[test]
+    fn is_skill_call_is_case_insensitive() {
+        let mixed = serde_json::json!({
+            "id": "x",
+            "function": {"name": " Skill ", "arguments": "{}"}
+        });
+        assert!(is_skill_call(&mixed));
+        let upper = serde_json::json!({
+            "id": "x",
+            "function": {"name": "SKILL", "arguments": "{}"}
+        });
+        assert!(is_skill_call(&upper));
+    }
+
+    #[test]
+    fn is_discover_skills_call_is_case_insensitive() {
+        let mixed = serde_json::json!({
+            "id": "x",
+            "function": {"name": "DISCOVER_SKILLS", "arguments": "{}"}
+        });
+        assert!(is_discover_skills_call(&mixed));
+        let consolidated = serde_json::json!({
+            "id": "x",
+            "function": {"name": " Skill ", "arguments": "{\"action\":\"discover\"}"}
+        });
+        assert!(is_discover_skills_call(&consolidated));
     }
 
     #[test]

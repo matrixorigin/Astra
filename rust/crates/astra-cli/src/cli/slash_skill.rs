@@ -297,9 +297,20 @@ pub(crate) async fn handle_skill_command(
 
             // Parse filter flags from sub_arg: free text search and --source=X, --category=X
             let (search_query, source_filter, category_filter) = parse_list_filters(sub_arg);
+            let source_filter = match source_filter {
+                Some(source) => match crate::cli::skill_catalog::normalize_source_filter(&source) {
+                    Ok(source) => Some(source),
+                    Err(err) => {
+                        eprintln!("\n  {}", err.red());
+                        return Ok(());
+                    }
+                },
+                None => None,
+            };
 
             let manifests: Vec<_> = all_manifests
                 .into_iter()
+                .filter(|m| m.user_invocable)
                 .filter(|m| {
                     matches_skill_filter(m, &search_query, &source_filter, &category_filter)
                 })
@@ -351,12 +362,26 @@ pub(crate) async fn handle_skill_command(
                 .iter()
                 .filter(|m| m.source == astra_skills::SkillSourceKind::Mcp)
                 .count();
+            let database_count = manifests
+                .iter()
+                .filter(|m| m.source == astra_skills::SkillSourceKind::Database)
+                .count();
+            let plugin_count = manifests
+                .iter()
+                .filter(|m| m.source == astra_skills::SkillSourceKind::Plugin)
+                .count();
             let mut parts = vec![
                 format!("{} local", local_count),
                 format!("{} bundled", bundled_count),
             ];
+            if database_count > 0 {
+                parts.push(format!("{} database", database_count));
+            }
             if mcp_count > 0 {
                 parts.push(format!("{} mcp", mcp_count));
+            }
+            if plugin_count > 0 {
+                parts.push(format!("{} plugin", plugin_count));
             }
             parts.push(format!("{} total", manifests.len()));
             eprintln!(
@@ -1603,12 +1628,7 @@ fn print_skill_directory_raw(name: &str, skill_dir: &std::path::Path) -> Result<
 // ── List filtering helpers ──────────────────────────────────────────────
 
 fn source_label(source: &astra_skills::SkillSourceKind) -> &'static str {
-    match source {
-        astra_skills::SkillSourceKind::Local => "local",
-        astra_skills::SkillSourceKind::Bundled => "bundled",
-        astra_skills::SkillSourceKind::Mcp => "mcp",
-        _ => "other",
-    }
+    crate::cli::skill_catalog::source_label(source)
 }
 
 fn truncate_desc(desc: &str, max: usize) -> String {

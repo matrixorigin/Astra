@@ -162,8 +162,18 @@ pub async fn execute_send_message(mailbox: &AgentMailbox, args: &Value) -> SendR
 }
 
 /// Check whether a tool call is a `send_message` invocation.
+///
+/// Case-insensitive — runtime allowlist gating lowercases tool names before
+/// dispatching, and this detector must stay aligned to avoid the failure
+/// mode where a mixed-case name like `"Send_Message"` passes the allowlist
+/// gate but fails dispatch and falls through as an unknown tool.
 pub fn is_send_message_call(tool_call: &Value) -> bool {
-    tool_call.pointer("/function/name").and_then(|v| v.as_str()) == Some(SEND_MESSAGE_TOOL_NAME)
+    tool_call
+        .pointer("/function/name")
+        .and_then(|v| v.as_str())
+        .and_then(astra_text_utils::tool_name::normalize_ascii_tool_name)
+        .as_deref()
+        == Some(SEND_MESSAGE_TOOL_NAME)
 }
 
 /// Extract the call ID and arguments from a send_message tool call.
@@ -211,6 +221,24 @@ mod tests {
             "function": { "name": "delegate", "arguments": "{}" }
         });
         assert!(!is_send_message_call(&call));
+    }
+
+    #[test]
+    fn is_send_message_call_is_case_insensitive() {
+        // Mixed-case must still detect — runtime allowlist gating lowercases,
+        // and this detector must agree on what "send_message" means or a
+        // mixed-case call would fall through as an unknown tool.
+        let upper = serde_json::json!({
+            "id": "x",
+            "function": {"name": "SEND_MESSAGE", "arguments": "{}"}
+        });
+        assert!(is_send_message_call(&upper));
+
+        let with_space = serde_json::json!({
+            "id": "x",
+            "function": {"name": " Send_Message ", "arguments": "{}"}
+        });
+        assert!(is_send_message_call(&with_space));
     }
 
     #[test]

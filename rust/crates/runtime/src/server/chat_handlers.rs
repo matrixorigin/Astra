@@ -124,6 +124,7 @@ fn chat_stream_bridge_fallback_payload(
     chat_data: &astra_services::runs::ChatRequestData,
 ) -> serde_json::Value {
     let allow_skills = normalize_bridge_allowlist(chat_data.allow_skills.as_deref());
+    let allow_skill_sources = normalize_bridge_allowlist(chat_data.allow_skill_sources.as_deref());
     let allow_tools = normalize_bridge_allowlist(chat_data.allow_tools.as_deref());
     // Hoist test_llm_stream_blocks from context to top-level so bridge can find it.
     let test_llm_stream_blocks = chat_data
@@ -141,6 +142,7 @@ fn chat_stream_bridge_fallback_payload(
             .map(|config| serde_json::json!(config)),
         "skill_search": chat_data.skill_search.as_ref(),
         "allow_skills": allow_skills,
+        "allow_skill_sources": allow_skill_sources,
         "allow_tools": allow_tools,
         "context": chat_data.context.as_ref(),
         "execution_budget": chat_data.execution_budget.as_ref(),
@@ -549,6 +551,7 @@ mod tests {
                 surface_cap: 20,
             }),
             allow_skills: Some(vec!["plan".to_string()]),
+            allow_skill_sources: None,
             allow_tools: Some(vec!["bash".to_string()]),
             context: None,
             forward_headers: std::collections::HashMap::new(),
@@ -576,6 +579,7 @@ mod tests {
         );
         assert_eq!(obj["llm_token_service"]["timeout_ms"], 2500);
         assert_eq!(obj["allow_skills"], serde_json::json!(["plan"]));
+        assert_eq!(obj["allow_skill_sources"], serde_json::Value::Null);
         assert_eq!(obj["allow_tools"], serde_json::json!(["bash"]));
         let messages = obj["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
@@ -597,6 +601,11 @@ mod tests {
                 "PLAN".to_string(),
                 "analyze".to_string(),
             ]),
+            allow_skill_sources: Some(vec![
+                " local ".to_string(),
+                "DATABASE".to_string(),
+                "local".to_string(),
+            ]),
             allow_tools: Some(vec![
                 " bash ".to_string(),
                 "BASH".to_string(),
@@ -614,6 +623,10 @@ mod tests {
         });
         let obj = payload.as_object().unwrap();
         assert_eq!(obj["allow_skills"], serde_json::json!(["analyze", "plan"]));
+        assert_eq!(
+            obj["allow_skill_sources"],
+            serde_json::json!(["database", "local"])
+        );
         assert_eq!(obj["allow_tools"], serde_json::json!(["bash", "read_file"]));
     }
 

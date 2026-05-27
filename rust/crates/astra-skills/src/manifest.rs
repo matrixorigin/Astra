@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use super::hooks::SkillHooks;
 use super::version::{Dependency, Version};
@@ -21,6 +22,101 @@ pub enum SkillSourceKind {
     Mcp,
     /// External plugin.
     Plugin,
+}
+
+/// Single source of truth for [`SkillSourceKind`] string serialization.
+///
+/// Adding a variant to the enum without a row here triggers a compile error
+/// in [`SkillSourceKind::as_str`] (the exhaustive `match` keeps the table and
+/// enum in sync), so the four shapes `as_str` / `Display` / `FromStr` /
+/// `SUPPORTED_FILTERS` derive from one place.
+const SKILL_SOURCE_KIND_TABLE: &[(SkillSourceKind, &str)] = &[
+    (SkillSourceKind::Local, "local"),
+    (SkillSourceKind::Bundled, "bundled"),
+    (SkillSourceKind::Database, "database"),
+    (SkillSourceKind::Mcp, "mcp"),
+    (SkillSourceKind::Plugin, "plugin"),
+];
+
+impl SkillSourceKind {
+    pub const SUPPORTED_FILTERS: &'static [&'static str] =
+        &["local", "bundled", "database", "mcp", "plugin"];
+
+    pub fn as_str(&self) -> &'static str {
+        // Exhaustive match so adding a variant fails to compile until the
+        // table above grows a matching row.
+        match self {
+            Self::Local => SKILL_SOURCE_KIND_TABLE[0].1,
+            Self::Bundled => SKILL_SOURCE_KIND_TABLE[1].1,
+            Self::Database => SKILL_SOURCE_KIND_TABLE[2].1,
+            Self::Mcp => SKILL_SOURCE_KIND_TABLE[3].1,
+            Self::Plugin => SKILL_SOURCE_KIND_TABLE[4].1,
+        }
+    }
+}
+
+impl std::fmt::Display for SkillSourceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SkillSourceKind {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let needle = raw.trim().to_ascii_lowercase();
+        SKILL_SOURCE_KIND_TABLE
+            .iter()
+            .find(|(_, label)| *label == needle)
+            .map(|(variant, _)| variant.clone())
+            .ok_or_else(|| {
+                format!(
+                    "unsupported skill source '{raw}'; expected one of: {}",
+                    Self::SUPPORTED_FILTERS.join(", ")
+                )
+            })
+    }
+}
+
+#[cfg(test)]
+mod skill_source_kind_table_tests {
+    use super::*;
+
+    /// Pin SUPPORTED_FILTERS to the labels in the variants table.
+    /// If they ever drift, this test catches the inconsistency before users do.
+    #[test]
+    fn supported_filters_matches_variants_table() {
+        let from_table: Vec<&'static str> = SKILL_SOURCE_KIND_TABLE
+            .iter()
+            .map(|(_, label)| *label)
+            .collect();
+        assert_eq!(SkillSourceKind::SUPPORTED_FILTERS, from_table.as_slice());
+    }
+
+    /// Round-trip every row: `as_str ∘ from_str = identity` and vice versa.
+    #[test]
+    fn variants_round_trip_through_table() {
+        for (variant, label) in SKILL_SOURCE_KIND_TABLE {
+            assert_eq!(variant.as_str(), *label);
+            assert_eq!(SkillSourceKind::from_str(label).unwrap(), *variant);
+        }
+    }
+
+    #[test]
+    fn variants_round_trip_through_display_form() {
+        for variant in [
+            SkillSourceKind::Local,
+            SkillSourceKind::Bundled,
+            SkillSourceKind::Database,
+            SkillSourceKind::Mcp,
+            SkillSourceKind::Plugin,
+        ] {
+            let encoded = variant.to_string();
+            let decoded = SkillSourceKind::from_str(&encoded).expect("round-trip should parse");
+            assert_eq!(decoded, variant);
+        }
+    }
 }
 
 /// Execution context for a skill invocation.

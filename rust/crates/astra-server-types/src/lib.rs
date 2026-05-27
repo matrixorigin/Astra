@@ -90,6 +90,8 @@ pub struct ChatRequest {
     #[serde(default)]
     pub allow_skills: Option<Vec<String>>,
     #[serde(default)]
+    pub allow_skill_sources: Option<Vec<String>>,
+    #[serde(default)]
     pub allow_tools: Option<Vec<String>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
@@ -1031,6 +1033,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         llm_token_service: request.llm_token_service.map(Into::into),
         skill_search: request.skill_search,
         allow_skills: request.allow_skills,
+        allow_skill_sources: request.allow_skill_sources,
         allow_tools: request.allow_tools,
         context,
         forward_headers: std::collections::HashMap::new(),

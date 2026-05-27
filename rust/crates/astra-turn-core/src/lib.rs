@@ -89,6 +89,7 @@ pub mod task_context;
 pub mod thinking_config;
 pub mod token_accounting;
 pub mod tool;
+pub mod tool_allowlist;
 pub mod trace_alert;
 pub mod turn_metrics;
 pub mod working_memory;

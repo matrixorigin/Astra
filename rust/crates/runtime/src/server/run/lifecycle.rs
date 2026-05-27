@@ -294,13 +294,9 @@ async fn post_loop_memory_cleanup(
 fn build_server_skill_resolver(
     skill_service: Option<Arc<dyn SkillService>>,
     user_id: &str,
-    allow_skills: Option<&HashSet<String>>,
 ) -> ServerSkillResolverBundle {
     use crate::turn::skill_tool::SkillResolver as _;
 
-    if matches!(allow_skills, Some(allow_skills) if allow_skills.is_empty()) {
-        return (None, None);
-    }
     let Some(registry) = crate::capabilities::build_server_skill_registry(skill_service, user_id)
     else {
         return (None, None);
@@ -337,6 +333,24 @@ fn normalize_request_allowlist(
     let mut normalized = HashSet::new();
     for entry in entries {
         normalized.insert(normalize_allowlist_entry(entry, field)?);
+    }
+    Ok(Some(normalized))
+}
+
+fn normalize_request_skill_sources(
+    entries: Option<&[String]>,
+    field: &str,
+) -> Result<Option<HashSet<crate::skills::manifest::SkillSourceKind>>, String> {
+    let Some(entries) = entries else {
+        return Ok(None);
+    };
+    let mut normalized = HashSet::new();
+    for entry in entries {
+        normalized.insert(
+            entry
+                .parse::<crate::skills::manifest::SkillSourceKind>()
+                .map_err(|error| format!("{field}: {error}"))?,
+        );
     }
     Ok(Some(normalized))
 }
@@ -448,120 +462,14 @@ fn validate_llm_token_service_config(
     Ok(())
 }
 
-fn skill_tool_names(skill: &crate::turn::skill_tool::SkillToolInfo) -> Vec<String> {
-    std::iter::once(skill.name.as_str())
-        .chain(skill.aliases.iter().map(String::as_str))
-        .map(|name| name.trim().to_ascii_lowercase())
-        .filter(|name| !name.is_empty())
-        .collect()
-}
-
-fn resolved_skill_names(skill: &crate::turn::skill_tool::ResolvedSkill) -> Vec<String> {
-    std::iter::once(skill.name.as_str())
-        .chain(skill.aliases.iter().map(String::as_str))
-        .map(|name| name.trim().to_ascii_lowercase())
-        .filter(|name| !name.is_empty())
-        .collect()
-}
-
-struct RequestScopedSkillResolver {
-    inner: Arc<dyn crate::turn::skill_tool::SkillResolver>,
-    allowed_lookup: HashSet<String>,
-    visible_skills: Vec<crate::turn::skill_tool::SkillToolInfo>,
-}
-
-impl RequestScopedSkillResolver {
-    fn new(
-        inner: Arc<dyn crate::turn::skill_tool::SkillResolver>,
-        requested: HashSet<String>,
-    ) -> Result<Self, String> {
-        let mut visible_skills = Vec::new();
-        let mut allowed_lookup = HashSet::new();
-        let mut matched = HashSet::new();
-
-        for skill in inner.available_skills() {
-            let names = skill_tool_names(&skill);
-            let skill_matches = names
-                .iter()
-                .filter(|name| requested.contains(*name))
-                .cloned()
-                .collect::<Vec<_>>();
-            if skill_matches.is_empty() {
-                continue;
-            }
-            matched.extend(skill_matches);
-            allowed_lookup.extend(names);
-            visible_skills.push(skill);
-        }
-
-        let mut unmatched = requested.difference(&matched).cloned().collect::<Vec<_>>();
-        unmatched.sort();
-        if !unmatched.is_empty() {
-            return Err(format!(
-                "allow_skills contains unknown entries: {}",
-                unmatched.join(", ")
-            ));
-        }
-
-        Ok(Self {
-            inner,
-            allowed_lookup,
-            visible_skills,
-        })
-    }
-}
-
-impl crate::turn::skill_tool::SkillResolver for RequestScopedSkillResolver {
-    fn resolve(
-        &self,
-        name: &str,
-    ) -> Result<crate::turn::skill_tool::ResolvedSkill, crate::skills::SkillError> {
-        let lookup = name.trim().to_ascii_lowercase();
-        if lookup.is_empty() || !self.allowed_lookup.contains(&lookup) {
-            return Err(crate::skills::SkillError::PermissionDenied(format!(
-                "skill '{name}' is not allowed for this request"
-            )));
-        }
-
-        let resolved = self.inner.resolve(name)?;
-        if resolved_skill_names(&resolved)
-            .into_iter()
-            .any(|candidate| self.allowed_lookup.contains(&candidate))
-        {
-            Ok(resolved)
-        } else {
-            Err(crate::skills::SkillError::PermissionDenied(format!(
-                "skill '{}' resolved outside the request allowlist",
-                resolved.name
-            )))
-        }
-    }
-
-    fn available_skills(&self) -> Vec<crate::turn::skill_tool::SkillToolInfo> {
-        self.visible_skills.clone()
-    }
-}
-
 fn apply_normalized_skill_allowlist(
     resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
-    allow_skills: Option<&HashSet<String>>,
+    request_constraints: &RequestConstraints,
 ) -> Result<Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>, String> {
-    let Some(allow_skills) = allow_skills else {
-        return Ok(resolver);
-    };
-
-    let Some(inner) = resolver else {
-        return if allow_skills.is_empty() {
-            Ok(None)
-        } else {
-            Err("allow_skills was provided, but no skills are configured on this server".into())
-        };
-    };
-
-    Ok(Some(Arc::new(RequestScopedSkillResolver::new(
-        inner,
-        allow_skills.clone(),
-    )?)))
+    crate::turn::skill_tool::apply_skill_surfacing_policy(
+        resolver,
+        &request_constraints.skill_surfacing_policy(),
+    )
 }
 
 /// Build a server-side skill executor that supports both Inline and Fork
@@ -2687,13 +2595,20 @@ impl AgenticRunLifecycleService {
         entry
     }
 
-    fn request_constraints_from_request(request: &ChatRequestData) -> RequestConstraints {
-        RequestConstraints::new(
-            normalize_request_allowlist(request.allow_tools.as_deref(), "allow_tools")
-                .expect("request allow_tools should be validated before state build"),
-            normalize_request_allowlist(request.allow_skills.as_deref(), "allow_skills")
-                .expect("request allow_skills should be validated before state build"),
-        )
+    /// Single source of truth: parse all three allowlist lanes from raw wire
+    /// shape, validating each. Every code path that needs a
+    /// [`RequestConstraints`] for the agentic loop runs through this; the
+    /// previous `.expect("validated before state build")` ladder is gone
+    /// because validation and construction now happen together.
+    fn try_request_constraints(request: &ChatRequestData) -> Result<RequestConstraints, String> {
+        Ok(RequestConstraints::new(
+            normalize_request_allowlist(request.allow_tools.as_deref(), "allow_tools")?,
+            normalize_request_allowlist(request.allow_skills.as_deref(), "allow_skills")?,
+            normalize_request_skill_sources(
+                request.allow_skill_sources.as_deref(),
+                "allow_skill_sources",
+            )?,
+        ))
     }
 
     fn inherited_permissions_from_constraints(
@@ -2719,7 +2634,15 @@ impl AgenticRunLifecycleService {
         #[cfg(feature = "harness")] harness_sink: Option<Arc<dyn astra_harness::SnapshotSink>>,
     ) {
         let entry = self.server_agent_spawner_for_session(session_id).await;
-        let request_constraints = Self::request_constraints_from_request(request);
+        // Validation already happened up the call chain (see
+        // `validate_request_constraints`); this re-parse is safe because the
+        // wire-level shape was checked before this point. If validation ever
+        // becomes optional on this path, the `unwrap_or_else` below logs the
+        // surprise instead of silently building corrupt constraints.
+        let request_constraints = Self::try_request_constraints(request).unwrap_or_else(|err| {
+            tracing::error!(error = %err, "request constraints failed late validation in dynamic-agent wiring");
+            RequestConstraints::default()
+        });
         entry
             .executor
             .set_runtime_context(ServerSpawnRuntimeContext {
@@ -3280,29 +3203,30 @@ impl AgenticRunLifecycleService {
         Ok(trusted_domains)
     }
 
+    /// Validate the request and return the parsed [`RequestConstraints`].
+    ///
+    /// The returned constraints are the ones every downstream consumer
+    /// (`build_initial_state`, dynamic-agent spawner wiring, delegation
+    /// engine) must use — re-parsing wire shape after this point is the bug
+    /// pattern that motivated the refactor. Callers that just need
+    /// validation and don't take the constraints can drop the result with
+    /// `let _ = ...?;`.
     async fn validate_request_constraints(
         &self,
         user_id: &str,
         request: &ChatRequestData,
-    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<RequestConstraints, (StatusCode, Json<ErrorResponse>)> {
         if request.llm_token_service.is_some() {
             let trusted_domains = self.load_trusted_llm_token_service_domains().await?;
             validate_llm_token_service_config(request.llm_token_service.as_ref(), &trusted_domains)
                 .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
         }
-        normalize_request_allowlist(request.allow_tools.as_deref(), "allow_tools")
+        let request_constraints = Self::try_request_constraints(request)
             .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
-        let allowed_skills =
-            normalize_request_allowlist(request.allow_skills.as_deref(), "allow_skills")
-                .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
-        let (_, resolver) = build_server_skill_resolver(
-            self.skill_service.clone(),
-            user_id,
-            allowed_skills.as_ref(),
-        );
-        apply_normalized_skill_allowlist(resolver, allowed_skills.as_ref())
-            .map(|_| ())
-            .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))
+        let (_, resolver) = build_server_skill_resolver(self.skill_service.clone(), user_id);
+        apply_normalized_skill_allowlist(resolver, &request_constraints)
+            .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        Ok(request_constraints)
     }
 
     /// Build a [`ServerAgenticLoopHost`] for a single run.
@@ -3387,22 +3311,34 @@ impl AgenticRunLifecycleService {
             detect_turn_hook_sets, is_plan_subtask_from_chat_context, project_root_for_stop_hooks,
         };
 
-        let request_constraints = RequestConstraints::new(
-            normalize_request_allowlist(request.allow_tools.as_deref(), "allow_tools")
-                .expect("request allow_tools should be validated before state build"),
-            normalize_request_allowlist(request.allow_skills.as_deref(), "allow_skills")
-                .expect("request allow_skills should be validated before state build"),
-        );
-        let (skill_registry, raw_skill_resolver) = build_server_skill_resolver(
-            self.skill_service.clone(),
-            user_id,
-            request_constraints.allowed_skills.as_ref(),
-        );
+        // Constraints come pre-validated through `validate_request_constraints`
+        // (caller is `create_run` / resume paths). For deep-internal call
+        // sites (tests, recovery flows) we re-parse and surface the error in
+        // structured logs rather than panicking — a bad value here means an
+        // upstream invariant is broken, not a user mistake.
+        let request_constraints = match Self::try_request_constraints(request) {
+            Ok(c) => c,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "request constraints failed validation in build_initial_state — falling back to default; upstream caller should validate first",
+                );
+                RequestConstraints::default()
+            }
+        };
+        let (skill_registry, raw_skill_resolver) =
+            build_server_skill_resolver(self.skill_service.clone(), user_id);
         let skill_resolver = apply_normalized_skill_allowlist(
             raw_skill_resolver,
-            request_constraints.allowed_skills.as_ref(),
+            &request_constraints,
         )
-        .expect("request allow_skills should be validated before state build");
+        .unwrap_or_else(|err| {
+            tracing::error!(
+                error = %err,
+                "skill allowlist failed in build_initial_state — proceeding without resolver",
+            );
+            None
+        });
         use astra_turn_core::turn_guard::TurnGuard;
 
         let user_message = json!({
@@ -5500,7 +5436,11 @@ fn spawn_child_request_constraints(
         (None, None) => None,
     };
 
-    RequestConstraints::new(allowed_tools, parent.allowed_skills.clone())
+    RequestConstraints::new(
+        allowed_tools,
+        parent.allowed_skills.clone(),
+        parent.allowed_skill_sources.clone(),
+    )
 }
 
 fn spawn_system_prompt(config: &SpawnRunConfig) -> String {
@@ -5852,15 +5792,10 @@ impl SubRunExecutor for ServerSubRunExecutor {
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
 
-        let (skill_registry, raw_skill_resolver) = build_server_skill_resolver(
-            self.skill_service.clone(),
-            &config.user_id,
-            config.request_constraints.allowed_skills.as_ref(),
-        );
-        let skill_resolver = apply_normalized_skill_allowlist(
-            raw_skill_resolver,
-            config.request_constraints.allowed_skills.as_ref(),
-        )?;
+        let (skill_registry, raw_skill_resolver) =
+            build_server_skill_resolver(self.skill_service.clone(), &config.user_id);
+        let skill_resolver =
+            apply_normalized_skill_allowlist(raw_skill_resolver, &config.request_constraints)?;
 
         // Sub-agent / delegation path: model comes from the agent profile
         // override, not a request field.
@@ -6528,6 +6463,14 @@ mod tests {
                     .collect(),
             ),
             Some(["review"].into_iter().map(String::from).collect()),
+            Some(
+                [
+                    crate::skills::manifest::SkillSourceKind::Local,
+                    crate::skills::manifest::SkillSourceKind::Database,
+                ]
+                .into_iter()
+                .collect(),
+            ),
         );
         let config = test_spawn_run_config(vec!["bash", "read_file"], true);
 
@@ -6544,6 +6487,15 @@ mod tests {
             constraints.allowed_skills.unwrap(),
             ["review"].into_iter().map(String::from).collect()
         );
+        assert_eq!(
+            constraints.allowed_skill_sources.unwrap(),
+            [
+                crate::skills::manifest::SkillSourceKind::Local,
+                crate::skills::manifest::SkillSourceKind::Database,
+            ]
+            .into_iter()
+            .collect()
+        );
     }
 
     #[test]
@@ -6555,6 +6507,7 @@ mod tests {
                     .map(String::from)
                     .collect(),
             ),
+            None,
             None,
         );
         let config = test_spawn_run_config(vec!["*"], false);
@@ -6850,6 +6803,7 @@ mod tests {
             llm_token_service: None,
             skill_search: None,
             allow_skills: None,
+            allow_skill_sources: None,
             allow_tools: None,
             context: None,
             forward_headers: HashMap::new(),
@@ -7619,6 +7573,7 @@ mod tests {
             llm_token_service: None,
             skill_search: None,
             allow_skills: None,
+            allow_skill_sources: None,
             allow_tools: None,
             context: Some(ctx),
             forward_headers: HashMap::new(),
@@ -7732,6 +7687,21 @@ mod tests {
     }
 
     #[test]
+    fn normalize_request_allowlists_preserve_explicit_empty_sets() {
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(
+            super::normalize_request_allowlist(Some(&empty), "allow_skills")
+                .expect("empty allow_skills should normalize"),
+            Some(HashSet::new())
+        );
+        assert_eq!(
+            super::normalize_request_skill_sources(Some(&empty), "allow_skill_sources")
+                .expect("empty allow_skill_sources should normalize"),
+            Some(HashSet::new())
+        );
+    }
+
+    #[test]
     fn extract_edge_profile_from_context() {
         let mut ctx = serde_json::Map::new();
         ctx.insert(
@@ -7747,6 +7717,7 @@ mod tests {
             llm_token_service: None,
             skill_search: None,
             allow_skills: None,
+            allow_skill_sources: None,
             allow_tools: None,
             context: Some(ctx),
             forward_headers: HashMap::new(),

@@ -88,6 +88,38 @@ fn should_echo_close_frame(message: Option<&Result<Message, axum::Error>>) -> bo
 
 /// Messages sent from browser client to server.
 #[derive(serde::Deserialize, Debug, Clone)]
+pub(super) struct WsChatMessage {
+    content: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    skill_search: Option<astra_core::SkillSearchSettings>,
+    #[serde(default)]
+    allow_skills: Option<Vec<String>>,
+    #[serde(default)]
+    allow_skill_sources: Option<Vec<String>>,
+    #[serde(default)]
+    allow_tools: Option<Vec<String>>,
+    #[serde(default)]
+    context: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    execution_budget: Option<astra_services::runs::ExecutionBudget>,
+    #[serde(default)]
+    explain: bool,
+    #[serde(default)]
+    interaction_mode: Option<astra_services::runs::RequestedTurnInteractionMode>,
+    #[serde(default)]
+    plan_subtask_id: Option<String>,
+    #[serde(default)]
+    is_plan_subtask: Option<bool>,
+}
+
+/// Messages sent from browser client to server.
+#[derive(serde::Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub(super) enum WsClientMessage {
     /// Authenticate with a Bearer token (must be first message).
@@ -97,31 +129,8 @@ pub(super) enum WsClientMessage {
     /// Send a chat message to the agent.
     #[serde(rename = "message")]
     ChatMessage {
-        content: String,
-        #[serde(default)]
-        session_id: Option<String>,
-        #[serde(default)]
-        agent_id: Option<String>,
-        #[serde(default)]
-        model: Option<String>,
-        #[serde(default)]
-        skill_search: Option<astra_core::SkillSearchSettings>,
-        #[serde(default)]
-        allow_skills: Option<Vec<String>>,
-        #[serde(default)]
-        allow_tools: Option<Vec<String>>,
-        #[serde(default)]
-        context: Option<serde_json::Map<String, serde_json::Value>>,
-        #[serde(default)]
-        execution_budget: Option<astra_services::runs::ExecutionBudget>,
-        #[serde(default)]
-        explain: bool,
-        #[serde(default)]
-        interaction_mode: Option<astra_services::runs::RequestedTurnInteractionMode>,
-        #[serde(default)]
-        plan_subtask_id: Option<String>,
-        #[serde(default)]
-        is_plan_subtask: Option<bool>,
+        #[serde(flatten)]
+        request: Box<WsChatMessage>,
     },
 
     /// Cancel an active run.
@@ -522,21 +531,23 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<WsClientMessage>(&text) {
-                            Ok(WsClientMessage::ChatMessage {
-                                content,
-                                session_id,
-                                agent_id,
-                                model,
-                                skill_search,
-                                allow_skills,
-                                allow_tools,
-                                context,
-                                execution_budget,
-                                explain,
-                                interaction_mode,
-                                plan_subtask_id,
-                                is_plan_subtask,
-                            }) => {
+                            Ok(WsClientMessage::ChatMessage { request }) => {
+                                let WsChatMessage {
+                                    content,
+                                    session_id,
+                                    agent_id,
+                                    model,
+                                    skill_search,
+                                    allow_skills,
+                                    allow_skill_sources,
+                                    allow_tools,
+                                    context,
+                                    execution_budget,
+                                    explain,
+                                    interaction_mode,
+                                    plan_subtask_id,
+                                    is_plan_subtask,
+                                } = *request;
                                 handle_chat_message(
                                     socket,
                                     state,
@@ -547,6 +558,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                     model,
                                     skill_search,
                                     allow_skills,
+                                    allow_skill_sources,
                                     allow_tools,
                                     context,
                                     execution_budget,
@@ -660,6 +672,7 @@ async fn handle_chat_message(
     model: Option<String>,
     skill_search: Option<astra_core::SkillSearchSettings>,
     allow_skills: Option<Vec<String>>,
+    allow_skill_sources: Option<Vec<String>>,
     allow_tools: Option<Vec<String>>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
     execution_budget: Option<astra_services::runs::ExecutionBudget>,
@@ -683,6 +696,7 @@ async fn handle_chat_message(
         model,
         skill_search,
         allow_skills,
+        allow_skill_sources,
         allow_tools,
         context,
         execution_budget,
@@ -937,6 +951,7 @@ fn build_bridge_chat_payload(
     model: Option<String>,
     skill_search: Option<astra_core::SkillSearchSettings>,
     allow_skills: Option<Vec<String>>,
+    allow_skill_sources: Option<Vec<String>>,
     allow_tools: Option<Vec<String>>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
     execution_budget: Option<astra_services::runs::ExecutionBudget>,
@@ -944,6 +959,7 @@ fn build_bridge_chat_payload(
     interaction_mode: Option<astra_services::runs::RequestedTurnInteractionMode>,
 ) -> Value {
     let allow_skills = normalize_bridge_allowlist(allow_skills.as_deref());
+    let allow_skill_sources = normalize_bridge_allowlist(allow_skill_sources.as_deref());
     let allow_tools = normalize_bridge_allowlist(allow_tools.as_deref());
     serde_json::json!({
         "session_id": session_id,
@@ -951,6 +967,7 @@ fn build_bridge_chat_payload(
         "model": model,
         "skill_search": skill_search,
         "allow_skills": allow_skills,
+        "allow_skill_sources": allow_skill_sources,
         "allow_tools": allow_tools,
         "context": context,
         "execution_budget": execution_budget,
@@ -981,6 +998,7 @@ fn build_ws_chat_request(
     model: Option<String>,
     skill_search: Option<astra_core::SkillSearchSettings>,
     allow_skills: Option<Vec<String>>,
+    allow_skill_sources: Option<Vec<String>>,
     allow_tools: Option<Vec<String>>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
     execution_budget: Option<astra_services::runs::ExecutionBudget>,
@@ -998,6 +1016,7 @@ fn build_ws_chat_request(
         llm_token_service: None,
         skill_search,
         allow_skills,
+        allow_skill_sources,
         allow_tools,
         context: merge_plan_subtask_context(context, plan_subtask_id, is_plan_subtask),
         forward_headers: std::collections::HashMap::new(),
@@ -2131,24 +2150,26 @@ mod tests {
 
     #[test]
     fn parse_chat_message() {
-        let json = r#"{"type": "message", "content": "hello", "session_id": "s1", "agent_id": "agent-1", "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "allow_skills": ["plan"], "allow_tools": ["bash"], "execution_budget": {"initial_turns": 3, "hard_turn_limit": 7}, "explain": true, "interaction_mode": "auto", "plan_subtask_id": "sub-42", "is_plan_subtask": true}"#;
+        let json = r#"{"type": "message", "content": "hello", "session_id": "s1", "agent_id": "agent-1", "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "allow_skills": ["plan"], "allow_skill_sources": ["database"], "allow_tools": ["bash"], "execution_budget": {"initial_turns": 3, "hard_turn_limit": 7}, "explain": true, "interaction_mode": "auto", "plan_subtask_id": "sub-42", "is_plan_subtask": true}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
-            WsClientMessage::ChatMessage {
-                content,
-                session_id,
-                agent_id,
-                model,
-                skill_search,
-                allow_skills,
-                allow_tools,
-                context,
-                execution_budget,
-                explain,
-                interaction_mode,
-                plan_subtask_id,
-                is_plan_subtask,
-            } => {
+            WsClientMessage::ChatMessage { request } => {
+                let WsChatMessage {
+                    content,
+                    session_id,
+                    agent_id,
+                    model,
+                    skill_search,
+                    allow_skills,
+                    allow_skill_sources,
+                    allow_tools,
+                    context,
+                    execution_budget,
+                    explain,
+                    interaction_mode,
+                    plan_subtask_id,
+                    is_plan_subtask,
+                } = *request;
                 assert_eq!(content, "hello");
                 assert_eq!(session_id, Some("s1".into()));
                 assert_eq!(agent_id.as_deref(), Some("agent-1"));
@@ -2162,6 +2183,7 @@ mod tests {
                     })
                 );
                 assert_eq!(allow_skills, Some(vec!["plan".into()]));
+                assert_eq!(allow_skill_sources, Some(vec!["database".into()]));
                 assert_eq!(allow_tools, Some(vec!["bash".into()]));
                 assert!(context.is_none());
                 assert_eq!(
@@ -2188,22 +2210,25 @@ mod tests {
         let json = r#"{"type": "message", "content": "你好"}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
-            WsClientMessage::ChatMessage {
-                content,
-                agent_id,
-                skill_search,
-                allow_skills,
-                allow_tools,
-                execution_budget,
-                explain,
-                plan_subtask_id,
-                is_plan_subtask,
-                ..
-            } => {
+            WsClientMessage::ChatMessage { request } => {
+                let WsChatMessage {
+                    content,
+                    agent_id,
+                    skill_search,
+                    allow_skills,
+                    allow_skill_sources,
+                    allow_tools,
+                    execution_budget,
+                    explain,
+                    plan_subtask_id,
+                    is_plan_subtask,
+                    ..
+                } = *request;
                 assert_eq!(content, "你好");
                 assert!(agent_id.is_none());
                 assert!(skill_search.is_none());
                 assert!(allow_skills.is_none());
+                assert!(allow_skill_sources.is_none());
                 assert!(allow_tools.is_none());
                 assert!(execution_budget.is_none());
                 assert!(!explain);
@@ -2231,6 +2256,7 @@ mod tests {
                 surface_cap: 20,
             }),
             Some(vec!["plan".into()]),
+            Some(vec!["database".into()]),
             Some(vec!["bash".into()]),
             Some(context.clone()),
             Some(astra_services::runs::ExecutionBudget {
@@ -2248,6 +2274,10 @@ mod tests {
         assert_eq!(payload["skill_search"]["min_catalog_size"], 12);
         assert_eq!(payload["skill_search"]["surface_cap"], 20);
         assert_eq!(payload["allow_skills"], serde_json::json!(["plan"]));
+        assert_eq!(
+            payload["allow_skill_sources"],
+            serde_json::json!(["database"])
+        );
         assert_eq!(payload["allow_tools"], serde_json::json!(["bash"]));
         assert_eq!(payload["context"], serde_json::Value::Object(context));
         assert_eq!(payload["execution_budget"]["initial_turns"], 3);
@@ -2267,6 +2297,7 @@ mod tests {
             Some("gpt-5.4".into()),
             None,
             Some(vec![" plan ".into(), "PLAN".into(), "analyze".into()]),
+            Some(vec![" local ".into(), "MCP".into(), "local".into()]),
             Some(vec![" bash ".into(), "BASH".into(), "read_file".into()]),
             None,
             Some(astra_services::runs::ExecutionBudget {
@@ -2280,6 +2311,10 @@ mod tests {
         assert_eq!(
             payload["allow_skills"],
             serde_json::json!(["analyze", "plan"])
+        );
+        assert_eq!(
+            payload["allow_skill_sources"],
+            serde_json::json!(["local", "mcp"])
         );
         assert_eq!(
             payload["allow_tools"],
@@ -2300,6 +2335,7 @@ mod tests {
                 surface_cap: 20,
             }),
             Some(vec!["plan".into()]),
+            Some(vec!["database".into()]),
             Some(vec!["bash".into(), "read_file".into()]),
             Some(serde_json::Map::from_iter([(
                 "cwd".to_string(),
@@ -2335,6 +2371,7 @@ mod tests {
             })
         );
         assert_eq!(request.allow_skills, Some(vec!["plan".into()]));
+        assert_eq!(request.allow_skill_sources, Some(vec!["database".into()]));
         assert_eq!(
             request.allow_tools,
             Some(vec!["bash".into(), "read_file".into()])
@@ -3582,7 +3619,8 @@ mod tests {
         }"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
-            WsClientMessage::ChatMessage { model, context, .. } => {
+            WsClientMessage::ChatMessage { request } => {
+                let WsChatMessage { model, context, .. } = *request;
                 assert_eq!(model.as_deref(), Some("gpt-4"));
                 assert!(context.is_some());
                 assert_eq!(
@@ -3768,7 +3806,7 @@ mod tests {
         let json = r#"{"type":"message","content":""}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
-            WsClientMessage::ChatMessage { content, .. } => assert!(content.is_empty()),
+            WsClientMessage::ChatMessage { request } => assert!(request.content.is_empty()),
             _ => panic!("expected ChatMessage"),
         }
     }

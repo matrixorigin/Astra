@@ -530,7 +530,10 @@ impl SyncPolicy {
 ///
 /// When a push conflicts (cloud version mismatches), the orchestrator pulls
 /// fresh remote data and applies this strategy to reconcile local vs. remote.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Copy` because every variant is a tag with no payload — passing it by
+/// value to adapter methods avoids forcing callers to clone in dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConflictStrategy {
     /// Events are append-only — conflicts are impossible by design.
@@ -985,20 +988,10 @@ impl SyncOrchestrator {
             return DomainSyncResult::error(domain, format!("validation: {}", e.message));
         }
 
-        let merged = match policy.conflict_strategy {
-            ConflictStrategy::AppendOnly => {
-                adapter.resolve_conflict(ConflictStrategy::AppendOnly, &local, &remote)
-            }
-            ConflictStrategy::Leased => {
-                adapter.resolve_conflict(ConflictStrategy::Leased, &local, &remote)
-            }
-            ConflictStrategy::UnionMerge => {
-                adapter.resolve_conflict(ConflictStrategy::UnionMerge, &local, &remote)
-            }
-            ConflictStrategy::LastWriteWins => {
-                adapter.resolve_conflict(ConflictStrategy::LastWriteWins, &local, &remote)
-            }
-        };
+        // ConflictStrategy is `Copy`; pass it directly. Adapters dispatch on
+        // the variant internally — having an exhaustive match here adds no
+        // safety because all four arms forwarded the strategy unchanged.
+        let merged = adapter.resolve_conflict(policy.conflict_strategy, &local, &remote);
 
         let merged = match merged {
             Ok(payload) => payload,

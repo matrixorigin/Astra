@@ -223,6 +223,7 @@ pub struct ChatRequestData {
     pub llm_token_service: Option<LlmTokenServiceConfig>,
     pub skill_search: Option<astra_core::SkillSearchSettings>,
     pub allow_skills: Option<Vec<String>>,
+    pub allow_skill_sources: Option<Vec<String>>,
     pub allow_tools: Option<Vec<String>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     pub forward_headers: std::collections::HashMap<String, String>,
@@ -264,6 +265,7 @@ impl std::fmt::Debug for ChatRequestData {
             .field("llm_token_service", &self.llm_token_service)
             .field("skill_search", &self.skill_search)
             .field("allow_skills", &self.allow_skills)
+            .field("allow_skill_sources", &self.allow_skill_sources)
             .field("allow_tools", &self.allow_tools)
             .field("context", &self.context)
             .field(
@@ -3012,6 +3014,7 @@ mod tests {
             llm_token_service: None,
             skill_search: None,
             allow_skills: None,
+            allow_skill_sources: None,
             allow_tools: None,
             context: None,
             forward_headers,
@@ -3047,6 +3050,7 @@ mod tests {
                     llm_token_service: None,
                     skill_search: None,
                     allow_skills: None,
+                    allow_skill_sources: None,
                     allow_tools: None,
                     context: None,
                     forward_headers: std::collections::HashMap::new(),

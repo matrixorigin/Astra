@@ -1029,10 +1029,16 @@ pub(crate) enum SkillCmd {
 
 #[derive(Args, Debug)]
 pub(crate) struct SkillListArgs {
+    #[arg()]
+    pub query: Vec<String>,
     #[arg(long, default_value_t = 50)]
     pub limit: u32,
     #[arg(long, default_value_t = 0)]
     pub offset: u32,
+    #[arg(long)]
+    pub source: Option<String>,
+    #[arg(long)]
+    pub category: Option<String>,
 }
 
 #[derive(Args, Debug)]

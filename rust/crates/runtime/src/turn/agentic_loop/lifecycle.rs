@@ -37,11 +37,7 @@ fn should_complete_budget_exhaustion_gracefully(state: &AgenticLoopState) -> boo
 }
 
 pub(crate) fn session_turn_number(state: &AgenticLoopState) -> u32 {
-    if state.session_turn > 0 {
-        state.session_turn
-    } else {
-        state.max_turns.saturating_sub(state.remaining_turns).max(1) as u32
-    }
+    state.current_session_turn_number()
 }
 
 pub(crate) fn current_agentic_step(state: &AgenticLoopState) -> u32 {
@@ -59,6 +55,157 @@ pub(crate) fn completed_tool_calls(state: &AgenticLoopState) -> u32 {
         .filter(|record| !record.is_synthetic_placeholder())
         .count()
         .min(u32::MAX as usize) as u32
+}
+
+fn is_explicit_parallel_skill_request(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    let normalized = lower
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '-' && *ch != '_')
+        .collect::<String>();
+    [
+        "parallelreview",
+        "differentanglesinparallel",
+        "multiagent",
+        "multipleagents",
+        "parallelfanout",
+        "多agents",
+        "多agent",
+        "多个agent",
+        "并行review",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn auto_route_tool_call_id(skill_name: &str) -> String {
+    let mut normalized = String::with_capacity(skill_name.len());
+    let mut last_was_dash = true;
+    for ch in skill_name.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            normalized.push('-');
+            last_was_dash = true;
+        }
+    }
+    let normalized = normalized.trim_matches('-');
+    if normalized.is_empty() {
+        "skill-auto-route".to_string()
+    } else {
+        format!("skill-auto-route-{normalized}")
+    }
+}
+
+async fn maybe_pre_route_skill(state: &mut AgenticLoopState) {
+    if state.llm_rounds_completed > 0
+        || !state.tool_results.is_empty()
+        || !state.skills.invoked.is_empty()
+    {
+        return;
+    }
+
+    let query = state.message.trim().to_string();
+    if query.is_empty() || is_explicit_parallel_skill_request(&query) {
+        return;
+    }
+
+    let Some(resolver) = state.skills.resolver.clone() else {
+        return;
+    };
+
+    let full = resolver.available_skills();
+    if full.is_empty() {
+        return;
+    }
+
+    let visible = crate::turn::skill_tool::visible_skills_for_host_turn(
+        &full,
+        &query,
+        &state.skills.quality_tracker,
+        &state.skills.pinned,
+        &state.skills.discovered,
+        &state.skills.invoked,
+        &state.skills.search,
+    );
+    let Some(skill_name) = crate::turn::skill_tool::select_auto_routed_skill_with_config(
+        &query,
+        &visible,
+        state.skills.auto_routing,
+    ) else {
+        return;
+    };
+
+    let composition_ctx = crate::skills::composition::CompositionContext::root();
+    let skill_ctx = crate::turn::agentic::tool_interception::build_skill_context(state);
+    let result = crate::turn::skill_tool::execute_skill_direct(
+        resolver.as_ref(),
+        state.skills.executor.as_ref(),
+        &skill_name,
+        &query,
+        Some(&composition_ctx),
+        &skill_ctx,
+    )
+    .await;
+    let verified = result
+        .verification
+        .as_ref()
+        .map(|outcome| outcome.all_required_passed)
+        .unwrap_or(true);
+    if !result.success || !verified {
+        return;
+    }
+
+    let tool_call_id = auto_route_tool_call_id(&skill_name);
+    let mut skill_result =
+        crate::turn::skill_tool::append_skill_loaded_marker(&result.output, &skill_name);
+    if let Some(activation) = result.activation {
+        crate::turn::agentic::tool_interception::apply_skill_activation(state, activation);
+    }
+    if let Some(notice) =
+        crate::turn::agentic::tool_interception::runtime_tool_allowlist_notice(state)
+    {
+        skill_result.push_str("\n\n");
+        skill_result.push_str(&notice);
+    }
+    let content_for_model = astra_turn_core::tool_result_sanitize::tool_result_content_for_model(
+        crate::turn::skill_tool::SKILL_TOOL_NAME,
+        &skill_result,
+    );
+
+    state.messages.push(serde_json::json!({
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [{
+            "id": tool_call_id,
+            "type": "function",
+            "function": {
+                "name": crate::turn::skill_tool::SKILL_TOOL_NAME,
+                "arguments": serde_json::json!({
+                    "skill_name": skill_name.clone(),
+                    "task": query,
+                }).to_string(),
+            }
+        }]
+    }));
+    let (tool_msg, tool_result) =
+        astra_turn_core::headless_tool_assembly::openai_tool_roundtrip_values(
+            &tool_call_id,
+            crate::turn::skill_tool::SKILL_TOOL_NAME,
+            &content_for_model,
+        );
+    state.messages.push(tool_msg);
+    state.tool_results.push(tool_result);
+    state.skills.invoked.insert(
+        skill_name.clone(),
+        crate::turn::skill_tool::InvokedSkill {
+            name: skill_name,
+            content: skill_result,
+            invoked_at_turn: session_turn_number(state),
+            reentry_count: 0,
+        },
+    );
 }
 
 fn default_budget_exhaustion_completion_text(state: &AgenticLoopState) -> String {
@@ -1181,6 +1328,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             })
         };
     }
+    maybe_pre_route_skill(state).await;
 
     if turn_index > 0 {
         // Inventory snapshots go through the structured volatile lane so
@@ -1449,13 +1597,30 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use astra_services::session_journal::ToolCallRecord;
+    use astra_skills::hooks::SkillHooks;
+    use astra_skills::manifest::{ExecutionContext, SkillSourceKind, TrustTier};
+    use astra_skills::traits::{ResolvedSkill, SkillResolver, SkillToolInfo};
     use serde_json::json;
 
     use crate::turn::agentic_loop::host::run_agentic_loop_with_host;
     use crate::turn::agentic_loop::host::tests::{MockHost, make_state, text_result};
 
     use super::*;
+
+    #[test]
+    fn explicit_parallel_skill_request_ignores_spacing() {
+        assert!(is_explicit_parallel_skill_request("并行 review 当前分支"));
+        assert!(is_explicit_parallel_skill_request("并行review 当前分支"));
+        assert!(is_explicit_parallel_skill_request("multi-agent review"));
+        assert!(is_explicit_parallel_skill_request("multi agent review"));
+        assert!(is_explicit_parallel_skill_request("parallel fanout review"));
+        assert!(!is_explicit_parallel_skill_request(
+            "implement a fanout pattern"
+        ));
+    }
 
     fn agent_record(
         action: &str,
@@ -1489,6 +1654,52 @@ mod tests {
             ),
             round: Some(round),
             ..Default::default()
+        }
+    }
+
+    struct AutoRouteResolver;
+
+    impl SkillResolver for AutoRouteResolver {
+        fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
+            Ok(ResolvedSkill {
+                name: name.to_string(),
+                instructions: format!("Use the {name} workflow."),
+                model: None,
+                max_tokens: None,
+                allowed_tools: vec!["read_file".into()],
+                execution_context: ExecutionContext::Inline,
+                hooks: SkillHooks::default(),
+                skill_dir: None,
+                source: SkillSourceKind::Local,
+                success_criteria: Vec::new(),
+                composition: None,
+                input_schema: None,
+                output_schema: None,
+                remote_url: None,
+                forward_headers: Vec::new(),
+                required_headers: Vec::new(),
+                aliases: vec!["review changes".into()],
+                effort: None,
+                agent_type: None,
+                trust_tier: TrustTier::Bundled,
+            })
+        }
+
+        fn available_skills(&self) -> Vec<SkillToolInfo> {
+            vec![
+                SkillToolInfo {
+                    name: "review-changes".into(),
+                    description: "Review the current branch diff.".into(),
+                    aliases: vec!["review changes".into()],
+                    ..Default::default()
+                },
+                SkillToolInfo {
+                    name: "optimize-prompt".into(),
+                    description: "Reduce prompt size.".into(),
+                    aliases: vec!["prompt optimization".into()],
+                    ..Default::default()
+                },
+            ]
         }
     }
 
@@ -1766,6 +1977,95 @@ mod tests {
             "{}",
             state.final_text
         );
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_iteration_pre_routes_unambiguous_skill_requests() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.message = "review changes on current branch".into();
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+        state.skills.resolver = Some(Arc::new(AutoRouteResolver));
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        assert_eq!(
+            state.remaining_turns, 9,
+            "pre-routing still consumes the current turn budget"
+        );
+        assert_eq!(state.tool_results.len(), 1);
+        assert!(state.skills.invoked.contains_key("review-changes"));
+        assert_eq!(
+            state.messages.iter().find_map(|msg| {
+                msg.get("tool_calls")?
+                    .as_array()?
+                    .first()?
+                    .get("id")?
+                    .as_str()
+            }),
+            Some("skill-auto-route-review-changes")
+        );
+        assert_eq!(
+            state.messages.iter().find_map(|msg| {
+                msg.get("tool_calls")?
+                    .as_array()?
+                    .first()?
+                    .get("function")?
+                    .get("name")?
+                    .as_str()
+            }),
+            Some(crate::turn::skill_tool::SKILL_TOOL_NAME)
+        );
+        assert!(
+            state.tool_results[0]["result"]
+                .as_str()
+                .is_some_and(|content| content.contains("<skill-loaded name=\"review-changes\"/>"))
+        );
+        assert!(
+            state.tool_results[0]["result"]
+                .as_str()
+                .is_some_and(|content| {
+                    content.contains("only these non-skill tools are callable: read_file")
+                })
+        );
+        assert!(state.messages.iter().any(|msg| {
+            msg.get("role").and_then(|v| v.as_str()) == Some("tool")
+                && msg
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|content| {
+                        content.contains("<skill-loaded name=\"review-changes\"/>")
+                    })
+        }));
+    }
+
+    #[test]
+    fn auto_route_tool_call_id_is_deterministic_and_sanitized() {
+        assert_eq!(
+            auto_route_tool_call_id("Review Changes"),
+            "skill-auto-route-review-changes"
+        );
+        assert_eq!(auto_route_tool_call_id("  !!!  "), "skill-auto-route");
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_iteration_skips_parallel_skill_requests() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.message = "parallel review changes on current branch".into();
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+        state.skills.resolver = Some(Arc::new(AutoRouteResolver));
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        assert!(state.tool_results.is_empty());
+        assert!(state.skills.invoked.is_empty());
     }
 
     /// P1-D: Production code must not use unsafe set_var.

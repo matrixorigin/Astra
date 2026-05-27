@@ -327,16 +327,33 @@ pub struct RequestConstraints {
     /// When set, only this subset of skills may be visible/executable via
     /// the `skill` / `discover_skills` tool schemas.
     pub allowed_skills: Option<HashSet<String>>,
+    /// When set, only skills from these source kinds may be surfaced via the
+    /// `skill` / `discover_skills` tool schemas.
+    pub allowed_skill_sources: Option<HashSet<crate::skills::manifest::SkillSourceKind>>,
 }
 
 impl RequestConstraints {
+    /// Construct with all three lanes set explicitly.
+    ///
+    /// Every field is required so adding a new constraint axis is a hard
+    /// compile error at every call site, not a silent default. Callers that
+    /// don't have a specific lane should pass `None`.
     pub fn new(
         allowed_tools: Option<HashSet<String>>,
         allowed_skills: Option<HashSet<String>>,
+        allowed_skill_sources: Option<HashSet<crate::skills::manifest::SkillSourceKind>>,
     ) -> Self {
         Self {
             allowed_tools,
             allowed_skills,
+            allowed_skill_sources,
+        }
+    }
+
+    pub fn skill_surfacing_policy(&self) -> crate::turn::skill_tool::SkillSurfacingPolicy {
+        crate::turn::skill_tool::SkillSurfacingPolicy {
+            allowed_names: self.allowed_skills.clone(),
+            allowed_sources: self.allowed_skill_sources.clone(),
         }
     }
 }
@@ -360,11 +377,10 @@ pub struct SkillState {
     pub effort: Option<crate::skills::manifest::EffortLevel>,
     /// Agent type hint from the most recently activated skill.
     pub agent_type: Option<String>,
-    /// Tool allow-list from the most recently activated skill (additive only).
-    /// When set, the host ensures these tools are present in the model's tool
-    /// schemas (via `inject_skill_allowed_tools`), but never restricts other
-    /// tools. `allowed_tools` is treated as a visibility hint, not a
-    /// security boundary.
+    /// Tool allow-list from the most recently activated skill.
+    /// This is enforced only by runtime tool interception. Hosts must not use
+    /// it to prune prompt-visible tool schemas, because that would churn the
+    /// provider prompt-cache prefix every time a skill is loaded.
     pub allowed_tools: Option<HashSet<String>>,
     /// Request-scoped tool/skill constraints supplied by the external caller.
     /// Nested runs inherit these constraints unchanged.
@@ -382,6 +398,8 @@ pub struct SkillState {
     pub pinned: std::collections::HashSet<String>,
     /// Canonical skill names surfaced via `discover_skills` this session.
     pub discovered: HashSet<String>,
+    /// Scoring thresholds for deterministic pre-turn skill auto-routing.
+    pub auto_routing: crate::turn::skill_tool::AutoRoutingConfig,
     /// Skill catalog surfacing for this request / session.
     pub search: astra_core::SkillSearchSettings,
     /// Skill listing message (available skill names + descriptions).
@@ -416,6 +434,7 @@ impl Default for SkillState {
             improvement_tracker: Default::default(),
             pinned: HashSet::new(),
             discovered: HashSet::new(),
+            auto_routing: Default::default(),
             search: Default::default(),
             listing_message: None,
             invoked: HashMap::new(),
@@ -1449,29 +1468,35 @@ impl AgenticLoopState {
             .unwrap_or("")
             .to_string();
         let mut augmented = base;
-        let tail_is_user = augmented
-            .last()
-            .and_then(|m| m.get("role"))
-            .and_then(serde_json::Value::as_str)
-            == Some("user");
-        if tail_is_user && !volatile_text.is_empty() {
+        // Single-pass: bind the mutable reference and check the role through
+        // it so we never have to re-`last_mut().expect(...)`. If the borrow
+        // matches and we have non-empty volatile text, prepend in-place;
+        // otherwise the function-level `else` branch appends. This makes
+        // the previous "tail_is_user → non-empty" invariant unrepresentable.
+        let prepended = augmented.last_mut().is_some_and(|last| {
+            if last.get("role").and_then(serde_json::Value::as_str) != Some("user")
+                || volatile_text.is_empty()
+            {
+                return false;
+            }
             // Prepend into the last user msg so we don't create
             // `[user, user]` which breaks Bedrock/Anthropic alternation.
-            let last = augmented.last_mut().expect("tail_is_user → non-empty");
             let existing = last
                 .get("content")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
                 .to_string();
             let merged = if existing.is_empty() {
-                volatile_text
+                volatile_text.clone()
             } else {
                 format!("{volatile_text}\n\n{existing}")
             };
             last["content"] = serde_json::Value::String(merged);
-        } else {
-            // Safe to append — tail is assistant/tool (tool-loop case)
-            // or the base was empty.
+            true
+        });
+        if !prepended {
+            // Safe to append — tail is assistant/tool (tool-loop case),
+            // base was empty, or volatile text was empty.
             augmented.push(volatile_msg);
         }
         Some(augmented)
@@ -1499,6 +1524,33 @@ impl AgenticLoopState {
             .model_override
             .as_deref()
             .or_else(|| self.recent_rounds.last().map(|r| r.model.as_str()))
+    }
+
+    /// 1-based session turn number for the turn currently in progress.
+    ///
+    /// Two ways to derive it, in order:
+    /// 1. The explicit `session_turn` slot, populated by the host before the
+    ///    turn starts (server, edge sync, recovery paths).
+    /// 2. Otherwise, derive from the loop budget — `max_turns - remaining_turns`.
+    ///
+    /// The caller observes turn N during the entire window where they reason
+    /// about turn N (LLM round, tool round, post-turn capture). That is the
+    /// same value that downstream consumers like
+    /// [`crate::turn::skill_tool::InvokedSkill::invoked_at_turn`] persist —
+    /// see that field's doc for the captured-before-commit semantics.
+    pub fn current_session_turn_number(&self) -> u32 {
+        if self.session_turn > 0 {
+            self.session_turn
+        } else {
+            self.max_turns.saturating_sub(self.remaining_turns).max(1) as u32
+        }
+    }
+
+    /// Skill-scoped tool restrictions stay active until the next successful
+    /// skill activation replaces them. Failed loads do not mutate the active
+    /// allowlist, which keeps the session on the last known-good workflow.
+    pub fn skill_allowlist_active(&self) -> bool {
+        self.skills.allowed_tools.is_some()
     }
 }
 
@@ -4404,10 +4456,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn skill_allowed_tools_never_pollutes_restricted_tools() {
-        // Skill allowed_tools is additive (ensures tool schema visibility),
-        // never restrictive. The runtime must not add anything to restricted_tools
-        // based on skill allowed_tools.
+    async fn skill_allowed_tools_are_turn_scoped_only() {
+        // Skill allowlists may restrict tool visibility during the active turn,
+        // but they must not leak into later turns after host cleanup runs.
         let resolver = StubSkillResolver::new().with_allowed_tools(vec!["bash".into()]);
         let turns = vec![
             skill_tool_call_result("call_1", r#"{"skill_name": "test-skill"}"#, 100, 50),
@@ -4425,12 +4476,12 @@ pub(crate) mod tests {
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        // restricted_tools must stay empty — skill allowed_tools is additive only
+        // Turn-scoped restrictions must be removed after the turn completes.
         assert!(
             state.restricted_tools.is_empty(),
-            "skill allowed_tools must not pollute restricted_tools"
+            "skill allowlist restrictions must not leak after turn cleanup"
         );
-        // The allowed_tools field is still set for schema injection
+        // The activated allowlist is still tracked on skill state.
         let allowed = state.skills.allowed_tools.as_ref().unwrap();
         assert!(allowed.contains("bash"));
     }
@@ -4688,9 +4739,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn skill_dedup_returns_stub_on_second_invocation() {
+    async fn skill_dedup_replays_loaded_content_on_second_invocation() {
         // Turn 1: skill call → full instructions returned + recorded
-        // Turn 2: same skill call → stub returned (dedup)
+        // Turn 2: same skill call → replay loaded content + dedup note
         // Turn 3: text completion
         let resolver = StubSkillResolver::new(); // has "test-skill"
         let turns = vec![
@@ -4732,7 +4783,7 @@ pub(crate) mod tests {
                 .contains("Follow these instructions carefully.")
         );
 
-        // Second call: stub (dedup)
+        // Second call: replay loaded content + dedup note.
         let msg2: Vec<&Value> = state
             .messages
             .iter()
@@ -4742,11 +4793,15 @@ pub(crate) mod tests {
         let stub = msg2[0]["content"].as_str().unwrap();
         assert!(
             stub.contains("already loaded"),
-            "expected dedup stub, got: {stub}"
+            "expected dedup note, got: {stub}"
         );
         assert!(
-            !stub.contains("# Skill:"),
-            "stub should NOT contain full instructions"
+            stub.contains("# Skill: test-skill"),
+            "first re-entry should replay the loaded skill instructions"
+        );
+        assert!(
+            stub.contains("<skill-loaded name=\"test-skill\"/>"),
+            "first re-entry should replay the skill-loaded marker"
         );
 
         // Skill should be tracked

@@ -71,6 +71,23 @@ fn parse_request_allowlist_from_context(
     Ok(Some(normalized))
 }
 
+fn parse_request_skill_sources_from_context(
+    context: &mut HashMap<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<HashSet<crate::skills::manifest::SkillSourceKind>>, String> {
+    let Some(values) = parse_request_allowlist_from_context(context, key)? else {
+        return Ok(None);
+    };
+    let mut parsed = HashSet::with_capacity(values.len());
+    for value in values {
+        let source = value
+            .parse()
+            .map_err(|error| format!("context[{key}]: {error}"))?;
+        parsed.insert(source);
+    }
+    Ok(Some(parsed))
+}
+
 fn critical_finding_summary_from_agent_result(result: &AgentResult) -> Option<String> {
     let text = [result.output.as_deref(), result.error.as_deref()]
         .into_iter()
@@ -1716,6 +1733,10 @@ impl DelegationEngine {
             parse_request_allowlist_from_context(
                 &mut request.context,
                 crate::turn::agentic::delegate_interception::REQUEST_ALLOWED_SKILLS_CONTEXT_KEY,
+            )?,
+            parse_request_skill_sources_from_context(
+                &mut request.context,
+                crate::turn::agentic::delegate_interception::REQUEST_ALLOWED_SKILL_SOURCES_CONTEXT_KEY,
             )?,
         );
 
@@ -4608,6 +4629,42 @@ mod tests {
         let err = parse_request_allowlist_from_context(&mut empty_context, key)
             .expect_err("empty entry should fail");
         assert!(err.contains("must not contain empty or whitespace-only strings"));
+    }
+
+    #[test]
+    fn parse_request_skill_sources_from_context_normalizes_and_parses() {
+        let key =
+            crate::turn::agentic::delegate_interception::REQUEST_ALLOWED_SKILL_SOURCES_CONTEXT_KEY;
+        let mut context = HashMap::from([(
+            key.to_string(),
+            serde_json::json!([" Database ", "database", "MCP"]),
+        )]);
+
+        let parsed = parse_request_skill_sources_from_context(&mut context, key)
+            .expect("skill sources should parse")
+            .expect("skill sources should be present");
+
+        let expected = HashSet::from([
+            crate::skills::manifest::SkillSourceKind::Database,
+            crate::skills::manifest::SkillSourceKind::Mcp,
+        ]);
+        assert_eq!(parsed, expected);
+        assert!(
+            !context.contains_key(key),
+            "key should be removed from context"
+        );
+    }
+
+    #[test]
+    fn parse_request_skill_sources_from_context_rejects_unknown_source() {
+        let key =
+            crate::turn::agentic::delegate_interception::REQUEST_ALLOWED_SKILL_SOURCES_CONTEXT_KEY;
+        let mut context = HashMap::from([(key.to_string(), serde_json::json!(["dynamic"]))]);
+
+        let err = parse_request_skill_sources_from_context(&mut context, key)
+            .expect_err("unknown skill source should fail");
+        assert!(err.contains("unsupported skill source"));
+        assert!(err.contains("expected one of"));
     }
 
     #[tokio::test]
