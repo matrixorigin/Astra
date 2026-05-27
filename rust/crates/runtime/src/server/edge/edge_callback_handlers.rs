@@ -10,13 +10,13 @@ use axum::extract::Extension;
 use super::*;
 
 use astra_services::session_journal::{
-    find_latest_approval_decision, find_latest_approval_required, validate_session_id,
-    JournalEvent, JournalWriter,
+    JournalEvent, JournalWriter, find_latest_approval_decision, find_latest_approval_required,
+    validate_session_id,
 };
 use astra_thin_client::ASTRA_EDGE_ID_HEADER;
 use serde::Deserialize;
 
-use astra_turn_core::edge_ledger::{approval_callback_key, tool_callback_key, LEDGER_MAX_ENTRIES};
+use astra_turn_core::edge_ledger::{LEDGER_MAX_ENTRIES, approval_callback_key, tool_callback_key};
 
 /// Server-enforced cap on `last_seen_request_ids` entries per heartbeat.
 /// Excess entries beyond this limit are silently dropped — the edge will
@@ -125,6 +125,25 @@ pub(crate) fn insert_approval_ledger_entry(
     Ok(true)
 }
 
+fn validate_tool_result_request(
+    body: &astra_thin_client::ToolResultRequest,
+) -> Result<(), &'static str> {
+    let output = body
+        .output
+        .as_deref()
+        .ok_or("tool result output is required")?;
+    let result_hash = body
+        .result_hash
+        .as_deref()
+        .ok_or("tool result result_hash is required")?;
+    let expected_hash =
+        astra_thin_client::ToolResultRequest::compute_result_hash(&body.request_id, output);
+    if result_hash != expected_hash {
+        return Err("tool result result_hash does not match payload");
+    }
+    Ok(())
+}
+
 pub(crate) async fn post_tool_result_handler(
     Extension(trace): Extension<RequestTrace>,
     State(state): State<AppState>,
@@ -133,6 +152,8 @@ pub(crate) async fn post_tool_result_handler(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let edge_id = edge_id_from_headers(&headers);
+    validate_tool_result_request(&body)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
     let key = tool_callback_key(&user.user_id, &body.request_id);
     let mut lock = state.edge_callback_ledger.lock().await;
     insert_ledger_entry(
@@ -394,7 +415,7 @@ pub(crate) async fn post_agents_edge_heartbeat_handler(
         "edge_id": edge_id,
         "edge_agent_id": body.edge_agent_id,
         "pending_requests": pending_requests,
-        "ack_request_ids": body.last_seen_request_ids,
+        "ack_request_ids": seen_ids,
     })))
 }
 
@@ -406,7 +427,7 @@ mod edge_callback_insert_tests {
     //! point is to lock in the "at-most-once" contract broken by the
     //! previous `contains_key` short-circuit.
 
-    use super::{insert_approval_ledger_entry, insert_ledger_entry, LedgerInsertError};
+    use super::{LedgerInsertError, insert_approval_ledger_entry, insert_ledger_entry};
     use astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES;
     use serde_json::json;
     use std::collections::HashMap;
@@ -549,5 +570,31 @@ mod edge_callback_insert_tests {
         )
         .expect("durable fallback path returns Ok(false)");
         assert!(!out, "durable fallback path signals not-enqueued");
+    }
+
+    #[test]
+    fn tool_result_hash_mismatch_is_rejected() {
+        let body = astra_thin_client::ToolResultRequest {
+            request_id: "req-1".to_string(),
+            status: "completed".to_string(),
+            output: Some("actual".to_string()),
+            duration_ms: Some(1),
+            result_hash: Some("wrong".to_string()),
+        };
+        assert_eq!(
+            super::validate_tool_result_request(&body),
+            Err("tool result result_hash does not match payload")
+        );
+    }
+
+    #[test]
+    fn tool_result_hash_matching_payload_is_accepted() {
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            "req-1".to_string(),
+            "completed".to_string(),
+            "actual".to_string(),
+            1,
+        );
+        assert_eq!(super::validate_tool_result_request(&body), Ok(()));
     }
 }

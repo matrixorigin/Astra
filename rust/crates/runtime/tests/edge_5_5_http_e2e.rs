@@ -142,7 +142,12 @@ async fn post_tools_result_populates_ledger_then_take_consumes() {
     let (st, j) = post_json(
         app.clone(),
         "/tools/result",
-        json!({"request_id": "tc-1", "status": "ok", "output": "out"}),
+        json!({
+            "request_id": "tc-1",
+            "status": "ok",
+            "output": "out",
+            "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash("tc-1", "out"),
+        }),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
@@ -370,7 +375,12 @@ async fn post_tool_result_rejects_when_ledger_is_full() {
     let (st, _) = post_json(
         app.clone(),
         "/tools/result",
-        json!({"request_id": "tc-overflow", "status": "ok", "output": "out"}),
+        json!({
+            "request_id": "tc-overflow",
+            "status": "ok",
+            "output": "out",
+            "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash("tc-overflow", "out"),
+        }),
     )
     .await;
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);

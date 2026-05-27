@@ -96,6 +96,10 @@ async fn run_tool_backed_chat_turn(
                     "request_id": "ctx-trace-tool-1",
                     "status": "ok",
                     "output": "# README\nfrom tool-backed matrix e2e\n",
+                    "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
+                        "ctx-trace-tool-1",
+                        "# README\nfrom tool-backed matrix e2e\n",
+                    ),
                 }),
             )
             .await;
@@ -782,6 +786,10 @@ pub async fn run_product_matrix_full_journey(
             "request_id": "matrix-tool-req-1",
             "status": "ok",
             "output": "done",
+            "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
+                "matrix-tool-req-1",
+                "done",
+            ),
             "duration_ms": 12
         }),
     )

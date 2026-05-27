@@ -30,21 +30,49 @@ impl StartupTracer {
 
     /// Write the accumulated phases as a `Bootstrap` journal event (best-effort).
     ///
-    /// The journal event uses `session_id = None` because bootstrap happens before
-    /// a session is fully materialised. `astra journal query --type bootstrap` can
-    /// still find and display these events.
-    pub(crate) fn finish(&self) {
+    /// Startup finishes after session materialisation, so write the event into
+    /// the real session journal instead of a synthetic bootstrap pseudo-session.
+    pub(crate) fn finish(&self, session_id: Option<&str>) {
+        let Some(session_id) = session_id else {
+            return;
+        };
         if self.phases.is_empty() {
             return;
         }
         let total_us = self.phases.last().map(|(_, us)| *us).unwrap_or(0);
-        let event =
-            astra_services::session_journal::JournalEvent::bootstrap(None, &self.phases, total_us);
-        // Write directly to the sessions directory using a throwaway JournalWriter.
-        // The session journal is per-session; bootstrap events are session-less
-        // diagnostics written to a well-known "bootstrap" session id.
-        if let Ok(writer) = astra_services::session_journal::JournalWriter::new("__bootstrap__") {
+        let event = astra_services::session_journal::JournalEvent::bootstrap(
+            Some(session_id),
+            &self.phases,
+            total_us,
+        );
+        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) {
             let _ = writer.append(&event);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finish_writes_bootstrap_into_real_session_journal() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let mut tracer = StartupTracer::new();
+        tracer.phase("auth");
+        tracer.phase("startup");
+
+        tracer.finish(Some("session-123"));
+
+        let events =
+            astra_services::session_journal::read_journal("session-123").expect("read journal");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            astra_services::session_journal::journal_file_path("session-123")
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("session-123.jsonl")
+        );
     }
 }

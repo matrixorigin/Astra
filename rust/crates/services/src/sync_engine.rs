@@ -91,7 +91,10 @@ pub enum SyncState {
 
 impl SyncState {
     pub fn is_dirty(&self) -> bool {
-        matches!(self, Self::Dirty)
+        matches!(
+            self,
+            Self::Dirty | Self::Conflict { .. } | Self::Error { .. }
+        )
     }
 
     pub fn is_clean(&self) -> bool {
@@ -146,8 +149,14 @@ impl SyncEnvelope {
     pub fn mark_dirty(&mut self) {
         self.local_version += 1;
         self.last_modified = epoch_secs();
-        if self.sync_state.is_clean() {
-            self.sync_state = SyncState::Dirty;
+        match &mut self.sync_state {
+            SyncState::Conflict { local_version, .. } => {
+                *local_version = self.local_version;
+            }
+            SyncState::Dirty => {}
+            _ => {
+                self.sync_state = SyncState::Dirty;
+            }
         }
     }
 
@@ -306,6 +315,7 @@ pub trait DomainAdapter: Send + Sync {
     /// Returns the merged payload to push.
     fn resolve_conflict(
         &self,
+        strategy: ConflictStrategy,
         local: &SyncPayload,
         remote: &SyncPayload,
     ) -> Result<SyncPayload, SyncError>;
@@ -786,10 +796,19 @@ impl SyncOrchestrator {
                     "push conflict; pulling fresh data and applying {:?} strategy",
                     strategy
                 );
-                // Pull fresh data, merge, then retry.
-                // The adapter applies its ConflictStrategy during merge_remote.
-                let _pull_result = self.pull_domain(domain).await;
-                continue;
+                let resolved = self.resolve_conflict_and_push(domain, &policy).await;
+                if resolved.success {
+                    return resolved;
+                }
+                if resolved
+                    .error
+                    .as_deref()
+                    .map(|e| e.contains("conflict"))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                return resolved;
             }
 
             // Non-conflict error or max retries exceeded
@@ -812,24 +831,9 @@ impl SyncOrchestrator {
             None => return DomainSyncResult::error(domain, "adapter not registered"),
         };
 
-        // Export payload (prefer delta if policy says so)
-        let (payload, op) = if policy.prefer_delta {
-            match adapter.export_delta() {
-                Ok(Some(delta)) => (delta, SyncOperation::PushDelta),
-                Ok(None) | Err(_) => match adapter.export_full() {
-                    Ok(full) => (full, SyncOperation::PushFull),
-                    Err(e) => {
-                        return DomainSyncResult::error(domain, format!("export: {}", e.message));
-                    }
-                },
-            }
-        } else {
-            match adapter.export_full() {
-                Ok(full) => (full, SyncOperation::PushFull),
-                Err(e) => {
-                    return DomainSyncResult::error(domain, format!("export: {}", e.message));
-                }
-            }
+        let (payload, op) = match self.export_payload_for_push(domain, adapter.as_ref(), policy) {
+            Ok(export) => export,
+            Err(err) => return err,
         };
 
         let envelope = adapter.envelope();
@@ -915,6 +919,196 @@ impl SyncOrchestrator {
                 adapter.set_envelope(envelope);
 
                 self.log_event(domain, op, false, start, 0, Some("timeout"));
+                DomainSyncResult::error(domain, "timeout")
+            }
+        }
+    }
+
+    fn export_payload_for_push(
+        &self,
+        domain: SyncDomain,
+        adapter: &dyn DomainAdapter,
+        policy: &SyncPolicy,
+    ) -> Result<(SyncPayload, SyncOperation), DomainSyncResult> {
+        if policy.prefer_delta {
+            match adapter.export_delta() {
+                Ok(Some(delta)) => Ok((delta, SyncOperation::PushDelta)),
+                Ok(None) | Err(_) => adapter
+                    .export_full()
+                    .map(|full| (full, SyncOperation::PushFull))
+                    .map_err(|e| DomainSyncResult::error(domain, format!("export: {}", e.message))),
+            }
+        } else {
+            adapter
+                .export_full()
+                .map(|full| (full, SyncOperation::PushFull))
+                .map_err(|e| DomainSyncResult::error(domain, format!("export: {}", e.message)))
+        }
+    }
+
+    async fn resolve_conflict_and_push(
+        &mut self,
+        domain: SyncDomain,
+        policy: &SyncPolicy,
+    ) -> DomainSyncResult {
+        let start = std::time::Instant::now();
+
+        let adapter = match self.adapters.get(&domain) {
+            Some(a) => a,
+            None => return DomainSyncResult::error(domain, "adapter not registered"),
+        };
+
+        let local = match adapter.export_full() {
+            Ok(payload) => payload,
+            Err(e) => return DomainSyncResult::error(domain, format!("export: {}", e.message)),
+        };
+
+        let remote_pull = match tokio::time::timeout(
+            Duration::from_secs(policy.timeout_secs),
+            self.transport.pull(&self.user_id, domain),
+        )
+        .await
+        {
+            Ok(Ok(pull)) => pull,
+            Ok(Err(e)) => return DomainSyncResult::error(domain, format!("pull: {}", e.message)),
+            Err(_) => return DomainSyncResult::error(domain, "pull: timeout"),
+        };
+
+        let Some(remote) = remote_pull.payload else {
+            return DomainSyncResult::error(domain, "pull: missing remote payload");
+        };
+
+        if let Err(e) = adapter.validate(&remote) {
+            let mut envelope = adapter.envelope();
+            envelope.mark_error(format!("validation: {}", e.message));
+            adapter.set_envelope(envelope);
+            return DomainSyncResult::error(domain, format!("validation: {}", e.message));
+        }
+
+        let merged = match policy.conflict_strategy {
+            ConflictStrategy::AppendOnly => {
+                adapter.resolve_conflict(ConflictStrategy::AppendOnly, &local, &remote)
+            }
+            ConflictStrategy::Leased => {
+                adapter.resolve_conflict(ConflictStrategy::Leased, &local, &remote)
+            }
+            ConflictStrategy::UnionMerge => {
+                adapter.resolve_conflict(ConflictStrategy::UnionMerge, &local, &remote)
+            }
+            ConflictStrategy::LastWriteWins => {
+                adapter.resolve_conflict(ConflictStrategy::LastWriteWins, &local, &remote)
+            }
+        };
+
+        let merged = match merged {
+            Ok(payload) => payload,
+            Err(e) => return DomainSyncResult::error(domain, format!("resolve: {}", e.message)),
+        };
+
+        let mut envelope = adapter.envelope();
+        envelope.sync_state = SyncState::Syncing;
+        adapter.set_envelope(envelope);
+
+        let expected_version = remote_pull.version;
+        let bytes = merged.size() as u64;
+        let push_result = tokio::time::timeout(
+            Duration::from_secs(policy.timeout_secs),
+            self.transport
+                .push(&self.user_id, domain, &merged, expected_version),
+        )
+        .await;
+
+        match push_result {
+            Ok(Ok(result)) if result.success => {
+                let mut envelope = adapter.envelope();
+                if let Some(v) = result.new_version {
+                    envelope.mark_synced(v);
+                    envelope.stats.bytes_pushed += bytes;
+                }
+                adapter.set_envelope(envelope);
+                let _ = adapter.clear_dirty();
+                self.log_event(
+                    domain,
+                    SyncOperation::ConflictResolve,
+                    true,
+                    start,
+                    bytes,
+                    None,
+                );
+                DomainSyncResult {
+                    domain,
+                    success: true,
+                    merge: None,
+                    version: result.new_version,
+                    error: None,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                }
+            }
+            Ok(Ok(result)) if result.is_conflict => {
+                let remote_version = result
+                    .new_version
+                    .or(expected_version.map(|v| v + 1))
+                    .unwrap_or(0);
+                let mut envelope = adapter.envelope();
+                envelope.mark_conflict(remote_version);
+                adapter.set_envelope(envelope);
+                self.log_event(
+                    domain,
+                    SyncOperation::ConflictResolve,
+                    false,
+                    start,
+                    0,
+                    Some("conflict"),
+                );
+                DomainSyncResult {
+                    domain,
+                    success: false,
+                    merge: None,
+                    version: None,
+                    error: Some("conflict".to_string()),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                }
+            }
+            Ok(Ok(result)) => {
+                let mut envelope = adapter.envelope();
+                envelope.mark_error(result.message.clone());
+                adapter.set_envelope(envelope);
+                self.log_event(
+                    domain,
+                    SyncOperation::ConflictResolve,
+                    false,
+                    start,
+                    0,
+                    Some(&result.message),
+                );
+                DomainSyncResult::error(domain, result.message)
+            }
+            Ok(Err(e)) => {
+                let mut envelope = adapter.envelope();
+                envelope.mark_error(e.message.clone());
+                adapter.set_envelope(envelope);
+                self.log_event(
+                    domain,
+                    SyncOperation::ConflictResolve,
+                    false,
+                    start,
+                    0,
+                    Some(&e.message),
+                );
+                DomainSyncResult::error(domain, e.message)
+            }
+            Err(_) => {
+                let mut envelope = adapter.envelope();
+                envelope.mark_error("timeout".to_string());
+                adapter.set_envelope(envelope);
+                self.log_event(
+                    domain,
+                    SyncOperation::ConflictResolve,
+                    false,
+                    start,
+                    0,
+                    Some("timeout"),
+                );
                 DomainSyncResult::error(domain, "timeout")
             }
         }
@@ -1089,6 +1283,11 @@ mod tests {
         assert!(env.sync_state.is_dirty());
         assert_eq!(env.local_version, 2);
 
+        env.sync_state = SyncState::Syncing;
+        env.mark_dirty();
+        assert!(env.sync_state.is_dirty());
+        assert_eq!(env.local_version, 3);
+
         // Synced
         env.sync_state = SyncState::Syncing;
         env.mark_synced(5);
@@ -1104,6 +1303,10 @@ mod tests {
         env.mark_conflict(10);
         assert!(env.sync_state.is_conflict());
         assert_eq!(env.stats.conflicts, 1);
+
+        env.mark_dirty();
+        assert!(env.sync_state.is_dirty());
+        assert_eq!(env.local_version, 2);
     }
 
     #[test]
@@ -1226,6 +1429,7 @@ mod tests {
     struct MockAdapter {
         domain: SyncDomain,
         envelope: std::sync::Mutex<SyncEnvelope>,
+        resolved_strategies: std::sync::Mutex<Vec<ConflictStrategy>>,
     }
 
     impl MockAdapter {
@@ -1233,6 +1437,7 @@ mod tests {
             Self {
                 domain,
                 envelope: std::sync::Mutex::new(SyncEnvelope::new(domain)),
+                resolved_strategies: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -1257,9 +1462,11 @@ mod tests {
 
         fn resolve_conflict(
             &self,
+            strategy: ConflictStrategy,
             _local: &SyncPayload,
             _remote: &SyncPayload,
         ) -> Result<SyncPayload, SyncError> {
+            self.resolved_strategies.lock().unwrap().push(strategy);
             Ok(test_payload())
         }
 
@@ -1283,6 +1490,136 @@ mod tests {
             checksum: "abcd".to_string(),
             item_count: 1,
             compressed: false,
+        }
+    }
+
+    struct ConflictTransport {
+        pushes: std::sync::Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl CloudTransport for ConflictTransport {
+        async fn push(
+            &self,
+            _user_id: &str,
+            _domain: SyncDomain,
+            _payload: &SyncPayload,
+            _expected_version: Option<u64>,
+        ) -> Result<PushResult, SyncError> {
+            let mut pushes = self.pushes.lock().unwrap();
+            *pushes += 1;
+            if *pushes == 1 {
+                Ok(PushResult {
+                    success: false,
+                    new_version: Some(7),
+                    is_conflict: true,
+                    remote_payload: None,
+                    message: "conflict".to_string(),
+                })
+            } else {
+                Ok(PushResult {
+                    success: true,
+                    new_version: Some(8),
+                    is_conflict: false,
+                    remote_payload: None,
+                    message: "ok".to_string(),
+                })
+            }
+        }
+
+        async fn pull(&self, _user_id: &str, _domain: SyncDomain) -> Result<PullResult, SyncError> {
+            Ok(PullResult {
+                payload: Some(SyncPayload {
+                    data: b"remote".to_vec(),
+                    format: PayloadFormat::Full,
+                    checksum: "remote".to_string(),
+                    item_count: 1,
+                    compressed: false,
+                }),
+                version: Some(7),
+                message: "ok".to_string(),
+            })
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn push_conflict_dispatches_policy_strategy_and_logs_resolution() {
+        let transport = Arc::new(ConflictTransport {
+            pushes: std::sync::Mutex::new(0),
+        });
+        let adapter = Arc::new(MockAdapter::new(SyncDomain::Templates));
+        let mut envelope = adapter.envelope();
+        envelope.mark_dirty();
+        adapter.set_envelope(envelope);
+
+        let mut orch = SyncOrchestrator::new(transport, "user1");
+        orch.register(
+            Box::new(SharedMockAdapter(adapter.clone())),
+            SyncPolicy::templates(),
+        );
+
+        let result = orch.push_domain(SyncDomain::Templates).await;
+
+        assert!(result.success);
+        assert_eq!(
+            adapter.resolved_strategies.lock().unwrap().as_slice(),
+            &[ConflictStrategy::UnionMerge]
+        );
+        assert!(
+            orch.event_log().iter().any(|event| matches!(
+                event.operation,
+                SyncOperation::ConflictResolve
+            ) && event.success)
+        );
+    }
+
+    struct SharedMockAdapter(Arc<MockAdapter>);
+
+    #[async_trait]
+    impl DomainAdapter for SharedMockAdapter {
+        fn domain(&self) -> SyncDomain {
+            self.0.domain()
+        }
+
+        fn export_full(&self) -> Result<SyncPayload, SyncError> {
+            self.0.export_full()
+        }
+
+        fn export_delta(&self) -> Result<Option<SyncPayload>, SyncError> {
+            self.0.export_delta()
+        }
+
+        fn merge_remote(&self, remote: &SyncPayload) -> Result<MergeResult, SyncError> {
+            self.0.merge_remote(remote)
+        }
+
+        fn resolve_conflict(
+            &self,
+            strategy: ConflictStrategy,
+            local: &SyncPayload,
+            remote: &SyncPayload,
+        ) -> Result<SyncPayload, SyncError> {
+            self.0.resolve_conflict(strategy, local, remote)
+        }
+
+        fn validate(&self, payload: &SyncPayload) -> Result<(), SyncError> {
+            self.0.validate(payload)
+        }
+
+        fn envelope(&self) -> SyncEnvelope {
+            self.0.envelope()
+        }
+
+        fn set_envelope(&self, envelope: SyncEnvelope) {
+            self.0.set_envelope(envelope);
+        }
+
+        fn clear_dirty(&self) -> Result<(), SyncError> {
+            self.0.clear_dirty()
         }
     }
 }

@@ -449,74 +449,129 @@ impl SkillManifest {
 
     /// Validate the manifest for required fields and well-formedness.
     ///
-    /// Returns a list of validation errors. An empty list means the manifest is valid.
-    /// This is called explicitly on load — no implicit/magic activation.
-    pub fn validate(&self) -> Vec<String> {
+    /// Returns structured validation errors so callers can react without
+    /// string-parsing. An empty list means the manifest is valid.
+    pub fn validate(&self) -> Vec<SkillManifestValidationError> {
         let mut errors = Vec::new();
 
-        // Name is required and must not contain path separators
-        if self.name.is_empty() {
-            errors.push("name is required".to_string());
-        } else if self.name.contains('/') || self.name.contains('\\') || self.name.contains("..") {
-            errors.push(format!(
-                "invalid skill name '{}': must not contain '/', '\\\\', or '..'",
-                self.name
-            ));
-        }
-
-        // Description is required
-        if self.description.is_empty() {
-            errors.push("description is required".to_string());
-        }
-
-        // Version must be at least 0.1.0 (non-zero)
-        if self.version.major == 0 && self.version.minor == 0 && self.version.patch == 0 {
-            errors.push(format!(
-                "version {}.{}.{} is invalid: must be >= 0.1.0",
-                self.version.major, self.version.minor, self.version.patch
-            ));
-        }
+        errors.extend(validate_skill_manifest_core(
+            self.name.as_str(),
+            self.description.as_str(),
+            Some(&self.version),
+        ));
 
         // allowed_tools should have valid tool names if specified
         for tool in &self.allowed_tools {
             if tool.is_empty() {
-                errors.push("allowed_tools contains an empty tool name".to_string());
+                errors.push(SkillManifestValidationError::EmptyAllowedTool);
             }
         }
 
         // input_schema must be valid JSON Schema if provided
-        if let Some(ref schema) = self.input_schema {
-            if !schema.is_object() {
-                errors.push("input_schema must be a JSON object".to_string());
-            }
+        if let Some(ref schema) = self.input_schema
+            && !schema.is_object()
+        {
+            errors.push(SkillManifestValidationError::NonObjectSchema {
+                field: "input_schema",
+            });
         }
 
         // output_schema must be valid JSON Schema if provided
-        if let Some(ref schema) = self.output_schema {
-            if !schema.is_object() {
-                errors.push("output_schema must be a JSON object".to_string());
-            }
+        if let Some(ref schema) = self.output_schema
+            && !schema.is_object()
+        {
+            errors.push(SkillManifestValidationError::NonObjectSchema {
+                field: "output_schema",
+            });
         }
 
         // remote_url must be valid HTTP/HTTPS if provided
-        if let Some(ref url) = self.remote_url {
-            if !url.starts_with("http://") && !url.starts_with("https://") {
-                errors.push(format!(
-                    "remote_url '{}' must start with http:// or https://",
-                    url
-                ));
-            }
+        if let Some(ref url) = self.remote_url
+            && !url.starts_with("http://")
+            && !url.starts_with("https://")
+        {
+            errors.push(SkillManifestValidationError::InvalidRemoteUrl(url.clone()));
         }
 
         // arguments must have non-empty names
         for arg in &self.arguments {
             if arg.name.is_empty() {
-                errors.push("arguments contain an argument with an empty name".to_string());
+                errors.push(SkillManifestValidationError::EmptyArgumentName);
             }
         }
 
         errors
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SkillManifestValidationError {
+    MissingName,
+    InvalidName(String),
+    MissingDescription,
+    MissingVersion,
+    InvalidVersion(String),
+    EmptyAllowedTool,
+    NonObjectSchema { field: &'static str },
+    InvalidRemoteUrl(String),
+    EmptyArgumentName,
+}
+
+impl std::fmt::Display for SkillManifestValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingName => write!(f, "name is required"),
+            Self::InvalidName(name) => write!(
+                f,
+                "invalid skill name '{}': must not contain '/', '\\\\', or '..'",
+                name
+            ),
+            Self::MissingDescription => write!(f, "description is required"),
+            Self::MissingVersion => write!(f, "version is required"),
+            Self::InvalidVersion(version) => {
+                write!(f, "version {version} is invalid")
+            }
+            Self::EmptyAllowedTool => write!(f, "allowed_tools contains an empty tool name"),
+            Self::NonObjectSchema { field } => write!(f, "{field} must be a JSON object"),
+            Self::InvalidRemoteUrl(url) => {
+                write!(f, "remote_url '{url}' must start with http:// or https://")
+            }
+            Self::EmptyArgumentName => {
+                write!(f, "arguments contain an argument with an empty name")
+            }
+        }
+    }
+}
+
+pub fn validate_skill_manifest_core(
+    name: &str,
+    description: &str,
+    version: Option<&Version>,
+) -> Vec<SkillManifestValidationError> {
+    let mut errors = Vec::new();
+
+    if name.is_empty() {
+        errors.push(SkillManifestValidationError::MissingName);
+    } else if name.contains('/') || name.contains('\\') || name.contains("..") {
+        errors.push(SkillManifestValidationError::InvalidName(name.to_string()));
+    }
+
+    if description.is_empty() {
+        errors.push(SkillManifestValidationError::MissingDescription);
+    }
+
+    match version {
+        None => errors.push(SkillManifestValidationError::MissingVersion),
+        Some(version) if version.major == 0 && version.minor == 0 && version.patch == 0 => {
+            errors.push(SkillManifestValidationError::InvalidVersion(format!(
+                "{}.{}.{}",
+                version.major, version.minor, version.patch
+            )));
+        }
+        Some(_) => {}
+    }
+
+    errors
 }
 
 /// A compatibility issue detected by `check_compatibility()`.

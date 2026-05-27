@@ -1195,9 +1195,11 @@ pub struct LlmRoundRecord {
 /// writes partial data without fsync.
 /// Max events before oldest are evicted (ring-buffer semantics).
 const TURN_EVENT_BUFFER_CAP: usize = 1000;
+const TURN_EVENT_DROPPED_META_KEY: &str = "dropped_events_before";
 
 pub struct TurnEventBuffer {
     events: std::collections::VecDeque<JournalEvent>,
+    dropped_events: u64,
     turn_start: std::time::Instant,
     session_id: Option<String>,
     turn: u32,
@@ -1215,6 +1217,7 @@ impl TurnEventBuffer {
     pub fn begin_turn_with_round(session_id: Option<&str>, turn: u32, round: u32) -> Self {
         Self {
             events: std::collections::VecDeque::new(),
+            dropped_events: 0,
             turn_start: std::time::Instant::now(),
             session_id: session_id.map(ToString::to_string),
             turn,
@@ -1228,6 +1231,7 @@ impl TurnEventBuffer {
         self.events.push_back(event);
         while self.events.len() > TURN_EVENT_BUFFER_CAP {
             self.events.pop_front();
+            self.dropped_events = self.dropped_events.saturating_add(1);
         }
     }
 
@@ -1307,35 +1311,6 @@ impl TurnEventBuffer {
         self.push_event(event);
     }
 
-    /// Record a lightweight trace span event in the journal.
-    ///
-    /// Use this for phase timing: `turn_start`, `context_assembly`,
-    /// `llm_call`, `tool_selection`, `tool_execution`, `turn_end`.
-    pub fn record_trace_span(
-        &mut self,
-        span_id: &str,
-        name: &str,
-        start_us: u64,
-        end_us: u64,
-        parent_span_id: Option<&str>,
-        attrs: Option<&std::collections::HashMap<String, String>>,
-        trace_id: Option<&str>,
-    ) {
-        
-        let event = JournalEvent::trace_span(
-            self.session_id.as_deref(),
-            Some(self.turn),
-            span_id,
-            parent_span_id,
-            name,
-            start_us,
-            end_us,
-            attrs,
-            trace_id,
-        );
-        self.push_event(event);
-    }
-
     /// Record a trace span via builder — preferred API.
     pub fn record_trace_span_v2(&mut self, builder: TraceSpanBuilder) {
         let mut evt = builder
@@ -1353,6 +1328,13 @@ impl TurnEventBuffer {
         self.events.len()
     }
 
+    /// Number of oldest events evicted from the in-memory ring buffer for the
+    /// current turn. When non-zero, any flush/drain result is necessarily
+    /// partial and the first surviving event is annotated with the count.
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped_events
+    }
+
     /// Whether no events have been collected.
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
@@ -1363,8 +1345,11 @@ impl TurnEventBuffer {
         if self.events.is_empty() {
             return Ok(());
         }
-        writer.append_bulk(self.events.make_contiguous())?;
+        let events = self.events.make_contiguous();
+        annotate_dropped_turn_events(events, self.dropped_events);
+        writer.append_bulk(events)?;
         self.events.clear();
+        self.dropped_events = 0;
         Ok(())
     }
 
@@ -1379,14 +1364,35 @@ impl TurnEventBuffer {
                 obj.insert("partial".into(), serde_json::json!(true));
             }
         }
-        writer.append_bulk_no_sync(self.events.make_contiguous())?;
+        let events = self.events.make_contiguous();
+        annotate_dropped_turn_events(events, self.dropped_events);
+        writer.append_bulk_no_sync(events)?;
         self.events.clear();
+        self.dropped_events = 0;
         Ok(())
     }
 
     /// Drain collected events (for callers that persist elsewhere, e.g. DB).
     pub fn drain(&mut self) -> Vec<JournalEvent> {
-        std::mem::take(&mut self.events).into()
+        let mut events: Vec<JournalEvent> = std::mem::take(&mut self.events).into();
+        annotate_dropped_turn_events(&mut events, self.dropped_events);
+        self.dropped_events = 0;
+        events
+    }
+}
+
+fn annotate_dropped_turn_events(events: &mut [JournalEvent], dropped_events: u64) {
+    if dropped_events == 0 || events.is_empty() {
+        return;
+    }
+    let meta = events[0]
+        .metadata
+        .get_or_insert_with(|| serde_json::json!({}));
+    if let Some(obj) = meta.as_object_mut() {
+        obj.insert(
+            TURN_EVENT_DROPPED_META_KEY.into(),
+            serde_json::json!(dropped_events),
+        );
     }
 }
 
@@ -2426,7 +2432,7 @@ impl JournalEvent {
 
 /// Builder for [`JournalEvent::trace_span`]. Enforces required fields at
 /// compile time and avoids the 8-argument constructor.
-/// 
+///
 /// Adds `trace_id` for cross-boundary (edge ↔ cloud) correlation.
 #[derive(Debug, Default, Clone)]
 pub struct TraceSpanBuilder {
@@ -2479,7 +2485,7 @@ impl TraceSpanBuilder {
     }
 
     pub fn attrs(mut self, v: Option<&HashMap<String, String>>) -> Self {
-        self.attrs = v.map(|m| m.clone());
+        self.attrs = v.cloned();
         self
     }
 
@@ -2491,7 +2497,9 @@ impl TraceSpanBuilder {
     pub fn build(self) -> JournalEvent {
         let span_id = self.span_id.expect("TraceSpanBuilder: span_id is required");
         let name = self.name.expect("TraceSpanBuilder: name is required");
-        let start_us = self.start_us.expect("TraceSpanBuilder: start_us is required");
+        let start_us = self
+            .start_us
+            .expect("TraceSpanBuilder: start_us is required");
         let end_us = self.end_us.expect("TraceSpanBuilder: end_us is required");
         let mut evt = JournalEvent::base(JournalEventType::TraceSpan, self.session_id.as_deref());
         evt.turn = self.turn;
@@ -7120,6 +7128,29 @@ mod turn_event_buffer_tests {
         let drained = buf.drain();
         assert_eq!(drained.len(), 2);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drain_exposes_evicted_event_count() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("s"), 0);
+        for _ in 0..(TURN_EVENT_BUFFER_CAP + 5) {
+            buf.record(JournalEvent::base_public(JournalEventType::Turn, Some("s")));
+        }
+
+        assert_eq!(buf.len(), TURN_EVENT_BUFFER_CAP);
+        assert_eq!(buf.dropped_events(), 5);
+
+        let drained = buf.drain();
+        assert_eq!(drained.len(), TURN_EVENT_BUFFER_CAP);
+        assert_eq!(
+            drained[0]
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get(TURN_EVENT_DROPPED_META_KEY))
+                .and_then(|value| value.as_u64()),
+            Some(5)
+        );
+        assert_eq!(buf.dropped_events(), 0);
     }
 
     #[test]

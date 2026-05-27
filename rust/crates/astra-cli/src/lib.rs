@@ -34,7 +34,7 @@ pub mod git_branch_cache;
 pub mod manifest_loader;
 pub mod mcp_client;
 pub mod sandbox_retry;
-pub mod skill_instructions;
+pub(crate) mod skill_instructions;
 pub mod tool_safety_guard;
 
 // ═══════════════════════════ CLI modules ═════════════════════════════════

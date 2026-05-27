@@ -40,7 +40,10 @@ use std::path::{Path, PathBuf};
 
 use crate::mcp_client::{McpServerConfig, RetryConfig, Transport};
 use astra_skills::loader::parse_skill_md;
-use astra_skills::manifest::SkillManifest;
+use astra_skills::manifest::{
+    SkillManifest, SkillManifestValidationError, validate_skill_manifest_core,
+};
+use astra_skills::version::Version;
 
 // ─── Manifest Types ─────────────────────────────────────────────────────────
 
@@ -79,6 +82,44 @@ pub struct ToolManifest {
     pub table_prefix: Option<String>,
     #[serde(default)]
     pub author: Option<String>,
+}
+
+impl ToolManifest {
+    fn validate(&self) -> Vec<SkillManifestValidationError> {
+        let mut errors = Vec::new();
+        let version_text = self.version.trim();
+        let mut version_invalid = false;
+
+        let version = if version_text.is_empty() {
+            None
+        } else {
+            match version_text.parse::<Version>() {
+                Ok(version) => Some(version),
+                Err(err) => {
+                    errors.push(SkillManifestValidationError::InvalidVersion(format!(
+                        "{version_text}: {err}"
+                    )));
+                    version_invalid = true;
+                    None
+                }
+            }
+        };
+
+        let mut core_errors = validate_skill_manifest_core(
+            self.name.as_str(),
+            self.description.as_str(),
+            version.as_ref(),
+        );
+
+        // If we already reported InvalidVersion, suppress MissingVersion from core
+        // to avoid double-reporting
+        if version_invalid {
+            core_errors.retain(|e| !matches!(e, SkillManifestValidationError::MissingVersion));
+        }
+
+        errors.extend(core_errors);
+        errors
+    }
 }
 
 /// Tool definition within a skill manifest.
@@ -267,23 +308,16 @@ pub fn load_skill(skill_dir: &Path) -> Result<LoadedSkill, String> {
     let manifest_path = skill_dir.join("manifest.yaml");
     let manifest = load_manifest(&manifest_path)?;
 
-    // Explicit validation before loading — no implicit activation.
-    if manifest.name.is_empty() {
+    let validation_errors = manifest.validate();
+    if !validation_errors.is_empty() {
         return Err(format!(
-            "skill manifest '{}' missing required field: name",
-            manifest_path.display()
-        ));
-    }
-    if manifest.version.is_empty() {
-        return Err(format!(
-            "skill '{}' missing required field: version (e.g. 1.0.0)",
-            manifest.name
-        ));
-    }
-    if manifest.description.is_empty() {
-        return Err(format!(
-            "skill '{}' missing required field: description",
-            manifest.name
+            "skill manifest '{}': {}",
+            manifest_path.display(),
+            validation_errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
         ));
     }
 
@@ -308,7 +342,10 @@ fn escape_yaml_string(s: &str) -> String {
 }
 
 /// Load SKILL.md for a manifest (checks instructions_file or default SKILL.md).
-fn load_skill_instructions(manifest: &ToolManifest, skill_dir: &Path) -> Option<(SkillManifest, String)> {
+fn load_skill_instructions(
+    manifest: &ToolManifest,
+    skill_dir: &Path,
+) -> Option<(SkillManifest, String)> {
     // Check for inline instructions first
     if let Some(ref inline) = manifest.instructions {
         // Wrap inline instructions in frontmatter format

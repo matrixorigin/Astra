@@ -5,7 +5,8 @@
 //! stored in [`AppState`] and queried by the tool routing layer to decide
 //! whether to route tool calls to a remote edge or fall back to the server.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -75,10 +76,22 @@ pub struct EdgeConnectionPool {
     /// Pending tool requests dispatched to edges, keyed by request_id.
     /// Used for reconnection dedup: when an edge reconnects, cloud can
     /// check its pending requests against completed IDs reported by the edge.
-    pending_requests: Arc<DashMap<String, DispatchedToolRequest>>,
+    pending_requests: Arc<DashMap<String, PendingRequestEntry>>,
+    /// Per-user request index for fast reconnection lookup without scanning
+    /// every in-flight request in the process.
+    pending_request_ids_by_user: Arc<DashMap<String, VecDeque<String>>>,
+    /// Global FIFO of dispatched request IDs for O(1)-amortized eviction when
+    /// the pending set reaches capacity. Stale IDs are lazily skipped.
+    pending_request_order: Arc<Mutex<VecDeque<String>>>,
     /// Maximum number of inflight dispatched tool requests. When exceeded,
     /// the oldest entry is evicted before insertion.
     max_pending: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRequestEntry {
+    user_id: String,
+    request: DispatchedToolRequest,
 }
 
 impl EdgeConnectionPool {
@@ -86,6 +99,8 @@ impl EdgeConnectionPool {
         Self {
             connections: Arc::new(DashMap::new()),
             pending_requests: Arc::new(DashMap::new()),
+            pending_request_ids_by_user: Arc::new(DashMap::new()),
+            pending_request_order: Arc::new(Mutex::new(VecDeque::new())),
             max_pending: MAX_PENDING_REQUESTS,
         }
     }
@@ -191,24 +206,23 @@ impl EdgeConnectionPool {
             args: args.clone(),
             dispatched_at: Instant::now(),
         };
-        let pending_key = format!("{user_id}:{request_id}");
-        self.insert_pending_request(pending_key.clone(), dispatched);
+        self.insert_pending_request(user_id, &request_id, dispatched);
 
         if sender.send(msg).is_err() {
             pending_results.remove(&request_id);
-            self.pending_requests.remove(&pending_key);
+            self.remove_pending_request(&request_id);
             return None;
         }
 
         let timeout_dur = Duration::from_secs(EDGE_TOOL_TIMEOUT_SECS);
         match tokio::time::timeout(timeout_dur, rx).await {
             Ok(Ok(result)) => {
-                self.pending_requests.remove(&pending_key);
+                self.remove_pending_request(&request_id);
                 Some(result)
             }
             _ => {
                 pending_results.remove(&request_id);
-                self.pending_requests.remove(&pending_key);
+                self.remove_pending_request(&request_id);
                 None
             }
         }
@@ -253,32 +267,72 @@ impl EdgeConnectionPool {
         self.connections.retain(|_, conn| !conn.sender.is_closed());
 
         let deadline = Instant::now() - Duration::from_secs(PENDING_REQUEST_TTL_SECS);
-        self.pending_requests
-            .retain(|_, req| req.dispatched_at > deadline);
+        let stale_ids: Vec<String> = self
+            .pending_requests
+            .iter()
+            .filter(|entry| entry.value().request.dispatched_at <= deadline)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for request_id in stale_ids {
+            self.remove_pending_request(&request_id);
+        }
     }
 
     /// Insert a dispatched request into the pending set, enforcing the capacity
     /// limit by evicting the oldest entry if necessary.
-    fn insert_pending_request(&self, key: String, req: DispatchedToolRequest) {
-        let len = self.pending_requests.len();
-        if len >= self.max_pending {
-            // Find and remove the oldest entry
-            let mut oldest: Option<(String, Instant)> = None;
-            for entry in self.pending_requests.iter() {
-                let at = entry.value().dispatched_at;
-                match oldest {
-                    None => oldest = Some((entry.key().clone(), at)),
-                    Some((_, ref prev)) if at < *prev => {
-                        oldest = Some((entry.key().clone(), at))
-                    }
-                    _ => {}
-                }
-            }
-            if let Some((oldest_key, _)) = oldest {
-                self.pending_requests.remove(&oldest_key);
+    fn insert_pending_request(&self, user_id: &str, request_id: &str, req: DispatchedToolRequest) {
+        let mut eviction_attempts = 0usize;
+        while self.pending_requests.len() >= self.max_pending
+            && eviction_attempts < self.max_pending.max(1)
+        {
+            eviction_attempts += 1;
+            let oldest_request_id = self
+                .pending_request_order
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front();
+            let Some(oldest_request_id) = oldest_request_id else {
+                break;
+            };
+            if self.remove_pending_request(&oldest_request_id).is_some() {
+                break;
             }
         }
-        self.pending_requests.insert(key, req);
+        self.pending_requests.insert(
+            request_id.to_string(),
+            PendingRequestEntry {
+                user_id: user_id.to_string(),
+                request: req,
+            },
+        );
+        self.pending_request_ids_by_user
+            .entry(user_id.to_string())
+            .or_default()
+            .push_back(request_id.to_string());
+        self.pending_request_order
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(request_id.to_string());
+    }
+
+    fn remove_pending_request(&self, request_id: &str) -> Option<PendingRequestEntry> {
+        let removed = self
+            .pending_requests
+            .remove(request_id)
+            .map(|(_, entry)| entry)?;
+        self.remove_user_pending_index(&removed.user_id, request_id);
+        Some(removed)
+    }
+
+    fn remove_user_pending_index(&self, user_id: &str, request_id: &str) {
+        let mut remove_user_bucket = false;
+        if let Some(mut entry) = self.pending_request_ids_by_user.get_mut(user_id) {
+            entry.retain(|id| id != request_id);
+            remove_user_bucket = entry.is_empty();
+        }
+        if remove_user_bucket {
+            self.pending_request_ids_by_user.remove(user_id);
+        }
     }
 
     /// Number of active connections.
@@ -289,15 +343,17 @@ impl EdgeConnectionPool {
     /// Get pending tool requests for a user. Only returns requests that are
     /// still in the pending set — completed requests should already have been
     /// removed via [`ack_completed_for_user`] before calling this method.
-    pub fn get_pending_requests_for_user(
-        &self,
-        user_id: &str,
-    ) -> Vec<DispatchedToolRequest> {
-        let prefix = format!("{user_id}:");
-        self.pending_requests
+    pub fn get_pending_requests_for_user(&self, user_id: &str) -> Vec<DispatchedToolRequest> {
+        let Some(index) = self.pending_request_ids_by_user.get(user_id) else {
+            return Vec::new();
+        };
+        index
             .iter()
-            .filter(|entry| entry.key().starts_with(&prefix))
-            .map(|entry| entry.value().clone())
+            .filter_map(|request_id| {
+                self.pending_requests
+                    .get(request_id)
+                    .map(|entry| entry.value().request.clone())
+            })
             .collect()
     }
 
@@ -306,9 +362,21 @@ impl EdgeConnectionPool {
     /// from the edge, confirming those tools have been executed.
     pub fn ack_completed_for_user(&self, user_id: &str, completed_request_ids: &[String]) {
         for id in completed_request_ids {
-            let key = format!("{user_id}:{id}");
-            self.pending_requests.remove(&key);
+            let matches_user = self
+                .pending_requests
+                .get(id)
+                .map(|entry| entry.value().user_id == user_id)
+                .unwrap_or(false);
+            if matches_user {
+                self.remove_pending_request(id);
+            }
         }
+    }
+}
+
+impl Default for EdgeConnectionPool {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -438,5 +506,87 @@ mod tests {
             .execute_tool("user-1", "nonexistent", "bash", &json!({}))
             .await;
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn pending_requests_are_isolated_by_exact_user_id() {
+        let pool = EdgeConnectionPool::new();
+        pool.insert_pending_request(
+            "alice",
+            "req-1",
+            DispatchedToolRequest {
+                request_id: "req-1".into(),
+                tool_name: "bash".into(),
+                args: json!({"command":"pwd"}),
+                dispatched_at: Instant::now(),
+            },
+        );
+        pool.insert_pending_request(
+            "alice:eve",
+            "req-2",
+            DispatchedToolRequest {
+                request_id: "req-2".into(),
+                tool_name: "bash".into(),
+                args: json!({"command":"whoami"}),
+                dispatched_at: Instant::now(),
+            },
+        );
+
+        let alice = pool.get_pending_requests_for_user("alice");
+        assert_eq!(alice.len(), 1);
+        assert_eq!(alice[0].request_id, "req-1");
+    }
+
+    #[test]
+    fn pending_request_eviction_updates_user_index() {
+        let mut pool = EdgeConnectionPool::new();
+        pool.max_pending = 2;
+
+        for request_id in ["req-1", "req-2", "req-3"] {
+            pool.insert_pending_request(
+                "alice",
+                request_id,
+                DispatchedToolRequest {
+                    request_id: request_id.into(),
+                    tool_name: "bash".into(),
+                    args: json!({}),
+                    dispatched_at: Instant::now(),
+                },
+            );
+        }
+
+        let pending = pool.get_pending_requests_for_user("alice");
+        let ids: Vec<&str> = pending.iter().map(|req| req.request_id.as_str()).collect();
+        assert_eq!(ids, vec!["req-2", "req-3"]);
+    }
+
+    #[test]
+    fn ack_completed_only_removes_matching_user_requests() {
+        let pool = EdgeConnectionPool::new();
+        pool.insert_pending_request(
+            "alice",
+            "req-1",
+            DispatchedToolRequest {
+                request_id: "req-1".into(),
+                tool_name: "bash".into(),
+                args: json!({}),
+                dispatched_at: Instant::now(),
+            },
+        );
+        pool.insert_pending_request(
+            "bob",
+            "req-2",
+            DispatchedToolRequest {
+                request_id: "req-2".into(),
+                tool_name: "bash".into(),
+                args: json!({}),
+                dispatched_at: Instant::now(),
+            },
+        );
+
+        pool.ack_completed_for_user("alice", &["req-2".into(), "req-1".into()]);
+
+        assert!(pool.get_pending_requests_for_user("alice").is_empty());
+        assert_eq!(pool.get_pending_requests_for_user("bob").len(), 1);
     }
 }

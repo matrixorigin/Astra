@@ -612,7 +612,7 @@ pub(crate) async fn run_tui_session(
         cli_context,
     )
     .await?;
-    tracer.finish();
+    tracer.finish(state.session_id.as_deref());
 
     // ── TUI mode overrides ──────────────────────────────────────────────
     let (tui_tx, mut tui_rx) = stream_bridge::create_channels();

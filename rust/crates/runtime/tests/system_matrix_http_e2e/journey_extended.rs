@@ -316,7 +316,11 @@ pub async fn run_edge_callback_http_boundary_failures() {
         json!({
             "request_id": format!("tool-unauth-{}", ctx.suffix),
             "status": "ok",
-            "output": "ignored"
+            "output": "ignored",
+            "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
+                &format!("tool-unauth-{}", ctx.suffix),
+                "ignored",
+            )
         }),
     )
     .await;
@@ -460,6 +464,10 @@ pub async fn run_duplicate_tool_result_is_idempotent() {
                         "request_id": "tc-dup-tool-1",
                         "status": "ok",
                         "output": tool_output,
+                        "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
+                            "tc-dup-tool-1",
+                            tool_output,
+                        ),
                     }),
                 )
                 .await;
@@ -635,6 +643,10 @@ pub async fn run_chat_turn_partial_batch_failure() {
                     "request_id": "tc-partial-1",
                     "status": "ok",
                     "output": ok_output,
+                    "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
+                        "tc-partial-1",
+                        ok_output,
+                    ),
                 }),
             )
             .await;
@@ -654,6 +666,10 @@ pub async fn run_chat_turn_partial_batch_failure() {
                     "request_id": "tc-partial-2",
                     "status": "error",
                     "output": err_output,
+                    "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
+                        "tc-partial-2",
+                        err_output,
+                    ),
                 }),
             )
             .await;
@@ -797,6 +813,10 @@ pub async fn run_chat_turn_out_of_order_tool_results() {
                         "request_id": "tc-race-2",
                         "status": "ok",
                         "output": second_output,
+                        "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
+                            "tc-race-2",
+                            second_output,
+                        ),
                     }),
                 ),
                 async {
@@ -809,6 +829,10 @@ pub async fn run_chat_turn_out_of_order_tool_results() {
                             "request_id": "tc-race-1",
                             "status": "ok",
                             "output": first_output,
+                            "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
+                                "tc-race-1",
+                                first_output,
+                            ),
                         }),
                     )
                     .await
@@ -1131,6 +1155,10 @@ pub async fn run_same_session_waiting_turn_overlap_isolated() {
                     "request_id": "tc-overlap-wait-1",
                     "status": "ok",
                     "output": tool_output,
+                    "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
+                        "tc-overlap-wait-1",
+                        tool_output,
+                    ),
                 }),
             )
             .await;

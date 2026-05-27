@@ -49,8 +49,9 @@
 //! which wraps this loop with consistent outcome mapping.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use astra_services::session_audit::RuntimePromotionEventData;
 use astra_services::session_journal::{ToolCallRecord, TraceSpanBuilder};
@@ -72,6 +73,48 @@ use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use astra_turn_core::tool_registry_report::SelectionReport;
 use tokio_util::sync::CancellationToken;
 
+/// Anchors journal wall-clock timestamps to a single process-local epoch so
+/// later reads stay monotonic even if `SystemTime` jumps backwards.
+///
+/// The anchor is created on first trace emission in this process and then only
+/// advanced via `Instant::elapsed()`. This keeps cross-span ordering stable
+/// without pretending to be a globally synchronized clock.
+static TRACE_CLOCK_ANCHOR: std::sync::LazyLock<(u64, Instant)> = std::sync::LazyLock::new(|| {
+    let wall_us = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64;
+    (wall_us, Instant::now())
+});
+
+fn now_us() -> u64 {
+    let (wall_us, monotonic_anchor) = &*TRACE_CLOCK_ANCHOR;
+    wall_us.saturating_add(monotonic_anchor.elapsed().as_micros() as u64)
+}
+
+fn record_trace_span(
+    buf: &mut astra_services::session_journal::TurnEventBuffer,
+    span_id: String,
+    name: &str,
+    started_at: Instant,
+    parent_span_id: Option<String>,
+    attrs: Option<&HashMap<String, String>>,
+    trace_id: Option<&str>,
+) {
+    let end_us = now_us();
+    let start_us = end_us.saturating_sub(started_at.elapsed().as_micros() as u64);
+    buf.record_trace_span_v2(
+        TraceSpanBuilder::default()
+            .span_id(span_id)
+            .name(name.to_string())
+            .start_us(start_us)
+            .end_us(end_us)
+            .parent_span_id(parent_span_id)
+            .attrs(attrs)
+            .trace_id(trace_id.map(str::to_string)),
+    );
+}
+
 // ─── Host turn result ────────────────────────────────────────────────────────
 
 /// Result from one host-executed turn (payload prep + HTTP + SSE consumption).
@@ -90,8 +133,8 @@ pub struct HostTurnResult {
 }
 
 pub use astra_turn_core::interaction_types::{
-    interaction_scoped_tool_restrictions, tool_counts_as_factual_evidence, TurnInteractionMode,
-    TurnInteractionPolicy, ASK_USER_TOOL_NAME,
+    ASK_USER_TOOL_NAME, TurnInteractionMode, TurnInteractionPolicy,
+    interaction_scoped_tool_restrictions, tool_counts_as_factual_evidence,
 };
 
 // ─── Host trait ──────────────────────────────────────────────────────────────
@@ -1467,9 +1510,9 @@ pub(crate) const MAX_TRACKED_FILE_READS: usize = 20;
 
 #[allow(unused_imports)]
 pub(crate) use super::super::agentic::adaptive_tuning::{
-    apply_adaptive_execution_profile, apply_per_turn_adaptation, apply_tactical_actions,
-    maybe_run_tuning_cycle, record_loop_completion_feedback, should_emit_adaptive_scenario_event,
-    DEFAULT_TUNING_CYCLE_INTERVAL,
+    DEFAULT_TUNING_CYCLE_INTERVAL, apply_adaptive_execution_profile, apply_per_turn_adaptation,
+    apply_tactical_actions, maybe_run_tuning_cycle, record_loop_completion_feedback,
+    should_emit_adaptive_scenario_event,
 };
 #[cfg(test)]
 pub(crate) use super::tool_support::delegate_tool_schema;
@@ -1503,20 +1546,20 @@ pub const DELEGATE_TOOL_NAME: &str =
 
 #[allow(unused_imports)]
 pub(crate) use super::super::agentic::delegate_interception::{
-    coordination_pattern_name, delegation_adaptive_context, delegation_final_output_preview,
-    format_delegation_result, format_delegation_terminal_preview, is_delegation_call,
-    merge_workspace_hint_into_delegation_request, parse_coordination_pattern,
+    DelegationAdaptiveContext, DelegationExecutionResult, DelegationFinalOutputSource,
+    DelegationOutcomeMetadata, coordination_pattern_name, delegation_adaptive_context,
+    delegation_final_output_preview, format_delegation_result, format_delegation_terminal_preview,
+    is_delegation_call, merge_workspace_hint_into_delegation_request, parse_coordination_pattern,
     parse_delegate_agents, parse_delegation_request, partition_and_execute_delegations,
     pattern_from_name, select_default_coordination_pattern, task_needs_review,
-    tool_call_arguments_value, tool_call_name, DelegationAdaptiveContext,
-    DelegationExecutionResult, DelegationFinalOutputSource, DelegationOutcomeMetadata,
+    tool_call_arguments_value, tool_call_name,
 };
 
 #[allow(unused_imports)]
 use super::super::harness_adapter::harness_at;
 #[allow(unused_imports)]
 pub(crate) use super::execution_phase::{
-    execute_turn_and_ingest_phase, TurnExecutionControl, TurnExecutionPhase,
+    TurnExecutionControl, TurnExecutionPhase, execute_turn_and_ingest_phase,
 };
 #[allow(unused_imports)]
 pub(crate) use super::finalization::{
@@ -1525,10 +1568,10 @@ pub(crate) use super::finalization::{
 };
 #[allow(unused_imports)]
 pub(crate) use super::lifecycle::{
-    prepare_turn_iteration, run_loop_preamble, PreparedTurnIteration, TurnIterationPrep,
+    PreparedTurnIteration, TurnIterationPrep, prepare_turn_iteration, run_loop_preamble,
 };
 #[allow(unused_imports)]
-pub(crate) use super::tool_phase::{execute_tool_phase, TurnToolPhaseControl};
+pub(crate) use super::tool_phase::{TurnToolPhaseControl, execute_tool_phase};
 
 #[cfg(feature = "harness")]
 pub(crate) fn set_harness_interruption(
@@ -1589,6 +1632,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         state
     );
 
+    let loop_start_time = Instant::now();
     let mut turn_index = 0usize;
     while turn_index < state.max_turns || state.remaining_turns == 0 {
         state.current_round_index = turn_index as u32;
@@ -1609,18 +1653,14 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
         // Trace: turn_start
         if let Some(ref mut buf) = state.turn_event_buffer {
-            let now_us = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_micros() as u64;
-            buf.record_trace_span(
-                &format!("turn_{}", turn_index),
+            record_trace_span(
+                buf,
+                format!("turn_{}", turn_index),
                 "turn_start",
-                now_us,
-                now_us,
+                turn_start_time,
                 None,
                 None,
-                Some(state.current_run_id.as_deref().unwrap_or("unknown")),
+                state.current_run_id.as_deref(),
             );
         }
 
@@ -1651,18 +1691,30 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
         // Trace: llm_call
         if let Some(ref mut buf) = state.turn_event_buffer {
-            let now_us = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_micros() as u64;
-            buf.record_trace_span(
-                &format!("llm_{}", turn_index),
+            record_trace_span(
+                buf,
+                format!("llm_{}", turn_index),
                 "llm_call",
-                now_us,
-                now_us,
-                Some(&format!("turn_{}", turn_index)),
+                llm_wall_start,
+                Some(format!("turn_{}", turn_index)),
                 None,
-                Some(state.current_run_id.as_deref().unwrap_or("unknown")),
+                state.current_run_id.as_deref(),
+            );
+        }
+
+        // Trace: tool_selection
+        if let Some(ref mut buf) = state.turn_event_buffer {
+            let tool_count = turn_result.accum.tool_calls.len();
+            let mut attrs = std::collections::HashMap::new();
+            attrs.insert("tool_count".into(), tool_count.to_string());
+            record_trace_span(
+                buf,
+                format!("select_{}", turn_index),
+                "tool_selection",
+                llm_wall_start,
+                Some(format!("llm_{}", turn_index)),
+                Some(&attrs),
+                state.current_run_id.as_deref(),
             );
         }
 
@@ -1724,6 +1776,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             false
         };
 
+        let tool_phase_start = Instant::now();
         #[cfg(feature = "harness")]
         let tool_phase_control = if harness_blocked_tools {
             TurnToolPhaseControl::ContinueLoop
@@ -1759,6 +1812,19 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             },
         )
         .await?;
+
+        // Trace: tool_execution
+        if let Some(ref mut buf) = state.turn_event_buffer {
+            record_trace_span(
+                buf,
+                format!("tools_{}", turn_index),
+                "tool_execution",
+                tool_phase_start,
+                Some(format!("llm_{}", turn_index)),
+                None,
+                state.current_run_id.as_deref(),
+            );
+        }
 
         // ── Harness: PostToolBatch — Block/Pause halts session ──
         #[cfg(feature = "harness")]
@@ -1827,18 +1893,14 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
     }
     // Trace: turn_end
     if let Some(ref mut buf) = state.turn_event_buffer {
-        let now_us = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
-        buf.record_trace_span(
-            "loop_end",
+        record_trace_span(
+            buf,
+            "loop_end".to_string(),
             "turn_end",
-            now_us,
-            now_us,
+            loop_start_time,
             None,
             None,
-            Some(state.current_run_id.as_deref().unwrap_or("unknown")),
+            state.current_run_id.as_deref(),
         );
     }
     // Loop exhausted max_turns without explicit break — write final state.
@@ -2625,7 +2687,7 @@ pub(crate) mod tests {
         // Tokens accumulate across turns (+=)
         assert_eq!(state.total_prompt, 35); // 20 + 15
         assert_eq!(state.total_completion, 15); // 10 + 5
-                                                // Edge tool counted
+        // Edge tool counted
         assert!(state.total_tool_calls >= 1);
         // Messages accumulated: assistant + tool from turn 1, at minimum
         assert!(state.messages.len() >= 2);
@@ -2805,7 +2867,7 @@ pub(crate) mod tests {
         assert_eq!(host.current_turn, 0); // No turns executed
         assert!(state.final_text.contains("without a final answer")); // EmptyCompletion message
         assert_eq!(state.remaining_turns, 10); // Unchanged
-                                               // EmptyCompletion interruption recorded
+        // EmptyCompletion interruption recorded
         let interruption = state
             .interruption
             .as_ref()
@@ -2977,11 +3039,13 @@ pub(crate) mod tests {
         assert!(outcome.is_ok());
         assert_eq!(host.current_turn, 2);
         assert!(state.final_text.contains("Turn budget exhausted"));
-        assert!(!state
-            .messages
-            .iter()
-            .filter_map(|message| message.get("content").and_then(Value::as_str))
-            .any(|content| content.contains("Budget review")));
+        assert!(
+            !state
+                .messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(Value::as_str))
+                .any(|content| content.contains("Budget review"))
+        );
     }
 
     #[tokio::test]
@@ -3086,14 +3150,18 @@ pub(crate) mod tests {
             !state.final_text.contains("changes look good"),
             "budget exhaustion must overwrite stale success-shaped text"
         );
-        assert!(state
-            .final_text
-            .contains("Turn budget exhausted after 2 agentic turn(s)"));
-        assert!(!state
-            .messages
-            .iter()
-            .filter_map(|message| message.get("content").and_then(Value::as_str))
-            .any(|content| content.contains("Budget review")));
+        assert!(
+            state
+                .final_text
+                .contains("Turn budget exhausted after 2 agentic turn(s)")
+        );
+        assert!(
+            !state
+                .messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(Value::as_str))
+                .any(|content| content.contains("Budget review"))
+        );
     }
 
     #[tokio::test]
@@ -3639,14 +3707,14 @@ pub(crate) mod tests {
     // ── E2E delegation round-trip tests ─────────────────────────────────────
 
     /// Helper to build a DelegationEngine with StubSubRunExecutor for tests.
-    pub(crate) fn make_test_delegation_engine(
-    ) -> Arc<crate::server::delegation::engine::DelegationEngine> {
+    pub(crate) fn make_test_delegation_engine()
+    -> Arc<crate::server::delegation::engine::DelegationEngine> {
         use crate::server::delegation::engine::{
             DelegationEngine, DelegationTracker, StubSubRunExecutor,
         };
         use crate::server::run::engine::RunEngine;
-        use astra_services::coordination::{AgentProfile, AgentTier};
         use astra_services::AgentProfileRegistry;
+        use astra_services::coordination::{AgentProfile, AgentTier};
 
         let mut registry = AgentProfileRegistry::new();
         let _ = registry.register(AgentProfile::new(
@@ -4651,14 +4719,18 @@ pub(crate) mod tests {
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
             .collect();
         assert_eq!(msg1.len(), 1);
-        assert!(msg1[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("# Skill: test-skill"));
-        assert!(msg1[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("Follow these instructions carefully."));
+        assert!(
+            msg1[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: test-skill")
+        );
+        assert!(
+            msg1[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Follow these instructions carefully.")
+        );
 
         // Second call: stub (dedup)
         let msg2: Vec<&Value> = state
@@ -4714,20 +4786,24 @@ pub(crate) mod tests {
             .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
             .collect();
-        assert!(msg1[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("# Skill: test-skill"));
+        assert!(
+            msg1[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: test-skill")
+        );
 
         let msg2: Vec<&Value> = state
             .messages
             .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_2"))
             .collect();
-        assert!(msg2[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("# Skill: other-skill"));
+        assert!(
+            msg2[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: other-skill")
+        );
 
         // Both tracked
         assert_eq!(state.skills.invoked.len(), 2);
@@ -4862,10 +4938,12 @@ pub(crate) mod tests {
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_skill"))
             .collect();
         assert_eq!(skill_msgs.len(), 1);
-        assert!(skill_msgs[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("# Skill: test-skill"));
+        assert!(
+            skill_msgs[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: test-skill")
+        );
 
         // Skill exclusivity drop is now a debug log, not a user-facing headless line.
         // Verify the host did NOT receive any deferred notice (it goes to tracing now).
@@ -6112,8 +6190,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
         }
     }
 
-    fn make_session(
-    ) -> std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>> {
+    fn make_session()
+    -> std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>> {
         std::sync::Arc::new(std::sync::RwLock::new(
             crate::observability::ObservabilitySession::new_simple("test-session"),
         ))
@@ -7565,7 +7643,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
     #[test]
     fn stress_all_8_default_rules_fire() {
-        use astra_learning::auto_tuning::{default_rules, FeedbackSignal, SignalType};
+        use astra_learning::auto_tuning::{FeedbackSignal, SignalType, default_rules};
 
         let hub = make_hub();
         // Load default evolution rules so the tuning engine has something to evaluate
@@ -9020,7 +9098,7 @@ mod parallel_execution_tests {
     /// Unit test for partition_tool_batches.
     #[test]
     fn partition_tool_batches_groups_correctly() {
-        use crate::turn::agentic::headless_round::{partition_tool_batches, ToolBatch};
+        use crate::turn::agentic::headless_round::{ToolBatch, partition_tool_batches};
         use astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx;
 
         let tool_calls = vec![
