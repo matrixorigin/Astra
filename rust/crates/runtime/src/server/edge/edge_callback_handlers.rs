@@ -10,13 +10,13 @@ use axum::extract::Extension;
 use super::*;
 
 use astra_services::session_journal::{
-    find_latest_approval_decision, find_latest_approval_required, validate_session_id,
-    JournalEvent, JournalWriter,
+    JournalEvent, JournalWriter, find_latest_approval_decision, find_latest_approval_required,
+    validate_session_id,
 };
 use astra_thin_client::ASTRA_EDGE_ID_HEADER;
 use serde::Deserialize;
 
-use astra_turn_core::edge_ledger::{approval_callback_key, tool_callback_key, LEDGER_MAX_ENTRIES};
+use astra_turn_core::edge_ledger::{LEDGER_MAX_ENTRIES, approval_callback_key, tool_callback_key};
 
 fn edge_id_from_headers(headers: &HeaderMap) -> String {
     headers
@@ -386,7 +386,7 @@ mod edge_callback_insert_tests {
     //! point is to lock in the "at-most-once" contract broken by the
     //! previous `contains_key` short-circuit.
 
-    use super::{insert_approval_ledger_entry, insert_ledger_entry, LedgerInsertError};
+    use super::{LedgerInsertError, insert_approval_ledger_entry, insert_ledger_entry};
     use astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES;
     use serde_json::json;
     use std::collections::HashMap;

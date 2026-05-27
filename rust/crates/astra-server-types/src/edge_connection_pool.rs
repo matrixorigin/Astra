@@ -271,11 +271,7 @@ impl EdgeConnectionPool {
     /// Remove dispatched requests that the edge has confirmed as completed.
     /// Called when the cloud heartbeat handler receives `last_seen_request_ids`
     /// from the edge, confirming those tools have been executed.
-    pub fn ack_completed_for_user(
-        &self,
-        user_id: &str,
-        completed_request_ids: &[String],
-    ) {
+    pub fn ack_completed_for_user(&self, user_id: &str, completed_request_ids: &[String]) {
         for id in completed_request_ids {
             let key = format!("{user_id}:{id}");
             self.pending_requests.remove(&key);

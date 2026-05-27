@@ -38,17 +38,12 @@ impl StartupTracer {
             return;
         }
         let total_us = self.phases.last().map(|(_, us)| *us).unwrap_or(0);
-        let event = astra_services::session_journal::JournalEvent::bootstrap(
-            None,
-            &self.phases,
-            total_us,
-        );
+        let event =
+            astra_services::session_journal::JournalEvent::bootstrap(None, &self.phases, total_us);
         // Write directly to the sessions directory using a throwaway JournalWriter.
         // The session journal is per-session; bootstrap events are session-less
         // diagnostics written to a well-known "bootstrap" session id.
-        if let Ok(writer) =
-            astra_services::session_journal::JournalWriter::new("__bootstrap__")
-        {
+        if let Ok(writer) = astra_services::session_journal::JournalWriter::new("__bootstrap__") {
             let _ = writer.append(&event);
         }
     }

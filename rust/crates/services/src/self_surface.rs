@@ -2393,10 +2393,12 @@ mod tests {
             panic!("expected verify surface");
         };
         assert!(!verify.ok, "journal is missing so acceptance should fail");
-        assert!(verify
-            .checks
-            .iter()
-            .any(|check| check.name == "runtime_config_parse"));
+        assert!(
+            verify
+                .checks
+                .iter()
+                .any(|check| check.name == "runtime_config_parse")
+        );
     }
 
     #[tokio::test]
@@ -2526,9 +2528,11 @@ mod tests {
             .expect("verification evolution record");
 
         assert_eq!(verification.status, "recorded");
-        assert!(verification
-            .summary
-            .contains("verification failed global subtask-1"));
+        assert!(
+            verification
+                .summary
+                .contains("verification failed global subtask-1")
+        );
         assert!(verification.summary.contains("integration-tests"));
     }
 }

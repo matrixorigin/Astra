@@ -1,15 +1,13 @@
 //! Cloud edge registry + heartbeat (Phase 3). See `docs/design/multi-agent-cloud-runtime.md` §5.5.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::cli::chat_stream::edge_executor_instance_id;
 use crate::cli::session_runtime::{attempt_token_refresh, current_access_token};
-use astra_thin_client::{
-    EdgeHeartbeatRequest, EdgeRegisterRequest, ThinClient, ThinClientError,
-};
 use astra_thin_client::edge::edge_register_with_capabilities;
+use astra_thin_client::{EdgeHeartbeatRequest, EdgeRegisterRequest, ThinClient, ThinClientError};
 
 /// Ring buffer of recently completed tool request IDs, for deduplication
 /// on reconnection. Heartbeat sends these so cloud knows which tool calls
@@ -126,7 +124,10 @@ pub async fn register_edge_once(api: &ThinClient, token: &str) -> Result<(), Thi
     Ok(())
 }
 
-async fn send_heartbeat(api: &ThinClient, token: &str) -> Result<Option<Vec<serde_json::Value>>, ThinClientError> {
+async fn send_heartbeat(
+    api: &ThinClient,
+    token: &str,
+) -> Result<Option<Vec<serde_json::Value>>, ThinClientError> {
     if !edge_cloud_registry_enabled() {
         return Ok(None);
     }
@@ -170,8 +171,7 @@ pub fn spawn_edge_heartbeat(
                         let t = token.clone();
                         let id = edge_executor_instance_id().to_string();
                         tokio::spawn(async move {
-                            reexecute_pending_requests(&client, &t, &id, &pending_requests)
-                                .await;
+                            reexecute_pending_requests(&client, &t, &id, &pending_requests).await;
                         });
                     }
                 }
@@ -483,17 +483,13 @@ mod tests {
             .await;
 
         let api = ThinClient::new(&server.uri(), None).expect("url");
-        send_heartbeat(&api, "test-token")
-            .await
-            .expect("heartbeat");
+        send_heartbeat(&api, "test-token").await.expect("heartbeat");
 
         let received = server.received_requests().await.unwrap();
         assert_eq!(received.len(), 1);
-        let body: serde_json::Value =
-            serde_json::from_slice(&received[0].body).expect("json body");
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
         assert_eq!(
-            body.get("pending_request_count")
-                .and_then(|v| v.as_u64()),
+            body.get("pending_request_count").and_then(|v| v.as_u64()),
             Some(3)
         );
         // last_seen_request_ids present (may be empty or contain prior completions)

@@ -2320,17 +2320,11 @@ impl JournalEvent {
     ///
     /// `phases` is an ordered list of `(phase_name, timestamp_us_since_process_start)` tuples.
     /// Stored in `metadata.phases` as `[{name, us}]` and `metadata.total_us`.
-    pub fn bootstrap(
-        session_id: Option<&str>,
-        phases: &[(&str, u64)],
-        total_us: u64,
-    ) -> Self {
+    pub fn bootstrap(session_id: Option<&str>, phases: &[(&str, u64)], total_us: u64) -> Self {
         let mut evt = Self::base(JournalEventType::Bootstrap, session_id);
         let phase_entries: Vec<serde_json::Value> = phases
             .iter()
-            .map(|(name, us)| {
-                serde_json::json!({"name": name, "us": us})
-            })
+            .map(|(name, us)| serde_json::json!({"name": name, "us": us}))
             .collect();
         evt.metadata = Some(serde_json::json!({
             "phases": phase_entries,
@@ -2345,6 +2339,7 @@ impl JournalEvent {
     /// `name` is the span operation name (e.g. "context_assembly", "llm_call").
     /// `start_us` and `end_us` are microsecond timestamps relative to turn start.
     /// `attrs` is an optional set of string key-value tags.
+    #[allow(clippy::too_many_arguments)]
     pub fn trace_span(
         session_id: Option<&str>,
         turn: Option<u32>,

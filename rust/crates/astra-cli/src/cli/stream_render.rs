@@ -1162,7 +1162,8 @@ impl<'a> CliSseStreamHost<'a> {
         };
         self.edge_tool_round.push(result.clone());
 
-        let result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(request_id, &output);
+        let result_hash =
+            astra_thin_client::ToolResultRequest::compute_result_hash(request_id, &output);
         let body = astra_thin_client::ToolResultRequest {
             request_id: request_id.to_string(),
             status,
@@ -1724,7 +1725,8 @@ impl<'a> CliSseStreamHost<'a> {
         };
         self.edge_tool_round.push(result.clone());
 
-        let result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(&req.request_id, &output);
+        let result_hash =
+            astra_thin_client::ToolResultRequest::compute_result_hash(&req.request_id, &output);
         let body = astra_thin_client::ToolResultRequest {
             request_id: req.request_id.clone(),
             status: status.to_string(),
@@ -3295,7 +3297,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             status: status.clone(),
             duration_ms,
         });
-        let result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(request_id, &output);
+        let result_hash =
+            astra_thin_client::ToolResultRequest::compute_result_hash(request_id, &output);
         let body = astra_thin_client::ToolResultRequest {
             request_id: request_id.to_string(),
             status: status.clone(),
@@ -4024,7 +4027,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             results[orig_idx] = Some(result);
 
             // Post tool result to cloud API.
-            let result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(&req.request_id, &output);
+            let result_hash =
+                astra_thin_client::ToolResultRequest::compute_result_hash(&req.request_id, &output);
             let body = astra_thin_client::ToolResultRequest {
                 request_id: req.request_id.clone(),
                 status: status.to_string(),
