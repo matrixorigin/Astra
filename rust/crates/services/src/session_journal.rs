@@ -912,6 +912,12 @@ pub enum JournalEventType {
     ContextReleased,
     /// Startup bootstrap phases completed (per-phase timestamps in metadata).
     Bootstrap,
+    /// Lightweight trace span for cross-boundary observability (edge ↔ cloud).
+    ///
+    /// Stored in `metadata` as `{span_id, parent_span_id, name, start_us, end_us, attrs}`.
+    /// Turn-level spans use `turn` + `parent_event_id` for causal tree construction
+    /// without requiring a dedicated graph database.
+    TraceSpan,
 }
 
 /// Why the gate rejected a session-memory extraction attempt.
@@ -2330,6 +2336,45 @@ impl JournalEvent {
             "phases": phase_entries,
             "total_us": total_us,
         }));
+        evt
+    }
+
+    /// Lightweight trace span for cross-boundary observability (edge ↔ cloud).
+    ///
+    /// `span_id` is a short unique identifier; `parent_span_id` links to the parent span.
+    /// `name` is the span operation name (e.g. "context_assembly", "llm_call").
+    /// `start_us` and `end_us` are microsecond timestamps relative to turn start.
+    /// `attrs` is an optional set of string key-value tags.
+    pub fn trace_span(
+        session_id: Option<&str>,
+        turn: Option<u32>,
+        span_id: &str,
+        parent_span_id: Option<&str>,
+        name: &str,
+        start_us: u64,
+        end_us: u64,
+        attrs: Option<&HashMap<String, String>>,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::TraceSpan, session_id);
+        evt.turn = turn;
+        let mut meta = serde_json::json!({
+            "span_id": span_id,
+            "name": name,
+            "start_us": start_us,
+            "end_us": end_us,
+            "duration_us": end_us.saturating_sub(start_us),
+        });
+        if let Some(pid) = parent_span_id {
+            meta["parent_span_id"] = serde_json::Value::String(pid.to_string());
+        }
+        if let Some(a) = attrs {
+            let attrs_map: serde_json::Map<String, serde_json::Value> = a
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            meta["attrs"] = serde_json::Value::Object(attrs_map);
+        }
+        evt.metadata = Some(meta);
         evt
     }
 

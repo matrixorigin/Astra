@@ -2021,6 +2021,7 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::MemorySuppressed => "memory_suppressed",
         JournalEventType::ContextReleased => "context_released",
         JournalEventType::Bootstrap => "bootstrap",
+        JournalEventType::TraceSpan => "trace_span",
     }
     .to_string()
 }

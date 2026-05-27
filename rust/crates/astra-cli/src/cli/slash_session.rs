@@ -2029,7 +2029,8 @@ pub(crate) async fn handle_session_command(
                             | session_journal::JournalEventType::PipelineCompactionAudit
                             | session_journal::JournalEventType::MemorySuppressed
                             | session_journal::JournalEventType::ContextReleased
-                            | session_journal::JournalEventType::Bootstrap => {
+                            | session_journal::JournalEventType::Bootstrap
+                            | session_journal::JournalEventType::TraceSpan => {
                                 // Rendered by /inspect; suppress in timeline for now
                             }
                         }
