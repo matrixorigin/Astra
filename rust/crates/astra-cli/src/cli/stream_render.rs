@@ -1172,15 +1172,12 @@ impl<'a> CliSseStreamHost<'a> {
         };
         self.edge_tool_round.push(result.clone());
 
-        let result_hash =
-            astra_thin_client::ToolResultRequest::compute_result_hash(request_id, &output);
-        let body = astra_thin_client::ToolResultRequest {
-            request_id: request_id.to_string(),
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            request_id.to_string(),
             status,
-            output: Some(output),
-            duration_ms: Some(duration_ms),
-            result_hash: Some(result_hash),
-        };
+            output,
+            duration_ms,
+        );
         // ── Reconnection dedup: only record when server acked the result ──
         if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
             crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
@@ -1736,15 +1733,12 @@ impl<'a> CliSseStreamHost<'a> {
         };
         self.edge_tool_round.push(result.clone());
 
-        let result_hash =
-            astra_thin_client::ToolResultRequest::compute_result_hash(&req.request_id, &output);
-        let body = astra_thin_client::ToolResultRequest {
-            request_id: req.request_id.clone(),
-            status: status.to_string(),
-            output: Some(output),
-            duration_ms: Some(duration_ms),
-            result_hash: Some(result_hash),
-        };
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            req.request_id.clone(),
+            status.to_string(),
+            output,
+            duration_ms,
+        );
         // ── Reconnection dedup: only record when server acked the result ──
         if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
             crate::cli::edge_lifecycle::record_completed_request(req.request_id.clone());
@@ -3309,15 +3303,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             status: status.clone(),
             duration_ms,
         });
-        let result_hash =
-            astra_thin_client::ToolResultRequest::compute_result_hash(request_id, &output);
-        let body = astra_thin_client::ToolResultRequest {
-            request_id: request_id.to_string(),
-            status: status.clone(),
-            output: Some(output),
-            duration_ms: Some(duration_ms),
-            result_hash: Some(result_hash),
-        };
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            request_id.to_string(),
+            status.clone(),
+            output,
+            duration_ms,
+        );
         // ── Reconnection dedup: only record when server acked the result ──
         if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
             crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
@@ -4040,15 +4031,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             results[orig_idx] = Some(result);
 
             // Post tool result to cloud API.
-            let result_hash =
-                astra_thin_client::ToolResultRequest::compute_result_hash(&req.request_id, &output);
-            let body = astra_thin_client::ToolResultRequest {
-                request_id: req.request_id.clone(),
-                status: status.to_string(),
-                output: Some(output),
-                duration_ms: Some(duration_ms),
-                result_hash: Some(result_hash),
-            };
+            let body = astra_thin_client::ToolResultRequest::new_with_hash(
+                req.request_id.clone(),
+                status.to_string(),
+                output,
+                duration_ms,
+            );
             // ── Reconnection dedup: only record when server acked the result ──
             if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
                 crate::cli::edge_lifecycle::record_completed_request(req.request_id.clone());

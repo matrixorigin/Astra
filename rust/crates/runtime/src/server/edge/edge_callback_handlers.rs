@@ -10,13 +10,18 @@ use axum::extract::Extension;
 use super::*;
 
 use astra_services::session_journal::{
-    JournalEvent, JournalWriter, find_latest_approval_decision, find_latest_approval_required,
-    validate_session_id,
+    find_latest_approval_decision, find_latest_approval_required, validate_session_id,
+    JournalEvent, JournalWriter,
 };
 use astra_thin_client::ASTRA_EDGE_ID_HEADER;
 use serde::Deserialize;
 
-use astra_turn_core::edge_ledger::{LEDGER_MAX_ENTRIES, approval_callback_key, tool_callback_key};
+use astra_turn_core::edge_ledger::{approval_callback_key, tool_callback_key, LEDGER_MAX_ENTRIES};
+
+/// Server-enforced cap on `last_seen_request_ids` entries per heartbeat.
+/// Excess entries beyond this limit are silently dropped — the edge will
+/// report them again on the next heartbeat cycle.
+const MAX_LAST_SEEN_REQUEST_IDS: usize = 256;
 
 fn edge_id_from_headers(headers: &HeaderMap) -> String {
     headers
@@ -328,17 +333,32 @@ pub(crate) async fn post_agents_edge_heartbeat_handler(
     // ── Reconnection dedup ──────────────────────────────────────────
     // 1. Ack completed request IDs: remove from cloud's pending set.
     //    The edge confirmed these tools were executed, so no re-issue needed.
-    if !body.last_seen_request_ids.is_empty() {
+    //    Server-side scoping: each lookup key is "{user_id}:{request_id}",
+    //    so the edge can only remove entries belonging to its authenticated
+    //    user. Fabricated IDs for other users have no effect.
+    let seen_ids: &[String] = if body.last_seen_request_ids.len() > MAX_LAST_SEEN_REQUEST_IDS {
+        tracing::warn!(
+            user_id = %user.user_id,
+            edge_id = %edge_id,
+            total = body.last_seen_request_ids.len(),
+            limit = MAX_LAST_SEEN_REQUEST_IDS,
+            "truncating last_seen_request_ids to server limit"
+        );
+        &body.last_seen_request_ids[..MAX_LAST_SEEN_REQUEST_IDS]
+    } else {
+        &body.last_seen_request_ids
+    };
+    if !seen_ids.is_empty() {
         state
             .edge_connection_pool
-            .ack_completed_for_user(&user.user_id, &body.last_seen_request_ids);
+            .ack_completed_for_user(&user.user_id, seen_ids);
     }
 
-    // 2. Return pending requests that the edge hasn't completed yet.
+    // 2. Return pending requests (those still in the set after ack).
     //    On reconnection, the edge re-executes these and reports results.
     let pending_requests: Vec<serde_json::Value> = state
         .edge_connection_pool
-        .get_pending_requests_for_user(&user.user_id, &body.last_seen_request_ids)
+        .get_pending_requests_for_user(&user.user_id)
         .into_iter()
         .map(|req| {
             serde_json::json!({
@@ -386,7 +406,7 @@ mod edge_callback_insert_tests {
     //! point is to lock in the "at-most-once" contract broken by the
     //! previous `contains_key` short-circuit.
 
-    use super::{LedgerInsertError, insert_approval_ledger_entry, insert_ledger_entry};
+    use super::{insert_approval_ledger_entry, insert_ledger_entry, LedgerInsertError};
     use astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES;
     use serde_json::json;
     use std::collections::HashMap;

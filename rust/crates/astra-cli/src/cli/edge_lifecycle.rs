@@ -260,15 +260,12 @@ async fn reexecute_pending_requests(
         let output = outcome.output;
         let status = if outcome.is_error { "error" } else { "completed" };
 
-        let result_hash =
-            astra_thin_client::ToolResultRequest::compute_result_hash(&request_id, &output);
-        let body = astra_thin_client::ToolResultRequest {
-            request_id: request_id.clone(),
-            status: status.to_string(),
-            output: Some(output),
-            duration_ms: None,
-            result_hash: Some(result_hash),
-        };
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            request_id.clone(),
+            status.to_string(),
+            output,
+            0, // reconnection re-execution doesn't track timing
+        );
 
         match api
             .post_tool_result(Some(token), Some(executor_id), &body)

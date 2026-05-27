@@ -15,6 +15,16 @@ use uuid::Uuid;
 
 use crate::edge_ws_protocol::{EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage};
 
+/// Maximum number of inflight dispatched tool requests tracked for dedup.
+/// When exceeded, the oldest entry (by dispatch time) is evicted before inserting.
+const MAX_PENDING_REQUESTS: usize = 1000;
+
+/// Each dispatched request lives at most this long in the pending set before
+/// being purged by `cleanup_stale`. Set to 3× the edge tool timeout as a
+/// generous safety margin (normal cleanup happens in execute_tool's
+/// success/timeout paths).
+const PENDING_REQUEST_TTL_SECS: u64 = EDGE_TOOL_TIMEOUT_SECS * 3;
+
 /// Sender half that pushes frames into an edge agent's WebSocket write loop.
 pub type EdgeWsSender = mpsc::UnboundedSender<EdgeServerMessage>;
 
@@ -59,13 +69,16 @@ fn pool_key(user_id: &str, edge_agent_id: &str) -> String {
 }
 
 /// Thread-safe pool of live edge WebSocket connections.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct EdgeConnectionPool {
     connections: Arc<DashMap<String, EdgeConnection>>,
     /// Pending tool requests dispatched to edges, keyed by request_id.
     /// Used for reconnection dedup: when an edge reconnects, cloud can
     /// check its pending requests against completed IDs reported by the edge.
     pending_requests: Arc<DashMap<String, DispatchedToolRequest>>,
+    /// Maximum number of inflight dispatched tool requests. When exceeded,
+    /// the oldest entry is evicted before insertion.
+    max_pending: usize,
 }
 
 impl EdgeConnectionPool {
@@ -73,6 +86,7 @@ impl EdgeConnectionPool {
         Self {
             connections: Arc::new(DashMap::new()),
             pending_requests: Arc::new(DashMap::new()),
+            max_pending: MAX_PENDING_REQUESTS,
         }
     }
 
@@ -178,8 +192,7 @@ impl EdgeConnectionPool {
             dispatched_at: Instant::now(),
         };
         let pending_key = format!("{user_id}:{request_id}");
-        self.pending_requests
-            .insert(pending_key.clone(), dispatched);
+        self.insert_pending_request(pending_key.clone(), dispatched);
 
         if sender.send(msg).is_err() {
             pending_results.remove(&request_id);
@@ -235,9 +248,37 @@ impl EdgeConnectionPool {
         false
     }
 
-    /// Remove stale connections (sender closed).
+    /// Remove stale connections (sender closed) and expired pending requests.
     pub fn cleanup_stale(&self) {
         self.connections.retain(|_, conn| !conn.sender.is_closed());
+
+        let deadline = Instant::now() - Duration::from_secs(PENDING_REQUEST_TTL_SECS);
+        self.pending_requests
+            .retain(|_, req| req.dispatched_at > deadline);
+    }
+
+    /// Insert a dispatched request into the pending set, enforcing the capacity
+    /// limit by evicting the oldest entry if necessary.
+    fn insert_pending_request(&self, key: String, req: DispatchedToolRequest) {
+        let len = self.pending_requests.len();
+        if len >= self.max_pending {
+            // Find and remove the oldest entry
+            let mut oldest: Option<(String, Instant)> = None;
+            for entry in self.pending_requests.iter() {
+                let at = entry.value().dispatched_at;
+                match oldest {
+                    None => oldest = Some((entry.key().clone(), at)),
+                    Some((_, ref prev)) if at < *prev => {
+                        oldest = Some((entry.key().clone(), at))
+                    }
+                    _ => {}
+                }
+            }
+            if let Some((oldest_key, _)) = oldest {
+                self.pending_requests.remove(&oldest_key);
+            }
+        }
+        self.pending_requests.insert(key, req);
     }
 
     /// Number of active connections.
@@ -245,26 +286,17 @@ impl EdgeConnectionPool {
         self.connections.len()
     }
 
-    /// Get pending tool requests for a user that the edge hasn't yet reported
-    /// as completed. Used by heartbeat handler to return `pending_requests`
-    /// to a reconnecting edge.
+    /// Get pending tool requests for a user. Only returns requests that are
+    /// still in the pending set — completed requests should already have been
+    /// removed via [`ack_completed_for_user`] before calling this method.
     pub fn get_pending_requests_for_user(
         &self,
         user_id: &str,
-        completed_request_ids: &[String],
     ) -> Vec<DispatchedToolRequest> {
-        let completed: std::collections::HashSet<&str> =
-            completed_request_ids.iter().map(|s| s.as_str()).collect();
+        let prefix = format!("{user_id}:");
         self.pending_requests
             .iter()
-            .filter(|entry| {
-                let req = entry.value();
-                let key = req.request_id.as_str();
-                // Only return requests that the edge hasn't completed yet.
-                // Exact user-prefix match ("{user_id}:") prevents cross-user leakage
-                // (e.g. user "alice" must not match "alice-admin"'s pending requests).
-                entry.key().starts_with(&format!("{user_id}:")) && !completed.contains(key)
-            })
+            .filter(|entry| entry.key().starts_with(&prefix))
             .map(|entry| entry.value().clone())
             .collect()
     }

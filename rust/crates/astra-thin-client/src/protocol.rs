@@ -114,6 +114,25 @@ impl ToolResultRequest {
         hasher.update(output.as_bytes());
         hex::encode(hasher.finalize())
     }
+
+    /// Factory: build a `ToolResultRequest` with the result hash pre-computed.
+    /// Every call site that posts a tool result should use this to guarantee
+    /// the hash is always present — no more scattered `compute_result_hash` calls.
+    pub fn new_with_hash(
+        request_id: String,
+        status: String,
+        output: String,
+        duration_ms: u64,
+    ) -> Self {
+        let result_hash = Self::compute_result_hash(&request_id, &output);
+        Self {
+            request_id,
+            status,
+            output: Some(output),
+            duration_ms: Some(duration_ms),
+            result_hash: Some(result_hash),
+        }
+    }
 }
 
 /// `POST /approval/respond` (§5.5).
