@@ -1308,6 +1308,7 @@ impl TurnEventBuffer {
         end_us: u64,
         parent_span_id: Option<&str>,
         attrs: Option<&std::collections::HashMap<String, String>>,
+        trace_id: Option<&str>,
     ) {
         use std::collections::HashMap;
         let event = JournalEvent::trace_span(
@@ -1319,6 +1320,7 @@ impl TurnEventBuffer {
             start_us,
             end_us,
             attrs,
+            trace_id,
         );
         self.events.push(event);
     }
@@ -2390,6 +2392,7 @@ impl JournalEvent {
         start_us: u64,
         end_us: u64,
         attrs: Option<&HashMap<String, String>>,
+        trace_id: Option<&str>,
     ) -> Self {
         TraceSpanBuilder::default()
             .session_id(session_id)
@@ -2400,6 +2403,7 @@ impl JournalEvent {
             .start_us(start_us)
             .end_us(end_us)
             .attrs(attrs)
+            .trace_id(trace_id.map(str::to_string))
             .build()
     }
 
@@ -2410,9 +2414,10 @@ impl JournalEvent {
 }
 
 /// Builder for [`JournalEvent::trace_span`]. Enforces required fields at
-/// compile time — no 8-argument constructor, no optional fields silently
-/// defaulting to None.
-#[derive(Default)]
+/// compile time and avoids the 8-argument constructor.
+/// 
+/// Adds `trace_id` for cross-boundary (edge ↔ cloud) correlation.
+#[derive(Debug, Default, Clone)]
 pub struct TraceSpanBuilder {
     session_id: Option<String>,
     turn: Option<u32>,
@@ -2422,6 +2427,8 @@ pub struct TraceSpanBuilder {
     start_us: Option<u64>,
     end_us: Option<u64>,
     attrs: Option<HashMap<String, String>>,
+    /// Cross-boundary correlation id (edge ↔ cloud)
+    trace_id: Option<String>,
 }
 
 impl TraceSpanBuilder {
@@ -2461,7 +2468,12 @@ impl TraceSpanBuilder {
     }
 
     pub fn attrs(mut self, v: Option<&HashMap<String, String>>) -> Self {
-        self.attrs = v.cloned();
+        self.attrs = v.map(|m| m.clone());
+        self
+    }
+
+    pub fn trace_id(mut self, v: Option<String>) -> Self {
+        self.trace_id = v;
         self
     }
 
@@ -2488,6 +2500,9 @@ impl TraceSpanBuilder {
                 .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                 .collect();
             meta["attrs"] = serde_json::Value::Object(attrs_map);
+        }
+        if let Some(ref tid) = self.trace_id {
+            meta["trace_id"] = serde_json::Value::String(tid.clone());
         }
         evt.metadata = Some(meta);
         evt
