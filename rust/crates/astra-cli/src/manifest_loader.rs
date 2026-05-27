@@ -272,6 +272,26 @@ pub fn load_skill(skill_dir: &Path) -> Result<LoadedSkill, String> {
     let manifest_path = skill_dir.join("manifest.yaml");
     let manifest = load_manifest(&manifest_path)?;
 
+    // Explicit validation before loading — no implicit activation.
+    if manifest.name.is_empty() {
+        return Err(format!(
+            "skill manifest '{}' missing required field: name",
+            manifest_path.display()
+        ));
+    }
+    if manifest.version.is_empty() {
+        return Err(format!(
+            "skill '{}' missing required field: version (e.g. 1.0.0)",
+            manifest.name
+        ));
+    }
+    if manifest.description.is_empty() {
+        return Err(format!(
+            "skill '{}' missing required field: description",
+            manifest.name
+        ));
+    }
+
     // Try to load SKILL.md
     let instructions = load_skill_instructions(&manifest, skill_dir);
 
