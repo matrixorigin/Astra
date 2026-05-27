@@ -1620,7 +1620,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 now_us,
                 None,
                 None,
-                state.current_run_id.as_deref(),
+                Some(state.current_run_id.as_deref().unwrap_or("unknown")),
             );
         }
 
@@ -1662,7 +1662,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 now_us,
                 Some(&format!("turn_{}", turn_index)),
                 None,
-                state.current_run_id.as_deref(),
+                Some(state.current_run_id.as_deref().unwrap_or("unknown")),
             );
         }
 
@@ -1838,7 +1838,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             now_us,
             None,
             None,
-            state.current_run_id.as_deref(),
+            Some(state.current_run_id.as_deref().unwrap_or("unknown")),
         );
     }
     // Loop exhausted max_turns without explicit break — write final state.
