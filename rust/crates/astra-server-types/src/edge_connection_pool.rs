@@ -261,8 +261,9 @@ impl EdgeConnectionPool {
                 let req = entry.value();
                 let key = req.request_id.as_str();
                 // Only return requests that the edge hasn't completed yet.
-                // The user_id prefix check prevents cross-user leakage.
-                entry.key().starts_with(user_id) && !completed.contains(key)
+                // Exact user-prefix match ("{user_id}:") prevents cross-user leakage
+                // (e.g. user "alice" must not match "alice-admin"'s pending requests).
+                entry.key().starts_with(&format!("{user_id}:")) && !completed.contains(key)
             })
             .map(|entry| entry.value().clone())
             .collect()

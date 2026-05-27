@@ -981,28 +981,38 @@ impl<'a> CliSseStreamHost<'a> {
         true
     }
 
+    /// Post a tool result to the cloud server with automatic token refresh on 401.
+    /// Returns `Ok(())` when the server acknowledged the result, `Err(())` otherwise.
+    /// Callers MUST gate `record_completed_request` on `Ok(())` — recording a result
+    /// that never reached the server causes the dedup system to falsely mark it as
+    /// completed and the reconnection protocol will never re-issue it.
     async fn post_tool_result_with_auth_retry(
         &mut self,
         body: &astra_thin_client::ToolResultRequest,
-    ) -> bool {
+    ) -> Result<(), ()> {
         let result = self
             .api
             .post_tool_result(Some(self.token.as_str()), Some(self.executor_id), body)
             .await;
         match result {
-            Ok(_) => false,
+            Ok(_) => Ok(()),
             Err(e) if is_edge_auth_failure(&e) && self.refresh_edge_token_after_401().await => {
                 let retry = self
                     .api
                     .post_tool_result(Some(self.token.as_str()), Some(self.executor_id), body)
                     .await;
-                if let Err(ref retry_err) = retry {
-                    self.handle_post_tool_result_error(retry_err)
-                } else {
-                    false
+                match retry {
+                    Ok(_) => Ok(()),
+                    Err(ref retry_err) => {
+                        self.handle_post_tool_result_error(retry_err);
+                        Err(())
+                    }
                 }
             }
-            Err(e) => self.handle_post_tool_result_error(&e),
+            Err(e) => {
+                self.handle_post_tool_result_error(&e);
+                Err(())
+            }
         }
     }
 
@@ -1171,9 +1181,10 @@ impl<'a> CliSseStreamHost<'a> {
             duration_ms: Some(duration_ms),
             result_hash: Some(result_hash),
         };
-        // ── Reconnection dedup: record after posting result ──
-        let _ = self.post_tool_result_with_auth_retry(&body).await;
-        crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
+        // ── Reconnection dedup: only record when server acked the result ──
+        if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
+            crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
+        }
         result
     }
 }
@@ -1734,9 +1745,10 @@ impl<'a> CliSseStreamHost<'a> {
             duration_ms: Some(duration_ms),
             result_hash: Some(result_hash),
         };
-        // ── Reconnection dedup: record after posting result ──
-        let _ = self.post_tool_result_with_auth_retry(&body).await;
-        crate::cli::edge_lifecycle::record_completed_request(req.request_id.clone());
+        // ── Reconnection dedup: only record when server acked the result ──
+        if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
+            crate::cli::edge_lifecycle::record_completed_request(req.request_id.clone());
+        }
 
         result
     }
@@ -3306,9 +3318,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             duration_ms: Some(duration_ms),
             result_hash: Some(result_hash),
         };
-        // ── Reconnection dedup: record after posting result ──
-        let _ = self.post_tool_result_with_auth_retry(&body).await;
-        crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
+        // ── Reconnection dedup: only record when server acked the result ──
+        if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
+            crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
+        }
         self.edge_tool_round
             .last()
             .cloned()
@@ -4036,9 +4049,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 duration_ms: Some(duration_ms),
                 result_hash: Some(result_hash),
             };
-            // ── Reconnection dedup: record after posting result ──
-            let _ = self.post_tool_result_with_auth_retry(&body).await;
-            crate::cli::edge_lifecycle::record_completed_request(req.request_id.clone());
+            // ── Reconnection dedup: only record when server acked the result ──
+            if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
+                crate::cli::edge_lifecycle::record_completed_request(req.request_id.clone());
+            }
         }
 
         // Clear batch progress when done.
@@ -7405,9 +7419,9 @@ mod tests {
             result_hash: None,
         };
 
-        let terminal_auth_failure = host.post_tool_result_with_auth_retry(&body).await;
+        let posted = host.post_tool_result_with_auth_retry(&body).await.is_ok();
 
-        assert!(!terminal_auth_failure);
+        assert!(posted);
         assert!(!host.auth_failure);
         assert_eq!(host.token, "fresh-token");
     }
