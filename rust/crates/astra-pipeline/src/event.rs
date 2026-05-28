@@ -47,6 +47,11 @@ pub enum TraceCategory {
     Budget,
     Reflection,
     Verification,
+    Thinking,
+    MemoryRetrieval,
+    SkillExecution,
+    PromptAssembly,
+    GuardEvaluation,
 }
 
 /// Global set of enabled trace categories.
@@ -226,21 +231,21 @@ impl EventKind {
     /// The trace category for this event kind.
     pub fn default_category(&self) -> TraceCategory {
         match self {
-            EventKind::ToolCallStarted { .. } | EventKind::ToolCallCompleted { .. } | EventKind::ToolsSelected { .. } => {
-                TraceCategory::ToolCalls
-            }
+            EventKind::ToolCallStarted { .. }
+            | EventKind::ToolCallCompleted { .. }
+            | EventKind::ToolsSelected { .. } => TraceCategory::ToolCalls,
             EventKind::LlmChunk { .. } => TraceCategory::LlmExchanges,
             EventKind::IntentDetected { .. } | EventKind::EntityExtracted { .. } => {
                 TraceCategory::ContextAssembly
             }
             EventKind::ReflectionGenerated { .. } => TraceCategory::Reflection,
             EventKind::PhaseTransition { .. } => TraceCategory::PhaseTransition,
-            EventKind::BudgetSet { .. } | EventKind::BudgetUpdate { .. } | EventKind::BudgetExpanded { .. } => {
-                TraceCategory::Budget
-            }
-            EventKind::ProgressRecorded { .. } | EventKind::StallDetected { .. } | EventKind::CircuitBreakerTripped { .. } => {
-                TraceCategory::Verification
-            }
+            EventKind::BudgetSet { .. }
+            | EventKind::BudgetUpdate { .. }
+            | EventKind::BudgetExpanded { .. } => TraceCategory::Budget,
+            EventKind::ProgressRecorded { .. }
+            | EventKind::StallDetected { .. }
+            | EventKind::CircuitBreakerTripped { .. } => TraceCategory::Verification,
             EventKind::TurnCompleted { .. } => TraceCategory::DecisionExplain,
         }
     }

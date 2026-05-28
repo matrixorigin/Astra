@@ -212,13 +212,17 @@ async fn main() {
     } = cli;
 
     let _ = (startup_trace, bare);
-    astra_config::runtime_config::set_cli_trace_config(
-        astra_config::runtime_config::SessionTraceConfig::from_cli(
+    // CLI trace flags are now applied through the RuntimeConfig overlay mechanism
+    // (set_cli_overlay). The trace config is resolved by load() → merge(cli_overlay).
+    let cli_overlay = astra_config::runtime_config::RuntimeConfig {
+        trace: astra_config::runtime_config::SessionTraceConfig::from_cli(
             trace_profile.as_deref(),
             trace_level.as_deref(),
             trace_cat.as_deref(),
         ),
-    );
+        ..Default::default()
+    };
+    astra_config::runtime_config::set_cli_overlay(Some(cli_overlay));
     let cli_context = match cli::cli_context::CliContext::from_launch_options(
         no_journal_content,
         max_turns,

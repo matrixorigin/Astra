@@ -22,8 +22,8 @@
 //!    write-back goes through `apply_edit`, the two ends close a loop
 //!    that's regression-guarded by `every_catalog_item_is_editable_via_apply_edit`.
 
-use crate::runtime_config::RuntimeConfig;
-use astra_core::runtime_limits::{RuntimeLimits, context_window_for_model};
+use crate::runtime_config::{RuntimeConfig, TraceCategory, TraceLevelSerde, TraceProfile};
+use astra_core::runtime_limits::{context_window_for_model, RuntimeLimits};
 use serde_json::Value;
 use std::path::Path;
 
@@ -109,7 +109,11 @@ pub fn effective_budget_for_model(config: &RuntimeConfig, model: Option<&str>) -
         // Keep the local-limit fallback consistent with RuntimeLimits:
         // env can override the configured value, so consult it too.
         let env_limit = RuntimeLimits::global().max_turn_input_tokens;
-        if env_limit > 0 { env_limit } else { configured }
+        if env_limit > 0 {
+            env_limit
+        } else {
+            configured
+        }
     }
 }
 
@@ -282,24 +286,46 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
             kind: SettingKind::Bool,
             value: Value::from(config.tool_selection.prefer_recent_tools),
         },
-        // ── Telemetry ──
+        // ── Trace ──
         SettingItem {
-            id: "telemetry.capture_context_traces".to_string(),
-            label: "Capture context-assembly traces".to_string(),
-            kind: SettingKind::Bool,
-            value: Value::from(config.telemetry.capture_context_traces),
+            id: "trace.profile".to_string(),
+            label: "Trace profile (production/dev/custom)".to_string(),
+            kind: SettingKind::Enum {
+                options: vec!["production".into(), "dev".into(), "custom".into()],
+            },
+            value: Value::from(format!("{:?}", config.trace.profile).to_lowercase()),
         },
         SettingItem {
-            id: "telemetry.capture_full_llm_exchanges".to_string(),
-            label: "Capture full LLM request/response payloads".to_string(),
-            kind: SettingKind::Bool,
-            value: Value::from(config.telemetry.capture_full_llm_exchanges),
+            id: "trace.min_level".to_string(),
+            label: "Minimum trace level (error/warn/info/debug/trace)".to_string(),
+            kind: SettingKind::Enum {
+                options: vec![
+                    "error".into(),
+                    "warn".into(),
+                    "info".into(),
+                    "debug".into(),
+                    "trace".into(),
+                ],
+            },
+            value: Value::from(format!("{:?}", config.trace.min_level).to_lowercase()),
         },
         SettingItem {
-            id: "telemetry.persist_to_journal".to_string(),
-            label: "Persist telemetry to journal".to_string(),
+            id: "trace.tool_calls".to_string(),
+            label: "Trace tool calls".to_string(),
             kind: SettingKind::Bool,
-            value: Value::from(config.telemetry.persist_to_journal),
+            value: Value::from(config.trace.category_enabled(TraceCategory::ToolCalls)),
+        },
+        SettingItem {
+            id: "trace.llm_exchanges".to_string(),
+            label: "Trace full LLM exchanges".to_string(),
+            kind: SettingKind::Bool,
+            value: Value::from(config.trace.category_enabled(TraceCategory::LlmExchanges)),
+        },
+        SettingItem {
+            id: "trace.thinking".to_string(),
+            label: "Trace LLM thinking/reasoning".to_string(),
+            kind: SettingKind::Bool,
+            value: Value::from(config.trace.category_enabled(TraceCategory::Thinking)),
         },
         // ── Runtime limits (per-turn agentic budget) ──
         SettingItem {
@@ -339,6 +365,17 @@ pub fn filter_settings(items: &[SettingItem], query: &str) -> Vec<SettingItem> {
         })
         .cloned()
         .collect()
+}
+
+/// Add or remove a category from the vec.
+fn toggle_category(cats: &mut Vec<TraceCategory>, cat: TraceCategory, enable: bool) {
+    if enable {
+        if !cats.contains(&cat) {
+            cats.push(cat);
+        }
+    } else {
+        cats.retain(|c| *c != cat);
+    }
 }
 
 /// Write `new_value` into the field identified by `id`.
@@ -479,14 +516,51 @@ pub fn apply_edit(
         "tool_selection.prefer_recent_tools" => {
             config.tool_selection.prefer_recent_tools = as_bool(&new_value, id)?;
         }
-        "telemetry.capture_context_traces" => {
-            config.telemetry.capture_context_traces = as_bool(&new_value, id)?;
+        "trace.profile" => {
+            // Profile changes require re-apply; handled as enum
+            if let Some(s) = new_value.as_str() {
+                config.trace.profile = match s {
+                    "production" => TraceProfile::Production,
+                    "dev" => TraceProfile::Dev,
+                    _ => TraceProfile::Custom,
+                };
+            }
         }
-        "telemetry.capture_full_llm_exchanges" => {
-            config.telemetry.capture_full_llm_exchanges = as_bool(&new_value, id)?;
+        "trace.min_level" => {
+            if let Some(s) = new_value.as_str() {
+                config.trace.min_level = match s {
+                    "error" => TraceLevelSerde::Error,
+                    "warn" => TraceLevelSerde::Warn,
+                    "info" => TraceLevelSerde::Info,
+                    "debug" => TraceLevelSerde::Debug,
+                    "trace" => TraceLevelSerde::Trace,
+                    _ => return Ok(config),
+                };
+            }
         }
-        "telemetry.persist_to_journal" => {
-            config.telemetry.persist_to_journal = as_bool(&new_value, id)?;
+        "trace.tool_calls" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::ToolCalls,
+                as_bool(&new_value, id)?,
+            );
+            return Ok(config);
+        }
+        "trace.llm_exchanges" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::LlmExchanges,
+                as_bool(&new_value, id)?,
+            );
+            return Ok(config);
+        }
+        "trace.thinking" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::Thinking,
+                as_bool(&new_value, id)?,
+            );
+            return Ok(config);
         }
         "runtime_limits.max_turns" => {
             let n = as_u32(&new_value, id)?;
@@ -508,25 +582,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_includes_full_llm_capture_toggle() {
+    fn catalog_includes_llm_exchanges_toggle() {
         let config = RuntimeConfig::default();
         let catalog = build_settings_catalog(&config);
         let item = catalog
             .iter()
-            .find(|item| item.id == "telemetry.capture_full_llm_exchanges")
-            .expect("catalog must expose the full LLM capture toggle");
+            .find(|item| item.id == "trace.llm_exchanges")
+            .expect("catalog must expose the LLM exchanges trace toggle");
         assert_eq!(item.label, "Capture full LLM request/response payloads");
         assert_eq!(item.value, Value::Bool(false));
     }
 
     #[test]
-    fn apply_edit_updates_full_llm_capture_toggle() {
+    fn apply_edit_updates_llm_exchanges_toggle() {
         let updated = apply_edit(
             RuntimeConfig::default(),
-            "telemetry.capture_full_llm_exchanges",
+            "trace.llm_exchanges",
             Value::Bool(true),
         )
         .expect("toggle edit should succeed");
-        assert!(updated.telemetry.capture_full_llm_exchanges);
+        assert!(updated
+            .trace
+            .enabled_categories
+            .contains(&TraceCategory::LlmExchanges));
     }
 }

@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use astra_core::SharedPool;
 use astra_services::{SessionArtifactJsonRecord, SessionArtifactJsonStore, SessionArtifactStore};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 pub(crate) const FULL_LLM_CAPTURE_METADATA_KEY: &str = "full_llm_capture";
 
@@ -36,8 +36,8 @@ pub(crate) fn session_full_llm_capture_enabled(
     resolve_full_llm_capture_enabled(
         metadata,
         astra_config::runtime_config::RuntimeConfig::cached()
-            .telemetry
-            .capture_full_llm_exchanges,
+            .trace
+            .category_enabled(astra_config::runtime_config::TraceCategory::LlmExchanges),
     )
 }
 
@@ -450,7 +450,7 @@ pub(crate) fn persist_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_services::{StoredSessionArtifact, session_journal::JournalDirGuard};
+    use astra_services::{session_journal::JournalDirGuard, StoredSessionArtifact};
     use async_trait::async_trait;
     use tempfile::tempdir;
 

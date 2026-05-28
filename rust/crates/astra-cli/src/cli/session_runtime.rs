@@ -240,6 +240,11 @@ fn create_pipeline_modules_inner(
             astra_config::runtime_config::TraceCategory::Budget => astra_pipeline::event::TraceCategory::Budget,
             astra_config::runtime_config::TraceCategory::Reflection => astra_pipeline::event::TraceCategory::Reflection,
             astra_config::runtime_config::TraceCategory::Verification => astra_pipeline::event::TraceCategory::Verification,
+            astra_config::runtime_config::TraceCategory::Thinking => astra_pipeline::event::TraceCategory::Thinking,
+            astra_config::runtime_config::TraceCategory::MemoryRetrieval => astra_pipeline::event::TraceCategory::MemoryRetrieval,
+            astra_config::runtime_config::TraceCategory::SkillExecution => astra_pipeline::event::TraceCategory::SkillExecution,
+            astra_config::runtime_config::TraceCategory::PromptAssembly => astra_pipeline::event::TraceCategory::PromptAssembly,
+            astra_config::runtime_config::TraceCategory::GuardEvaluation => astra_pipeline::event::TraceCategory::GuardEvaluation,
             astra_config::runtime_config::TraceCategory::All => {
                 // unreachable: All is skipped before iteration
                 unreachable!("All variant filtered before iteration")

@@ -14,6 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 // ─── Top-Level Configuration ─────────────────────────────────────────────────
 
@@ -36,9 +37,9 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub tool_selection: ToolSelectionConfig,
 
-    /// Telemetry configuration.
+    /// Per-session trace configuration.
     #[serde(default)]
-    pub telemetry: TelemetryConfig,
+    pub trace: SessionTraceConfig,
 
     /// Token budget configuration.
     #[serde(default)]
@@ -286,7 +287,7 @@ impl Default for RuntimeConfig {
             compression: CompressionConfig::default(),
             memory: MemoryConfig::default(),
             tool_selection: ToolSelectionConfig::default(),
-            telemetry: TelemetryConfig::default(),
+            trace: SessionTraceConfig::default(),
             token_budget: TokenBudgetConfig::default(),
             verification: VerificationConfig::default(),
             memory_pressure: MemoryPressureConfig::default(),
@@ -1146,60 +1147,6 @@ impl Default for ToolSelectionConfig {
     }
 }
 
-// ─── Telemetry Configuration ─────────────────────────────────────────────────
-
-/// Configuration for telemetry and tracing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TelemetryConfig {
-    /// Whether to capture context assembly traces.
-    #[serde(default = "default_true")]
-    pub capture_context_traces: bool,
-
-    /// Whether to capture full LLM request/response payloads by default.
-    ///
-    /// Session metadata `full_llm_capture` still wins when it is explicitly
-    /// present, so `/session trace on|off` can override this global default for
-    /// one session.
-    #[serde(default)]
-    pub capture_full_llm_exchanges: bool,
-
-    /// Whether to capture tool execution traces.
-    #[serde(default = "default_true")]
-    pub capture_tool_traces: bool,
-
-    /// Whether to capture decision explanations.
-    #[serde(default)]
-    pub capture_explanations: bool,
-
-    /// Maximum traces to keep in memory (reserved for future use).
-    /// Currently traces are per-turn and cleared after persist to journal,
-    /// so no in-memory buffer accumulates. This config will apply if/when
-    /// a diagnostic trace buffer is added for streaming or `/debug traces`.
-    #[serde(default = "default_max_traces_in_memory")]
-    pub max_traces_in_memory: u32,
-
-    /// Whether to persist traces to journal.
-    #[serde(default = "default_true")]
-    pub persist_to_journal: bool,
-}
-
-fn default_max_traces_in_memory() -> u32 {
-    100
-}
-
-impl Default for TelemetryConfig {
-    fn default() -> Self {
-        Self {
-            capture_context_traces: true,
-            capture_full_llm_exchanges: false,
-            capture_tool_traces: true,
-            capture_explanations: false,
-            max_traces_in_memory: default_max_traces_in_memory(),
-            persist_to_journal: true,
-        }
-    }
-}
-
 // ─── Session Trace Configuration ──────────────────────────────────────────────
 
 /// Predefined trace profiles for per-session trace configuration.
@@ -1241,6 +1188,16 @@ pub enum TraceCategory {
     Reflection,
     /// Verification and review events.
     Verification,
+    /// LLM thinking/reasoning content blocks.
+    Thinking,
+    /// Memory retrieval queries and results.
+    MemoryRetrieval,
+    /// Skill loading, execution, and teardown lifecycle.
+    SkillExecution,
+    /// System prompt assembly and injection decisions.
+    PromptAssembly,
+    /// Safety guard evaluations and rulings.
+    GuardEvaluation,
     /// Meta-category: enables all categories.
     All,
 }
@@ -1257,6 +1214,11 @@ impl TraceCategory {
             TraceCategory::Budget,
             TraceCategory::Reflection,
             TraceCategory::Verification,
+            TraceCategory::Thinking,
+            TraceCategory::MemoryRetrieval,
+            TraceCategory::SkillExecution,
+            TraceCategory::PromptAssembly,
+            TraceCategory::GuardEvaluation,
         ]
     }
 }
@@ -1275,15 +1237,12 @@ pub enum TraceSink {
 
 /// Per-session trace configuration.
 ///
-/// Each session can override the global [`TelemetryConfig`] with its own trace
-/// profile, level, category filter, and sink selection. This allows production
-/// sessions to stay lean while dev/debug sessions capture maximum detail.
+/// Each session can set its own trace profile, level, category filter, and sink selection.
 ///
 /// # Resolution order (highest priority first)
 /// 1. CLI flags (`--trace-profile`, `--trace-level`, `--trace-cat`)
 /// 2. Session metadata / persisted overrides (if session exists)
-/// 3. Global [`TelemetryConfig`] defaults
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionTraceConfig {
     /// Which pre-built profile to use. [`TraceProfile::Custom`] means the other
     /// fields drive behavior directly.
@@ -1360,7 +1319,27 @@ impl Default for SessionTraceConfig {
     }
 }
 
+/// Per-session trace config singleton. Set once at session startup via
+/// [`SessionTraceConfig::set_current`], read by [`SessionTraceConfig::current`].
+static SESSION_TRACE_CONFIG: OnceLock<SessionTraceConfig> = OnceLock::new();
+
 impl SessionTraceConfig {
+    /// Store the trace config for the current session. Call once at session
+    /// startup before any pipeline modules are created.
+    pub fn set_current(config: SessionTraceConfig) {
+        let _ = SESSION_TRACE_CONFIG.set(config);
+    }
+
+    /// Retrieve the current session's trace config. Returns the stored config
+    /// if set, otherwise the default (production-like).
+    ///
+    /// # Panics
+    /// Never — falls back to default on unset.
+    #[must_use]
+    pub fn current() -> Self {
+        SESSION_TRACE_CONFIG.get().cloned().unwrap_or_default()
+    }
+
     /// Apply a preset profile, overwriting relevant fields.
     pub fn apply_profile(mut self, profile: TraceProfile) -> Self {
         match profile {
@@ -1390,11 +1369,6 @@ impl SessionTraceConfig {
             return true;
         }
         self.enabled_categories.contains(&TraceCategory::All) || self.enabled_categories.contains(&cat)
-    }
-
-    /// Returns the CLI-specified trace config if set, otherwise the default.
-    pub fn current() -> Self {
-        SESSION_TRACE_CONFIG.get().cloned().unwrap_or_default()
     }
 
     /// Build from CLI flags (`--trace-profile`, `--trace-level`, `--trace-cat`).
@@ -1435,6 +1409,11 @@ impl SessionTraceConfig {
                     "budget" => Some(TraceCategory::Budget),
                     "reflection" => Some(TraceCategory::Reflection),
                     "verification" => Some(TraceCategory::Verification),
+                    "thinking" => Some(TraceCategory::Thinking),
+                    "memory_retrieval" => Some(TraceCategory::MemoryRetrieval),
+                    "skill_execution" => Some(TraceCategory::SkillExecution),
+                    "prompt_assembly" => Some(TraceCategory::PromptAssembly),
+                    "guard_evaluation" => Some(TraceCategory::GuardEvaluation),
                     _ => None,
                 }).collect()
             };
@@ -1724,9 +1703,7 @@ fn merge_if_non_default<T: PartialEq>(slot: &mut T, incoming: T, default: T) {
 /// Stored as the already-parsed `RuntimeConfig` rather than raw JSON so the
 /// CLI boundary is the only place that can fail on malformed input — every
 /// `load()` call thereafter is infallible.
-/// Per-session trace config overlay, set from CLI flags before session start.
-static SESSION_TRACE_CONFIG: std::sync::OnceLock<SessionTraceConfig> =
-    std::sync::OnceLock::new();
+
 
 static CLI_OVERLAY: std::sync::OnceLock<std::sync::RwLock<Option<RuntimeConfig>>> =
     std::sync::OnceLock::new();
@@ -1744,13 +1721,6 @@ pub fn set_cli_overlay(overlay: Option<RuntimeConfig>) {
     if let Ok(mut slot) = cli_overlay_cell().write() {
         *slot = overlay;
     }
-}
-
-/// Set the per-session trace config from CLI flags. Called once before session
-/// startup. Subsequent calls to [`SessionTraceConfig::current()`] will return
-/// this value instead of the default.
-pub fn set_cli_trace_config(config: SessionTraceConfig) {
-    let _ = SESSION_TRACE_CONFIG.set(config);
 }
 
 fn cli_overlay_snapshot() -> Option<RuntimeConfig> {
@@ -1865,7 +1835,7 @@ impl RuntimeConfig {
             compression,
             memory,
             tool_selection,
-            telemetry,
+            trace,
             token_budget,
             verification,
             memory_pressure,
@@ -2122,43 +2092,33 @@ impl RuntimeConfig {
             self.tool_selection.model_profiles = model_profiles;
         }
 
-        let TelemetryConfig {
-            capture_context_traces,
-            capture_full_llm_exchanges,
-            capture_tool_traces,
-            capture_explanations,
-            max_traces_in_memory,
-            persist_to_journal,
-        } = telemetry;
+        let SessionTraceConfig {
+            profile,
+            min_level,
+            enabled_categories,
+            sinks,
+            sampling_rate,
+        } = trace;
         merge_if_non_default(
-            &mut self.telemetry.capture_context_traces,
-            capture_context_traces,
-            default_true(),
+            &mut self.trace.profile,
+            profile,
+            TraceProfile::default(),
         );
         merge_if_non_default(
-            &mut self.telemetry.capture_full_llm_exchanges,
-            capture_full_llm_exchanges,
-            false,
+            &mut self.trace.min_level,
+            min_level,
+            TraceLevelSerde::default(),
         );
+        if !enabled_categories.is_empty() {
+            self.trace.enabled_categories = enabled_categories;
+        }
+        if !sinks.is_empty() {
+            self.trace.sinks = sinks;
+        }
         merge_if_non_default(
-            &mut self.telemetry.capture_tool_traces,
-            capture_tool_traces,
-            default_true(),
-        );
-        merge_if_non_default(
-            &mut self.telemetry.capture_explanations,
-            capture_explanations,
-            false,
-        );
-        merge_if_non_default(
-            &mut self.telemetry.max_traces_in_memory,
-            max_traces_in_memory,
-            default_max_traces_in_memory(),
-        );
-        merge_if_non_default(
-            &mut self.telemetry.persist_to_journal,
-            persist_to_journal,
-            default_true(),
+            &mut self.trace.sampling_rate,
+            sampling_rate,
+            1.0,
         );
 
         let TokenBudgetConfig {
@@ -2384,10 +2344,16 @@ impl RuntimeConfig {
             self.token_budget.max_turn_input_tokens = n;
         }
         if let Ok(val) = std::env::var("ASTRA_CAPTURE_TRACES") {
-            self.telemetry.capture_context_traces = val == "1" || val.to_lowercase() == "true";
+            if val == "1" || val.to_lowercase() == "true" {
+                self.trace.enabled_categories = vec![TraceCategory::All];
+            }
         }
         if let Ok(val) = std::env::var("ASTRA_CAPTURE_FULL_LLM") {
-            self.telemetry.capture_full_llm_exchanges = val == "1" || val.to_lowercase() == "true";
+            if val == "1" || val.to_lowercase() == "true" {
+                if !self.trace.enabled_categories.contains(&TraceCategory::LlmExchanges) {
+                    self.trace.enabled_categories.push(TraceCategory::LlmExchanges);
+                }
+            }
         }
         // ASTRA_FORK_INHERIT_PREFIX env var is ignored — fork capture
         // is now always-on. The `enabled` field is a deprecated no-op.
@@ -2409,7 +2375,7 @@ mod tests {
         assert_eq!(config.compression.max_history_tokens, 40000);
         assert!((config.compression.compression_threshold - 0.8).abs() < 0.001);
         assert_eq!(config.memory.retrieval_top_k, 5);
-        assert!(!config.telemetry.capture_full_llm_exchanges);
+        assert!(!config.trace.category_enabled(TraceCategory::LlmExchanges));
     }
 
     #[test]
@@ -2602,13 +2568,16 @@ mod tests {
                 exploration_family_churn_midloop_threshold: 0,
                 model_profiles: Vec::new(),
             },
-            telemetry: TelemetryConfig {
-                capture_context_traces: false,
-                capture_full_llm_exchanges: true,
-                capture_tool_traces: false,
-                capture_explanations: true,
-                max_traces_in_memory: 42,
-                persist_to_journal: false,
+            trace: SessionTraceConfig {
+                profile: TraceProfile::Custom,
+                min_level: TraceLevelSerde::Debug,
+                enabled_categories: vec![
+                    TraceCategory::ToolCalls,
+                    TraceCategory::LlmExchanges,
+                    TraceCategory::Reflection,
+                ],
+                sinks: vec![TraceSink::Stderr],
+                sampling_rate: 0.5,
             },
             token_budget: TokenBudgetConfig {
                 max_prompt_tokens: 16000,
@@ -2677,12 +2646,14 @@ mod tests {
         assert!((merged.tool_selection.recent_tool_boost - 0.4).abs() < 0.001);
         assert_eq!(merged.tool_selection.max_tool_schema_tokens, 22000);
 
-        assert!(!merged.telemetry.capture_context_traces);
-        assert!(merged.telemetry.capture_full_llm_exchanges);
-        assert!(!merged.telemetry.capture_tool_traces);
-        assert!(merged.telemetry.capture_explanations);
-        assert_eq!(merged.telemetry.max_traces_in_memory, 42);
-        assert!(!merged.telemetry.persist_to_journal);
+        assert_eq!(merged.trace.profile, TraceProfile::Custom);
+        assert_eq!(merged.trace.min_level, TraceLevelSerde::Debug);
+        assert!(merged.trace.category_enabled(TraceCategory::ToolCalls));
+        assert!(merged.trace.category_enabled(TraceCategory::LlmExchanges));
+        assert!(!merged.trace.category_enabled(TraceCategory::ContextAssembly));
+        assert!(merged.trace.category_enabled(TraceCategory::Reflection));
+        assert!(merged.trace.sinks.contains(&TraceSink::Stderr));
+        assert!((merged.trace.sampling_rate - 0.5).abs() < 0.001);
 
         assert_eq!(merged.token_budget.max_prompt_tokens, 16000);
         assert_eq!(merged.token_budget.max_turn_input_tokens, 32000);
