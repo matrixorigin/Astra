@@ -349,6 +349,7 @@ dependencies = [
 name = "astra-messaging"
 version = "0.1.0"
 dependencies = [
+ "astra-text-utils",
  "async-trait",
  "chrono",
  "serde",
@@ -611,9 +612,11 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "futures-util",
+ "hex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

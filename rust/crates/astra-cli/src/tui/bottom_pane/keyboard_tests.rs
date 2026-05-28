@@ -1,8 +1,8 @@
 #![cfg(test)]
 
 use super::{BottomPane, BottomPaneAction};
-use crate::chat_stream::ApprovalResponse;
-use crate::permission_manager::PermissionMode;
+use crate::cli::chat_stream::ApprovalResponse;
+use crate::cli::permission_manager::PermissionMode;
 use crate::tui::slash_dispatch::next_permission_mode_for_cycle;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::oneshot;

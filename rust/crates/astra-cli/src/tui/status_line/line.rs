@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthStr;
 
-pub(crate) use crate::permission_manager::PermissionMode;
+pub(crate) use crate::cli::permission_manager::PermissionMode;
 
 /// Inputs that feed the status line. Owned so the struct is `Clone`
 /// and easy to fixture.

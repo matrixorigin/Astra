@@ -17,16 +17,16 @@ pub(crate) struct ToolSafetyGuard;
 
 impl ToolSafetyGuard {
     pub(crate) fn check_request(
-        perm_manager: Option<&mut crate::permission_manager::PermissionManager>,
+        perm_manager: Option<&mut crate::cli::permission_manager::PermissionManager>,
         name: &str,
         args: &Value,
-    ) -> crate::permission_manager::PermissionDecision {
+    ) -> crate::cli::permission_manager::PermissionDecision {
         if let Err(error) = Self::check_dispatch(name, args) {
-            return crate::permission_manager::PermissionDecision::Deny(error);
+            return crate::cli::permission_manager::PermissionDecision::Deny(error);
         }
         match perm_manager {
             Some(pm) => pm.check_nonblocking(name, args),
-            None => crate::permission_manager::PermissionDecision::Allow,
+            None => crate::cli::permission_manager::PermissionDecision::Allow,
         }
     }
 
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn check_request_static_denial_overrides_auto_mode() {
-        let mut pm = crate::permission_manager::PermissionManager::new(true);
+        let mut pm = crate::cli::permission_manager::PermissionManager::new(true);
         let decision = ToolSafetyGuard::check_request(
             Some(&mut pm),
             "mo_query",
@@ -182,7 +182,7 @@ mod tests {
         );
 
         match decision {
-            crate::permission_manager::PermissionDecision::Deny(reason) => {
+            crate::cli::permission_manager::PermissionDecision::Deny(reason) => {
                 assert!(reason.contains("blocked by default"));
             }
             other => panic!("expected deny, got: {other:?}"),
@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn check_request_delegates_safe_write_tool_to_permission_manager() {
-        let mut pm = crate::permission_manager::PermissionManager::new(false);
+        let mut pm = crate::cli::permission_manager::PermissionManager::new(false);
         let decision = ToolSafetyGuard::check_request(
             Some(&mut pm),
             "write_file",
@@ -200,13 +200,13 @@ mod tests {
 
         assert!(matches!(
             decision,
-            crate::permission_manager::PermissionDecision::NeedApproval { .. }
+            crate::cli::permission_manager::PermissionDecision::NeedApproval { .. }
         ));
     }
 
     #[test]
     fn check_request_blocks_obfuscated_shell_command() {
-        let mut pm = crate::permission_manager::PermissionManager::new(false);
+        let mut pm = crate::cli::permission_manager::PermissionManager::new(false);
         let decision = ToolSafetyGuard::check_request(
             Some(&mut pm),
             "bash",
@@ -214,7 +214,7 @@ mod tests {
         );
 
         match decision {
-            crate::permission_manager::PermissionDecision::Deny(reason) => {
+            crate::cli::permission_manager::PermissionDecision::Deny(reason) => {
                 assert!(reason.contains("shell_obfuscation"));
                 assert!(reason.contains("eval"));
             }

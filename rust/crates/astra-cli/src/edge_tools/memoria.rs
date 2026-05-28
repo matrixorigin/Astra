@@ -12,8 +12,8 @@ use super::ToolExecutor;
 pub use astra_tools::memoria::{BoostSearchHit, parse_memory_search_hits};
 
 fn current_memoria_proxy_target() -> Result<(String, String), String> {
-    let base = crate::command_router::resolve_api_url(None);
-    let token = crate::session_runtime::current_access_token(None).ok_or_else(|| {
+    let base = crate::cli::config_manager::resolve_api_url(None)?;
+    let token = crate::cli::session_runtime::current_access_token(None).ok_or_else(|| {
         "not logged in; memory operations must go through the Astra server".to_string()
     })?;
     Ok((base, token))

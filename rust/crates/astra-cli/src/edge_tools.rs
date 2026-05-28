@@ -28,9 +28,6 @@ use crossterm::style::Stylize;
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 
-#[path = "delta_log.rs"]
-pub mod delta_log;
-
 #[path = "edge_tools/agent_messaging.rs"]
 pub mod agent_messaging;
 #[path = "edge_tools/agent_spawning.rs"]
@@ -463,7 +460,7 @@ fn categorize_reference(line: &str, _symbol: &str) -> &'static str {
 }
 
 /// Commands queued by the tool executor for the TUI's BackgroundTaskRegistry.
-pub(crate) enum BgTaskCommand {
+pub enum BgTaskCommand {
     SpawnShell {
         command: String,
         description: String,
@@ -543,7 +540,7 @@ pub struct ToolExecutor {
     /// wait loops to record byte/line counters; polled by a
     /// `StreamEvent::ToolOutput` ticker.
     pub(crate) bash_progress_sink:
-        std::sync::RwLock<Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>>>,
+        std::sync::RwLock<Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>>,
     /// After a `.rs` file is written under a Rust workspace, set so the next
     /// `/chat` turn with `tool_results` can run passive `cargo check` and inject diagnostics.
     passive_cargo_pending: AtomicBool,
@@ -561,7 +558,7 @@ pub struct ToolExecutor {
         std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>>,
     /// MatrixOne snapshot journal — records captured pre-state snapshots so the
     /// executor can perform a bounded restore without reconstructing tool history.
-    pub database_snapshot_journal:
+    pub(crate) database_snapshot_journal:
         std::sync::Arc<std::sync::Mutex<mo_tools::DatabaseSnapshotRollbackJournal>>,
     /// Git stash rollback journal — records captured stash handles so bounded
     /// turn/batch rollback can re-apply shelved working tree state.
@@ -571,7 +568,7 @@ pub struct ToolExecutor {
     pub git_commit_journal: std::sync::Arc<std::sync::Mutex<git_gix::GitCommitRollbackJournal>>,
     /// Git worktree rollback journal — records newly created worktrees so bounded
     /// turn/batch rollback can remove them again while they are still clean.
-    pub git_worktree_journal:
+    pub(crate) git_worktree_journal:
         std::sync::Arc<std::sync::Mutex<worktree::GitWorktreeRollbackJournal>>,
     /// Session-state rollback journal — records bounded self-mod/task mutations so
     /// same-turn rollback can restore prior in-memory session state.
@@ -675,21 +672,21 @@ pub struct ToolExecutor {
     /// Per-turn ask-user channel — the host swaps a fresh sender in
     /// before each turn so the `ask_user` tool can reach the
     /// bottom-pane overlay.
-    ask_user_request_tx: std::sync::Mutex<Option<crate::chat_stream::AskUserRequestTx>>,
+    ask_user_request_tx: std::sync::Mutex<Option<crate::cli::chat_stream::AskUserRequestTx>>,
     /// Per-turn plan-review channel — installed by the host before
     /// each turn so `exit_plan_mode` can surface the dedicated
     /// plan-review overlay (scrollable plan body + 4-way radio).
     /// Separate from `ask_user_request_tx` because the plan overlay
     /// renders a markdown body, not the question/option layout
     /// `ask_user` needs.
-    plan_review_request_tx: std::sync::Mutex<Option<crate::chat_stream::PlanReviewRequestTx>>,
+    plan_review_request_tx: std::sync::Mutex<Option<crate::cli::chat_stream::PlanReviewRequestTx>>,
     /// Slot recording a permission-mode switch that the user
     /// confirmed inside a tool overlay (currently `exit_plan_mode`'s
     /// 4-option dialog). The host drains this slot at the start of
     /// the next turn — applying mid-turn would race the agentic
     /// loop's borrow of `perm_manager`.
     pending_permission_mode_change:
-        std::sync::Mutex<Option<crate::permission_manager::PermissionMode>>,
+        std::sync::Mutex<Option<crate::cli::permission_manager::PermissionMode>>,
     /// One-shot schema boost for the next agentic round. Used by
     /// `exit_plan_mode` so the model immediately regains the core
     /// edit tools (`bash` / `read_file` / `write_file` /
@@ -796,7 +793,7 @@ impl ToolExecutor {
     /// TUI overlay for confirmations.
     /// `None` clears the slot — passed at turn boundaries so a stale
     /// sender never leaks across turns.
-    pub fn set_ask_user_request_tx(&self, tx: Option<crate::chat_stream::AskUserRequestTx>) {
+    pub fn set_ask_user_request_tx(&self, tx: Option<crate::cli::chat_stream::AskUserRequestTx>) {
         if let Ok(mut guard) = self.ask_user_request_tx.lock() {
             *guard = tx;
         }
@@ -806,7 +803,10 @@ impl ToolExecutor {
     /// can surface the dedicated plan-approval overlay. Cleared at
     /// turn boundaries to keep stale senders from leaking into
     /// background sub-runs that share the same `Arc<ToolExecutor>`.
-    pub fn set_plan_review_request_tx(&self, tx: Option<crate::chat_stream::PlanReviewRequestTx>) {
+    pub fn set_plan_review_request_tx(
+        &self,
+        tx: Option<crate::cli::chat_stream::PlanReviewRequestTx>,
+    ) {
         if let Ok(mut guard) = self.plan_review_request_tx.lock() {
             *guard = tx;
         }
@@ -817,7 +817,7 @@ impl ToolExecutor {
     /// once and clears the slot. Called at turn start by the loop host.
     pub fn take_pending_permission_mode_change(
         &self,
-    ) -> Option<crate::permission_manager::PermissionMode> {
+    ) -> Option<crate::cli::permission_manager::PermissionMode> {
         self.pending_permission_mode_change
             .lock()
             .ok()
@@ -915,7 +915,7 @@ impl ToolExecutor {
     /// through half the shell module.
     pub fn set_bash_progress_sink(
         &self,
-        sink: Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>>,
+        sink: Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
     ) {
         if let Ok(mut slot) = self.bash_progress_sink.write() {
             *slot = sink;
@@ -927,7 +927,7 @@ impl ToolExecutor {
     /// `None` when no sink is installed (non-TUI callers, tests).
     pub(crate) fn current_bash_progress_sink(
         &self,
-    ) -> Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>> {
+    ) -> Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>> {
         self.bash_progress_sink.read().ok().and_then(|g| g.clone())
     }
 
@@ -1145,18 +1145,18 @@ impl ToolExecutor {
 
     /// Use a shared file-state cache (session-scoped) so read-before-write
     /// tracking survives across plan executor subtask turns.
-    pub fn with_shared_file_state(mut self, state: SharedFileState) -> Self {
+    pub(crate) fn with_shared_file_state(mut self, state: SharedFileState) -> Self {
         self.file_state = state;
         self
     }
 
     /// Return a clone of the shared file-state Arc for cross-turn sharing.
-    pub fn shared_file_state(&self) -> SharedFileState {
+    pub(crate) fn shared_file_state(&self) -> SharedFileState {
         self.file_state.clone()
     }
 
     /// Use a shared MatrixOne snapshot journal (session-scoped) instead of the default.
-    pub fn with_shared_database_snapshot_journal(
+    pub(crate) fn with_shared_database_snapshot_journal(
         mut self,
         journal: std::sync::Arc<std::sync::Mutex<mo_tools::DatabaseSnapshotRollbackJournal>>,
     ) -> Self {
@@ -1183,7 +1183,7 @@ impl ToolExecutor {
     }
 
     /// Use a shared git worktree rollback journal (session-scoped) instead of the default.
-    pub fn with_shared_git_worktree_journal(
+    pub(crate) fn with_shared_git_worktree_journal(
         mut self,
         journal: std::sync::Arc<std::sync::Mutex<worktree::GitWorktreeRollbackJournal>>,
     ) -> Self {
@@ -1192,7 +1192,7 @@ impl ToolExecutor {
     }
 
     /// Use a shared session-state rollback journal (session-scoped) instead of the default.
-    pub fn with_shared_session_state_journal(
+    pub(crate) fn with_shared_session_state_journal(
         mut self,
         journal: std::sync::Arc<std::sync::Mutex<session_state::SessionStateRollbackJournal>>,
     ) -> Self {
@@ -1214,7 +1214,7 @@ impl ToolExecutor {
         self
     }
 
-    pub fn with_bg_task_commands(
+    pub(crate) fn with_bg_task_commands(
         mut self,
         commands: std::sync::Arc<std::sync::Mutex<Vec<BgTaskCommand>>>,
     ) -> Self {
@@ -1492,7 +1492,7 @@ impl ToolExecutor {
             return None;
         }
         let token = self.cloud_token();
-        match crate::session_todo_client::execute_todo_action(
+        match crate::cli::session_todo_client::execute_todo_action(
             &cloud_base,
             token.as_deref(),
             &session_id,
@@ -1619,13 +1619,13 @@ impl ToolExecutor {
     /// calls within the same turn collapse to a single switch.
     fn stage_pending_plan_mode(&self) {
         if let Ok(mut slot) = self.pending_permission_mode_change.lock() {
-            *slot = Some(crate::permission_manager::PermissionMode::Plan);
+            *slot = Some(crate::cli::permission_manager::PermissionMode::Plan);
         }
     }
 
     fn stage_pending_permission_mode_change(
         &self,
-        mode: crate::permission_manager::PermissionMode,
+        mode: crate::cli::permission_manager::PermissionMode,
     ) {
         if let Ok(mut slot) = self.pending_permission_mode_change.lock() {
             *slot = Some(mode);
@@ -1646,7 +1646,7 @@ impl ToolExecutor {
     #[cfg(test)]
     pub(crate) fn debug_stage_pending_permission_mode_change_for_test(
         &self,
-        mode: crate::permission_manager::PermissionMode,
+        mode: crate::cli::permission_manager::PermissionMode,
     ) {
         self.stage_pending_permission_mode_change(mode);
     }
@@ -1758,7 +1758,7 @@ impl ToolExecutor {
             Err(err) => {
                 return format!(
                     "Error: failed to exit plan mode: {}",
-                    crate::map_thin_err(err)
+                    crate::cli::cli_utils::map_thin_err(err)
                 );
             }
         };
@@ -1770,7 +1770,7 @@ impl ToolExecutor {
 
         if approved {
             let next_mode =
-                follow_up_mode.unwrap_or(crate::permission_manager::PermissionMode::Auto);
+                follow_up_mode.unwrap_or(crate::cli::permission_manager::PermissionMode::Auto);
             self.set_plan_mode_authoring_cache_for_active_session(false)
                 .await;
             self.stage_pending_permission_mode_change(next_mode);
@@ -1813,7 +1813,7 @@ impl ToolExecutor {
 
         if approved {
             let next_mode =
-                follow_up_mode.unwrap_or(crate::permission_manager::PermissionMode::Auto);
+                follow_up_mode.unwrap_or(crate::cli::permission_manager::PermissionMode::Auto);
             // Local guard cache is informational only here — there
             // is no cloud guard to mirror. Setting it to `Some(false)`
             // keeps the cached flag consistent with "writes are
@@ -1855,8 +1855,8 @@ impl ToolExecutor {
     async fn resolve_exit_plan_mode_via_overlay(
         &self,
         plan_markdown: Option<&str>,
-    ) -> Result<(bool, Option<crate::permission_manager::PermissionMode>), String> {
-        use crate::chat_stream::{PlanReviewDecision, PlanReviewRequest};
+    ) -> Result<(bool, Option<crate::cli::permission_manager::PermissionMode>), String> {
+        use crate::cli::chat_stream::{PlanReviewDecision, PlanReviewRequest};
 
         let tx = self
             .plan_review_request_tx
@@ -1981,8 +1981,12 @@ impl ToolExecutor {
             .and_then(Value::as_str)
             .unwrap_or("active");
         let token = self.cloud_token();
-        match crate::session_todo_client::list_user_todos(&cloud_base, token.as_deref(), status)
-            .await
+        match crate::cli::session_todo_client::list_user_todos(
+            &cloud_base,
+            token.as_deref(),
+            status,
+        )
+        .await
         {
             Ok(output) => output,
             Err(err) => format!("Error: list_user todos failed: {err}"),
@@ -2734,12 +2738,12 @@ impl ToolExecutor {
             .active_session_id()
             .filter(|sid| !sid.is_empty())
             .map(|sid| {
-                let record = crate::slash_memory::load_local_session_memory(&sid);
-                crate::slash_memory::session_memory_surface_status(&sid, record.as_ref())
+                let record = crate::cli::slash_memory::load_local_session_memory(&sid);
+                crate::cli::slash_memory::session_memory_surface_status(&sid, record.as_ref())
             });
         let surface_block = surface_status
             .as_ref()
-            .map(crate::slash_memory::render_session_memory_surface_status)
+            .map(crate::cli::slash_memory::render_session_memory_surface_status)
             .filter(|block| !block.trim().is_empty());
         let journal_fallback = self.render_session_memory_journal_fallback();
         let journal_pipeline = self
@@ -3635,7 +3639,7 @@ impl ToolExecutor {
                     let last_n = args.get("last_n").and_then(|v| v.as_i64()).unwrap_or(20);
                     if let Some(session_id) = self.active_session_id().filter(|id| !id.is_empty()) {
                         let limit = usize::try_from(last_n.max(1)).unwrap_or(20);
-                        match crate::self_command::render_reflect_surface_for_session(
+                        match crate::cli::self_command::render_reflect_surface_for_session(
                             &session_id,
                             limit,
                             Some(focus),
@@ -4192,9 +4196,9 @@ impl ToolExecutor {
             .unwrap_or("all");
 
         if let Some(session_id) = self.active_session_id()
-            && let Some(surface) = crate::self_command::agent_info_surface_alias(dimension)
+            && let Some(surface) = crate::cli::self_command::agent_info_surface_alias(dimension)
         {
-            return crate::self_command::render_surface_for_session(&session_id, surface, 20)
+            return crate::cli::self_command::render_surface_for_session(&session_id, surface, 20)
                 .await
                 .unwrap_or_else(|error| serde_json::json!({ "error": error }).to_string());
         }

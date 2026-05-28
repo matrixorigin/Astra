@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/task_list/snapshot_tests.rs
+assertion_line: 248
 expression: "draw(&tasks, 45, 24, true)"
 ---
 3 tasks (1 done, 1 in progress, 1 open)

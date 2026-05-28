@@ -16,10 +16,10 @@ use astra_services::state_sync::pref_keys;
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 
 use super::chat_turn::enqueue_ingestion_pub;
-use super::{ExplainMode, SessionState};
+use crate::{ExplainMode, SessionState};
 
 /// Result from cloud pull attempt at session start.
-pub(super) struct CloudPullResult {
+pub(crate) struct CloudPullResult {
     /// True when the server's preferences endpoint responded
     /// successfully (regardless of whether it returned data).
     pub cloud_reachable: bool,
@@ -47,7 +47,7 @@ fn resolve_cloud_base() -> Option<String> {
 /// Check whether the cloud preference endpoint is reachable.
 /// Best-effort: returns `cloud_reachable: false` when cloud is
 /// unconfigured or unreachable.
-pub(super) async fn try_cloud_pull(profile_name: &str) -> CloudPullResult {
+pub(crate) async fn try_cloud_pull(profile_name: &str) -> CloudPullResult {
     let Some(cloud_base) = resolve_cloud_base() else {
         return CloudPullResult {
             cloud_reachable: false,
@@ -55,14 +55,14 @@ pub(super) async fn try_cloud_pull(profile_name: &str) -> CloudPullResult {
     };
     let token = super::session_runtime::current_access_token(Some(profile_name));
     let cloud_reachable =
-        crate::preferences_client::probe_cloud_reachable(&cloud_base, token.as_deref()).await;
+        crate::cli::preferences_client::probe_cloud_reachable(&cloud_base, token.as_deref()).await;
     CloudPullResult { cloud_reachable }
 }
 
 /// Pull user preferences from cloud at session start.
 /// Merges cloud preferences into local state (cloud-wins). Returns
 /// keys merged (for journal audit).
-pub(super) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<String> {
+pub(crate) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<String> {
     let Some(cloud_base) = resolve_cloud_base() else {
         return Vec::new();
     };
@@ -70,19 +70,20 @@ pub(super) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<
     // currently holds. Empty token still works for local dev
     // servers without auth; the server's auth_service decides.
     let token = super::session_runtime::current_access_token(None);
-    let prefs = match crate::preferences_client::pull_all_preferences(&cloud_base, token.as_deref())
-        .await
-    {
-        Ok(prefs) => prefs,
-        Err(e) => {
-            tracing::warn!(
-                target: "astra_cli::cloud_sync",
-                error = %e,
-                "preference pull skipped"
-            );
-            return Vec::new();
-        }
-    };
+    let prefs =
+        match crate::cli::preferences_client::pull_all_preferences(&cloud_base, token.as_deref())
+            .await
+        {
+            Ok(prefs) => prefs,
+            Err(e) => {
+                tracing::warn!(
+                    target: "astra_cli::cloud_sync",
+                    error = %e,
+                    "preference pull skipped"
+                );
+                return Vec::new();
+            }
+        };
     if prefs.is_empty() {
         return Vec::new();
     }
@@ -148,7 +149,7 @@ pub(super) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<
 }
 
 /// Push user preferences to cloud at session end.
-pub(super) async fn try_cloud_push_preferences(state: &SessionState) {
+pub(crate) async fn try_cloud_push_preferences(state: &SessionState) {
     let Some(cloud_base) = resolve_cloud_base() else {
         return;
     };
@@ -183,9 +184,13 @@ pub(super) async fn try_cloud_push_preferences(state: &SessionState) {
         ),
     ];
     for (key, value) in &prefs {
-        if let Err(e) =
-            crate::preferences_client::push_preference(&cloud_base, token.as_deref(), key, value)
-                .await
+        if let Err(e) = crate::cli::preferences_client::push_preference(
+            &cloud_base,
+            token.as_deref(),
+            key,
+            value,
+        )
+        .await
         {
             tracing::warn!(
                 target: "astra_cli::cloud_sync",
@@ -201,9 +206,9 @@ pub(super) async fn try_cloud_push_preferences(state: &SessionState) {
 
 /// When set to `1`, `session_startup` also journals a sync marker if MatrixOne was reachable but
 /// returned no preferences (audit / connectivity proof).
-pub(super) const ASTRA_JOURNAL_CLOUD_EMPTY_ACK: &str = "ASTRA_JOURNAL_CLOUD_EMPTY_ACK";
+pub(crate) const ASTRA_JOURNAL_CLOUD_EMPTY_ACK: &str = "ASTRA_JOURNAL_CLOUD_EMPTY_ACK";
 
-pub(super) fn cloud_pull_warrants_sync_marker(
+pub(crate) fn cloud_pull_warrants_sync_marker(
     pull: &CloudPullResult,
     pref_keys: &[String],
 ) -> bool {
@@ -217,7 +222,7 @@ fn cloud_pull_empty_ack_desired_for_source(source: &str) -> bool {
     std::env::var(ASTRA_JOURNAL_CLOUD_EMPTY_ACK).ok().as_deref() == Some("1")
 }
 
-pub(super) fn should_append_cloud_pull_journal(
+pub(crate) fn should_append_cloud_pull_journal(
     pull: &CloudPullResult,
     pref_keys: &[String],
     source: &str,
@@ -231,7 +236,7 @@ pub(super) fn should_append_cloud_pull_journal(
     cloud_pull_empty_ack_desired_for_source(source)
 }
 
-pub(super) fn append_cloud_pull_sync_journal(
+pub(crate) fn append_cloud_pull_sync_journal(
     state: &SessionState,
     profile: &str,
     source: &str,

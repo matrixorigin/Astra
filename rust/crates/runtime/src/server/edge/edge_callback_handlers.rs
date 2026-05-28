@@ -18,6 +18,11 @@ use serde::Deserialize;
 
 use astra_turn_core::edge_ledger::{LEDGER_MAX_ENTRIES, approval_callback_key, tool_callback_key};
 
+/// Server-enforced cap on `last_seen_request_ids` entries per heartbeat.
+/// Excess entries beyond this limit are silently dropped — the edge will
+/// report them again on the next heartbeat cycle.
+const MAX_LAST_SEEN_REQUEST_IDS: usize = 256;
+
 fn edge_id_from_headers(headers: &HeaderMap) -> String {
     headers
         .get(ASTRA_EDGE_ID_HEADER)
@@ -120,6 +125,25 @@ pub(crate) fn insert_approval_ledger_entry(
     Ok(true)
 }
 
+fn validate_tool_result_request(
+    body: &astra_thin_client::ToolResultRequest,
+) -> Result<(), &'static str> {
+    let output = body
+        .output
+        .as_deref()
+        .ok_or("tool result output is required")?;
+    let result_hash = body
+        .result_hash
+        .as_deref()
+        .ok_or("tool result result_hash is required")?;
+    let expected_hash =
+        astra_thin_client::ToolResultRequest::compute_result_hash(&body.request_id, output);
+    if result_hash != expected_hash {
+        return Err("tool result result_hash does not match payload");
+    }
+    Ok(())
+}
+
 pub(crate) async fn post_tool_result_handler(
     Extension(trace): Extension<RequestTrace>,
     State(state): State<AppState>,
@@ -128,6 +152,8 @@ pub(crate) async fn post_tool_result_handler(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let edge_id = edge_id_from_headers(&headers);
+    validate_tool_result_request(&body)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
     let key = tool_callback_key(&user.user_id, &body.request_id);
     let mut lock = state.edge_callback_ledger.lock().await;
     insert_ledger_entry(
@@ -260,6 +286,15 @@ pub(crate) struct EdgeRegisterRequest {
 #[derive(Deserialize)]
 pub(crate) struct EdgeHeartbeatRequest {
     pub edge_agent_id: String,
+    /// Number of in-flight tool requests on this edge executor (from thin-client).
+    /// Used to detect stalled edges: pending > 0 but no results for > 2 min → warning.
+    #[serde(default)]
+    pub pending_request_count: u32,
+    /// Recently completed request IDs the edge has processed, for deduplication
+    /// on reconnection. Cloud can cross-reference with its pending tool_requests
+    /// table to avoid re-issuing tool calls already completed by this edge.
+    #[serde(default)]
+    pub last_seen_request_ids: Vec<String>,
 }
 
 /// `POST /agents/edge` — upsert `edge_agent_registry` (Phase 3).
@@ -315,11 +350,72 @@ pub(crate) async fn post_agents_edge_heartbeat_handler(
         .heartbeat(&user.user_id, &body.edge_agent_id, &edge_id)
         .await
         .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
+
+    // ── Reconnection dedup ──────────────────────────────────────────
+    // 1. Ack completed request IDs: remove from cloud's pending set.
+    //    The edge confirmed these tools were executed, so no re-issue needed.
+    //    Server-side scoping: each lookup key is "{user_id}:{request_id}",
+    //    so the edge can only remove entries belonging to its authenticated
+    //    user. Fabricated IDs for other users have no effect.
+    let seen_ids: &[String] = if body.last_seen_request_ids.len() > MAX_LAST_SEEN_REQUEST_IDS {
+        tracing::warn!(
+            user_id = %user.user_id,
+            edge_id = %edge_id,
+            total = body.last_seen_request_ids.len(),
+            limit = MAX_LAST_SEEN_REQUEST_IDS,
+            "truncating last_seen_request_ids to server limit"
+        );
+        &body.last_seen_request_ids[..MAX_LAST_SEEN_REQUEST_IDS]
+    } else {
+        &body.last_seen_request_ids
+    };
+    if !seen_ids.is_empty() {
+        state
+            .edge_connection_pool
+            .ack_completed_for_user(&user.user_id, seen_ids);
+    }
+
+    // 2. Return pending requests (those still in the set after ack).
+    //    On reconnection, the edge re-executes these and reports results.
+    let pending_requests: Vec<serde_json::Value> = state
+        .edge_connection_pool
+        .get_pending_requests_for_user(&user.user_id)
+        .into_iter()
+        .map(|req| {
+            serde_json::json!({
+                "request_id": req.request_id,
+                "tool_name": req.tool_name,
+                "args": req.args,
+            })
+        })
+        .collect();
+
+    // Stale edge detection: warn if edge has pending tool requests with no progress.
+    if body.pending_request_count > 0 {
+        tracing::warn!(
+            user_id = %user.user_id,
+            edge_id = %edge_id,
+            pending = body.pending_request_count,
+            "edge heartbeat with active pending tool requests"
+        );
+    }
+
+    if !pending_requests.is_empty() {
+        tracing::info!(
+            user_id = %user.user_id,
+            edge_id = %edge_id,
+            count = pending_requests.len(),
+            "reconnection: returning pending requests to edge"
+        );
+    }
+
     Ok(Json(serde_json::json!({
         "ok": true,
         "user_id": user.user_id,
         "edge_id": edge_id,
         "edge_agent_id": body.edge_agent_id,
+        "pending_requests": pending_requests,
+        "ack_request_ids": seen_ids,
     })))
 }
 
@@ -474,5 +570,31 @@ mod edge_callback_insert_tests {
         )
         .expect("durable fallback path returns Ok(false)");
         assert!(!out, "durable fallback path signals not-enqueued");
+    }
+
+    #[test]
+    fn tool_result_hash_mismatch_is_rejected() {
+        let body = astra_thin_client::ToolResultRequest {
+            request_id: "req-1".to_string(),
+            status: "completed".to_string(),
+            output: Some("actual".to_string()),
+            duration_ms: Some(1),
+            result_hash: Some("wrong".to_string()),
+        };
+        assert_eq!(
+            super::validate_tool_result_request(&body),
+            Err("tool result result_hash does not match payload")
+        );
+    }
+
+    #[test]
+    fn tool_result_hash_matching_payload_is_accepted() {
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            "req-1".to_string(),
+            "completed".to_string(),
+            "actual".to_string(),
+            1,
+        );
+        assert_eq!(super::validate_tool_result_request(&body), Ok(()));
     }
 }

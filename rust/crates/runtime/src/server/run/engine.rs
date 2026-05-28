@@ -37,7 +37,7 @@ use astra_services::{
     DatabaseStateProjectionStore,
     runs::{
         DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord, DurableRunRecord,
-        RunStateStore,
+        RequestedTurnInteractionMode, RunStateStore,
     },
 };
 
@@ -54,6 +54,54 @@ use astra_core::{STATUS_RUNNING, STATUS_WAITING};
 pub struct RunEngine {
     store: Arc<dyn RunStateStore>,
     projection_store: Option<Arc<DatabaseStateProjectionStore>>,
+}
+
+/// Optional run-start interaction context persisted into the durable
+/// `run_started` event so replay/status surfaces can explain policy decisions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunStartContext {
+    pub interaction_mode: Option<RequestedTurnInteractionMode>,
+    pub interactive_client: Option<bool>,
+}
+
+fn requested_mode_label(mode: RequestedTurnInteractionMode) -> &'static str {
+    match mode {
+        RequestedTurnInteractionMode::NonInteractive => "non_interactive",
+        RequestedTurnInteractionMode::Prompt => "prompt",
+        RequestedTurnInteractionMode::Auto => "auto",
+        RequestedTurnInteractionMode::Deny => "deny",
+        RequestedTurnInteractionMode::Headless => "headless",
+    }
+}
+
+fn effective_mode_label(context: RunStartContext) -> Option<&'static str> {
+    if let Some(mode) = context.interaction_mode {
+        return Some(requested_mode_label(mode));
+    }
+    context
+        .interactive_client
+        .map(|interactive| if interactive { "prompt" } else { "headless" })
+}
+
+fn run_started_event_data(context: RunStartContext) -> serde_json::Value {
+    let mut data = serde_json::Map::new();
+    if let Some(mode_label) = effective_mode_label(context) {
+        data.insert(
+            "interaction_mode".to_string(),
+            serde_json::Value::String(mode_label.to_string()),
+        );
+        data.insert(
+            "suppressed_loop_nudges".to_string(),
+            serde_json::Value::Bool(mode_label == "auto"),
+        );
+    }
+    if let Some(interactive_client) = context.interactive_client {
+        data.insert(
+            "interactive_client".to_string(),
+            serde_json::Value::Bool(interactive_client),
+        );
+    }
+    serde_json::Value::Object(data)
 }
 
 impl RunEngine {
@@ -88,8 +136,22 @@ impl RunEngine {
         user_id: &str,
         session_id: &str,
     ) -> Result<(), String> {
-        self.start_run_ext(run_id, user_id, session_id, None, None, None, None)
+        self.start_run_with_context(run_id, user_id, session_id, RunStartContext::default())
             .await
+    }
+
+    /// Create a durable run record and capture request-level interaction context.
+    pub async fn start_run_with_context(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        session_id: &str,
+        context: RunStartContext,
+    ) -> Result<(), String> {
+        self.start_run_ext_with_context(
+            run_id, user_id, session_id, None, None, None, None, context,
+        )
+        .await
     }
 
     /// Extended version of `start_run` with delegation metadata.
@@ -102,6 +164,31 @@ impl RunEngine {
         delegation_id: Option<&str>,
         agent_id: Option<&str>,
         retry_of: Option<&str>,
+    ) -> Result<(), String> {
+        self.start_run_ext_with_context(
+            run_id,
+            user_id,
+            session_id,
+            parent_run_id,
+            delegation_id,
+            agent_id,
+            retry_of,
+            RunStartContext::default(),
+        )
+        .await
+    }
+
+    /// Extended version of `start_run` with delegation metadata and interaction context.
+    async fn start_run_ext_with_context(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        session_id: &str,
+        parent_run_id: Option<&str>,
+        delegation_id: Option<&str>,
+        agent_id: Option<&str>,
+        retry_of: Option<&str>,
+        context: RunStartContext,
     ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
         let (root_run_id, ancestor_path, depth) = if let Some(parent_run_id) = parent_run_id {
@@ -150,7 +237,10 @@ impl RunEngine {
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
             total_tool_calls: 0,
-            events: vec![serde_json::json!({"event_type": "run_started", "data": {}})],
+            events: vec![serde_json::json!({
+                "event_type": "run_started",
+                "data": run_started_event_data(context)
+            })],
             created_at: now.clone(),
             updated_at: now,
         };
@@ -491,6 +581,73 @@ mod tests {
         assert_eq!(run.session_id, "sess-1");
         assert_eq!(run.status, "running");
         assert_eq!(run.events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn start_run_with_context_persists_interaction_metadata() {
+        let engine = test_engine();
+        engine
+            .start_run_with_context(
+                "run-ctx",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    interaction_mode: Some(RequestedTurnInteractionMode::Auto),
+                    interactive_client: Some(true),
+                },
+            )
+            .await
+            .unwrap();
+        let run = engine.load_run("run-ctx").await.unwrap().unwrap();
+        assert_eq!(run.events[0]["event_type"], "run_started");
+        assert_eq!(run.events[0]["data"]["interaction_mode"], "auto");
+        assert_eq!(run.events[0]["data"]["suppressed_loop_nudges"], true);
+        assert_eq!(run.events[0]["data"]["interactive_client"], true);
+    }
+
+    #[tokio::test]
+    async fn start_run_with_context_uses_prompt_when_interactive_without_override() {
+        let engine = test_engine();
+        engine
+            .start_run_with_context(
+                "run-prompt",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    interaction_mode: None,
+                    interactive_client: Some(true),
+                },
+            )
+            .await
+            .unwrap();
+        let run = engine.load_run("run-prompt").await.unwrap().unwrap();
+        assert_eq!(run.events[0]["data"]["interaction_mode"], "prompt");
+        assert_eq!(run.events[0]["data"]["suppressed_loop_nudges"], false);
+        assert_eq!(run.events[0]["data"]["interactive_client"], true);
+    }
+
+    #[tokio::test]
+    async fn start_run_with_context_uses_snake_case_non_interactive_label() {
+        let engine = test_engine();
+        engine
+            .start_run_with_context(
+                "run-non-interactive",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    interaction_mode: Some(RequestedTurnInteractionMode::NonInteractive),
+                    interactive_client: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        let run = engine
+            .load_run("run-non-interactive")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.events[0]["data"]["interaction_mode"], "non_interactive");
+        assert_eq!(run.events[0]["data"]["suppressed_loop_nudges"], false);
     }
 
     #[tokio::test]

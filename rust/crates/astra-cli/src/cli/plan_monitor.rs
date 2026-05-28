@@ -1,14 +1,14 @@
 //! Plan execution progress rendering and blocking monitor loop.
 
-use crate::chat_stream;
-use crate::cli_formatting;
-use crate::durable_bridge;
-use crate::effects;
-use crate::plan_executor;
-use crate::session_state::SessionState;
-use crate::stream_render;
-use crate::streaming_md;
-use crate::theme;
+use crate::cli::chat_stream;
+use crate::cli::cli_formatting;
+use crate::cli::durable_bridge;
+use crate::cli::effects;
+use crate::cli::plan_executor;
+use crate::cli::session_state::SessionState;
+use crate::cli::stream_render;
+use crate::cli::streaming_md;
+use crate::cli::theme;
 use crossterm::style::Stylize;
 
 /// Shown after Ctrl+C pauses plan auto-execution (interrupt is not sent to the model).
@@ -355,7 +355,7 @@ fn display_plan_updates_live(
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
                 if let Some(tx) = state.pending_approval.take() {
-                    let _ = tx.send(crate::chat_stream::ApprovalResponse::Deny);
+                    let _ = tx.send(crate::cli::chat_stream::ApprovalResponse::Deny);
                 }
                 print_plan_monitor_line(
                     plan_spinner,
@@ -403,7 +403,7 @@ fn display_plan_updates_live(
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
                 if let Some(tx) = state.pending_approval.take() {
-                    let _ = tx.send(crate::chat_stream::ApprovalResponse::Deny);
+                    let _ = tx.send(crate::cli::chat_stream::ApprovalResponse::Deny);
                 }
                 print_plan_monitor_line(
                     plan_spinner,
@@ -930,7 +930,7 @@ fn cleanup_orphan_plan_executor(state: &mut SessionState, plan_spinner: &mut Opt
     state.executing_plan = None;
     state.current_plan_subtask_id = None;
     if let Some(tx) = state.pending_approval.take() {
-        let _ = tx.send(crate::chat_stream::ApprovalResponse::Deny);
+        let _ = tx.send(crate::cli::chat_stream::ApprovalResponse::Deny);
     }
     eprintln!(
         "\n{}  Plan executor stopped without a final status (channel closed). State cleared.",
@@ -1175,7 +1175,7 @@ async fn sync_task_board_from_executing_plan(state: &SessionState) {
     };
     if let Some(goal) = state.executing_plan_goal.as_deref()
         && let Err(error) =
-            crate::plan_task_board::mirror_plan_to_task_board(state, goal, plan).await
+            crate::cli::plan_task_board::mirror_plan_to_task_board(state, goal, plan).await
     {
         tracing::warn!(
             goal = %goal,
@@ -1183,7 +1183,7 @@ async fn sync_task_board_from_executing_plan(state: &SessionState) {
             "failed to ensure executing plan is mirrored into task board"
         );
     }
-    let plan_fingerprint = crate::plan_task_board::plan_task_board_fingerprint(plan);
+    let plan_fingerprint = crate::cli::plan_task_board::plan_task_board_fingerprint(plan);
     for subtask in &plan.subtasks {
         if let Err(error) =
             sync_task_board_subtask_status(state, &plan_fingerprint, &subtask.id, subtask.status)
@@ -1255,7 +1255,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let plan_fingerprint = crate::plan_task_board::plan_task_board_fingerprint(&plan);
+        let plan_fingerprint = crate::cli::plan_task_board::plan_task_board_fingerprint(&plan);
         let create = state
             .task_manager
             .create(&serde_json::json!({
@@ -1304,7 +1304,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        crate::plan_task_board::mirror_plan_to_task_board(&state, "same goal", &stale)
+        crate::cli::plan_task_board::mirror_plan_to_task_board(&state, "same goal", &stale)
             .await
             .unwrap();
 
@@ -1317,7 +1317,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        crate::plan_task_board::mirror_plan_to_task_board(&state, "same goal", &current)
+        crate::cli::plan_task_board::mirror_plan_to_task_board(&state, "same goal", &current)
             .await
             .unwrap();
         state.executing_plan = Some(current);

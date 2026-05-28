@@ -12,7 +12,7 @@ use super::*;
 /// In TUI mode this stays on the text fallback path.
 /// Kept for headless / non-interactive execution paths.
 #[allow(dead_code)]
-pub(super) fn handle_telemetry_command(arg: &str, state: &SessionState) {
+pub(crate) fn handle_telemetry_command(arg: &str, state: &SessionState) {
     let (sub_cmd, sub_arg) = match arg.find(char::is_whitespace) {
         Some(pos) => (arg[..pos].trim(), arg[pos..].trim()),
         None => (arg.trim(), ""),

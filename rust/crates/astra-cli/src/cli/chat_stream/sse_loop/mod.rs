@@ -36,11 +36,11 @@ use astra_runtime::{
     turn::turn_guard::TurnGuard,
 };
 
-use crate::{ExplainMode, StreamResult, cli_utils::terminal_width_usize, edge_tools};
+use crate::{ExplainMode, StreamResult, cli::cli_utils::terminal_width_usize, edge_tools};
 
-use super::ChatTurnParams;
-use super::StreamEvent;
-use super::explain_reports;
+use crate::cli::chat_stream::ChatTurnParams;
+use crate::cli::chat_stream::explain_reports;
+use crate::cli::chat_stream::params::StreamEvent;
 use agentic_sse_loop::{
     StreamLoopSidecarEprint, StreamResultBuild, build_stream_result, eprint_stream_loop_sidecars,
     resolved_tool_metrics,
@@ -155,10 +155,11 @@ pub(crate) async fn stream_chat_sse(
     // so long-running LLM extraction gets a subtle visual cue. Runs
     // for the duration of the turn; dropped when `_session_memory_ux`
     // goes out of scope.
-    let _session_memory_ux = crate::chat_stream::session_memory_ux::SessionMemoryUxBridge::spawn(
-        p.session_memory_extractor.as_ref(),
-        p.stream_event_tx.clone(),
-    );
+    let _session_memory_ux =
+        crate::cli::chat_stream::session_memory_ux::SessionMemoryUxBridge::spawn(
+            p.session_memory_extractor.as_ref(),
+            p.stream_event_tx.clone(),
+        );
     // Stable run_id for this turn — shared by:
     //   1. state.current_run_id (so on_turn_completed captures the
     //      parent prefix keyed on this id)
@@ -180,8 +181,8 @@ pub(crate) async fn stream_chat_sse(
     let show_early_hint = !p.render_policy.suppress_text()
         && std::io::IsTerminal::is_terminal(&std::io::stderr())
         && p.plan_assemble_line_release.is_none();
-    let early_spinner: Option<crate::effects::Spinner> = if show_early_hint {
-        Some(crate::effects::Spinner::start_immediate(
+    let early_spinner: Option<crate::cli::effects::Spinner> = if show_early_hint {
+        Some(crate::cli::effects::Spinner::start_immediate(
             "Preparing…".to_string(),
         ))
     } else {
@@ -321,7 +322,11 @@ pub(crate) async fn stream_chat_sse(
     });
 
     // --add-dir: expand sandbox to include additional directories
-    if let Ok(dirs) = std::env::var("ASTRA_CLI_ADD_DIRS") {
+    if let Some(cli_context) = p.cli_context {
+        for dir in &cli_context.add_dirs {
+            executor.expand_sandbox_path(dir.clone());
+        }
+    } else if let Ok(dirs) = std::env::var("ASTRA_CLI_ADD_DIRS") {
         for dir in dirs.split(':').filter(|s| !s.is_empty()) {
             executor.expand_sandbox_path(PathBuf::from(dir));
         }
@@ -370,28 +375,46 @@ pub(crate) async fn stream_chat_sse(
     let valid_tool_names: HashSet<String> = registry.all_schema_names().into_iter().collect();
 
     // --allowed-tools: if set, restrict to only the specified tools
-    let mut initial_restricted: HashSet<String> =
-        if let Ok(allowed_csv) = std::env::var("ASTRA_CLI_ALLOWED_TOOLS") {
-            let allowed: HashSet<&str> = allowed_csv
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !allowed.is_empty() {
-                valid_tool_names
-                    .iter()
-                    .filter(|name| !allowed.contains(name.as_str()))
-                    .cloned()
-                    .collect()
-            } else {
-                HashSet::new()
-            }
+    let mut initial_restricted: HashSet<String> = if let Some(cli_context) = p.cli_context {
+        let allowed: HashSet<&str> = cli_context
+            .allowed_tools
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if !allowed.is_empty() {
+            valid_tool_names
+                .iter()
+                .filter(|name| !allowed.contains(name.as_str()))
+                .cloned()
+                .collect()
         } else {
             HashSet::new()
-        };
+        }
+    } else if let Ok(allowed_csv) = std::env::var("ASTRA_CLI_ALLOWED_TOOLS") {
+        let allowed: HashSet<&str> = allowed_csv
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !allowed.is_empty() {
+            valid_tool_names
+                .iter()
+                .filter(|name| !allowed.contains(name.as_str()))
+                .cloned()
+                .collect()
+        } else {
+            HashSet::new()
+        }
+    } else {
+        HashSet::new()
+    };
 
     // --disallowed-tools: directly add to restricted set
-    if let Ok(denied_csv) = std::env::var("ASTRA_CLI_DISALLOWED_TOOLS") {
+    if let Some(cli_context) = p.cli_context {
+        for name in &cli_context.disallowed_tools {
+            initial_restricted.insert(name.clone());
+        }
+    } else if let Ok(denied_csv) = std::env::var("ASTRA_CLI_DISALLOWED_TOOLS") {
         for name in denied_csv
             .split(',')
             .map(|s| s.trim())
@@ -507,7 +530,7 @@ pub(crate) async fn stream_chat_sse(
         plan_review_request_tx: p.plan_review_request_tx,
         root_send_message_context,
         chat_turn_index: p.turn_index,
-        tool_cache: crate::stream_render::EdgeToolCache::new(
+        tool_cache: crate::cli::stream_render::EdgeToolCache::new(
             resolved_tool_policy.max_identical_tool_calls,
         ),
         prefix_store: prefix_store_for_host,
@@ -533,7 +556,7 @@ pub(crate) async fn stream_chat_sse(
 
     // Build skill executor — fork sub-runs inherit the resolver for nesting.
     let skill_executor: Option<Arc<dyn astra_skills::SkillExecutor>> = {
-        let mut subrun_exec = crate::skill_subrun::CliSkillSubRunExecutor::new(
+        let mut subrun_exec = crate::cli::skill_subrun::CliSkillSubRunExecutor::new(
             p.api.clone(),
             p.token.to_string(),
             p.model.map(|m| m.to_string()),
@@ -1011,10 +1034,10 @@ fn load_turn_messages(
 
 #[cfg(test)]
 mod tests {
-    use super::circuit_breaker_config_from_tool_selection;
-    use super::detect_turn_hook_sets;
-    use super::extend_restricted_with_blocked_tools;
-    use super::normalize_turn_model;
+    use super::{
+        circuit_breaker_config_from_tool_selection, detect_turn_hook_sets,
+        extend_restricted_with_blocked_tools, normalize_turn_model,
+    };
     use astra_runtime::observability::ObservabilityHub;
     use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
     use std::collections::HashSet;

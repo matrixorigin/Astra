@@ -11,8 +11,8 @@ use ratatui::{buffer::Buffer, layout::Rect};
 use tokio::sync::oneshot;
 
 use super::{BottomPane, BottomPaneAction};
-use crate::chat_stream::PlanReviewDecision;
-use crate::permission_manager::PermissionMode;
+use crate::cli::chat_stream::PlanReviewDecision;
+use crate::cli::permission_manager::PermissionMode;
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)

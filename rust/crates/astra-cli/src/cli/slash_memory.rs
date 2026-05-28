@@ -86,7 +86,7 @@ fn parse_memory_forget_args(input: &str) -> Result<(String, String), String> {
     Ok((memory_id, reason))
 }
 
-pub(super) async fn handle_memory_domain_command(
+pub(crate) async fn handle_memory_domain_command(
     cmd: &str,
     arg: &str,
     api: &astra_thin_client::ThinClient,
@@ -192,7 +192,7 @@ pub(super) async fn handle_memory_domain_command(
                             "⋯".dim(),
                             prefix_chars(&memory_id, 8).dim()
                         );
-                        match super::edge_tools::memoria::memoria_feedback(
+                        match crate::edge_tools::memoria::memoria_feedback(
                             &memory_id,
                             "irrelevant",
                             Some("user /memory dismiss"),
@@ -273,7 +273,7 @@ pub(super) async fn handle_memory_domain_command(
                                     let mut dismissed = 0u32;
                                     let mut failed = 0u32;
                                     for candidate in candidates {
-                                        match super::edge_tools::memoria::memoria_feedback(
+                                        match crate::edge_tools::memoria::memoria_feedback(
                                             &candidate.memory_id,
                                             "irrelevant",
                                             Some("user /memory dismiss"),
@@ -323,7 +323,7 @@ pub(super) async fn handle_memory_domain_command(
                 // ─── Show one memory by id ──────────────────────
                 "show" if !sub_arg.is_empty() => {
                     let memory_id = sub_arg.trim();
-                    match super::edge_tools::memoria::memoria_show(memory_id).await {
+                    match crate::edge_tools::memoria::memoria_show(memory_id).await {
                         Ok(body) => print_memory_detail(&body),
                         Err(e) => eprintln!("{}", format!("  ✗ Show failed: {e}").red()),
                     }
@@ -343,7 +343,7 @@ pub(super) async fn handle_memory_domain_command(
                     };
                     let body =
                         serde_json::json!({"memory_ids": [memory_id.clone()], "reason": reason});
-                    match super::edge_tools::memoria::memoria_purge(&body).await {
+                    match crate::edge_tools::memoria::memoria_purge(&body).await {
                         Ok(_) => {
                             eprintln!(
                                 "  {} Forgot memory {}",
@@ -361,7 +361,7 @@ pub(super) async fn handle_memory_domain_command(
                     } else {
                         sub_arg.to_string()
                     };
-                    match super::edge_tools::memoria::memoria_snapshot_create(&name).await {
+                    match crate::edge_tools::memoria::memoria_snapshot_create(&name).await {
                         Ok(_) => {
                             eprintln!(
                                 "  {} Snapshot '{}' created",
@@ -373,7 +373,7 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
                 "rollback" if !sub_arg.is_empty() => {
-                    match super::edge_tools::memoria::memoria_snapshot_rollback(sub_arg).await {
+                    match crate::edge_tools::memoria::memoria_snapshot_rollback(sub_arg).await {
                         Ok(_) => {
                             eprintln!(
                                 "  {} Rolled back to '{}'",
@@ -384,13 +384,13 @@ pub(super) async fn handle_memory_domain_command(
                         Err(e) => eprintln!("  {} Rollback failed: {e}", theme::icon_err()),
                     }
                 }
-                "snapshots" => match super::edge_tools::memoria::memoria_snapshots_list().await {
+                "snapshots" => match crate::edge_tools::memoria::memoria_snapshots_list().await {
                     Ok(body) => print_snapshots_list(&body),
                     Err(e) => eprintln!("  {} {e}", theme::icon_err()),
                 },
                 // ─── Cloud: Branches ──────────────────────────────
                 "branch" if !sub_arg.is_empty() => {
-                    match super::edge_tools::memoria::memoria_branch_create(sub_arg).await {
+                    match crate::edge_tools::memoria::memoria_branch_create(sub_arg).await {
                         Ok(_) => {
                             eprintln!(
                                 "  {} Branch '{}' created",
@@ -402,7 +402,7 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
                 "checkout" if !sub_arg.is_empty() => {
-                    match super::edge_tools::memoria::memoria_branch_checkout(sub_arg).await {
+                    match crate::edge_tools::memoria::memoria_branch_checkout(sub_arg).await {
                         Ok(_) => eprintln!(
                             "  {} Switched to branch '{}'",
                             theme::icon_ok(),
@@ -412,7 +412,7 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
                 "merge" if !sub_arg.is_empty() => {
-                    match super::edge_tools::memoria::memoria_branch_merge(sub_arg).await {
+                    match crate::edge_tools::memoria::memoria_branch_merge(sub_arg).await {
                         Ok(_) => {
                             eprintln!(
                                 "  {} Branch '{}' merged",
@@ -425,10 +425,10 @@ pub(super) async fn handle_memory_domain_command(
                 }
                 "diff" if !sub_arg.is_empty() => {
                     // Try branch diff first; fall back to snapshot diff on 404.
-                    match super::edge_tools::memoria::memoria_branch_diff(sub_arg).await {
+                    match crate::edge_tools::memoria::memoria_branch_diff(sub_arg).await {
                         Ok(body) => print_memory_diff(&body, sub_arg),
                         Err(branch_err) => {
-                            match super::edge_tools::memoria::memoria_snapshot_diff(sub_arg).await {
+                            match crate::edge_tools::memoria::memoria_snapshot_diff(sub_arg).await {
                                 Ok(body) => print_memory_diff(&body, sub_arg),
                                 Err(_) => eprintln!(
                                     "  {} diff failed (branch: {branch_err})",
@@ -438,19 +438,19 @@ pub(super) async fn handle_memory_domain_command(
                         }
                     }
                 }
-                "branches" => match super::edge_tools::memoria::memoria_branches_list().await {
+                "branches" => match crate::edge_tools::memoria::memoria_branches_list().await {
                     Ok(body) => print_branches_list(&body),
                     Err(e) => eprintln!("  {} {e}", theme::icon_err()),
                 },
                 // ─── Cloud: Analysis ─────────────────────────────
                 "reflect" => {
                     eprintln!("  {} Analyzing memory patterns...", "⋯".dim());
-                    match super::edge_tools::memoria::memoria_reflect().await {
+                    match crate::edge_tools::memoria::memoria_reflect().await {
                         Ok(body) => print_reflect_result(&body),
                         Err(e) => eprintln!("  {} {e}", theme::icon_err()),
                     }
                 }
-                "health" => match super::edge_tools::memoria::memoria_health().await {
+                "health" => match crate::edge_tools::memoria::memoria_health().await {
                     Ok(body) => print_health_status(&body),
                     Err(e) => eprintln!("  {} {e}", theme::icon_err()),
                 },
@@ -1306,7 +1306,7 @@ fn append_section_block(
     }
 }
 
-pub(super) async fn load_current_session_memory_body_with_profile(
+pub(crate) async fn load_current_session_memory_body_with_profile(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     session_id: &str,

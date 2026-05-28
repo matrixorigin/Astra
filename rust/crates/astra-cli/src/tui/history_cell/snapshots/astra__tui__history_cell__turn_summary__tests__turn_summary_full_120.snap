@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/turn_summary.rs
+assertion_line: 376
 expression: "render(&mk_full(), 120)"
 ---
   ─ ⏱ 16s (ttft 1.8s) │ ⚡  23.6k ↑23.2k ↓408 │ 🛠 2 │ Σ 145.0k · $0.014 ─

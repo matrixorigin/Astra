@@ -24,8 +24,8 @@ use serde::Serialize;
 
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
 
-use crate::cli_args;
-use crate::journal_digest;
+use crate::cli::cli_args;
+use crate::cli::journal_digest;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct JournalDiff {
@@ -286,7 +286,7 @@ pub fn render_text(diff: &JournalDiff) -> String {
     s
 }
 
-pub fn run_diff(args: &cli_args::JournalDiffArgs) -> Result<(), String> {
+pub(crate) fn run_diff(args: &cli_args::JournalDiffArgs) -> Result<(), String> {
     let a = journal_digest::resolve_session_for_digest(Some(&args.a), None)?;
     let b = journal_digest::resolve_session_for_digest(Some(&args.b), None)?;
     let diff = compute_diff(&a, &b)?;

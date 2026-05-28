@@ -2688,7 +2688,9 @@ fn lsp_document_symbols_requires_file() {
     assert!(result.contains("file"));
 }
 
+#[cfg(unix)]
 #[test]
+#[serial_test::serial]
 fn lsp_workspace_symbols_with_query() {
     let dir = tempfile::tempdir().unwrap();
     let exe = ToolExecutor::new(dir.path());
@@ -3482,7 +3484,9 @@ fn lsp_code_actions_apply_selected_item_with_real_typescript_language_server() {
     );
 }
 
+#[cfg(unix)]
 #[test]
+#[serial_test::serial]
 fn lsp_rename_falls_back_to_rename_symbol() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("main.rs"), "fn hello() { hello(); }\n").unwrap();

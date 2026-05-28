@@ -34,11 +34,11 @@ use astra_runtime::{
 use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
 use serde_json::{Value, json};
 
-use super::edge_tools;
 use super::effects::ChatTurnPrepLineGuard;
 use super::permission_manager::{PermissionManager, PermissionMode};
 use super::stream_render::{EdgeSseContext, RenderPolicy, consume_turn_sse};
-use crate::chat_stream::turn_policy_from_payload_edge_tools;
+use crate::cli::chat_stream::turn_policy_from_payload_edge_tools;
+use crate::edge_tools;
 
 const SUBRUN_MAX_TURNS: usize = 25;
 
@@ -85,10 +85,10 @@ pub(crate) struct SubRunHost {
     /// Agent identifier used to tag progress events.
     pub(crate) agent_id: String,
     /// Fine-grained live stream for spawned-agent UI drill-in.
-    pub(crate) stream_event_tx: Option<crate::chat_stream::StreamEventTx>,
+    pub(crate) stream_event_tx: Option<crate::cli::chat_stream::StreamEventTx>,
     /// Direct live stream sink for spawned agents; avoids buffering
     /// child output through an unbounded channel.
-    pub(crate) stream_event_sink: Option<crate::chat_stream::SharedStreamEventSink>,
+    pub(crate) stream_event_sink: Option<crate::cli::chat_stream::SharedStreamEventSink>,
     /// Cross-turn tool output cache for edge-path dedup within this sub-run.
     pub(crate) tool_cache: super::stream_render::EdgeToolCache,
     /// Captured parent prefix, if the spawner resolved one. Consumed
@@ -202,6 +202,7 @@ impl AgenticLoopHost for SubRunHost {
             session_id: state.current_session_id.as_deref(),
             agent_id: Some(self.agent_id.as_str()),
             model: effective_model,
+            interaction_mode: Some(interaction_mode.label()),
             explain_verbose: false,
             explain_on: false,
             edge_executor_id: "subrun",
@@ -837,7 +838,7 @@ mod tests {
             agent_id: String::new(),
             stream_event_tx: None,
             stream_event_sink: None,
-            tool_cache: crate::stream_render::EdgeToolCache::new(3),
+            tool_cache: crate::cli::stream_render::EdgeToolCache::new(3),
             inherited_prefix: None,
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
@@ -868,7 +869,7 @@ mod tests {
             agent_id: "test-agent".to_string(),
             stream_event_tx: None,
             stream_event_sink: None,
-            tool_cache: crate::stream_render::EdgeToolCache::new(3),
+            tool_cache: crate::cli::stream_render::EdgeToolCache::new(3),
             inherited_prefix: None,
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
@@ -898,7 +899,7 @@ mod tests {
             agent_id: String::new(),
             stream_event_tx: None,
             stream_event_sink: None,
-            tool_cache: crate::stream_render::EdgeToolCache::new(3),
+            tool_cache: crate::cli::stream_render::EdgeToolCache::new(3),
             inherited_prefix: None,
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),

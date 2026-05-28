@@ -15,7 +15,7 @@
 //! cli_list!([("Name", "John"), ("Age", "30")]);
 //! ```
 
-use crate::theme;
+use crate::cli::theme;
 use crossterm::style::Stylize;
 
 /// Print a success message with ✓ icon.
@@ -24,7 +24,7 @@ use crossterm::style::Stylize;
 #[macro_export]
 macro_rules! cli_ok {
     ($($arg:tt)*) => {{
-        use $crate::theme::icon_ok;
+        use $crate::cli::theme::icon_ok;
         eprintln!("  {} {}", icon_ok(), format!($($arg)*));
     }};
 }
@@ -35,7 +35,7 @@ macro_rules! cli_ok {
 #[macro_export]
 macro_rules! cli_warn {
     ($($arg:tt)*) => {{
-        use $crate::theme::icon_warn;
+        use $crate::cli::theme::icon_warn;
         use crossterm::style::Stylize;
         eprintln!("  {} {}", icon_warn(), format!($($arg)*).yellow());
     }};
@@ -47,7 +47,7 @@ macro_rules! cli_warn {
 #[macro_export]
 macro_rules! cli_err {
     ($($arg:tt)*) => {{
-        use $crate::theme::icon_err;
+        use $crate::cli::theme::icon_err;
         use crossterm::style::Stylize;
         eprintln!("  {} {}", icon_err(), format!($($arg)*).red());
     }};
@@ -59,7 +59,7 @@ macro_rules! cli_err {
 #[macro_export]
 macro_rules! cli_info {
     ($($arg:tt)*) => {{
-        use $crate::theme::icon_info;
+        use $crate::cli::theme::icon_info;
         eprintln!("  {} {}", icon_info(), format!($($arg)*));
     }};
 }
@@ -71,7 +71,7 @@ macro_rules! cli_info {
 macro_rules! cli_section {
     ($title:expr) => {{
         use crossterm::style::Stylize;
-        use $crate::theme::section;
+        use $crate::cli::theme::section;
         eprintln!();
         eprintln!("  {}", section($title).bold());
     }};

@@ -277,7 +277,7 @@ impl ToolExecutor {
                 *pinned = previous_pinned_tools.clone();
                 *deprioritized = previous_deprioritized_tools.clone();
                 if let Some(session_id) = self.active_session_id()
-                    && let Err(error) = crate::self_command::persist_tool_preferences(
+                    && let Err(error) = crate::cli::self_command::persist_tool_preferences(
                         &session_id,
                         &pinned,
                         &deprioritized,
@@ -298,7 +298,7 @@ impl ToolExecutor {
             } => {
                 self.restore_observability_snapshot(snapshot)?;
                 if let Some(session_id) = self.active_session_id() {
-                    crate::self_command::persist_config_override(
+                    crate::cli::self_command::persist_config_override(
                         &session_id,
                         path,
                         old_value.clone(),

@@ -4,7 +4,7 @@
 //! These types bridge the agentic runtime with the CLI display logic.
 
 /// Re-export of the verdict audit event type for convenience.
-pub(crate) type VerdictEvent = astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent;
+pub(crate) type VerdictEvent = astra_turn_core::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 
 /// Partial data rescued from `AgenticLoopState` when a turn fails.
 /// Enables enriched error logging, failure learning, and post-mortem analysis.

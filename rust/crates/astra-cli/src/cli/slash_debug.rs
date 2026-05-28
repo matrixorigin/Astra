@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 /// In TUI mode this is shadowed by TuiHandler::Panel (InfoView).
 /// Kept for headless / non-interactive execution paths.
 #[allow(dead_code)]
-pub(super) fn handle_debug_command(arg: &str, state: &SessionState) {
+pub(crate) fn handle_debug_command(arg: &str, state: &SessionState) {
     let session_id = if arg.is_empty() {
         match &state.session_id {
             Some(id) => id.clone(),
@@ -1381,7 +1381,7 @@ mod tests {
 
     #[test]
     fn tool_display_skill() {
-        use super::super::stream_render::format_tool_display_from_preview;
+        use crate::cli::stream_render::format_tool_display_from_preview;
         assert_eq!(
             format_tool_display_from_preview("skill", Some("code-review")),
             "Running skill: code-review"
@@ -1390,7 +1390,7 @@ mod tests {
 
     #[test]
     fn tool_display_mcp() {
-        use super::super::stream_render::format_tool_display_from_preview;
+        use crate::cli::stream_render::format_tool_display_from_preview;
         assert_eq!(
             format_tool_display_from_preview("mcp_github_get_pr", None),
             "MCP github "
@@ -1399,7 +1399,7 @@ mod tests {
 
     #[test]
     fn tool_display_bash() {
-        use super::super::stream_render::format_tool_display_from_preview;
+        use crate::cli::stream_render::format_tool_display_from_preview;
         assert_eq!(
             format_tool_display_from_preview("bash", Some("cargo test")),
             "$ cargo test"
@@ -1408,7 +1408,7 @@ mod tests {
 
     #[test]
     fn tool_display_read_file() {
-        use super::super::stream_render::format_tool_display_from_preview;
+        use crate::cli::stream_render::format_tool_display_from_preview;
         assert_eq!(
             format_tool_display_from_preview("read_file", Some("src/main.rs")),
             "Reading: src/main.rs"

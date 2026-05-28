@@ -1,14 +1,49 @@
-use super::*;
-use crate::chat_turn::is_auth_error;
-use crate::permission_manager::PermissionMode;
+use super::session_continuation::*;
+use crate::cli::arg_render::{
+    apply_system_prompt, join_words, render_agent_args, render_bug_args, render_debug_args,
+    render_diff_args, render_grep_args, render_memory_args, render_messaging_args,
+    render_permissions_args, render_review_args, render_task_args, render_team_args,
+};
+use crate::cli::auth_flow::*;
+use crate::cli::chat_turn::is_auth_error;
+use crate::cli::cli_args::*;
+use crate::cli::cli_utils::*;
+use crate::cli::config_manager::{
+    execute_config_command, latest_artifact_id, resolve_download_output_path,
+    resolve_remote_session_id, write_downloaded_capture,
+};
+use crate::cli::interactive_chat::run_interactive_chat;
+use crate::cli::mcp_config::execute_mcp_command;
+use crate::cli::permission_manager::{PermissionManager, PermissionMode};
+use crate::cli::project_instructions::*;
+use crate::cli::session_runtime;
+use crate::cli::session_runtime::*;
+use crate::cli::session_state::*;
+use crate::cli::skill_catalog::{
+    SkillCatalogFilter, list_skill_record_from_registry, load_skill_record_from_registry,
+    normalize_source_filter,
+};
+use crate::cli::slash_bug::*;
+use crate::cli::slash_debug::*;
+use crate::cli::slash_info::*;
+use crate::cli::slash_memory::*;
+use crate::cli::slash_messaging::*;
+use crate::cli::streaming_types::*;
+use crate::cli::{
+    agent_loader, cli_utils, delegate_subrun, diff_presenter, journal_diff, journal_digest,
+    journal_tree, slash_agent, slash_inspect, slash_task, slash_team, slash_telemetry, theme,
+};
 use astra_thin_client::paths;
 use clap::CommandFactory;
-use crossterm::style::Stylize;
-use std::io::{Read, Write};
+use crossterm::{style::Stylize, terminal};
+use std::{
+    fs,
+    io::{Read, Write},
+};
 
 /// Exit codes for CLI commands (for scripting integration)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ExitCode {
+pub(crate) enum ExitCode {
     /// Success (0)
     Success = 0,
     /// Tool execution failure (1) - at least one tool call failed
@@ -37,323 +72,6 @@ async fn start_http_server(host: &str, port: u16) -> Result<(), String> {
 impl From<ExitCode> for i32 {
     fn from(code: ExitCode) -> i32 {
         code as i32
-    }
-}
-
-/// Load conversation messages from a session's latest heavy checkpoint.
-/// Used by one-shot mode (`-m "..." --session-id <id>`) to provide
-/// conversation history that the model needs for multi-turn continuity.
-///
-/// Returns `None` if the session has no checkpoint (first turn) or
-/// the checkpoint is unreadable.
-fn load_session_messages_for_continuation(session_id: &str) -> Option<Vec<serde_json::Value>> {
-    match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(session_id) {
-        Ok(Some(cp)) if !cp.messages.is_empty() => {
-            Some(sanitize_continuation_messages(cp.messages))
-        }
-        _ => None,
-    }
-}
-
-/// Strip runtime-injected scaffolding messages that must not persist across
-/// turn boundaries. Without this, harness nudges (injected as "user" role)
-/// bias the model toward tool usage on the next turn even when the user's
-/// new message is purely conversational.
-fn sanitize_continuation_messages(mut msgs: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
-    msgs.retain(|m| {
-        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        let content_text = extract_text_content(m);
-        let content = content_text.as_deref().unwrap_or("");
-        match role {
-            "user" => !is_runtime_injected_user_msg(content),
-            "system" => !is_runtime_injected_system_msg(content),
-            _ => true,
-        }
-    });
-    trim_trailing_incomplete_tool_round(&mut msgs);
-    msgs
-}
-
-/// Extract text content from a message regardless of format.
-/// Handles both string content and array-format content blocks.
-fn extract_text_content(msg: &serde_json::Value) -> Option<String> {
-    if let Some(s) = msg.get("content").and_then(|c| c.as_str()) {
-        return Some(s.to_string());
-    }
-    if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
-        let texts: Vec<&str> = arr
-            .iter()
-            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-            .collect();
-        if !texts.is_empty() {
-            return Some(texts.join("\n"));
-        }
-    }
-    None
-}
-
-fn is_runtime_injected_user_msg(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    trimmed.starts_with("## ⚠ Sequential Tool Calls Detected")
-        || trimmed.starts_with("✓ Previous round:")
-        || trimmed.starts_with("[attention:")
-        || trimmed.starts_with("[working-set:")
-        || trimmed.starts_with("[session-anchor]")
-}
-
-fn is_runtime_injected_system_msg(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    trimmed.starts_with("[working-set:")
-        || trimmed.starts_with("[attention:")
-        || trimmed.starts_with("[session-anchor]")
-        || trimmed.starts_with("## Already Fetched")
-        || trimmed.starts_with("## Cross-Session Project Context")
-        || trimmed.starts_with("✓ ")
-}
-
-/// If the conversation ends with an incomplete tool round (assistant tool_use
-/// → tool results, but no final assistant text), trim back to the last
-/// complete exchange. This prevents the model from continuing a stale tool
-/// loop from the previous turn.
-fn trim_trailing_incomplete_tool_round(msgs: &mut Vec<serde_json::Value>) {
-    // Walk backwards: if the tail is tool/assistant-tool_use pattern without
-    // a final assistant-text, find the cut point.
-    let mut cut_at = None;
-    for i in (0..msgs.len()).rev() {
-        let role = msgs[i].get("role").and_then(|r| r.as_str()).unwrap_or("");
-        match role {
-            "tool" => continue,
-            "assistant" => {
-                if has_tool_use_content(&msgs[i]) {
-                    cut_at = Some(i);
-                    continue;
-                }
-                // Assistant with text content — this is a valid end point.
-                break;
-            }
-            _ => break,
-        }
-    }
-    if let Some(cut) = cut_at {
-        msgs.truncate(cut);
-    }
-}
-
-fn has_tool_use_content(msg: &serde_json::Value) -> bool {
-    if msg
-        .get("tool_calls")
-        .and_then(|v| v.as_array())
-        .is_some_and(|a| !a.is_empty())
-    {
-        return true;
-    }
-    if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
-        return content
-            .iter()
-            .any(|c| c.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
-    }
-    false
-}
-
-/// Prepend system prompt to user message when `--system-prompt` is set.
-fn apply_system_prompt(message: &str, system_prompt: Option<&str>) -> String {
-    match system_prompt {
-        Some(sp) => format!("<system_instructions>\n{sp}\n</system_instructions>\n\n{message}"),
-        None => message.to_string(),
-    }
-}
-fn join_words(words: &[String]) -> String {
-    words.join(" ")
-}
-
-fn render_team_args(args: &TeamArgs) -> String {
-    match &args.command {
-        None | Some(TeamSubcommand::List) => String::new(),
-        Some(TeamSubcommand::Create(cmd)) => {
-            let suffix = join_words(&cmd.description);
-            if suffix.is_empty() {
-                format!("create {}", cmd.name)
-            } else {
-                format!("create {} {}", cmd.name, suffix)
-            }
-        }
-        Some(TeamSubcommand::AddMember(cmd)) => {
-            let suffix = join_words(&cmd.description);
-            if suffix.is_empty() {
-                format!("add-member {} {}", cmd.team, cmd.role)
-            } else {
-                format!("add-member {} {} {}", cmd.team, cmd.role, suffix)
-            }
-        }
-        Some(TeamSubcommand::Info(cmd)) => format!("info {}", cmd.name),
-        Some(TeamSubcommand::Delete(cmd)) => format!("delete {}", cmd.name),
-        Some(TeamSubcommand::Context(cmd)) => {
-            format!(
-                "context {} {} {}",
-                cmd.team,
-                cmd.key,
-                join_words(&cmd.value)
-            )
-        }
-        Some(TeamSubcommand::Run(cmd)) => format!("run {} {}", cmd.team, join_words(&cmd.task)),
-        Some(TeamSubcommand::History(cmd)) => format!("history {}", cmd.name),
-        Some(TeamSubcommand::Snapshot(cmd)) => {
-            let suffix = join_words(&cmd.label);
-            if suffix.is_empty() {
-                format!("snapshot {}", cmd.team)
-            } else {
-                format!("snapshot {} {}", cmd.team, suffix)
-            }
-        }
-        Some(TeamSubcommand::Restore(cmd)) => format!("restore {} {}", cmd.team, cmd.snapshot_id),
-    }
-}
-
-fn render_task_args(args: &TaskArgs) -> String {
-    match &args.command {
-        None | Some(TaskSubcommand::List) => String::new(),
-        Some(TaskSubcommand::Add(cmd)) => format!("add {}", join_words(&cmd.text)),
-        Some(TaskSubcommand::Done(cmd)) => format!("done {}", join_words(&cmd.query)),
-        Some(TaskSubcommand::Status(cmd)) => format!("status {}", join_words(&cmd.query)),
-        Some(TaskSubcommand::Run(cmd)) => format!("run {}", join_words(&cmd.text)),
-        Some(TaskSubcommand::Queue(cmd)) => format!("add {}", join_words(&cmd.text)),
-        Some(TaskSubcommand::Worker(_)) => "worker".to_string(),
-        Some(TaskSubcommand::Result(cmd)) => format!("result {}", join_words(&cmd.query)),
-    }
-}
-
-fn render_memory_args(args: &MemoryArgs) -> String {
-    match &args.command {
-        None => String::new(),
-        Some(MemorySubcommand::List(cmd)) => {
-            let mut parts = Vec::new();
-            if let Some(ty) = &cmd.memory_type {
-                parts.push(format!("--type {ty}"));
-            }
-            if cmd.limit != 20 {
-                parts.push(format!("--limit {}", cmd.limit));
-            }
-            if parts.is_empty() {
-                String::new()
-            } else {
-                parts.join(" ")
-            }
-        }
-        Some(MemorySubcommand::Search(cmd)) => format!("search {}", join_words(&cmd.query)),
-        Some(MemorySubcommand::Show(cmd)) => format!("show {}", cmd.memory_id),
-        Some(MemorySubcommand::Forget(cmd)) => {
-            if let Some(reason) = &cmd.reason {
-                format!("forget {} --reason {}", cmd.memory_id, reason)
-            } else {
-                format!("forget {}", cmd.memory_id)
-            }
-        }
-    }
-}
-
-fn render_review_args(args: &ReviewArgs) -> String {
-    match &args.command {
-        Some(ReviewSubcommand::Head) => String::new(),
-        Some(ReviewSubcommand::Working) => "working".to_string(),
-        Some(ReviewSubcommand::Rev(cmd)) => join_words(&cmd.target),
-        None => join_words(&args.target),
-    }
-}
-
-fn render_grep_args(args: &GrepArgs) -> String {
-    match &args.command {
-        Some(GrepSubcommand::Content(cmd)) => join_words(&cmd.pattern),
-        Some(GrepSubcommand::Files(cmd)) => format!("files {}", join_words(&cmd.pattern)),
-        Some(GrepSubcommand::Review(cmd)) => format!("review {}", join_words(&cmd.pattern)),
-        None => join_words(&args.pattern),
-    }
-}
-
-fn render_permissions_args(args: &PermissionsArgs) -> String {
-    match &args.command {
-        None => String::new(),
-        Some(PermissionsSubcommand::Status) => "status".to_string(),
-        Some(PermissionsSubcommand::Auto) => "auto".to_string(),
-        Some(PermissionsSubcommand::AcceptEdits) => "accept_edits".to_string(),
-        Some(PermissionsSubcommand::Plan) => "plan".to_string(),
-        Some(PermissionsSubcommand::Prompt) => "prompt".to_string(),
-        Some(PermissionsSubcommand::Deny) => "deny".to_string(),
-        Some(PermissionsSubcommand::All) => "all".to_string(),
-        Some(PermissionsSubcommand::Rules) => "rules".to_string(),
-        Some(PermissionsSubcommand::Trust) => "trust".to_string(),
-        Some(PermissionsSubcommand::Untrust) => "untrust".to_string(),
-        Some(PermissionsSubcommand::Trace(cmd)) => match &cmd.export {
-            Some(path) => format!("trace --export {}", path.display()),
-            None => "trace".to_string(),
-        },
-    }
-}
-
-fn render_debug_args(args: &DebugArgs) -> String {
-    args.session_id.clone().unwrap_or_default()
-}
-
-fn render_agent_args(args: &AgentArgs) -> String {
-    match &args.command {
-        None | Some(AgentSubcommand::List) => String::new(),
-        Some(AgentSubcommand::Status(cmd)) => format!("status {}", cmd.agent_id),
-        Some(AgentSubcommand::Stop(cmd)) => format!("stop {}", cmd.agent_id),
-        Some(AgentSubcommand::Logs(cmd)) => format!("logs {}", cmd.agent_id),
-    }
-}
-
-fn render_messaging_args(args: &MessagingArgs) -> String {
-    match &args.command {
-        None | Some(MessagingSubcommand::Metrics) => String::new(),
-        Some(MessagingSubcommand::Dlq) => "dlq".to_string(),
-        Some(MessagingSubcommand::Status) => "status".to_string(),
-    }
-}
-
-fn render_diff_args(args: &DiffArgs) -> String {
-    match &args.command {
-        None => join_words(&args.paths),
-        Some(DiffSubcommand::Staged(cmd)) => {
-            let suffix = join_words(&cmd.paths);
-            if suffix.is_empty() {
-                "staged".to_string()
-            } else {
-                format!("staged {suffix}")
-            }
-        }
-        Some(DiffSubcommand::Unstaged(cmd)) => {
-            let suffix = join_words(&cmd.paths);
-            if suffix.is_empty() {
-                "unstaged".to_string()
-            } else {
-                format!("unstaged {suffix}")
-            }
-        }
-        Some(DiffSubcommand::Stat(cmd)) => {
-            let suffix = join_words(&cmd.paths);
-            if suffix.is_empty() {
-                "stat".to_string()
-            } else {
-                format!("stat {suffix}")
-            }
-        }
-        Some(DiffSubcommand::Show(cmd)) => {
-            let suffix = join_words(&cmd.paths);
-            if suffix.is_empty() {
-                format!("show {}", cmd.rev)
-            } else {
-                format!("show {} {}", cmd.rev, suffix)
-            }
-        }
-    }
-}
-
-fn render_bug_args(args: &BugArgs) -> String {
-    match &args.command {
-        None | Some(BugSubcommand::Print) => String::new(),
-        Some(BugSubcommand::Copy) => "copy".to_string(),
-        Some(BugSubcommand::Save) => "save".to_string(),
     }
 }
 
@@ -475,6 +193,7 @@ async fn execute_headless_task_body(
     profile: Option<&str>,
     global_model: Option<&str>,
     api: &astra_thin_client::ThinClient,
+    cli_context: &crate::cli::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
     let HeadlessTaskInput {
         task_id,
@@ -526,22 +245,23 @@ async fn execute_headless_task_body(
 
     let (stream_event_tx, stream_event_writer) = if options.stream_events {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let handle = crate::stream_events_writer::spawn_stderr_writer(rx);
+        let handle = crate::cli::stream_events_writer::spawn_stderr_writer(rx);
         (Some(tx), Some(handle))
     } else {
         (None, None)
     };
 
     let render_policy = if options.quiet || options.json {
-        crate::stream_render::RenderPolicy::Silent
+        crate::cli::stream_render::RenderPolicy::Silent
     } else {
-        crate::stream_render::RenderPolicy::Stream
+        crate::cli::stream_render::RenderPolicy::Stream
     };
     // Headless single-shot path: use the MO-backed task store when available
     // so session_todos is authoritative here the same way it is in the REPL.
-    let task_store = crate::session_runtime::resolve_task_store(profile, Some(&api.api_origin()))
-        .await
-        .0;
+    let task_store =
+        crate::cli::session_runtime::resolve_task_store(profile, Some(&api.api_origin()))
+            .await
+            .0;
     let task_manager = std::sync::Arc::new(crate::edge_tools::TaskManager::new(
         session_id
             .clone()
@@ -549,7 +269,7 @@ async fn execute_headless_task_body(
         task_store,
     ));
 
-    let chat_ctx = crate::chat_stream::BasicCliChatContext {
+    let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
         api,
         auth_profile: profile,
         message: &prompt,
@@ -559,6 +279,7 @@ async fn execute_headless_task_body(
         render_md: terminal::size().is_ok() && !options.quiet && !options.json,
         verbose_mode: !options.quiet && !options.json,
         render_policy,
+        cli_context: Some(cli_context),
         unified_skill_registry: &pipeline_modules.unified_skill_registry,
         skill_search: &skill_search,
         agent_spawner: Some(spawner),
@@ -576,28 +297,19 @@ async fn execute_headless_task_body(
         ))),
     };
 
-    let mut sr = match stream_chat_sse(ChatTurnParams::basic_cli(
+    let turn_options = crate::cli::turn_facade::BasicCliTurnOptions::default();
+    let mut sr = match crate::cli::turn_facade::execute_basic_cli_turn(
         &chat_ctx,
         &token,
         session_id.as_deref(),
+        None,
         &mut pm,
         &mut skill_qt,
-    ))
+        turn_options,
+    )
     .await
     {
         Ok(sr) => sr,
-        Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
-            let _ = clear_profile_last_session(profile);
-            stream_chat_sse(ChatTurnParams::basic_cli(
-                &chat_ctx,
-                &token,
-                None,
-                &mut pm,
-                &mut skill_qt,
-            ))
-            .await
-            .map_err(|f| f.error)?
-        }
         Err(e) => {
             let _ = svc.fail_task(&task_id, &e.error).await;
             emit_task_event(
@@ -751,6 +463,7 @@ async fn execute_headless_task_run(
     profile: Option<&str>,
     global_model: Option<&str>,
     api: &astra_thin_client::ThinClient,
+    cli_context: &crate::cli::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
     use astra_services::TaskCreateRequest;
 
@@ -759,16 +472,16 @@ async fn execute_headless_task_run(
         return Err("task prompt cannot be empty".to_string());
     }
 
-    let session_id = match std::env::var("ASTRA_CLI_SESSION_ID") {
-        Ok(value) => Some(value),
-        Err(_) => validated_resumable_last_session_id(api, profile).await,
+    let session_id = match cli_context.session_id.clone() {
+        Some(session_id) => Some(session_id),
+        None => validated_resumable_last_session_id(api, profile).await,
     };
-    let user_id = "local";
+    let user_id = cli_user_id();
     let task_session_id = session_id.as_deref().unwrap_or("no-session");
     let svc = session_runtime::resolve_task_service(profile).await;
     let task_id = svc
         .create_task(
-            user_id,
+            &user_id,
             task_session_id,
             TaskCreateRequest {
                 title: task_run_title(&prompt),
@@ -797,11 +510,15 @@ async fn execute_headless_task_run(
         profile,
         global_model,
         api,
+        cli_context,
     )
     .await
 }
 
-async fn execute_task_queue(args: TaskQueueArgs) -> Result<ExitCode, String> {
+async fn execute_task_queue(
+    args: TaskQueueArgs,
+    cli_context: &crate::cli::cli_context::CliContext,
+) -> Result<ExitCode, String> {
     use astra_services::TaskCreateRequest;
 
     let prompt = join_words(&args.text);
@@ -813,10 +530,14 @@ async fn execute_task_queue(args: TaskQueueArgs) -> Result<ExitCode, String> {
     // Per-user CLI sessions use `astra task worker` which threads
     // profile through.
     let (svc, _) = session_runtime::resolve_cloud_task_runtime(None).await?;
-    let session_id = std::env::var("ASTRA_CLI_SESSION_ID").unwrap_or_else(|_| "cloud-queue".into());
+    let session_id = cli_context
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "cloud-queue".into());
+    let user_id = cli_user_id();
     let task_id = svc
         .create_task(
-            "local",
+            &user_id,
             &session_id,
             TaskCreateRequest {
                 title: task_run_title(&prompt),
@@ -874,14 +595,15 @@ async fn execute_task_worker_once(
     profile: Option<&str>,
     global_model: Option<&str>,
     api: &astra_thin_client::ThinClient,
+    cli_context: &crate::cli::cli_context::CliContext,
 ) -> Result<WorkerOutcome, String> {
     use astra_services::{LeaseClaimResult, TaskStatus};
 
     let (svc, lease_svc) = session_runtime::resolve_cloud_task_runtime(profile).await?;
-    let user_id = "local";
+    let user_id = cli_user_id();
     let agent_id = args.agent_id.clone().unwrap_or_else(default_task_agent_id);
     let edge_id = std::env::var("ASTRA_EDGE_ID").unwrap_or_else(|_| agent_id.clone());
-    let pending_tasks = svc.list_tasks(user_id, Some(TaskStatus::Pending)).await?;
+    let pending_tasks = svc.list_tasks(&user_id, Some(TaskStatus::Pending)).await?;
     if pending_tasks.is_empty() {
         if args.json {
             println!(
@@ -902,7 +624,7 @@ async fn execute_task_worker_once(
         // on the first flaky query. Log and try the next candidate.
         let claim = match lease_svc
             .try_claim_lease(
-                user_id,
+                &user_id,
                 &candidate.task_id,
                 &agent_id,
                 &edge_id,
@@ -989,7 +711,7 @@ async fn execute_task_worker_once(
         Ok(Some(t)) => t,
         Ok(None) => {
             if let Err(e) = lease_svc
-                .release_lease(user_id, &claimed_task_id, &agent_id)
+                .release_lease(&user_id, &claimed_task_id, &agent_id)
                 .await
             {
                 tracing::warn!(
@@ -1002,7 +724,7 @@ async fn execute_task_worker_once(
         }
         Err(e) => {
             if let Err(re) = lease_svc
-                .release_lease(user_id, &claimed_task_id, &agent_id)
+                .release_lease(&user_id, &claimed_task_id, &agent_id)
                 .await
             {
                 tracing::warn!(
@@ -1041,6 +763,7 @@ async fn execute_task_worker_once(
     // cooperative cancel-and-await below).
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancel_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let renewal_user_id = user_id.clone();
     let mut renewal_handle: Option<tokio::task::JoinHandle<()>> = Some({
         let lease_svc = lease_svc.clone();
         let task_id = task.task_id.clone();
@@ -1063,7 +786,7 @@ async fn execute_task_worker_once(
                     return;
                 }
                 if let Err(e) = lease_svc
-                    .renew_lease(user_id, &task_id, &agent_id, &edge_id, ttl)
+                    .renew_lease(&renewal_user_id, &task_id, &agent_id, &edge_id, ttl)
                     .await
                 {
                     tracing::debug!(
@@ -1105,6 +828,7 @@ async fn execute_task_worker_once(
             profile,
             global_model,
             api,
+            cli_context,
         ) => (res, false),
         _ = tokio::signal::ctrl_c() => {
             if !args.quiet && !args.json {
@@ -1156,28 +880,30 @@ async fn execute_task_worker_once(
     if interrupted {
         use std::time::Duration;
         let revert_timeout = Duration::from_secs(5);
-        let still_ours =
-            match tokio::time::timeout(revert_timeout, lease_svc.get_lease(user_id, &task.task_id))
-                .await
-            {
-                Ok(Ok(Some(view))) => view.holder_agent_id == agent_id,
-                Ok(Ok(None)) => false, // lease already expired / released
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        task_id = %task.task_id,
-                        error = %e,
-                        "get_lease before revert failed — skipping revert"
-                    );
-                    false
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        task_id = %task.task_id,
-                        "get_lease timed out before revert — skipping revert"
-                    );
-                    false
-                }
-            };
+        let still_ours = match tokio::time::timeout(
+            revert_timeout,
+            lease_svc.get_lease(&user_id, &task.task_id),
+        )
+        .await
+        {
+            Ok(Ok(Some(view))) => view.holder_agent_id == agent_id,
+            Ok(Ok(None)) => false, // lease already expired / released
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    task_id = %task.task_id,
+                    error = %e,
+                    "get_lease before revert failed — skipping revert"
+                );
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    task_id = %task.task_id,
+                    "get_lease timed out before revert — skipping revert"
+                );
+                false
+            }
+        };
         if still_ours {
             let revert = tokio::time::timeout(
                 revert_timeout,
@@ -1215,7 +941,7 @@ async fn execute_task_worker_once(
     }
 
     let release_result = lease_svc
-        .release_lease(user_id, &task.task_id, &agent_id)
+        .release_lease(&user_id, &task.task_id, &agent_id)
         .await;
     match release_result {
         Ok(true) => {
@@ -1438,18 +1164,21 @@ async fn execute_task_worker(
     profile: Option<&str>,
     global_model: Option<&str>,
     api: &astra_thin_client::ThinClient,
+    cli_context: &crate::cli::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
     if !args.once && !args.loop_mode {
         return Err("choose --once or --loop for task worker".to_string());
     }
     if args.once {
-        return match execute_task_worker_once(&args, profile, global_model, api).await? {
+        return match execute_task_worker_once(&args, profile, global_model, api, cli_context)
+            .await?
+        {
             WorkerOutcome::Completed(code) => Ok(code),
             WorkerOutcome::Interrupted => Ok(ExitCode::Success),
         };
     }
     loop {
-        match execute_task_worker_once(&args, profile, global_model, api).await? {
+        match execute_task_worker_once(&args, profile, global_model, api, cli_context).await? {
             WorkerOutcome::Completed(code) if code != ExitCode::Success => return Ok(code),
             WorkerOutcome::Completed(_) => {}
             // User Ctrl+C'd mid-task — exit the loop now so they don't
@@ -1631,16 +1360,11 @@ async fn execute_repl_bridge_command(
     profile: Option<&str>,
     global_model: Option<&str>,
     api: &astra_thin_client::ThinClient,
+    cli_context: &crate::cli::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
     try_silent_auth(api, profile).await;
 
-    let mut state = initialize_session_state(profile, global_model);
-    if let Ok(sid) = std::env::var("ASTRA_CLI_SESSION_ID") {
-        state.set_session_id(sid);
-    }
-    if let Ok(name) = std::env::var("ASTRA_CLI_SESSION_NAME") {
-        state.session_name = Some(name);
-    }
+    let mut state = initialize_session_state(profile, global_model, cli_context);
     if slash_cmd == "/messaging" {
         handle_messaging_command(arg, &state);
         return Ok(ExitCode::Success);
@@ -1672,8 +1396,14 @@ async fn execute_repl_bridge_command(
             handle_memory_domain_command("/memory", arg, api, &mut state, token.as_deref()).await?
         }
         "/plan" => {
-            crate::slash_plan::handle_plan_command(arg, api, profile, &mut state, token.as_deref())
-                .await?
+            crate::cli::slash_plan::handle_plan_command(
+                arg,
+                api,
+                profile,
+                &mut state,
+                token.as_deref(),
+            )
+            .await?
         }
         "/review" | "/grep" => {
             handle_info_command(slash_cmd, arg, api, &mut state, profile, token.as_deref()).await?
@@ -1702,8 +1432,6 @@ async fn execute_repl_bridge_command(
 }
 
 fn handle_permission_command(arg: &str, state: &mut SessionState) {
-    use permission_manager::PermissionMode;
-
     match arg {
         "" => {
             let next = match state.perm_manager.mode() {
@@ -1831,7 +1559,7 @@ mod permission_mode_display_tests {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn execute_cli_command(
+pub(crate) async fn execute_cli_command(
     command: Option<Command>,
     profile: Option<String>,
     global_model: Option<String>,
@@ -1840,6 +1568,7 @@ pub(super) async fn execute_cli_command(
     api: &astra_thin_client::ThinClient,
     no_instructions: bool,
     max_budget: f64,
+    cli_context: &crate::cli::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
     match command {
         // No subcommand → interactive TUI (Codex-style default)
@@ -1851,6 +1580,7 @@ pub(super) async fn execute_cli_command(
                 None,
                 no_instructions,
                 max_budget,
+                cli_context,
             )
             .await?;
             Ok(ExitCode::Success)
@@ -1861,11 +1591,11 @@ pub(super) async fn execute_cli_command(
                 None => {
                     start_http_server(&args.host, args.port).await?;
                 }
-                Some(crate::cli_args::ServeMode::Http(http_args)) => {
+                Some(crate::cli::cli_args::ServeMode::Http(http_args)) => {
                     start_http_server(&http_args.host, http_args.port).await?;
                 }
-                Some(crate::cli_args::ServeMode::Stdio) => {
-                    crate::app_server::run_stdio_app_server(
+                Some(crate::cli::cli_args::ServeMode::Stdio) => {
+                    crate::cli::app_server::run_stdio_app_server(
                         "stdio://",
                         api,
                         profile.as_deref(),
@@ -1884,7 +1614,10 @@ pub(super) async fn execute_cli_command(
             let raw_message = words.join(" ");
             let message = apply_system_prompt(&raw_message, system_prompt.as_deref());
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let session_id = validated_resumable_last_session_id(api, profile.as_deref()).await;
+            let session_id = match cli_context.session_id.clone() {
+                Some(session_id) => Some(session_id),
+                None => validated_resumable_last_session_id(api, profile.as_deref()).await,
+            };
             let mut continuation_messages = session_id
                 .as_deref()
                 .and_then(load_session_messages_for_continuation);
@@ -1897,11 +1630,11 @@ pub(super) async fn execute_cli_command(
             let mut pm = PermissionManager::with_load_policy(
                 mode,
                 &std::env::current_dir().unwrap_or_default(),
-                &crate::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+                &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
             );
             let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
             let skill_search = astra_core::SkillSearchSettings::default();
-            let chat_ctx = crate::chat_stream::BasicCliChatContext {
+            let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
                 api,
                 auth_profile: profile.as_deref(),
                 message: &message,
@@ -1910,7 +1643,8 @@ pub(super) async fn execute_cli_command(
                 explain: ExplainMode::Off,
                 render_md: terminal::size().is_ok(),
                 verbose_mode: true,
-                render_policy: crate::stream_render::RenderPolicy::Stream,
+                render_policy: crate::cli::stream_render::RenderPolicy::Stream,
+                cli_context: Some(cli_context),
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 skill_search: &skill_search,
                 // Non-Chat (Message-style) path — legacy single-shot
@@ -1931,41 +1665,40 @@ pub(super) async fn execute_cli_command(
                     astra_harness::SessionTrace::new(None),
                 ))),
             };
-            let mut params = ChatTurnParams::basic_cli(
+            let turn_options = crate::cli::turn_facade::BasicCliTurnOptions {
+                pre_loaded_messages: continuation_messages.take(),
+                ..Default::default()
+            };
+            let sr = match crate::cli::turn_facade::execute_basic_cli_turn(
                 &chat_ctx,
                 &token,
                 session_id.as_deref(),
+                profile.as_deref(),
                 &mut pm,
                 &mut skill_qt,
-            );
-            params.pre_loaded_messages = continuation_messages.take();
-            let sr = match stream_chat_sse(params).await {
+                turn_options.clone(),
+            )
+            .await
+            {
                 Ok(sr) => sr,
-                Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
-                    let _ = clear_profile_last_session(profile.as_deref());
-                    stream_chat_sse(ChatTurnParams::basic_cli(
-                        &chat_ctx,
-                        &token,
-                        None,
-                        &mut pm,
-                        &mut skill_qt,
-                    ))
-                    .await
-                    .map_err(|f| f.error)?
-                }
                 Err(e) if is_auth_error(&e.error) => {
                     if session_runtime::attempt_token_refresh(api, profile.as_deref()).await {
                         if let Some(new_token) =
                             session_runtime::current_access_token(profile.as_deref())
                         {
-                            eprintln!("  {} Token refreshed, retrying…", crate::theme::icon_ok());
-                            stream_chat_sse(ChatTurnParams::basic_cli(
+                            eprintln!(
+                                "  {} Token refreshed, retrying…",
+                                crate::cli::theme::icon_ok()
+                            );
+                            crate::cli::turn_facade::execute_basic_cli_turn(
                                 &chat_ctx,
                                 &new_token,
                                 session_id.as_deref(),
+                                profile.as_deref(),
                                 &mut pm,
                                 &mut skill_qt,
-                            ))
+                                turn_options.clone(),
+                            )
                             .await
                             .map_err(|f| f.error)?
                         } else {
@@ -2102,6 +1835,7 @@ pub(super) async fn execute_cli_command(
                 profile.as_deref(),
                 global_model.as_deref(),
                 api,
+                cli_context,
             )
             .await
         }
@@ -2113,16 +1847,20 @@ pub(super) async fn execute_cli_command(
                     profile.as_deref(),
                     global_model.as_deref(),
                     api,
+                    cli_context,
                 )
                 .await
             }
-            Some(TaskSubcommand::Queue(queue_args)) => execute_task_queue(queue_args).await,
+            Some(TaskSubcommand::Queue(queue_args)) => {
+                execute_task_queue(queue_args, cli_context).await
+            }
             Some(TaskSubcommand::Worker(worker_args)) => {
                 execute_task_worker(
                     worker_args,
                     profile.as_deref(),
                     global_model.as_deref(),
                     api,
+                    cli_context,
                 )
                 .await
             }
@@ -2134,6 +1872,7 @@ pub(super) async fn execute_cli_command(
                     profile.as_deref(),
                     global_model.as_deref(),
                     api,
+                    cli_context,
                 )
                 .await
             }
@@ -2146,6 +1885,7 @@ pub(super) async fn execute_cli_command(
                 profile.as_deref(),
                 global_model.as_deref(),
                 api,
+                cli_context,
             )
             .await
         }
@@ -2157,6 +1897,7 @@ pub(super) async fn execute_cli_command(
                 profile.as_deref(),
                 global_model.as_deref(),
                 api,
+                cli_context,
             )
             .await
         }
@@ -2168,6 +1909,7 @@ pub(super) async fn execute_cli_command(
                 profile.as_deref(),
                 global_model.as_deref(),
                 api,
+                cli_context,
             )
             .await
         }
@@ -2179,6 +1921,7 @@ pub(super) async fn execute_cli_command(
                 profile.as_deref(),
                 global_model.as_deref(),
                 api,
+                cli_context,
             )
             .await
         }
@@ -2190,6 +1933,7 @@ pub(super) async fn execute_cli_command(
                 profile.as_deref(),
                 global_model.as_deref(),
                 api,
+                cli_context,
             )
             .await
         }
@@ -2201,6 +1945,7 @@ pub(super) async fn execute_cli_command(
                 profile.as_deref(),
                 global_model.as_deref(),
                 api,
+                cli_context,
             )
             .await
         }
@@ -2212,6 +1957,7 @@ pub(super) async fn execute_cli_command(
                 profile.as_deref(),
                 global_model.as_deref(),
                 api,
+                cli_context,
             )
             .await
         }
@@ -2223,6 +1969,7 @@ pub(super) async fn execute_cli_command(
                 profile.as_deref(),
                 global_model.as_deref(),
                 api,
+                cli_context,
             )
             .await
         }
@@ -2234,6 +1981,7 @@ pub(super) async fn execute_cli_command(
                 profile.as_deref(),
                 global_model.as_deref(),
                 api,
+                cli_context,
             )
             .await
         }
@@ -2246,19 +1994,20 @@ pub(super) async fn execute_cli_command(
             // context state from a session that's already been
             // closed.
             match ctx_cmd {
-                crate::cli_args::ContextCmd::Dump(args) => {
+                crate::cli::cli_args::ContextCmd::Dump(args) => {
                     // Resolve session: explicit arg → prefix match;
                     // omitted → most recently touched session on disk.
-                    let sid = match crate::context_dump::resolve_session_id(args.session.as_deref())
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("context dump: {e}");
-                            return Ok(ExitCode::ApiError);
-                        }
-                    };
+                    let sid =
+                        match crate::cli::context_dump::resolve_session_id(args.session.as_deref())
+                        {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("context dump: {e}");
+                                return Ok(ExitCode::ApiError);
+                            }
+                        };
                     if args.summary {
-                        match crate::context_dump::print_summary(&sid) {
+                        match crate::cli::context_dump::print_summary(&sid) {
                             Ok(()) => Ok(ExitCode::Success),
                             Err(e) => {
                                 eprintln!("context dump failed: {e}");
@@ -2266,7 +2015,7 @@ pub(super) async fn execute_cli_command(
                             }
                         }
                     } else {
-                        match crate::context_dump::write_dump_from_journal(
+                        match crate::cli::context_dump::write_dump_from_journal(
                             &sid,
                             args.output.as_deref(),
                         ) {
@@ -2328,6 +2077,7 @@ pub(super) async fn execute_cli_command(
                     None,
                     no_instructions,
                     max_budget,
+                    cli_context,
                 )
                 .await?;
                 return Ok(ExitCode::Success);
@@ -2336,7 +2086,10 @@ pub(super) async fn execute_cli_command(
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let session_id = match args.session_id {
                 Some(session_id) => Some(session_id),
-                None => validated_resumable_last_session_id(api, profile.as_deref()).await,
+                None => match cli_context.session_id.clone() {
+                    Some(session_id) => Some(session_id),
+                    None => validated_resumable_last_session_id(api, profile.as_deref()).await,
+                },
             };
             // Load previous conversation for multi-turn continuity.
             let mut continuation_messages = session_id
@@ -2354,7 +2107,7 @@ pub(super) async fn execute_cli_command(
                     PermissionManager::with_load_policy(
                         mode,
                         &project_root,
-                        &crate::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+                        &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
                     )
                 } else {
                     let mode = if args.auto_approve || auto_approve {
@@ -2365,7 +2118,7 @@ pub(super) async fn execute_cli_command(
                     PermissionManager::with_load_policy(
                         mode,
                         &project_root,
-                        &crate::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+                        &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
                     )
                 }
             };
@@ -2379,9 +2132,9 @@ pub(super) async fn execute_cli_command(
             let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
             let skill_search = astra_core::SkillSearchSettings::default();
             let render_policy = if quiet {
-                crate::stream_render::RenderPolicy::Silent
+                crate::cli::stream_render::RenderPolicy::Silent
             } else {
-                crate::stream_render::RenderPolicy::Stream
+                crate::cli::stream_render::RenderPolicy::Stream
             };
 
             // Bug-A fix: build a DynamicAgentSpawner so `astra chat -m`
@@ -2417,7 +2170,7 @@ pub(super) async fn execute_cli_command(
             let spawner_handle_for_drain = one_shot_spawner.clone();
             let (stream_event_tx, _stream_event_writer) = if args.stream_events {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                let handle = crate::stream_events_writer::spawn_stderr_writer(rx);
+                let handle = crate::cli::stream_events_writer::spawn_stderr_writer(rx);
                 (Some(tx), Some(handle))
             } else {
                 (None, None)
@@ -2445,7 +2198,7 @@ pub(super) async fn execute_cli_command(
                     .unwrap_or_else(|| "no-session".to_string()),
                 chat_task_store,
             ));
-            let chat_ctx = crate::chat_stream::BasicCliChatContext {
+            let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
                 api,
                 auth_profile: profile.as_deref(),
                 message: &message,
@@ -2455,6 +2208,7 @@ pub(super) async fn execute_cli_command(
                 render_md,
                 verbose_mode: !quiet,
                 render_policy,
+                cli_context: Some(cli_context),
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 skill_search: &skill_search,
                 agent_spawner: Some(one_shot_spawner),
@@ -2469,30 +2223,24 @@ pub(super) async fn execute_cli_command(
                 #[cfg(feature = "harness")]
                 harness_trace: Some(harness_trace),
             };
-            let mut params = ChatTurnParams::basic_cli(
+            let turn_options = crate::cli::turn_facade::BasicCliTurnOptions {
+                pre_loaded_messages: continuation_messages.take(),
+                append_system_prompt: args.append_system_prompt.clone(),
+                ..Default::default()
+            };
+            let turn_start = std::time::Instant::now();
+            let mut sr = match crate::cli::turn_facade::execute_basic_cli_turn(
                 &chat_ctx,
                 &token,
                 session_id.as_deref(),
+                profile.as_deref(),
                 &mut pm,
                 &mut skill_qt,
-            );
-            params.pre_loaded_messages = continuation_messages.take();
-            params.append_system_prompt = args.append_system_prompt.clone();
-            let turn_start = std::time::Instant::now();
-            let mut sr = match stream_chat_sse(params).await {
+                turn_options,
+            )
+            .await
+            {
                 Ok(sr) => sr,
-                Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
-                    let _ = clear_profile_last_session(profile.as_deref());
-                    stream_chat_sse(ChatTurnParams::basic_cli(
-                        &chat_ctx,
-                        &token,
-                        None,
-                        &mut pm,
-                        &mut skill_qt,
-                    ))
-                    .await
-                    .map_err(|f| f.error)?
-                }
                 Err(e) => return Err(e.error),
             };
 
@@ -2707,7 +2455,8 @@ pub(super) async fn execute_cli_command(
         }
 
         Some(Command::SelfInspect(cmd)) => {
-            let body = crate::self_command::execute_self_command(&cmd, profile.as_deref()).await?;
+            let body =
+                crate::cli::self_command::execute_self_command(&cmd, profile.as_deref()).await?;
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }
@@ -2730,30 +2479,41 @@ pub(super) async fn execute_cli_command(
         }
 
         Some(Command::Skill(SkillCmd::List(args))) => {
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let q = vec![
-                ("limit", args.limit.to_string()),
-                ("offset", args.offset.to_string()),
-            ];
-            let body = api
-                .get_skills_query_text(&token, &q)
-                .await
-                .map_err(map_thin_err)?;
+            let pipeline_modules = create_pipeline_modules_quiet(api, profile.as_deref());
+            let filter = SkillCatalogFilter {
+                query: (!args.query.is_empty()).then(|| args.query.join(" ").to_lowercase()),
+                source: args
+                    .source
+                    .as_deref()
+                    .map(normalize_source_filter)
+                    .transpose()?,
+                category: args
+                    .category
+                    .as_ref()
+                    .map(|category| category.to_lowercase()),
+            };
+            let body = serde_json::to_string(&list_skill_record_from_registry(
+                &pipeline_modules.unified_skill_registry,
+                &filter,
+                args.limit,
+                args.offset,
+            ))
+            .map_err(|source| format!("failed to serialize skill list: {source}"))?;
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }
 
         Some(Command::Skill(SkillCmd::Show(args))) => {
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let q: Vec<(&str, String)> = if let Some(ref version) = args.version {
-                vec![("version", version.clone())]
-            } else {
-                vec![]
-            };
-            let body = api
-                .get_skill_query_text(&token, &args.skill_id, &q)
-                .await
-                .map_err(map_thin_err)?;
+            let pipeline_modules = create_pipeline_modules_quiet(api, profile.as_deref());
+            let body = serde_json::to_string(
+                &load_skill_record_from_registry(
+                    &pipeline_modules.unified_skill_registry,
+                    &args.skill_id,
+                    args.version.as_deref(),
+                )
+                .await?,
+            )
+            .map_err(|source| format!("failed to serialize skill record: {source}"))?;
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }
@@ -3159,13 +2919,14 @@ fn final_json_output_with_context(
 
 /// `--print` / `-p` mode: headless single-shot query, prints response and exits.
 /// Reads message from positional args (Message variant) or stdin.
-pub(super) async fn run_print_mode(
+pub(crate) async fn run_print_mode(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     output_format: &str,
     model: Option<&str>,
     system_prompt: Option<&str>,
     command: Option<Command>,
+    cli_context: &crate::cli::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
     // Extract message from command or stdin
     let raw_message = match command {
@@ -3189,7 +2950,10 @@ pub(super) async fn run_print_mode(
     let message = apply_system_prompt(&raw_message, system_prompt);
 
     let (_, _, _, token) = get_profile_and_token(profile)?;
-    let session_id = validated_resumable_last_session_id(api, profile).await;
+    let session_id = match cli_context.session_id.clone() {
+        Some(session_id) => Some(session_id),
+        None => validated_resumable_last_session_id(api, profile).await,
+    };
     let mut continuation_messages = session_id
         .as_deref()
         .and_then(load_session_messages_for_continuation);
@@ -3209,9 +2973,9 @@ pub(super) async fn run_print_mode(
     // still apply (a project can tighten, never loosen, the
     // headless policy).
     let mut pm = PermissionManager::with_load_policy(
-        crate::permission_manager::PermissionMode::Auto,
+        crate::cli::permission_manager::PermissionMode::Auto,
         &std::env::current_dir().unwrap_or_default(),
-        &crate::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+        &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
     );
     // Surface load_errors as exit-1: a corrupt project permissions.json
     // in CI must not silently fall back to "no rules" (issue #326 P0
@@ -3230,9 +2994,10 @@ pub(super) async fn run_print_mode(
     // path handles them. Without this, single-shot runs silently drop to
     // in-memory scratchpad and the Tier 1 board is invisible across turns
     // that reuse the same `session_id`.
-    let task_store = crate::session_runtime::resolve_task_store(profile, Some(&api.api_origin()))
-        .await
-        .0;
+    let task_store =
+        crate::cli::session_runtime::resolve_task_store(profile, Some(&api.api_origin()))
+            .await
+            .0;
     let print_task_manager = std::sync::Arc::new(crate::edge_tools::TaskManager::new(
         session_id
             .clone()
@@ -3240,7 +3005,7 @@ pub(super) async fn run_print_mode(
         task_store,
     ));
 
-    let chat_ctx = crate::chat_stream::BasicCliChatContext {
+    let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
         api,
         auth_profile: profile,
         message: &message,
@@ -3249,7 +3014,8 @@ pub(super) async fn run_print_mode(
         explain: ExplainMode::Off,
         render_md: false,
         verbose_mode: false,
-        render_policy: crate::stream_render::RenderPolicy::Silent,
+        render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+        cli_context: Some(cli_context),
         unified_skill_registry: astra_runtime::skills::default_unified_registry(),
         skill_search: &skill_search,
         agent_spawner: None,
@@ -3267,28 +3033,22 @@ pub(super) async fn run_print_mode(
         ))),
     };
 
-    let mut params = ChatTurnParams::basic_cli(
+    let turn_options = crate::cli::turn_facade::BasicCliTurnOptions {
+        pre_loaded_messages: continuation_messages.take(),
+        ..Default::default()
+    };
+    let sr = match crate::cli::turn_facade::execute_basic_cli_turn(
         &chat_ctx,
         &token,
         session_id.as_deref(),
+        profile,
         &mut pm,
         &mut skill_qt,
-    );
-    params.pre_loaded_messages = continuation_messages.take();
-    let sr = match stream_chat_sse(params).await {
+        turn_options,
+    )
+    .await
+    {
         Ok(sr) => sr,
-        Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
-            let _ = clear_profile_last_session(profile);
-            stream_chat_sse(ChatTurnParams::basic_cli(
-                &chat_ctx,
-                &token,
-                None,
-                &mut pm,
-                &mut skill_qt,
-            ))
-            .await
-            .map_err(|f| f.error)?
-        }
         Err(e) => return Err(e.error),
     };
 
@@ -3512,1326 +3272,6 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
         for issue in &issues {
             println!("  {} {}", theme::icon_warn(), issue);
         }
-    }
-}
-
-// ═══════════════════════════════════════════════════════ MCP CLI ══════════
-
-/// Load MCP server configs from JSON files or inline JSON strings and merge
-/// them into the project-level mcp.json. Each source should be a file path
-/// or a raw JSON string containing `{"mcpServers": {...}}`.
-pub(super) fn load_mcp_configs(sources: &[String]) -> Result<(), String> {
-    let project_path = crate::manifest_loader::project_mcp_json_path()
-        .ok_or_else(|| "Cannot determine project directory for MCP config".to_string())?;
-    let mut config = read_mcp_config(&project_path)?;
-
-    for source in sources {
-        let json_str = if std::path::Path::new(source).is_file() {
-            std::fs::read_to_string(source)
-                .map_err(|e| format!("Failed to read MCP config file '{}': {e}", source))?
-        } else {
-            source.clone()
-        };
-        let parsed: serde_json::Value = serde_json::from_str(&json_str)
-            .map_err(|e| format!("Invalid MCP config JSON from '{}': {e}", source))?;
-
-        if let Some(servers) = parsed.get("mcpServers").and_then(|v| v.as_object()) {
-            let target = config
-                .as_object_mut()
-                .ok_or("MCP config must be a JSON object")?
-                .entry("mcpServers")
-                .or_insert_with(|| serde_json::json!({}))
-                .as_object_mut()
-                .ok_or("mcpServers value must be a JSON object")?;
-            for (name, entry) in servers {
-                target.insert(name.clone(), entry.clone());
-            }
-        } else {
-            return Err(format!(
-                "MCP config from '{}' must contain a \"mcpServers\" object",
-                source
-            ));
-        }
-    }
-
-    write_mcp_config(&project_path, &config)?;
-    Ok(())
-}
-
-/// Resolve the mcp.json path for the given scope.
-fn mcp_json_path_for_scope(scope: &str) -> Result<std::path::PathBuf, String> {
-    match scope {
-        "project" => crate::manifest_loader::project_mcp_json_path()
-            .ok_or_else(|| "Cannot determine project directory".to_string()),
-        "user" => crate::manifest_loader::global_mcp_json_path()
-            .ok_or_else(|| "Cannot determine home directory".to_string()),
-        other => Err(format!("Unknown scope '{other}' — use 'project' or 'user'")),
-    }
-}
-
-/// Read and parse an mcp.json file, returning empty config if missing.
-fn read_mcp_config(path: &std::path::Path) -> Result<serde_json::Value, String> {
-    if !path.is_file() {
-        return Ok(serde_json::json!({"mcpServers": {}}));
-    }
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-    serde_json::from_str(&content).map_err(|e| format!("Failed to parse {}: {e}", path.display()))
-}
-
-/// Write config atomically (temp + rename).
-fn write_mcp_config(path: &std::path::Path, config: &serde_json::Value) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    let pretty = serde_json::to_string_pretty(config).unwrap_or_default();
-    std::fs::write(&tmp, &pretty).map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("Failed to rename to {}: {e}", path.display())
-    })
-}
-
-async fn execute_mcp_command(cmd: McpCmd) -> Result<(), String> {
-    match cmd {
-        McpCmd::List(args) => mcp_list(&args.scope),
-        McpCmd::Add(args) => mcp_add(&args.name, &args.command, &args.args, &args.scope),
-        McpCmd::AddJson(args) => mcp_add_json(&args.name, &args.json, &args.scope),
-        McpCmd::Remove(args) => mcp_remove(&args.name, &args.scope),
-        McpCmd::Get(args) => mcp_get(&args.name),
-        McpCmd::Test(args) => mcp_test(&args.name, &args.scope).await,
-        McpCmd::Ping(args) => mcp_ping(&args.name, &args.scope).await,
-    }
-}
-
-fn mcp_list(scope: &str) -> Result<(), String> {
-    let path = mcp_json_path_for_scope(scope)?;
-    let config = read_mcp_config(&path)?;
-    let servers = config
-        .get("mcpServers")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
-
-    if servers.is_empty() {
-        println!("  {}", "No MCP servers configured.".dim());
-        println!("  Use {} to add a server.", "astra mcp add".magenta());
-        return Ok(());
-    }
-
-    println!(
-        "  {:<20} {:<8} {:<40}",
-        "Name".bold(),
-        "Type".bold(),
-        "Command / URL".bold()
-    );
-    println!("  {}", "─".repeat(68).dim());
-    for (name, entry) in &servers {
-        let server_type = entry
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("stdio");
-        let detail = match server_type {
-            "sse" | "http" => entry
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("-")
-                .to_string(),
-            _ => {
-                let cmd = entry.get("command").and_then(|v| v.as_str()).unwrap_or("-");
-                let args = entry
-                    .get("args")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str())
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    })
-                    .unwrap_or_default();
-                if args.is_empty() {
-                    cmd.to_string()
-                } else {
-                    format!("{cmd} {args}")
-                }
-            }
-        };
-        println!(
-            "  {:<20} {:<8} {}",
-            name.as_str().magenta(),
-            server_type.dim(),
-            detail
-        );
-    }
-    println!(
-        "\n  {} {}",
-        "Config:".dim(),
-        path.display().to_string().dim()
-    );
-    Ok(())
-}
-
-fn mcp_add(name: &str, command: &str, args: &[String], scope: &str) -> Result<(), String> {
-    let path = mcp_json_path_for_scope(scope)?;
-    let mut config = read_mcp_config(&path)?;
-
-    // Check for duplicate
-    if let Some(servers) = config.get("mcpServers").and_then(|v| v.as_object()) {
-        if servers.contains_key(name) {
-            return Err(format!(
-                "Server '{name}' already exists. Remove it first with: astra mcp remove {name}"
-            ));
-        }
-    }
-
-    let entry = serde_json::json!({
-        "command": command,
-        "args": args,
-    });
-    config
-        .as_object_mut()
-        .ok_or("MCP config must be a JSON object")?
-        .entry("mcpServers")
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .ok_or("mcpServers value must be a JSON object")?
-        .insert(name.to_string(), entry);
-
-    write_mcp_config(&path, &config)?;
-    println!(
-        "  {} Added '{}' to {}",
-        theme::icon_ok(),
-        name.magenta(),
-        path.display().to_string().dim()
-    );
-    Ok(())
-}
-
-fn mcp_add_json(name: &str, json: &str, scope: &str) -> Result<(), String> {
-    let entry: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| format!("Invalid JSON: {e}"))?;
-    if !entry.is_object() {
-        return Err("JSON config must be an object".to_string());
-    }
-
-    let path = mcp_json_path_for_scope(scope)?;
-    let mut config = read_mcp_config(&path)?;
-
-    if let Some(servers) = config.get("mcpServers").and_then(|v| v.as_object()) {
-        if servers.contains_key(name) {
-            return Err(format!(
-                "Server '{name}' already exists. Remove it first with: astra mcp remove {name}"
-            ));
-        }
-    }
-
-    config
-        .as_object_mut()
-        .ok_or("MCP config must be a JSON object")?
-        .entry("mcpServers")
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .ok_or("mcpServers value must be a JSON object")?
-        .insert(name.to_string(), entry);
-
-    write_mcp_config(&path, &config)?;
-    println!(
-        "  {} Added '{}' to {}",
-        theme::icon_ok(),
-        name.magenta(),
-        path.display().to_string().dim()
-    );
-    Ok(())
-}
-
-fn mcp_remove(name: &str, scope: &str) -> Result<(), String> {
-    let path = mcp_json_path_for_scope(scope)?;
-    if !path.is_file() {
-        return Err(format!("No config file at {}", path.display()));
-    }
-    let mut config = read_mcp_config(&path)?;
-
-    let removed = config
-        .get_mut("mcpServers")
-        .and_then(|v| v.as_object_mut())
-        .map(|m| m.remove(name).is_some())
-        .unwrap_or(false);
-
-    if !removed {
-        return Err(format!("Server '{name}' not found in {}", path.display()));
-    }
-
-    write_mcp_config(&path, &config)?;
-    println!(
-        "  {} Removed '{}' from {}",
-        theme::icon_ok(),
-        name.magenta(),
-        path.display().to_string().dim()
-    );
-    Ok(())
-}
-
-fn mcp_get(name: &str) -> Result<(), String> {
-    // Search both scopes
-    let scopes = ["project", "user"];
-    for scope in &scopes {
-        let path = match mcp_json_path_for_scope(scope) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let config = match read_mcp_config(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        if let Some(entry) = config
-            .get("mcpServers")
-            .and_then(|v| v.as_object())
-            .and_then(|m| m.get(name))
-        {
-            println!("  {}:", name.bold().magenta());
-            println!("    {} {scope}", "Scope:".dim());
-            let server_type = entry
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("stdio");
-            println!("    {} {server_type}", "Type:".dim());
-            match server_type {
-                "sse" | "http" => {
-                    if let Some(url) = entry.get("url").and_then(|v| v.as_str()) {
-                        println!("    {} {url}", "URL:".dim());
-                    }
-                }
-                _ => {
-                    if let Some(cmd) = entry.get("command").and_then(|v| v.as_str()) {
-                        println!("    {} {cmd}", "Command:".dim());
-                    }
-                    if let Some(args) = entry.get("args").and_then(|v| v.as_array()) {
-                        let args_str: Vec<&str> = args.iter().filter_map(|v| v.as_str()).collect();
-                        println!("    {} {}", "Args:".dim(), args_str.join(" "));
-                    }
-                }
-            }
-            if let Some(env) = entry.get("env").and_then(|v| v.as_object()) {
-                println!("    {}:", "Environment".dim());
-                for (k, v) in env {
-                    println!(
-                        "      {}={}",
-                        k.as_str().magenta(),
-                        v.as_str().unwrap_or(&v.to_string())
-                    );
-                }
-            }
-            println!(
-                "\n  {} astra mcp remove \"{}\" -s {scope}",
-                "To remove:".dim(),
-                name
-            );
-            return Ok(());
-        }
-    }
-    Err(format!("No MCP server found with name: {name}"))
-}
-
-/// Find a server entry by name in a JSON config. Searches both scopes.
-fn find_server_entry<'a>(
-    config: &'a serde_json::Value,
-    name: &str,
-) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
-    config
-        .get("mcpServers")
-        .and_then(|v| v.as_object())
-        .and_then(|m| m.get(name))
-        .and_then(|v| v.as_object())
-}
-
-/// Convert a JSON server entry to an `McpServerConfig`.
-fn json_entry_to_mcp_config(
-    name: &str,
-    entry: &serde_json::Map<String, serde_json::Value>,
-) -> Result<astra_mcp::McpServerConfig, String> {
-    let server_type = entry
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("stdio");
-
-    let transport = match server_type {
-        "sse" => {
-            let url = entry
-                .get("url")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("SSE server '{name}' missing `url`"))?;
-            astra_mcp::Transport::Sse {
-                url: url.to_string(),
-                auth_token: entry
-                    .get("auth_token")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                headers: entry
-                    .get("headers")
-                    .and_then(|v| v.as_object())
-                    .map(|h| {
-                        h.iter()
-                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            }
-        }
-        "http" | "streamable_http" | "streamable-http" => {
-            let url = entry
-                .get("url")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("HTTP MCP server '{name}' missing `url`"))?;
-            astra_mcp::Transport::StreamableHttp {
-                url: url.to_string(),
-                auth_token: entry
-                    .get("auth_token")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                headers: entry
-                    .get("headers")
-                    .and_then(|v| v.as_object())
-                    .map(|h| {
-                        h.iter()
-                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            }
-        }
-        "ws" | "websocket" => {
-            let url = entry
-                .get("url")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("WS server '{name}' missing `url`"))?;
-            astra_mcp::Transport::Ws {
-                url: url.to_string(),
-                auth_token: entry
-                    .get("auth_token")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                headers: entry
-                    .get("headers")
-                    .and_then(|v| v.as_object())
-                    .map(|h| {
-                        h.iter()
-                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            }
-        }
-        _ => {
-            let command = entry
-                .get("command")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("Stdio server '{name}' missing `command`"))?;
-            let mut cmd = vec![command.to_string()];
-            if let Some(args) = entry.get("args").and_then(|v| v.as_array()) {
-                cmd.extend(args.iter().filter_map(|v| v.as_str()).map(String::from));
-            }
-            astra_mcp::Transport::Stdio {
-                command: cmd,
-                args: Vec::new(),
-                env: entry
-                    .get("env")
-                    .and_then(|v| v.as_object())
-                    .map(|h| {
-                        h.iter()
-                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            }
-        }
-    };
-
-    Ok(astra_mcp::McpServerConfig {
-        name: name.to_string(),
-        transport,
-        description: String::new(),
-        enabled: true,
-        retry: Default::default(),
-    })
-}
-
-async fn mcp_test(name: &str, scope: &str) -> Result<(), String> {
-    let path = mcp_json_path_for_scope(scope)?;
-    let config = read_mcp_config(&path)?;
-    let entry = find_server_entry(&config, name)
-        .ok_or_else(|| format!("Server '{name}' not found in {}", path.display()))?;
-    let mcp_config = json_entry_to_mcp_config(name, entry)?;
-
-    eprintln!("  {} Connecting to {}...", theme::icon_ok(), name.magenta());
-
-    let mut manager = astra_mcp::McpClientManager::new();
-    let tool_count = manager
-        .connect(mcp_config)
-        .await
-        .map_err(|e| format!("Failed to connect to '{name}': {e}"))?;
-
-    let conn = manager
-        .get(name)
-        .ok_or_else(|| format!("Connected but cannot find '{name}'"))?;
-
-    eprintln!(
-        "  {} Connected successfully ({} tools, uptime {}s)",
-        theme::icon_ok(),
-        tool_count.to_string().magenta(),
-        conn.uptime()
-            .map(|d| d.as_secs().to_string())
-            .unwrap_or_else(|| "n/a".to_string())
-    );
-
-    // List tools
-    let tools = conn.tools();
-    if !tools.is_empty() {
-        eprintln!("\n  {}:", "Tools".bold());
-        for tool in tools {
-            let desc = tool.description.as_deref().unwrap_or("");
-            let short_desc = if desc.len() > 80 {
-                format!("{}…", &desc[..desc.floor_char_boundary(80)])
-            } else {
-                desc.to_string()
-            };
-            eprintln!("    {} {}", tool.name.magenta(), short_desc.dim());
-        }
-    }
-
-    // List resources
-    match conn.list_resources().await {
-        Ok(resources) if !resources.is_empty() => {
-            eprintln!("\n  {}:", "Resources".bold());
-            for r in &resources {
-                eprintln!(
-                    "    {} → {}",
-                    r.raw.name.clone().magenta(),
-                    r.raw.uri.clone().dim()
-                );
-            }
-        }
-        _ => {}
-    }
-
-    manager.disconnect(name);
-    eprintln!("\n  {} Disconnected.", theme::icon_ok());
-    Ok(())
-}
-
-async fn mcp_ping(name: &str, scope: &str) -> Result<(), String> {
-    let path = mcp_json_path_for_scope(scope)?;
-    let config = read_mcp_config(&path)?;
-    let entry = find_server_entry(&config, name)
-        .ok_or_else(|| format!("Server '{name}' not found in {}", path.display()))?;
-    let mcp_config = json_entry_to_mcp_config(name, entry)?;
-
-    let mut manager = astra_mcp::McpClientManager::new();
-    manager
-        .connect(mcp_config)
-        .await
-        .map_err(|e| format!("Failed to connect to '{name}': {e}"))?;
-
-    match manager.ping(name).await {
-        Ok(latency) => {
-            eprintln!(
-                "  {} {} — {}",
-                theme::icon_ok(),
-                name.magenta(),
-                format!("{}ms", latency.as_millis()).dim()
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "  {} {} — {}",
-                theme::icon_warn(),
-                name.magenta(),
-                format!("ping failed: {e}").yellow()
-            );
-        }
-    }
-
-    manager.disconnect(name);
-    Ok(())
-}
-
-/// Path to `~/.astra/settings.json`.
-fn settings_path(override_path: Option<&std::path::PathBuf>) -> Result<std::path::PathBuf, String> {
-    if let Some(p) = override_path {
-        return Ok(p.clone());
-    }
-    dirs::home_dir()
-        .map(|h| h.join(".astra").join("settings.json"))
-        .ok_or_else(|| "Cannot determine home directory".to_string())
-}
-
-fn read_settings_from(
-    path_override: Option<&std::path::PathBuf>,
-) -> Result<serde_json::Map<String, serde_json::Value>, String> {
-    let path = settings_path(path_override)?;
-    if !path.is_file() {
-        return Ok(serde_json::Map::new());
-    }
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-    let val: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
-    val.as_object()
-        .cloned()
-        .ok_or_else(|| format!("{} is not a JSON object", path.display()))
-}
-
-fn read_settings() -> Result<serde_json::Map<String, serde_json::Value>, String> {
-    read_settings_from(None)
-}
-
-/// Read `default_model` from settings.json, if set.
-pub fn read_config_default_model() -> Result<Option<String>, String> {
-    let settings = read_settings()?;
-    Ok(settings
-        .get("default_model")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string()))
-}
-
-/// Read `api_url` from settings.json, if set.
-pub fn read_config_api_url() -> Result<Option<String>, String> {
-    read_config_api_url_from(None)
-}
-
-/// Read `api_url` from a specific path (for testing) or the default settings path.
-fn read_config_api_url_from(
-    path_override: Option<&std::path::PathBuf>,
-) -> Result<Option<String>, String> {
-    let settings = read_settings_from(path_override)?;
-    Ok(settings
-        .get("api_url")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string()))
-}
-
-const DEFAULT_API_URL: &str = "http://127.0.0.1:8000";
-
-/// Resolve API URL with priority: flag > env var > config file > default.
-pub fn resolve_api_url(flag: Option<&str>) -> String {
-    resolve_api_url_with(
-        flag,
-        || std::env::var("ASTRA_API_URL").ok(),
-        read_config_api_url,
-    )
-}
-
-/// Testable core: resolve API URL with injectable env and config sources.
-fn resolve_api_url_with(
-    flag: Option<&str>,
-    env_fn: impl FnOnce() -> Option<String>,
-    config_fn: impl FnOnce() -> Result<Option<String>, String>,
-) -> String {
-    flag.map(|s| s.trim_end_matches('/').to_string())
-        .or_else(|| env_fn().map(|s| s.trim_end_matches('/').to_string()))
-        .or_else(|| match config_fn() {
-            Ok(Some(url)) => Some(url.trim_end_matches('/').to_string()),
-            Ok(None) => None,
-            Err(e) => {
-                eprintln!("warning: failed to read config for api_url: {e}");
-                None
-            }
-        })
-        .unwrap_or_else(|| DEFAULT_API_URL.to_string())
-}
-
-async fn resolve_remote_session_id(
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    requested: Option<&str>,
-) -> Result<String, String> {
-    match requested.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(session_id) => Ok(session_id.to_string()),
-        None => validated_resumable_last_session_id(api, profile)
-            .await
-            .ok_or_else(|| {
-                "No session id provided and no recent resumable session is available".to_string()
-            }),
-    }
-}
-
-fn latest_artifact_id(body: &str) -> Result<String, String> {
-    let json: serde_json::Value = serde_json::from_str(body)
-        .map_err(|error| format!("Invalid latest artifact response: {error}"))?;
-    json.get("artifact_id")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .map(ToString::to_string)
-        .ok_or_else(|| "Latest artifact response missing artifact_id".to_string())
-}
-
-fn resolve_download_output_path(
-    output: Option<&std::path::Path>,
-    suggested_name: &str,
-) -> std::path::PathBuf {
-    // Sanitize server-supplied filename: strip directory components and reject traversal.
-    let safe_name = std::path::Path::new(suggested_name)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
-        .unwrap_or("download.json");
-    match output {
-        Some(path) if path.is_dir() => path.join(safe_name),
-        Some(path) => path.to_path_buf(),
-        None => std::path::PathBuf::from(safe_name),
-    }
-}
-
-fn write_downloaded_capture(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
-    }
-    std::fs::write(path, bytes).map_err(|e| format!("Failed to write {}: {e}", path.display()))
-}
-
-fn write_settings(settings: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
-    let path = settings_path(None)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
-    }
-    let val = serde_json::Value::Object(settings.clone());
-    let pretty = serde_json::to_string_pretty(&val).unwrap_or_default();
-    std::fs::write(&path, &pretty).map_err(|e| format!("Failed to write {}: {e}", path.display()))
-}
-
-/// Known setting keys with descriptions for list/help.
-const KNOWN_SETTINGS: &[(&str, &str)] = &[
-    (
-        "default_model",
-        "Default model for chat (e.g. gpt-4o, claude-3.5-sonnet)",
-    ),
-    ("verbose", "Enable verbose output (true/false)"),
-    ("auto_approve", "Auto-approve tool calls (true/false)"),
-    ("api_url", "API server URL"),
-    ("theme", "Color theme (auto/dark/light)"),
-    (
-        "permission_mode",
-        "Default permission mode (auto/plan/accept_edits/prompt/deny)",
-    ),
-];
-
-async fn execute_config_command(cmd: ConfigCmd) -> Result<(), String> {
-    match cmd {
-        ConfigCmd::List => config_list(),
-        ConfigCmd::Get(args) => config_get(&args.key),
-        ConfigCmd::Set(args) => config_set(&args.key, &args.value),
-        ConfigCmd::ShowPolicy(args) => config_show_policy(args.model.as_deref(), args.json),
-        ConfigCmd::Version(sub) => config_version_dispatch(sub).await,
-    }
-}
-
-/// Dispatch for `astra config version ...`. Uses the default
-/// `LocalFileStore` at `~/.astra/config/versions/`; if home dir is
-/// unresolvable we surface that as an error instead of silently using
-/// the process cwd, which would mislead users about where their
-/// versions live.
-async fn config_version_dispatch(sub: ConfigVersionCmd) -> Result<(), String> {
-    use astra_config::config_version_cli::{
-        format_current, format_version_diff, format_version_list, format_version_show,
-    };
-    use astra_config::config_versions::LocalFileStore;
-
-    let store = LocalFileStore::at_default_root()
-        .ok_or_else(|| "could not locate home directory for version store".to_string())?;
-    match sub {
-        ConfigVersionCmd::List(args) => {
-            let out = format_version_list(&store, args.limit).map_err(|e| e.to_string())?;
-            print!("{out}");
-            Ok(())
-        }
-        ConfigVersionCmd::Show(args) => {
-            let out = format_version_show(&store, &args.id).map_err(|e| e.to_string())?;
-            print!("{out}");
-            Ok(())
-        }
-        ConfigVersionCmd::Diff(args) => {
-            let out = format_version_diff(&store, &args.a, &args.b).map_err(|e| e.to_string())?;
-            print!("{out}");
-            Ok(())
-        }
-        ConfigVersionCmd::Current => {
-            let id = format_current().map_err(|e| e.to_string())?;
-            println!("{id}");
-            Ok(())
-        }
-        ConfigVersionCmd::Pull(_) => Err(
-            "config version pull is server-owned; CLI no longer connects to MatrixOne directly"
-                .to_string(),
-        ),
-    }
-}
-
-fn config_show_policy(model: Option<&str>, json: bool) -> Result<(), String> {
-    let cfg = astra_config::runtime_config::RuntimeConfig::load();
-    let policy = cfg.tool_selection.resolve_for_model(model);
-    let trust_mode = match cfg.safety.resolved_trust_mode() {
-        astra_config::runtime_config::TrustModeSerde::Strict => "strict",
-        astra_config::runtime_config::TrustModeSerde::Trusted => "trusted",
-    };
-    let rejected = cfg.tool_selection.rejected_model_match_patterns();
-    println!(
-        "{}",
-        format_policy_output(model, &policy, trust_mode, &rejected, json)
-    );
-    Ok(())
-}
-
-/// Render a resolved [`EffectiveToolPolicy`] as either JSON or human text.
-///
-/// Kept as a pure function of inputs so it can be unit-tested without
-/// shelling out to the binary or touching the filesystem.
-///
-/// `rejected_patterns` is the list of `model_profiles.model_match` values
-/// that were silently ignored at resolve time because they were too short
-/// (see `ToolSelectionConfig::rejected_model_match_patterns`). When
-/// non-empty, they're surfaced so users can spot misconfigs.
-fn format_policy_output(
-    model: Option<&str>,
-    policy: &astra_config::runtime_config::EffectiveToolPolicy,
-    trust_mode: &str,
-    rejected_patterns: &[String],
-    json: bool,
-) -> String {
-    if json {
-        let payload = serde_json::json!({
-            "model": model,
-            "trust_mode": trust_mode,
-            "max_identical_tool_calls": policy.max_identical_tool_calls,
-            "max_tools_per_turn": policy.max_tools_per_turn,
-            "repeated_cache_hit_suppression": policy.repeated_cache_hit_suppression,
-            "max_consecutive_empty_name": policy.max_consecutive_empty_name,
-            "parallel_batching_force_streak": policy.parallel_batching_force_streak,
-            // Always present as an array (possibly empty) so json consumers
-            // never have to special-case the absent-vs-empty case.
-            "rejected_model_match_patterns": rejected_patterns,
-        });
-        serde_json::to_string_pretty(&payload)
-            .unwrap_or_else(|_| "{\"error\": \"failed to serialize policy\"}".to_string())
-    } else {
-        let label = model.unwrap_or("<global defaults — no model>");
-        let mut out = format!(
-            "Resolved workflow-guard policy for {label}:\n\
-             \n  trust_mode                     = {trust_mode}\
-             \n  max_identical_tool_calls       = {}\
-             \n  max_tools_per_turn             = {}\
-             \n  repeated_cache_hit_suppression = {}\
-             \n  max_consecutive_empty_name     = {}\
-             \n  parallel_batching_force_streak = {}\n",
-            policy.max_identical_tool_calls,
-            policy.max_tools_per_turn,
-            policy.repeated_cache_hit_suppression,
-            policy.max_consecutive_empty_name,
-            policy.parallel_batching_force_streak,
-        );
-        if !rejected_patterns.is_empty() {
-            out.push_str(
-                "\n⚠  rejected model_match patterns (too short, ignored at resolve time):\n",
-            );
-            for p in rejected_patterns {
-                out.push_str(&format!("    - \"{p}\"\n"));
-            }
-        }
-        out
-    }
-}
-
-fn config_list() -> Result<(), String> {
-    let settings = read_settings()?;
-    let path = settings_path(None)?;
-
-    if settings.is_empty() {
-        println!("  {}", "No settings configured.".dim());
-        println!(
-            "  Use {} to set a value.",
-            "astra config set <key> <value>".magenta()
-        );
-        println!("\n  {}:", "Available keys".bold());
-        for (key, desc) in KNOWN_SETTINGS {
-            println!("    {}  {}", key.magenta(), desc.dim());
-        }
-        return Ok(());
-    }
-
-    let (hk, hv) = ("Key", "Value");
-    println!("  {:<20} {hv}", hk.bold());
-    println!("  {}", "─".repeat(50).dim());
-    for (key, value) in &settings {
-        let display = match value {
-            serde_json::Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-        println!("  {:<20} {display}", key.as_str().magenta());
-    }
-    println!(
-        "\n  {} {}",
-        "Config:".dim(),
-        path.display().to_string().dim()
-    );
-    Ok(())
-}
-
-fn config_get(key: &str) -> Result<(), String> {
-    let settings = read_settings()?;
-    match settings.get(key) {
-        Some(val) => {
-            match val {
-                serde_json::Value::String(s) => println!("{s}"),
-                other => println!("{other}"),
-            }
-            Ok(())
-        }
-        None => {
-            // Check if it's a known key
-            if let Some((_, desc)) = KNOWN_SETTINGS.iter().find(|(k, _)| *k == key) {
-                Err(format!("'{key}' is not set. {desc}"))
-            } else {
-                Err(format!("'{key}' is not set"))
-            }
-        }
-    }
-}
-
-fn config_set(key: &str, value: &str) -> Result<(), String> {
-    let mut settings = read_settings()?;
-
-    // Parse value: try bool, then number, then keep as string
-    let json_value = match value {
-        "true" => serde_json::Value::Bool(true),
-        "false" => serde_json::Value::Bool(false),
-        v if v.parse::<f64>().is_ok() && !v.contains(|c: char| c.is_alphabetic()) => {
-            if let Ok(n) = v.parse::<i64>() {
-                serde_json::Value::Number(n.into())
-            } else {
-                serde_json::Value::String(v.to_string())
-            }
-        }
-        v => serde_json::Value::String(v.to_string()),
-    };
-
-    settings.insert(key.to_string(), json_value);
-    write_settings(&settings)?;
-    println!("  {} Set '{}' = {}", theme::icon_ok(), key.magenta(), value);
-    Ok(())
-}
-
-#[cfg(test)]
-mod mcp_cli_tests {
-    use super::*;
-
-    fn make_config(path: &std::path::Path, servers: serde_json::Value) {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        let config = serde_json::json!({"mcpServers": servers});
-        std::fs::write(path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
-    }
-
-    #[test]
-    fn read_mcp_config_missing_file() {
-        let config = read_mcp_config(std::path::Path::new("/tmp/nonexistent_mcp.json")).unwrap();
-        assert!(config["mcpServers"].as_object().unwrap().is_empty());
-    }
-
-    #[test]
-    fn read_mcp_config_valid() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), r#"{"mcpServers":{"test":{"command":"echo"}}}"#).unwrap();
-        let config = read_mcp_config(tmp.path()).unwrap();
-        assert!(config["mcpServers"]["test"]["command"] == "echo");
-    }
-
-    #[test]
-    fn read_mcp_config_invalid_json() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), "not json").unwrap();
-        let err = read_mcp_config(tmp.path()).unwrap_err();
-        assert!(err.contains("Failed to parse"));
-    }
-
-    #[test]
-    fn write_mcp_config_creates_parents() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("sub").join("dir").join("mcp.json");
-        let config = serde_json::json!({"mcpServers": {}});
-        write_mcp_config(&path, &config).unwrap();
-        assert!(path.is_file());
-    }
-
-    #[test]
-    fn mcp_json_path_for_scope_invalid() {
-        let err = mcp_json_path_for_scope("invalid").unwrap_err();
-        assert!(err.contains("Unknown scope"));
-    }
-
-    #[test]
-    fn mcp_add_and_remove_roundtrip() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("mcp.json");
-
-        // Start empty
-        make_config(&path, serde_json::json!({}));
-
-        // Add a server
-        let mut config = read_mcp_config(&path).unwrap();
-        let entry = serde_json::json!({"command": "npx", "args": ["@mcp/server"]});
-        config["mcpServers"]
-            .as_object_mut()
-            .unwrap()
-            .insert("test-server".to_string(), entry);
-        write_mcp_config(&path, &config).unwrap();
-
-        // Verify it's there
-        let config = read_mcp_config(&path).unwrap();
-        assert!(config["mcpServers"]["test-server"]["command"] == "npx");
-
-        // Remove it
-        let mut config = read_mcp_config(&path).unwrap();
-        let removed = config["mcpServers"]
-            .as_object_mut()
-            .unwrap()
-            .remove("test-server")
-            .is_some();
-        assert!(removed);
-        write_mcp_config(&path, &config).unwrap();
-
-        // Verify it's gone
-        let config = read_mcp_config(&path).unwrap();
-        assert!(
-            !config["mcpServers"]
-                .as_object()
-                .unwrap()
-                .contains_key("test-server")
-        );
-    }
-
-    #[test]
-    fn mcp_add_json_valid() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("mcp.json");
-        make_config(&path, serde_json::json!({}));
-
-        let entry: serde_json::Value =
-            serde_json::from_str(r#"{"url":"http://localhost:3000","type":"sse"}"#).unwrap();
-        let mut config = read_mcp_config(&path).unwrap();
-        config["mcpServers"]
-            .as_object_mut()
-            .unwrap()
-            .insert("sse-server".to_string(), entry);
-        write_mcp_config(&path, &config).unwrap();
-
-        let config = read_mcp_config(&path).unwrap();
-        assert_eq!(config["mcpServers"]["sse-server"]["type"], "sse");
-        assert_eq!(
-            config["mcpServers"]["sse-server"]["url"],
-            "http://localhost:3000"
-        );
-    }
-
-    #[test]
-    fn mcp_add_json_invalid_json() {
-        let err: Result<serde_json::Value, _> = serde_json::from_str("not json");
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn mcp_add_duplicate_detection() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("mcp.json");
-        make_config(&path, serde_json::json!({"existing": {"command": "echo"}}));
-
-        let config = read_mcp_config(&path).unwrap();
-        let has_existing = config["mcpServers"]
-            .as_object()
-            .unwrap()
-            .contains_key("existing");
-        assert!(has_existing);
-    }
-
-    #[test]
-    fn mcp_remove_nonexistent_server() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("mcp.json");
-        make_config(&path, serde_json::json!({}));
-
-        let mut config = read_mcp_config(&path).unwrap();
-        let removed = config["mcpServers"]
-            .as_object_mut()
-            .unwrap()
-            .remove("ghost")
-            .is_some();
-        assert!(!removed);
-    }
-
-    #[test]
-    fn mcp_get_searches_both_scopes() {
-        // mcp_get searches project then user; verify the search logic
-        let scopes = ["project", "user"];
-        assert_eq!(scopes.len(), 2);
-        assert_eq!(scopes[0], "project");
-        assert_eq!(scopes[1], "user");
-    }
-
-    #[test]
-    fn mcp_list_empty_config() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("mcp.json");
-        make_config(&path, serde_json::json!({}));
-
-        let config = read_mcp_config(&path).unwrap();
-        let servers = config["mcpServers"].as_object().unwrap();
-        assert!(servers.is_empty());
-    }
-
-    #[test]
-    fn mcp_list_multiple_server_types() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("mcp.json");
-        make_config(
-            &path,
-            serde_json::json!({
-                "stdio-srv": {"command": "npx", "args": ["@mcp/server"]},
-                "sse-srv": {"type": "sse", "url": "http://localhost:3000"},
-                "http-srv": {"type": "http", "url": "http://localhost:4000"}
-            }),
-        );
-
-        let config = read_mcp_config(&path).unwrap();
-        let servers = config["mcpServers"].as_object().unwrap();
-        assert_eq!(servers.len(), 3);
-
-        // stdio type inference
-        let stdio = &servers["stdio-srv"];
-        assert_eq!(
-            stdio
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("stdio"),
-            "stdio"
-        );
-
-        // sse type
-        assert_eq!(servers["sse-srv"]["type"], "sse");
-
-        // http type
-        assert_eq!(servers["http-srv"]["type"], "http");
-    }
-
-    #[test]
-    fn write_mcp_config_atomic_no_partial() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("mcp.json");
-        let config = serde_json::json!({"mcpServers": {"s": {"command": "echo"}}});
-        write_mcp_config(&path, &config).unwrap();
-
-        // tmp file should not remain
-        let tmp = path.with_extension("json.tmp");
-        assert!(!tmp.exists());
-
-        // written file should be valid JSON
-        let content = std::fs::read_to_string(&path).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(parsed["mcpServers"]["s"]["command"], "echo");
-    }
-
-    #[test]
-    fn load_mcp_configs_from_file() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let config_file = dir.path().join("custom-mcp.json");
-        std::fs::write(
-            &config_file,
-            r#"{"mcpServers":{"test-server":{"command":"echo","args":["hello"]}}}"#,
-        )
-        .unwrap();
-
-        // We can't easily test load_mcp_configs (needs project_mcp_json_path),
-        // but we can test the JSON parsing logic directly
-        let json_str = std::fs::read_to_string(&config_file).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        let servers = parsed
-            .get("mcpServers")
-            .and_then(|v| v.as_object())
-            .unwrap();
-        assert!(servers.contains_key("test-server"));
-        assert_eq!(servers["test-server"]["command"], "echo");
-        assert_eq!(servers["test-server"]["args"][0], "hello");
-    }
-
-    #[test]
-    fn load_mcp_configs_rejects_missing_mcp_servers_key() {
-        let json_str = r#"{"servers":{"foo":{}}}"#;
-        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
-        let servers = parsed.get("mcpServers").and_then(|v| v.as_object());
-        assert!(servers.is_none(), "missing mcpServers should return None");
-    }
-}
-
-#[cfg(test)]
-mod config_cli_tests {
-    use super::*;
-
-    #[test]
-    fn read_settings_missing_file_returns_empty() {
-        // settings_path() returns home-based path; test read directly
-        let settings = serde_json::Map::new();
-        assert!(settings.is_empty());
-    }
-
-    #[test]
-    fn write_and_read_settings_roundtrip() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("settings.json");
-
-        let mut settings = serde_json::Map::new();
-        settings.insert(
-            "default_model".to_string(),
-            serde_json::Value::String("gpt-4o".into()),
-        );
-        settings.insert("verbose".to_string(), serde_json::Value::Bool(true));
-
-        let val = serde_json::Value::Object(settings.clone());
-        std::fs::write(&path, serde_json::to_string_pretty(&val).unwrap()).unwrap();
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        let loaded = parsed.as_object().unwrap();
-        assert_eq!(loaded["default_model"], "gpt-4o");
-        assert_eq!(loaded["verbose"], true);
-    }
-
-    #[test]
-    fn value_parsing_booleans() {
-        let parse = |v: &str| -> serde_json::Value {
-            match v {
-                "true" => serde_json::Value::Bool(true),
-                "false" => serde_json::Value::Bool(false),
-                _ => serde_json::Value::String(v.to_string()),
-            }
-        };
-        assert_eq!(parse("true"), serde_json::Value::Bool(true));
-        assert_eq!(parse("false"), serde_json::Value::Bool(false));
-        assert_eq!(parse("hello"), serde_json::Value::String("hello".into()));
-    }
-
-    #[test]
-    fn value_parsing_numbers() {
-        let v = "42";
-        let parsed = v.parse::<i64>().unwrap();
-        assert_eq!(parsed, 42);
-    }
-
-    #[test]
-    fn known_settings_not_empty() {
-        assert!(!KNOWN_SETTINGS.is_empty());
-        for (key, desc) in KNOWN_SETTINGS {
-            assert!(!key.is_empty());
-            assert!(!desc.is_empty());
-        }
-    }
-
-    #[test]
-    fn config_set_overwrites() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("settings.json");
-
-        // Initial
-        let mut settings = serde_json::Map::new();
-        settings.insert("key".to_string(), serde_json::Value::String("v1".into()));
-        std::fs::write(
-            &path,
-            serde_json::to_string_pretty(&serde_json::Value::Object(settings)).unwrap(),
-        )
-        .unwrap();
-
-        // Overwrite
-        let content = std::fs::read_to_string(&path).unwrap();
-        let mut loaded: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str::<serde_json::Value>(&content)
-                .unwrap()
-                .as_object()
-                .unwrap()
-                .clone();
-        loaded.insert("key".to_string(), serde_json::Value::String("v2".into()));
-        std::fs::write(
-            &path,
-            serde_json::to_string_pretty(&serde_json::Value::Object(loaded)).unwrap(),
-        )
-        .unwrap();
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        let final_val: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(final_val["key"], "v2");
-    }
-
-    // Helper matching config_set's value parsing logic
-    fn parse_value(value: &str) -> serde_json::Value {
-        match value {
-            "true" => serde_json::Value::Bool(true),
-            "false" => serde_json::Value::Bool(false),
-            v if v.parse::<f64>().is_ok() && !v.contains(|c: char| c.is_alphabetic()) => {
-                if let Ok(n) = v.parse::<i64>() {
-                    serde_json::Value::Number(n.into())
-                } else {
-                    serde_json::Value::String(v.to_string())
-                }
-            }
-            v => serde_json::Value::String(v.to_string()),
-        }
-    }
-
-    #[test]
-    fn config_value_parsing_booleans() {
-        assert_eq!(parse_value("true"), serde_json::Value::Bool(true));
-        assert_eq!(parse_value("false"), serde_json::Value::Bool(false));
-    }
-
-    #[test]
-    fn config_value_parsing_integers() {
-        assert_eq!(parse_value("42"), serde_json::Value::Number(42.into()));
-        assert_eq!(parse_value("0"), serde_json::Value::Number(0.into()));
-        assert_eq!(parse_value("-1"), serde_json::Value::Number((-1).into()));
-    }
-
-    #[test]
-    fn config_value_parsing_strings() {
-        assert_eq!(
-            parse_value("gpt-4o"),
-            serde_json::Value::String("gpt-4o".into())
-        );
-        assert_eq!(parse_value(""), serde_json::Value::String("".into()));
-    }
-
-    #[test]
-    fn known_settings_has_default_model() {
-        assert!(KNOWN_SETTINGS.iter().any(|(k, _)| *k == "default_model"));
-    }
-
-    #[test]
-    fn known_settings_has_auto_approve() {
-        assert!(KNOWN_SETTINGS.iter().any(|(k, _)| *k == "auto_approve"));
-    }
-
-    #[test]
-    fn apply_system_prompt_none_passthrough() {
-        assert_eq!(apply_system_prompt("hello", None), "hello");
-    }
-
-    #[test]
-    fn apply_system_prompt_wraps_message() {
-        let result = apply_system_prompt("hello", Some("Be concise"));
-        assert!(result.starts_with("<system_instructions>"));
-        assert!(result.contains("Be concise"));
-        assert!(result.ends_with("hello"));
     }
 }
 
@@ -5065,8 +3505,12 @@ mod exit_code_tests {
             deprioritized_tools: vec![],
             force_stop: true,
             nudge_count: 0,
+            interaction_mode: "prompt".to_string(),
+            suppressed_loop_nudges: false,
             total_errors: 3,
             deprioritized_count: 0,
+            recent_error_pressure: 0,
+            recent_timeout_pressure: 0,
             total_timeouts: 0,
             timeout_dominant_tools: vec![],
             total_cache_hits: 0,
@@ -5189,8 +3633,12 @@ mod exit_code_tests {
             deprioritized_tools: vec![],
             force_stop: false,
             nudge_count: 1,
+            interaction_mode: "prompt".to_string(),
+            suppressed_loop_nudges: false,
             total_errors: 1,
             deprioritized_count: 0,
+            recent_error_pressure: 0,
+            recent_timeout_pressure: 0,
             total_timeouts: 0,
             timeout_dominant_tools: vec![],
             total_cache_hits: 0,
@@ -5308,52 +3756,8 @@ mod final_json_output_tests {
 }
 
 #[cfg(test)]
-mod arg_render_tests {
-    use super::*;
-
-    #[test]
-    fn bare_permissions_command_renders_empty_arg_for_mode_cycle() {
-        let args = PermissionsArgs { command: None };
-        assert_eq!(render_permissions_args(&args), "");
-    }
-
-    #[test]
-    fn permissions_trace_renders_trace_arg() {
-        let args = PermissionsArgs {
-            command: Some(PermissionsSubcommand::Trace(PermissionsTraceArgs {
-                export: None,
-            })),
-        };
-        assert_eq!(render_permissions_args(&args), "trace");
-    }
-
-    #[test]
-    fn permissions_trust_commands_render_args() {
-        let trust = PermissionsArgs {
-            command: Some(PermissionsSubcommand::Trust),
-        };
-        assert_eq!(render_permissions_args(&trust), "trust");
-
-        let untrust = PermissionsArgs {
-            command: Some(PermissionsSubcommand::Untrust),
-        };
-        assert_eq!(render_permissions_args(&untrust), "untrust");
-    }
-
-    #[test]
-    fn permissions_trace_export_renders_path_arg() {
-        let args = PermissionsArgs {
-            command: Some(PermissionsSubcommand::Trace(PermissionsTraceArgs {
-                export: Some(std::path::PathBuf::from("trace.jsonl")),
-            })),
-        };
-        assert_eq!(render_permissions_args(&args), "trace --export trace.jsonl");
-    }
-}
-
-#[cfg(test)]
 mod show_policy_tests {
-    use super::*;
+    use crate::cli::config_manager::format_policy_output;
     use astra_config::runtime_config::EffectiveToolPolicy;
 
     fn fake_policy() -> EffectiveToolPolicy {
@@ -5562,6 +3966,9 @@ mod default_model_tests {
 #[cfg(test)]
 mod api_url_config_tests {
     use super::*;
+    use crate::cli::config_manager::{
+        DEFAULT_API_URL, KNOWN_SETTINGS, read_config_api_url_from, resolve_api_url_with,
+    };
 
     fn no_env() -> Option<String> {
         None
@@ -5584,7 +3991,8 @@ mod api_url_config_tests {
             Some("http://flag:8000"),
             env_val("http://env:8000"),
             config_val("http://config:8000"),
-        );
+        )
+        .expect("flag should win");
         assert_eq!(url, "http://flag:8000");
     }
 
@@ -5594,44 +4002,50 @@ mod api_url_config_tests {
             None,
             env_val("http://env:8000"),
             config_val("http://config:8000"),
-        );
+        )
+        .expect("env should win");
         assert_eq!(url, "http://env:8000");
     }
 
     #[test]
     fn config_wins_over_default() {
-        let url = resolve_api_url_with(None, no_env, config_val("http://config:8000"));
+        let url = resolve_api_url_with(None, no_env, config_val("http://config:8000"))
+            .expect("config should win");
         assert_eq!(url, "http://config:8000");
     }
 
     #[test]
     fn falls_back_to_default_when_all_none() {
-        let url = resolve_api_url_with(None, no_env, no_config);
+        let url = resolve_api_url_with(None, no_env, no_config).expect("default should apply");
         assert_eq!(url, DEFAULT_API_URL);
     }
 
     #[test]
     fn trailing_slash_stripped_from_flag() {
-        let url = resolve_api_url_with(Some("http://flag:8000/"), no_env, no_config);
+        let url = resolve_api_url_with(Some("http://flag:8000/"), no_env, no_config)
+            .expect("flag should trim slash");
         assert_eq!(url, "http://flag:8000");
     }
 
     #[test]
     fn trailing_slash_stripped_from_env() {
-        let url = resolve_api_url_with(None, env_val("http://env:8000/"), no_config);
+        let url = resolve_api_url_with(None, env_val("http://env:8000/"), no_config)
+            .expect("env should trim slash");
         assert_eq!(url, "http://env:8000");
     }
 
     #[test]
     fn trailing_slash_stripped_from_config() {
-        let url = resolve_api_url_with(None, no_env, config_val("http://config:8000/"));
+        let url = resolve_api_url_with(None, no_env, config_val("http://config:8000/"))
+            .expect("config should trim slash");
         assert_eq!(url, "http://config:8000");
     }
 
     #[test]
-    fn config_error_falls_through_to_default() {
-        let url = resolve_api_url_with(None, no_env, || Err("broken".to_string()));
-        assert_eq!(url, DEFAULT_API_URL);
+    fn config_error_is_propagated() {
+        let err = resolve_api_url_with(None, no_env, || Err("broken".to_string()))
+            .expect_err("config error should not fall through");
+        assert_eq!(err, "broken");
     }
 
     #[test]
@@ -5717,128 +4131,5 @@ mod api_url_config_tests {
         let target = dir.path().join("nested").join("capture.json");
         write_downloaded_capture(&target, br#"{"ok":true}"#).unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), r#"{"ok":true}"#);
-    }
-}
-
-#[cfg(test)]
-mod session_continuation_tests {
-    #[allow(unused_imports)]
-    use serde_json::json;
-
-    /// Regression test: `--session-id` in one-shot mode must load previous
-    /// messages from the session's heavy checkpoint. Before the fix, messages
-    /// were always empty — the model couldn't see prior conversation turns.
-    #[test]
-    fn load_session_messages_returns_checkpoint_messages() {
-        let session_id = format!("test-session-cont-{}", uuid::Uuid::new_v4());
-
-        // Write a heavy checkpoint to the standard sessions dir.
-        let home = dirs::home_dir().unwrap();
-        let cp_dir = home
-            .join(".astra/sessions")
-            .join(&session_id)
-            .join("step_checkpoints");
-        std::fs::create_dir_all(&cp_dir).unwrap();
-
-        // Use the same format as a real checkpoint (read from step_protocol.rs).
-        // The key insight: serde will skip unknown fields with #[serde(default)],
-        // so we only need the required fields.
-        let checkpoint_json = r#"{
-            "Heavy": {
-                "light": {
-                    "protocol_version": 1,
-                    "cursor": {"phase": "Done", "slots": [], "parallel": false, "wait_trigger": null, "sub_step": null},
-                    "step_id": "s1",
-                    "task_id": "t1",
-                    "agent_id": "astra-cli",
-                    "progress": 1.0,
-                    "total_tokens": 100,
-                    "created_at": 1700000000
-                },
-                "messages": [
-                    {"role": "user", "content": "Remember: code is ZEBRA-99"},
-                    {"role": "assistant", "content": "OK, noted."}
-                ],
-                "budget_remaining_tokens": 100000,
-                "budget_remaining_rounds": 50,
-                "blocked_tools": [],
-                "recent_tools": []
-            }
-        }"#;
-        std::fs::write(cp_dir.join("000002-heavy.json"), checkpoint_json).unwrap();
-
-        // The function under test: load messages for session continuation.
-        let messages = super::load_session_messages_for_continuation(&session_id);
-
-        // Cleanup
-        let home = dirs::home_dir().unwrap();
-        let _ = std::fs::remove_dir_all(home.join(".astra/sessions").join(&session_id));
-
-        // Assert: must return the 2 messages from the checkpoint.
-        let messages = messages.expect("should load messages from checkpoint");
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["role"], "user");
-        assert_eq!(messages[0]["content"], "Remember: code is ZEBRA-99");
-        assert_eq!(messages[1]["role"], "assistant");
-        assert_eq!(messages[1]["content"], "OK, noted.");
-    }
-
-    #[test]
-    fn load_session_messages_returns_none_for_missing_session() {
-        let messages = super::load_session_messages_for_continuation("nonexistent-session-xyz-42");
-        assert!(messages.is_none());
-    }
-
-    #[test]
-    fn sanitize_strips_runtime_injected_messages() {
-        let msgs = vec![
-            json!({"role": "user", "content": "review code"}),
-            json!({"role": "assistant", "content": "Here is the review..."}),
-            json!({"role": "system", "content": "[working-set:v1]\ngoal: review code\npending_work: none"}),
-            json!({"role": "user", "content": "\n\n## ⚠ Sequential Tool Calls Detected\nYour last 4 rounds..."}),
-            json!({"role": "system", "content": "## Already Fetched (do NOT re-read)\nContext already fetched:\nGit: status"}),
-            json!({"role": "system", "content": "## Cross-Session Project Context\nBelow are summaries..."}),
-            json!({"role": "user", "content": "\n\n✓ Previous round: 2 tools executed in parallel — excellent."}),
-            json!({"role": "user", "content": "[attention:v1]\ngoal: stale goal\ncurrent_todo: none"}),
-            json!({"role": "user", "content": "[working-set:v1]\ngoal: stale\npending_work: none"}),
-            json!({"role": "user", "content": "[session-anchor] Goal: stale. State: t1."}),
-            json!({"role": "system", "content": "[attention:v1]\ngoal: stale system-role manifest"}),
-            json!({"role": "system", "content": "[session-anchor] Goal: stale. State: t1."}),
-            json!({"role": "user", "content": "你好"}),
-        ];
-        let result = super::sanitize_continuation_messages(msgs);
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0]["content"], "review code");
-        assert_eq!(result[1]["content"], "Here is the review...");
-        assert_eq!(result[2]["content"], "你好");
-    }
-
-    #[test]
-    fn sanitize_trims_trailing_tool_round() {
-        let msgs = vec![
-            json!({"role": "user", "content": "check status"}),
-            json!({"role": "assistant", "content": "Here is the status."}),
-            json!({"role": "user", "content": "hi"}),
-            json!({"role": "assistant", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "git_status", "arguments": "{}"}}]}),
-            json!({"role": "tool", "content": "M file.rs", "tool_call_id": "1"}),
-            json!({"role": "assistant", "tool_calls": [{"id": "2", "type": "function", "function": {"name": "git_diff", "arguments": "{}"}}]}),
-            json!({"role": "tool", "content": "+line", "tool_call_id": "2"}),
-        ];
-        let result = super::sanitize_continuation_messages(msgs);
-        // Should trim back to the last complete exchange
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[2]["content"], "hi");
-    }
-
-    #[test]
-    fn sanitize_preserves_complete_conversation() {
-        let msgs = vec![
-            json!({"role": "user", "content": "hello"}),
-            json!({"role": "assistant", "content": "Hi! How can I help?"}),
-            json!({"role": "user", "content": "thanks"}),
-            json!({"role": "assistant", "content": "You're welcome!"}),
-        ];
-        let result = super::sanitize_continuation_messages(msgs.clone());
-        assert_eq!(result.len(), 4);
     }
 }

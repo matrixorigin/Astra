@@ -1,6 +1,6 @@
 use super::chat_stream_tests::sse_text_response;
 use super::*;
-use crate::cli_utils::{CredentialsFile, Profile, save_credentials};
+use crate::cli::cli_utils::{CredentialsFile, Profile, save_credentials};
 use axum::response::IntoResponse;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -142,6 +142,7 @@ async fn find_task_wrong_user() {
 
 // ── Resume user verification ─────────────────────────────────────────────
 
+#[serial_test::serial]
 #[tokio::test]
 async fn resume_local_restore_rejects_unowned_session() {
     let _creds = isolate_credentials();
@@ -209,6 +210,7 @@ total_tokens_out: 3
     // that the journal exists, not that the user owns it. This is a known limitation.
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn initialize_session_state_marks_workspace_session_as_pending_recovery() {
     let _creds = isolate_credentials();
@@ -290,7 +292,11 @@ async fn initialize_session_state_marks_workspace_session_as_pending_recovery() 
     );
     save_credentials(&creds).unwrap();
 
-    let state = session_runtime::initialize_session_state(None, None);
+    let state = session_runtime::initialize_session_state(
+        None,
+        None,
+        &crate::cli::cli_context::CliContext::default(),
+    );
     assert_eq!(state.session_id, None);
     assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
     assert!(state.history.is_empty());
@@ -421,7 +427,11 @@ async fn crash_recovery_short_continue_starts_fresh_session_without_auto_restore
     );
     save_credentials(&creds).unwrap();
 
-    let mut state = session_runtime::initialize_session_state(None, Some("gpt-4o"));
+    let mut state = session_runtime::initialize_session_state(
+        None,
+        Some("gpt-4o"),
+        &crate::cli::cli_context::CliContext::default(),
+    );
     assert_eq!(state.session_id, None);
     assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
 
@@ -520,6 +530,7 @@ async fn crash_recovery_short_continue_starts_fresh_session_without_auto_restore
     assert!(state.resume_guidance.is_none());
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn crash_recovery_low_information_repair_followup_does_not_auto_restore() {
     let _creds = isolate_credentials();
@@ -563,7 +574,11 @@ async fn crash_recovery_low_information_repair_followup_does_not_auto_restore() 
     );
     save_credentials(&creds).unwrap();
 
-    let mut state = session_runtime::initialize_session_state(None, Some("qwen3.6-plus"));
+    let mut state = session_runtime::initialize_session_state(
+        None,
+        Some("qwen3.6-plus"),
+        &crate::cli::cli_context::CliContext::default(),
+    );
     assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
 
     #[derive(Clone)]
@@ -656,6 +671,7 @@ async fn crash_recovery_low_information_repair_followup_does_not_auto_restore() 
 
 // ── Edge cases ───────────────────────────────────────────────────────────
 
+#[serial_test::serial]
 #[tokio::test]
 async fn resume_handles_malformed_workspace_yaml() {
     let _creds = isolate_credentials();
@@ -696,6 +712,7 @@ async fn resume_handles_malformed_workspace_yaml() {
     assert!(!result.restored_from_cloud);
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn resume_handles_missing_workspace() {
     let _creds = isolate_credentials();
@@ -727,6 +744,7 @@ async fn resume_handles_missing_workspace() {
 
 // ── Checkpoint listing ───────────────────────────────────────────────────
 
+#[serial_test::serial]
 #[tokio::test]
 async fn resume_lists_checkpoints_for_session() {
     let _creds = isolate_credentials();

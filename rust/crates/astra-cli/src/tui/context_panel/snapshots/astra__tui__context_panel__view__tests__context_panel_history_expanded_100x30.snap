@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/context_panel/view.rs
+assertion_line: 2116
 expression: buffer_to_string(&buf)
 ---
   2.0k / 100.0k tokens  (2.0%)

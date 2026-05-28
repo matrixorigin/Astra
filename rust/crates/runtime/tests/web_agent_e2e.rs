@@ -489,6 +489,7 @@ async fn post_tool_result(
         "request_id": request_id,
         "status": status,
         "output": output,
+        "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(request_id, output),
         "duration_ms": 10,
     });
     let req = Request::builder()

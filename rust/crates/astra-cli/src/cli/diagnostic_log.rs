@@ -1,10 +1,10 @@
 //! Optional structured logging for the CLI (does not replace REPL / user-facing stderr).
 //!
-//! See [`crate::cli_args::Cli`] (`--diagnostic-log`, `--log-file`).
+//! See [`crate::cli::cli_args::Cli`] (`--diagnostic-log`, `--log-file`).
 
 use std::sync::OnceLock;
 
-use crate::cli_args::Cli;
+use crate::cli::cli_args::Cli;
 use tracing_appender::non_blocking::WorkerGuard;
 
 /// Keeps the [`WorkerGuard`] alive so the non-blocking writer flushes on process exit (drop on shutdown).
@@ -13,7 +13,7 @@ static FILE_LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 /// Initialize diagnostic logging once per process from parsed CLI flags.
 ///
 /// **Priority:** `--log-file` → `--diagnostic-log` (stderr only).
-pub fn init_cli_observability(cli: &Cli) {
+pub(crate) fn init_cli_observability(cli: &Cli) {
     static INIT: OnceLock<()> = OnceLock::new();
     INIT.get_or_init(|| {
         let file_path = cli

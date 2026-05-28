@@ -124,6 +124,7 @@ fn chat_stream_bridge_fallback_payload(
     chat_data: &astra_services::runs::ChatRequestData,
 ) -> serde_json::Value {
     let allow_skills = normalize_bridge_allowlist(chat_data.allow_skills.as_deref());
+    let allow_skill_sources = normalize_bridge_allowlist(chat_data.allow_skill_sources.as_deref());
     let allow_tools = normalize_bridge_allowlist(chat_data.allow_tools.as_deref());
     let edge_profile = chat_data
         .context
@@ -146,12 +147,14 @@ fn chat_stream_bridge_fallback_payload(
             .map(|config| serde_json::json!(config)),
         "skill_search": chat_data.skill_search.as_ref(),
         "allow_skills": allow_skills,
+        "allow_skill_sources": allow_skill_sources,
         "allow_tools": allow_tools,
         "mcp_binding_ids": chat_data.mcp_binding_ids.as_ref(),
         "context": chat_data.context.as_ref(),
         "edge_profile": edge_profile,
         "execution_budget": chat_data.execution_budget.as_ref(),
         "explain": chat_data.explain,
+        "interaction_mode": chat_data.interaction_mode,
         "test_llm_stream_blocks": test_llm_stream_blocks,
         "messages": [
             {
@@ -560,6 +563,7 @@ mod tests {
                 surface_cap: 20,
             }),
             allow_skills: Some(vec!["plan".to_string()]),
+            allow_skill_sources: None,
             allow_tools: Some(vec!["bash".to_string()]),
             mcp_binding_ids: Some(vec![301]),
             context: Some(context),
@@ -569,6 +573,7 @@ mod tests {
                 hard_turn_limit: Some(7),
             }),
             explain: true,
+            interaction_mode: Some(astra_services::runs::RequestedTurnInteractionMode::Auto),
             interactive_client: false,
         });
         let obj = payload.as_object().unwrap();
@@ -577,6 +582,7 @@ mod tests {
         assert_eq!(obj["execution_budget"]["initial_turns"], 3);
         assert_eq!(obj["execution_budget"]["hard_turn_limit"], 7);
         assert_eq!(obj["explain"], true);
+        assert_eq!(obj["interaction_mode"], "auto");
         assert_eq!(obj["skill_search"]["dynamic_surface"], false);
         assert_eq!(obj["skill_search"]["min_catalog_size"], 12);
         assert_eq!(obj["skill_search"]["surface_cap"], 20);
@@ -586,6 +592,7 @@ mod tests {
         );
         assert_eq!(obj["llm_token_service"]["timeout_ms"], 2500);
         assert_eq!(obj["allow_skills"], serde_json::json!(["plan"]));
+        assert_eq!(obj["allow_skill_sources"], serde_json::Value::Null);
         assert_eq!(obj["allow_tools"], serde_json::json!(["bash"]));
         assert_eq!(obj["mcp_binding_ids"], serde_json::json!([301]));
         assert_eq!(
@@ -612,6 +619,11 @@ mod tests {
                 "PLAN".to_string(),
                 "analyze".to_string(),
             ]),
+            allow_skill_sources: Some(vec![
+                " local ".to_string(),
+                "DATABASE".to_string(),
+                "local".to_string(),
+            ]),
             allow_tools: Some(vec![
                 " bash ".to_string(),
                 "BASH".to_string(),
@@ -625,10 +637,15 @@ mod tests {
                 hard_turn_limit: Some(7),
             }),
             explain: true,
+            interaction_mode: None,
             interactive_client: false,
         });
         let obj = payload.as_object().unwrap();
         assert_eq!(obj["allow_skills"], serde_json::json!(["analyze", "plan"]));
+        assert_eq!(
+            obj["allow_skill_sources"],
+            serde_json::json!(["database", "local"])
+        );
         assert_eq!(obj["allow_tools"], serde_json::json!(["bash", "read_file"]));
     }
 

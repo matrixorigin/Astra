@@ -1,6 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/chat_widget/turn_driver.rs
-assertion_line: 138
+assertion_line: 163
 expression: "render_history(&w, 80)"
 ---
 › run ls

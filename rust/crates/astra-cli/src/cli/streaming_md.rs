@@ -14,7 +14,7 @@ use super::terminal_region::TerminalRegion;
 use std::time::Instant;
 
 /// Incremental markdown renderer that streams formatted output.
-pub(super) struct StreamingMarkdown {
+pub(crate) struct StreamingMarkdown {
     /// Full accumulated text so far.
     full_text: String,
     /// Byte offset into `full_text` up to which we have already printed
@@ -36,7 +36,7 @@ pub(super) struct StreamingMarkdown {
 const NO_FLICKER_INTERVAL_MS: u64 = 50;
 
 impl StreamingMarkdown {
-    pub(super) fn new(term_width: usize) -> Self {
+    pub(crate) fn new(term_width: usize) -> Self {
         Self {
             full_text: String::new(),
             stable_end: 0,
@@ -50,12 +50,12 @@ impl StreamingMarkdown {
 
     /// Total lines currently on screen (stable + unstable).
     #[allow(dead_code)] // Used when tuning stderr/stdout cursor accounting; keep for future UX work.
-    pub(super) fn height(&self) -> usize {
+    pub(crate) fn height(&self) -> usize {
         self.stable_region.height() + self.unstable_region.height()
     }
 
     /// Append a text delta and incrementally render.
-    pub(super) fn push(&mut self, delta: &str) {
+    pub(crate) fn push(&mut self, delta: &str) {
         self.full_text.push_str(delta);
 
         // Strip XML-style thinking/reflect tags that leaked into text output.
@@ -110,21 +110,21 @@ impl StreamingMarkdown {
     }
 
     /// Finalize: render any buffered content.
-    pub(super) fn finish(&mut self) {
+    pub(crate) fn finish(&mut self) {
         self.render_incremental();
     }
 
     /// Temporarily clear the unstable region without losing buffered content.
     /// Call this before external stdout output that would desync cursor tracking.
     /// The unstable region will be re-rendered on the next push().
-    pub(super) fn pause_unstable(&mut self) {
+    pub(crate) fn pause_unstable(&mut self) {
         self.unstable_region.clear();
     }
 
     /// Drop any intermediate draft before the next tool round.
     /// For multi-turn tool workflows we only want the final answer to remain
     /// visible; preserving draft prose makes reviews appear duplicated.
-    pub(super) fn discard_and_reset(&mut self) {
+    pub(crate) fn discard_and_reset(&mut self) {
         self.unstable_region.clear();
         self.stable_region.clear();
         self.stable_end = 0;
@@ -185,7 +185,7 @@ const BUFFERED_TAGS: &[SuppressedTag] = &[
 /// - Matched pairs: `<tag>…</tag>` or `<tag attr="…">…</tag>` → removed
 /// - Unclosed opening tags: `<tag>trailing` → truncated at tag start
 /// - Lone closing tags: `</tag>` without matching open → removed
-pub(super) fn strip_xml_tags_inplace(text: &mut String) {
+pub(crate) fn strip_xml_tags_inplace(text: &mut String) {
     let mut changed = false;
 
     for tag in SUPPRESSED_TAGS {
@@ -294,7 +294,7 @@ fn strip_orphan_opening_fences(text: &mut String) {
 
 /// Find the start of `<name` followed by a word boundary (space, `>`, newline,
 /// or end-of-string) at or after `from`. Returns `None` if not found.
-fn find_attr_tag_open(text: &str, name: &str, from: usize) -> Option<usize> {
+pub(crate) fn find_attr_tag_open(text: &str, name: &str, from: usize) -> Option<usize> {
     let prefix = format!("<{name}");
     let mut search_from = from;
     loop {
@@ -316,7 +316,7 @@ fn find_attr_tag_open(text: &str, name: &str, from: usize) -> Option<usize> {
 /// - Lines starting with common narration patterns
 /// - Keeps content starting from markdown structure (headers, bold, lists)
 #[allow(dead_code)]
-pub(super) fn strip_leading_narration(text: &mut String) {
+pub(crate) fn strip_leading_narration(text: &mut String) {
     // Patterns that indicate narration (case-insensitive matching)
     const NARRATION_STARTS: &[&str] = &[
         "now i have",
@@ -393,7 +393,7 @@ pub(super) fn strip_leading_narration(text: &mut String) {
 /// from the known set of LLM thinking tags.  Used to suppress premature
 /// rendering of text that will be stripped once the closing tag arrives.
 #[allow(dead_code)]
-pub(super) fn has_open_xml_tag(text: &str) -> bool {
+pub(crate) fn has_open_xml_tag(text: &str) -> bool {
     for tag in SUPPRESSED_TAGS.iter().chain(BUFFERED_TAGS) {
         let (name, has_attrs) = match tag {
             SuppressedTag::Simple(n) => (*n, false),
@@ -424,7 +424,7 @@ pub(super) fn has_open_xml_tag(text: &str) -> bool {
 ///
 /// Prefixes are auto-derived from [`SUPPRESSED_TAGS`] and [`BUFFERED_TAGS`] —
 /// no manual list needed.
-pub(super) fn could_become_suppressed_tag(partial: &str) -> bool {
+pub(crate) fn could_become_suppressed_tag(partial: &str) -> bool {
     if partial == "<" || partial == "</" {
         return true;
     }
@@ -741,15 +741,15 @@ mod tests {
     fn find_attr_tag_open_basic() {
         // Unit test for the helper — used by WithAttrs variant.
         assert_eq!(
-            super::find_attr_tag_open("<invoke name=\"x\">", "invoke", 0),
+            find_attr_tag_open("<invoke name=\"x\">", "invoke", 0),
             Some(0)
         );
         assert_eq!(
-            super::find_attr_tag_open("text <invoke name=\"x\">", "invoke", 0),
+            find_attr_tag_open("text <invoke name=\"x\">", "invoke", 0),
             Some(5)
         );
         // <invoker> should not match.
-        assert_eq!(super::find_attr_tag_open("<invoker>", "invoke", 0), None);
+        assert_eq!(find_attr_tag_open("<invoker>", "invoke", 0), None);
     }
 
     #[test]

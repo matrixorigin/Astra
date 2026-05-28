@@ -1,6 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/slash_menu/popup.rs
-assertion_line: 379
+assertion_line: 465
 expression: "render_menu(&menu, 80, 3)"
 ---
   no matching commands — try a shorter prefix

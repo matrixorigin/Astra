@@ -2,6 +2,7 @@ use super::*;
 
 // ── command_router ────────────────────────────────────────────────────
 
+#[serial_test::serial]
 #[tokio::test]
 async fn execute_cli_health_command() {
     let _creds_dir = isolate_credentials();
@@ -20,6 +21,7 @@ async fn execute_cli_health_command() {
         &api,
         false,
         0.0,
+        &crate::cli::cli_context::CliContext::default(),
     )
     .await;
     // Health command should succeed regardless of auth
@@ -31,8 +33,11 @@ async fn execute_cli_health_command() {
 #[test]
 fn build_effective_line_plain() {
     let state = SessionState::default();
-    let result =
-        chat_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+    let result = chat_turn::build_effective_line(
+        "hello",
+        &state,
+        &mut crate::cli::ui_adapter::LineUiAdapter,
+    );
     assert_eq!(result, "hello");
 }
 
@@ -43,8 +48,11 @@ fn build_effective_line_with_system_skills() {
     if let Some(md) = skills.iter().find(|s| s.name == "markdown") {
         state.active_system_skills.push(md.clone());
     }
-    let result =
-        chat_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+    let result = chat_turn::build_effective_line(
+        "hello",
+        &state,
+        &mut crate::cli::ui_adapter::LineUiAdapter,
+    );
     assert!(result.contains("hello"));
     assert!(result.contains("Markdown"));
 }

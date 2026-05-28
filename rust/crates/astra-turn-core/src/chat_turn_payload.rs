@@ -16,6 +16,7 @@ pub struct ChatTurnBasePayloadInput<'a> {
     pub session_id: Option<&'a str>,
     pub agent_id: Option<&'a str>,
     pub model: Option<&'a str>,
+    pub interaction_mode: Option<&'a str>,
     pub explain_verbose: bool,
     pub explain_on: bool,
     pub edge_executor_id: &'a str,
@@ -36,6 +37,7 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
         session_id,
         agent_id,
         model,
+        interaction_mode,
         explain_verbose,
         explain_on,
         edge_executor_id,
@@ -49,6 +51,7 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
         "session_id": session_id,
         "agent_id": agent_id,
         "model": model,
+        "interaction_mode": interaction_mode,
         "explain": chat_turn_explain_field_json(explain_verbose, explain_on),
         "edge_executor_id": edge_executor_id,
         "capabilities": capabilities,
@@ -155,6 +158,7 @@ mod tests {
             session_id: None,
             agent_id: Some("test-agent"),
             model: Some("gpt-test"),
+            interaction_mode: Some("auto"),
             explain_verbose: false,
             explain_on: true,
             edge_executor_id: "edge-unit",
@@ -167,6 +171,7 @@ mod tests {
         assert_eq!(p["session_id"], Value::Null);
         assert_eq!(p["agent_id"], "test-agent");
         assert_eq!(p["model"], "gpt-test");
+        assert_eq!(p["interaction_mode"], "auto");
         assert_eq!(p["explain"], json!(true));
         assert_eq!(p["edge_executor_id"], "edge-unit");
         let caps = p["capabilities"].as_array().unwrap();
@@ -185,6 +190,7 @@ mod tests {
             session_id: Some("sess-1"),
             agent_id: None,
             model: Some("m"),
+            interaction_mode: None,
             explain_verbose: true,
             explain_on: false,
             edge_executor_id: "e",
@@ -195,6 +201,7 @@ mod tests {
         });
         assert_eq!(p["session_id"], "sess-1");
         assert_eq!(p["agent_id"], Value::Null);
+        assert_eq!(p["interaction_mode"], Value::Null);
         assert_eq!(p["explain"], json!("verbose"));
     }
 
@@ -205,6 +212,7 @@ mod tests {
             session_id: None,
             agent_id: None,
             model: Some("claude-thinking"),
+            interaction_mode: Some("non_interactive"),
             explain_verbose: false,
             explain_on: false,
             edge_executor_id: "e",
@@ -226,6 +234,7 @@ mod tests {
             session_id: None,
             agent_id: None,
             model: Some("gpt-4o"),
+            interaction_mode: None,
             explain_verbose: false,
             explain_on: false,
             edge_executor_id: "e",

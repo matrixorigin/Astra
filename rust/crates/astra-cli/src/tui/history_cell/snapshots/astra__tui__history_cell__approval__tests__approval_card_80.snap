@@ -1,6 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/approval.rs
-assertion_line: 982
+assertion_line: 1005
 expression: "render_at(&fixture_full(), 80)"
 ---
 ╭─ ⏸ npm test --filter auth

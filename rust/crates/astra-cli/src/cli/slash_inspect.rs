@@ -6,7 +6,7 @@ use super::*;
 /// In TUI mode this is shadowed by TuiHandler::Panel (InfoView).
 /// Kept for headless / non-interactive execution paths.
 #[allow(dead_code)]
-pub(super) fn handle_inspect_command(arg: &str, state: &SessionState) {
+pub(crate) fn handle_inspect_command(arg: &str, state: &SessionState) {
     use astra_harness::SnapshotSink;
 
     let trimmed = arg.trim();
@@ -58,7 +58,7 @@ pub(super) fn handle_inspect_command(arg: &str, state: &SessionState) {
 }
 
 #[cfg(feature = "harness")]
-pub(super) fn format_snapshot_summary(s: &astra_harness::RuntimeSnapshot) -> String {
+pub(crate) fn format_snapshot_summary(s: &astra_harness::RuntimeSnapshot) -> String {
     let turns = match s.turns_limit {
         Some(limit) => format!("{} / {}", s.turns_used, limit),
         None => format!("{}", s.turns_used),
@@ -136,7 +136,7 @@ fn print_cache(state: &SessionState) {
 }
 
 #[cfg(not(feature = "harness"))]
-pub(super) fn handle_inspect_command(_arg: &str, _state: &SessionState) {
+pub(crate) fn handle_inspect_command(_arg: &str, _state: &SessionState) {
     eprintln!(
         "{}",
         "  Harness feature is disabled. Rebuild with `--features harness` to enable /inspect."

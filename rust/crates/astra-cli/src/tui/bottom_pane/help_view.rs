@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use super::view::{BottomPaneView, CancellationEvent, ViewCompletion};
-use crate::command_registry::{self, CommandGroup, CommandMeta};
+use crate::cli::command_registry::{self, CommandGroup, CommandMeta};
 
 const MAX_CMD_ROWS: usize = 10;
 

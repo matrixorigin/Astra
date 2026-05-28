@@ -919,6 +919,7 @@ fn chat_request_into_data_maps_all_fields() {
         }),
         skill_search: Some(astra_core::SkillSearchSettings::default()),
         allow_skills: None,
+        allow_skill_sources: None,
         allow_tools: None,
         mcp_binding_ids: Some(vec![301]),
         context: Some(ctx.clone()),
@@ -927,6 +928,8 @@ fn chat_request_into_data_maps_all_fields() {
             hard_turn_limit: Some(7),
         }),
         explain: true,
+        interaction_mode: Some(astra_services::runs::RequestedTurnInteractionMode::Auto),
+        interactive_client: true,
         plan_subtask_id: None,
         is_plan_subtask: None,
     };
@@ -957,6 +960,11 @@ fn chat_request_into_data_maps_all_fields() {
         })
     );
     assert!(data.explain);
+    assert_eq!(
+        data.interaction_mode,
+        Some(astra_services::runs::RequestedTurnInteractionMode::Auto)
+    );
+    assert!(data.interactive_client);
 }
 
 #[test]
@@ -972,6 +980,8 @@ fn chat_request_into_data_maps_defaults() {
     assert!(data.context.is_none());
     assert!(data.execution_budget.is_none());
     assert!(!data.explain);
+    assert!(data.interaction_mode.is_none());
+    assert!(!data.interactive_client);
 }
 
 #[test]
@@ -984,11 +994,14 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         llm_token_service: None,
         skill_search: None,
         allow_skills: None,
+        allow_skill_sources: None,
         allow_tools: None,
         mcp_binding_ids: None,
         context: None,
         execution_budget: None,
         explain: false,
+        interaction_mode: None,
+        interactive_client: false,
         plan_subtask_id: Some("sub-42".into()),
         is_plan_subtask: Some(true),
     };

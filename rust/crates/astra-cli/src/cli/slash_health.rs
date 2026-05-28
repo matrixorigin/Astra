@@ -5,7 +5,7 @@ use super::*;
 /// In TUI mode this is typically reached via `/stats health` or the `/health` alias.
 /// Kept for headless / non-interactive execution paths.
 #[allow(dead_code)]
-pub(super) async fn handle_health_command(arg: &str, state: &SessionState) {
+pub(crate) async fn handle_health_command(arg: &str, state: &SessionState) {
     use astra_turn_core::tool_health::ToolHealthTracker;
 
     let detail = arg.trim() == "detail";
@@ -159,7 +159,7 @@ pub(super) async fn handle_health_command(arg: &str, state: &SessionState) {
 }
 
 /// Render cloud sync status section.
-pub(super) fn display_sync_status(status: &astra_services::SyncStatus) {
+pub(crate) fn display_sync_status(status: &astra_services::SyncStatus) {
     // Connection confirmed — show details
     let overall = if status.last_error.is_some() {
         "⚠ Error".yellow().to_string()
@@ -193,7 +193,7 @@ pub(super) fn display_sync_status(status: &astra_services::SyncStatus) {
 }
 
 /// Format an ISO 8601 timestamp as relative age (e.g., "3m ago", "2h ago").
-pub(super) fn format_sync_age(ts: &str) -> String {
+pub(crate) fn format_sync_age(ts: &str) -> String {
     // Try to parse ISO 8601 timestamps in common formats
     let now = chrono::Utc::now();
     let parsed = chrono::DateTime::parse_from_rfc3339(ts)

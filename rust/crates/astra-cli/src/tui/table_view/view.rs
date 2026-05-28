@@ -189,7 +189,7 @@ mod tests {
     fn snapshot_basic_three_row_table() {
         let t = fixture();
         let n = TableNav::new(t.num_rows(), t.num_cols());
-        insta::assert_snapshot!("table_basic_100x8", draw(&t, &n, 100, 8));
+        crate::tui::testing::assert_tui_snapshot!("table_basic_100x8", draw(&t, &n, 100, 8));
     }
 
     #[test]
@@ -197,14 +197,17 @@ mod tests {
         let t = fixture();
         let mut n = TableNav::new(t.num_rows(), t.num_cols());
         n.move_down();
-        insta::assert_snapshot!("table_row2_selected_100x8", draw(&t, &n, 100, 8));
+        crate::tui::testing::assert_tui_snapshot!(
+            "table_row2_selected_100x8",
+            draw(&t, &n, 100, 8)
+        );
     }
 
     #[test]
     fn snapshot_narrow_shows_subset_cols() {
         let t = fixture();
         let n = TableNav::new(t.num_rows(), t.num_cols());
-        insta::assert_snapshot!("table_narrow_50x8", draw(&t, &n, 50, 8));
+        crate::tui::testing::assert_tui_snapshot!("table_narrow_50x8", draw(&t, &n, 50, 8));
     }
 
     #[test]
@@ -212,7 +215,7 @@ mod tests {
         let t = fixture();
         let mut n = TableNav::new(t.num_rows(), t.num_cols());
         n.scroll_right();
-        insta::assert_snapshot!("table_scrolled_right_60x8", draw(&t, &n, 60, 8));
+        crate::tui::testing::assert_tui_snapshot!("table_scrolled_right_60x8", draw(&t, &n, 60, 8));
     }
 
     #[test]
@@ -222,7 +225,7 @@ mod tests {
             rows: Vec::new(),
         };
         let n = TableNav::new(0, 0);
-        insta::assert_snapshot!("table_empty_80x3", draw(&t, &n, 80, 3));
+        crate::tui::testing::assert_tui_snapshot!("table_empty_80x3", draw(&t, &n, 80, 3));
     }
 
     #[test]
@@ -237,7 +240,7 @@ mod tests {
 ";
         let t = parse(wide).unwrap();
         let n = TableNav::new(t.num_rows(), t.num_cols());
-        insta::assert_snapshot!("table_truncates_80x8", draw(&t, &n, 80, 8));
+        crate::tui::testing::assert_tui_snapshot!("table_truncates_80x8", draw(&t, &n, 80, 8));
     }
 
     // Helpers

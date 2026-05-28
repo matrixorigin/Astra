@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use super::hooks::SkillHooks;
 use super::version::{Dependency, Version};
@@ -21,6 +22,101 @@ pub enum SkillSourceKind {
     Mcp,
     /// External plugin.
     Plugin,
+}
+
+/// Single source of truth for [`SkillSourceKind`] string serialization.
+///
+/// Adding a variant to the enum without a row here triggers a compile error
+/// in [`SkillSourceKind::as_str`] (the exhaustive `match` keeps the table and
+/// enum in sync), so the four shapes `as_str` / `Display` / `FromStr` /
+/// `SUPPORTED_FILTERS` derive from one place.
+const SKILL_SOURCE_KIND_TABLE: &[(SkillSourceKind, &str)] = &[
+    (SkillSourceKind::Local, "local"),
+    (SkillSourceKind::Bundled, "bundled"),
+    (SkillSourceKind::Database, "database"),
+    (SkillSourceKind::Mcp, "mcp"),
+    (SkillSourceKind::Plugin, "plugin"),
+];
+
+impl SkillSourceKind {
+    pub const SUPPORTED_FILTERS: &'static [&'static str] =
+        &["local", "bundled", "database", "mcp", "plugin"];
+
+    pub fn as_str(&self) -> &'static str {
+        // Exhaustive match so adding a variant fails to compile until the
+        // table above grows a matching row.
+        match self {
+            Self::Local => SKILL_SOURCE_KIND_TABLE[0].1,
+            Self::Bundled => SKILL_SOURCE_KIND_TABLE[1].1,
+            Self::Database => SKILL_SOURCE_KIND_TABLE[2].1,
+            Self::Mcp => SKILL_SOURCE_KIND_TABLE[3].1,
+            Self::Plugin => SKILL_SOURCE_KIND_TABLE[4].1,
+        }
+    }
+}
+
+impl std::fmt::Display for SkillSourceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SkillSourceKind {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let needle = raw.trim().to_ascii_lowercase();
+        SKILL_SOURCE_KIND_TABLE
+            .iter()
+            .find(|(_, label)| *label == needle)
+            .map(|(variant, _)| variant.clone())
+            .ok_or_else(|| {
+                format!(
+                    "unsupported skill source '{raw}'; expected one of: {}",
+                    Self::SUPPORTED_FILTERS.join(", ")
+                )
+            })
+    }
+}
+
+#[cfg(test)]
+mod skill_source_kind_table_tests {
+    use super::*;
+
+    /// Pin SUPPORTED_FILTERS to the labels in the variants table.
+    /// If they ever drift, this test catches the inconsistency before users do.
+    #[test]
+    fn supported_filters_matches_variants_table() {
+        let from_table: Vec<&'static str> = SKILL_SOURCE_KIND_TABLE
+            .iter()
+            .map(|(_, label)| *label)
+            .collect();
+        assert_eq!(SkillSourceKind::SUPPORTED_FILTERS, from_table.as_slice());
+    }
+
+    /// Round-trip every row: `as_str ∘ from_str = identity` and vice versa.
+    #[test]
+    fn variants_round_trip_through_table() {
+        for (variant, label) in SKILL_SOURCE_KIND_TABLE {
+            assert_eq!(variant.as_str(), *label);
+            assert_eq!(SkillSourceKind::from_str(label).unwrap(), *variant);
+        }
+    }
+
+    #[test]
+    fn variants_round_trip_through_display_form() {
+        for variant in [
+            SkillSourceKind::Local,
+            SkillSourceKind::Bundled,
+            SkillSourceKind::Database,
+            SkillSourceKind::Mcp,
+            SkillSourceKind::Plugin,
+        ] {
+            let encoded = variant.to_string();
+            let decoded = SkillSourceKind::from_str(&encoded).expect("round-trip should parse");
+            assert_eq!(decoded, variant);
+        }
+    }
 }
 
 /// Execution context for a skill invocation.
@@ -446,6 +542,132 @@ impl SkillManifest {
         }
         issues
     }
+
+    /// Validate the manifest for required fields and well-formedness.
+    ///
+    /// Returns structured validation errors so callers can react without
+    /// string-parsing. An empty list means the manifest is valid.
+    pub fn validate(&self) -> Vec<SkillManifestValidationError> {
+        let mut errors = Vec::new();
+
+        errors.extend(validate_skill_manifest_core(
+            self.name.as_str(),
+            self.description.as_str(),
+            Some(&self.version),
+        ));
+
+        // allowed_tools should have valid tool names if specified
+        for tool in &self.allowed_tools {
+            if tool.is_empty() {
+                errors.push(SkillManifestValidationError::EmptyAllowedTool);
+            }
+        }
+
+        // input_schema must be valid JSON Schema if provided
+        if let Some(ref schema) = self.input_schema
+            && !schema.is_object()
+        {
+            errors.push(SkillManifestValidationError::NonObjectSchema {
+                field: "input_schema",
+            });
+        }
+
+        // output_schema must be valid JSON Schema if provided
+        if let Some(ref schema) = self.output_schema
+            && !schema.is_object()
+        {
+            errors.push(SkillManifestValidationError::NonObjectSchema {
+                field: "output_schema",
+            });
+        }
+
+        // remote_url must be valid HTTP/HTTPS if provided
+        if let Some(ref url) = self.remote_url
+            && !url.starts_with("http://")
+            && !url.starts_with("https://")
+        {
+            errors.push(SkillManifestValidationError::InvalidRemoteUrl(url.clone()));
+        }
+
+        // arguments must have non-empty names
+        for arg in &self.arguments {
+            if arg.name.is_empty() {
+                errors.push(SkillManifestValidationError::EmptyArgumentName);
+            }
+        }
+
+        errors
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SkillManifestValidationError {
+    MissingName,
+    InvalidName(String),
+    MissingDescription,
+    MissingVersion,
+    InvalidVersion(String),
+    EmptyAllowedTool,
+    NonObjectSchema { field: &'static str },
+    InvalidRemoteUrl(String),
+    EmptyArgumentName,
+}
+
+impl std::fmt::Display for SkillManifestValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingName => write!(f, "name is required"),
+            Self::InvalidName(name) => write!(
+                f,
+                "invalid skill name '{}': must not contain '/', '\\\\', or '..'",
+                name
+            ),
+            Self::MissingDescription => write!(f, "description is required"),
+            Self::MissingVersion => write!(f, "version is required"),
+            Self::InvalidVersion(version) => {
+                write!(f, "version {version} is invalid")
+            }
+            Self::EmptyAllowedTool => write!(f, "allowed_tools contains an empty tool name"),
+            Self::NonObjectSchema { field } => write!(f, "{field} must be a JSON object"),
+            Self::InvalidRemoteUrl(url) => {
+                write!(f, "remote_url '{url}' must start with http:// or https://")
+            }
+            Self::EmptyArgumentName => {
+                write!(f, "arguments contain an argument with an empty name")
+            }
+        }
+    }
+}
+
+pub fn validate_skill_manifest_core(
+    name: &str,
+    description: &str,
+    version: Option<&Version>,
+) -> Vec<SkillManifestValidationError> {
+    let mut errors = Vec::new();
+
+    if name.is_empty() {
+        errors.push(SkillManifestValidationError::MissingName);
+    } else if name.contains('/') || name.contains('\\') || name.contains("..") {
+        errors.push(SkillManifestValidationError::InvalidName(name.to_string()));
+    }
+
+    if description.is_empty() {
+        errors.push(SkillManifestValidationError::MissingDescription);
+    }
+
+    match version {
+        None => errors.push(SkillManifestValidationError::MissingVersion),
+        Some(version) if version.major == 0 && version.minor == 0 && version.patch == 0 => {
+            errors.push(SkillManifestValidationError::InvalidVersion(format!(
+                "{}.{}.{}",
+                version.major, version.minor, version.patch
+            )));
+        }
+        Some(_) => {}
+    }
+
+    errors
 }
 
 /// A compatibility issue detected by `check_compatibility()`.

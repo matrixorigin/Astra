@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/slash_dispatch.rs
+assertion_line: 3364
 expression: "build_panels_cheat_sheet_lines().join(\"\\n\")"
 ---
   /resume

@@ -3,13 +3,14 @@
 //! This module defines `SessionState`, the central struct that holds all session state
 //! for the CLI REPL. It also includes helper types like `ExplainMode` and `SkillDevState`.
 
-use crate::PermissionManager;
-use crate::durable_bridge;
+use crate::cli::cli_context::CliContext;
+use crate::cli::durable_bridge;
+use crate::cli::permission_manager::PermissionManager;
+use crate::cli::plan_executor;
+use crate::cli::slash_team;
 use crate::mcp_client;
-use crate::plan_executor;
-use crate::prompts;
-use crate::slash_team;
 use astra_runtime::plan;
+use astra_runtime::prompts;
 use astra_runtime::tool_registry;
 use astra_services::session_journal;
 use astra_turn_core::conversation_log::manager::CslManager;
@@ -64,6 +65,7 @@ pub(crate) struct SessionState {
     pub run_id: Option<String>,
     /// Display name for this session (set via --name flag).
     pub session_name: Option<String>,
+    pub cli_context: CliContext,
     pub model: Option<String>,
     pub turn: u32,
     pub last_response: Option<String>,
@@ -110,7 +112,7 @@ pub(crate) struct SessionState {
     /// on the next REPL iteration. Consumed once after dispatch.
     pub queued_message: Option<String>,
     /// Suggested next prompt shown after a completed turn when the next action is obvious.
-    pub pending_followup_suggestion: Option<crate::followup_suggestion::FollowupSuggestion>,
+    pub pending_followup_suggestion: Option<crate::cli::followup_suggestion::FollowupSuggestion>,
     pub explain: ExplainMode,
     pub verbose_mode: bool,
     /// User preference: enable background memory-extraction agent.
@@ -121,7 +123,7 @@ pub(crate) struct SessionState {
     pub notifications_enabled: bool,
     /// User preference: notification delivery method.
     /// Synced via `pref_keys::NOTIFICATION_METHOD`.
-    pub notification_method: crate::notifications::NotificationMethod,
+    pub notification_method: crate::cli::notifications::NotificationMethod,
     /// User preference: minimum elapsed seconds before a notification fires.
     /// Synced via `pref_keys::NOTIFICATION_THRESHOLD_SECS`.
     pub notification_threshold_secs: u64,
@@ -252,14 +254,14 @@ pub(crate) struct SessionState {
     /// When Some, a plan-executor tool is waiting for user approval.
     /// In blocking mode this is handled inline; kept for edge-case fallback.
     pub pending_approval:
-        Option<tokio::sync::oneshot::Sender<crate::chat_stream::ApprovalResponse>>,
+        Option<tokio::sync::oneshot::Sender<crate::cli::chat_stream::ApprovalResponse>>,
     /// True while plan display is in the middle of printing streaming LLM tokens.
     /// Used to insert a newline before the next non-token event.
     pub plan_in_token_stream: bool,
     /// Streaming markdown renderer for plan execution token output.
-    pub plan_md_renderer: Option<crate::streaming_md::StreamingMarkdown>,
+    pub plan_md_renderer: Option<crate::cli::streaming_md::StreamingMarkdown>,
     /// Thinking preview pane for plan execution (reasoning visibility).
-    pub plan_thinking_pane: Option<crate::effects::ThinkingPreviewPane>,
+    pub plan_thinking_pane: Option<crate::cli::effects::ThinkingPreviewPane>,
     /// Project-level instructions loaded from `.astra/instructions.md`.
     /// Injected into every turn's effective message as `<project_instructions>`.
     pub project_instructions: Option<String>,
@@ -364,9 +366,9 @@ pub(crate) struct SessionState {
 
     // ── TUI mode overrides ──
     /// When set, `run_chat_turn` uses this render policy instead of `Stream`.
-    pub tui_render_policy: Option<crate::stream_render::RenderPolicy>,
+    pub tui_render_policy: Option<crate::cli::stream_render::RenderPolicy>,
     /// When set, `run_chat_turn` injects this channel into ChatTurnParams.
-    pub tui_stream_event_tx: Option<crate::chat_stream::StreamEventTx>,
+    pub tui_stream_event_tx: Option<crate::cli::chat_stream::StreamEventTx>,
     /// Live child-agent event lane; does not gate parent TurnComplete.
     pub tui_agent_live_event_sink:
         Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
@@ -375,15 +377,15 @@ pub(crate) struct SessionState {
     pub tui_cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
     /// When set, tool approval requests are sent through this channel
     /// instead of using interactive inquire prompts.
-    pub tui_approval_request_tx: Option<crate::chat_stream::ApprovalRequestTx>,
+    pub tui_approval_request_tx: Option<crate::cli::chat_stream::ApprovalRequestTx>,
     /// When set, ask_user requests are rendered by the native TUI overlay.
-    pub tui_ask_user_request_tx: Option<crate::chat_stream::AskUserRequestTx>,
+    pub tui_ask_user_request_tx: Option<crate::cli::chat_stream::AskUserRequestTx>,
     /// When set, `exit_plan_mode` surfaces its 4-way plan-review
     /// overlay through the native TUI instead of headless / inquire
     /// prompts. Independent of `tui_ask_user_request_tx` because the
     /// plan-review overlay renders a markdown body, not the
     /// question/option layout `ask_user` expects.
-    pub tui_plan_review_request_tx: Option<crate::chat_stream::PlanReviewRequestTx>,
+    pub tui_plan_review_request_tx: Option<crate::cli::chat_stream::PlanReviewRequestTx>,
 
     /// Notifications from background tasks (completed/failed/stalled)
     /// queued for injection into the model's next turn context.
@@ -417,6 +419,7 @@ impl Default for SessionState {
             pending_recovery: None,
             run_id: None,
             session_name: None,
+            cli_context: CliContext::default(),
             model: None,
             turn: 0,
             last_response: None,
@@ -451,7 +454,7 @@ impl Default for SessionState {
             verbose_mode: true,
             auto_memory_enabled: true,
             notifications_enabled: true,
-            notification_method: crate::notifications::NotificationMethod::Auto,
+            notification_method: crate::cli::notifications::NotificationMethod::Auto,
             notification_threshold_secs: 10,
             history: Vec::new(),
             total_prompt_tokens: 0,
@@ -477,9 +480,7 @@ impl Default for SessionState {
             journal: None,
             recent_tools: Vec::new(),
             perm_manager: PermissionManager::with_workspace_trust(
-                std::env::var("ASTRA_CLI_AUTO_APPROVE")
-                    .map(|v| v == "1")
-                    .unwrap_or(false),
+                default_auto_approve_from_env(),
                 &std::env::current_dir().unwrap_or_default(),
             ),
             ingestion_user_id: None,
@@ -581,6 +582,18 @@ impl Default for SessionState {
     }
 }
 
+/// Backward-compatible default for ad-hoc `SessionState::default()` callers.
+///
+/// Startup paths should prefer `session_runtime::initialize_session_state`,
+/// which threads the validated `CliContext` through explicitly. We still honor
+/// `ASTRA_CLI_AUTO_APPROVE` here because a few tests and legacy call sites
+/// construct `SessionState` directly.
+fn default_auto_approve_from_env() -> bool {
+    std::env::var("ASTRA_CLI_AUTO_APPROVE")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
 impl SessionState {
     /// Set the current session id and keep the Tier 1 task manager in sync
     /// (so `session_todos` reads/writes hit the correct session). Prefer
@@ -627,7 +640,23 @@ impl SessionState {
     /// signal; UI / nudge / status-line consumers must call this
     /// helper.
     pub fn plan_mode_active(&self) -> bool {
-        self.perm_manager.mode() == crate::permission_manager::PermissionMode::Plan
+        self.perm_manager.mode() == crate::cli::permission_manager::PermissionMode::Plan
+    }
+}
+
+#[cfg(test)]
+mod default_tests {
+    use super::*;
+
+    #[test]
+    fn default_auto_approve_reads_env_flag() {
+        unsafe { std::env::set_var("ASTRA_CLI_AUTO_APPROVE", "1") };
+        let state = SessionState::default();
+        assert_eq!(
+            state.perm_manager.mode(),
+            PermissionManager::new(true).mode()
+        );
+        unsafe { std::env::remove_var("ASTRA_CLI_AUTO_APPROVE") };
     }
 }
 
@@ -650,7 +679,7 @@ mod plan_mode_invariant_tests {
 
         state
             .perm_manager
-            .set_mode(crate::permission_manager::PermissionMode::Plan);
+            .set_mode(crate::cli::permission_manager::PermissionMode::Plan);
         assert!(
             state.plan_mode_active(),
             "switching perm_manager to Plan must immediately surface as plan_mode_active"
@@ -658,7 +687,7 @@ mod plan_mode_invariant_tests {
 
         state
             .perm_manager
-            .set_mode(crate::permission_manager::PermissionMode::Auto);
+            .set_mode(crate::cli::permission_manager::PermissionMode::Auto);
         assert!(
             !state.plan_mode_active(),
             "switching back must clear plan_mode_active without any other state change"

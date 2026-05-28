@@ -1,14 +1,14 @@
 //! Plan execution wiring: spawns a background executor task, then runs the
 //! in-process plan monitor in the current task until the run pauses, completes, or
 //! the user cancels. Progress is shown live; between-monitor idle time (if the CLI
-//! prompt is reached again) may still use [`crate::plan_monitor::flush_plan_updates_between_prompts`]
+//! prompt is reached again) may still use [`crate::cli::plan_monitor::flush_plan_updates_between_prompts`]
 //! when applicable.
 
-use crate::durable_bridge;
-use crate::plan_executor;
+use crate::cli::durable_bridge;
+use crate::cli::plan_executor;
 
-use crate::session_state::SessionState;
-use crate::theme;
+use crate::cli::session_state::SessionState;
+use crate::cli::theme;
 use crossterm::style::Stylize;
 
 fn build_fallback_delegation_engine()
@@ -49,6 +49,7 @@ fn take_plan_context(
         token,
         profile: profile.map(|p| p.to_string()),
         model: state.model.clone(),
+        cli_context: state.cli_context.clone(),
         plan,
         plan_goal: state.executing_plan_goal.clone(),
         plan_id: state.executing_plan_id.clone(),
@@ -89,13 +90,13 @@ fn take_plan_context(
 }
 
 /// Spawns a background plan executor, then **blocks the caller** in
-/// [`crate::plan_monitor::run_blocking_plan_monitor`] until the run pauses, finishes,
+/// [`crate::cli::plan_monitor::run_blocking_plan_monitor`] until the run pauses, finishes,
 /// or the user hits Ctrl+C (per monitor behavior).
 ///
 /// The heavy work still runs in the executor’s `tokio` task. This function only
 /// returns after the blocking monitor loop exits, so the normal CLI prompt is not
 /// interleaved with that plan run. The in-memory `executing_plan` copy and
-/// `plan_handle` keep [`crate::plan_monitor::flush_plan_updates_between_prompts`] and
+/// `plan_handle` keep [`crate::cli::plan_monitor::flush_plan_updates_between_prompts`] and
 /// related execution state available when the user is at the prompt again.
 pub(crate) async fn start_and_monitor_plan(
     state: &mut SessionState,
@@ -136,7 +137,7 @@ pub(crate) async fn start_and_monitor_plan(
 /// new executor or when abandoning an in-flight run.
 pub(crate) fn shutdown_plan_executor(state: &mut SessionState) -> bool {
     if let Some(mut h) = state.plan_handle.take() {
-        let _ = h.send_command(crate::plan_executor::PlanCommand::Cancel);
+        let _ = h.send_command(crate::cli::plan_executor::PlanCommand::Cancel);
         while h.try_recv().is_some() {}
         true
     } else {

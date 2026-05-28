@@ -910,6 +910,14 @@ pub enum JournalEventType {
     MemorySuppressed,
     /// Agent released a tool result from context (early eviction).
     ContextReleased,
+    /// Startup bootstrap phases completed (per-phase timestamps in metadata).
+    Bootstrap,
+    /// Lightweight trace span for cross-boundary observability (edge ↔ cloud).
+    ///
+    /// Stored in `metadata` as `{span_id, parent_span_id, name, start_us, end_us, attrs}`.
+    /// Turn-level spans use `turn` + `parent_event_id` for causal tree construction
+    /// without requiring a dedicated graph database.
+    TraceSpan,
 }
 
 /// Why the gate rejected a session-memory extraction attempt.
@@ -1185,8 +1193,13 @@ pub struct LlmRoundRecord {
 /// Events are accumulated during a turn and flushed to the journal in a single
 /// IO operation when the turn completes. On interruption, `flush_interrupted`
 /// writes partial data without fsync.
+/// Max events before oldest are evicted (ring-buffer semantics).
+const TURN_EVENT_BUFFER_CAP: usize = 1000;
+const TURN_EVENT_DROPPED_META_KEY: &str = "dropped_events_before";
+
 pub struct TurnEventBuffer {
-    events: Vec<JournalEvent>,
+    events: std::collections::VecDeque<JournalEvent>,
+    dropped_events: u64,
     turn_start: std::time::Instant,
     session_id: Option<String>,
     turn: u32,
@@ -1203,12 +1216,22 @@ impl TurnEventBuffer {
     /// Start collecting events for a new turn at a specific round offset.
     pub fn begin_turn_with_round(session_id: Option<&str>, turn: u32, round: u32) -> Self {
         Self {
-            events: Vec::new(),
+            events: std::collections::VecDeque::new(),
+            dropped_events: 0,
             turn_start: std::time::Instant::now(),
             session_id: session_id.map(ToString::to_string),
             turn,
             round,
             batch_counter: 0,
+        }
+    }
+
+    /// Push event, evicting oldest if buffer is full (ring-buffer semantics).
+    fn push_event(&mut self, event: JournalEvent) {
+        self.events.push_back(event);
+        while self.events.len() > TURN_EVENT_BUFFER_CAP {
+            self.events.pop_front();
+            self.dropped_events = self.dropped_events.saturating_add(1);
         }
     }
 
@@ -1278,19 +1301,38 @@ impl TurnEventBuffer {
             }
             evt.metadata = Some(serde_json::Value::Object(meta));
         }
-        self.events.push(evt);
+        self.push_event(evt);
         self.round += 1;
         self.batch_counter = 0;
     }
 
     /// Record a single event (generic).
     pub fn record(&mut self, event: JournalEvent) {
-        self.events.push(event);
+        self.push_event(event);
+    }
+
+    /// Record a trace span via builder — preferred API.
+    pub fn record_trace_span_v2(&mut self, builder: TraceSpanBuilder) {
+        let mut evt = builder
+            .session_id(self.session_id.as_deref())
+            .turn(Some(self.turn))
+            .build();
+        // base() may have already set session_id; let the builder override win
+        evt.session_id = self.session_id.clone();
+        evt.turn = Some(self.turn);
+        self.push_event(evt);
     }
 
     /// Number of events collected so far.
     pub fn len(&self) -> usize {
         self.events.len()
+    }
+
+    /// Number of oldest events evicted from the in-memory ring buffer for the
+    /// current turn. When non-zero, any flush/drain result is necessarily
+    /// partial and the first surviving event is annotated with the count.
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped_events
     }
 
     /// Whether no events have been collected.
@@ -1303,8 +1345,11 @@ impl TurnEventBuffer {
         if self.events.is_empty() {
             return Ok(());
         }
-        writer.append_bulk(&self.events)?;
+        let events = self.events.make_contiguous();
+        annotate_dropped_turn_events(events, self.dropped_events);
+        writer.append_bulk(events)?;
         self.events.clear();
+        self.dropped_events = 0;
         Ok(())
     }
 
@@ -1319,14 +1364,35 @@ impl TurnEventBuffer {
                 obj.insert("partial".into(), serde_json::json!(true));
             }
         }
-        writer.append_bulk_no_sync(&self.events)?;
+        let events = self.events.make_contiguous();
+        annotate_dropped_turn_events(events, self.dropped_events);
+        writer.append_bulk_no_sync(events)?;
         self.events.clear();
+        self.dropped_events = 0;
         Ok(())
     }
 
     /// Drain collected events (for callers that persist elsewhere, e.g. DB).
     pub fn drain(&mut self) -> Vec<JournalEvent> {
-        std::mem::take(&mut self.events)
+        let mut events: Vec<JournalEvent> = std::mem::take(&mut self.events).into();
+        annotate_dropped_turn_events(&mut events, self.dropped_events);
+        self.dropped_events = 0;
+        events
+    }
+}
+
+fn annotate_dropped_turn_events(events: &mut [JournalEvent], dropped_events: u64) {
+    if dropped_events == 0 || events.is_empty() {
+        return;
+    }
+    let meta = events[0]
+        .metadata
+        .get_or_insert_with(|| serde_json::json!({}));
+    if let Some(obj) = meta.as_object_mut() {
+        obj.insert(
+            TURN_EVENT_DROPPED_META_KEY.into(),
+            serde_json::json!(dropped_events),
+        );
     }
 }
 
@@ -2308,6 +2374,161 @@ impl JournalEvent {
         evt
     }
 
+    /// Startup bootstrap event: records per-phase timestamps (microsecond precision).
+    ///
+    /// `phases` is an ordered list of `(phase_name, timestamp_us_since_process_start)` tuples.
+    /// Stored in `metadata.phases` as `[{name, us}]` and `metadata.total_us`.
+    pub fn bootstrap(session_id: Option<&str>, phases: &[(&str, u64)], total_us: u64) -> Self {
+        let mut evt = Self::base(JournalEventType::Bootstrap, session_id);
+        let phase_entries: Vec<serde_json::Value> = phases
+            .iter()
+            .map(|(name, us)| serde_json::json!({"name": name, "us": us}))
+            .collect();
+        evt.metadata = Some(serde_json::json!({
+            "phases": phase_entries,
+            "total_us": total_us,
+        }));
+        evt
+    }
+
+    /// Lightweight trace span for cross-boundary observability (edge ↔ cloud).
+    ///
+    /// `span_id` is a short unique identifier; `parent_span_id` links to the parent span.
+    /// `name` is the span operation name (e.g. "context_assembly", "llm_call").
+    /// Record a trace span within the journal (phase timing, tool exec, etc.).
+    ///
+    /// Use the [`TraceSpanBuilder`] to construct — the builder enforces
+    /// required fields at compile time and avoids the 8-argument constructor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn trace_span(
+        session_id: Option<&str>,
+        turn: Option<u32>,
+        span_id: &str,
+        parent_span_id: Option<&str>,
+        name: &str,
+        start_us: u64,
+        end_us: u64,
+        attrs: Option<&HashMap<String, String>>,
+        trace_id: Option<&str>,
+    ) -> Self {
+        TraceSpanBuilder::default()
+            .session_id(session_id)
+            .turn(turn)
+            .span_id(span_id.to_string())
+            .parent_span_id(parent_span_id.map(str::to_string))
+            .name(name.to_string())
+            .start_us(start_us)
+            .end_us(end_us)
+            .attrs(attrs)
+            .trace_id(trace_id.map(str::to_string))
+            .build()
+    }
+
+    /// Record a trace span via the builder.
+    pub fn trace_span_v2(builder: TraceSpanBuilder) -> Self {
+        builder.build()
+    }
+}
+
+/// Builder for [`JournalEvent::trace_span`]. Enforces required fields at
+/// compile time and avoids the 8-argument constructor.
+///
+/// Adds `trace_id` for cross-boundary (edge ↔ cloud) correlation.
+#[derive(Debug, Default, Clone)]
+pub struct TraceSpanBuilder {
+    session_id: Option<String>,
+    turn: Option<u32>,
+    span_id: Option<String>,
+    parent_span_id: Option<String>,
+    name: Option<String>,
+    start_us: Option<u64>,
+    end_us: Option<u64>,
+    attrs: Option<HashMap<String, String>>,
+    /// Cross-boundary correlation id (edge ↔ cloud)
+    trace_id: Option<String>,
+}
+
+impl TraceSpanBuilder {
+    pub fn session_id(mut self, v: Option<&str>) -> Self {
+        self.session_id = v.map(str::to_string);
+        self
+    }
+
+    pub fn turn(mut self, v: Option<u32>) -> Self {
+        self.turn = v;
+        self
+    }
+
+    pub fn span_id(mut self, v: String) -> Self {
+        self.span_id = Some(v);
+        self
+    }
+
+    pub fn parent_span_id(mut self, v: Option<String>) -> Self {
+        self.parent_span_id = v;
+        self
+    }
+
+    pub fn name(mut self, v: String) -> Self {
+        self.name = Some(v);
+        self
+    }
+
+    pub fn start_us(mut self, v: u64) -> Self {
+        self.start_us = Some(v);
+        self
+    }
+
+    pub fn end_us(mut self, v: u64) -> Self {
+        self.end_us = Some(v);
+        self
+    }
+
+    pub fn attrs(mut self, v: Option<&HashMap<String, String>>) -> Self {
+        self.attrs = v.cloned();
+        self
+    }
+
+    pub fn trace_id(mut self, v: Option<String>) -> Self {
+        self.trace_id = v;
+        self
+    }
+
+    pub fn build(self) -> JournalEvent {
+        let span_id = self.span_id.expect("TraceSpanBuilder: span_id is required");
+        let name = self.name.expect("TraceSpanBuilder: name is required");
+        let start_us = self
+            .start_us
+            .expect("TraceSpanBuilder: start_us is required");
+        let end_us = self.end_us.expect("TraceSpanBuilder: end_us is required");
+        let mut evt = JournalEvent::base(JournalEventType::TraceSpan, self.session_id.as_deref());
+        evt.turn = self.turn;
+        let mut meta = serde_json::json!({
+            "span_id": &span_id,
+            "name": &name,
+            "start_us": start_us,
+            "end_us": end_us,
+            "duration_us": end_us.saturating_sub(start_us),
+        });
+        if let Some(ref pid) = self.parent_span_id {
+            meta["parent_span_id"] = serde_json::Value::String(pid.clone());
+        }
+        if let Some(ref a) = self.attrs {
+            let attrs_map: serde_json::Map<String, serde_json::Value> = a
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            meta["attrs"] = serde_json::Value::Object(attrs_map);
+        }
+        if let Some(ref tid) = self.trace_id {
+            meta["trace_id"] = serde_json::Value::String(tid.clone());
+        }
+        evt.metadata = Some(meta);
+        evt
+    }
+}
+
+impl JournalEvent {
     /// Record that this session was forked from `lineage.parent_session_id`.
     pub fn session_fork(
         session_id: Option<&str>,
@@ -3626,11 +3847,28 @@ fn truncate(s: &str, max: usize) -> String {
 
 pub const ASTRA_JOURNAL_CONTENT_REDACT_ENV: &str = "ASTRA_JOURNAL_CONTENT_REDACT";
 
+static JOURNAL_CONTENT_REDACT_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_journal_content_redact_override(enabled: Option<bool>) {
+    let encoded = match enabled {
+        Some(false) => 1,
+        Some(true) => 2,
+        None => 0,
+    };
+    JOURNAL_CONTENT_REDACT_OVERRIDE.store(encoded, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Returns true when [`ASTRA_JOURNAL_CONTENT_REDACT_ENV`]=`1` is set in the
 /// environment. When enabled, the on-disk JSONL journal stores a privacy
 /// marker (`<redacted: len=N sha=...>`) in place of `user_input` and
 /// `assistant_output` fields.
 pub fn journal_content_redact_enabled() -> bool {
+    match JOURNAL_CONTENT_REDACT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
     std::env::var(ASTRA_JOURNAL_CONTENT_REDACT_ENV).as_deref() == Ok("1")
 }
 
@@ -6890,6 +7128,29 @@ mod turn_event_buffer_tests {
         let drained = buf.drain();
         assert_eq!(drained.len(), 2);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drain_exposes_evicted_event_count() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("s"), 0);
+        for _ in 0..(TURN_EVENT_BUFFER_CAP + 5) {
+            buf.record(JournalEvent::base_public(JournalEventType::Turn, Some("s")));
+        }
+
+        assert_eq!(buf.len(), TURN_EVENT_BUFFER_CAP);
+        assert_eq!(buf.dropped_events(), 5);
+
+        let drained = buf.drain();
+        assert_eq!(drained.len(), TURN_EVENT_BUFFER_CAP);
+        assert_eq!(
+            drained[0]
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get(TURN_EVENT_DROPPED_META_KEY))
+                .and_then(|value| value.as_u64()),
+            Some(5)
+        );
+        assert_eq!(buf.dropped_events(), 0);
     }
 
     #[test]

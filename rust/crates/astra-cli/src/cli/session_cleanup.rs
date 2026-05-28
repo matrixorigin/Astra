@@ -14,11 +14,11 @@ use astra_services::session_journal;
 use crossterm::style::Stylize;
 use std::time::Duration;
 
-use super::SessionState;
 use super::auth_flow::clear_profile_last_session;
 use super::chat_turn::enqueue_ingestion_pub;
-use super::edge_tools;
 use super::session_guard::{ShutdownSignal, clear_panic_guard};
+use crate::SessionState;
+use crate::edge_tools;
 
 /// Why the interactive session is exiting. Drives two user-visible
 /// decisions in `finalize_session_exit`:
@@ -92,7 +92,7 @@ fn should_clear_last_session_id(reason: SessionExit) -> bool {
 }
 
 /// Finalize a session: journal end event, persist state, extract learnings.
-pub(super) async fn finalize_session(state: &mut SessionState) {
+pub(crate) async fn finalize_session(state: &mut SessionState) {
     // 0. Drain any background session-memory extraction worker still in
     //    flight from the final turn, then forget per-session debounce
     //    state so the service doesn't leak it. Without the drain, the
@@ -236,9 +236,20 @@ pub(super) async fn finalize_session(state: &mut SessionState) {
     })
     .await;
     if let Some(sid) = state.session_id.as_deref() {
+        let cloud_base = match crate::cli::config_manager::resolve_api_url(None) {
+            Ok(base) => Some(base),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %sid,
+                    error = %error,
+                    "skipping pending recall feedback close during cleanup because API URL configuration is invalid"
+                );
+                None
+            }
+        };
         let report = super::chat_turn::close_pending_memory_feedback_at_turn_end(
             Some(sid),
-            Some(crate::command_router::resolve_api_url(None)),
+            cloud_base,
             super::session_runtime::current_access_token(None),
             "cli-session-end",
         )

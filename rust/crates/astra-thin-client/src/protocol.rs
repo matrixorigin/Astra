@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 /// `POST /chat/stream` body — superset of server `ChatRequest` plus optional edge fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -16,6 +17,8 @@ pub struct ChatStreamRequest {
     pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<serde_json::Map<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -50,6 +53,7 @@ impl ChatStreamRequest {
             session_id: None,
             agent_id: None,
             model: None,
+            interaction_mode: None,
             context: None,
             execution_budget: None,
             explain: false,
@@ -92,6 +96,43 @@ pub struct ToolResultRequest {
     pub output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Hash of the tool result content for idempotent deduplication.
+    /// Cloud can reject duplicate submissions (same request_id + result_hash)
+    /// and return 200 OK — the edge treats this as success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_hash: Option<String>,
+}
+
+impl ToolResultRequest {
+    /// Compute a content-based hash of the tool result (request_id + output).
+    /// Used for idempotent deduplication: cloud can detect and reject duplicate
+    /// submissions with the same request_id + hash without re-processing.
+    pub fn compute_result_hash(request_id: &str, output: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(request_id.as_bytes());
+        hasher.update(b":");
+        hasher.update(output.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    /// Factory: build a `ToolResultRequest` with the result hash pre-computed.
+    /// Every call site that posts a tool result should use this to guarantee
+    /// the hash is always present — no more scattered `compute_result_hash` calls.
+    pub fn new_with_hash(
+        request_id: String,
+        status: String,
+        output: String,
+        duration_ms: u64,
+    ) -> Self {
+        let result_hash = Self::compute_result_hash(&request_id, &output);
+        Self {
+            request_id,
+            status,
+            output: Some(output),
+            duration_ms: Some(duration_ms),
+            result_hash: Some(result_hash),
+        }
+    }
 }
 
 /// `POST /approval/respond` (§5.5).
@@ -151,6 +192,15 @@ impl EdgeRegisterRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EdgeHeartbeatRequest {
     pub edge_agent_id: String,
+    /// Number of in-flight tool requests on this edge executor.
+    /// Used by cloud to detect stalled edges (pending > 0 but no results
+    /// received for > 2 min → warning; no heartbeat for > 5 min → stale).
+    #[serde(default)]
+    pub pending_request_count: u32,
+    /// Recently completed request IDs for deduplication on reconnection.
+    /// Cloud can skip re-issuing tool calls already completed by this edge.
+    #[serde(default)]
+    pub last_seen_request_ids: Vec<String>,
 }
 
 /// `POST /tasks/{id}/lease/{claim,release,renew}` — matches server lease handlers.
@@ -532,6 +582,7 @@ mod tests {
             session_id: Some("s-1".into()),
             agent_id: None,
             model: Some("m".into()),
+            interaction_mode: Some("auto".into()),
             context: None,
             execution_budget: Some(ExecutionBudget {
                 initial_turns: Some(3),

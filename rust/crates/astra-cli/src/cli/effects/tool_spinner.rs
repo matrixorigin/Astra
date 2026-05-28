@@ -4,11 +4,11 @@
 //! - [`ToolRunningLineSpinner`]: stderr spinner for markdown mode
 //! - [`ToolStdoutLineAnim`]: stdout animation via TerminalRegion for raw mode
 
-use super::super::terminal_region::TerminalRegion;
 use super::{
     ICON_RUNNING, SPINNER_FRAMES, clear_stderr_line, interruptible_sleep, paint_unified_line,
     term_width,
 };
+use crate::cli::terminal_region::TerminalRegion;
 use crossterm::style::Stylize;
 use std::io::{self, IsTerminal};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +17,7 @@ use std::time::Instant;
 
 /// Tool lines drawn with [`TerminalRegion`] (non-markdown CLI).
 pub struct ToolRegionState {
-    pub region: TerminalRegion,
+    pub(crate) region: TerminalRegion,
     pub lines: Vec<String>,
 }
 

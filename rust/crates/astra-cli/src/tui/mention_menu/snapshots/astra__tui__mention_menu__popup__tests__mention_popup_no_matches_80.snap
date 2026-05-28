@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/mention_menu/popup.rs
+assertion_line: 220
 expression: "render_menu(&menu, 80, 2)"
 ---
   no matching files

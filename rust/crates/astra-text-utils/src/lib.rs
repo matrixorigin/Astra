@@ -7,3 +7,5 @@ pub mod output_style;
 pub mod semantic_dedup;
 pub mod str_preview;
 pub mod text_tokenize;
+pub mod tool_name;
+pub mod xml_escape;

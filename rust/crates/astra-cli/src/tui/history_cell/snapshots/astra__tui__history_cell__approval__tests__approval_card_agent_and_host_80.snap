@@ -1,6 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/approval.rs
-assertion_line: 1002
+assertion_line: 1025
 expression: "render_at(&cell, 80)"
 ---
 ╭─ ⏸ npm test --filter auth [agent: review-subagent] [ssh:bastion-prod]

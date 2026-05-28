@@ -326,7 +326,7 @@ mod markdown_tests {
 
 #[cfg(test)]
 mod stream_bridge_tests {
-    use crate::chat_stream::StreamEvent;
+    use crate::cli::chat_stream::StreamEvent;
     use crate::tui::app_event::TuiAppEvent;
     use crate::tui::stream_bridge;
 

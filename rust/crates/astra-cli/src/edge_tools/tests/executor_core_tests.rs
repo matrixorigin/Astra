@@ -292,7 +292,7 @@ async fn exit_plan_mode_accepts_plan_alias_and_explicit_approved_skips_overlay()
     );
     assert_eq!(
         executor.take_pending_permission_mode_change(),
-        Some(crate::permission_manager::PermissionMode::Auto),
+        Some(crate::cli::permission_manager::PermissionMode::Auto),
         "headless explicit approval must still stage a non-plan permission mode"
     );
 }
@@ -351,8 +351,8 @@ async fn exit_plan_mode_overlay_approve_auto_records_pending_mode_change() {
     // 4-option dialog through `plan_review_request_tx`; the test
     // auto-answers with PermissionMode::Auto so the executor commits
     // the plan and stages Auto in the pending-mode slot.
-    use crate::chat_stream::PlanReviewDecision;
-    use crate::permission_manager::PermissionMode;
+    use crate::cli::chat_stream::PlanReviewDecision;
+    use crate::cli::permission_manager::PermissionMode;
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -384,7 +384,7 @@ async fn exit_plan_mode_overlay_approve_auto_records_pending_mode_change() {
         .with_cloud(server.uri(), "token");
 
     let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::PlanReviewRequest>();
+        tokio::sync::mpsc::unbounded_channel::<crate::cli::chat_stream::PlanReviewRequest>();
     executor.set_plan_review_request_tx(Some(tx));
 
     let overlay_task = tokio::spawn(async move {
@@ -409,7 +409,7 @@ async fn exit_plan_mode_overlay_approve_auto_records_pending_mode_change() {
     );
     assert_eq!(
         executor.take_pending_permission_mode_change(),
-        Some(crate::permission_manager::PermissionMode::Auto),
+        Some(crate::cli::permission_manager::PermissionMode::Auto),
         "host must see Auto staged in the pending slot to apply on the next turn"
     );
     assert_eq!(
@@ -459,7 +459,7 @@ async fn enter_plan_mode_falls_back_to_local_when_cloud_unavailable() {
     );
     assert_eq!(
         executor.take_pending_permission_mode_change(),
-        Some(crate::permission_manager::PermissionMode::Plan),
+        Some(crate::cli::permission_manager::PermissionMode::Plan),
         "entering plan mode must stage Plan on the pending slot \
          so the host applies it on the next turn"
     );
@@ -502,7 +502,7 @@ async fn enter_plan_mode_stages_perm_mode_change_to_plan_even_on_cloud_path() {
     );
     assert_eq!(
         executor.take_pending_permission_mode_change(),
-        Some(crate::permission_manager::PermissionMode::Plan),
+        Some(crate::cli::permission_manager::PermissionMode::Plan),
         "cloud path must stage Plan on the pending slot too — single \
          source of truth invariant"
     );
@@ -520,8 +520,8 @@ async fn exit_plan_mode_local_path_makes_zero_cloud_calls() {
     //
     // GREEN once Step 4 finishes (already partially correct via
     // dual-path Step 3 work).
-    use crate::chat_stream::PlanReviewDecision;
-    use crate::permission_manager::PermissionMode;
+    use crate::cli::chat_stream::PlanReviewDecision;
+    use crate::cli::permission_manager::PermissionMode;
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -540,7 +540,7 @@ async fn exit_plan_mode_local_path_makes_zero_cloud_calls() {
         .with_cloud(server.uri(), "token");
 
     let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::PlanReviewRequest>();
+        tokio::sync::mpsc::unbounded_channel::<crate::cli::chat_stream::PlanReviewRequest>();
     executor.set_plan_review_request_tx(Some(tx));
 
     let overlay_task = tokio::spawn(async move {
@@ -567,7 +567,7 @@ async fn exit_plan_mode_local_path_makes_zero_cloud_calls() {
     );
     assert_eq!(
         executor.take_pending_permission_mode_change(),
-        Some(crate::permission_manager::PermissionMode::Prompt),
+        Some(crate::cli::permission_manager::PermissionMode::Prompt),
         "Prompt approval must be staged for the next round"
     );
     assert_eq!(
@@ -606,21 +606,21 @@ async fn enter_plan_mode_then_exit_full_cycle_offline() {
     );
     assert_eq!(
         executor.take_pending_permission_mode_change(),
-        Some(crate::permission_manager::PermissionMode::Plan),
+        Some(crate::cli::permission_manager::PermissionMode::Plan),
         "enter must stage Plan"
     );
 
     // Step 2-4: exit through overlay, choose Auto
     let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::PlanReviewRequest>();
+        tokio::sync::mpsc::unbounded_channel::<crate::cli::chat_stream::PlanReviewRequest>();
     executor.set_plan_review_request_tx(Some(tx));
 
     let overlay_task = tokio::spawn(async move {
         let request = rx.recv().await.expect("overlay request");
         let _ = request
             .response_tx
-            .send(crate::chat_stream::PlanReviewDecision::Approve {
-                mode: crate::permission_manager::PermissionMode::Auto,
+            .send(crate::cli::chat_stream::PlanReviewDecision::Approve {
+                mode: crate::cli::permission_manager::PermissionMode::Auto,
             });
     });
 
@@ -635,7 +635,7 @@ async fn enter_plan_mode_then_exit_full_cycle_offline() {
     );
     assert_eq!(
         executor.take_pending_permission_mode_change(),
-        Some(crate::permission_manager::PermissionMode::Auto),
+        Some(crate::cli::permission_manager::PermissionMode::Auto),
         "exit must stage Auto"
     );
 }
@@ -655,7 +655,7 @@ async fn exit_plan_mode_explicit_approved_defaults_to_auto_offline() {
     );
     assert_eq!(
         executor.take_pending_permission_mode_change(),
-        Some(crate::permission_manager::PermissionMode::Plan),
+        Some(crate::cli::permission_manager::PermissionMode::Plan),
         "enter must stage Plan before the simulated host applies it"
     );
 
@@ -675,7 +675,7 @@ async fn exit_plan_mode_explicit_approved_defaults_to_auto_offline() {
     );
     assert_eq!(
         executor.take_pending_permission_mode_change(),
-        Some(crate::permission_manager::PermissionMode::Auto),
+        Some(crate::cli::permission_manager::PermissionMode::Auto),
         "explicit approval without overlay must still leave plan mode on the next turn"
     );
 }
@@ -686,7 +686,7 @@ async fn exit_plan_mode_overlay_keep_planning_leaves_plan_open() {
     // phase (server call body `approved: false`), no permission-mode
     // change should be staged, and the message must tell the model
     // to address feedback before re-calling.
-    use crate::chat_stream::PlanReviewDecision;
+    use crate::cli::chat_stream::PlanReviewDecision;
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -718,7 +718,7 @@ async fn exit_plan_mode_overlay_keep_planning_leaves_plan_open() {
         .with_cloud(server.uri(), "token");
 
     let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::PlanReviewRequest>();
+        tokio::sync::mpsc::unbounded_channel::<crate::cli::chat_stream::PlanReviewRequest>();
     executor.set_plan_review_request_tx(Some(tx));
 
     let overlay_task = tokio::spawn(async move {
@@ -756,7 +756,7 @@ fn switching_sessions_clears_deferred_plan_exit_state() {
     let temp = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-a");
     executor.debug_stage_pending_permission_mode_change_for_test(
-        crate::permission_manager::PermissionMode::AcceptEdits,
+        crate::cli::permission_manager::PermissionMode::AcceptEdits,
     );
     executor.debug_stage_pending_round_tool_boost_for_test(&[
         "bash",
@@ -794,8 +794,8 @@ async fn exit_plan_mode_shift_tab_path_works_without_cloud_plan_record() {
     // through to the overlay + `pending_permission_mode_change` slot
     // exactly like the cloud path does, and never hit any
     // `/plans/*/exit-plan-mode` endpoint.
-    use crate::chat_stream::PlanReviewDecision;
-    use crate::permission_manager::PermissionMode;
+    use crate::cli::chat_stream::PlanReviewDecision;
+    use crate::cli::permission_manager::PermissionMode;
 
     let server = MockServer::start().await;
     // Probe returns an empty plans array — that's the trigger for
@@ -817,7 +817,7 @@ async fn exit_plan_mode_shift_tab_path_works_without_cloud_plan_record() {
         .with_cloud(server.uri(), "token");
 
     let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::PlanReviewRequest>();
+        tokio::sync::mpsc::unbounded_channel::<crate::cli::chat_stream::PlanReviewRequest>();
     executor.set_plan_review_request_tx(Some(tx));
 
     let overlay_task = tokio::spawn(async move {
@@ -853,7 +853,7 @@ async fn exit_plan_mode_shift_tab_path_works_without_cloud_plan_record() {
     );
     assert_eq!(
         executor.take_pending_permission_mode_change(),
-        Some(crate::permission_manager::PermissionMode::AcceptEdits),
+        Some(crate::cli::permission_manager::PermissionMode::AcceptEdits),
         "host must see AcceptEdits staged in the pending slot for the next turn"
     );
 }

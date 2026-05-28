@@ -236,12 +236,12 @@ mod tests {
     #[test]
     fn snapshot_single_line_40col() {
         let cell = UserCell::new("rebuild the index");
-        insta::assert_snapshot!("user_single_line_40", render_cell(&cell, 40, 3));
+        crate::tui::testing::assert_tui_snapshot!("user_single_line_40", render_cell(&cell, 40, 3));
     }
 
     #[test]
     fn snapshot_multiline_60col() {
         let cell = UserCell::new("first line\nsecond line with more words\nthird line");
-        insta::assert_snapshot!("user_multiline_60", render_cell(&cell, 60, 5));
+        crate::tui::testing::assert_tui_snapshot!("user_multiline_60", render_cell(&cell, 60, 5));
     }
 }

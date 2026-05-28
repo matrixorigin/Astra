@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use crossterm::style::Stylize;
 
-use crate::theme;
+use crate::cli::theme;
 
 // ─── Plan Update Events (channel protocol) ───────────────────────────────────
 
@@ -119,7 +119,7 @@ pub enum PlanUpdate {
     },
     /// Return the durable task state back to the session state after execution ends,
     /// so re-runs can reuse the contract instead of regenerating it.
-    DurableStateReturn(Box<crate::durable_bridge::DurableTaskState>),
+    DurableStateReturn(Box<crate::cli::durable_bridge::DurableTaskState>),
 }
 
 /// Commands sent from the plan monitor to a background plan executor.
@@ -205,7 +205,7 @@ impl PlanOutputSink for StderrSink {
 
     fn subtask_completed(&self, _id: &str, title: &str, pct: u32, elapsed: Option<Duration>) {
         let elapsed_str = elapsed
-            .map(|d| format!(" ({})", super::format_duration_short(d)))
+            .map(|d| format!(" ({})", crate::format_duration_short(d)))
             .unwrap_or_default();
         eprintln!(
             "\n{}  {} {} {}{}",
@@ -252,7 +252,7 @@ impl PlanOutputSink for StderrSink {
         eprint!("{summary}");
         eprintln!(
             "{}",
-            format!("  Total elapsed: {}", super::format_duration_short(elapsed)).dim()
+            format!("  Total elapsed: {}", crate::format_duration_short(elapsed)).dim()
         );
     }
 
@@ -270,7 +270,7 @@ impl PlanOutputSink for StderrSink {
             "Plan paused".bold().yellow(),
             format!("{pct}").magenta(),
             blocked_ids.bold(),
-            format!("({})", super::format_duration_short(elapsed)).dim(),
+            format!("({})", crate::format_duration_short(elapsed)).dim(),
         );
     }
 
@@ -437,7 +437,7 @@ pub struct PlanExecutorHandle {
 fn is_credential_error(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     let upstream_github_auth = lower.contains("github api error");
-    crate::cli_utils::is_astra_session_auth_error(msg)
+    crate::cli::cli_utils::is_astra_session_auth_error(msg)
         || lower.contains("invalid credentials")
         || (!upstream_github_auth && lower.contains("bad credentials"))
 }
@@ -963,7 +963,7 @@ use super::permission_manager::PermissionManager;
 /// finalize later the caller should use the start + finish pair directly;
 /// this helper is the terminal-only shortcut the CLI uses on subtask-done.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn record_cloud_step_run(
+pub(crate) async fn record_cloud_step_run(
     api: &astra_thin_client::ThinClient,
     token: &str,
     plan_id: Option<&str>,
@@ -1038,11 +1038,12 @@ pub(super) async fn record_cloud_step_run(
 ///
 /// All fields are owned (no lifetimes) so the struct is `Send + 'static`.
 /// Created by [`spawn_plan_executor`] which takes these fields from SessionState.
-pub(super) struct BackgroundPlanContext {
+pub(crate) struct BackgroundPlanContext {
     pub api: astra_thin_client::ThinClient,
     pub token: String,
     pub profile: Option<String>,
     pub model: Option<String>,
+    pub cli_context: crate::cli::cli_context::CliContext,
     pub plan: TaskPlan,
     pub plan_goal: Option<String>,
     /// Cloud plan_id the executor should post step-run rows to. `None` when
@@ -1116,7 +1117,7 @@ pub(super) struct BackgroundPlanContext {
 /// Returns a [`PlanExecutorHandle`] for the plan monitor to poll for updates and
 /// send commands. The `TaskPlan` is moved into the spawned task and will
 /// be returned via `PlanUpdate::PlanCompleted` when execution finishes.
-pub(super) fn spawn_plan_executor(ctx: BackgroundPlanContext) -> PlanExecutorHandle {
+pub(crate) fn spawn_plan_executor(ctx: BackgroundPlanContext) -> PlanExecutorHandle {
     let (handle, update_tx, cmd_rx) = create_plan_channels();
 
     tokio::spawn(async move {
@@ -1420,7 +1421,7 @@ async fn plan_executor_task(
             } else {
                 String::new()
             };
-            let progress = super::format_plan_progress(
+            let progress = crate::format_plan_progress(
                 done_so_far.saturating_sub(1) as usize,
                 total,
                 if subtask_durations.is_empty() {
@@ -1503,7 +1504,8 @@ async fn plan_executor_task(
                     history: &ctx.history,
                     perm_manager: &mut perm_manager,
                     verbose_mode: false,
-                    render_policy: crate::stream_render::RenderPolicy::Silent,
+                    render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+                    cli_context: Some(&ctx.cli_context),
                     recent_tools: &ctx.recent_tools,
                     tool_health_entries: &ctx.tool_health_entries,
                     session_lessons: &[],
@@ -1893,7 +1895,7 @@ async fn plan_executor_task(
                         &failure.error,
                         0,
                     );
-                    crate::streaming_types::apply_partial_turn_data_to_error_event(
+                    crate::cli::streaming_types::apply_partial_turn_data_to_error_event(
                         &mut event,
                         &failure.partial,
                     );
@@ -2044,6 +2046,7 @@ mod tests {
             token: String::new(),
             profile: None,
             model: None,
+            cli_context: crate::cli::cli_context::CliContext::default(),
             plan: TaskPlan::default(),
             plan_goal: None,
             plan_id: None,
@@ -2268,7 +2271,7 @@ mod tests {
                 recent_outcomes: vec![],
             },
         ];
-        let line = super::high_failure_tool_evidence(&entries, 3).expect("should surface evidence");
+        let line = high_failure_tool_evidence(&entries, 3).expect("should surface evidence");
         assert!(
             line.contains("flaky_tool"),
             "evidence line must name the repeat offender: {line}"
@@ -2294,7 +2297,7 @@ mod tests {
             last_updated_epoch: 0,
             recent_outcomes: vec![],
         }];
-        assert!(super::high_failure_tool_evidence(&entries, 3).is_none());
+        assert!(high_failure_tool_evidence(&entries, 3).is_none());
     }
 
     #[test]
@@ -2313,7 +2316,7 @@ mod tests {
             }],
             timestamp: String::new(),
         };
-        assert!(super::render_verifier_failure_hint(&report).is_none());
+        assert!(render_verifier_failure_hint(&report).is_none());
     }
 
     #[test]
@@ -2342,7 +2345,7 @@ mod tests {
             ],
             timestamp: String::new(),
         };
-        let hint = super::render_verifier_failure_hint(&report).expect("hint");
+        let hint = render_verifier_failure_hint(&report).expect("hint");
         assert!(
             hint.contains("Acceptance checks failed"),
             "hint should lead with a clear header: {hint}"
@@ -2381,7 +2384,7 @@ mod tests {
             }],
             timestamp: String::new(),
         };
-        let hint = super::render_verifier_failure_hint(&report).expect("hint");
+        let hint = render_verifier_failure_hint(&report).expect("hint");
         assert!(
             hint.contains("no matches for `use anyhow::`"),
             "hint should fall back to evidence when error is None: {hint}"
@@ -2614,13 +2617,13 @@ All acceptance checks pass:
             ],
         );
 
-        let report = super::browser_verification_gap_report(&subtask, &result)
+        let report = browser_verification_gap_report(&subtask, &result)
             .expect("browser-only verification gap should fail");
         assert!(
-            super::report_contains_browser_verification_gap(&report),
+            report_contains_browser_verification_gap(&report),
             "report should tag the browser-verification criterion: {report:?}"
         );
-        let hint = super::render_verifier_failure_hint(&report).expect("retry hint");
+        let hint = render_verifier_failure_hint(&report).expect("retry hint");
         assert!(
             hint.contains("browser_verification_evidence"),
             "hint should surface the synthetic criterion id: {hint}"
@@ -2645,7 +2648,7 @@ All acceptance checks pass:
         );
 
         assert!(
-            super::browser_verification_gap_report(&subtask, &result).is_none(),
+            browser_verification_gap_report(&subtask, &result).is_none(),
             "real browser-capable evidence should satisfy the guard"
         );
     }
@@ -2755,7 +2758,7 @@ All acceptance checks pass:
     #[test]
     fn failed_verification_status_fails_browser_gap_without_durable() {
         let (status, retries_exhausted, retry_pending) =
-            super::failed_verification_status(None, "browser-check", true);
+            failed_verification_status(None, "browser-check", true);
         assert_eq!(status, TaskStatus::Failed);
         assert!(retries_exhausted);
         assert!(!retry_pending);
@@ -2765,7 +2768,7 @@ All acceptance checks pass:
     fn failed_verification_status_fails_browser_gap_after_durable_retries_exhausted() {
         let durable = stub_durable_task_state("browser-check", 2, 2);
         let (status, retries_exhausted, retry_pending) =
-            super::failed_verification_status(Some(&durable), "browser-check", true);
+            failed_verification_status(Some(&durable), "browser-check", true);
         assert_eq!(status, TaskStatus::Failed);
         assert!(retries_exhausted);
         assert!(!retry_pending);
@@ -2775,7 +2778,7 @@ All acceptance checks pass:
     fn failed_verification_status_preserves_existing_force_complete_for_non_browser_failures() {
         let durable = stub_durable_task_state("subtask-1", 2, 2);
         let (status, retries_exhausted, retry_pending) =
-            super::failed_verification_status(Some(&durable), "subtask-1", false);
+            failed_verification_status(Some(&durable), "subtask-1", false);
         assert_eq!(status, TaskStatus::Completed);
         assert!(retries_exhausted);
         assert!(!retry_pending);
@@ -2785,7 +2788,7 @@ All acceptance checks pass:
     fn failed_verification_status_retries_when_budget_remains() {
         let durable = stub_durable_task_state("browser-check", 1, 2);
         let (status, retries_exhausted, retry_pending) =
-            super::failed_verification_status(Some(&durable), "browser-check", true);
+            failed_verification_status(Some(&durable), "browser-check", true);
         assert_eq!(status, TaskStatus::Pending);
         assert!(!retries_exhausted);
         assert!(retry_pending);
@@ -2795,8 +2798,8 @@ All acceptance checks pass:
     async fn spawn_plan_executor_marks_browser_subtask_failed_in_real_turn_flow() {
         use tokio::time::{Duration, Instant, sleep};
 
-        let mock = super::super::mock_llm::MockLlmServer::start(
-            super::super::mock_llm::MockScenario::TextOnly,
+        let mock = crate::cli::mock_llm::MockLlmServer::start(
+            crate::cli::mock_llm::MockScenario::TextOnly,
         )
         .await
         .expect("mock llm server");
@@ -2828,7 +2831,7 @@ All acceptance checks pass:
                 drained_any = true;
                 match update {
                     PlanUpdate::VerificationReport(report)
-                        if super::report_contains_browser_verification_gap(&report) =>
+                        if report_contains_browser_verification_gap(&report) =>
                     {
                         saw_browser_report = true;
                     }
@@ -2876,8 +2879,8 @@ All acceptance checks pass:
     async fn spawn_plan_executor_tags_real_turn_event_with_subtask_id() {
         use tokio::time::{Duration, Instant, sleep};
 
-        let mock = super::super::mock_llm::MockLlmServer::start(
-            super::super::mock_llm::MockScenario::TextOnly,
+        let mock = crate::cli::mock_llm::MockLlmServer::start(
+            crate::cli::mock_llm::MockScenario::TextOnly,
         )
         .await
         .expect("mock llm server");
@@ -2932,11 +2935,10 @@ All acceptance checks pass:
     async fn spawn_plan_executor_tags_real_turn_error_event_with_subtask_id() {
         use tokio::time::{Duration, Instant, sleep};
 
-        let mock = super::super::mock_llm::MockLlmServer::start(
-            super::super::mock_llm::MockScenario::Fail,
-        )
-        .await
-        .expect("mock llm server");
+        let mock =
+            crate::cli::mock_llm::MockLlmServer::start(crate::cli::mock_llm::MockScenario::Fail)
+                .await
+                .expect("mock llm server");
         let mut ctx = test_background_plan_context();
         ctx.api = astra_thin_client::ThinClient::new(&mock.base_url, None).expect("thin client");
         ctx.plan = TaskPlan {
@@ -2989,8 +2991,8 @@ All acceptance checks pass:
     async fn spawn_plan_executor_emits_compact_history_entries_between_subtasks() {
         use tokio::time::{Duration, Instant, sleep};
 
-        let mock = super::super::mock_llm::MockLlmServer::start(
-            super::super::mock_llm::MockScenario::TextOnly,
+        let mock = crate::cli::mock_llm::MockLlmServer::start(
+            crate::cli::mock_llm::MockScenario::TextOnly,
         )
         .await
         .expect("mock llm server");

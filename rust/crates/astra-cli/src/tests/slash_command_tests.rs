@@ -2,6 +2,7 @@ use super::*;
 
 // ── slash commands with mock server ───────────────────────────────────
 
+#[serial_test::serial]
 #[tokio::test]
 async fn slash_clear_creates_new_session() {
     let _creds_dir = isolate_credentials();

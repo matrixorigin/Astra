@@ -26,9 +26,9 @@ use astra_turn_core::agent_live_event::SharedAgentLiveEventSink;
 use serde_json::{Value, json};
 
 use super::chat_stream::StreamEvent;
-use super::edge_tools;
 use super::permission_manager::PermissionMode;
 use super::skill_subrun::SubRunHost;
+use crate::edge_tools;
 
 // ─── CliSpawnAgentExecutor ──────────────────────────────────────────────────
 

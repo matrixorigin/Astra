@@ -1095,13 +1095,22 @@ mod tests {
         );
 
         let events = astra_services::session_journal::read_journal(sid).unwrap();
-        assert_eq!(
-            events.first().map(|event| event.event_type.clone()),
-            Some(astra_services::session_journal::JournalEventType::SessionStart)
+        let session_start_index = events.iter().position(|event| {
+            event.event_type == astra_services::session_journal::JournalEventType::SessionStart
+        });
+        let interruption_index = events.iter().position(|event| {
+            event.event_type
+                == astra_services::session_journal::JournalEventType::InterruptionRecorded
+        });
+        assert!(
+            session_start_index.is_some(),
+            "session start must be recorded on a fresh journal"
         );
-        assert_eq!(
-            events.get(1).map(|event| event.event_type.clone()),
-            Some(astra_services::session_journal::JournalEventType::InterruptionRecorded)
+        let session_start_index = session_start_index.expect("session start event");
+        let interruption_index = interruption_index.expect("interruption event");
+        assert!(
+            session_start_index < interruption_index,
+            "session start must be recorded before interruption even when trace spans precede it"
         );
     }
 

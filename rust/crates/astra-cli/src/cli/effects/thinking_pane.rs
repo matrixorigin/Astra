@@ -3,7 +3,7 @@
 //! Shows reasoning/thinking content in a viewport that grows until a cap,
 //! then folds away old lines with a "hidden lines above" header.
 
-use super::super::terminal_region::{TerminalRegion, char_display_width};
+use crate::cli::terminal_region::{TerminalRegion, char_display_width};
 use crossterm::style::Stylize;
 use std::time::Instant;
 

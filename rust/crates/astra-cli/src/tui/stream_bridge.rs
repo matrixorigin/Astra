@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::{Semaphore, mpsc};
 
 use super::app_event::TuiAppEvent;
-use crate::chat_stream::StreamEvent;
+use crate::cli::chat_stream::StreamEvent;
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveSendError,
     SharedAgentLiveEventSink,
@@ -23,8 +23,11 @@ pub(crate) fn create_channels() -> (TuiAppEventTx, TuiAppEventRx) {
 /// IMPORTANT: Create a new bridge for each turn. The sender returned here must be the
 /// ONLY sender for this channel — when it's dropped (turn ends), the bridge detects
 /// closure and sends TurnComplete.
-pub(crate) fn create_per_turn_bridge(tui_tx: TuiAppEventTx) -> crate::chat_stream::StreamEventTx {
-    let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<crate::chat_stream::StreamEvent>();
+pub(crate) fn create_per_turn_bridge(
+    tui_tx: TuiAppEventTx,
+) -> crate::cli::chat_stream::StreamEventTx {
+    let (stream_tx, mut stream_rx) =
+        mpsc::unbounded_channel::<crate::cli::chat_stream::StreamEvent>();
 
     tokio::spawn(async move {
         while let Some(event) = stream_rx.recv().await {

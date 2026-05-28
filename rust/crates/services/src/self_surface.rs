@@ -2020,6 +2020,8 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::PipelineCompactionAudit => "pipeline_compaction_audit",
         JournalEventType::MemorySuppressed => "memory_suppressed",
         JournalEventType::ContextReleased => "context_released",
+        JournalEventType::Bootstrap => "bootstrap",
+        JournalEventType::TraceSpan => "trace_span",
     }
     .to_string()
 }

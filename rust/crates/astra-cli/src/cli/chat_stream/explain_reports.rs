@@ -1,4 +1,4 @@
-use astra_turn_core::explain_report_lines::{
+use astra_turn_core::guardrails::explain_report_lines::{
     REPORT_SEPARATOR_LINE, VERDICT_REPORT_HEADER, verdict_avoid_tools_line,
     verdict_event_summary_line, verdict_injection_count_line, verdict_injection_preview_line,
     verdict_severity_icon,
@@ -47,7 +47,9 @@ pub(super) fn print_verdict_report(verdict_events: &[VerdictEvent], verbose: boo
                 icon,
                 ve.severity.as_str(),
                 ve.nudge_count,
-                ve.total_errors,
+                ve.interaction_mode.as_str(),
+                ve.suppressed_loop_nudges,
+                ve.recent_error_pressure,
                 ve.deprioritized_count,
                 ve.force_stop,
             )

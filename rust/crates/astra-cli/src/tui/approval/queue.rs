@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use tokio::sync::oneshot;
 
 use super::button_row::ButtonRow;
-use crate::chat_stream::ApprovalResponse;
+use crate::cli::chat_stream::ApprovalResponse;
 use astra_turn_core::permission::scope::AllowScope;
 
 /// Monotonic id assigned by the queue. Stable across the session so the
@@ -1407,7 +1407,7 @@ mod tests {
         assert_eq!(q.len(), 1, "the kept entry must remain in the queue");
         assert_eq!(
             rx_drop.try_recv().unwrap(),
-            crate::chat_stream::ApprovalResponse::AllowOnce,
+            crate::cli::chat_stream::ApprovalResponse::AllowOnce,
             "released entries must broadcast AllowOnce to their senders"
         );
     }
@@ -1503,11 +1503,11 @@ mod tests {
         // Both waiters get the same Allow.
         assert_eq!(
             rx_a.try_recv().unwrap(),
-            crate::chat_stream::ApprovalResponse::AllowOnce,
+            crate::cli::chat_stream::ApprovalResponse::AllowOnce,
         );
         assert_eq!(
             rx_b.try_recv().unwrap(),
-            crate::chat_stream::ApprovalResponse::AllowOnce,
+            crate::cli::chat_stream::ApprovalResponse::AllowOnce,
         );
     }
 }

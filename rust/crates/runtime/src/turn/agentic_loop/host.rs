@@ -51,9 +51,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use astra_services::session_audit::RuntimePromotionEventData;
-use astra_services::session_journal::ToolCallRecord;
+use astra_services::session_journal::{ToolCallRecord, TraceSpanBuilder};
 use astra_services::{DatabaseEvaluationService, DatabaseEventService};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -62,15 +63,57 @@ use astra_pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
 use astra_tools::task_mgmt::{SessionTask, TaskManager};
-use astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent;
 use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use astra_turn_core::compaction_types::CompactionTier;
+use astra_turn_core::guardrails::turn_guard::TurnGuard;
+use astra_turn_core::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 use astra_turn_core::headless_tool_body_preview::HeadlessStderrStyle;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use astra_turn_core::tool_registry_report::SelectionReport;
-use astra_turn_core::turn_guard::TurnGuard;
 use tokio_util::sync::CancellationToken;
+
+/// Anchors journal wall-clock timestamps to a single process-local epoch so
+/// later reads stay monotonic even if `SystemTime` jumps backwards.
+///
+/// The anchor is created on first trace emission in this process and then only
+/// advanced via `Instant::elapsed()`. This keeps cross-span ordering stable
+/// without pretending to be a globally synchronized clock.
+static TRACE_CLOCK_ANCHOR: std::sync::LazyLock<(u64, Instant)> = std::sync::LazyLock::new(|| {
+    let wall_us = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64;
+    (wall_us, Instant::now())
+});
+
+fn now_us() -> u64 {
+    let (wall_us, monotonic_anchor) = &*TRACE_CLOCK_ANCHOR;
+    wall_us.saturating_add(monotonic_anchor.elapsed().as_micros() as u64)
+}
+
+fn record_trace_span(
+    buf: &mut astra_services::session_journal::TurnEventBuffer,
+    span_id: String,
+    name: &str,
+    started_at: Instant,
+    parent_span_id: Option<String>,
+    attrs: Option<&HashMap<String, String>>,
+    trace_id: Option<&str>,
+) {
+    let end_us = now_us();
+    let start_us = end_us.saturating_sub(started_at.elapsed().as_micros() as u64);
+    buf.record_trace_span_v2(
+        TraceSpanBuilder::default()
+            .span_id(span_id)
+            .name(name.to_string())
+            .start_us(start_us)
+            .end_us(end_us)
+            .parent_span_id(parent_span_id)
+            .attrs(attrs)
+            .trace_id(trace_id.map(str::to_string)),
+    );
+}
 
 // ─── Host turn result ────────────────────────────────────────────────────────
 
@@ -284,16 +327,33 @@ pub struct RequestConstraints {
     /// When set, only this subset of skills may be visible/executable via
     /// the `skill` / `discover_skills` tool schemas.
     pub allowed_skills: Option<HashSet<String>>,
+    /// When set, only skills from these source kinds may be surfaced via the
+    /// `skill` / `discover_skills` tool schemas.
+    pub allowed_skill_sources: Option<HashSet<crate::skills::manifest::SkillSourceKind>>,
 }
 
 impl RequestConstraints {
+    /// Construct with all three lanes set explicitly.
+    ///
+    /// Every field is required so adding a new constraint axis is a hard
+    /// compile error at every call site, not a silent default. Callers that
+    /// don't have a specific lane should pass `None`.
     pub fn new(
         allowed_tools: Option<HashSet<String>>,
         allowed_skills: Option<HashSet<String>>,
+        allowed_skill_sources: Option<HashSet<crate::skills::manifest::SkillSourceKind>>,
     ) -> Self {
         Self {
             allowed_tools,
             allowed_skills,
+            allowed_skill_sources,
+        }
+    }
+
+    pub fn skill_surfacing_policy(&self) -> crate::turn::skill_tool::SkillSurfacingPolicy {
+        crate::turn::skill_tool::SkillSurfacingPolicy {
+            allowed_names: self.allowed_skills.clone(),
+            allowed_sources: self.allowed_skill_sources.clone(),
         }
     }
 }
@@ -317,11 +377,10 @@ pub struct SkillState {
     pub effort: Option<crate::skills::manifest::EffortLevel>,
     /// Agent type hint from the most recently activated skill.
     pub agent_type: Option<String>,
-    /// Tool allow-list from the most recently activated skill (additive only).
-    /// When set, the host ensures these tools are present in the model's tool
-    /// schemas (via `inject_skill_allowed_tools`), but never restricts other
-    /// tools. `allowed_tools` is treated as a visibility hint, not a
-    /// security boundary.
+    /// Tool allow-list from the most recently activated skill.
+    /// This is enforced only by runtime tool interception. Hosts must not use
+    /// it to prune prompt-visible tool schemas, because that would churn the
+    /// provider prompt-cache prefix every time a skill is loaded.
     pub allowed_tools: Option<HashSet<String>>,
     /// Request-scoped tool/skill constraints supplied by the external caller.
     /// Nested runs inherit these constraints unchanged.
@@ -339,6 +398,8 @@ pub struct SkillState {
     pub pinned: std::collections::HashSet<String>,
     /// Canonical skill names surfaced via `discover_skills` this session.
     pub discovered: HashSet<String>,
+    /// Scoring thresholds for deterministic pre-turn skill auto-routing.
+    pub auto_routing: crate::turn::skill_tool::AutoRoutingConfig,
     /// Skill catalog surfacing for this request / session.
     pub search: astra_core::SkillSearchSettings,
     /// Skill listing message (available skill names + descriptions).
@@ -373,6 +434,7 @@ impl Default for SkillState {
             improvement_tracker: Default::default(),
             pinned: HashSet::new(),
             discovered: HashSet::new(),
+            auto_routing: Default::default(),
             search: Default::default(),
             listing_message: None,
             invoked: HashMap::new(),
@@ -1406,29 +1468,35 @@ impl AgenticLoopState {
             .unwrap_or("")
             .to_string();
         let mut augmented = base;
-        let tail_is_user = augmented
-            .last()
-            .and_then(|m| m.get("role"))
-            .and_then(serde_json::Value::as_str)
-            == Some("user");
-        if tail_is_user && !volatile_text.is_empty() {
+        // Single-pass: bind the mutable reference and check the role through
+        // it so we never have to re-`last_mut().expect(...)`. If the borrow
+        // matches and we have non-empty volatile text, prepend in-place;
+        // otherwise the function-level `else` branch appends. This makes
+        // the previous "tail_is_user → non-empty" invariant unrepresentable.
+        let prepended = augmented.last_mut().is_some_and(|last| {
+            if last.get("role").and_then(serde_json::Value::as_str) != Some("user")
+                || volatile_text.is_empty()
+            {
+                return false;
+            }
             // Prepend into the last user msg so we don't create
             // `[user, user]` which breaks Bedrock/Anthropic alternation.
-            let last = augmented.last_mut().expect("tail_is_user → non-empty");
             let existing = last
                 .get("content")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
                 .to_string();
             let merged = if existing.is_empty() {
-                volatile_text
+                volatile_text.clone()
             } else {
                 format!("{volatile_text}\n\n{existing}")
             };
             last["content"] = serde_json::Value::String(merged);
-        } else {
-            // Safe to append — tail is assistant/tool (tool-loop case)
-            // or the base was empty.
+            true
+        });
+        if !prepended {
+            // Safe to append — tail is assistant/tool (tool-loop case),
+            // base was empty, or volatile text was empty.
             augmented.push(volatile_msg);
         }
         Some(augmented)
@@ -1456,6 +1524,33 @@ impl AgenticLoopState {
             .model_override
             .as_deref()
             .or_else(|| self.recent_rounds.last().map(|r| r.model.as_str()))
+    }
+
+    /// 1-based session turn number for the turn currently in progress.
+    ///
+    /// Two ways to derive it, in order:
+    /// 1. The explicit `session_turn` slot, populated by the host before the
+    ///    turn starts (server, edge sync, recovery paths).
+    /// 2. Otherwise, derive from the loop budget — `max_turns - remaining_turns`.
+    ///
+    /// The caller observes turn N during the entire window where they reason
+    /// about turn N (LLM round, tool round, post-turn capture). That is the
+    /// same value that downstream consumers like
+    /// [`crate::turn::skill_tool::InvokedSkill::invoked_at_turn`] persist —
+    /// see that field's doc for the captured-before-commit semantics.
+    pub fn current_session_turn_number(&self) -> u32 {
+        if self.session_turn > 0 {
+            self.session_turn
+        } else {
+            self.max_turns.saturating_sub(self.remaining_turns).max(1) as u32
+        }
+    }
+
+    /// Skill-scoped tool restrictions stay active until the next successful
+    /// skill activation replaces them. Failed loads do not mutate the active
+    /// allowlist, which keeps the session on the last known-good workflow.
+    pub fn skill_allowlist_active(&self) -> bool {
+        self.skills.allowed_tools.is_some()
     }
 }
 
@@ -1589,6 +1684,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         state
     );
 
+    let loop_start_time = Instant::now();
     let mut turn_index = 0usize;
     while turn_index < state.max_turns || state.remaining_turns == 0 {
         state.current_round_index = turn_index as u32;
@@ -1606,6 +1702,19 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 return Ok(outcome);
             }
         };
+
+        // Trace: turn_start
+        if let Some(ref mut buf) = state.turn_event_buffer {
+            record_trace_span(
+                buf,
+                format!("turn_{}", turn_index),
+                "turn_start",
+                turn_start_time,
+                None,
+                None,
+                state.current_run_id.as_deref(),
+            );
+        }
 
         let TurnExecutionPhase {
             llm_wall_start,
@@ -1631,6 +1740,35 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 return Ok(outcome);
             }
         };
+
+        // Trace: llm_call
+        if let Some(ref mut buf) = state.turn_event_buffer {
+            record_trace_span(
+                buf,
+                format!("llm_{}", turn_index),
+                "llm_call",
+                llm_wall_start,
+                Some(format!("turn_{}", turn_index)),
+                None,
+                state.current_run_id.as_deref(),
+            );
+        }
+
+        // Trace: tool_selection
+        if let Some(ref mut buf) = state.turn_event_buffer {
+            let tool_count = turn_result.accum.tool_calls.len();
+            let mut attrs = std::collections::HashMap::new();
+            attrs.insert("tool_count".into(), tool_count.to_string());
+            record_trace_span(
+                buf,
+                format!("select_{}", turn_index),
+                "tool_selection",
+                llm_wall_start,
+                Some(format!("llm_{}", turn_index)),
+                Some(&attrs),
+                state.current_run_id.as_deref(),
+            );
+        }
 
         // ── Harness: PostLlmResponse — Block/Pause halts session ──
         #[cfg(feature = "harness")]
@@ -1690,6 +1828,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             false
         };
 
+        let tool_phase_start = Instant::now();
         #[cfg(feature = "harness")]
         let tool_phase_control = if harness_blocked_tools {
             TurnToolPhaseControl::ContinueLoop
@@ -1725,6 +1864,19 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             },
         )
         .await?;
+
+        // Trace: tool_execution
+        if let Some(ref mut buf) = state.turn_event_buffer {
+            record_trace_span(
+                buf,
+                format!("tools_{}", turn_index),
+                "tool_execution",
+                tool_phase_start,
+                Some(format!("llm_{}", turn_index)),
+                None,
+                state.current_run_id.as_deref(),
+            );
+        }
 
         // ── Harness: PostToolBatch — Block/Pause halts session ──
         #[cfg(feature = "harness")]
@@ -1790,6 +1942,18 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         }
 
         turn_index += 1;
+    }
+    // Trace: turn_end
+    if let Some(ref mut buf) = state.turn_event_buffer {
+        record_trace_span(
+            buf,
+            "loop_end".to_string(),
+            "turn_end",
+            loop_start_time,
+            None,
+            None,
+            state.current_run_id.as_deref(),
+        );
     }
     // Loop exhausted max_turns without explicit break — write final state.
     finalize_and_render(host, state).await;
@@ -2910,6 +3074,10 @@ pub(crate) mod tests {
                 deprioritized_tools: vec![],
                 force_stop: false,
                 nudge_count: 1,
+                interaction_mode: "prompt".into(),
+                suppressed_loop_nudges: false,
+                recent_error_pressure: 0,
+                recent_timeout_pressure: 0,
                 total_errors: 0,
                 deprioritized_count: 0,
                 total_timeouts: 0,
@@ -4288,10 +4456,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn skill_allowed_tools_never_pollutes_restricted_tools() {
-        // Skill allowed_tools is additive (ensures tool schema visibility),
-        // never restrictive. The runtime must not add anything to restricted_tools
-        // based on skill allowed_tools.
+    async fn skill_allowed_tools_are_turn_scoped_only() {
+        // Skill allowlists may restrict tool visibility during the active turn,
+        // but they must not leak into later turns after host cleanup runs.
         let resolver = StubSkillResolver::new().with_allowed_tools(vec!["bash".into()]);
         let turns = vec![
             skill_tool_call_result("call_1", r#"{"skill_name": "test-skill"}"#, 100, 50),
@@ -4309,12 +4476,12 @@ pub(crate) mod tests {
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        // restricted_tools must stay empty — skill allowed_tools is additive only
+        // Turn-scoped restrictions must be removed after the turn completes.
         assert!(
             state.restricted_tools.is_empty(),
-            "skill allowed_tools must not pollute restricted_tools"
+            "skill allowlist restrictions must not leak after turn cleanup"
         );
-        // The allowed_tools field is still set for schema injection
+        // The activated allowlist is still tracked on skill state.
         let allowed = state.skills.allowed_tools.as_ref().unwrap();
         assert!(allowed.contains("bash"));
     }
@@ -4572,9 +4739,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn skill_dedup_returns_stub_on_second_invocation() {
+    async fn skill_dedup_replays_loaded_content_on_second_invocation() {
         // Turn 1: skill call → full instructions returned + recorded
-        // Turn 2: same skill call → stub returned (dedup)
+        // Turn 2: same skill call → replay loaded content + dedup note
         // Turn 3: text completion
         let resolver = StubSkillResolver::new(); // has "test-skill"
         let turns = vec![
@@ -4616,7 +4783,7 @@ pub(crate) mod tests {
                 .contains("Follow these instructions carefully.")
         );
 
-        // Second call: stub (dedup)
+        // Second call: replay loaded content + dedup note.
         let msg2: Vec<&Value> = state
             .messages
             .iter()
@@ -4626,11 +4793,15 @@ pub(crate) mod tests {
         let stub = msg2[0]["content"].as_str().unwrap();
         assert!(
             stub.contains("already loaded"),
-            "expected dedup stub, got: {stub}"
+            "expected dedup note, got: {stub}"
         );
         assert!(
-            !stub.contains("# Skill:"),
-            "stub should NOT contain full instructions"
+            stub.contains("# Skill: test-skill"),
+            "first re-entry should replay the loaded skill instructions"
+        );
+        assert!(
+            stub.contains("<skill-loaded name=\"test-skill\"/>"),
+            "first re-entry should replay the skill-loaded marker"
         );
 
         // Skill should be tracked

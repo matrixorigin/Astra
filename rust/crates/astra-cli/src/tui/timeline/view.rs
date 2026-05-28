@@ -605,27 +605,33 @@ mod tests {
     #[test]
     fn snapshot_three_turns_default_selection() {
         let tl = fixture();
-        insta::assert_snapshot!("timeline_default_100x10", render_tl(&tl, 100, 10));
+        crate::tui::testing::assert_tui_snapshot!(
+            "timeline_default_100x10",
+            render_tl(&tl, 100, 10)
+        );
     }
 
     #[test]
     fn snapshot_second_turn_selected() {
         let mut tl = fixture();
         tl.move_down();
-        insta::assert_snapshot!("timeline_second_selected_100x10", render_tl(&tl, 100, 10));
+        crate::tui::testing::assert_tui_snapshot!(
+            "timeline_second_selected_100x10",
+            render_tl(&tl, 100, 10)
+        );
     }
 
     #[test]
     fn snapshot_narrow_collapses_to_single_pane() {
         let tl = fixture();
-        insta::assert_snapshot!("timeline_narrow_70x10", render_tl(&tl, 70, 10));
+        crate::tui::testing::assert_tui_snapshot!("timeline_narrow_70x10", render_tl(&tl, 70, 10));
     }
 
     #[test]
     fn snapshot_empty_state() {
         let src = StaticTurnSource::new(vec![]);
         let tl = Timeline::new(src, "sess_empty");
-        insta::assert_snapshot!("timeline_empty_80x3", render_tl(&tl, 80, 3));
+        crate::tui::testing::assert_tui_snapshot!("timeline_empty_80x3", render_tl(&tl, 80, 3));
     }
 
     #[test]
@@ -636,7 +642,10 @@ mod tests {
         ]);
         let mut tl = Timeline::new(src, "sess_err");
         tl.move_down();
-        insta::assert_snapshot!("timeline_error_turn_100x10", render_tl(&tl, 100, 10));
+        crate::tui::testing::assert_tui_snapshot!(
+            "timeline_error_turn_100x10",
+            render_tl(&tl, 100, 10)
+        );
     }
 
     // ─── Helpers ──────────────────────────────────────────────────

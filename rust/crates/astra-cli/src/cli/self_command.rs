@@ -1,10 +1,10 @@
 use chrono::Utc;
 use serde::Serialize;
 
-use crate::cli_args::{
+use crate::cli::cli_args::{
     SelfCmd, SelfJournalArgs, SelfMutateCmd, SelfMutateConfigArgs, SelfReflectArgs,
 };
-use crate::cli_utils::resumable_last_session_id;
+use crate::cli::cli_utils::resumable_last_session_id;
 use astra_config::runtime_config::RuntimeConfig;
 use astra_runtime::self_model::ConstraintSet;
 use astra_runtime::tool_registry::ToolRegistry;
@@ -745,6 +745,8 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::PipelineCompactionAudit => "pipeline_compaction_audit",
         JournalEventType::MemorySuppressed => "memory_suppressed",
         JournalEventType::ContextReleased => "context_released",
+        JournalEventType::Bootstrap => "bootstrap",
+        JournalEventType::TraceSpan => "trace_span",
     }
     .to_string()
 }
@@ -769,7 +771,7 @@ fn compact_json_value(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli_args::SelfSessionArgs;
+    use crate::cli::cli_args::SelfSessionArgs;
     use astra_services::session_journal::{JournalDirGuard, ToolCallRecord};
     use astra_services::session_workspace::ContextTraceSignal;
 

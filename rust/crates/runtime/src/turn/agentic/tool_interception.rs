@@ -15,6 +15,111 @@ pub(crate) struct PreparedToolRound {
     pub(crate) edge_tool_round: Vec<EdgeToolExecResult>,
 }
 
+fn effective_runtime_allowed_tools(state: &AgenticLoopState) -> Option<HashSet<String>> {
+    let skill_allowed = state
+        .skill_allowlist_active()
+        .then_some(())
+        .and(state.skills.allowed_tools.as_ref());
+    let effective = astra_turn_core::tool_allowlist::compute_effective_allowlist(
+        state.skills.request_constraints.allowed_tools.as_ref(),
+        skill_allowed,
+    );
+    if matches!(effective.as_ref(), Some(allowed) if allowed.is_empty()) {
+        tracing::warn!(
+            "runtime tool allowlist intersection is empty; only skill/discover_skills remain callable"
+        );
+    }
+    effective
+}
+
+pub(crate) fn runtime_tool_allowlist_notice(state: &AgenticLoopState) -> Option<String> {
+    state.skills.allowed_tools.as_ref()?;
+
+    let effective_allowed = effective_runtime_allowed_tools(state).unwrap_or_default();
+    let mut allowed_display = effective_allowed.into_iter().collect::<Vec<_>>();
+    allowed_display.sort();
+    if allowed_display.is_empty() {
+        Some(
+            "Runtime tool policy: after loading this skill, no non-skill tools are currently callable because the request allowlist and the skill allowlist do not overlap. Only `skill` and `discover_skills` remain callable until you load a different skill or the request policy changes.".to_string(),
+        )
+    } else {
+        Some(format!(
+            "Runtime tool policy: after loading this skill, only these non-skill tools are callable: {}. Other visible tools remain advertised for cache stability but will be BLOCKED at runtime.",
+            allowed_display.join(", ")
+        ))
+    }
+}
+
+fn intercept_disallowed_tool_calls(
+    state: &AgenticLoopState,
+    tool_calls: &[Value],
+) -> (
+    Vec<crate::turn::skill_tool::InterceptedToolResult>,
+    Vec<Value>,
+) {
+    let Some(allowed_tools) = effective_runtime_allowed_tools(state) else {
+        return (Vec::new(), tool_calls.to_vec());
+    };
+
+    let mut allowed_tool_names = allowed_tools.iter().cloned().collect::<Vec<_>>();
+    allowed_tool_names.sort();
+    let allowed_display = if allowed_tool_names.is_empty() {
+        "none".to_string()
+    } else {
+        allowed_tool_names.join(", ")
+    };
+
+    let mut blocked = Vec::new();
+    let mut remaining = Vec::new();
+    for tool_call in tool_calls {
+        let raw_tool_name = tool_call
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str);
+        let Some(tool_name) =
+            raw_tool_name.and_then(astra_turn_core::tool_allowlist::normalize_tool_name)
+        else {
+            let tool_call_id = tool_call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .unwrap_or("unknown")
+                .to_string();
+            blocked.push(crate::turn::skill_tool::InterceptedToolResult {
+                tool_call_id,
+                tool_name: "<missing>".to_string(),
+                result: format!(
+                    "BLOCKED: Tool name is missing or empty, so the call cannot bypass the active request/skill allowlist. Allowed tools: {allowed_display}. Use an allowed tool name or call `skill` to load a different workflow."
+                ),
+            });
+            continue;
+        };
+        if tool_name == crate::turn::skill_tool::SKILL_TOOL_NAME
+            || tool_name == crate::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME
+            || allowed_tools.contains(&tool_name)
+        {
+            remaining.push(tool_call.clone());
+            continue;
+        }
+
+        let tool_call_id = tool_call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+        blocked.push(crate::turn::skill_tool::InterceptedToolResult {
+            tool_call_id,
+            tool_name: tool_name.clone(),
+            result: format!(
+                "BLOCKED: Tool '{tool_name}' is not allowed by the active request/skill allowlist. Allowed tools: {allowed_display}. Use the allowed tools or call `skill` to load a different workflow."
+            ),
+        });
+    }
+
+    (blocked, remaining)
+}
+
 pub(crate) async fn prepare_intercepted_tool_round(
     state: &mut AgenticLoopState,
     turn_result: &HostTurnResult,
@@ -25,13 +130,59 @@ pub(crate) async fn prepare_intercepted_tool_round(
     let tool_calls =
         astra_turn_core::headless_tool_assembly::ensure_tool_call_ids(effective_tool_calls)
             .into_owned();
+    let (blocked_tool_results, allowed_tool_calls) =
+        intercept_disallowed_tool_calls(state, &tool_calls);
     let (mut pre_resolved_results, post_send_tool_calls) =
-        intercept_send_message_calls(state, &tool_calls, valid_tool_names).await;
+        intercept_send_message_calls(state, &allowed_tool_calls, valid_tool_names).await;
     let SkillInterceptionResult {
         results: skill_results,
         surgically_removed_ids,
         short_circuit_meta,
     } = intercept_skill_calls(state, &post_send_tool_calls).await;
+
+    // Build the id→args lookup once. Without it, the per-result `find` below
+    // is O(N²) over `tool_calls`, which a model emitting many simultaneous
+    // disallowed calls would exercise.
+    let args_preview_by_id: HashMap<&str, String> = tool_calls
+        .iter()
+        .filter_map(|tc| {
+            let id = tc.get("id").and_then(Value::as_str)?;
+            let args = tc
+                .get("function")
+                .and_then(|function| function.get("arguments"))
+                .and_then(Value::as_str)?;
+            Some((id, args.chars().take(200).collect::<String>()))
+        })
+        .collect();
+
+    for result in &blocked_tool_results {
+        let args_preview = args_preview_by_id
+            .get(result.tool_call_id.as_str())
+            .cloned();
+        pre_resolved_results.push((result.tool_call_id.clone(), result.result.clone()));
+        let (round, start_offset_ms) = match state.turn_event_buffer.as_ref() {
+            Some(buf) => (Some(buf.current_round()), Some(buf.offset_ms())),
+            None => (None, None),
+        };
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: result.tool_name.clone(),
+            ok: false,
+            ms: 0,
+            error: Some("tool blocked by active request/skill allowlist".to_string()),
+            input_bytes: None,
+            output_bytes: Some(result.result.len() as u32),
+            args_preview,
+            result_preview: Some(result.result.chars().take(500).collect::<String>()),
+            file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
+            args_full: None,
+            result_full: Some(result.result.clone()),
+            round,
+            start_offset_ms,
+            ..Default::default()
+        });
+    }
 
     for result in &skill_results {
         pre_resolved_results.push((result.tool_call_id.clone(), result.result.clone()));
@@ -288,11 +439,16 @@ pub(crate) fn dedup_skill_calls(
                         name, invoked_at, reentry, reentry,
                     )
                 } else {
-                    format!(
+                    let mut replay = prev.content.clone();
+                    if !replay.is_empty() {
+                        replay.push_str("\n\n");
+                    }
+                    replay.push_str(&format!(
                         "Skill '{}' was already loaded (turn {}). \
                          Follow those instructions directly — do not re-invoke.",
                         name, invoked_at
-                    )
+                    ));
+                    replay
                 };
                 short_circuits.push((
                     crate::turn::skill_tool::InterceptedToolResult {
@@ -351,7 +507,7 @@ async fn intercept_skill_calls(
         dedup_results.push(res);
     }
 
-    let (sr, remaining, activation) =
+    let (mut sr, remaining, activation) =
         crate::turn::skill_tool::partition_discover_and_execute_skills(
             &fresh_tool_calls,
             resolver.as_ref(),
@@ -364,6 +520,23 @@ async fn intercept_skill_calls(
             &skill_ctx,
         )
         .await;
+
+    let activation_notice = if let Some(activation) = activation {
+        apply_skill_activation(state, activation);
+        runtime_tool_allowlist_notice(state)
+    } else {
+        None
+    };
+
+    if let Some(notice) = activation_notice
+        && let Some(skill_result) = sr
+            .iter_mut()
+            .rev()
+            .find(|result| result.tool_name == crate::turn::skill_tool::SKILL_TOOL_NAME)
+    {
+        skill_result.result.push_str("\n\n");
+        skill_result.result.push_str(&notice);
+    }
 
     let current_turn = (state.max_turns - state.remaining_turns) as u32;
     for result in &sr {
@@ -468,18 +641,6 @@ async fn intercept_skill_calls(
         );
     }
 
-    if let Some(act) = activation {
-        state.skills.model_override = act.model_override.filter(|m| is_valid_model_string(m));
-        state.skills.allowed_tools = if act.allowed_tools.is_empty() {
-            None
-        } else {
-            Some(act.allowed_tools.into_iter().collect())
-        };
-        state.skills.effort = act.effort;
-        state.skills.agent_type = act.agent_type;
-        state.skills.sandbox_policy = act.sandbox_policy;
-    }
-
     SkillInterceptionResult {
         results: skill_results,
         surgically_removed_ids,
@@ -487,7 +648,9 @@ async fn intercept_skill_calls(
     }
 }
 
-fn build_skill_context(state: &AgenticLoopState) -> crate::turn::skill_tool::SkillContext {
+pub(crate) fn build_skill_context(
+    state: &AgenticLoopState,
+) -> crate::turn::skill_tool::SkillContext {
     let session_dir = state.current_session_id.as_ref().and_then(|id| {
         astra_services::local_session_artifact_store()
             .session_dir(id)
@@ -504,6 +667,23 @@ fn build_skill_context(state: &AgenticLoopState) -> crate::turn::skill_tool::Ski
         forward_headers: state.hooks.forward_headers.clone(),
         extra: build_skill_extra(state),
     }
+}
+
+pub(crate) fn apply_skill_activation(
+    state: &mut AgenticLoopState,
+    act: crate::turn::skill_tool::SkillActivation,
+) {
+    state.skills.model_override = act.model_override.filter(|m| is_valid_model_string(m));
+    let normalized_allowed_tools =
+        astra_turn_core::tool_allowlist::normalize_tool_names(&act.allowed_tools);
+    state.skills.allowed_tools = if normalized_allowed_tools.is_empty() {
+        None
+    } else {
+        Some(normalized_allowed_tools)
+    };
+    state.skills.effort = act.effort;
+    state.skills.agent_type = act.agent_type;
+    state.skills.sandbox_policy = act.sandbox_policy;
 }
 
 fn build_skill_extra(state: &AgenticLoopState) -> HashMap<String, String> {
@@ -565,6 +745,18 @@ fn build_skill_extra(state: &AgenticLoopState) -> HashMap<String, String> {
     extra.insert(
         "error_count".into(),
         state.turn_guard.errors.total_errors.to_string(),
+    );
+    extra.insert(
+        "recent_error_pressure".into(),
+        state.turn_guard.errors.recent_error_pressure().to_string(),
+    );
+    extra.insert(
+        "recent_timeout_pressure".into(),
+        state
+            .turn_guard
+            .errors
+            .recent_error_count(astra_turn_core::error_recovery::ErrorCategory::ToolTimeout)
+            .to_string(),
     );
     let depri = state.turn_guard.health.deprioritized_tools();
     if !depri.is_empty() {
@@ -653,6 +845,7 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
     use serde_json::json;
 
     use super::*;
@@ -698,6 +891,116 @@ mod tests {
         (parent, child)
     }
 
+    fn empty_host_turn_result() -> HostTurnResult {
+        HostTurnResult {
+            accum: ChatTurnSseAccum::default(),
+            ttft_ms: None,
+            edge_tool_round: Vec::new(),
+            error_kind: None,
+        }
+    }
+
+    #[test]
+    fn runtime_tool_allowlist_notice_describes_effective_intersection() {
+        let mut state = make_state();
+        state.skills.request_constraints.allowed_tools = Some(
+            ["bash".to_string(), "read_file".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        apply_skill_activation(
+            &mut state,
+            crate::turn::skill_tool::SkillActivation {
+                model_override: None,
+                allowed_tools: vec![" READ_FILE ".to_string()],
+                effort: None,
+                agent_type: None,
+                sandbox_policy: None,
+            },
+        );
+
+        let notice = runtime_tool_allowlist_notice(&state).expect("notice should be emitted");
+
+        assert!(notice.contains("read_file"));
+        assert!(notice.contains("BLOCKED at runtime"));
+    }
+
+    #[test]
+    fn runtime_tool_allowlist_notice_uses_applied_activation_not_stale_skill_state() {
+        let mut state = make_state();
+        state.skills.request_constraints.allowed_tools = Some(
+            ["bash".to_string(), "read_file".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        state.skills.allowed_tools = Some(["read_file".to_string()].into_iter().collect());
+        state.skills.invoked.insert(
+            "old-skill".into(),
+            crate::turn::skill_tool::InvokedSkill {
+                name: "old-skill".into(),
+                content: String::new(),
+                invoked_at_turn: 1,
+                reentry_count: 0,
+            },
+        );
+
+        apply_skill_activation(
+            &mut state,
+            crate::turn::skill_tool::SkillActivation {
+                model_override: None,
+                allowed_tools: vec!["bash".to_string()],
+                effort: None,
+                agent_type: None,
+                sandbox_policy: None,
+            },
+        );
+
+        let notice = runtime_tool_allowlist_notice(&state).expect("notice should be emitted");
+
+        assert!(notice.contains("callable: bash"));
+        assert!(!notice.contains("read_file"));
+    }
+
+    #[test]
+    fn runtime_tool_allowlist_notice_warns_when_intersection_is_empty() {
+        let mut state = make_state();
+        state.skills.request_constraints.allowed_tools =
+            Some(["bash".to_string()].into_iter().collect());
+        apply_skill_activation(
+            &mut state,
+            crate::turn::skill_tool::SkillActivation {
+                model_override: None,
+                allowed_tools: vec!["read_file".to_string()],
+                effort: None,
+                agent_type: None,
+                sandbox_policy: None,
+            },
+        );
+
+        let notice = runtime_tool_allowlist_notice(&state).expect("notice should be emitted");
+
+        assert!(notice.contains("no non-skill tools are currently callable"));
+    }
+
+    #[test]
+    fn runtime_tool_allowlist_notice_is_absent_without_skill_tool_policy() {
+        let mut state = make_state();
+        state.skills.request_constraints.allowed_tools =
+            Some(["bash".to_string()].into_iter().collect());
+        apply_skill_activation(
+            &mut state,
+            crate::turn::skill_tool::SkillActivation {
+                model_override: None,
+                allowed_tools: Vec::new(),
+                effort: None,
+                agent_type: None,
+                sandbox_policy: None,
+            },
+        );
+
+        assert!(runtime_tool_allowlist_notice(&state).is_none());
+    }
+
     #[tokio::test]
     async fn send_message_interception_respects_valid_tool_names() {
         let (mut parent, child) = setup_mailboxes().await;
@@ -727,6 +1030,214 @@ mod tests {
         assert!(
             parent.try_recv().is_none(),
             "no message should be delivered when send_message is disallowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_intercepted_tool_round_blocks_disallowed_skill_tools_at_runtime() {
+        let mut state = make_state();
+        state.skills.allowed_tools = Some(
+            [" Bash ".to_string(), "READ_FILE".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        state.skills.invoked.insert(
+            "review-changes".into(),
+            crate::turn::skill_tool::InvokedSkill {
+                name: "review-changes".into(),
+                content: String::new(),
+                invoked_at_turn: 1,
+                reentry_count: 0,
+            },
+        );
+
+        let tool_calls = vec![
+            json!({
+                "id": "call-bash",
+                "type": "function",
+                "function": { "name": "bash", "arguments": "{}" }
+            }),
+            json!({
+                "id": "call-str-replace",
+                "type": "function",
+                "function": { "name": "str_replace", "arguments": "{}" }
+            }),
+        ];
+        let prepared = prepare_intercepted_tool_round(
+            &mut state,
+            &empty_host_turn_result(),
+            &tool_calls,
+            false,
+            &HashSet::from(["bash".to_string(), "str_replace".to_string()]),
+        )
+        .await;
+
+        assert_eq!(
+            prepared.tool_calls.len(),
+            2,
+            "assistant tool calls stay intact"
+        );
+        assert!(
+            prepared
+                .pre_resolved_results
+                .iter()
+                .any(|(call_id, result)| {
+                    call_id == "call-str-replace" && result.contains("BLOCKED:")
+                })
+        );
+        assert!(
+            prepared
+                .pre_resolved_results
+                .iter()
+                .all(|(call_id, _)| call_id != "call-bash"),
+            "allowed tools should not be pre-resolved as blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_intercepted_tool_round_honors_explicit_empty_request_allowlist() {
+        let mut state = make_state();
+        state.skills.request_constraints.allowed_tools = Some(HashSet::new());
+
+        let tool_calls = vec![json!({
+            "id": "call-bash",
+            "type": "function",
+            "function": { "name": "bash", "arguments": "{}" }
+        })];
+        let prepared = prepare_intercepted_tool_round(
+            &mut state,
+            &empty_host_turn_result(),
+            &tool_calls,
+            false,
+            &HashSet::from(["bash".to_string()]),
+        )
+        .await;
+
+        assert!(
+            prepared
+                .pre_resolved_results
+                .iter()
+                .any(|(call_id, result)| {
+                    call_id == "call-bash" && result.contains("Allowed tools: none")
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_intercepted_tool_round_blocks_request_only_allowlist() {
+        // Coverage gap fixed: only request allowlist set, no skill activation.
+        // Without this test the request-only branch of compute_effective_allowlist
+        // had no regression guard.
+        let mut state = make_state();
+        state.skills.request_constraints.allowed_tools =
+            Some(["bash".to_string()].into_iter().collect());
+
+        let tool_calls = vec![
+            json!({
+                "id": "call-bash",
+                "type": "function",
+                "function": { "name": "bash", "arguments": "{}" }
+            }),
+            json!({
+                "id": "call-rf",
+                "type": "function",
+                "function": { "name": "read_file", "arguments": "{}" }
+            }),
+        ];
+        let prepared = prepare_intercepted_tool_round(
+            &mut state,
+            &empty_host_turn_result(),
+            &tool_calls,
+            false,
+            &HashSet::from(["bash".to_string(), "read_file".to_string()]),
+        )
+        .await;
+
+        assert!(
+            prepared
+                .pre_resolved_results
+                .iter()
+                .any(|(id, msg)| id == "call-rf" && msg.contains("BLOCKED:")),
+            "request-only allowlist should block read_file"
+        );
+        assert!(
+            prepared
+                .pre_resolved_results
+                .iter()
+                .all(|(id, _)| id != "call-bash"),
+            "request-only allowlist should leave allowed bash alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_intercepted_tool_round_admits_mixed_case_skill_call() {
+        // Regression: a model emitting "Skill" (mixed-case) used to pass the
+        // allowlist gate (which lowercases) but skip is_skill_call (which was
+        // exact-match), turning a legitimate skill invocation into an unknown-
+        // tool dispatch. Both halves now normalize to lowercase, so the call
+        // reaches intercept_skill_calls and produces a skill result.
+        let mut state = make_state();
+        state.skills.request_constraints.allowed_tools =
+            Some(["bash".to_string()].into_iter().collect());
+
+        let tool_calls = vec![json!({
+            "id": "call-skill-mixed",
+            "type": "function",
+            "function": {
+                "name": "Skill",
+                "arguments": "{\"skill_name\": \"any\"}"
+            }
+        })];
+        let prepared = prepare_intercepted_tool_round(
+            &mut state,
+            &empty_host_turn_result(),
+            &tool_calls,
+            false,
+            &HashSet::from(["bash".to_string()]),
+        )
+        .await;
+
+        // Mixed-case "Skill" must NOT be reported as a blocked-allowlist
+        // result; it routes through the skill execution path. (No resolver
+        // is configured here, so it produces no skill output either, which
+        // is fine — the assertion is purely "the allowlist gate didn't
+        // mistake it for a denied tool".)
+        assert!(
+            prepared
+                .pre_resolved_results
+                .iter()
+                .all(|(id, msg)| id != "call-skill-mixed" || !msg.contains("BLOCKED:")),
+            "mixed-case Skill must not be blocked by the allowlist gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_intercepted_tool_round_blocks_empty_tool_names() {
+        let mut state = make_state();
+        state.skills.request_constraints.allowed_tools =
+            Some(["bash".to_string()].into_iter().collect());
+
+        let tool_calls = vec![json!({
+            "id": "call-empty",
+            "type": "function",
+            "function": { "name": "   ", "arguments": "{}" }
+        })];
+        let prepared = prepare_intercepted_tool_round(
+            &mut state,
+            &empty_host_turn_result(),
+            &tool_calls,
+            false,
+            &HashSet::from(["bash".to_string()]),
+        )
+        .await;
+
+        assert!(
+            prepared
+                .pre_resolved_results
+                .iter()
+                .any(|(call_id, result)| {
+                    call_id == "call-empty" && result.contains("Tool name is missing or empty")
+                })
         );
     }
 
@@ -854,6 +1365,11 @@ mod tests {
         assert!(
             res1.result.contains("was already loaded"),
             "first re-entry uses passive wording, got: {}",
+            res1.result
+        );
+        assert!(
+            res1.result.contains("# Skill: review-changes"),
+            "first re-entry should replay the already-loaded skill content, got: {}",
             res1.result
         );
         assert!(

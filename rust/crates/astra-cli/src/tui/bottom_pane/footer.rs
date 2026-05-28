@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use ratatui::{buffer::Buffer, layout::Rect};
 
-use crate::permission_manager::{PermissionMode, PermissionModeMirror};
+use crate::cli::permission_manager::{PermissionMode, PermissionModeMirror};
 use crate::tui::status_line::{StatusContext, StatusLine};
 
 pub(crate) struct Footer {

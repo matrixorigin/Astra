@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
-use crate::{ExplainMode, permission_manager::PermissionManager};
+use crate::{ExplainMode, cli::permission_manager::PermissionManager};
 
 /// Atomic counter pair published by streaming tools (currently
 /// bash) while they run. Consumers read `lines` / `bytes` on a
@@ -220,7 +220,7 @@ pub struct ApprovalRequest {
     pub response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
     /// Optional enriched metadata. Stored as `Option<Box<…>>` so
     /// the empty case stays cheap on the message channel.
-    pub metadata: Option<Box<crate::tui::approval::queue::ApprovalMetadata>>,
+    pub(crate) metadata: Option<Box<crate::tui::approval::queue::ApprovalMetadata>>,
 }
 
 impl ApprovalRequest {
@@ -277,7 +277,7 @@ pub type AskUserRequestTx = mpsc::UnboundedSender<AskUserRequest>;
 pub enum PlanReviewDecision {
     /// User approved and chose an execution mode.
     Approve {
-        mode: crate::permission_manager::PermissionMode,
+        mode: crate::cli::permission_manager::PermissionMode,
     },
     /// User wants to keep planning — provide feedback on next turn.
     KeepPlanning,
@@ -296,6 +296,8 @@ pub type PlanReviewRequestTx = mpsc::UnboundedSender<PlanReviewRequest>;
 
 /// Parameters for a single agentic chat turn — groups the many arguments
 /// to `stream_chat_sse` into a named struct to reduce cognitive load.
+use crate::cli::cli_context::CliContext;
+
 pub(crate) struct ChatTurnParams<'a> {
     pub(crate) api: &'a astra_thin_client::ThinClient,
     pub(crate) token: &'a str,
@@ -312,7 +314,8 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) history: &'a [(String, String)],
     pub(crate) perm_manager: &'a mut PermissionManager,
     pub(crate) verbose_mode: bool,
-    pub(crate) render_policy: super::super::stream_render::RenderPolicy,
+    pub(crate) render_policy: crate::cli::stream_render::RenderPolicy,
+    pub(crate) cli_context: Option<&'a CliContext>,
 
     pub(crate) recent_tools: &'a [String],
     pub(crate) tool_health_entries: &'a [ToolHealthEntry],
@@ -467,7 +470,8 @@ pub(crate) struct BasicCliChatContext<'a> {
     pub explain: ExplainMode,
     pub render_md: bool,
     pub verbose_mode: bool,
-    pub render_policy: super::super::stream_render::RenderPolicy,
+    pub render_policy: crate::cli::stream_render::RenderPolicy,
+    pub cli_context: Option<&'a CliContext>,
 
     pub unified_skill_registry: &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     pub skill_search: &'a astra_core::SkillSearchSettings,
@@ -530,6 +534,7 @@ impl<'a> ChatTurnParams<'a> {
             perm_manager,
             verbose_mode: ctx.verbose_mode,
             render_policy: ctx.render_policy,
+            cli_context: ctx.cli_context,
 
             recent_tools: &[],
             tool_health_entries: &[],

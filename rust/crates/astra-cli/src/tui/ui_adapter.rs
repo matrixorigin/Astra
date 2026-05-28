@@ -1,4 +1,4 @@
-pub(crate) use crate::ui_adapter::ReplUiAdapter;
+pub(crate) use crate::cli::ui_adapter::ReplUiAdapter;
 
 use crate::tui::app_event::TuiAppEvent;
 

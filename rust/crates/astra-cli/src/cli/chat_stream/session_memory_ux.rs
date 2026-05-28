@@ -40,7 +40,7 @@ use astra_runtime::session_memory::{BackgroundActivity, MemoryExtractionService}
 use astra_services::session_journal::SessionMemoryExtractionSource;
 use tokio::task::JoinHandle;
 
-use super::params::{StreamEvent, StreamEventTx};
+use crate::cli::chat_stream::params::{StreamEvent, StreamEventTx};
 
 /// Minimum duration a `Started` event must stay "in progress" before
 /// we consider it worth surfacing. Below this, the extraction is

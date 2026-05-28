@@ -13,13 +13,12 @@ use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::chat_stream::{ApprovalRequest, ApprovalResponse, ChatTurnParams, StreamEvent};
-use crate::cli_utils::get_profile_and_token;
-use crate::permission_manager::{PermissionLoadPolicy, PermissionManager, PermissionMode};
-use crate::session_runtime;
-use crate::streaming_types::StreamResult;
-use crate::{ExplainMode, chat_stream::BasicCliChatContext};
-use astra_turn_core::chat_turn_heuristics::is_session_not_found_error;
+use crate::cli::chat_stream::{ApprovalRequest, ApprovalResponse, StreamEvent};
+use crate::cli::cli_utils::get_profile_and_token;
+use crate::cli::permission_manager::{PermissionLoadPolicy, PermissionManager, PermissionMode};
+use crate::cli::session_runtime;
+use crate::cli::streaming_types::StreamResult;
+use crate::{ExplainMode, cli::chat_stream::BasicCliChatContext};
 
 type JsonWriter = Arc<Mutex<std::io::Stdout>>;
 
@@ -400,7 +399,7 @@ async fn run_turn(
     let skill_search = astra_core::SkillSearchSettings::default();
     let explain_mode = explain_mode_from_params(&params)?;
     let unified_skill_registry = astra_runtime::skills::default_unified_registry();
-    let agent_spawner = crate::agent_runtime::build_one_shot_spawner(
+    let agent_spawner = crate::cli::agent_runtime::build_one_shot_spawner(
         &ctx.api,
         token.clone(),
         unified_skill_registry.clone(),
@@ -429,7 +428,8 @@ async fn run_turn(
         explain: explain_mode,
         render_md: false,
         verbose_mode: false,
-        render_policy: crate::stream_render::RenderPolicy::Silent,
+        render_policy: crate::cli::stream_render::RenderPolicy::Silent,
+        cli_context: None,
         unified_skill_registry,
         skill_search: &skill_search,
         agent_spawner: Some(agent_spawner),
@@ -450,23 +450,22 @@ async fn run_turn(
         .map(str::to_string)
         .or(developer_instructions)
         .or(ctx.system_prompt.clone());
-    let mut turn_params =
-        ChatTurnParams::basic_cli(&chat_ctx, &token, Some(&thread_id), &mut pm, &mut skill_qt);
-    turn_params.cancel_token = Some(cancel.clone());
-    turn_params.append_system_prompt = append_system_prompt.clone();
-    turn_params.approval_request_tx = Some(approval_tx.clone());
-
-    let result = match crate::chat_stream::stream_chat_sse(turn_params).await {
-        Err(err) if is_session_not_found_error(&err.error) => {
-            let mut retry_params =
-                ChatTurnParams::basic_cli(&chat_ctx, &token, None, &mut pm, &mut skill_qt);
-            retry_params.cancel_token = Some(cancel);
-            retry_params.append_system_prompt = append_system_prompt;
-            retry_params.approval_request_tx = Some(approval_tx.clone());
-            crate::chat_stream::stream_chat_sse(retry_params).await
-        }
-        other => other,
+    let turn_options = crate::cli::turn_facade::BasicCliTurnOptions {
+        append_system_prompt,
+        cancel_token: Some(cancel),
+        approval_request_tx: Some(approval_tx.clone()),
+        ..Default::default()
     };
+    let result = crate::cli::turn_facade::execute_basic_cli_turn(
+        &chat_ctx,
+        &token,
+        Some(&thread_id),
+        None,
+        &mut pm,
+        &mut skill_qt,
+        turn_options,
+    )
+    .await;
     drop(chat_ctx);
     drop(approval_tx);
     join_or_abort_app_server_task(event_task, Duration::from_millis(250)).await;

@@ -1088,15 +1088,22 @@ fn permission_mode_roundtrip_parse() {
 }
 
 #[test]
-fn session_state_auto_approve_env_activates_auto_mode() {
-    // When ASTRA_CLI_AUTO_APPROVE=1, SessionState should start in Auto mode
-    unsafe {
-        std::env::set_var("ASTRA_CLI_AUTO_APPROVE", "1");
-    }
-    let state = SessionState::default();
-    unsafe {
-        std::env::remove_var("ASTRA_CLI_AUTO_APPROVE");
-    }
+fn session_state_cli_context_auto_approve_activates_auto_mode() {
+    let state = session_runtime::initialize_session_state(
+        None,
+        None,
+        &crate::cli::cli_context::CliContext::from_launch_options(
+            false,
+            None,
+            &[],
+            &[],
+            &[],
+            true,
+            None,
+            None,
+        )
+        .expect("cli context"),
+    );
     assert_eq!(
         state.perm_manager.mode(),
         permission_manager::PermissionMode::Auto
@@ -1355,8 +1362,11 @@ fn format_project_instructions_wraps_in_tags() {
 fn build_effective_line_includes_project_instructions() {
     let mut state = SessionState::default();
     state.project_instructions = Some("Always use Rust.".to_string());
-    let result =
-        chat_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+    let result = chat_turn::build_effective_line(
+        "hello",
+        &state,
+        &mut crate::cli::ui_adapter::LineUiAdapter,
+    );
     assert!(
         result.contains("<project_instructions>"),
         "should wrap in tags"
@@ -1371,8 +1381,11 @@ fn build_effective_line_includes_project_instructions() {
 #[test]
 fn build_effective_line_no_instructions_when_none() {
     let state = SessionState::default();
-    let result =
-        chat_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+    let result = chat_turn::build_effective_line(
+        "hello",
+        &state,
+        &mut crate::cli::ui_adapter::LineUiAdapter,
+    );
     assert!(
         !result.contains("<project_instructions>"),
         "should not inject when None"

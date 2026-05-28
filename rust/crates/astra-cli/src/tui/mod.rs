@@ -74,8 +74,8 @@ pub(crate) use event_loop::{can_run_tui, run_tui_session as run_tui};
 /// pairs for the `/context dump` JSON file.
 pub(crate) fn collect_chat_turns_for_dump(
     chat: &chat_widget::ChatWidget,
-) -> Vec<crate::context_dump::ChatTurnDump> {
-    use crate::context_dump::ChatTurnDump;
+) -> Vec<crate::cli::context_dump::ChatTurnDump> {
+    use crate::cli::context_dump::ChatTurnDump;
     use history_cell::{
         assistant::AssistantCell, reasoning::ReasoningCell, system::SystemCell, user::UserCell,
     };

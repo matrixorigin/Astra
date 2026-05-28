@@ -1,7 +1,7 @@
 use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
 use serde_json::Value;
 
-use crate::session_state::SessionState;
+use crate::cli::session_state::SessionState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParsedPlanCommand {
@@ -157,7 +157,7 @@ pub(crate) async fn prepare_plan_execution(
     }
 
     let plan_id = if from_authoring {
-        crate::plan_lifecycle::exit_remote_plan_mode(api, token, state, true).await?
+        crate::cli::plan_lifecycle::exit_remote_plan_mode(api, token, state, true).await?
     } else {
         state.executing_plan_id.clone()
     };
@@ -199,7 +199,7 @@ pub(crate) async fn rewind_plan(
                     .as_deref()
                     .filter(|sid| !sid.trim().is_empty()),
             ) {
-                crate::plan_lifecycle::active_remote_planning_plan_id(api, token, session_id)
+                crate::cli::plan_lifecycle::active_remote_planning_plan_id(api, token, session_id)
                     .await?
             } else {
                 None
@@ -260,7 +260,7 @@ pub(crate) fn abandon_plan_execution(state: &mut SessionState) -> bool {
         return false;
     }
 
-    let _ = crate::plan_runtime::shutdown_plan_executor(state);
+    let _ = crate::cli::plan_runtime::shutdown_plan_executor(state);
     reset_plan_runtime_metadata(state);
     state.executing_plan = None;
     state.executing_plan_goal = None;
@@ -440,7 +440,7 @@ fn apply_rewound_plan(
 }
 
 fn reset_plan_runtime_metadata(state: &mut SessionState) {
-    let _ = crate::plan_runtime::shutdown_plan_executor(state);
+    let _ = crate::cli::plan_runtime::shutdown_plan_executor(state);
     state.current_plan_subtask_id = None;
     state.plan_run_task_id = None;
     state.plan_run_task_last_progress = None;

@@ -1,6 +1,6 @@
 use super::*;
 
-fn default_skill_category(category: Option<&str>) -> String {
+pub(crate) fn default_skill_category(category: Option<&str>) -> String {
     category
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -122,7 +122,7 @@ fn apply_skill_surfacing(state: &mut SessionState, command: SkillSurfacingCmd) -
     }
 }
 
-pub(super) async fn handle_skill_command(
+pub(crate) async fn handle_skill_command(
     arg: &str,
     api: &astra_thin_client::ThinClient,
     state: &mut SessionState,
@@ -297,9 +297,20 @@ pub(super) async fn handle_skill_command(
 
             // Parse filter flags from sub_arg: free text search and --source=X, --category=X
             let (search_query, source_filter, category_filter) = parse_list_filters(sub_arg);
+            let source_filter = match source_filter {
+                Some(source) => match crate::cli::skill_catalog::normalize_source_filter(&source) {
+                    Ok(source) => Some(source),
+                    Err(err) => {
+                        eprintln!("\n  {}", err.red());
+                        return Ok(());
+                    }
+                },
+                None => None,
+            };
 
             let manifests: Vec<_> = all_manifests
                 .into_iter()
+                .filter(|m| m.user_invocable)
                 .filter(|m| {
                     matches_skill_filter(m, &search_query, &source_filter, &category_filter)
                 })
@@ -351,12 +362,26 @@ pub(super) async fn handle_skill_command(
                 .iter()
                 .filter(|m| m.source == astra_skills::SkillSourceKind::Mcp)
                 .count();
+            let database_count = manifests
+                .iter()
+                .filter(|m| m.source == astra_skills::SkillSourceKind::Database)
+                .count();
+            let plugin_count = manifests
+                .iter()
+                .filter(|m| m.source == astra_skills::SkillSourceKind::Plugin)
+                .count();
             let mut parts = vec![
                 format!("{} local", local_count),
                 format!("{} bundled", bundled_count),
             ];
+            if database_count > 0 {
+                parts.push(format!("{} database", database_count));
+            }
             if mcp_count > 0 {
                 parts.push(format!("{} mcp", mcp_count));
+            }
+            if plugin_count > 0 {
+                parts.push(format!("{} plugin", plugin_count));
             }
             parts.push(format!("{} total", manifests.len()));
             eprintln!(
@@ -896,7 +921,7 @@ Follow these steps:
                     return Ok(());
                 }
             };
-            state.skill_dev = Some(super::SkillDevState {
+            state.skill_dev = Some(crate::SkillDevState {
                 name: name.to_string(),
                 dir: skill_dir.clone(),
             });
@@ -1603,12 +1628,7 @@ fn print_skill_directory_raw(name: &str, skill_dir: &std::path::Path) -> Result<
 // ── List filtering helpers ──────────────────────────────────────────────
 
 fn source_label(source: &astra_skills::SkillSourceKind) -> &'static str {
-    match source {
-        astra_skills::SkillSourceKind::Local => "local",
-        astra_skills::SkillSourceKind::Bundled => "bundled",
-        astra_skills::SkillSourceKind::Mcp => "mcp",
-        _ => "other",
-    }
+    crate::cli::skill_catalog::source_label(source)
 }
 
 fn truncate_desc(desc: &str, max: usize) -> String {
@@ -1756,7 +1776,7 @@ fn skill_relevance_score(m: &astra_skills::SkillManifest, query: &str) -> u32 {
 /// Analyze the current session and generate a SKILL.md from observed patterns.
 async fn create_skill_from_session(
     arg: &str,
-    state: &mut super::SessionState,
+    state: &mut crate::SessionState,
 ) -> Result<(), String> {
     use astra_services::session_journal;
     use std::collections::HashMap;
@@ -2246,6 +2266,10 @@ mod tests {
     // ── Marketplace integration tests (wiremock) ────────────────────────
 
     mod marketplace_tests {
+        use super::super::{
+            browse_marketplace, default_skill_category, fetch_marketplace_version,
+            install_single_skill_legacy, list_installed_marketplace, trending_marketplace,
+        };
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2283,7 +2307,7 @@ mod tests {
                 .await;
 
             let client = make_client(&srv.uri());
-            super::browse_marketplace("", &client, Some("tok")).await;
+            browse_marketplace("", &client, Some("tok")).await;
             // Mock expectation validates the endpoint was called exactly once.
         }
 
@@ -2307,7 +2331,7 @@ mod tests {
                 .await;
 
             let client = make_client(&srv.uri());
-            super::browse_marketplace("security --limit=10", &client, Some("tok")).await;
+            browse_marketplace("security --limit=10", &client, Some("tok")).await;
         }
 
         #[tokio::test]
@@ -2329,7 +2353,7 @@ mod tests {
                 .await;
 
             let client = make_client(&srv.uri());
-            super::browse_marketplace("--trust=verified", &client, Some("tok")).await;
+            browse_marketplace("--trust=verified", &client, Some("tok")).await;
         }
 
         #[tokio::test]
@@ -2344,7 +2368,7 @@ mod tests {
 
             let client = make_client(&srv.uri());
             // Should not panic — gracefully prints error.
-            super::browse_marketplace("", &client, Some("tok")).await;
+            browse_marketplace("", &client, Some("tok")).await;
         }
 
         #[tokio::test]
@@ -2377,7 +2401,7 @@ mod tests {
                 .await;
 
             let client = make_client(&srv.uri());
-            super::trending_marketplace(&client, Some("tok")).await;
+            trending_marketplace(&client, Some("tok")).await;
         }
 
         #[tokio::test]
@@ -2405,7 +2429,7 @@ mod tests {
                 .await;
 
             let client = make_client(&srv.uri());
-            super::list_installed_marketplace(&client, Some("tok")).await;
+            list_installed_marketplace(&client, Some("tok")).await;
         }
 
         #[tokio::test]
@@ -2425,7 +2449,7 @@ mod tests {
                 .await;
 
             let client = make_client(&srv.uri());
-            super::list_installed_marketplace(&client, Some("tok")).await;
+            list_installed_marketplace(&client, Some("tok")).await;
         }
 
         #[tokio::test]
@@ -2451,8 +2475,7 @@ mod tests {
                 .await;
 
             let client = make_client(&srv.uri());
-            let ok = super::install_single_skill_legacy("test-install-skill", None, &client, "tok")
-                .await;
+            let ok = install_single_skill_legacy("test-install-skill", None, &client, "tok").await;
 
             assert!(ok, "install should succeed");
 
@@ -2493,13 +2516,8 @@ mod tests {
                 .await;
 
             let client = make_client(&srv.uri());
-            let ok = super::install_single_skill_legacy(
-                "versioned-skill",
-                Some("2.0.0"),
-                &client,
-                "tok",
-            )
-            .await;
+            let ok =
+                install_single_skill_legacy("versioned-skill", Some("2.0.0"), &client, "tok").await;
 
             assert!(ok);
 
@@ -2521,8 +2539,7 @@ mod tests {
                 .await;
 
             let client = make_client(&srv.uri());
-            let ok =
-                super::install_single_skill_legacy("missing-skill", None, &client, "tok").await;
+            let ok = install_single_skill_legacy("missing-skill", None, &client, "tok").await;
 
             assert!(!ok, "install should fail on 404");
         }
@@ -2617,7 +2634,7 @@ mod tests {
                 .await;
 
             let client = make_client(&srv.uri());
-            let ver = super::fetch_marketplace_version("my-skill", &client, "tok").await;
+            let ver = fetch_marketplace_version("my-skill", &client, "tok").await;
             assert_eq!(ver, Some("2.0.0".to_string()));
         }
 
@@ -2638,7 +2655,7 @@ mod tests {
                 .await;
 
             let client = make_client(&srv.uri());
-            let ver = super::fetch_marketplace_version("nonexistent", &client, "tok").await;
+            let ver = fetch_marketplace_version("nonexistent", &client, "tok").await;
             assert_eq!(ver, None);
         }
 
@@ -2653,7 +2670,7 @@ mod tests {
                 .await;
 
             let client = make_client(&srv.uri());
-            let ver = super::fetch_marketplace_version("some-skill", &client, "tok").await;
+            let ver = fetch_marketplace_version("some-skill", &client, "tok").await;
             assert_eq!(ver, None);
         }
 
@@ -2681,13 +2698,10 @@ mod tests {
 
         #[test]
         fn default_skill_category_falls_back_to_general() {
-            assert_eq!(super::default_skill_category(None), "general");
-            assert_eq!(super::default_skill_category(Some("")), "general");
-            assert_eq!(super::default_skill_category(Some("   ")), "general");
-            assert_eq!(
-                super::default_skill_category(Some("automation")),
-                "automation"
-            );
+            assert_eq!(default_skill_category(None), "general");
+            assert_eq!(default_skill_category(Some("")), "general");
+            assert_eq!(default_skill_category(Some("   ")), "general");
+            assert_eq!(default_skill_category(Some("automation")), "automation");
         }
     }
 }
@@ -2748,7 +2762,7 @@ async fn upload_quality_report(
 }
 
 /// Upload quality on REPL exit — disabled (was opt-in via ASTRA_QUALITY_UPLOAD).
-pub(super) async fn maybe_upload_quality_on_exit(
+pub(crate) async fn maybe_upload_quality_on_exit(
     _api: &astra_thin_client::ThinClient,
     _tracker: &astra_skills::quality::SkillQualityTracker,
     _token: Option<&str>,

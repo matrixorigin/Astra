@@ -19,7 +19,7 @@ use serde_json::Value;
 use crate::explain_dag::ExplainTurnMeta;
 use crate::{ExplainMode, StreamResult, VerdictEvent};
 
-use super::super::explain_reports::{print_explain_report, print_verdict_report};
+use crate::cli::chat_stream::explain_reports::{print_explain_report, print_verdict_report};
 
 pub(crate) struct StreamLoopSidecarEprint<'a> {
     pub(crate) explain: ExplainMode,
@@ -480,8 +480,12 @@ mod tests {
                 deprioritized_tools: vec![],
                 force_stop: false,
                 nudge_count: 0,
+                interaction_mode: "prompt".into(),
+                suppressed_loop_nudges: false,
                 total_errors: 0,
                 deprioritized_count: 0,
+                recent_error_pressure: 0,
+                recent_timeout_pressure: 0,
                 total_timeouts: 0,
                 timeout_dominant_tools: vec![],
                 total_cache_hits: 0,
@@ -495,8 +499,12 @@ mod tests {
                 deprioritized_tools: vec![],
                 force_stop: false,
                 nudge_count: 0,
+                interaction_mode: "prompt".into(),
+                suppressed_loop_nudges: false,
                 total_errors: 0,
                 deprioritized_count: 0,
+                recent_error_pressure: 0,
+                recent_timeout_pressure: 0,
                 total_timeouts: 0,
                 timeout_dominant_tools: vec![],
                 total_cache_hits: 0,
@@ -510,8 +518,12 @@ mod tests {
                 deprioritized_tools: vec![],
                 force_stop: false,
                 nudge_count: 0,
+                interaction_mode: "prompt".into(),
+                suppressed_loop_nudges: false,
                 total_errors: 0,
                 deprioritized_count: 0,
+                recent_error_pressure: 0,
+                recent_timeout_pressure: 0,
                 total_timeouts: 0,
                 timeout_dominant_tools: vec![],
                 total_cache_hits: 0,

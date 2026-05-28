@@ -14,327 +14,73 @@
     clippy::unnecessary_mut_passed
 )]
 
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    io::{self, Write},
-    path::{Path, PathBuf},
-    process::{Command as SysCommand, Stdio},
-    sync::{Mutex, OnceLock},
-};
-
-use astra_runtime::{prompts, tool_registry};
 use astra_services::session_journal;
 use clap::Parser;
-use crossterm::{
-    cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-    execute,
-    style::Stylize,
-    terminal,
-};
+use crossterm::style::Stylize;
 
 mod edge_tools;
 mod git_branch_cache;
 mod manifest_loader;
 mod mcp_client;
 mod skill_instructions;
-use serde::{Deserialize, Serialize};
 
-#[path = "cli/agent_loader.rs"]
-mod agent_loader;
-#[path = "cli/agent_runtime.rs"]
-mod agent_runtime;
-#[path = "cli/app_server.rs"]
-mod app_server;
-#[path = "cli/auth_flow.rs"]
-mod auth_flow;
-#[path = "cli/chat_stream/mod.rs"]
-mod chat_stream;
-#[path = "cli/cli_args.rs"]
-mod cli_args;
-#[path = "cli/cli_formatting.rs"]
-mod cli_formatting;
-#[path = "cli/cli_output.rs"]
-mod cli_output;
-#[path = "cli/cli_utils.rs"]
-mod cli_utils;
-#[path = "cli/cloud_sync.rs"]
-mod cloud_sync;
-#[path = "cli/command_registry.rs"]
-mod command_registry;
-#[path = "cli/command_router.rs"]
-mod command_router;
-#[path = "cli/command_usage.rs"]
-mod command_usage;
-#[path = "cli/context_dump.rs"]
-mod context_dump;
-#[path = "cli/context_references.rs"]
-mod context_references;
+mod cli;
 mod explain_dag;
 
-#[path = "cli/chat_turn.rs"]
-mod chat_turn;
-#[path = "cli/delegate_subrun.rs"]
-mod delegate_subrun;
-#[path = "cli/diagnostic_log.rs"]
-mod diagnostic_log;
-#[path = "cli/diff_presenter.rs"]
-mod diff_presenter;
 mod diff_utils;
-#[path = "cli/durable_bridge.rs"]
-mod durable_bridge;
-#[path = "cli/edge_lifecycle.rs"]
-mod edge_lifecycle;
-#[path = "cli/effects/mod.rs"]
-mod effects;
-#[path = "cli/execution_state_summary.rs"]
-mod execution_state_summary;
-#[path = "cli/file_history.rs"]
-mod file_history;
-#[path = "cli/followup_suggestion.rs"]
-mod followup_suggestion;
-#[path = "cli/http_task_service.rs"]
-mod http_task_service;
-#[path = "cli/http_team_store.rs"]
-mod http_team_store;
-#[path = "cli/idle_agent_messages.rs"]
-mod idle_agent_messages;
-#[path = "cli/journal_diff.rs"]
-mod journal_diff;
-#[path = "cli/journal_digest.rs"]
-mod journal_digest;
-#[path = "cli/journal_tree.rs"]
-mod journal_tree;
-#[path = "cli/mock_llm.rs"]
-mod mock_llm;
-#[path = "cli/notifications.rs"]
-mod notifications;
-#[path = "cli/permission_manager.rs"]
-mod permission_manager;
-#[path = "cli/plan_commands.rs"]
-mod plan_commands;
-#[path = "cli/plan_executor.rs"]
-mod plan_executor;
-#[path = "cli/plan_lifecycle.rs"]
-mod plan_lifecycle;
-#[path = "cli/plan_monitor.rs"]
-mod plan_monitor;
-#[path = "cli/plan_runtime.rs"]
-mod plan_runtime;
-#[path = "cli/plan_task_board.rs"]
-mod plan_task_board;
-#[path = "cli/preferences_client.rs"]
-mod preferences_client;
-#[path = "cli/project_instructions.rs"]
-mod project_instructions;
 mod sandbox_retry;
-#[path = "cli/self_command.rs"]
-mod self_command;
-#[path = "cli/session_cleanup.rs"]
-mod session_cleanup;
-#[path = "cli/session_guard.rs"]
-mod session_guard;
-#[path = "cli/session_runtime.rs"]
-mod session_runtime;
-#[path = "cli/session_startup.rs"]
-mod session_startup;
-#[path = "cli/session_state.rs"]
-mod session_state;
-#[path = "cli/session_todo_client.rs"]
-mod session_todo_client;
-#[path = "cli/skill_subrun.rs"]
-mod skill_subrun;
-#[path = "cli/slash_account.rs"]
-mod slash_account;
-#[path = "cli/slash_agent.rs"]
-mod slash_agent;
-#[path = "cli/slash_bug.rs"]
-mod slash_bug;
-#[path = "cli/slash_cache.rs"]
-mod slash_cache;
-#[path = "cli/slash_config.rs"]
-mod slash_config;
-#[path = "cli/slash_debug.rs"]
-mod slash_debug;
-#[path = "cli/slash_health.rs"]
-mod slash_health;
-#[path = "cli/slash_info.rs"]
-mod slash_info;
-#[path = "cli/slash_inspect.rs"]
-mod slash_inspect;
-#[path = "cli/slash_mcp.rs"]
-mod slash_mcp;
-#[path = "cli/slash_memory.rs"]
-mod slash_memory;
-#[path = "cli/slash_messaging.rs"]
-mod slash_messaging;
-#[path = "cli/slash_plan.rs"]
-mod slash_plan;
-#[path = "cli/slash_profile.rs"]
-mod slash_profile;
-#[path = "cli/slash_router.rs"]
-mod slash_router;
-#[path = "cli/slash_session.rs"]
-mod slash_session;
-#[path = "cli/slash_skill.rs"]
-mod slash_skill;
-#[path = "cli/slash_state.rs"]
-mod slash_state;
-#[path = "cli/slash_stats.rs"]
-mod slash_stats;
-#[path = "cli/slash_sync.rs"]
-mod slash_sync;
-#[path = "cli/slash_task.rs"]
-mod slash_task;
-#[path = "cli/slash_team.rs"]
-mod slash_team;
-#[path = "cli/slash_telemetry.rs"]
-mod slash_telemetry;
-#[path = "cli/slash_tools.rs"]
-mod slash_tools;
-#[path = "cli/spawn_subrun.rs"]
-mod spawn_subrun;
-#[path = "cli/sse_utils.rs"]
-mod sse_utils;
-#[path = "cli/startup_trace.rs"]
-mod startup_trace;
-#[path = "cli/stream_events_writer.rs"]
-mod stream_events_writer;
-#[path = "cli/stream_render.rs"]
-mod stream_render;
-#[path = "cli/streaming_md.rs"]
-mod streaming_md;
-#[path = "cli/streaming_types.rs"]
-mod streaming_types;
-#[path = "cli/task_summary.rs"]
-mod task_summary;
-#[path = "cli/terminal_hyperlinks.rs"]
-mod terminal_hyperlinks;
-#[path = "cli/terminal_region.rs"]
-mod terminal_region;
-#[path = "cli/theme.rs"]
-mod theme;
-#[path = "cli/tool_call_groups.rs"]
-mod tool_call_groups;
 mod tool_safety_guard;
 mod tui;
-#[path = "cli/ui_adapter.rs"]
-mod ui_adapter;
-#[path = "cli/workspace_trust.rs"]
-mod workspace_trust;
 
-use agent_runtime::initialize_multi_agent_runtime;
-use astra_turn_core::chat_turn_heuristics::{
-    is_session_not_found_error, looks_like_live_query_with_context,
-};
-use auth_flow::{clear_profile_last_session, do_login, do_register};
-use chat_stream::{ChatTurnParams, stream_chat_sse};
-#[cfg(test)]
-use cli_utils::save_credentials;
-use cli_utils::{
-    SessionResumePreflight, clear_profile_last_session_if_matches, compact_or_raw,
-    credential_store, get_profile_and_token, interactive_select, load_credentials, map_thin_err,
-    mutate_credentials, normalize_model_override, normalize_model_override_owned,
-    persist_profile_last_session, persist_profile_memoria_api_key, prefix_chars,
-    preflight_remote_resume_session, print_json_or_raw, profile_name, prompt_or,
-    prompt_password_masked, resumable_last_session_id, truncate_str, urlencoding,
-    validated_resumable_last_session_id,
-};
-use command_router::{ExitCode, execute_cli_command, run_print_mode};
-use edge_lifecycle::register_and_start_heartbeat;
-use permission_manager::PermissionManager;
-use startup_trace::StartupTracer;
-#[cfg(test)]
-use stream_render::{RenderPolicy, StreamRenderState, TurnResult, dispatch_turn_event_block};
+pub(crate) use cli::*;
 
-use chat_turn::create_manual_checkpoint;
 #[cfg(test)]
-use chat_turn::{TurnContext, handle_chat_input};
-use session_runtime::{
-    create_pipeline_modules, current_access_token, initialize_session_state, print_session_banner,
-    try_silent_auth,
+use cli::cli_utils::save_credentials;
+use cli::cli_utils::{
+    map_thin_err, normalize_model_override_owned, persist_profile_last_session,
+    resumable_last_session_id,
 };
-use slash_account::handle_account_command;
-use slash_bug::handle_bug_command;
-use slash_debug::handle_debug_command;
-use slash_info::handle_info_command;
-use slash_memory::handle_memory_domain_command;
-use slash_messaging::handle_messaging_command;
+use cli::command_router::{ExitCode, execute_cli_command, run_print_mode};
 #[cfg(test)]
-use slash_router::handle_slash_command;
-use slash_session::handle_session_command;
+use cli::stream_render::{RenderPolicy, StreamRenderState, TurnResult, dispatch_turn_event_block};
+
 #[cfg(test)]
-use slash_session::resolve_journal_target_session;
-use slash_skill::handle_skill_command;
-use slash_state::{StateCommandContext, handle_state_command};
+use cli::chat_turn::{TurnContext, handle_chat_input};
+#[cfg(test)]
+use cli::slash_router::handle_slash_command;
+#[cfg(test)]
+use cli::slash_session::resolve_journal_target_session;
 
 // CLI argument structs moved to cli/cli_args.rs
-use cli_args::*;
 
 // SSE streaming types moved to cli/streaming_types.rs
-pub(crate) use streaming_types::{PartialTurnData, StreamResult, TurnFailure, VerdictEvent};
+pub(crate) use cli::streaming_types::{PartialTurnData, StreamResult, TurnFailure, VerdictEvent};
 
 // Session state moved to cli/session_state.rs
 #[cfg(test)]
-use idle_agent_messages::drain_root_mailbox_into_idle_queue;
-pub(crate) use plan_monitor::{format_duration_short, format_plan_progress};
-pub(crate) use session_state::{ExplainMode, SessionState, SkillDevState};
+use cli::idle_agent_messages::drain_root_mailbox_into_idle_queue;
+pub(crate) use cli::plan_monitor::{format_duration_short, format_plan_progress};
+pub(crate) use cli::session_state::{ExplainMode, SessionState, SkillDevState};
 
 // ═══════════════════════════════════════════════ Output Styles ═════════════
 
 // ═══════════════════════════════════════════════════ Learning Merge ═══════
 // Cloud sync moved to cli/cloud_sync.rs
 
-pub(crate) use cloud_sync::post_auth_cloud_resync;
+pub(crate) use cli::cloud_sync::post_auth_cloud_resync;
 #[cfg(test)]
-use cloud_sync::try_cloud_push_preferences;
-use cloud_sync::{append_cloud_pull_sync_journal, try_cloud_pull, try_cloud_pull_preferences};
+use cli::cloud_sync::try_cloud_push_preferences;
 
 // ═══════════════════════════════════════════════════════ Task Commands ════
 
 // ══════════════════════════════════════════════════════ Slash Commands ════
-
-// ═══════════════════════════════════════════════════════════ Interactive ════
-
-async fn run_interactive_chat(
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    initial_model: Option<&str>,
-    resume_session_id: Option<&str>,
-    no_instructions: bool,
-    max_budget: f64,
-) -> Result<(), String> {
-    if !tui::can_run_tui() {
-        eprintln!(
-            "{}",
-            "astra requires an interactive terminal (TTY) for interactive chat.".red()
-        );
-        eprintln!();
-        eprintln!("For one-shot use:   astra chat -m \"your message\"");
-        eprintln!("For SSH:            ssh -t host \"astra\"");
-        eprintln!("For scripts/CI:     astra --print \"your message\"");
-        return Err("no TTY".into());
-    }
-    // Box::pin to reduce the parent future's stack frame size (avoids stack
-    // overflow in debug-mode tests that instantiate execute_cli_command).
-    Box::pin(tui::run_tui(
-        api,
-        profile,
-        initial_model,
-        resume_session_id,
-        no_instructions,
-        max_budget,
-    ))
-    .await
-}
 
 // ---------------------------------------------------------------------------
 // Session finalization — shared logic for all exit paths
 // ---------------------------------------------------------------------------
 
 // Session cleanup moved to session_cleanup.rs
-use project_instructions::{
+use cli::project_instructions::{
     discover_project_instructions, format_project_instructions, resolve_system_prompt,
 };
 
@@ -344,14 +90,21 @@ use project_instructions::{
 async fn main() {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
-    diagnostic_log::init_cli_observability(&cli);
-    // `--settings <JSON-or-path>` must install its overlay BEFORE any
-    // code calls `RuntimeConfig::load()` — the first such call below is
-    // the safety-config apply. parse_settings_source handles inline JSON
-    // vs. filesystem path; apply_settings_json parses the JSON into a
-    // RuntimeConfig (all fields default) that `load()` will then merge
-    // with non-default-wins semantics. Malformed input aborts with a
-    // clear message instead of silently dropping the flag.
+    cli::diagnostic_log::init_cli_observability(&cli);
+    let mut cli_overlay = astra_config::runtime_config::RuntimeConfig::default();
+    let mut has_cli_overlay = false;
+    // Accumulate CLI-driven config overrides into a local overlay. The
+    // overlay is NOT installed yet — it will be installed via
+    // set_cli_overlay immediately before the first RuntimeConfig::load()
+    // call. Keeping accumulation and installation close together prevents
+    // a footgun window: any code placed between here and the load() call
+    // would see stale config if the overlay were installed early.
+    //
+    // parse_settings_source handles inline JSON vs. filesystem path;
+    // apply_settings_json parses the JSON into a RuntimeConfig (all fields
+    // default) that `load()` will then merge with non-default-wins
+    // semantics. Malformed input aborts with a clear message instead of
+    // silently dropping the flag.
     if let Some(raw) = cli.settings.as_deref() {
         match astra_config::config_overlay::parse_settings_source(raw) {
             Ok(json) => match astra_config::config_overlay::apply_settings_json(
@@ -359,7 +112,8 @@ async fn main() {
                 &json,
             ) {
                 Ok(overlay) => {
-                    astra_config::runtime_config::set_cli_overlay(Some(overlay));
+                    cli_overlay = overlay;
+                    has_cli_overlay = true;
                 }
                 Err(err) => {
                     eprintln!(
@@ -375,14 +129,39 @@ async fn main() {
             }
         }
     }
+    if let Some(turns) = cli.max_turns {
+        let Ok(turns) = u32::try_from(turns) else {
+            eprintln!("{}", "Error: --max-turns exceeds u32 range".red());
+            std::process::exit(2);
+        };
+        cli_overlay.runtime_limits.max_turns = turns;
+        has_cli_overlay = true;
+    }
     // Apply safety.trust_mode from runtime config to the global guard.
     // Defaults to Strict — users must explicitly opt in via
     // `~/.astra/config/runtime.toml` [safety] trust_mode = "trusted".
+    //
+    // Install CLI overlay immediately before the first RuntimeConfig::load()
+    // to minimise the window where future code could call load()/cached()
+    // without the overlay.
+    if has_cli_overlay {
+        astra_config::runtime_config::set_cli_overlay(Some(cli_overlay));
+    }
     astra_runtime::apply_safety_config_from_runtime_config(
         &astra_config::runtime_config::RuntimeConfig::load(),
     );
     // Resolve API URL: --api-url flag > ASTRA_API_URL env var > config file > default
-    let base = command_router::resolve_api_url(cli.api_url.as_deref());
+    let base = match cli::config_manager::resolve_api_url(cli.api_url.as_deref()) {
+        Ok(base) => base,
+        Err(err) => {
+            tracing::error!(target: "astra_cli", error = %err, "failed to resolve API URL");
+            eprintln!(
+                "{}",
+                format!("Error: failed to resolve API URL: {err}").red()
+            );
+            std::process::exit(2);
+        }
+    };
     let api = match astra_thin_client::ThinClient::new(&base, None) {
         Ok(api) => api,
         Err(err) => {
@@ -430,18 +209,32 @@ async fn main() {
     } = cli;
 
     let _ = (startup_trace, bare);
-
-    if no_journal_content {
+    let cli_context = match cli::cli_context::CliContext::from_launch_options(
+        no_journal_content,
+        max_turns,
+        &allowed_tools,
+        &disallowed_tools,
+        &add_dir,
+        auto_approve,
+        cli_session_id.clone(),
+        session_name.clone(),
+    ) {
+        Ok(cli_context) => cli_context,
+        Err(err) => {
+            tracing::error!(target: "astra_cli", error = %err, "invalid CLI startup context");
+            eprintln!("{}", err.red());
+            std::process::exit(1);
+        }
+    };
+    // Preserve the historical process-wide signal for call sites that still
+    // construct SessionState directly instead of going through CliContext.
+    if auto_approve {
         unsafe {
-            std::env::set_var(session_journal::ASTRA_JOURNAL_CONTENT_REDACT_ENV, "1");
+            std::env::set_var("ASTRA_CLI_AUTO_APPROVE", "1");
         }
     }
-
-    // --max-turns: override via env var before RuntimeLimits singleton is initialized
-    if let Some(turns) = max_turns {
-        unsafe {
-            std::env::set_var("ASTRA_CLI_MAX_TURNS", turns.to_string());
-        }
+    if cli_context.no_journal_content {
+        session_journal::set_journal_content_redact_override(Some(true));
     }
 
     // --system-prompt: support @file syntax to read from file
@@ -467,101 +260,34 @@ async fn main() {
         }
     };
 
-    // --allowed-tools: normalize comma/space-separated list and export as env var
-    if !allowed_tools.is_empty() {
-        let normalized: Vec<String> = allowed_tools
-            .iter()
-            .flat_map(|s| s.split([',', ' ']))
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !normalized.is_empty() {
-            unsafe {
-                std::env::set_var("ASTRA_CLI_ALLOWED_TOOLS", normalized.join(","));
-            }
-        }
-    }
-
-    // --disallowed-tools: normalize and export as env var (deny-list, opposite of --allowed-tools)
-    if !disallowed_tools.is_empty() {
-        let normalized: Vec<String> = disallowed_tools
-            .iter()
-            .flat_map(|s| s.split([',', ' ']))
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !normalized.is_empty() {
-            unsafe {
-                std::env::set_var("ASTRA_CLI_DISALLOWED_TOOLS", normalized.join(","));
-            }
-        }
-    }
-
-    // --add-dir: export additional directories as env var
-    if !add_dir.is_empty() {
-        let dirs: Vec<String> = add_dir
-            .iter()
-            .map(|d| {
-                std::path::Path::new(d)
-                    .canonicalize()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| d.clone())
-            })
-            .collect();
-        unsafe {
-            std::env::set_var("ASTRA_CLI_ADD_DIRS", dirs.join(":"));
-        }
-    }
-
-    // --yes (-y): set auto-approve mode for the interactive TUI. SessionState::default()
-    // reads ASTRA_CLI_AUTO_APPROVE, so propagate the flag before TUI startup.
-    if auto_approve {
-        unsafe {
-            std::env::set_var("ASTRA_CLI_AUTO_APPROVE", "1");
-        }
-    }
     let _ = verbose;
 
     // --mcp-config: load MCP server configs from files/JSON strings
     if !mcp_config.is_empty() {
-        if let Err(e) = command_router::load_mcp_configs(&mcp_config) {
-            eprintln!(
-                "{}",
-                format!("Warning: failed to load MCP config: {e}").yellow()
-            );
-        }
-    }
-
-    // --session-id: validate UUID format and export for TUI to pick up
-    if let Some(ref sid) = cli_session_id {
-        if uuid::Uuid::parse_str(sid).is_err() {
-            tracing::error!(
-                target: "astra_cli",
-                session_id = %sid,
-                "invalid --session-id (expected UUID)"
-            );
-            eprintln!(
-                "{}",
-                format!("Error: --session-id must be a valid UUID, got '{sid}'").red()
-            );
-            std::process::exit(1);
-        }
-        unsafe {
-            std::env::set_var("ASTRA_CLI_SESSION_ID", sid);
-        }
-    }
-
-    // --name: export session display name
-    if let Some(ref name) = session_name {
-        unsafe {
-            std::env::set_var("ASTRA_CLI_SESSION_NAME", name);
+        if let Err(e) = cli::mcp_config::load_mcp_configs(&mcp_config) {
+            tracing::error!(target: "astra_cli", error = %e, "failed to load MCP config");
+            eprintln!("{}", format!("Error: failed to load MCP config: {e}").red());
+            std::process::exit(2);
         }
     }
 
     // Resolve model: --model flag > config default_model > None
-    let resolved_model = normalize_model_override_owned(
-        cli_model.or_else(|| command_router::read_config_default_model().ok().flatten()),
-    );
+    let config_default_model = match cli::config_manager::read_config_default_model() {
+        Ok(model) => model,
+        Err(err) => {
+            tracing::error!(
+                target: "astra_cli",
+                error = %err,
+                "failed to read default_model from settings"
+            );
+            eprintln!(
+                "{}",
+                format!("Error: failed to read default_model from settings: {err}").red()
+            );
+            std::process::exit(2);
+        }
+    };
+    let resolved_model = normalize_model_override_owned(cli_model.or(config_default_model));
 
     // Make the resolved model available to slash commands that print
     // model-aware diagnostics without mutating the process environment.
@@ -576,6 +302,7 @@ async fn main() {
             resolved_model.as_deref(),
             system_prompt.as_deref(),
             command,
+            &cli_context,
         )
         .await
         {
@@ -601,13 +328,14 @@ async fn main() {
 
         match resolved_sid {
             Some(sid) => {
-                let result = run_interactive_chat(
+                let result = cli::interactive_chat::run_interactive_chat(
                     &api,
                     profile.as_deref(),
                     resolved_model.as_deref(),
                     Some(&sid),
                     no_instructions,
                     max_budget,
+                    &cli_context,
                 )
                 .await;
                 match result {
@@ -637,6 +365,7 @@ async fn main() {
         &api,
         no_instructions,
         max_budget,
+        &cli_context,
     )
     .await
     {
@@ -654,11 +383,11 @@ async fn main() {
 mod tests {
     use super::*;
     use axum::{Router, routing::get, routing::post};
-    use cloud_sync::{
+    use cli::cloud_sync::{
         ASTRA_JOURNAL_CLOUD_EMPTY_ACK, CloudPullResult, cloud_pull_warrants_sync_marker,
         should_append_cloud_pull_journal,
     };
-    use project_instructions::discover_instructions_from_paths;
+    use cli::project_instructions::discover_instructions_from_paths;
 
     async fn spawn_mock(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -723,6 +452,7 @@ mod tests {
     mod stats_tools_tests;
     // ── auth_flow ─────────────────────────────────────────────────────────
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn do_login_success() {
         let _creds_dir = isolate_credentials();
@@ -741,6 +471,7 @@ mod tests {
         assert_eq!(result.unwrap(), "tok-abc");
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn do_login_failure_returns_error() {
         let _creds_dir = isolate_credentials();
@@ -760,6 +491,7 @@ mod tests {
         assert!(result.unwrap_err().contains("401"));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn do_register_success() {
         let _creds_dir = isolate_credentials();
@@ -790,6 +522,7 @@ mod tests {
         assert_eq!(profile.refresh_token.as_deref(), Some("ref-new"));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn do_register_conflict_returns_error() {
         let _creds_dir = isolate_credentials();
@@ -817,6 +550,7 @@ mod tests {
 
     // ── slash commands with mock server ───────────────────────────────────
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn slash_clear_creates_new_session() {
         let _creds_dir = isolate_credentials();
@@ -942,6 +676,7 @@ mod tests {
 
     // ── command_router ────────────────────────────────────────────────────
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn execute_cli_health_command() {
         let _creds_dir = isolate_credentials();
@@ -960,6 +695,7 @@ mod tests {
             &api,
             false,
             0.0,
+            &cli::cli_context::CliContext::default(),
         )
         .await;
         // Health command should succeed regardless of auth
@@ -978,6 +714,7 @@ mod tests {
             &api,
             false,
             0.0,
+            &cli::cli_context::CliContext::default(),
         )
         .await;
         assert!(result.is_ok());
@@ -994,8 +731,11 @@ mod tests {
     #[test]
     fn build_effective_line_plain() {
         let state = SessionState::default();
-        let result =
-            chat_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let result = chat_turn::build_effective_line(
+            "hello",
+            &state,
+            &mut crate::cli::ui_adapter::LineUiAdapter,
+        );
         assert_eq!(result, "hello");
     }
 
@@ -1006,8 +746,11 @@ mod tests {
         if let Some(md) = skills.iter().find(|s| s.name == "markdown") {
             state.active_system_skills.push(md.clone());
         }
-        let result =
-            chat_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let result = chat_turn::build_effective_line(
+            "hello",
+            &state,
+            &mut crate::cli::ui_adapter::LineUiAdapter,
+        );
         assert!(result.contains("hello"));
         assert!(result.contains("Markdown"));
     }
@@ -1018,7 +761,7 @@ mod tests {
             ("q1".to_string(), "a1".to_string()),
             ("q2".to_string(), "a2".to_string()),
         ];
-        let msgs = chat_turn::history_as_messages(&history);
+        let msgs = cli::chat_turn::history_as_messages(&history);
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[1]["role"], "assistant");
@@ -1027,7 +770,7 @@ mod tests {
     #[test]
     fn history_as_messages_compacted_turn() {
         let history = vec![("".to_string(), "summary".to_string())];
-        let msgs = chat_turn::history_as_messages(&history);
+        let msgs = cli::chat_turn::history_as_messages(&history);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["role"], "assistant");
     }
@@ -1159,6 +902,7 @@ mod tests {
 
     // ── Resume user verification ─────────────────────────────────────────────
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn resume_local_restore_rejects_unowned_session() {
         let _creds = isolate_credentials();
@@ -1228,6 +972,7 @@ total_tokens_out: 3
 
     // ── Edge cases ───────────────────────────────────────────────────────────
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn resume_handles_malformed_workspace_yaml() {
         let _creds = isolate_credentials();
@@ -1268,6 +1013,7 @@ total_tokens_out: 3
         assert!(!result.restored_from_cloud);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn resume_handles_missing_workspace() {
         let _creds = isolate_credentials();
@@ -1299,6 +1045,7 @@ total_tokens_out: 3
 
     // ── Checkpoint listing ───────────────────────────────────────────────────
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn resume_lists_checkpoints_for_session() {
         let _creds = isolate_credentials();
@@ -1707,7 +1454,7 @@ total_tokens_out: 500
         unsafe {
             std::env::remove_var("ASTRA_API_URL");
         }
-        let result = cloud_sync::try_cloud_pull("default").await;
+        let result = cli::cloud_sync::try_cloud_pull("default").await;
         assert!(
             !result.cloud_reachable,
             "Without ASTRA_API_URL, cloud should be unreachable"
@@ -3261,7 +3008,8 @@ total_tokens_out: 500
     // The initialize_session_state default is 0.0; after applying the flag it must equal the value.
     #[test]
     fn max_budget_applied_to_session_state() {
-        let mut state = initialize_session_state(None, None);
+        let mut state =
+            initialize_session_state(None, None, &cli::cli_context::CliContext::default());
         assert!(
             (state.max_budget_limit - 0.0).abs() < f64::EPSILON,
             "default max_budget_limit must be 0.0"
@@ -3360,16 +3108,16 @@ total_tokens_out: 500
 
     #[test]
     fn permission_mode_set_mode() {
-        let mut pm = permission_manager::PermissionManager::with_project(
+        let mut pm = cli::permission_manager::PermissionManager::with_project(
             false,
             &std::path::PathBuf::from("/tmp"),
         );
         assert_eq!(pm.mode(), permission_manager::PermissionMode::Prompt);
-        pm.set_mode(permission_manager::PermissionMode::AcceptEdits);
+        pm.set_mode(cli::permission_manager::PermissionMode::AcceptEdits);
         assert_eq!(pm.mode(), permission_manager::PermissionMode::AcceptEdits);
-        pm.set_mode(permission_manager::PermissionMode::Auto);
+        pm.set_mode(cli::permission_manager::PermissionMode::Auto);
         assert_eq!(pm.mode(), permission_manager::PermissionMode::Auto);
-        pm.set_mode(permission_manager::PermissionMode::Deny);
+        pm.set_mode(cli::permission_manager::PermissionMode::Deny);
         assert_eq!(pm.mode(), permission_manager::PermissionMode::Deny);
     }
 
@@ -3382,15 +3130,22 @@ total_tokens_out: 500
     }
 
     #[test]
-    fn session_state_auto_approve_env_activates_auto_mode() {
-        // When ASTRA_CLI_AUTO_APPROVE=1, SessionState should start in Auto mode
-        unsafe {
-            std::env::set_var("ASTRA_CLI_AUTO_APPROVE", "1");
-        }
-        let state = SessionState::default();
-        unsafe {
-            std::env::remove_var("ASTRA_CLI_AUTO_APPROVE");
-        }
+    fn session_state_cli_context_auto_approve_activates_auto_mode() {
+        let state = initialize_session_state(
+            None,
+            None,
+            &cli::cli_context::CliContext::from_launch_options(
+                false,
+                None,
+                &[],
+                &[],
+                &[],
+                true,
+                None,
+                None,
+            )
+            .expect("cli context"),
+        );
         assert_eq!(
             state.perm_manager.mode(),
             permission_manager::PermissionMode::Auto
@@ -3649,8 +3404,11 @@ total_tokens_out: 500
     fn build_effective_line_includes_project_instructions() {
         let mut state = SessionState::default();
         state.project_instructions = Some("Always use Rust.".to_string());
-        let result =
-            chat_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let result = chat_turn::build_effective_line(
+            "hello",
+            &state,
+            &mut crate::cli::ui_adapter::LineUiAdapter,
+        );
         assert!(
             result.contains("<project_instructions>"),
             "should wrap in tags"
@@ -3665,8 +3423,11 @@ total_tokens_out: 500
     #[test]
     fn build_effective_line_no_instructions_when_none() {
         let state = SessionState::default();
-        let result =
-            chat_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let result = chat_turn::build_effective_line(
+            "hello",
+            &state,
+            &mut crate::cli::ui_adapter::LineUiAdapter,
+        );
         assert!(
             !result.contains("<project_instructions>"),
             "should not inject when None"

@@ -1,4 +1,4 @@
-use crate::session_state::SessionState;
+use crate::cli::session_state::SessionState;
 
 pub(crate) async fn mirror_plan_to_task_board(
     state: &SessionState,

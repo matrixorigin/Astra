@@ -3,7 +3,7 @@
 use std::io::IsTerminal;
 
 use super::*;
-use crate::command_usage;
+use crate::cli::command_usage;
 
 /// GET `/models` returns `ModelListItemResponse` with field `is_active` (snake_case).
 /// Accept legacy `active` if present; if neither is a bool, treat as active for unknown servers.
@@ -395,7 +395,7 @@ pub(crate) async fn handle_slash_command(
                     eprintln!(
                         "  {} Permission mode → {}",
                         theme::icon_info(),
-                        crate::command_router::permission_mode_display_label(next).magenta()
+                        crate::cli::command_router::permission_mode_display_label(next).magenta()
                     );
                 }
                 "all" => {
@@ -419,7 +419,7 @@ pub(crate) async fn handle_slash_command(
                     eprintln!(
                         "  {} Permission mode → {} (workspace-local edits auto-approved)",
                         theme::icon_info(),
-                        crate::command_router::permission_mode_display_label(
+                        crate::cli::command_router::permission_mode_display_label(
                             PermissionMode::AcceptEdits
                         )
                         .magenta()
@@ -477,7 +477,8 @@ pub(crate) async fn handle_slash_command(
                         eprintln!(
                             "  {} Permission mode → {}",
                             theme::icon_info(),
-                            crate::command_router::permission_mode_display_label(mode).magenta()
+                            crate::cli::command_router::permission_mode_display_label(mode)
+                                .magenta()
                         );
                     }
                     Err(_) => {
@@ -559,7 +560,7 @@ pub(crate) async fn handle_slash_command(
         }
 
         "/plan" => {
-            crate::slash_plan::handle_plan_command(arg, api, profile, state, token).await?;
+            crate::cli::slash_plan::handle_plan_command(arg, api, profile, state, token).await?;
         }
 
         "/task" => {

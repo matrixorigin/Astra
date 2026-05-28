@@ -1,7 +1,7 @@
 use super::cli_utils::{CredentialStore, Profile, credential_store};
 use super::*;
 
-pub(super) fn clear_profile_last_session(profile: Option<&str>) -> Result<(), String> {
+pub(crate) fn clear_profile_last_session(profile: Option<&str>) -> Result<(), String> {
     credential_store()
         .mutate(|creds| {
             let name = profile_name(profile, creds);
@@ -12,7 +12,7 @@ pub(super) fn clear_profile_last_session(profile: Option<&str>) -> Result<(), St
         .map_err(|e| e.to_string())
 }
 
-pub(super) fn clear_profile_auth(profile: Option<&str>) -> Result<(), String> {
+pub(crate) fn clear_profile_auth(profile: Option<&str>) -> Result<(), String> {
     credential_store()
         .mutate(|creds| {
             let name = profile_name(profile, creds);
@@ -73,7 +73,7 @@ fn save_profile_auth_tokens(
         .map_err(|e| e.to_string())
 }
 
-pub(super) async fn do_login(
+pub(crate) async fn do_login(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     username: &str,
@@ -88,7 +88,7 @@ pub(super) async fn do_login(
     Ok(tokens.access_token)
 }
 
-pub(super) async fn do_register(
+pub(crate) async fn do_register(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     username: &str,

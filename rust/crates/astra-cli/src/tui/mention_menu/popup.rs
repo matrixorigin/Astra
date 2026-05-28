@@ -186,7 +186,10 @@ mod tests {
     #[test]
     fn snapshot_default_four_entries() {
         let menu = fixture_menu();
-        insta::assert_snapshot!("mention_popup_default_80", render_menu(&menu, 80, 4));
+        crate::tui::testing::assert_tui_snapshot!(
+            "mention_popup_default_80",
+            render_menu(&menu, 80, 4)
+        );
     }
 
     #[test]
@@ -195,7 +198,10 @@ mod tests {
         // Skip past the two dirs to land on a file.
         menu.move_down();
         menu.move_down();
-        insta::assert_snapshot!("mention_popup_file_selected_80", render_menu(&menu, 80, 4));
+        crate::tui::testing::assert_tui_snapshot!(
+            "mention_popup_file_selected_80",
+            render_menu(&menu, 80, 4)
+        );
     }
 
     #[test]
@@ -206,7 +212,10 @@ mod tests {
             end_byte: 5,
             partial: "rea".into(),
         });
-        insta::assert_snapshot!("mention_popup_filtered_rea_80", render_menu(&menu, 80, 2));
+        crate::tui::testing::assert_tui_snapshot!(
+            "mention_popup_filtered_rea_80",
+            render_menu(&menu, 80, 2)
+        );
     }
 
     #[test]
@@ -217,7 +226,10 @@ mod tests {
             end_byte: 10,
             partial: "zzz_no_match".into(),
         });
-        insta::assert_snapshot!("mention_popup_no_matches_80", render_menu(&menu, 80, 2));
+        crate::tui::testing::assert_tui_snapshot!(
+            "mention_popup_no_matches_80",
+            render_menu(&menu, 80, 2)
+        );
     }
 
     #[test]
@@ -232,7 +244,10 @@ mod tests {
             end_byte: 1,
             partial: String::new(),
         });
-        insta::assert_snapshot!("mention_popup_narrow_20", render_menu(&menu, 20, 2));
+        crate::tui::testing::assert_tui_snapshot!(
+            "mention_popup_narrow_20",
+            render_menu(&menu, 20, 2)
+        );
     }
 
     // ─── Pure unit tests ──────────────────────────────────────────
