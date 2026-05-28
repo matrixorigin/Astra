@@ -18,84 +18,43 @@
 
 use std::time::Instant;
 
+// Re-export shared trace types from astra-core
+pub use astra_core::{TraceCategory, TraceLevel};
+
 /// Unique event identifier (monotonically increasing within a turn).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EventId(pub u64);
 
-/// Global default minimum trace level, settable once per session from CLI flags.
+/// Global default minimum trace level, settable at runtime from CLI flags or /config.
 /// `EventLog::new()` reads this; if unset, falls back to [`TraceLevel::Info`].
-static GLOBAL_MIN_LEVEL: std::sync::OnceLock<TraceLevel> = std::sync::OnceLock::new();
+static GLOBAL_MIN_LEVEL: std::sync::RwLock<Option<TraceLevel>> = std::sync::RwLock::new(None);
 
 /// Set the global default min_level for all `EventLog::new()` instances.
-/// Call once before any pipeline runs, typically from CLI startup code.
+/// Can be called multiple times to update the level at runtime.
 pub fn set_global_min_level(level: TraceLevel) {
-    let _ = GLOBAL_MIN_LEVEL.set(level);
+    if let Ok(mut guard) = GLOBAL_MIN_LEVEL.write() {
+        *guard = Some(level);
+    }
 }
 
 // ── Trace categories ────────────────────────────────────────────────
-
-/// Categories for filtering pipeline events by domain.
-/// Mirrors [`astra_config::runtime_config::TraceCategory`] so callers can
-/// pass categories through without a dependency on the config crate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TraceCategory {
-    ToolCalls,
-    LlmExchanges,
-    ContextAssembly,
-    DecisionExplain,
-    PhaseTransition,
-    Budget,
-    Reflection,
-    Verification,
-    Thinking,
-    MemoryRetrieval,
-    SkillExecution,
-    PromptAssembly,
-    GuardEvaluation,
-}
+// TraceCategory is re-exported from astra_core above.
 
 /// Global set of enabled trace categories.
 /// If empty (unset), all categories pass through (no filtering).
-static GLOBAL_CATEGORIES: std::sync::OnceLock<Vec<TraceCategory>> = std::sync::OnceLock::new();
+static GLOBAL_CATEGORIES: std::sync::RwLock<Option<Vec<TraceCategory>>> =
+    std::sync::RwLock::new(None);
 
 /// Set the enabled trace categories for the session.
 /// Pass an empty vec to disable filtering (allow all).
+/// Can be called multiple times to update categories at runtime.
 pub fn set_global_trace_categories(cats: Vec<TraceCategory>) {
-    let _ = GLOBAL_CATEGORIES.set(cats);
-}
-
-/// Trace severity level, mirroring log-level semantics for pipeline events.
-///
-/// Used by [`EventLog::min_level`] to drop events below the configured threshold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum TraceLevel {
-    /// Hard failures that require attention.
-    Error = 0,
-    /// Near-limit conditions, degraded quality signals.
-    Warn = 1,
-    /// Normal operational events — the baseline for production.
-    Info = 2,
-    /// Reasoning signals useful for debugging.
-    Debug = 3,
-    /// Fine-grained detail; only emitted in verbose/dev mode.
-    Trace = 4,
-}
-
-impl TraceLevel {
-    /// Parse a [`TraceLevel`] from a lowercase string (e.g. "debug", "warn").
-    ///
-    /// Returns `None` for unknown strings.
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "error" => Some(Self::Error),
-            "warn" => Some(Self::Warn),
-            "info" => Some(Self::Info),
-            "debug" => Some(Self::Debug),
-            "trace" => Some(Self::Trace),
-            _ => None,
-        }
+    if let Ok(mut guard) = GLOBAL_CATEGORIES.write() {
+        *guard = Some(cats);
     }
 }
+
+// TraceLevel is re-exported from astra_core above.
 
 /// A single event in the causal event log.
 #[derive(Debug, Clone)]
@@ -259,6 +218,7 @@ impl EventKind {
 /// - **Learning**: Analyze successful/failed patterns
 /// - **Root-cause analysis**: Trace `caused_by` chains on failure
 /// - **Level filtering**: Events below [`min_level`] are silently dropped.
+/// - **Category filtering**: Events can be filtered by domain categories.
 #[derive(Debug)]
 pub struct EventLog {
     events: Vec<TurnEvent>,
@@ -268,46 +228,67 @@ pub struct EventLog {
     /// Defaults to [`TraceLevel::Info`] for balanced production use.
     /// Set to [`TraceLevel::Trace`] for dev-mode full capture.
     pub min_level: TraceLevel,
+    /// Enabled trace categories. If empty, all categories pass through.
+    /// If non-empty, only events matching these categories are recorded.
+    enabled_categories: Vec<TraceCategory>,
 }
 
 impl EventLog {
-    /// Create a new event log with the default min_level of [`TraceLevel::Info`].
+    /// Create a new event log with the default min_level of [`TraceLevel::Info`]
+    /// and no category filtering (all categories pass through).
     pub fn new() -> Self {
         Self {
             events: Vec::new(),
             next_id: 0,
             start: Instant::now(),
-            min_level: GLOBAL_MIN_LEVEL.get().copied().unwrap_or(TraceLevel::Info),
+            min_level: GLOBAL_MIN_LEVEL
+                .read()
+                .ok()
+                .and_then(|guard| *guard)
+                .unwrap_or(TraceLevel::Info),
+            enabled_categories: Vec::new(),
         }
     }
 
-    /// Create a new event log with a specific minimum trace level.
+    /// Create a new event log with a specific minimum trace level
+    /// and no category filtering.
     pub fn with_min_level(min_level: TraceLevel) -> Self {
         Self {
             events: Vec::new(),
             next_id: 0,
             start: Instant::now(),
             min_level,
+            enabled_categories: Vec::new(),
+        }
+    }
+
+    /// Create a new event log with both minimum trace level and category filtering.
+    /// If `enabled_categories` is empty, all categories pass through.
+    pub fn with_config(min_level: TraceLevel, enabled_categories: Vec<TraceCategory>) -> Self {
+        Self {
+            events: Vec::new(),
+            next_id: 0,
+            start: Instant::now(),
+            min_level,
+            enabled_categories,
         }
     }
 
     /// Emit a new event, returning its ID for use as `caused_by` in future events.
     ///
     /// Events whose [`EventKind::default_level`] is below the log's [`min_level`]
-    /// are silently dropped and return an id with `0` (never emitted), so callers
-    /// should not use the returned id as `caused_by` for subsequent events.
-    pub fn emit(&mut self, kind: EventKind, caused_by: Option<EventId>) -> EventId {
+    /// or whose category is filtered out are silently dropped and `None` is returned.
+    /// Callers should check for `Some(id)` before using the returned id as `caused_by`.
+    pub fn emit(&mut self, kind: EventKind, caused_by: Option<EventId>) -> Option<EventId> {
         let level = kind.default_level();
         if level > self.min_level {
-            return EventId(0);
+            return None;
         }
         // Category filter: if configured, events must match an enabled category.
-        if let Some(cats) = GLOBAL_CATEGORIES.get() {
-            if !cats.is_empty() {
-                let cat = kind.default_category();
-                if !cats.contains(&cat) {
-                    return EventId(0);
-                }
+        if !self.enabled_categories.is_empty() {
+            let cat = kind.default_category();
+            if !self.enabled_categories.contains(&cat) {
+                return None;
             }
         }
         let id = EventId(self.next_id);
@@ -321,7 +302,7 @@ impl EventLog {
             span_id,
         };
         self.events.push(event);
-        id
+        Some(id)
     }
 
     /// All events in order.
@@ -394,24 +375,28 @@ mod tests {
         let mut log = EventLog::with_min_level(TraceLevel::Trace);
         assert!(log.is_empty());
 
-        let id1 = log.emit(
-            EventKind::PhaseTransition {
-                from: crate::state::AgentPhase::Perceive,
-                to: crate::state::AgentPhase::Plan,
-            },
-            None,
-        );
+        let id1 = log
+            .emit(
+                EventKind::PhaseTransition {
+                    from: crate::state::AgentPhase::Perceive,
+                    to: crate::state::AgentPhase::Plan,
+                },
+                None,
+            )
+            .unwrap();
         assert_eq!(log.len(), 1);
         assert_eq!(id1, EventId(0));
 
-        let id2 = log.emit(
-            EventKind::ToolsSelected {
-                tools: vec!["bash".into()],
-                confidence: 0.8,
-                boost_terms: vec![],
-            },
-            Some(id1),
-        );
+        let id2 = log
+            .emit(
+                EventKind::ToolsSelected {
+                    tools: vec!["bash".into()],
+                    confidence: 0.8,
+                    boost_terms: vec![],
+                },
+                Some(id1),
+            )
+            .unwrap();
         assert_eq!(id2, EventId(1));
         assert_eq!(log.len(), 2);
     }
@@ -419,38 +404,46 @@ mod tests {
     #[test]
     fn causal_chain_traces_correctly() {
         let mut log = EventLog::with_min_level(TraceLevel::Trace);
-        let e0 = log.emit(
-            EventKind::IntentDetected {
-                signals: vec!["is_fetch".into()],
-                confidence: 0.7,
-            },
-            None,
-        );
-        let e1 = log.emit(
-            EventKind::ToolsSelected {
-                tools: vec!["github_list_prs".into()],
-                confidence: 0.7,
-                boost_terms: vec![],
-            },
-            Some(e0),
-        );
-        let e2 = log.emit(
-            EventKind::ToolCallStarted {
-                call_id: "c1".into(),
-                tool_name: "github_list_prs".into(),
-            },
-            Some(e1),
-        );
-        let e3 = log.emit(
-            EventKind::ToolCallCompleted {
-                call_id: "c1".into(),
-                tool_name: "github_list_prs".into(),
-                duration_ms: 150,
-                success: false,
-                error: Some("404 Not Found".into()),
-            },
-            Some(e2),
-        );
+        let e0 = log
+            .emit(
+                EventKind::IntentDetected {
+                    signals: vec!["is_fetch".into()],
+                    confidence: 0.7,
+                },
+                None,
+            )
+            .unwrap();
+        let e1 = log
+            .emit(
+                EventKind::ToolsSelected {
+                    tools: vec!["github_list_prs".into()],
+                    confidence: 0.7,
+                    boost_terms: vec![],
+                },
+                Some(e0),
+            )
+            .unwrap();
+        let e2 = log
+            .emit(
+                EventKind::ToolCallStarted {
+                    call_id: "c1".into(),
+                    tool_name: "github_list_prs".into(),
+                },
+                Some(e1),
+            )
+            .unwrap();
+        let e3 = log
+            .emit(
+                EventKind::ToolCallCompleted {
+                    call_id: "c1".into(),
+                    tool_name: "github_list_prs".into(),
+                    duration_ms: 150,
+                    success: false,
+                    error: Some("404 Not Found".into()),
+                },
+                Some(e2),
+            )
+            .unwrap();
 
         // Root cause of the failure should be the intent detection
         let root = log.root_cause(e3);
@@ -466,13 +459,15 @@ mod tests {
     #[test]
     fn root_cause_single_event() {
         let mut log = EventLog::with_min_level(TraceLevel::Trace);
-        let e0 = log.emit(
-            EventKind::StallDetected {
-                round: 3,
-                reason: "repeated tool calls".into(),
-            },
-            None,
-        );
+        let e0 = log
+            .emit(
+                EventKind::StallDetected {
+                    round: 3,
+                    reason: "repeated tool calls".into(),
+                },
+                None,
+            )
+            .unwrap();
         assert_eq!(log.root_cause(e0), e0);
     }
 
@@ -480,7 +475,10 @@ mod tests {
     fn event_ids_monotonic() {
         let mut log = EventLog::with_min_level(TraceLevel::Trace);
         let ids: Vec<EventId> = (0..5)
-            .map(|_| log.emit(EventKind::LlmChunk { text: "hi".into() }, None))
+            .map(|_| {
+                log.emit(EventKind::LlmChunk { text: "hi".into() }, None)
+                    .unwrap()
+            })
             .collect();
         for i in 1..ids.len() {
             assert!(ids[i].0 > ids[i - 1].0);
@@ -491,7 +489,9 @@ mod tests {
     fn causal_chain_no_infinite_loop() {
         // Even if caused_by points to self (shouldn't happen, but defense)
         let mut log = EventLog::with_min_level(TraceLevel::Trace);
-        let e0 = log.emit(EventKind::LlmChunk { text: "a".into() }, None);
+        let e0 = log
+            .emit(EventKind::LlmChunk { text: "a".into() }, None)
+            .unwrap();
         // Manually can't create a cycle since emit always uses increasing IDs.
         // But test root_cause terminates.
         let chain = log.causal_chain(e0);

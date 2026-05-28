@@ -218,39 +218,17 @@ fn create_pipeline_modules_inner(
     announce_skills: bool,
     trace_config: astra_config::runtime_config::SessionTraceConfig,
 ) -> PipelineModules {
-    // Set the global pipeline event log min_level from the per-session trace config.
-    // All EventLog::new() instances in this session will inherit this level.
-    astra_pipeline::event::set_global_min_level(match trace_config.min_level {
-        astra_config::runtime_config::TraceLevelSerde::Error => astra_pipeline::event::TraceLevel::Error,
-        astra_config::runtime_config::TraceLevelSerde::Warn => astra_pipeline::event::TraceLevel::Warn,
-        astra_config::runtime_config::TraceLevelSerde::Info => astra_pipeline::event::TraceLevel::Info,
-        astra_config::runtime_config::TraceLevelSerde::Debug => astra_pipeline::event::TraceLevel::Debug,
-        astra_config::runtime_config::TraceLevelSerde::Trace => astra_pipeline::event::TraceLevel::Trace,
-    });
+    // Both astra-config and astra-pipeline now use the shared types from astra-core,
+    // so no conversion is needed. Simply filter out the "All" variant.
+    let enabled_categories: Vec<astra_pipeline::event::TraceCategory> = trace_config
+        .enabled_categories
+        .iter()
+        .filter(|c| **c != astra_config::runtime_config::TraceCategory::All)
+        .copied()
+        .collect();
 
-    // Sync the enabled trace categories from the session config into the
-    // global pipeline filter. An empty list disables category filtering.
-    astra_pipeline::event::set_global_trace_categories(
-        trace_config.enabled_categories.iter().filter(|c| **c != astra_config::runtime_config::TraceCategory::All).map(|c| match c {
-            astra_config::runtime_config::TraceCategory::ToolCalls => astra_pipeline::event::TraceCategory::ToolCalls,
-            astra_config::runtime_config::TraceCategory::LlmExchanges => astra_pipeline::event::TraceCategory::LlmExchanges,
-            astra_config::runtime_config::TraceCategory::ContextAssembly => astra_pipeline::event::TraceCategory::ContextAssembly,
-            astra_config::runtime_config::TraceCategory::DecisionExplain => astra_pipeline::event::TraceCategory::DecisionExplain,
-            astra_config::runtime_config::TraceCategory::PhaseTransition => astra_pipeline::event::TraceCategory::PhaseTransition,
-            astra_config::runtime_config::TraceCategory::Budget => astra_pipeline::event::TraceCategory::Budget,
-            astra_config::runtime_config::TraceCategory::Reflection => astra_pipeline::event::TraceCategory::Reflection,
-            astra_config::runtime_config::TraceCategory::Verification => astra_pipeline::event::TraceCategory::Verification,
-            astra_config::runtime_config::TraceCategory::Thinking => astra_pipeline::event::TraceCategory::Thinking,
-            astra_config::runtime_config::TraceCategory::MemoryRetrieval => astra_pipeline::event::TraceCategory::MemoryRetrieval,
-            astra_config::runtime_config::TraceCategory::SkillExecution => astra_pipeline::event::TraceCategory::SkillExecution,
-            astra_config::runtime_config::TraceCategory::PromptAssembly => astra_pipeline::event::TraceCategory::PromptAssembly,
-            astra_config::runtime_config::TraceCategory::GuardEvaluation => astra_pipeline::event::TraceCategory::GuardEvaluation,
-            astra_config::runtime_config::TraceCategory::All => {
-                // unreachable: All is skipped before iteration
-                unreachable!("All variant filtered before iteration")
-            }
-        }).collect(),
-    );
+    astra_pipeline::event::set_global_min_level(trace_config.min_level);
+    astra_pipeline::event::set_global_trace_categories(enabled_categories);
 
     // Selector removed — the runtime now builds the turn-specific tool surface
     // directly from the local CLI catalog plus any mounted server/MCP schemas.
