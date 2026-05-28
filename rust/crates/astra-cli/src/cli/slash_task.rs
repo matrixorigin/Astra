@@ -282,7 +282,7 @@ pub(crate) async fn handle_task_command(
                 let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
                 let _modules =
-                    crate::cli::session_runtime::create_pipeline_modules_quiet(&api_clone, None);
+                    crate::cli::session_runtime::create_pipeline_modules_quiet(&api_clone, None, astra_config::runtime_config::SessionTraceConfig::default());
 
                 let result = stream_chat_sse(ChatTurnParams {
                     api: &api_clone,

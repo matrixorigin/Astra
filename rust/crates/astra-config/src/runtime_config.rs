@@ -1200,6 +1200,199 @@ impl Default for TelemetryConfig {
     }
 }
 
+// ─── Session Trace Configuration ──────────────────────────────────────────────
+
+/// Predefined trace profiles for per-session trace configuration.
+///
+/// - `Production`: minimal overhead — only `Error` + `Warn` events, core categories.
+/// - `Dev`: maximum introspection — `Trace` level, all categories.
+/// - `Custom`: fully user-controlled via the other fields on [`SessionTraceConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TraceProfile {
+    Production,
+    Dev,
+    Custom,
+}
+
+impl Default for TraceProfile {
+    fn default() -> Self {
+        Self::Production
+    }
+}
+
+/// Trace event categories that can be toggled on/off per session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceCategory {
+    /// Tool call lifecycle (start, complete, failures).
+    ToolCalls,
+    /// Full LLM request/response payloads.
+    LlmExchanges,
+    /// Context assembly and compression decisions.
+    ContextAssembly,
+    /// Decision explanations (tool selection rationale).
+    DecisionExplain,
+    /// Phase transitions (Perceive → Plan → Execute → Evaluate → Reflect).
+    PhaseTransition,
+    /// Budget tracking (set, update, expansion).
+    Budget,
+    /// Reflection generation and adaptation.
+    Reflection,
+    /// Verification and review events.
+    Verification,
+    /// Meta-category: enables all categories.
+    All,
+}
+
+impl TraceCategory {
+    /// Every individual category except `All`.
+    pub fn individual_categories() -> &'static [TraceCategory] {
+        &[
+            TraceCategory::ToolCalls,
+            TraceCategory::LlmExchanges,
+            TraceCategory::ContextAssembly,
+            TraceCategory::DecisionExplain,
+            TraceCategory::PhaseTransition,
+            TraceCategory::Budget,
+            TraceCategory::Reflection,
+            TraceCategory::Verification,
+        ]
+    }
+}
+
+/// Where trace events are delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceSink {
+    /// Persist to session journal (JSONL).
+    Journal,
+    /// Emit to stderr via `tracing` subscriber.
+    Stderr,
+    /// Export via OpenTelemetry (requires `otel` feature).
+    Otlp,
+}
+
+/// Per-session trace configuration.
+///
+/// Each session can override the global [`TelemetryConfig`] with its own trace
+/// profile, level, category filter, and sink selection. This allows production
+/// sessions to stay lean while dev/debug sessions capture maximum detail.
+///
+/// # Resolution order (highest priority first)
+/// 1. CLI flags (`--trace-profile`, `--trace-level`, `--trace-cat`)
+/// 2. Session metadata / persisted overrides (if session exists)
+/// 3. Global [`TelemetryConfig`] defaults
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTraceConfig {
+    /// Which pre-built profile to use. [`TraceProfile::Custom`] means the other
+    /// fields drive behavior directly.
+    #[serde(default)]
+    pub profile: TraceProfile,
+
+    /// Minimum severity level for event emission. Events with a lower
+    /// default level are silently dropped.
+    ///
+    /// Serialized as a lowercase string: `"error"`, `"warn"`, `"info"`,
+    /// `"debug"`, `"trace"`.
+    #[serde(default = "default_trace_level")]
+    pub min_level: TraceLevelSerde,
+
+    /// Which event categories to emit. `All` means every category.
+    #[serde(default = "default_trace_categories")]
+    pub enabled_categories: Vec<TraceCategory>,
+
+    /// Where to deliver trace events. Defaults to `[Journal]`.
+    #[serde(default = "default_trace_sinks")]
+    pub sinks: Vec<TraceSink>,
+
+    /// Sampling rate (0.0–1.0). 1.0 = emit all non-filtered events;
+    /// 0.1 = emit ~10%. Useful for high-volume Trace-level sessions.
+    #[serde(default = "default_sampling_rate")]
+    pub sampling_rate: f64,
+}
+
+/// String-based [`TraceLevel`] for TOML/JSON serialization.
+///
+/// This duplicates `astra_pipeline::TraceLevel` as a serde-friendly enum so
+/// `astra-config` stays decoupled from `astra-pipeline`. Convert with `From`/`Into`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TraceLevelSerde {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl Default for TraceLevelSerde {
+    fn default() -> Self {
+        Self::Info
+    }
+}
+
+fn default_trace_level() -> TraceLevelSerde {
+    TraceLevelSerde::Info
+}
+
+fn default_trace_categories() -> Vec<TraceCategory> {
+    vec![TraceCategory::ToolCalls, TraceCategory::PhaseTransition, TraceCategory::Budget]
+}
+
+fn default_trace_sinks() -> Vec<TraceSink> {
+    vec![TraceSink::Journal]
+}
+
+fn default_sampling_rate() -> f64 {
+    1.0
+}
+
+impl Default for SessionTraceConfig {
+    fn default() -> Self {
+        Self {
+            profile: TraceProfile::default(),
+            min_level: default_trace_level(),
+            enabled_categories: default_trace_categories(),
+            sinks: default_trace_sinks(),
+            sampling_rate: default_sampling_rate(),
+        }
+    }
+}
+
+impl SessionTraceConfig {
+    /// Apply a preset profile, overwriting relevant fields.
+    pub fn apply_profile(mut self, profile: TraceProfile) -> Self {
+        match profile {
+            TraceProfile::Production => {
+                self.min_level = TraceLevelSerde::Warn;
+                self.enabled_categories = vec![TraceCategory::ToolCalls, TraceCategory::PhaseTransition];
+                self.sinks = vec![TraceSink::Journal];
+                self.sampling_rate = 1.0;
+            }
+            TraceProfile::Dev => {
+                self.min_level = TraceLevelSerde::Trace;
+                self.enabled_categories = vec![TraceCategory::All];
+                self.sinks = vec![TraceSink::Journal, TraceSink::Stderr];
+                self.sampling_rate = 1.0;
+            }
+            TraceProfile::Custom => {
+                // keep existing values; caller is responsible for setting them
+            }
+        }
+        self.profile = profile;
+        self
+    }
+
+    /// Check whether a given category should be emitted.
+    pub fn category_enabled(&self, cat: TraceCategory) -> bool {
+        if cat == TraceCategory::All {
+            return true;
+        }
+        self.enabled_categories.contains(&TraceCategory::All) || self.enabled_categories.contains(&cat)
+    }
+}
+
 // ─── Token Budget Configuration ──────────────────────────────────────────────
 
 /// Configuration for token budget allocation.

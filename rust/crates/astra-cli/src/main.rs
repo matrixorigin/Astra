@@ -205,6 +205,9 @@ async fn main() {
         startup_trace,
         diagnostic_log: _,
         log_file: _,
+        trace_profile: _,
+        trace_level: _,
+        trace_cat: _,
         command,
     } = cli;
 

@@ -3,12 +3,57 @@
 //! Every state mutation in the cognitive runtime emits a TurnEvent.
 //! Events form a causal graph via the `caused_by` field, enabling
 //! automatic root-cause analysis on failures.
+//!
+//! # Trace Levels
+//!
+//! Each [`EventKind`] carries a default [`TraceLevel`], inspired by log levels:
+//! - `Error` — hard failures (circuit breaker trips, stalls)
+//! - `Warn` — near-limit conditions, low progress scores
+//! - `Info` — normal operational events (tool calls, phase transitions)
+//! - `Debug` — reasoning signals (intent detection, budget decisions)
+//! - `Trace` — fine-grained detail (individual LLM chunks, budget expansions)
+//!
+//! [`EventLog`] filters events below a configured `min_level` so production
+//! sessions can stay lean while dev sessions capture full detail.
 
 use std::time::Instant;
 
 /// Unique event identifier (monotonically increasing within a turn).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EventId(pub u64);
+
+/// Trace severity level, mirroring log-level semantics for pipeline events.
+///
+/// Used by [`EventLog::min_level`] to drop events below the configured threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TraceLevel {
+    /// Hard failures that require attention.
+    Error = 0,
+    /// Near-limit conditions, degraded quality signals.
+    Warn = 1,
+    /// Normal operational events — the baseline for production.
+    Info = 2,
+    /// Reasoning signals useful for debugging.
+    Debug = 3,
+    /// Fine-grained detail; only emitted in verbose/dev mode.
+    Trace = 4,
+}
+
+impl TraceLevel {
+    /// Parse a [`TraceLevel`] from a lowercase string (e.g. "debug", "warn").
+    ///
+    /// Returns `None` for unknown strings.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "error" => Some(Self::Error),
+            "warn" => Some(Self::Warn),
+            "info" => Some(Self::Info),
+            "debug" => Some(Self::Debug),
+            "trace" => Some(Self::Trace),
+            _ => None,
+        }
+    }
+}
 
 /// A single event in the causal event log.
 #[derive(Debug, Clone)]
@@ -19,6 +64,9 @@ pub struct TurnEvent {
     pub caused_by: Option<EventId>,
     /// Monotonic timestamp.
     pub elapsed_ms: u64,
+    /// Optional tracing span id that was active when this event was emitted.
+    /// Connects this pipeline event to the `tracing` crate's span tree.
+    pub span_id: Option<tracing::Id>,
 }
 
 /// The kinds of events emitted during a turn.
@@ -107,6 +155,38 @@ pub enum EventKind {
     },
 }
 
+impl EventKind {
+    /// The default trace level for this event kind.
+    ///
+    /// These defaults keep production sessions lean (only Info and above make it
+    /// past the default `min_level`) while dev sessions can lower the bar to
+    /// `Trace` for full introspection.
+    pub fn default_level(&self) -> TraceLevel {
+        match self {
+            // ── Error ── hard failures
+            EventKind::CircuitBreakerTripped { .. } => TraceLevel::Error,
+            EventKind::StallDetected { .. } => TraceLevel::Error,
+            // ── Warn ── near-limit or degraded quality
+            EventKind::BudgetUpdate { .. } => TraceLevel::Warn,
+            EventKind::ProgressRecorded { .. } => TraceLevel::Warn,
+            // ── Info ── normal operational events
+            EventKind::PhaseTransition { .. } => TraceLevel::Info,
+            EventKind::ToolCallStarted { .. } => TraceLevel::Info,
+            EventKind::ToolCallCompleted { .. } => TraceLevel::Info,
+            EventKind::ToolsSelected { .. } => TraceLevel::Info,
+            EventKind::TurnCompleted { .. } => TraceLevel::Info,
+            // ── Debug ── reasoning signals
+            EventKind::IntentDetected { .. } => TraceLevel::Debug,
+            EventKind::EntityExtracted { .. } => TraceLevel::Debug,
+            EventKind::BudgetSet { .. } => TraceLevel::Debug,
+            EventKind::ReflectionGenerated { .. } => TraceLevel::Debug,
+            // ── Trace ── fine-grained detail
+            EventKind::LlmChunk { .. } => TraceLevel::Trace,
+            EventKind::BudgetExpanded { .. } => TraceLevel::Trace,
+        }
+    }
+}
+
 /// Append-only causal event log.
 ///
 /// Used for:
@@ -114,31 +194,58 @@ pub enum EventKind {
 /// - **Replay**: Reconstruct turn state from events
 /// - **Learning**: Analyze successful/failed patterns
 /// - **Root-cause analysis**: Trace `caused_by` chains on failure
+/// - **Level filtering**: Events below [`min_level`] are silently dropped.
 #[derive(Debug)]
 pub struct EventLog {
     events: Vec<TurnEvent>,
     next_id: u64,
     start: Instant,
+    /// Minimum severity required for an event to be recorded.
+    /// Defaults to [`TraceLevel::Info`] for balanced production use.
+    /// Set to [`TraceLevel::Trace`] for dev-mode full capture.
+    pub min_level: TraceLevel,
 }
 
 impl EventLog {
+    /// Create a new event log with the default min_level of [`TraceLevel::Info`].
     pub fn new() -> Self {
         Self {
             events: Vec::new(),
             next_id: 0,
             start: Instant::now(),
+            min_level: TraceLevel::Info,
+        }
+    }
+
+    /// Create a new event log with a specific minimum trace level.
+    pub fn with_min_level(min_level: TraceLevel) -> Self {
+        Self {
+            events: Vec::new(),
+            next_id: 0,
+            start: Instant::now(),
+            min_level,
         }
     }
 
     /// Emit a new event, returning its ID for use as `caused_by` in future events.
+    ///
+    /// Events whose [`EventKind::default_level`] is below the log's [`min_level`]
+    /// are silently dropped and return an id with `0` (never emitted), so callers
+    /// should not use the returned id as `caused_by` for subsequent events.
     pub fn emit(&mut self, kind: EventKind, caused_by: Option<EventId>) -> EventId {
+        let level = kind.default_level();
+        if level > self.min_level {
+            return EventId(0);
+        }
         let id = EventId(self.next_id);
         self.next_id += 1;
+        let span_id = tracing::Span::current().id();
         let event = TurnEvent {
             id,
             kind,
             caused_by,
             elapsed_ms: self.start.elapsed().as_millis() as u64,
+            span_id,
         };
         self.events.push(event);
         id
@@ -211,7 +318,7 @@ mod tests {
 
     #[test]
     fn event_log_basic_emit() {
-        let mut log = EventLog::new();
+        let mut log = EventLog::with_min_level(TraceLevel::Trace);
         assert!(log.is_empty());
 
         let id1 = log.emit(
@@ -238,7 +345,7 @@ mod tests {
 
     #[test]
     fn causal_chain_traces_correctly() {
-        let mut log = EventLog::new();
+        let mut log = EventLog::with_min_level(TraceLevel::Trace);
         let e0 = log.emit(
             EventKind::IntentDetected {
                 signals: vec!["is_fetch".into()],
@@ -285,7 +392,7 @@ mod tests {
 
     #[test]
     fn root_cause_single_event() {
-        let mut log = EventLog::new();
+        let mut log = EventLog::with_min_level(TraceLevel::Trace);
         let e0 = log.emit(
             EventKind::StallDetected {
                 round: 3,
@@ -298,7 +405,7 @@ mod tests {
 
     #[test]
     fn event_ids_monotonic() {
-        let mut log = EventLog::new();
+        let mut log = EventLog::with_min_level(TraceLevel::Trace);
         let ids: Vec<EventId> = (0..5)
             .map(|_| log.emit(EventKind::LlmChunk { text: "hi".into() }, None))
             .collect();
@@ -310,7 +417,7 @@ mod tests {
     #[test]
     fn causal_chain_no_infinite_loop() {
         // Even if caused_by points to self (shouldn't happen, but defense)
-        let mut log = EventLog::new();
+        let mut log = EventLog::with_min_level(TraceLevel::Trace);
         let e0 = log.emit(EventKind::LlmChunk { text: "a".into() }, None);
         // Manually can't create a cycle since emit always uses increasing IDs.
         // But test root_cause terminates.

@@ -389,7 +389,7 @@ async fn run_turn(
     });
 
     let _pipeline =
-        session_runtime::create_pipeline_modules_quiet(&ctx.api, ctx.auth_profile.as_deref());
+        session_runtime::create_pipeline_modules_quiet(&ctx.api, ctx.auth_profile.as_deref(), astra_config::runtime_config::SessionTraceConfig::default());
     let mut pm = PermissionManager::with_load_policy(
         permission_mode,
         &std::env::current_dir().unwrap_or_default(),
