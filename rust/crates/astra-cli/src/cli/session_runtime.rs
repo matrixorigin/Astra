@@ -218,17 +218,9 @@ fn create_pipeline_modules_inner(
     announce_skills: bool,
     trace_config: astra_config::runtime_config::SessionTraceConfig,
 ) -> PipelineModules {
-    // Both astra-config and astra-pipeline now use the shared types from astra-core,
-    // so no conversion is needed. Simply filter out the "All" variant.
-    let enabled_categories: Vec<astra_pipeline::event::TraceCategory> = trace_config
-        .enabled_categories
-        .iter()
-        .filter(|c| **c != astra_config::runtime_config::TraceCategory::All)
-        .copied()
-        .collect();
-
     // Trace config is stored in RuntimeConfig; each turn's EventLog reads it
     // from the config snapshot (not from process-global state).
+    let _ = &trace_config; // consumed by RuntimeConfig snapshot; unused locally after global-setter removal
 
     // Selector removed — the runtime now builds the turn-specific tool surface
     // directly from the local CLI catalog plus any mounted server/MCP schemas.
