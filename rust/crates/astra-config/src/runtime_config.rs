@@ -1392,6 +1392,11 @@ impl SessionTraceConfig {
         self.enabled_categories.contains(&TraceCategory::All) || self.enabled_categories.contains(&cat)
     }
 
+    /// Returns the CLI-specified trace config if set, otherwise the default.
+    pub fn current() -> Self {
+        SESSION_TRACE_CONFIG.get().cloned().unwrap_or_default()
+    }
+
     /// Build from CLI flags (`--trace-profile`, `--trace-level`, `--trace-cat`).
     pub fn from_cli(
         profile: Option<&str>,
@@ -1719,6 +1724,10 @@ fn merge_if_non_default<T: PartialEq>(slot: &mut T, incoming: T, default: T) {
 /// Stored as the already-parsed `RuntimeConfig` rather than raw JSON so the
 /// CLI boundary is the only place that can fail on malformed input — every
 /// `load()` call thereafter is infallible.
+/// Per-session trace config overlay, set from CLI flags before session start.
+static SESSION_TRACE_CONFIG: std::sync::OnceLock<SessionTraceConfig> =
+    std::sync::OnceLock::new();
+
 static CLI_OVERLAY: std::sync::OnceLock<std::sync::RwLock<Option<RuntimeConfig>>> =
     std::sync::OnceLock::new();
 
@@ -1735,6 +1744,13 @@ pub fn set_cli_overlay(overlay: Option<RuntimeConfig>) {
     if let Ok(mut slot) = cli_overlay_cell().write() {
         *slot = overlay;
     }
+}
+
+/// Set the per-session trace config from CLI flags. Called once before session
+/// startup. Subsequent calls to [`SessionTraceConfig::current()`] will return
+/// this value instead of the default.
+pub fn set_cli_trace_config(config: SessionTraceConfig) {
+    let _ = SESSION_TRACE_CONFIG.set(config);
 }
 
 fn cli_overlay_snapshot() -> Option<RuntimeConfig> {

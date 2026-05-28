@@ -205,13 +205,20 @@ async fn main() {
         startup_trace,
         diagnostic_log: _,
         log_file: _,
-        trace_profile: _,
-        trace_level: _,
-        trace_cat: _,
+        trace_profile,
+        trace_level,
+        trace_cat,
         command,
     } = cli;
 
     let _ = (startup_trace, bare);
+    astra_config::runtime_config::set_cli_trace_config(
+        astra_config::runtime_config::SessionTraceConfig::from_cli(
+            trace_profile.as_deref(),
+            trace_level.as_deref(),
+            trace_cat.as_deref(),
+        ),
+    );
     let cli_context = match cli::cli_context::CliContext::from_launch_options(
         no_journal_content,
         max_turns,

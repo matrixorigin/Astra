@@ -484,7 +484,7 @@ pub(crate) async fn complete_session_startup(
     // Session-scoped confidence calibrator: thresholds adapt to correction rates
     let _confidence_calibrator =
         std::sync::Arc::new(astra_turn_core::routing_metrics::ConfidenceCalibrator::default());
-    let pipeline_modules = session_runtime::create_pipeline_modules(api, profile, astra_config::runtime_config::SessionTraceConfig::default());
+    let pipeline_modules = session_runtime::create_pipeline_modules(api, profile, astra_config::runtime_config::SessionTraceConfig::current());
     tracer.phase("pipeline_modules");
 
     // Load cross-session tool-health state from local files.
