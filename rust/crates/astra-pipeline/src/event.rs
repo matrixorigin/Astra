@@ -24,6 +24,21 @@ pub use astra_core::{TraceCategory, TraceLevel};
 /// Maximum Unicode scalars kept in [`EventKind::ToolCallOutput`]'s `output_preview`.
 pub const TOOL_OUTPUT_PREVIEW_CHARS: usize = 500;
 
+/// Clip `s` to at most [`TOOL_OUTPUT_PREVIEW_CHARS`] Unicode scalars,
+/// appending … when the output was longer.
+///
+/// Use when constructing [`EventKind::ToolCallOutput`] so callers
+/// never accidentally store full (unbounded) tool output.
+pub fn clip_output_preview(s: &str) -> String {
+    let mut chars = s.chars();
+    let preview: String = chars.by_ref().take(TOOL_OUTPUT_PREVIEW_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
+}
+
 /// Unique event identifier (monotonically increasing within a turn).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EventId(pub u64);
