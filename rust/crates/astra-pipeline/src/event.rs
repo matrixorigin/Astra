@@ -21,6 +21,9 @@ use std::time::Instant;
 // Re-export shared trace types from astra-core
 pub use astra_core::{TraceCategory, TraceLevel};
 
+/// Maximum Unicode scalars kept in [`EventKind::ToolCallOutput`]'s `output_preview`.
+pub const TOOL_OUTPUT_PREVIEW_CHARS: usize = 500;
+
 /// Unique event identifier (monotonically increasing within a turn).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EventId(pub u64);
@@ -113,6 +116,56 @@ pub enum EventKind {
         output_preview: String,
     },
 
+    // ── Memory ──
+    /// Memory retrieval query fired during context assembly (verbose-gated).
+    /// Emitted at `TraceLevel::Debug`, category `TraceCategory::MemoryRetrieval`.
+    MemoryQuery {
+        query: String,
+        top_k: usize,
+        /// Data source tag, e.g. `"local"`, `"cloud"`, `"hybrid"`.
+        source: String,
+    },
+    /// Result count and latency for a completed memory retrieval.
+    /// Emitted at `TraceLevel::Debug`, category `TraceCategory::MemoryRetrieval`.
+    MemoryRetrieved {
+        result_count: usize,
+        duration_ms: u64,
+    },
+
+    // ── Skill lifecycle ──
+    /// Skill loading started.
+    /// Emitted at `TraceLevel::Info`, category `TraceCategory::SkillExecution`.
+    SkillStarted {
+        skill_name: String,
+    },
+    /// Skill execution completed.
+    /// Emitted at `TraceLevel::Info`, category `TraceCategory::SkillExecution`.
+    SkillCompleted {
+        skill_name: String,
+        duration_ms: u64,
+        success: bool,
+    },
+
+    // ── Prompt assembly ──
+    /// System-prompt assembly completed (verbose-gated).
+    /// Emitted at `TraceLevel::Debug`, category `TraceCategory::PromptAssembly`.
+    PromptAssembled {
+        /// Number of logical components injected (system, memory, skill, etc.).
+        component_count: usize,
+        /// Rough token estimate for the assembled prompt.
+        estimated_tokens: usize,
+    },
+
+    // ── Guard evaluation ──
+    /// Safety/capability guard evaluated for this turn.
+    /// Emitted at `TraceLevel::Info`, category `TraceCategory::GuardEvaluation`.
+    GuardEvaluated {
+        guard_name: String,
+        allowed: bool,
+        /// Human-readable ruling summary (e.g. `"blocked: malware pattern detected"`).
+        reason: Option<String>,
+    },
+
     // ── Evaluation ──
     ProgressRecorded {
         score: f64,
@@ -183,6 +236,10 @@ impl EventKind {
             EventKind::ThinkingChunk { .. } => TraceLevel::Trace,
             EventKind::LlmRequest { .. } => TraceLevel::Trace,
             EventKind::ToolCallOutput { .. } => TraceLevel::Trace,
+            EventKind::MemoryQuery { .. } | EventKind::MemoryRetrieved { .. } => TraceLevel::Debug,
+            EventKind::SkillStarted { .. } | EventKind::SkillCompleted { .. } => TraceLevel::Info,
+            EventKind::PromptAssembled { .. } => TraceLevel::Debug,
+            EventKind::GuardEvaluated { .. } => TraceLevel::Info,
             EventKind::BudgetExpanded { .. } => TraceLevel::Trace,
         }
     }
@@ -207,6 +264,10 @@ impl EventKind {
             EventKind::ProgressRecorded { .. }
             | EventKind::StallDetected { .. }
             | EventKind::CircuitBreakerTripped { .. } => TraceCategory::Verification,
+            EventKind::MemoryQuery { .. } | EventKind::MemoryRetrieved { .. } => TraceCategory::MemoryRetrieval,
+            EventKind::SkillStarted { .. } | EventKind::SkillCompleted { .. } => TraceCategory::SkillExecution,
+            EventKind::PromptAssembled { .. } => TraceCategory::PromptAssembly,
+            EventKind::GuardEvaluated { .. } => TraceCategory::GuardEvaluation,
             EventKind::TurnCompleted { .. } => TraceCategory::DecisionExplain,
         }
     }
