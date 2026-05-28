@@ -28,9 +28,54 @@
 //! let summary = recorder.finalize();
 //! ```
 
+use crate::event::clip_output_preview;
 use crate::step_checkpoint::FileBackedEventStore;
 use crate::step_protocol::*;
 use std::collections::HashMap;
+
+/// Redact common credential patterns from tool output before persisting to disk.
+/// Returns (redacted_text, redaction_count).
+fn redact_credentials_for_storage(text: &str) -> (String, usize) {
+    let mut count = 0usize;
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| {
+            let lowered = line.to_lowercase();
+            let is_sensitive = lowered.contains("api_key")
+                || lowered.contains("apikey")
+                || lowered.contains("secret_key")
+                || lowered.contains("secretkey")
+                || lowered.contains("access_key")
+                || lowered.contains("private_key")
+                || lowered.contains("password")
+                || lowered.contains("passwd")
+                || lowered.contains("token")
+                || lowered.contains("bearer")
+                || lowered.contains("credential")
+                || lowered.contains("authorization");
+            let has_sk_prefix = line.contains("sk-") || line.contains("SK-");
+            if (is_sensitive || has_sk_prefix)
+                && (line.contains('=') || line.contains(':'))
+            {
+                let sep = if line.contains(':') && !line.contains("://") {
+                    line.find(':')
+                } else {
+                    line.find('=')
+                };
+                if let Some(idx) = sep {
+                    count += 1;
+                    format!("{}[REDACTED]", &line[..=idx])
+                } else {
+                    count += 1;
+                    "[REDACTED]".to_string()
+                }
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    (lines.join("\n"), count)
+}
 
 /// Records chat_stream execution as Step lifecycle events.
 /// Wraps the implicit state machine with explicit StepAction tracking.
@@ -581,9 +626,17 @@ impl StepRecorder {
             }
         }
         if let Some(out) = output {
-            payload["output"] = serde_json::json!(out);
+            // Security: clip and redact tool output before persisting to disk.
+            // Full output is already available in-memory for the LLM context;
+            // the persisted copy should never contain unbounded or sensitive data.
+            let clipped = clip_output_preview(out);
+            let (redacted, redactions) = redact_credentials_for_storage(&clipped);
+            if redactions > 0 {
+                payload["redactions"] = serde_json::json!(redactions);
+            }
+            payload["output"] = serde_json::json!(redacted);
             if is_error {
-                payload["error"] = serde_json::json!(out);
+                payload["error"] = serde_json::json!(redacted);
             }
         } else if is_error {
             payload["error"] = serde_json::json!("tool failed without captured error");
