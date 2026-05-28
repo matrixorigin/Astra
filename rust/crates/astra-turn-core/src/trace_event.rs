@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Canonical in-process trace event for DB-backed Web session traceability.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -26,6 +27,9 @@ pub struct TraceEvent {
     pub meta_duration_ms: Option<i32>,
     pub parent_event_id: Option<String>,
     pub causal_chain_id: Option<String>,
+    /// Canonical UUID v7 from the originating EventLog event, enabling
+    /// cross-layer correlation with StepRecorder and EventLog.
+    pub canonical_event_id: Option<Uuid>,
     pub metadata: serde_json::Value,
     pub created_at: DateTime<Utc>,
 }
@@ -60,6 +64,7 @@ impl TraceEvent {
             meta_duration_ms: None,
             parent_event_id: None,
             causal_chain_id: None,
+            canonical_event_id: None,
             metadata: serde_json::json!({}),
             created_at: Utc::now(),
         }

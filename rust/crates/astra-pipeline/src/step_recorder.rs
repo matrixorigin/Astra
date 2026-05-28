@@ -881,6 +881,7 @@ impl StepRecorder {
     fn emit(&mut self, step_id: &str, event_type: StepEventType) {
         let event = StepEvent {
             event_id: format!("evt-{}-{}", self.events.len(), epoch_ms()),
+            canonical_event_id: None,
             step_id: step_id.to_string(),
             event_type,
             agent_id: None,
@@ -922,6 +923,7 @@ impl StepRecorder {
         };
         let event = StepEvent {
             event_id: format!("evt-{}-{}", self.events.len(), epoch_ms()),
+            canonical_event_id: None,
             step_id,
             event_type,
             agent_id: None,

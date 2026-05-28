@@ -18,6 +18,8 @@
 
 use std::time::Instant;
 
+use uuid::Uuid;
+
 // Re-export shared trace types from astra-core
 pub use astra_core::{TraceCategory, TraceLevel, TraceVerbosity};
 
@@ -55,6 +57,8 @@ pub struct TurnEvent {
     /// Optional tracing span id that was active when this event was emitted.
     /// Connects this pipeline event to the `tracing` crate's span tree.
     pub span_id: Option<tracing::Id>,
+    /// Canonical UUID v7 shared across all storage layers.
+    pub canonical_event_id: Uuid,
 }
 
 /// The kinds of events emitted during a turn.
@@ -266,7 +270,9 @@ impl EventKind {
             | EventKind::ToolCallCompleted { .. }
             | EventKind::ToolCallOutput { .. }
             | EventKind::ToolsSelected { .. } => TraceCategory::ToolCalls,
-            EventKind::LlmChunk { .. } | EventKind::LlmRequest { .. } => TraceCategory::LlmExchanges,
+            EventKind::LlmChunk { .. } | EventKind::LlmRequest { .. } => {
+                TraceCategory::LlmExchanges
+            }
             EventKind::ThinkingChunk { .. } => TraceCategory::Thinking,
             EventKind::IntentDetected { .. } | EventKind::EntityExtracted { .. } => {
                 TraceCategory::ContextAssembly
@@ -279,8 +285,12 @@ impl EventKind {
             EventKind::ProgressRecorded { .. }
             | EventKind::StallDetected { .. }
             | EventKind::CircuitBreakerTripped { .. } => TraceCategory::Verification,
-            EventKind::MemoryQuery { .. } | EventKind::MemoryRetrieved { .. } => TraceCategory::MemoryRetrieval,
-            EventKind::SkillStarted { .. } | EventKind::SkillCompleted { .. } => TraceCategory::SkillExecution,
+            EventKind::MemoryQuery { .. } | EventKind::MemoryRetrieved { .. } => {
+                TraceCategory::MemoryRetrieval
+            }
+            EventKind::SkillStarted { .. } | EventKind::SkillCompleted { .. } => {
+                TraceCategory::SkillExecution
+            }
             EventKind::PromptAssembled { .. } => TraceCategory::PromptAssembly,
             EventKind::GuardEvaluated { .. } => TraceCategory::GuardEvaluation,
             EventKind::TurnCompleted { .. } => TraceCategory::DecisionExplain,
@@ -394,12 +404,14 @@ impl EventLog {
         let id = EventId(self.next_id);
         self.next_id += 1;
         let span_id = tracing::Span::current().id();
+        let canonical_event_id = Uuid::now_v7();
         let event = TurnEvent {
             id,
             kind,
             caused_by,
             elapsed_ms: self.start.elapsed().as_millis() as u64,
             span_id,
+            canonical_event_id,
         };
         self.events.push(event);
         Some(id)
@@ -614,7 +626,9 @@ mod new_variant_contracts {
 
     #[test]
     fn thinking_chunk_is_trace_and_thinking() {
-        let e = EventKind::ThinkingChunk { text: "step 1".into() };
+        let e = EventKind::ThinkingChunk {
+            text: "step 1".into(),
+        };
         assert_eq!(level(&e), TraceLevel::Trace);
         assert_eq!(cat(&e), TraceCategory::Thinking);
     }
@@ -651,7 +665,10 @@ mod new_variant_contracts {
             top_k: 5,
             source: "hybrid".into(),
         };
-        let r = EventKind::MemoryRetrieved { result_count: 3, duration_ms: 12 };
+        let r = EventKind::MemoryRetrieved {
+            result_count: 3,
+            duration_ms: 12,
+        };
         for e in [&q, &r] {
             assert_eq!(level(e), TraceLevel::Debug);
             assert_eq!(cat(e), TraceCategory::MemoryRetrieval);
@@ -660,7 +677,9 @@ mod new_variant_contracts {
 
     #[test]
     fn skill_events_are_info_and_skill_execution() {
-        let s = EventKind::SkillStarted { skill_name: "review-changes".into() };
+        let s = EventKind::SkillStarted {
+            skill_name: "review-changes".into(),
+        };
         let c = EventKind::SkillCompleted {
             skill_name: "review-changes".into(),
             duration_ms: 300,
@@ -674,7 +693,10 @@ mod new_variant_contracts {
 
     #[test]
     fn prompt_assembled_is_debug_and_prompt_assembly() {
-        let e = EventKind::PromptAssembled { component_count: 3, estimated_tokens: 512 };
+        let e = EventKind::PromptAssembled {
+            component_count: 3,
+            estimated_tokens: 512,
+        };
         assert_eq!(level(&e), TraceLevel::Debug);
         assert_eq!(cat(&e), TraceCategory::PromptAssembly);
     }

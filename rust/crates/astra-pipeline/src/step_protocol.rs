@@ -1437,6 +1437,8 @@ impl IdempotencyCache for InMemoryIdempotencyCache {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepEvent {
     pub event_id: String,
+    /// Canonical UUID v7 shared across EventLog, TraceEvent DB, and StepRecorder.
+    pub canonical_event_id: Option<String>,
     pub step_id: String,
     pub event_type: StepEventType,
     pub agent_id: Option<String>,
