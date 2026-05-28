@@ -319,7 +319,7 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
         },
         SettingItem {
             id: "trace.llm_exchanges".to_string(),
-            label: "Trace full LLM exchanges".to_string(),
+            label: "Capture full LLM request/response payloads".to_string(),
             kind: SettingKind::Bool,
             value: Value::from(config.trace.category_enabled(TraceCategory::LlmExchanges)),
         },
