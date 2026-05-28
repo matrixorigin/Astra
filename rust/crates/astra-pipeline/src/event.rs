@@ -80,6 +80,17 @@ pub enum EventKind {
     ThinkingChunk {
         text: String,
     },
+    /// LLM request metadata emitted before each LLM call (verbose-gated).
+    /// Only recorded when `TraceCategory::LlmExchanges` is enabled AND
+    /// `min_level` ≤ `Trace`.
+    LlmRequest {
+        model: String,
+        provider: String,
+        message_count: usize,
+        tool_count: usize,
+        max_output_tokens: Option<usize>,
+        round: u32,
+    },
     ToolCallStarted {
         call_id: String,
         tool_name: String,
@@ -90,6 +101,16 @@ pub enum EventKind {
         duration_ms: u64,
         success: bool,
         error: Option<String>,
+    },
+
+    /// Truncated tool output captured after a completed tool call (verbose-gated).
+    /// Emitted when `TraceCategory::ToolCalls` is enabled AND `min_level` ≤ `Trace`.
+    /// Output is truncated to at most [`TOOL_OUTPUT_PREVIEW_CHARS`] Unicode scalars.
+    ToolCallOutput {
+        call_id: String,
+        tool_name: String,
+        /// First `TOOL_OUTPUT_PREVIEW_CHARS` chars of output (appended with "…" if truncated).
+        output_preview: String,
     },
 
     // ── Evaluation ──
@@ -160,6 +181,8 @@ impl EventKind {
             // ── Trace ── fine-grained detail
             EventKind::LlmChunk { .. } => TraceLevel::Trace,
             EventKind::ThinkingChunk { .. } => TraceLevel::Trace,
+            EventKind::LlmRequest { .. } => TraceLevel::Trace,
+            EventKind::ToolCallOutput { .. } => TraceLevel::Trace,
             EventKind::BudgetExpanded { .. } => TraceLevel::Trace,
         }
     }
@@ -169,8 +192,9 @@ impl EventKind {
         match self {
             EventKind::ToolCallStarted { .. }
             | EventKind::ToolCallCompleted { .. }
+            | EventKind::ToolCallOutput { .. }
             | EventKind::ToolsSelected { .. } => TraceCategory::ToolCalls,
-            EventKind::LlmChunk { .. } => TraceCategory::LlmExchanges,
+            EventKind::LlmChunk { .. } | EventKind::LlmRequest { .. } => TraceCategory::LlmExchanges,
             EventKind::ThinkingChunk { .. } => TraceCategory::Thinking,
             EventKind::IntentDetected { .. } | EventKind::EntityExtracted { .. } => {
                 TraceCategory::ContextAssembly
