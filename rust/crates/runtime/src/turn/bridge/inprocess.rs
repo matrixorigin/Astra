@@ -688,6 +688,10 @@ fn build_bridge_tool_call_records(
             .get("exit_semantics")
             .and_then(Value::as_str)
             .and_then(normalize_exit_semantics_tag);
+        let result_class = tool_result
+            .get("result_class")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
         records.push(ToolCallRecord {
             name: tool_name,
             ok,
@@ -712,6 +716,7 @@ fn build_bridge_tool_call_records(
             batch_id,
             parallel,
             exit_semantics,
+            result_class,
             ..Default::default()
         });
     }

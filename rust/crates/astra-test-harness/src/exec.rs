@@ -153,6 +153,9 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
                 stderr: String::new(),
                 session_id: None,
                 run_id: None,
+                final_state: None,
+                interruption_kind: None,
+                tool_result_class_counts: std::collections::BTreeMap::new(),
                 tool_calls_count: 0,
                 tools_used: vec![],
                 completion_tokens: 0,
@@ -200,6 +203,9 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
             stderr: String::new(),
             session_id: None,
             run_id: None,
+            final_state: None,
+            interruption_kind: None,
+            tool_result_class_counts: std::collections::BTreeMap::new(),
             tool_calls_count: 0,
             tools_used: vec![],
             completion_tokens: 0,
@@ -228,6 +234,9 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
             stderr: String::new(),
             session_id: None,
             run_id: None,
+            final_state: Some("interrupted".into()),
+            interruption_kind: Some("timeout".into()),
+            tool_result_class_counts: std::collections::BTreeMap::new(),
             tool_calls_count: 0,
             tools_used: vec![],
             completion_tokens: 0,
@@ -435,6 +444,9 @@ pub(crate) mod test_support {
                     cache_hits: 0,
                     total_tool_calls: 0,
                     ttft_ms: 0,
+                    final_state: None,
+                    interruption_kind: None,
+                    tool_result_class_counts: std::collections::BTreeMap::new(),
                 })
         }
         fn reproducer(&self, case: &Case, model: &str) -> String {
@@ -625,6 +637,9 @@ mod tests {
             cache_hits: 0,
             total_tool_calls: 0,
             ttft_ms: 0,
+            final_state: None,
+            interruption_kind: None,
+            tool_result_class_counts: std::collections::BTreeMap::new(),
         };
         seed.exit_code = 0;
         fe.seed("c1", "qwen-flash", seed.clone());

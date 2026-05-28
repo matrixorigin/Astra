@@ -2424,6 +2424,8 @@ mod tests {
             turn_observability_events: Vec::new(),
             llm_rounds: None,
             interruption: None,
+            final_state: "completed".into(),
+            interruption_kind: None,
             final_messages: Vec::new(),
             background_agent_results: Vec::new(),
         }
@@ -3438,6 +3440,8 @@ All acceptance checks pass:
             turn_observability_events: Vec::new(),
             llm_rounds: Some(3),
             interruption: None,
+            final_state: "completed".into(),
+            interruption_kind: None,
             final_messages: Vec::new(),
             background_agent_results: Vec::new(),
         };

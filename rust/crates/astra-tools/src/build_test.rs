@@ -1355,6 +1355,11 @@ pub fn is_build_test_command(command: &str) -> bool {
 pub fn parse_build_test_output(output: &str, exit_code: Option<i32>) -> BuildTestResult {
     let lower = output.to_lowercase();
     let truncated = output.contains("[truncated]");
+    let result_class = crate::exit_semantics::classify_command_result("", output, "", exit_code);
+    let env_failure = matches!(
+        result_class,
+        crate::exit_semantics::CommandResultClass::EnvFailure
+    );
 
     // Detect framework
     let framework = detect_framework(output);
@@ -1371,16 +1376,26 @@ pub fn parse_build_test_output(output: &str, exit_code: Option<i32>) -> BuildTes
             // Generic fallback
             let error_count = count_generic_errors(&lower);
             let (error_messages, error_locations) = extract_generic_errors(output);
-            let passed = passed_from_exit && error_count == 0;
+            let passed = passed_from_exit && error_count == 0 && !env_failure;
             BuildTestResult {
                 passed,
                 exit_code,
                 framework,
-                error_count,
-                error_messages,
+                error_count: if env_failure && error_count == 0 {
+                    1
+                } else {
+                    error_count
+                },
+                error_messages: if env_failure && error_messages.is_empty() {
+                    vec!["environment failure while running build/test command".to_string()]
+                } else {
+                    error_messages
+                },
                 error_locations,
                 summary: if passed {
                     "completed".to_string()
+                } else if env_failure {
+                    "environment failure".to_string()
                 } else {
                     format!("{} error(s)", error_count)
                 },
@@ -1648,6 +1663,10 @@ fn parse_pytest_output(output: &str, exit_code: Option<i32>, truncated: bool) ->
         truncated,
         ..Default::default()
     };
+    let env_failure = matches!(
+        crate::exit_semantics::classify_command_result("pytest", output, "", exit_code),
+        crate::exit_semantics::CommandResultClass::EnvFailure
+    );
 
     // Parse summary line
     if let Some(cap) = PYTEST_SUMMARY_RE.captures(output) {
@@ -1661,8 +1680,19 @@ fn parse_pytest_output(output: &str, exit_code: Option<i32>, truncated: bool) ->
         }
     }
 
-    result.passed = result.tests_failed == 0 && exit_code.map(|c| c == 0).unwrap_or(true);
-    result.error_count = result.tests_failed;
+    result.passed =
+        result.tests_failed == 0 && exit_code.map(|c| c == 0).unwrap_or(true) && !env_failure;
+    result.error_count = if env_failure && result.tests_failed == 0 {
+        1
+    } else {
+        result.tests_failed
+    };
+    if env_failure {
+        result.summary = "environment failure".to_string();
+        result
+            .error_messages
+            .push("environment failure while running pytest".to_string());
+    }
 
     // Extract failed test names and traceback locations
     let lines: Vec<&str> = output.lines().collect();
@@ -1709,10 +1739,12 @@ fn parse_pytest_output(output: &str, exit_code: Option<i32>, truncated: bool) ->
         }
     }
 
-    result.summary = format!(
-        "{} passed, {} failed",
-        result.tests_passed, result.tests_failed
-    );
+    if !env_failure {
+        result.summary = format!(
+            "{} passed, {} failed",
+            result.tests_passed, result.tests_failed
+        );
+    }
 
     result
 }
@@ -2071,6 +2103,14 @@ tests/test_main.py .....                                                  [100%]
         assert_eq!(result.framework, "pytest");
         assert_eq!(result.tests_passed, 5);
         assert_eq!(result.tests_failed, 0);
+    }
+
+    #[test]
+    fn parse_masked_command_not_found_as_env_failure() {
+        let result = parse_build_test_output("bash: python: command not found\n", Some(0));
+        assert!(!result.passed);
+        assert_eq!(result.summary, "environment failure");
+        assert_eq!(result.error_count, 1);
     }
 
     #[test]

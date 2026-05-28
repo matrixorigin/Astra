@@ -97,6 +97,26 @@ impl ToolResult {
     /// Attach exit-code semantics while preserving the existing output/error shape.
     pub fn with_exit_semantics(mut self, semantics: exit_semantics::ExitSemantics) -> Self {
         self.exit_semantics = Some(semantics);
+        let metadata = self.metadata.get_or_insert_with(serde_json::Map::new);
+        metadata.insert(
+            "exit_semantics".to_string(),
+            Value::String(
+                serde_json::to_value(semantics)
+                    .ok()
+                    .and_then(|v| v.as_str().map(ToString::to_string))
+                    .unwrap_or_else(|| format!("{semantics:?}").to_ascii_lowercase()),
+            ),
+        );
+        self
+    }
+
+    /// Attach output-aware command result classification for downstream trace/harness use.
+    pub fn with_result_class(mut self, result_class: exit_semantics::CommandResultClass) -> Self {
+        let metadata = self.metadata.get_or_insert_with(serde_json::Map::new);
+        metadata.insert(
+            "result_class".to_string(),
+            Value::String(result_class.as_str().to_string()),
+        );
         self
     }
 

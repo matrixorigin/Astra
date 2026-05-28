@@ -155,6 +155,30 @@ mod enabled {
             .and_then(|sigs| sigs.iter().last().cloned());
 
         let consecutive_same_tool = compute_consecutive_same_tool(&state.turn_guard.tool_sigs);
+        let has_final_text = !state.final_text.trim().is_empty();
+        let interruption_kind = state
+            .interruption
+            .as_ref()
+            .map(|interruption| interruption.kind.label().to_string());
+        let final_state = Some(classify_final_state(
+            has_final_text,
+            interruption_kind.as_deref(),
+        ));
+        let last_tool_result_class = state
+            .stall
+            .tool_call_records
+            .iter()
+            .rev()
+            .find_map(|record| record.result_class.clone());
+        let read_only_round_streak = state
+            .stall
+            .circuit_breaker
+            .consecutive_read_only()
+            .min(u32::MAX as usize) as u32;
+        let redundant_read_count = astra_turn_core::evaluation::count_redundant_overlapping_reads(
+            &state.stall.tool_call_records,
+        )
+        .min(u32::MAX as usize) as u32;
 
         let elapsed = now.saturating_sub(session_start_unix_millis);
 
@@ -180,13 +204,32 @@ mod enabled {
             unique_tools_used: unique_tools,
             last_tool_called,
             consecutive_same_tool,
+            final_state,
+            interruption_kind,
+            has_final_text,
+            last_tool_result_class,
+            read_only_round_streak,
+            redundant_read_count,
             delegations_this_turn: state.delegations_this_turn,
             recursion_depth: state.recursion_depth,
             consecutive_errors: state.error_recovery.consecutive_same_error,
             captured_at_unix_millis: now,
             session_start_unix_millis,
             causal_chain_id: state.bridge_turn_chain_id.clone(),
-            schema_version: 2,
+            schema_version: 3,
+        }
+    }
+
+    pub(crate) fn classify_final_state(
+        has_final_text: bool,
+        interruption_kind: Option<&str>,
+    ) -> String {
+        if interruption_kind.is_some() {
+            "interrupted".to_string()
+        } else if has_final_text {
+            "completed".to_string()
+        } else {
+            "empty".to_string()
         }
     }
 
@@ -256,6 +299,19 @@ mod enabled {
             assert_eq!(snap.tool_calls_this_session, 0);
             assert!(snap.unique_tools_used.is_empty());
             assert_eq!(snap.session_start_unix_millis, 1_000_000);
+            assert_eq!(snap.final_state.as_deref(), Some("empty"));
+            assert!(!snap.has_final_text);
+            assert_eq!(snap.schema_version, 3);
+        }
+
+        #[test]
+        fn classify_final_state_prefers_interruption() {
+            assert_eq!(classify_final_state(true, None), "completed");
+            assert_eq!(classify_final_state(false, None), "empty");
+            assert_eq!(
+                classify_final_state(true, Some("budget_exhausted")),
+                "interrupted"
+            );
         }
 
         #[test]

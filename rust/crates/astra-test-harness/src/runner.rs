@@ -54,6 +54,15 @@ pub struct RunOutcome {
     pub total_tool_calls: u32,
     /// Time to first token in ms (from JSON envelope).
     pub ttft_ms: u64,
+    /// Machine-readable terminal state from `astra chat --json`.
+    #[serde(default)]
+    pub final_state: Option<String>,
+    /// Interruption kind label when final_state is interrupted.
+    #[serde(default)]
+    pub interruption_kind: Option<String>,
+    /// Counts of tool result classes observed during the run.
+    #[serde(default)]
+    pub tool_result_class_counts: std::collections::BTreeMap<String, u32>,
 }
 
 impl RunOutcome {
@@ -101,6 +110,16 @@ impl RunOutcome {
     pub fn with_tools_used(mut self, tools: Vec<String>) -> Self {
         self.tool_calls_count = tools.len() as u32;
         self.tools_used = tools;
+        self
+    }
+
+    pub fn with_final_state(mut self, state: impl Into<String>) -> Self {
+        self.final_state = Some(state.into());
+        self
+    }
+
+    pub fn with_interruption_kind(mut self, kind: impl Into<String>) -> Self {
+        self.interruption_kind = Some(kind.into());
         self
     }
 }
@@ -184,6 +203,9 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
                 cache_hits: 0,
                 total_tool_calls: 0,
                 ttft_ms: 0,
+                final_state: None,
+                interruption_kind: None,
+                tool_result_class_counts: Default::default(),
             };
         }
     };
@@ -272,6 +294,27 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
         cache_hits: 0,
         total_tool_calls: 0,
         ttft_ms: v.get("ttft_ms").and_then(|x| x.as_u64()).unwrap_or(0),
+        final_state: v
+            .get("final_state")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        interruption_kind: v
+            .get("interruption_kind")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        tool_result_class_counts: v
+            .get("tool_result_class_counts")
+            .and_then(|x| x.as_object())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(key, value)| {
+                        value
+                            .as_u64()
+                            .map(|count| (key.clone(), count.min(u32::MAX as u64) as u32))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 

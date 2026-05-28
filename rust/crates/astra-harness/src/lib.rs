@@ -60,6 +60,18 @@ pub struct RuntimeSnapshot {
 
     // ── Behavior signals ──
     pub consecutive_same_tool: u32,
+    #[serde(default)]
+    pub final_state: Option<String>,
+    #[serde(default)]
+    pub interruption_kind: Option<String>,
+    #[serde(default)]
+    pub has_final_text: bool,
+    #[serde(default)]
+    pub last_tool_result_class: Option<String>,
+    #[serde(default)]
+    pub read_only_round_streak: u32,
+    #[serde(default)]
+    pub redundant_read_count: u32,
 
     // ── Delegation (Phase 4) ──
     #[serde(default)]
@@ -85,7 +97,7 @@ pub struct RuntimeSnapshot {
 }
 
 fn default_schema_version() -> u32 {
-    2
+    3
 }
 
 impl RuntimeSnapshot {
@@ -112,13 +124,19 @@ impl RuntimeSnapshot {
             unique_tools_used: Vec::new(),
             last_tool_called: None,
             consecutive_same_tool: 0,
+            final_state: None,
+            interruption_kind: None,
+            has_final_text: false,
+            last_tool_result_class: None,
+            read_only_round_streak: 0,
+            redundant_read_count: 0,
             delegations_this_turn: 0,
             recursion_depth: 0,
             consecutive_errors: 0,
             captured_at_unix_millis: 0,
             session_start_unix_millis: 0,
             causal_chain_id: None,
-            schema_version: 2,
+            schema_version: 3,
         }
     }
 }
@@ -174,6 +192,7 @@ pub struct Violation {
 pub enum Severity {
     Warning,
     Error,
+    Pause,
     Fatal,
 }
 
@@ -334,12 +353,18 @@ mod tests {
             unique_tools_used: vec!["bash".into(), "read_file".into()],
             last_tool_called: Some("bash".into()),
             consecutive_same_tool: 2,
+            final_state: Some("completed".into()),
+            interruption_kind: None,
+            has_final_text: true,
+            last_tool_result_class: Some("success".into()),
+            read_only_round_streak: 0,
+            redundant_read_count: 0,
             delegations_this_turn: 0,
             recursion_depth: 0,
             consecutive_errors: 0,
             captured_at_unix_millis: 1_700_000_000_000,
             session_start_unix_millis: 1_700_000_000_000 - 45_000,
-            schema_version: 2,
+            schema_version: 3,
             causal_chain_id: None,
         };
 
@@ -350,6 +375,8 @@ mod tests {
         assert_eq!(deserialized.turn_number, 7);
         assert_eq!(deserialized.model.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(deserialized.context_total_tokens, Some(50_000));
+        assert_eq!(deserialized.final_state.as_deref(), Some("completed"));
+        assert!(deserialized.has_final_text);
         assert_eq!(deserialized.context_utilization, Some(0.25));
         assert_eq!(deserialized.unique_tools_used.len(), 2);
         assert_eq!(deserialized.consecutive_same_tool, 2);

@@ -2898,12 +2898,28 @@ fn final_json_output_with_context(
     request_id: Option<String>,
 ) -> serde_json::Value {
     let total_prompt_tokens = sr.prompt_tokens + sr.cache_read_tokens + sr.cache_creation_tokens;
+    let mut tool_result_class_counts = serde_json::Map::new();
+    for class in sr
+        .tool_call_records
+        .iter()
+        .filter_map(|record| record.result_class.as_deref())
+    {
+        let next = tool_result_class_counts
+            .get(class)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            + 1;
+        tool_result_class_counts.insert(class.to_string(), serde_json::json!(next));
+    }
     serde_json::json!({
         "trace_id": trace_id,
         "request_id": request_id,
         "run_id": sr.run_id,
         "session_id": sr.session_id,
         "text": sr.full_text,
+        "final_state": sr.final_state,
+        "interruption_kind": sr.interruption_kind,
+        "tool_result_class_counts": tool_result_class_counts,
         "prompt_tokens": total_prompt_tokens,
         "fresh_prompt_tokens": sr.prompt_tokens,
         "cache": {
@@ -3312,6 +3328,8 @@ mod exit_code_tests {
             turn_observability_events: Vec::new(),
             llm_rounds: None,
             interruption: None,
+            final_state: "completed".into(),
+            interruption_kind: None,
             final_messages: Vec::new(),
             background_agent_results: Vec::new(),
         }
@@ -3685,6 +3703,8 @@ mod final_json_output_tests {
             turn_observability_events: Vec::new(),
             llm_rounds: None,
             interruption: None,
+            final_state: "completed".into(),
+            interruption_kind: None,
             final_messages: Vec::new(),
             background_agent_results: Vec::new(),
         }
@@ -3705,6 +3725,9 @@ mod final_json_output_tests {
         assert_eq!(output["run_id"], "run-1");
         assert_eq!(output["session_id"], "session-1");
         assert_eq!(output["text"], "hello");
+        assert_eq!(output["final_state"], "completed");
+        assert!(output["interruption_kind"].is_null());
+        assert_eq!(output["tool_result_class_counts"], serde_json::json!({}));
         assert_eq!(output["prompt_tokens"], 13);
         assert_eq!(output["fresh_prompt_tokens"], 10);
         assert!(output.get("cached_input_tokens").is_none());
@@ -3728,6 +3751,9 @@ mod final_json_output_tests {
             "run_id",
             "session_id",
             "text",
+            "final_state",
+            "interruption_kind",
+            "tool_result_class_counts",
             "prompt_tokens",
             "fresh_prompt_tokens",
             "cache",

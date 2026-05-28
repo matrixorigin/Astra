@@ -33,6 +33,8 @@ impl StandardKernel {
             Box::new(crate::verifiers::TurnGuardVerifierAdapter::default()),
             Box::new(crate::verifiers::DelegationVerifier::default()),
             Box::new(crate::verifiers::ConfidenceVerifier::default()),
+            Box::new(crate::verifiers::ProgressVerifier::default()),
+            Box::new(crate::verifiers::CompletionVerifier::default()),
         ];
         if let Some(max_cost) = limits.max_session_cost_usd {
             verifiers.push(Box::new(crate::verifiers::CostVerifier {
@@ -82,6 +84,8 @@ impl HarnessKernel for StandardKernel {
     fn on_record(&self, record: &DecisionRecord) -> HookVerdict {
         self.sink.update(record);
 
+        let mut first_pause: Option<String> = None;
+
         for v in &self.verifiers {
             if !v.trigger_points().contains(&record.point) {
                 continue;
@@ -116,12 +120,21 @@ impl HarnessKernel for StandardKernel {
                     "harness violation: {}",
                     violation.message,
                 );
-                if violation.severity == Severity::Fatal {
-                    return HookVerdict::Block {
-                        reason: format!("[{}] {}", v.name(), violation.message),
-                    };
+                match violation.severity {
+                    Severity::Fatal => {
+                        return HookVerdict::Block {
+                            reason: format!("[{}] {}", v.name(), violation.message),
+                        };
+                    }
+                    Severity::Pause if first_pause.is_none() => {
+                        first_pause = Some(format!("[{}] {}", v.name(), violation.message));
+                    }
+                    Severity::Pause | Severity::Error | Severity::Warning => {}
                 }
             }
+        }
+        if let Some(reason) = first_pause {
+            return HookVerdict::Pause { reason };
         }
         HookVerdict::Continue
     }
@@ -179,6 +192,29 @@ mod tests {
             kernel.on_record(&record),
             HookVerdict::Block { .. }
         ));
+    }
+
+    #[test]
+    fn pause_severity_maps_to_hook_pause() {
+        let sink = InMemorySnapshotSink::arc();
+        let kernel = StandardKernel::new(
+            sink.clone(),
+            vec![Box::new(ProgressVerifier {
+                max_read_only_round_streak: 2,
+                max_redundant_read_count: 10,
+            })],
+        );
+
+        let mut record = make_record(HookPoint::PostTurn, 1, 0);
+        record.snapshot.final_state = Some("empty".into());
+        record.snapshot.read_only_round_streak = 2;
+
+        match kernel.on_record(&record) {
+            HookVerdict::Pause { reason } => {
+                assert!(reason.contains("decision checkpoint"));
+            }
+            other => panic!("expected pause verdict, got {other:?}"),
+        }
     }
 
     #[test]

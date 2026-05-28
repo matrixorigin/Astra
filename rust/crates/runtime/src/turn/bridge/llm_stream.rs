@@ -448,6 +448,16 @@ async fn anthropic_stream_with_retry(
             let idle_pre = crate::turn::llm::client::stream_idle_timeout();
             let idle_post = crate::turn::llm::client::stream_idle_timeout_after_progress();
             let cc = client_cancel.clone();
+            let client_for_fallback = client.clone();
+            let messages_for_fallback: Vec<Value> = messages.to_vec();
+            let tools_for_fallback: Vec<Value> = tools.to_vec();
+            let model_for_fallback = upstream_name.to_string();
+            let api_key_for_fallback = api_key.to_string();
+            let base_url_for_fallback = base_url.to_string();
+            let provider_for_fallback = provider.to_string();
+            let max_out_for_fallback = max_output_tokens;
+            let request_body_overrides_for_fallback = request_body_overrides.cloned();
+            let thinking_for_fallback = thinking.clone();
             let out = stream! {
                 let sse = parse_openai_sse_json_stream(byte_stream);
                 tokio::pin!(sse);
@@ -459,6 +469,7 @@ async fn anthropic_stream_with_retry(
                     std::collections::HashMap::new();
                 let mut usage = Map::new();
                 let mut made_progress = false;
+                let mut had_terminal_error = false;
 
                 loop {
                     let idle = if made_progress { idle_post } else { idle_pre };
@@ -475,22 +486,200 @@ async fn anthropic_stream_with_retry(
                             let Ok(next) = tick else {
                                 astra_core::agent_warn!(
                                     "llm",
-                                    "anthropic SSE idle after {}ms — closing",
+                                    "anthropic SSE idle after {}ms (made_progress={})",
                                     idle.as_millis(),
+                                    made_progress,
                                 );
+                                if made_progress {
+                                    let streamed_text = full_text.clone();
+                                    let streamed_reasoning = reasoning.clone();
+                                    let existing_tool_calls = tool_calls_map.clone();
+                                    let fb_timeout = crate::turn::llm::client::llm_fallback_timeout();
+                                    match crate::turn::llm::client::call_llm_nonstream_fallback_with_request_overrides(
+                                        &client_for_fallback,
+                                        &messages_for_fallback,
+                                        &tools_for_fallback,
+                                        &model_for_fallback,
+                                        &api_key_for_fallback,
+                                        &base_url_for_fallback,
+                                        &provider_for_fallback,
+                                        max_out_for_fallback,
+                                        fb_timeout,
+                                        None,
+                                        request_body_overrides_for_fallback.as_ref(),
+                                        None,
+                                        None,
+                                        &thinking_for_fallback,
+                                    )
+                                    .await
+                                    {
+                                        Ok(mut result) => {
+                                            ensure_tool_call_ids(&mut result.tool_calls);
+                                            full_text = result.full_text.clone();
+                                            reasoning = result.reasoning.clone();
+                                            if !result.reasoning_signature.is_empty() {
+                                                reasoning_signature = result.reasoning_signature.clone();
+                                            }
+                                            usage = result.usage.clone();
+                                            tool_calls_map.clear();
+                                            for (i, tc) in result.tool_calls.iter().enumerate() {
+                                                if let Value::Object(m) = tc {
+                                                    tool_calls_map.insert(i, m.clone());
+                                                }
+                                            }
+                                            if result.tool_calls.is_empty()
+                                                && let Some(suffix) =
+                                                    streamed_suffix(&streamed_text, &result.full_text)
+                                            {
+                                                yield render_sse(&json!({"type":"text_delta","content": suffix}));
+                                            }
+                                            if let Some(suffix) =
+                                                streamed_suffix(&streamed_reasoning, &result.reasoning)
+                                            {
+                                                yield render_sse(&json!({"type":"reasoning_delta","content": suffix}));
+                                            }
+                                            for (i, tc) in result.tool_calls.iter().enumerate() {
+                                                if tool_call_start_already_emitted(&existing_tool_calls, i) {
+                                                    continue;
+                                                }
+                                                if let Some(obj) = tc.as_object() {
+                                                    let mut tc = obj.clone();
+                                                    if let Some(event) = tool_call_start_event(&mut tc) {
+                                                        yield render_sse(&event);
+                                                    }
+                                                }
+                                            }
+                                            if let Some(event) = usage_sse_event_from_result_map(&result.usage) {
+                                                yield render_sse(&event);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            had_terminal_error = true;
+                                            yield render_sse(&Value::Object(
+                                                crate::build_stream_error_event(
+                                                    &format!("anthropic stream stalled; non-stream recovery failed: {e}"),
+                                                    "stream_transport",
+                                                    true,
+                                                ),
+                                            ));
+                                            tool_calls_map.clear();
+                                            full_text.clear();
+                                            reasoning.clear();
+                                            reasoning_signature.clear();
+                                        }
+                                    }
+                                } else {
+                                    had_terminal_error = true;
+                                    yield render_sse(&Value::Object(
+                                        crate::build_stream_error_event(
+                                            "anthropic SSE idle before any response data",
+                                            "stream_idle",
+                                            true,
+                                        ),
+                                    ));
+                                }
                                 break;
                             };
                             let Some(chunk) = next else { break };
                             let chunk = match chunk {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    yield render_sse(&Value::Object(
-                                        crate::build_stream_error_event(
-                                            &format!("anthropic SSE transport error: {e}"),
-                                            "stream_transport",
-                                            true,
-                                        ),
-                                    ));
+                                    if made_progress {
+                                        astra_core::agent_warn!(
+                                            "llm",
+                                            "anthropic SSE transport error after progress: {e} — attempting non-stream fallback"
+                                        );
+                                        let streamed_text = full_text.clone();
+                                        let streamed_reasoning = reasoning.clone();
+                                        let existing_tool_calls = tool_calls_map.clone();
+                                        let fb_timeout = crate::turn::llm::client::llm_fallback_timeout();
+                                        match crate::turn::llm::client::call_llm_nonstream_fallback_with_request_overrides(
+                                            &client_for_fallback,
+                                            &messages_for_fallback,
+                                            &tools_for_fallback,
+                                            &model_for_fallback,
+                                            &api_key_for_fallback,
+                                            &base_url_for_fallback,
+                                            &provider_for_fallback,
+                                            max_out_for_fallback,
+                                            fb_timeout,
+                                            None,
+                                            request_body_overrides_for_fallback.as_ref(),
+                                            None,
+                                            None,
+                                            &thinking_for_fallback,
+                                        )
+                                        .await
+                                        {
+                                            Ok(mut result) => {
+                                                ensure_tool_call_ids(&mut result.tool_calls);
+                                                full_text = result.full_text.clone();
+                                                reasoning = result.reasoning.clone();
+                                                if !result.reasoning_signature.is_empty() {
+                                                    reasoning_signature = result.reasoning_signature.clone();
+                                                }
+                                                usage = result.usage.clone();
+                                                tool_calls_map.clear();
+                                                for (i, tc) in result.tool_calls.iter().enumerate() {
+                                                    if let Value::Object(m) = tc {
+                                                        tool_calls_map.insert(i, m.clone());
+                                                    }
+                                                }
+                                                if result.tool_calls.is_empty()
+                                                    && let Some(suffix) =
+                                                        streamed_suffix(&streamed_text, &result.full_text)
+                                                {
+                                                    yield render_sse(&json!({"type":"text_delta","content": suffix}));
+                                                }
+                                                if let Some(suffix) =
+                                                    streamed_suffix(&streamed_reasoning, &result.reasoning)
+                                                {
+                                                    yield render_sse(&json!({"type":"reasoning_delta","content": suffix}));
+                                                }
+                                                for (i, tc) in result.tool_calls.iter().enumerate() {
+                                                    if tool_call_start_already_emitted(&existing_tool_calls, i) {
+                                                        continue;
+                                                    }
+                                                    if let Some(obj) = tc.as_object() {
+                                                        let mut tc = obj.clone();
+                                                        if let Some(event) = tool_call_start_event(&mut tc) {
+                                                            yield render_sse(&event);
+                                                        }
+                                                    }
+                                                }
+                                                if let Some(event) = usage_sse_event_from_result_map(&result.usage) {
+                                                    yield render_sse(&event);
+                                                }
+                                            }
+                                            Err(error) => {
+                                                had_terminal_error = true;
+                                                yield render_sse(&Value::Object(
+                                                    crate::build_stream_error_event(
+                                                        &format!("anthropic stream transport failed; non-stream recovery failed: {error}"),
+                                                        "stream_transport",
+                                                        true,
+                                                    ),
+                                                ));
+                                                tool_calls_map.clear();
+                                                full_text.clear();
+                                                reasoning.clear();
+                                                reasoning_signature.clear();
+                                            }
+                                        }
+                                    } else {
+                                        had_terminal_error = true;
+                                        yield render_sse(&Value::Object(
+                                            crate::build_stream_error_event(
+                                                &format!("anthropic SSE transport error: {e}"),
+                                                "stream_transport",
+                                                true,
+                                            ),
+                                        ));
+                                        tool_calls_map.clear();
+                                        full_text.clear();
+                                        reasoning.clear();
+                                        reasoning_signature.clear();
+                                    }
                                     break;
                                 }
                             };
@@ -507,6 +696,10 @@ async fn anthropic_stream_with_retry(
                             }
                         }
                     }
+                }
+
+                if had_terminal_error {
+                    return;
                 }
 
                 let tool_calls: Vec<Value> = {
@@ -2002,6 +2195,69 @@ mod tests {
         format!("http://{addr}")
     }
 
+    async fn spawn_raw_anthropic_partial_transport_server(
+        hits: TransportFallbackHits,
+        fallback_status: u16,
+        fallback_body: &'static str,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw mock anthropic listener");
+        let addr = listener.local_addr().expect("raw anthropic local_addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let hits = hits.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 8192];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..read]);
+                    let is_stream = req.contains("\"stream\":true");
+                    if is_stream {
+                        hits.stream_hits.fetch_add(1, Ordering::SeqCst);
+                        let partial = format!(
+                            "event: content_block_delta\ndata: {}\n\n",
+                            json!({
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {"type": "text_delta", "text": "partial"},
+                            })
+                        );
+                        let chunk = format!("{:X}\r\n{}\r\n", partial.len(), partial);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{chunk}"
+                        );
+                        socket
+                            .write_all(response.as_bytes())
+                            .await
+                            .expect("write partial anthropic stream response");
+                        let _ = socket.shutdown().await;
+                    } else {
+                        hits.fallback_hits.fetch_add(1, Ordering::SeqCst);
+                        let status_text = if fallback_status == 200 {
+                            "OK"
+                        } else {
+                            "Internal Server Error"
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {fallback_status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{fallback_body}",
+                            fallback_body.len()
+                        );
+                        socket
+                            .write_all(response.as_bytes())
+                            .await
+                            .expect("write anthropic fallback response");
+                        let _ = socket.shutdown().await;
+                    }
+                });
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        format!("http://{addr}")
+    }
+
     #[tokio::test]
     async fn call_llm_stream_falls_back_after_partial_stream_transport_error() {
         let hits = TransportFallbackHits {
@@ -2042,6 +2298,112 @@ mod tests {
         assert!(
             body.contains("from-transport-fallback"),
             "fallback content should reach the client: {body}"
+        );
+        assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(hits.fallback_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_transport_falls_back_after_partial_stream_transport_error() {
+        let hits = TransportFallbackHits {
+            stream_hits: Arc::new(AtomicU32::new(0)),
+            fallback_hits: Arc::new(AtomicU32::new(0)),
+        };
+        let base = spawn_raw_anthropic_partial_transport_server(
+            hits.clone(),
+            200,
+            r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[{"type":"text","text":"partial recovered"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2}}"#,
+        )
+        .await;
+        let stream = call_llm_stream(
+            &[json!({"role":"user","content":"hi"})],
+            &[],
+            "claude-test",
+            None,
+            "k",
+            &base,
+            "anthropic",
+            None,
+            false,
+            None,
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+        )
+        .await
+        .expect("anthropic bridge stream");
+        let body = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .collect::<String>();
+        assert!(
+            !body.contains("\"type\":\"error\""),
+            "anthropic transport-after-progress should recover via fallback instead of emitting an error: {body}"
+        );
+        let stitched_text = body
+            .split("\n\n")
+            .filter_map(|frame| frame.trim().strip_prefix("data: "))
+            .filter_map(|json_line| serde_json::from_str::<Value>(json_line).ok())
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("text_delta"))
+            .filter_map(|event| {
+                event
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<String>();
+        assert_eq!(
+            stitched_text, "partial recovered",
+            "fallback should only emit the missing anthropic suffix: {body}"
+        );
+        assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(hits.fallback_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_transport_fallback_failure_emits_structured_error_code() {
+        let hits = TransportFallbackHits {
+            stream_hits: Arc::new(AtomicU32::new(0)),
+            fallback_hits: Arc::new(AtomicU32::new(0)),
+        };
+        let base = spawn_raw_anthropic_partial_transport_server(
+            hits.clone(),
+            500,
+            r#"{"error":{"message":"fallback transport recovery failed"}}"#,
+        )
+        .await;
+        let stream = call_llm_stream(
+            &[json!({"role":"user","content":"hi"})],
+            &[],
+            "claude-test",
+            None,
+            "k",
+            &base,
+            "anthropic",
+            None,
+            false,
+            None,
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+        )
+        .await
+        .expect("anthropic bridge stream");
+        let body = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .collect::<String>();
+        assert!(
+            body.contains("\"content\":\"partial\""),
+            "partial anthropic text should reach the client before fallback failure: {body}"
+        );
+        assert!(
+            body.contains("\"code\":\"stream_transport\""),
+            "anthropic transport fallback failure should emit structured stream_transport code: {body}"
+        );
+        assert!(
+            body.contains("\"retryable\":true"),
+            "anthropic transport fallback failure should stay retryable: {body}"
         );
         assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
         assert_eq!(hits.fallback_hits.load(Ordering::SeqCst), 1);

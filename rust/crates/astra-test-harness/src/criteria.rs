@@ -31,6 +31,15 @@ pub enum Criterion {
     /// pinning expected failures.
     ExitCode { code: i32 },
 
+    /// Passes when `astra chat --json` reports the expected terminal state.
+    FinalState { expect: String },
+
+    /// Passes when the structured interruption kind matches.
+    InterruptionKind { expect: String },
+
+    /// Passes when a tool result class occurred within the expected count range.
+    ToolResultClassCount { class: String, min: u32, max: u32 },
+
     /// Passes when the total tool_calls_count is within the range
     /// `min..=max`. Catches runaway loops or under-tool-use.
     ToolsCountBetween { min: u32, max: u32 },
@@ -267,6 +276,9 @@ fn default_severity() -> CriterionSeverity {
 pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
     match c {
         Criterion::ExitCode { .. }
+        | Criterion::FinalState { .. }
+        | Criterion::InterruptionKind { .. }
+        | Criterion::ToolResultClassCount { .. }
         | Criterion::ToolCalled { .. }
         | Criterion::TextContains { .. }
         | Criterion::ToolSequence { .. }
@@ -360,6 +372,46 @@ fn evaluate_one(
                         outcome.tools_used
                     )
                 },
+                full_detail: None,
+                score: None,
+            }
+        }
+        Criterion::FinalState { expect } => {
+            let actual = outcome.final_state.as_deref().unwrap_or("missing");
+            let pass = actual == expect;
+            CriterionResult {
+                criterion: c.clone(),
+                severity: criterion_severity(c),
+                passed: pass,
+                detail: format!("final_state={actual} (expected {expect})"),
+                full_detail: None,
+                score: None,
+            }
+        }
+        Criterion::InterruptionKind { expect } => {
+            let actual = outcome.interruption_kind.as_deref().unwrap_or("missing");
+            let pass = actual == expect;
+            CriterionResult {
+                criterion: c.clone(),
+                severity: criterion_severity(c),
+                passed: pass,
+                detail: format!("interruption_kind={actual} (expected {expect})"),
+                full_detail: None,
+                score: None,
+            }
+        }
+        Criterion::ToolResultClassCount { class, min, max } => {
+            let count = outcome
+                .tool_result_class_counts
+                .get(class)
+                .copied()
+                .unwrap_or(0);
+            let pass = count >= *min && count <= *max;
+            CriterionResult {
+                criterion: c.clone(),
+                severity: criterion_severity(c),
+                passed: pass,
+                detail: format!("tool_result_class_count[{class}]={count}, expected {min}..={max}"),
                 full_detail: None,
                 score: None,
             }
@@ -1009,6 +1061,27 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             Ok(())
         }
         Criterion::ExitCode { .. } => Ok(()),
+        Criterion::FinalState { expect } => {
+            if expect.trim().is_empty() {
+                return Err("FinalState.expect must not be empty".into());
+            }
+            Ok(())
+        }
+        Criterion::InterruptionKind { expect } => {
+            if expect.trim().is_empty() {
+                return Err("InterruptionKind.expect must not be empty".into());
+            }
+            Ok(())
+        }
+        Criterion::ToolResultClassCount { class, min, max } => {
+            if class.trim().is_empty() {
+                return Err("ToolResultClassCount.class must not be empty".into());
+            }
+            if min > max {
+                return Err(format!("ToolResultClassCount: min ({min}) > max ({max})"));
+            }
+            Ok(())
+        }
         Criterion::TokensBetween { min, max } => {
             if min > max {
                 return Err(format!("TokensBetween: min ({min}) > max ({max})"));
@@ -1135,6 +1208,9 @@ mod tests {
             cache_hits: 0,
             total_tool_calls: 0,
             ttft_ms: 0,
+            final_state: None,
+            interruption_kind: None,
+            tool_result_class_counts: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1319,6 +1395,40 @@ mod tests {
         let outside =
             evaluate_deterministic(&[Criterion::ToolsCountBetween { min: 5, max: 10 }], &out);
         assert!(!outside[0].passed);
+    }
+
+    #[test]
+    fn final_state_and_interruption_criteria() {
+        let out = RunOutcome::new("m")
+            .with_final_state("interrupted")
+            .with_interruption_kind("budget_exhausted");
+        let results = evaluate_deterministic(
+            &[
+                Criterion::FinalState {
+                    expect: "interrupted".into(),
+                },
+                Criterion::InterruptionKind {
+                    expect: "budget_exhausted".into(),
+                },
+            ],
+            &out,
+        );
+        assert!(results.iter().all(|result| result.passed));
+    }
+
+    #[test]
+    fn tool_result_class_count_criterion() {
+        let mut out = RunOutcome::new("m");
+        out.tool_result_class_counts.insert("env_failure".into(), 2);
+        let results = evaluate_deterministic(
+            &[Criterion::ToolResultClassCount {
+                class: "env_failure".into(),
+                min: 1,
+                max: 2,
+            }],
+            &out,
+        );
+        assert!(results[0].passed);
     }
 
     #[test]

@@ -571,6 +571,11 @@ pub struct ToolCallRecord {
     /// test failures).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_semantics: Option<String>,
+    /// Output-aware command result classification for trace/harness use.
+    /// This catches failures that raw exit status can hide, such as a
+    /// build/test pipeline whose final `tail` command exits successfully.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_class: Option<String>,
 }
 
 /// Tool call name sentinel used for assistant messages that had parallel tool

@@ -541,23 +541,6 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) {
-    // ── Harness: SessionEnd (observe only, fire at most once) ──
-    #[cfg(feature = "harness")]
-    if !state.harness.session_ended {
-        state.harness.session_ended = true;
-        super::super::harness_adapter::harness_at!(
-            &state.harness,
-            astra_harness::HookPoint::SessionEnd,
-            state
-        );
-    }
-    #[cfg(not(feature = "harness"))]
-    super::super::harness_adapter::harness_at!(
-        &state.harness,
-        astra_harness::HookPoint::SessionEnd,
-        state
-    );
-
     finalize_turn_trace(state).await;
     close_pending_memory_feedback_at_turn_end(state).await;
 
@@ -577,6 +560,26 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     reset_per_turn_corrective_state(state);
     state.refresh_task_board_snapshot().await;
     ensure_terminal_text(state);
+
+    // ── Harness: SessionEnd (observe only, fire at most once) ──
+    // Fire after terminal text/interruption normalization so snapshots expose
+    // the real final state instead of a pre-finalization empty/completed shell.
+    #[cfg(feature = "harness")]
+    if !state.harness.session_ended {
+        state.harness.session_ended = true;
+        super::super::harness_adapter::harness_at!(
+            &state.harness,
+            astra_harness::HookPoint::SessionEnd,
+            state
+        );
+    }
+    #[cfg(not(feature = "harness"))]
+    super::super::harness_adapter::harness_at!(
+        &state.harness,
+        astra_harness::HookPoint::SessionEnd,
+        state
+    );
+
     try_write_heavy_checkpoint(state);
     if !state.final_text.is_empty() && !state.final_text_streamed {
         host.render_final_text(&state.final_text);

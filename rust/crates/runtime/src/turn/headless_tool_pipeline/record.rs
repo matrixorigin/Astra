@@ -139,6 +139,16 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         // Fill observability fields on the just-pushed record.
         if let Some(rec) = self.ctx.tool_call_records.last_mut() {
             rec.tool_call_id = Some(execution.id.clone());
+            if let Some(fields) = execution.tool_result_fields.as_ref() {
+                rec.exit_semantics = fields
+                    .get("exit_semantics")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string);
+                rec.result_class = fields
+                    .get("result_class")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string);
+            }
             if let Some(start) = self.ctx.turn_start {
                 rec.start_offset_ms =
                     Some((start.elapsed().as_millis() as u64).saturating_sub(executed_ms));

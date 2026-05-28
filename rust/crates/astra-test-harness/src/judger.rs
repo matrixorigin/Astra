@@ -834,6 +834,9 @@ mod tests {
             cache_hits: 0,
             total_tool_calls: 0,
             ttft_ms: 0,
+            final_state: None,
+            interruption_kind: None,
+            tool_result_class_counts: std::collections::BTreeMap::new(),
         }
     }
 
@@ -946,6 +949,9 @@ mod tests {
             cache_hits: 0,
             total_tool_calls: 0,
             ttft_ms: 0,
+            final_state: None,
+            interruption_kind: None,
+            tool_result_class_counts: std::collections::BTreeMap::new(),
         }
     }
 

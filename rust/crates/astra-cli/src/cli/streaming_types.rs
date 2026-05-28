@@ -115,6 +115,10 @@ pub(crate) struct StreamResult {
     /// Structured interruption context when the runtime completed the turn
     /// partially (for example due to budget exhaustion after tool progress).
     pub(crate) interruption: Option<serde_json::Value>,
+    /// Machine-readable terminal state: completed, interrupted, or empty.
+    pub(crate) final_state: String,
+    /// Interruption kind label when final_state is interrupted.
+    pub(crate) interruption_kind: Option<String>,
     /// Full messages array after this turn — used by CslManager for persistence.
     pub(crate) final_messages: Vec<serde_json::Value>,
     /// Results from background-spawned agents collected after the agentic

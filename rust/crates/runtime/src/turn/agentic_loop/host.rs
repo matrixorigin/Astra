@@ -9416,10 +9416,28 @@ mod parallel_execution_tests {
     mod harness_e2e {
         use super::*;
         use astra_harness::{
-            HarnessKernel, HarnessLimits, HookPoint, InMemorySnapshotSink, RecordingKernel,
-            SnapshotSink, StandardKernel,
+            DecisionRecord, HarnessKernel, HarnessLimits, HookPoint, HookVerdict,
+            InMemorySnapshotSink, RecordingKernel, SnapshotSink, StandardKernel,
         };
         use std::sync::Arc;
+
+        struct PauseAtPostTurnKernel;
+
+        impl HarnessKernel for PauseAtPostTurnKernel {
+            fn snapshot(&self) -> Option<astra_harness::RuntimeSnapshot> {
+                None
+            }
+
+            fn on_record(&self, record: &DecisionRecord) -> HookVerdict {
+                if record.point == HookPoint::PostTurn {
+                    HookVerdict::Pause {
+                        reason: "decision checkpoint from test".into(),
+                    }
+                } else {
+                    HookVerdict::Continue
+                }
+            }
+        }
 
         fn setup_harness_state(
             limits: HarnessLimits,
@@ -9638,6 +9656,49 @@ mod parallel_execution_tests {
                 session_ends.len(),
                 1,
                 "exactly one SessionEnd must fire even when harness blocks"
+            );
+        }
+
+        #[tokio::test]
+        async fn harness_paused_verdict_sets_pause_interruption() {
+            let sink = InMemorySnapshotSink::arc();
+            let mut state = make_state();
+            state.current_session_id = Some("pause-test".into());
+            state.message = "test query".into();
+            state
+                .messages
+                .push(json!({"role": "user", "content": "test query"}));
+            state.max_turns = 5;
+            state.remaining_turns = 5;
+            state.harness = crate::turn::harness_adapter::HarnessSlot::new(
+                Arc::new(PauseAtPostTurnKernel) as Arc<dyn HarnessKernel>,
+                sink as Arc<dyn SnapshotSink>,
+            );
+
+            let mut host = MockHost::new(vec![edge_tool_result(
+                vec![make_edge_tool("bash", "output")],
+                100,
+                20,
+                Some(50),
+            )])
+            .with_valid_tools(&["bash"]);
+
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            assert!(outcome.is_ok());
+            let interruption = state
+                .interruption
+                .as_ref()
+                .expect("pause verdict must set interruption");
+            assert_eq!(
+                interruption.kind,
+                astra_turn_core::interruption::InterruptionKind::HarnessPaused
+            );
+            assert!(
+                interruption
+                    .error_detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("decision checkpoint")),
+                "pause reason should be preserved for resume guidance"
             );
         }
 

@@ -237,6 +237,19 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
     } = ctx;
     let (tool_calls_count, tools_used) =
         resolved_tool_metrics(tool_calls_count, tools_used, &tool_call_records);
+    let interruption_kind = interruption
+        .as_ref()
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let final_state = if interruption_kind.is_some() {
+        "interrupted"
+    } else if full_text.trim().is_empty() {
+        "empty"
+    } else {
+        "completed"
+    }
+    .to_string();
 
     let report = first_selection_report.unwrap_or_else(|| tool_registry::SelectionReport {
         tools_selected: Vec::new(),
@@ -295,6 +308,8 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         turn_observability_events,
         llm_rounds,
         interruption,
+        final_state,
+        interruption_kind,
         final_messages,
         background_agent_results: Vec::new(),
     }
@@ -369,9 +384,27 @@ mod tests {
         assert_eq!(result.session_id.as_deref(), Some("sess-1"));
         assert_eq!(result.run_id.as_deref(), Some("run-1"));
         assert_eq!(result.full_text, "hello");
+        assert_eq!(result.final_state, "completed");
+        assert_eq!(result.interruption_kind, None);
         assert_eq!(result.tool_calls_count, 3);
         assert_eq!(result.ttft_ms, Some(42));
         assert_eq!(result.context_ms, Some(100));
+    }
+
+    #[test]
+    fn build_stream_result_marks_interrupted_state() {
+        let sr = make_step_recorder();
+        let tg = make_turn_guard();
+        let mut ctx = make_build_ctx(&sr, &tg);
+        ctx.interruption = Some(serde_json::json!({"kind": "budget_exhausted"}));
+
+        let result = build_stream_result(ctx);
+
+        assert_eq!(result.final_state, "interrupted");
+        assert_eq!(
+            result.interruption_kind.as_deref(),
+            Some("budget_exhausted")
+        );
     }
 
     fn tool_record(name: &str, ok: bool, result_preview: Option<&str>) -> ToolCallRecord {

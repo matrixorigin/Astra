@@ -4615,6 +4615,7 @@ mod tests {
                 skill_reentry_count: None,
                 skill_locked_out: None,
                 exit_semantics: None,
+                result_class: None,
             });
         }
 

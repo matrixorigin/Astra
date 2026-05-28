@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use astra_sandbox::{CommandRisk, analyze_command_risks, is_rm_catastrophic_rm_path};
 
-use crate::exit_semantics::{ExitSemantics, classify_exit};
+use crate::exit_semantics::{ExitSemantics, classify_command_result, classify_exit};
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
 const GREP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -199,7 +199,18 @@ fn classify_single_segment(segment: &str) -> BashCommandClass {
         "vitest" | "jest" | "mocha" | "playwright" | "cypress" => BashCommandClass::Test,
 
         // ── Python ────────────────────────────────────────────────────────
-        "python" | "python3" | "uv" | "poetry" | "pip" | "pip3" => match sub {
+        "python" | "python3" => {
+            if sub == "-m" {
+                match rest.get(2).copied().unwrap_or("") {
+                    "pytest" | "unittest" => BashCommandClass::Test,
+                    "mypy" | "pyright" | "pylint" => BashCommandClass::Lint,
+                    _ => BashCommandClass::Build,
+                }
+            } else {
+                BashCommandClass::Build
+            }
+        }
+        "uv" | "poetry" | "pip" | "pip3" => match sub {
             "install" | "sync" | "add" | "lock" => BashCommandClass::Package,
             _ => BashCommandClass::Build,
         },
@@ -575,10 +586,12 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
 
     let timeout = Duration::from_secs_f64(timeout_secs);
     let mut cmd = Command::new("bash");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(workspace_root)
-        .kill_on_drop(true);
+    if should_enable_pipefail(command) {
+        cmd.arg("-o").arg("pipefail").arg("-c").arg(command);
+    } else {
+        cmd.arg("-c").arg(command);
+    }
+    cmd.current_dir(workspace_root).kill_on_drop(true);
 
     let output_limit = per_tool_output_limit("bash");
     let raw_stdout_limit = output_limit.saturating_mul(2).max(16_384);
@@ -713,12 +726,22 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
     }
 
     let exit_semantics = classify_exit(command, output.exit_code);
-    if output.exit_code != 0 {
+    let result_class = classify_command_result(
+        command,
+        &output.stdout,
+        &output.stderr,
+        Some(output.exit_code),
+    );
+    if output.exit_code != 0 || result_class.is_tool_error() {
         let output = truncate_output(result, output_limit);
-        if exit_semantics.is_tool_error() {
-            return ToolResult::error(output).with_exit_semantics(exit_semantics);
+        if exit_semantics.is_tool_error() || result_class.is_tool_error() {
+            return ToolResult::error(output)
+                .with_exit_semantics(exit_semantics)
+                .with_result_class(result_class);
         }
-        return ToolResult::text(output).with_exit_semantics(exit_semantics);
+        return ToolResult::text(output)
+            .with_exit_semantics(exit_semantics)
+            .with_result_class(result_class);
     }
 
     if command_has_background_operator(command) {
@@ -736,10 +759,49 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
     if result.is_empty() {
         ToolResult::text("(command completed with no output)".into())
             .with_exit_semantics(ExitSemantics::Success)
+            .with_result_class(result_class)
     } else {
         ToolResult::text(truncate_output(result, output_limit))
             .with_exit_semantics(ExitSemantics::Success)
+            .with_result_class(result_class)
     }
+}
+
+fn should_enable_pipefail(command: &str) -> bool {
+    if !command_has_pipeline_operator(command) {
+        return false;
+    }
+    matches!(
+        classify_bash_command(command),
+        BashCommandClass::Build | BashCommandClass::Lint | BashCommandClass::Test
+    )
+}
+
+fn command_has_pipeline_operator(command: &str) -> bool {
+    let chars: Vec<char> = command.chars().collect();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if !in_single => {
+                i += 2;
+                continue;
+            }
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '|' if !in_single && !in_double => {
+                let prev = i.checked_sub(1).and_then(|idx| chars.get(idx)).copied();
+                let next = chars.get(i + 1).copied();
+                if prev != Some('|') && next != Some('|') {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Returns true if the command uses `&` to background a process (not `&&`).
@@ -4345,6 +4407,32 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
+    async fn bash_masked_missing_command_is_env_failure() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "definitely_missing_astra_command_for_test -m pytest 2>&1 | tail -20"
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_error,
+            "masked env failure must be an error: {result:?}"
+        );
+        let metadata = result.metadata.as_ref().expect("result_class metadata");
+        assert_eq!(
+            metadata
+                .get("result_class")
+                .and_then(serde_json::Value::as_str),
+            Some("env_failure")
+        );
+    }
+
+    #[tokio::test]
     async fn bash_timeout_keeps_partial_output() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
@@ -4620,6 +4708,8 @@ printf 'probe.txt:1:needle\n'
         assert_eq!(classify_bash_command("tsc --noEmit"), Build);
         assert_eq!(classify_bash_command("vitest run"), Test);
         assert_eq!(classify_bash_command("pytest tests/"), Test);
+        assert_eq!(classify_bash_command("python -m pytest tests/"), Test);
+        assert_eq!(classify_bash_command("python3 -m unittest tests/"), Test);
         assert_eq!(classify_bash_command("mypy src/"), Lint);
         assert_eq!(classify_bash_command("ruff check ."), Lint);
         assert_eq!(classify_bash_command("ruff format ."), Build);
@@ -4661,6 +4751,18 @@ printf 'probe.txt:1:needle\n'
         assert_eq!(classify_bash_command(""), Unknown);
         assert_eq!(classify_bash_command("some_custom_script.sh"), Unknown);
         assert_eq!(classify_bash_command("./run.sh"), Unknown);
+    }
+
+    #[test]
+    fn pipefail_only_enabled_for_build_lint_test_pipelines() {
+        assert!(should_enable_pipefail(
+            "python -m pytest tests 2>&1 | tail -20"
+        ));
+        assert!(should_enable_pipefail("cargo test 2>&1 | tail -20"));
+        assert!(should_enable_pipefail("cargo clippy 2>&1 | tee clippy.log"));
+        assert!(!should_enable_pipefail("rg TODO src | head -20"));
+        assert!(!should_enable_pipefail("echo 'a|b'"));
+        assert!(!should_enable_pipefail("false || true"));
     }
 
     #[test]
