@@ -238,6 +238,7 @@ impl PipelineStage for ReflectStage {
 mod tests {
     use super::*;
     use crate::event::EventLog;
+    use crate::event::TraceLevel;
     use crate::state::TurnState;
     use std::collections::HashSet;
 
@@ -392,7 +393,7 @@ mod tests {
     async fn reflect_emits_event() {
         let stage = ReflectStage;
         let mut state = make_state();
-        let mut log = EventLog::new();
+        let mut log = EventLog::with_min_level(TraceLevel::Trace);
         state.phase = AgentPhase::Reflect;
 
         let _ = stage.execute(&mut state, &mut log).await.unwrap();

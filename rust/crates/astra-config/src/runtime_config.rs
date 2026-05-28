@@ -36,9 +36,9 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub tool_selection: ToolSelectionConfig,
 
-    /// Telemetry configuration.
+    /// Per-session trace configuration.
     #[serde(default)]
-    pub telemetry: TelemetryConfig,
+    pub trace: SessionTraceConfig,
 
     /// Token budget configuration.
     #[serde(default)]
@@ -286,7 +286,7 @@ impl Default for RuntimeConfig {
             compression: CompressionConfig::default(),
             memory: MemoryConfig::default(),
             tool_selection: ToolSelectionConfig::default(),
-            telemetry: TelemetryConfig::default(),
+            trace: SessionTraceConfig::default(),
             token_budget: TokenBudgetConfig::default(),
             verification: VerificationConfig::default(),
             memory_pressure: MemoryPressureConfig::default(),
@@ -1146,57 +1146,229 @@ impl Default for ToolSelectionConfig {
     }
 }
 
-// ─── Telemetry Configuration ─────────────────────────────────────────────────
+// ─── Session Trace Configuration ──────────────────────────────────────────────
 
-/// Configuration for telemetry and tracing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TelemetryConfig {
-    /// Whether to capture context assembly traces.
-    #[serde(default = "default_true")]
-    pub capture_context_traces: bool,
+/// Predefined trace profiles for per-session trace configuration.
+///
+/// - `Production`: lean operational tracing — `Info`+ for a small core category set.
+/// - `Dev`: maximum introspection — `Trace` level, all categories.
+/// - `Custom`: fully user-controlled via the other fields on [`SessionTraceConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TraceProfile {
+    #[default]
+    Production,
+    Dev,
+    Custom,
+}
 
-    /// Whether to capture full LLM request/response payloads by default.
+// Re-export shared trace types from astra-core
+pub use astra_core::TraceCategory;
+use std::str::FromStr;
+
+/// Where trace events are delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceSink {
+    /// Persist to session journal (JSONL).
+    Journal,
+    /// Emit to stderr via `tracing` subscriber.
+    Stderr,
+    /// Export via OpenTelemetry (requires `otel` feature).
+    Otlp,
+}
+
+/// Per-session trace configuration.
+///
+/// Each session can set its own trace profile, level, category filter, and sink selection.
+///
+/// # Resolution order (highest priority first)
+/// 1. CLI flags (`--trace-profile`, `--trace-level`, `--trace-cat`)
+/// 2. Session metadata / persisted overrides (if session exists)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionTraceConfig {
+    /// Which pre-built profile to use. [`TraceProfile::Custom`] means the other
+    /// fields drive behavior directly.
+    #[serde(default)]
+    pub profile: TraceProfile,
+
+    /// Minimum severity level for event emission. Events with a lower
+    /// default level are silently dropped.
     ///
-    /// Session metadata `full_llm_capture` still wins when it is explicitly
-    /// present, so `/session trace on|off` can override this global default for
-    /// one session.
-    #[serde(default)]
-    pub capture_full_llm_exchanges: bool,
+    /// Serialized as a lowercase string: `"error"`, `"warn"`, `"info"`,
+    /// `"debug"`, `"trace"`.
+    #[serde(default = "default_trace_level")]
+    pub min_level: TraceLevelSerde,
 
-    /// Whether to capture tool execution traces.
-    #[serde(default = "default_true")]
-    pub capture_tool_traces: bool,
+    /// Which event categories to emit. `All` means every category.
+    #[serde(default = "default_trace_categories")]
+    pub enabled_categories: Vec<TraceCategory>,
 
-    /// Whether to capture decision explanations.
-    #[serde(default)]
-    pub capture_explanations: bool,
+    /// Where to deliver trace events. Defaults to `[Journal]`.
+    #[serde(default = "default_trace_sinks")]
+    pub sinks: Vec<TraceSink>,
 
-    /// Maximum traces to keep in memory (reserved for future use).
-    /// Currently traces are per-turn and cleared after persist to journal,
-    /// so no in-memory buffer accumulates. This config will apply if/when
-    /// a diagnostic trace buffer is added for streaming or `/debug traces`.
-    #[serde(default = "default_max_traces_in_memory")]
-    pub max_traces_in_memory: u32,
-
-    /// Whether to persist traces to journal.
-    #[serde(default = "default_true")]
-    pub persist_to_journal: bool,
+    /// Sampling rate (0.0–1.0). 1.0 = emit all non-filtered events;
+    /// 0.1 = emit ~10%. Useful for high-volume Trace-level sessions.
+    #[serde(default = "default_sampling_rate")]
+    pub sampling_rate: f64,
 }
 
-fn default_max_traces_in_memory() -> u32 {
-    100
+// Re-export shared trace types from astra-core
+pub use astra_core::TraceLevel;
+
+// Backward-compatible type alias for serde deserialization
+pub type TraceLevelSerde = TraceLevel;
+
+fn default_trace_level() -> TraceLevel {
+    TraceLevel::Info
 }
 
-impl Default for TelemetryConfig {
+fn production_trace_categories() -> Vec<TraceCategory> {
+    vec![
+        TraceCategory::ToolCalls,
+        TraceCategory::PhaseTransition,
+        TraceCategory::Budget,
+    ]
+}
+
+fn default_trace_categories() -> Vec<TraceCategory> {
+    production_trace_categories()
+}
+
+fn default_trace_sinks() -> Vec<TraceSink> {
+    vec![TraceSink::Journal]
+}
+
+fn default_sampling_rate() -> f64 {
+    1.0
+}
+
+impl Default for SessionTraceConfig {
     fn default() -> Self {
         Self {
-            capture_context_traces: true,
-            capture_full_llm_exchanges: false,
-            capture_tool_traces: true,
-            capture_explanations: false,
-            max_traces_in_memory: default_max_traces_in_memory(),
-            persist_to_journal: true,
+            profile: TraceProfile::default(),
+            min_level: default_trace_level(),
+            enabled_categories: default_trace_categories(),
+            sinks: default_trace_sinks(),
+            sampling_rate: default_sampling_rate(),
         }
+        .normalize()
+    }
+}
+
+impl SessionTraceConfig {
+    fn normalize_categories(categories: Vec<TraceCategory>) -> Vec<TraceCategory> {
+        let mut normalized = if categories.contains(&TraceCategory::All) {
+            TraceCategory::individual_categories().to_vec()
+        } else {
+            categories
+        };
+        normalized.sort();
+        normalized.dedup();
+        normalized
+    }
+
+    fn parse_categories(raw: &str) -> Result<Vec<TraceCategory>, String> {
+        let mut categories = Vec::new();
+        let mut invalid = Vec::new();
+        for token in raw
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            let lowered = token.to_ascii_lowercase();
+            match TraceCategory::from_str(&lowered) {
+                Ok(category) => categories.push(category),
+                Err(()) => invalid.push(token.to_string()),
+            }
+        }
+        if !invalid.is_empty() {
+            return Err(format!("invalid trace categories: {}", invalid.join(", ")));
+        }
+        if categories.is_empty() {
+            return Err("trace categories cannot be empty".to_string());
+        }
+        Ok(Self::normalize_categories(categories))
+    }
+
+    #[must_use]
+    pub fn normalize(mut self) -> Self {
+        self.enabled_categories = Self::normalize_categories(self.enabled_categories);
+        self.sinks.sort();
+        self.sinks.dedup();
+        if !self.sampling_rate.is_finite() {
+            self.sampling_rate = default_sampling_rate();
+        } else {
+            self.sampling_rate = self.sampling_rate.clamp(0.0, 1.0);
+        }
+        self
+    }
+
+    /// Apply a preset profile, overwriting relevant fields.
+    pub fn apply_profile(mut self, profile: TraceProfile) -> Self {
+        match profile {
+            TraceProfile::Production => {
+                self.min_level = TraceLevel::Info;
+                self.enabled_categories = production_trace_categories();
+                self.sinks = vec![TraceSink::Journal];
+                self.sampling_rate = 1.0;
+            }
+            TraceProfile::Dev => {
+                self.min_level = TraceLevel::Trace;
+                self.enabled_categories = TraceCategory::individual_categories().to_vec();
+                self.sinks = vec![TraceSink::Journal, TraceSink::Stderr];
+                self.sampling_rate = 1.0;
+            }
+            TraceProfile::Custom => {
+                // keep existing values; caller is responsible for setting them
+            }
+        }
+        self.profile = profile;
+        self.normalize()
+    }
+
+    /// Check whether a given category should be emitted.
+    pub fn category_enabled(&self, cat: TraceCategory) -> bool {
+        self.enabled_categories.contains(&cat)
+    }
+
+    /// Apply CLI flag overrides (`--trace-profile`, `--trace-level`, `--trace-cat`)
+    /// on top of an existing trace config.
+    pub fn with_cli_overrides(
+        mut self,
+        profile: Option<&str>,
+        level: Option<&str>,
+        cats: Option<&str>,
+    ) -> Result<Self, String> {
+        if let Some(p) = profile {
+            self = self.apply_profile(match p {
+                "production" => TraceProfile::Production,
+                "dev" => TraceProfile::Dev,
+                "custom" => TraceProfile::Custom,
+                other => return Err(format!("invalid trace profile `{other}`")),
+            });
+        }
+        if let Some(l) = level {
+            self.min_level =
+                TraceLevel::from_str(l).map_err(|()| format!("invalid trace level `{l}`"))?;
+        }
+        if let Some(c) = cats {
+            self.enabled_categories = Self::parse_categories(c)?;
+        }
+        if level.is_some() || cats.is_some() {
+            self.profile = TraceProfile::Custom;
+        }
+        Ok(self.normalize())
+    }
+
+    /// Build from CLI flags (`--trace-profile`, `--trace-level`, `--trace-cat`).
+    pub fn from_cli(
+        profile: Option<&str>,
+        level: Option<&str>,
+        cats: Option<&str>,
+    ) -> Result<Self, String> {
+        Self::default().with_cli_overrides(profile, level, cats)
     }
 }
 
@@ -1581,6 +1753,8 @@ impl RuntimeConfig {
             strategy.apply_to(&mut config.compression);
         }
 
+        config.trace = config.trace.normalize();
+
         config
     }
 
@@ -1611,7 +1785,7 @@ impl RuntimeConfig {
             compression,
             memory,
             tool_selection,
-            telemetry,
+            trace,
             token_budget,
             verification,
             memory_pressure,
@@ -1868,44 +2042,31 @@ impl RuntimeConfig {
             self.tool_selection.model_profiles = model_profiles;
         }
 
-        let TelemetryConfig {
-            capture_context_traces,
-            capture_full_llm_exchanges,
-            capture_tool_traces,
-            capture_explanations,
-            max_traces_in_memory,
-            persist_to_journal,
-        } = telemetry;
+        let SessionTraceConfig {
+            profile,
+            min_level,
+            enabled_categories,
+            sinks,
+            sampling_rate,
+        } = trace.normalize();
+        merge_if_non_default(&mut self.trace.profile, profile, TraceProfile::default());
         merge_if_non_default(
-            &mut self.telemetry.capture_context_traces,
-            capture_context_traces,
-            default_true(),
+            &mut self.trace.min_level,
+            min_level,
+            TraceLevelSerde::default(),
         );
         merge_if_non_default(
-            &mut self.telemetry.capture_full_llm_exchanges,
-            capture_full_llm_exchanges,
-            false,
+            &mut self.trace.enabled_categories,
+            enabled_categories,
+            default_trace_categories(),
         );
+        merge_if_non_default(&mut self.trace.sinks, sinks, default_trace_sinks());
         merge_if_non_default(
-            &mut self.telemetry.capture_tool_traces,
-            capture_tool_traces,
-            default_true(),
+            &mut self.trace.sampling_rate,
+            sampling_rate,
+            default_sampling_rate(),
         );
-        merge_if_non_default(
-            &mut self.telemetry.capture_explanations,
-            capture_explanations,
-            false,
-        );
-        merge_if_non_default(
-            &mut self.telemetry.max_traces_in_memory,
-            max_traces_in_memory,
-            default_max_traces_in_memory(),
-        );
-        merge_if_non_default(
-            &mut self.telemetry.persist_to_journal,
-            persist_to_journal,
-            default_true(),
-        );
+        self.trace = std::mem::take(&mut self.trace).normalize();
 
         let TokenBudgetConfig {
             max_prompt_tokens,
@@ -2129,11 +2290,21 @@ impl RuntimeConfig {
         {
             self.token_budget.max_turn_input_tokens = n;
         }
-        if let Ok(val) = std::env::var("ASTRA_CAPTURE_TRACES") {
-            self.telemetry.capture_context_traces = val == "1" || val.to_lowercase() == "true";
+        if let Ok(val) = std::env::var("ASTRA_CAPTURE_TRACES")
+            && (val == "1" || val.to_lowercase() == "true")
+        {
+            self.trace.enabled_categories = TraceCategory::individual_categories().to_vec();
         }
-        if let Ok(val) = std::env::var("ASTRA_CAPTURE_FULL_LLM") {
-            self.telemetry.capture_full_llm_exchanges = val == "1" || val.to_lowercase() == "true";
+        if let Ok(val) = std::env::var("ASTRA_CAPTURE_FULL_LLM")
+            && (val == "1" || val.to_lowercase() == "true")
+            && !self
+                .trace
+                .enabled_categories
+                .contains(&TraceCategory::LlmExchanges)
+        {
+            self.trace
+                .enabled_categories
+                .push(TraceCategory::LlmExchanges);
         }
         // ASTRA_FORK_INHERIT_PREFIX env var is ignored — fork capture
         // is now always-on. The `enabled` field is a deprecated no-op.
@@ -2155,7 +2326,7 @@ mod tests {
         assert_eq!(config.compression.max_history_tokens, 40000);
         assert!((config.compression.compression_threshold - 0.8).abs() < 0.001);
         assert_eq!(config.memory.retrieval_top_k, 5);
-        assert!(!config.telemetry.capture_full_llm_exchanges);
+        assert!(!config.trace.category_enabled(TraceCategory::LlmExchanges));
     }
 
     #[test]
@@ -2348,13 +2519,16 @@ mod tests {
                 exploration_family_churn_midloop_threshold: 0,
                 model_profiles: Vec::new(),
             },
-            telemetry: TelemetryConfig {
-                capture_context_traces: false,
-                capture_full_llm_exchanges: true,
-                capture_tool_traces: false,
-                capture_explanations: true,
-                max_traces_in_memory: 42,
-                persist_to_journal: false,
+            trace: SessionTraceConfig {
+                profile: TraceProfile::Custom,
+                min_level: TraceLevelSerde::Debug,
+                enabled_categories: vec![
+                    TraceCategory::ToolCalls,
+                    TraceCategory::LlmExchanges,
+                    TraceCategory::Reflection,
+                ],
+                sinks: vec![TraceSink::Stderr],
+                sampling_rate: 0.5,
             },
             token_budget: TokenBudgetConfig {
                 max_prompt_tokens: 16000,
@@ -2423,12 +2597,18 @@ mod tests {
         assert!((merged.tool_selection.recent_tool_boost - 0.4).abs() < 0.001);
         assert_eq!(merged.tool_selection.max_tool_schema_tokens, 22000);
 
-        assert!(!merged.telemetry.capture_context_traces);
-        assert!(merged.telemetry.capture_full_llm_exchanges);
-        assert!(!merged.telemetry.capture_tool_traces);
-        assert!(merged.telemetry.capture_explanations);
-        assert_eq!(merged.telemetry.max_traces_in_memory, 42);
-        assert!(!merged.telemetry.persist_to_journal);
+        assert_eq!(merged.trace.profile, TraceProfile::Custom);
+        assert_eq!(merged.trace.min_level, TraceLevelSerde::Debug);
+        assert!(merged.trace.category_enabled(TraceCategory::ToolCalls));
+        assert!(merged.trace.category_enabled(TraceCategory::LlmExchanges));
+        assert!(
+            !merged
+                .trace
+                .category_enabled(TraceCategory::ContextAssembly)
+        );
+        assert!(merged.trace.category_enabled(TraceCategory::Reflection));
+        assert!(merged.trace.sinks.contains(&TraceSink::Stderr));
+        assert!((merged.trace.sampling_rate - 0.5).abs() < 0.001);
 
         assert_eq!(merged.token_budget.max_prompt_tokens, 16000);
         assert_eq!(merged.token_budget.max_turn_input_tokens, 32000);
@@ -3227,5 +3407,192 @@ mod tests {
         // Default value doesn't matter for runtime behavior since
         // the field is a no-op; we just verify it deserializes.
         let _ = cfg.enabled;
+    }
+
+    // ─── SessionTraceConfig::from_cli() tests ─────────────────────
+
+    #[test]
+    fn from_cli_no_args_returns_default() {
+        let cfg = SessionTraceConfig::from_cli(None, None, None).expect("default trace config");
+        let default_cfg = SessionTraceConfig::default();
+        assert_eq!(cfg.profile, default_cfg.profile);
+        assert_eq!(cfg.min_level, default_cfg.min_level);
+        assert_eq!(cfg.enabled_categories, default_cfg.enabled_categories);
+    }
+
+    #[test]
+    fn from_cli_profile_dev() {
+        let cfg = SessionTraceConfig::from_cli(Some("dev"), None, None).expect("dev profile");
+        assert_eq!(cfg.profile, TraceProfile::Dev);
+        assert_eq!(
+            cfg.enabled_categories,
+            TraceCategory::individual_categories().to_vec()
+        );
+    }
+
+    #[test]
+    fn from_cli_profile_production() {
+        let cfg =
+            SessionTraceConfig::from_cli(Some("production"), None, None).expect("prod profile");
+        assert_eq!(cfg.profile, TraceProfile::Production);
+        assert_eq!(cfg.min_level, TraceLevelSerde::Info);
+        assert_eq!(cfg.enabled_categories, default_trace_categories());
+    }
+
+    #[test]
+    fn from_cli_profile_custom() {
+        let cfg = SessionTraceConfig::from_cli(Some("custom"), None, None).expect("custom profile");
+        assert_eq!(cfg.profile, TraceProfile::Custom);
+    }
+
+    #[test]
+    fn from_cli_profile_unknown_errors() {
+        let err = SessionTraceConfig::from_cli(Some("unknown_profile"), None, None)
+            .expect_err("unknown profile must fail");
+        assert!(err.contains("invalid trace profile"));
+    }
+
+    #[test]
+    fn from_cli_level_error() {
+        let cfg = SessionTraceConfig::from_cli(None, Some("error"), None).expect("error level");
+        assert_eq!(cfg.min_level, TraceLevelSerde::Error);
+        assert_eq!(cfg.profile, TraceProfile::Custom);
+    }
+
+    #[test]
+    fn from_cli_level_warn() {
+        let cfg = SessionTraceConfig::from_cli(None, Some("warn"), None).expect("warn level");
+        assert_eq!(cfg.min_level, TraceLevelSerde::Warn);
+    }
+
+    #[test]
+    fn from_cli_level_info() {
+        let cfg = SessionTraceConfig::from_cli(None, Some("info"), None).expect("info level");
+        assert_eq!(cfg.min_level, TraceLevelSerde::Info);
+    }
+
+    #[test]
+    fn from_cli_level_debug() {
+        let cfg = SessionTraceConfig::from_cli(None, Some("debug"), None).expect("debug level");
+        assert_eq!(cfg.min_level, TraceLevelSerde::Debug);
+    }
+
+    #[test]
+    fn from_cli_level_trace() {
+        let cfg = SessionTraceConfig::from_cli(None, Some("trace"), None).expect("trace level");
+        assert_eq!(cfg.min_level, TraceLevelSerde::Trace);
+    }
+
+    #[test]
+    fn from_cli_level_invalid_errors() {
+        let err = SessionTraceConfig::from_cli(None, Some("invalid"), None)
+            .expect_err("invalid level must fail");
+        assert!(err.contains("invalid trace level"));
+    }
+
+    #[test]
+    fn from_cli_categories_all() {
+        let cfg = SessionTraceConfig::from_cli(None, None, Some("all")).expect("all categories");
+        assert_eq!(
+            cfg.enabled_categories,
+            TraceCategory::individual_categories().to_vec()
+        );
+    }
+
+    #[test]
+    fn from_cli_categories_single() {
+        let cfg = SessionTraceConfig::from_cli(None, None, Some("tool_calls")).expect("single cat");
+        assert_eq!(cfg.enabled_categories, vec![TraceCategory::ToolCalls]);
+        assert_eq!(cfg.profile, TraceProfile::Custom);
+    }
+
+    #[test]
+    fn from_cli_categories_multiple() {
+        let cfg = SessionTraceConfig::from_cli(None, None, Some("tool_calls,llm_exchanges,budget"))
+            .expect("multiple categories");
+        assert_eq!(cfg.enabled_categories.len(), 3);
+        assert!(cfg.enabled_categories.contains(&TraceCategory::ToolCalls));
+        assert!(
+            cfg.enabled_categories
+                .contains(&TraceCategory::LlmExchanges)
+        );
+        assert!(cfg.enabled_categories.contains(&TraceCategory::Budget));
+    }
+
+    #[test]
+    fn from_cli_categories_case_insensitive() {
+        let cfg = SessionTraceConfig::from_cli(None, None, Some("TOOL_CALLS,LLM_Exchanges"))
+            .expect("case-insensitive categories");
+        assert_eq!(cfg.enabled_categories.len(), 2);
+        assert!(cfg.enabled_categories.contains(&TraceCategory::ToolCalls));
+        assert!(
+            cfg.enabled_categories
+                .contains(&TraceCategory::LlmExchanges)
+        );
+    }
+
+    #[test]
+    fn from_cli_categories_with_whitespace() {
+        let cfg = SessionTraceConfig::from_cli(None, None, Some(" tool_calls , llm_exchanges "))
+            .expect("whitespace categories");
+        assert_eq!(cfg.enabled_categories.len(), 2);
+        assert!(cfg.enabled_categories.contains(&TraceCategory::ToolCalls));
+        assert!(
+            cfg.enabled_categories
+                .contains(&TraceCategory::LlmExchanges)
+        );
+    }
+
+    #[test]
+    fn from_cli_categories_invalid_error() {
+        let err = SessionTraceConfig::from_cli(None, None, Some("tool_calls,invalid_cat,budget"))
+            .expect_err("invalid category must fail");
+        assert!(err.contains("invalid trace categories"));
+    }
+
+    #[test]
+    fn from_cli_combined_profile_level_categories() {
+        let cfg =
+            SessionTraceConfig::from_cli(Some("dev"), Some("debug"), Some("tool_calls,budget"))
+                .expect("combined overrides");
+        assert_eq!(cfg.profile, TraceProfile::Custom);
+        assert_eq!(cfg.min_level, TraceLevelSerde::Debug);
+        assert_eq!(cfg.enabled_categories.len(), 2);
+        assert!(cfg.enabled_categories.contains(&TraceCategory::ToolCalls));
+        assert!(cfg.enabled_categories.contains(&TraceCategory::Budget));
+    }
+
+    #[test]
+    fn from_cli_profile_overrides_categories() {
+        // Profile sets categories, then explicit categories override
+        let cfg =
+            SessionTraceConfig::from_cli(Some("dev"), None, Some("budget")).expect("override cat");
+        assert_eq!(cfg.profile, TraceProfile::Custom);
+        // Explicit categories should override profile's categories
+        assert_eq!(cfg.enabled_categories, vec![TraceCategory::Budget]);
+    }
+
+    #[test]
+    fn runtime_config_merge_preserves_trace_when_overlay_is_default() {
+        let base = RuntimeConfig {
+            trace: SessionTraceConfig::default().apply_profile(TraceProfile::Dev),
+            ..RuntimeConfig::default()
+        };
+        let merged = base.clone().merge(RuntimeConfig::default());
+        assert_eq!(merged.trace, base.trace);
+    }
+
+    #[test]
+    fn with_cli_overrides_preserves_existing_categories_when_only_level_changes() {
+        let cfg = SessionTraceConfig::default()
+            .apply_profile(TraceProfile::Dev)
+            .with_cli_overrides(None, Some("debug"), None)
+            .expect("level-only override should succeed");
+        assert_eq!(cfg.profile, TraceProfile::Custom);
+        assert_eq!(cfg.min_level, TraceLevelSerde::Debug);
+        assert_eq!(
+            cfg.enabled_categories,
+            TraceCategory::individual_categories().to_vec()
+        );
     }
 }

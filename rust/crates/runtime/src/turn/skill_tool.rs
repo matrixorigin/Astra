@@ -370,7 +370,17 @@ pub fn apply_skill_surfacing_policy(
         return if matches!(policy.allowed_names.as_ref(), Some(names) if !names.is_empty())
             || matches!(policy.allowed_sources.as_ref(), Some(sources) if !sources.is_empty())
         {
-            Err("skill surfacing policy was provided, but no skills are configured".into())
+            let mut fields = Vec::new();
+            if matches!(policy.allowed_names.as_ref(), Some(names) if !names.is_empty()) {
+                fields.push("allow_skills");
+            }
+            if matches!(policy.allowed_sources.as_ref(), Some(sources) if !sources.is_empty()) {
+                fields.push("allow_skill_sources");
+            }
+            Err(format!(
+                "{} was provided, but no skills are configured",
+                fields.join(" and ")
+            ))
         } else {
             Ok(None)
         };
@@ -2393,6 +2403,36 @@ mod tests {
             filtered.available_skills().is_empty(),
             "explicit empty allowlists should deny all surfaced skills"
         );
+    }
+
+    #[test]
+    fn missing_catalog_error_mentions_allow_skills_field() {
+        let policy = SkillSurfacingPolicy {
+            allowed_names: Some(HashSet::from(["code-review".to_string()])),
+            allowed_sources: None,
+        };
+
+        let err = match apply_skill_surfacing_policy(None, &policy) {
+            Ok(_) => panic!("named allowlist without catalog should fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("allow_skills"));
+    }
+
+    #[test]
+    fn missing_catalog_error_mentions_allow_skill_sources_field() {
+        let policy = SkillSurfacingPolicy {
+            allowed_names: None,
+            allowed_sources: Some(HashSet::from([SkillSourceKind::Local])),
+        };
+
+        let err = match apply_skill_surfacing_policy(None, &policy) {
+            Ok(_) => panic!("source allowlist without catalog should fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("allow_skill_sources"));
     }
 
     #[test]

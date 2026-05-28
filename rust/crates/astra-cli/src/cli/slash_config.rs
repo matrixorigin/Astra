@@ -10,7 +10,7 @@
 //! - `/config diff` — Show difference from defaults
 //! - `/config edit` — Alias for `/config` (kept for muscle memory)
 
-use astra_config::runtime_config::RuntimeConfig;
+use astra_config::runtime_config::{RuntimeConfig, TraceCategory};
 use crossterm::style::Stylize;
 use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
@@ -219,31 +219,41 @@ fn show_config() {
         config.token_budget.tools_reserve.to_string().yellow()
     );
 
-    // Telemetry settings
-    println!("\n{}", "📊 Telemetry".bold());
+    // Trace configuration
+    println!("\n{}", "📊 Trace".bold());
     println!(
-        "  capture_context_traces: {}",
-        config.telemetry.capture_context_traces.to_string().yellow()
-    );
-    println!(
-        "  capture_full_llm_exchanges: {}",
-        config
-            .telemetry
-            .capture_full_llm_exchanges
-            .to_string()
+        "  profile: {}",
+        format!("{:?}", config.trace.profile)
+            .to_lowercase()
             .yellow()
     );
     println!(
-        "{}",
-        "    Global default for full request/response capture.".dim()
+        "  min_level: {}",
+        format!("{:?}", config.trace.min_level)
+            .to_lowercase()
+            .yellow()
     );
     println!(
-        "  capture_explanations: {}",
-        config.telemetry.capture_explanations.to_string().yellow()
+        "  enabled_categories: {}",
+        config
+            .trace
+            .enabled_categories
+            .iter()
+            .map(|c| format!("{:?}", c).to_lowercase())
+            .collect::<Vec<_>>()
+            .join(", ")
+            .yellow()
     );
     println!(
-        "  persist_to_journal: {}",
-        config.telemetry.persist_to_journal.to_string().yellow()
+        "  sinks: {}",
+        config
+            .trace
+            .sinks
+            .iter()
+            .map(|s| format!("{:?}", s).to_lowercase())
+            .collect::<Vec<_>>()
+            .join(", ")
+            .yellow()
     );
 
     println!(
@@ -358,30 +368,39 @@ fn show_sources() {
         );
     }
 
-    // Telemetry
-    if final_config.telemetry.capture_context_traces != defaults.telemetry.capture_context_traces {
+    // Trace
+    if final_config.trace.profile != defaults.trace.profile {
         shown_any = true;
         println!(
-            "  • {} = {} [{}]",
-            "telemetry.capture_context_traces".magenta(),
-            final_config
-                .telemetry
-                .capture_context_traces
-                .to_string()
+            "  • {} = {} [profile]",
+            "trace.profile".magenta(),
+            format!("{:?}", final_config.trace.profile)
+                .to_lowercase()
                 .yellow(),
-            source_for("ASTRA_CAPTURE_TRACES")
         );
     }
-    if final_config.telemetry.capture_full_llm_exchanges
-        != defaults.telemetry.capture_full_llm_exchanges
+    if final_config.trace.min_level != defaults.trace.min_level {
+        shown_any = true;
+        println!(
+            "  • {} = {} [level]",
+            "trace.min_level".magenta(),
+            format!("{:?}", final_config.trace.min_level)
+                .to_lowercase()
+                .yellow(),
+        );
+    }
+    if final_config
+        .trace
+        .category_enabled(TraceCategory::LlmExchanges)
+        != defaults.trace.category_enabled(TraceCategory::LlmExchanges)
     {
         shown_any = true;
         println!(
             "  • {} = {} [{}]",
-            "telemetry.capture_full_llm_exchanges".magenta(),
+            "trace.llm_exchanges".magenta(),
             final_config
-                .telemetry
-                .capture_full_llm_exchanges
+                .trace
+                .category_enabled(TraceCategory::LlmExchanges)
                 .to_string()
                 .yellow(),
             source_for("ASTRA_CAPTURE_FULL_LLM")
@@ -446,11 +465,8 @@ fn show_paths() {
             "ASTRA_MAX_TURN_INPUT_TOKENS",
             "token_budget.max_turn_input_tokens",
         ),
-        ("ASTRA_CAPTURE_TRACES", "telemetry.capture_context_traces"),
-        (
-            "ASTRA_CAPTURE_FULL_LLM",
-            "telemetry.capture_full_llm_exchanges",
-        ),
+        ("ASTRA_CAPTURE_TRACES", "trace.enabled_categories"),
+        ("ASTRA_CAPTURE_FULL_LLM", "trace.llm_exchanges"),
     ];
 
     for (var, config_path) in env_vars {
@@ -568,32 +584,43 @@ fn show_diff() {
         );
     }
 
-    // Telemetry
-    if current.telemetry.capture_context_traces != default.telemetry.capture_context_traces {
+    // Trace
+    if current.trace.profile != default.trace.profile {
         has_diff = true;
         println!(
-            "  telemetry.capture_context_traces: {} → {}",
-            default.telemetry.capture_context_traces.to_string().dim(),
-            current
-                .telemetry
-                .capture_context_traces
-                .to_string()
+            "  trace.profile: {} → {}",
+            format!("{:?}", default.trace.profile).to_lowercase().dim(),
+            format!("{:?}", current.trace.profile)
+                .to_lowercase()
                 .yellow()
         );
     }
-    if current.telemetry.capture_full_llm_exchanges != default.telemetry.capture_full_llm_exchanges
+    if current.trace.min_level != default.trace.min_level {
+        has_diff = true;
+        println!(
+            "  trace.min_level: {} → {}",
+            format!("{:?}", default.trace.min_level)
+                .to_lowercase()
+                .dim(),
+            format!("{:?}", current.trace.min_level)
+                .to_lowercase()
+                .yellow()
+        );
+    }
+    if current.trace.category_enabled(TraceCategory::LlmExchanges)
+        != default.trace.category_enabled(TraceCategory::LlmExchanges)
     {
         has_diff = true;
         println!(
-            "  telemetry.capture_full_llm_exchanges: {} → {}",
+            "  trace.llm_exchanges: {} → {}",
             default
-                .telemetry
-                .capture_full_llm_exchanges
+                .trace
+                .category_enabled(TraceCategory::LlmExchanges)
                 .to_string()
                 .dim(),
             current
-                .telemetry
-                .capture_full_llm_exchanges
+                .trace
+                .category_enabled(TraceCategory::LlmExchanges)
                 .to_string()
                 .yellow()
         );

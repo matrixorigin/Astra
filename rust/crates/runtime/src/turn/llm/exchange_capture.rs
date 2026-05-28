@@ -36,8 +36,8 @@ pub(crate) fn session_full_llm_capture_enabled(
     resolve_full_llm_capture_enabled(
         metadata,
         astra_config::runtime_config::RuntimeConfig::cached()
-            .telemetry
-            .capture_full_llm_exchanges,
+            .trace
+            .category_enabled(astra_config::runtime_config::TraceCategory::LlmExchanges),
     )
 }
 
