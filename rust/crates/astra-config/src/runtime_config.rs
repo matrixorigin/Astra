@@ -1261,6 +1261,10 @@ impl SessionTraceConfig {
     /// Store the trace config for the current session. Can be called multiple
     /// times to update the config at runtime (e.g., via /config command).
     pub fn set_current(config: SessionTraceConfig) {
+        // Sync the global trace state so EventLog::new() picks up the config
+        // without needing to depend on SessionTraceConfig directly.
+        astra_core::set_global_min_level(config.min_level);
+        astra_core::set_global_enabled_categories(config.enabled_categories.clone());
         if let Ok(mut guard) = SESSION_TRACE_CONFIG.write() {
             *guard = Some(config);
         }

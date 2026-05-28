@@ -7,6 +7,41 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use std::sync::RwLock;
+
+/// Per-process global minimum trace level.
+///
+/// Set by [`set_global_min_level`] (typically from `SessionTraceConfig::set_current()`).
+/// Read by `EventLog::new()` as its default filter.
+pub static GLOBAL_MIN_LEVEL: RwLock<Option<TraceLevel>> = RwLock::new(None);
+
+/// Per-process global enabled trace categories.
+///
+/// Set by [`set_global_enabled_categories`] (typically from `SessionTraceConfig::set_current()`).
+/// Read by `EventLog::new()` as its default filter.
+pub static GLOBAL_ENABLED_CATEGORIES: RwLock<Option<Vec<TraceCategory>>> = RwLock::new(None);
+
+/// Set the global default min_level for all `EventLog::new()` instances.
+///
+/// After calling this, new `EventLog` instances will use the given level
+/// unless overridden via `EventLog::with_config()`.
+pub fn set_global_min_level(level: TraceLevel) {
+    if let Ok(mut guard) = GLOBAL_MIN_LEVEL.write() {
+        *guard = Some(level);
+    }
+}
+
+/// Set the global default enabled categories for all `EventLog::new()` instances.
+///
+/// After calling this, new `EventLog` instances will filter by the given categories
+/// unless overridden via `EventLog::with_config()`.
+/// An empty vec means all categories pass through.
+pub fn set_global_enabled_categories(categories: Vec<TraceCategory>) {
+    if let Ok(mut guard) = GLOBAL_ENABLED_CATEGORIES.write() {
+        *guard = Some(categories);
+    }
+}
+
 /// Trace event categories that can be toggled on/off per session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -25,7 +25,7 @@
 use crate::runtime_config::{
     RuntimeConfig, TraceCategory, TraceLevelSerde, TraceProfile, TraceSink,
 };
-use astra_core::runtime_limits::{RuntimeLimits, context_window_for_model};
+use astra_core::runtime_limits::{context_window_for_model, RuntimeLimits};
 use serde_json::Value;
 use std::path::Path;
 
@@ -111,7 +111,11 @@ pub fn effective_budget_for_model(config: &RuntimeConfig, model: Option<&str>) -
         // Keep the local-limit fallback consistent with RuntimeLimits:
         // env can override the configured value, so consult it too.
         let env_limit = RuntimeLimits::global().max_turn_input_tokens;
-        if env_limit > 0 { env_limit } else { configured }
+        if env_limit > 0 {
+            env_limit
+        } else {
+            configured
+        }
     }
 }
 
@@ -526,13 +530,14 @@ pub fn apply_edit(
             config.tool_selection.prefer_recent_tools = as_bool(&new_value, id)?;
         }
         "trace.profile" => {
-            // Profile changes require re-apply; handled as enum
             if let Some(s) = new_value.as_str() {
-                config.trace.profile = match s {
+                let profile = match s {
                     "production" => TraceProfile::Production,
                     "dev" => TraceProfile::Dev,
                     _ => TraceProfile::Custom,
                 };
+                // Re-apply full profile effects (min_level, categories, sinks)
+                config.trace = std::mem::take(&mut config.trace).apply_profile(profile);
             }
         }
         "trace.min_level" => {
@@ -711,11 +716,9 @@ mod tests {
             Value::Bool(true),
         )
         .expect("toggle edit should succeed");
-        assert!(
-            updated
-                .trace
-                .enabled_categories
-                .contains(&TraceCategory::LlmExchanges)
-        );
+        assert!(updated
+            .trace
+            .enabled_categories
+            .contains(&TraceCategory::LlmExchanges));
     }
 }

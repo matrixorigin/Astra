@@ -25,34 +25,11 @@ pub use astra_core::{TraceCategory, TraceLevel};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EventId(pub u64);
 
-/// Global default minimum trace level, settable at runtime from CLI flags or /config.
-/// `EventLog::new()` reads this; if unset, falls back to [`TraceLevel::Info`].
-static GLOBAL_MIN_LEVEL: std::sync::RwLock<Option<TraceLevel>> = std::sync::RwLock::new(None);
-
-/// Set the global default min_level for all `EventLog::new()` instances.
-/// Can be called multiple times to update the level at runtime.
-pub fn set_global_min_level(level: TraceLevel) {
-    if let Ok(mut guard) = GLOBAL_MIN_LEVEL.write() {
-        *guard = Some(level);
-    }
-}
-
-// ── Trace categories ────────────────────────────────────────────────
-// TraceCategory is re-exported from astra_core above.
-
-/// Global set of enabled trace categories.
-/// If empty (unset), all categories pass through (no filtering).
-static GLOBAL_CATEGORIES: std::sync::RwLock<Option<Vec<TraceCategory>>> =
-    std::sync::RwLock::new(None);
-
-/// Set the enabled trace categories for the session.
-/// Pass an empty vec to disable filtering (allow all).
-/// Can be called multiple times to update categories at runtime.
-pub fn set_global_trace_categories(cats: Vec<TraceCategory>) {
-    if let Ok(mut guard) = GLOBAL_CATEGORIES.write() {
-        *guard = Some(cats);
-    }
-}
+// Re-export global trace state (now shared from astra_core)
+pub use astra_core::set_global_enabled_categories;
+pub use astra_core::set_global_min_level;
+pub use astra_core::GLOBAL_ENABLED_CATEGORIES;
+pub use astra_core::GLOBAL_MIN_LEVEL;
 
 // TraceLevel is re-exported from astra_core above.
 
@@ -246,7 +223,11 @@ impl EventLog {
                 .ok()
                 .and_then(|guard| *guard)
                 .unwrap_or(TraceLevel::Info),
-            enabled_categories: Vec::new(),
+            enabled_categories: GLOBAL_ENABLED_CATEGORIES
+                .read()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .unwrap_or_default(),
         }
     }
 
