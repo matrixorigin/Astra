@@ -5,7 +5,7 @@
 
 use astra_pipeline::{
     engine::{ExecutionEngine, PipelineStage, StageAction, StageRegistry},
-    event::{EventKind, EventLog},
+    event::{EventKind, EventLog, TraceLevel},
     stages::{evaluate::EvaluateStage, reflect::ReflectStage},
     state::{AgentPhase, TurnOutcome, TurnState, TurnStatus},
 };
@@ -134,7 +134,7 @@ async fn full_loop_stall_triggers_reflect_then_recovers() {
 
     let engine = ExecutionEngine::new(registry);
     let mut state = TurnState::new("test stall recovery", vec![], 20, 1_000_000, 300_000);
-    let mut log = EventLog::new();
+    let mut log = EventLog::with_min_level(TraceLevel::Trace);
 
     engine.run(&mut state, &mut log).await.unwrap();
 
@@ -217,7 +217,7 @@ async fn budget_exhaustion_terminates_cleanly() {
     let engine = ExecutionEngine::new(registry);
     // Only 2 rounds budget
     let mut state = TurnState::new("test budget", vec![], 2, 1_000_000, 300_000);
-    let mut log = EventLog::new();
+    let mut log = EventLog::with_min_level(TraceLevel::Trace);
 
     engine.run(&mut state, &mut log).await.unwrap();
 
@@ -281,7 +281,7 @@ async fn max_reflections_then_fail() {
 
     let engine = ExecutionEngine::new(registry);
     let mut state = TurnState::new("test max reflect", vec![], 50, 1_000_000, 300_000);
-    let mut log = EventLog::new();
+    let mut log = EventLog::with_min_level(TraceLevel::Trace);
 
     engine.run(&mut state, &mut log).await.unwrap();
 
@@ -378,7 +378,7 @@ async fn reflection_injects_context_into_messages() {
 
     let engine = ExecutionEngine::new(registry);
     let mut state = TurnState::new("test context injection", vec![], 20, 1_000_000, 300_000);
-    let mut log = EventLog::new();
+    let mut log = EventLog::with_min_level(TraceLevel::Trace);
 
     engine.run(&mut state, &mut log).await.unwrap();
 
@@ -431,7 +431,7 @@ async fn event_log_captures_full_lifecycle() {
 
     let engine = ExecutionEngine::new(registry);
     let mut state = TurnState::new("test events", vec![], 10, 100_000, 300_000);
-    let mut log = EventLog::new();
+    let mut log = EventLog::with_min_level(TraceLevel::Trace);
 
     engine.run(&mut state, &mut log).await.unwrap();
 
