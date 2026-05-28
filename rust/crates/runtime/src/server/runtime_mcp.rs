@@ -135,10 +135,8 @@ fn server_config(
 
 fn collect_secret_strings(value: &Value, out: &mut Vec<String>) {
     match value {
-        Value::String(s) => {
-            if s.len() >= 4 {
-                out.push(s.clone());
-            }
+        Value::String(s) if s.len() >= 4 => {
+            out.push(s.clone());
         }
         Value::Array(values) => {
             for value in values {
