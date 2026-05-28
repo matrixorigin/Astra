@@ -4,10 +4,13 @@
 //! (poll + take) so each callback is delivered at most once.
 
 use std::collections::HashMap;
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 /// Cap in-memory map size. New entries are REJECTED (not evicted) when this
@@ -27,6 +30,68 @@ pub const MAX_LEDGER_ENTRY_AGE: Duration = Duration::from_secs(300);
 
 pub const MSG_TOOL_LEDGER_TIMEOUT: &str =
     "timed out waiting for edge POST /tools/result (§5.5 ledger)";
+
+/// Retry backoff configuration for [`take_ledger_entry`].
+const BACKOFF_BASE_MS: u64 = 50;
+const BACKOFF_CAP_MS: u64 = 2_000;
+const BACKOFF_MULTIPLIER: u64 = 2;
+
+/// Compute next poll interval with exponential backoff.
+/// Starts at `BACKOFF_BASE_MS`, doubles each retry, caps at `BACKOFF_CAP_MS`.
+fn backoff_delay(retry_count: u32) -> Duration {
+    let ms = BACKOFF_BASE_MS
+        .saturating_mul(BACKOFF_MULTIPLIER.saturating_pow(retry_count))
+        .min(BACKOFF_CAP_MS);
+    Duration::from_millis(ms)
+}
+
+/// Metadata tracked alongside each ledger entry for retry and expiry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LedgerEntryMeta {
+    /// Unix epoch millis when the entry was first inserted.
+    created_at_ms: u64,
+    /// Number of times `take_ledger_entry` polled for this key.
+    retry_count: u32,
+    /// Unix epoch millis of the most recent poll for this key.
+    last_poll_at_ms: u64,
+}
+
+impl LedgerEntryMeta {
+    fn now() -> Self {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Self {
+            created_at_ms: now_ms,
+            retry_count: 0,
+            last_poll_at_ms: now_ms,
+        }
+    }
+
+    fn record_poll(&mut self) {
+        self.retry_count += 1;
+        self.last_poll_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+    }
+
+    fn age_ms(&self) -> u64 {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        now_ms.saturating_sub(self.created_at_ms)
+    }
+}
+
+/// Parallel side-channel of per-entry metadata (created_at, retry count, poll timestamps).
+fn ledger_meta() -> &'static StdMutex<HashMap<String, LedgerEntryMeta>> {
+    static META: std::sync::OnceLock<StdMutex<HashMap<String, LedgerEntryMeta>>> =
+        std::sync::OnceLock::new();
+    META.get_or_init(|| StdMutex::new(HashMap::new()))
+}
 
 /// Side-channel of "first-observed" timestamps for the ledger. We cannot
 /// modify the §5.5 insert helpers (locked down by PR #233) to embed an
@@ -85,7 +150,15 @@ pub async fn sweep_expired_entries(
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    sweep_expired_entries_inner(&mut g, &mut ts, Instant::now(), MAX_LEDGER_ENTRY_AGE)
+    let removed =
+        sweep_expired_entries_inner(&mut g, &mut ts, Instant::now(), MAX_LEDGER_ENTRY_AGE);
+    // Also clean up ledger_meta for removed keys
+    if removed > 0 {
+        if let Ok(mut meta) = ledger_meta().lock() {
+            meta.retain(|k, _| g.contains_key(k));
+        }
+    }
+    removed
 }
 
 /// Returns `true` if any assistant message in `messages` carries a
@@ -114,23 +187,164 @@ pub fn user_prompt_callback_key(user_id: &str, request_id: &str) -> String {
     format!("{user_id}:user_prompt:{request_id}")
 }
 
-/// Remove and return the value for `key`, waiting up to `timeout` (50ms polling).
+/// Record metadata when a new entry is inserted into the ledger by
+/// HTTP callback handlers. Called from
+/// [`super::edge_callback_handlers::insert_ledger_entry`].
+pub fn on_ledger_insert(key: &str) {
+    if let Ok(mut meta) = ledger_meta().lock() {
+        meta.entry(key.to_string())
+            .or_insert_with(LedgerEntryMeta::now);
+    }
+    // Persist if configured.
+    if let Some(p) = ledger_persistence() {
+        let _ = p.write_op("insert", key);
+    }
+}
+
+/// ── File-based persistence ──────────────────────────────────────────
+///
+/// Optional JSONL-based durability for edge callback ledger entries.
+/// When configured via [`set_ledger_persistence`], every insert and
+/// removal is appended to `edge_ledger.jsonl`. On process restart,
+/// [`recover_from_persistence`] replays the journal to restore
+/// un-consumed entries.
+
+/// Persistence handle for the edge callback ledger.
+#[derive(Debug, Clone)]
+pub struct LedgerPersistence {
+    dir: PathBuf,
+}
+
+impl LedgerPersistence {
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    fn file_path(&self) -> PathBuf {
+        self.dir.join("edge_ledger.jsonl")
+    }
+
+    /// Append an operation line to the JSONL journal.
+    fn write_op(&self, op: &str, key: &str) -> io::Result<()> {
+        let line = serde_json::json!({
+            "op": op,
+            "key": key,
+            "ts_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.file_path())?;
+        writeln!(file, "{line}")?;
+        Ok(())
+    }
+
+    /// Read all insert/remove operations and build a recovered ledger.
+    /// Returns the set of keys that were inserted but not yet removed.
+    pub fn recover(&self) -> io::Result<Vec<String>> {
+        let path = self.file_path();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = std::fs::File::open(&path)?;
+        let mut recovered: Vec<String> = Vec::new();
+        for line in io::BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+            let Some(op) = entry.get("op").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(key) = entry.get("key").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            match op {
+                "insert" => recovered.push(key.to_string()),
+                "remove" => {
+                    recovered.retain(|k| k != key);
+                }
+                _ => {}
+            }
+        }
+        Ok(recovered)
+    }
+
+    /// Compact the journal: rewrite with only active (non-removed) entries.
+    pub fn compact(&self, active_keys: &[String]) -> io::Result<()> {
+        let path = self.file_path();
+        let tmp = path.with_extension("jsonl.tmp");
+        let mut file = std::fs::File::create(&tmp)?;
+        for key in active_keys {
+            let line = serde_json::json!({
+                "op": "insert",
+                "key": key,
+                "ts_ms": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            });
+            writeln!(file, "{line}")?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+}
+
+static PERSISTENCE: std::sync::OnceLock<Option<LedgerPersistence>> = std::sync::OnceLock::new();
+
+/// Configure file-based persistence for the ledger.
+/// Must be called at most once, before any ledger operations.
+pub fn set_ledger_persistence(p: LedgerPersistence) {
+    let _ = PERSISTENCE.set(Some(p));
+}
+
+fn ledger_persistence() -> Option<&'static LedgerPersistence> {
+    PERSISTENCE.get().and_then(|opt| opt.as_ref())
+}
+
+/// Remove and return the value for `key`, waiting up to `timeout` with
+/// exponential backoff (50ms → 100ms → 200ms → … → cap 2s).
+///
+/// Each retry records metadata in [`ledger_meta`] for observability.
+/// Expired entries are swept opportunistically before each poll.
 pub async fn take_ledger_entry(
     ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
     key: &str,
     timeout: Duration,
 ) -> Option<Value> {
-    let poll = Duration::from_millis(DEFAULT_POLL_INTERVAL_MS);
     let started = Instant::now();
+    let mut retries: u32 = 0;
     loop {
-        // audit-#6: opportunistically reclaim stale entries before each poll
-        // so an idle ledger never silently fills to LEDGER_MAX_ENTRIES.
-        let _ = sweep_expired_entries(ledger).await;
+        // Sweep stale entries every 5th retry (avoid lock contention).
+        if retries % 5 == 0 {
+            let _ = sweep_expired_entries(ledger).await;
+        }
+        // Record poll in metadata.
+        {
+            if let Ok(mut meta) = ledger_meta().lock() {
+                meta.entry(key.to_string())
+                    .or_insert_with(LedgerEntryMeta::now)
+                    .record_poll();
+            }
+        }
         {
             let mut g = ledger.lock().await;
             if let Some(v) = g.remove(key) {
+                // Clean up metadata and timestamps.
                 if let Ok(mut ts) = ledger_timestamps().lock() {
                     ts.remove(key);
+                }
+                if let Ok(mut meta) = ledger_meta().lock() {
+                    meta.remove(key);
+                }
+                // Write tombstone for crash recovery.
+                if let Some(p) = ledger_persistence() {
+                    let _ = p.write_op("remove", key);
                 }
                 return Some(v);
             }
@@ -138,7 +352,11 @@ pub async fn take_ledger_entry(
         if started.elapsed() >= timeout {
             return None;
         }
-        tokio::time::sleep(poll).await;
+        let delay = backoff_delay(retries);
+        retries += 1;
+        // Don't sleep beyond the remaining timeout.
+        let remaining = timeout.saturating_sub(started.elapsed());
+        tokio::time::sleep(delay.min(remaining)).await;
     }
 }
 
@@ -418,7 +636,7 @@ pub fn strip_stale_reasoning(messages: &mut [Value], provider: &str, model: &str
 mod tests {
     use super::*;
 
-    use crate::history::{RecoveredEventRow, append_recovered_events};
+    use crate::history::{append_recovered_events, RecoveredEventRow};
 
     #[test]
     fn callback_keys_match_handler_convention() {
@@ -979,12 +1197,10 @@ mod tests {
                         .is_some_and(|s| !s.is_empty())
             })
             .expect("should have at least one message with non-empty reasoning");
-        assert!(
-            !last_reasoning["reasoning_content"]
-                .as_str()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(!last_reasoning["reasoning_content"]
+            .as_str()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

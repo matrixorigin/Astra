@@ -10,13 +10,13 @@ use axum::extract::Extension;
 use super::*;
 
 use astra_services::session_journal::{
-    JournalEvent, JournalWriter, find_latest_approval_decision, find_latest_approval_required,
-    validate_session_id,
+    find_latest_approval_decision, find_latest_approval_required, validate_session_id,
+    JournalEvent, JournalWriter,
 };
 use astra_thin_client::ASTRA_EDGE_ID_HEADER;
 use serde::Deserialize;
 
-use astra_turn_core::edge_ledger::{LEDGER_MAX_ENTRIES, approval_callback_key, tool_callback_key};
+use astra_turn_core::edge_ledger::{approval_callback_key, tool_callback_key, LEDGER_MAX_ENTRIES};
 
 /// Server-enforced cap on `last_seen_request_ids` entries per heartbeat.
 /// Excess entries beyond this limit are silently dropped — the edge will
@@ -94,7 +94,8 @@ pub(crate) fn insert_ledger_entry(
     if ledger.len() >= LEDGER_MAX_ENTRIES {
         return Err(LedgerInsertError::CapacityExceeded);
     }
-    ledger.insert(key, value);
+    ledger.insert(key.clone(), value);
+    astra_turn_core::edge_ledger::on_ledger_insert(&key);
     Ok(true)
 }
 
@@ -121,7 +122,8 @@ pub(crate) fn insert_approval_ledger_entry(
         }
         return Err(LedgerInsertError::CapacityExceeded);
     }
-    ledger.insert(key, value);
+    ledger.insert(key.clone(), value);
+    astra_turn_core::edge_ledger::on_ledger_insert(&key);
     Ok(true)
 }
 
@@ -427,7 +429,7 @@ mod edge_callback_insert_tests {
     //! point is to lock in the "at-most-once" contract broken by the
     //! previous `contains_key` short-circuit.
 
-    use super::{LedgerInsertError, insert_approval_ledger_entry, insert_ledger_entry};
+    use super::{insert_approval_ledger_entry, insert_ledger_entry, LedgerInsertError};
     use astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES;
     use serde_json::json;
     use std::collections::HashMap;
