@@ -14,9 +14,18 @@ use std::path::{Path, PathBuf};
 
 use astra_services::SessionArtifactStore;
 
+use crate::journal_crypto::hex_decode;
+use crate::journal_crypto::hex_encode;
+use crate::journal_crypto::JournalCrypto;
 use crate::step_protocol::{
     CheckpointTier, HeavyCheckpoint, LightCheckpoint, StepCheckpoint, StepEvent, StepEventStore,
 };
+use std::sync::OnceLock;
+
+fn journal_crypto() -> &'static JournalCrypto {
+    static CRYPTO: OnceLock<JournalCrypto> = OnceLock::new();
+    CRYPTO.get_or_init(JournalCrypto::from_env_or_machine)
+}
 
 /// Directory name within session workspace for step checkpoints.
 const STEP_CHECKPOINT_DIR: &str = "step_checkpoints";
@@ -25,6 +34,17 @@ const STEP_CHECKPOINT_DIR: &str = "step_checkpoints";
 const MAX_LIGHT_CHECKPOINTS: usize = 50;
 
 /// Get the step checkpoint directory for a session.
+/// Try to decrypt checkpoint content. Falls back to plain JSON for backward compat.
+fn decrypt_checkpoint(content: &str) -> Option<String> {
+    if content.starts_with('{') {
+        // Backward compat: unencrypted JSON
+        return Some(content.to_string());
+    }
+    let bytes = hex_decode(content.trim())?;
+    let decrypted = journal_crypto().decrypt(&bytes)?;
+    String::from_utf8(decrypted).ok()
+}
+
 fn checkpoint_dir_for(session_id: &str) -> PathBuf {
     astra_services::local_session_artifact_store()
         .session_path(session_id, STEP_CHECKPOINT_DIR)
@@ -56,7 +76,9 @@ pub fn write_step_checkpoint(
     {
         use std::io::Write;
         let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(json.as_bytes())?;
+        let encrypted = journal_crypto().encrypt(json.as_bytes());
+        let hex_str = hex_encode(&encrypted);
+        file.write_all(hex_str.as_bytes())?;
         file.sync_all()?;
     }
     std::fs::rename(&tmp_path, &path)?;
@@ -108,7 +130,9 @@ pub fn read_latest_heavy_checkpoint(session_id: &str) -> std::io::Result<Option<
                 continue;
             }
         };
-        let checkpoint: StepCheckpoint = match serde_json::from_str(&content) {
+        let decrypted = decrypt_checkpoint(&content)
+            .unwrap_or_else(|| content.to_string());
+        let checkpoint: StepCheckpoint = match serde_json::from_str(&decrypted) {
             Ok(cp) => cp,
             Err(e) => {
                 astra_core::agent_warn!(
@@ -166,7 +190,9 @@ pub fn read_latest_light_checkpoint(session_id: &str) -> std::io::Result<Option<
                 continue;
             }
         };
-        let checkpoint: StepCheckpoint = match serde_json::from_str(&content) {
+        let decrypted = decrypt_checkpoint(&content)
+            .unwrap_or_else(|| content.to_string());
+        let checkpoint: StepCheckpoint = match serde_json::from_str(&decrypted) {
             Ok(cp) => cp,
             Err(e) => {
                 astra_core::agent_warn!(
@@ -358,7 +384,9 @@ impl FileBackedEventStore {
             if line.trim().is_empty() {
                 continue;
             }
-            if let Ok(event) = serde_json::from_str::<StepEvent>(line) {
+            // Try decrypt first, fall back to plain JSON for backward compat
+            let json = decrypt_checkpoint(line).unwrap_or_else(|| line.to_string());
+            if let Ok(event) = serde_json::from_str::<StepEvent>(&json) {
                 events.push(event);
             }
             // Skip malformed lines (best-effort)
@@ -373,12 +401,14 @@ impl FileBackedEventStore {
         let path = events_path_for(&self.session_id);
         let json = serde_json::to_string(event)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let encrypted = journal_crypto().encrypt(json.as_bytes());
+        let hex_str = hex_encode(&encrypted);
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)?;
-        writeln!(file, "{}", json)?;
+        writeln!(file, "{}", hex_str)?;
         Ok(())
     }
 
