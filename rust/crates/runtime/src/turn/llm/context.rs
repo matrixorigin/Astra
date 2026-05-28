@@ -384,6 +384,7 @@ pub(crate) struct BridgeRuntimeSignals<'a> {
     pub extra_volatile_sections: &'a [crate::prompts::PromptSection],
     pub memory_entries: &'a [astra_turn_core::context_sources::MemoryEntry],
     pub session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
+    pub system_override: Option<&'a str>,
     pub selection_confidence: f64,
     pub task_type: Option<&'a str>,
 }
@@ -394,6 +395,7 @@ impl<'a> BridgeRuntimeSignals<'a> {
         extra_volatile_sections: &'a [crate::prompts::PromptSection],
         memory_entries: &'a [astra_turn_core::context_sources::MemoryEntry],
         session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
+        system_override: Option<&'a str>,
         selection_confidence: f64,
         task_type: Option<&'a str>,
     ) -> Self {
@@ -402,6 +404,7 @@ impl<'a> BridgeRuntimeSignals<'a> {
             extra_volatile_sections,
             memory_entries,
             session_memory_entry,
+            system_override,
             selection_confidence,
             task_type,
         }
@@ -681,6 +684,7 @@ pub(crate) fn assemble_bridge_context(
         input.runtime_signals.extra_volatile_sections,
         input.runtime_signals.memory_entries,
         input.runtime_signals.session_memory_entry.as_ref(),
+        input.runtime_signals.system_override,
         input.runtime_signals.selection_confidence,
         input.runtime_signals.task_type,
         input.session.cache_cfg,
@@ -850,11 +854,21 @@ pub(crate) fn assemble_context_pipeline(
     let plain = astra_turn_core::context_serializer::flatten_serialized_system_blocks(
         &pipeline_output.serialized,
     );
+    let system_prompt_override = input
+        .runtime_signals
+        .edge_profile
+        .get("system_prompt_override")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.trim().is_empty());
     let breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown {
         total_tokens: pipeline_output.metrics.sections,
         session_memory_injected: session_memory_injection(
             input.runtime_signals.session_memory_entry.as_ref(),
         ),
+        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
+            system_prompt_override,
+            ..Default::default()
+        },
         ..Default::default()
     };
 

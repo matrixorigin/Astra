@@ -125,6 +125,11 @@ fn chat_stream_bridge_fallback_payload(
 ) -> serde_json::Value {
     let allow_skills = normalize_bridge_allowlist(chat_data.allow_skills.as_deref());
     let allow_tools = normalize_bridge_allowlist(chat_data.allow_tools.as_deref());
+    let edge_profile = chat_data
+        .context
+        .as_ref()
+        .and_then(|c| c.get("edge_profile"))
+        .cloned();
     // Hoist test_llm_stream_blocks from context to top-level so bridge can find it.
     let test_llm_stream_blocks = chat_data
         .context
@@ -144,6 +149,7 @@ fn chat_stream_bridge_fallback_payload(
         "allow_tools": allow_tools,
         "mcp_binding_ids": chat_data.mcp_binding_ids.as_ref(),
         "context": chat_data.context.as_ref(),
+        "edge_profile": edge_profile,
         "execution_budget": chat_data.execution_budget.as_ref(),
         "explain": chat_data.explain,
         "test_llm_stream_blocks": test_llm_stream_blocks,
@@ -533,6 +539,11 @@ mod tests {
 
     #[test]
     fn chat_stream_fallback_payload_shape() {
+        let mut context = serde_json::Map::new();
+        context.insert(
+            "edge_profile".to_string(),
+            serde_json::json!({"system_prompt_override": "override text"}),
+        );
         let payload = chat_stream_bridge_fallback_payload(&ChatRequestData {
             message: "hello".to_string(),
             session_id: Some("s1".to_string()),
@@ -551,7 +562,7 @@ mod tests {
             allow_skills: Some(vec!["plan".to_string()]),
             allow_tools: Some(vec!["bash".to_string()]),
             mcp_binding_ids: Some(vec![301]),
-            context: None,
+            context: Some(context),
             forward_headers: std::collections::HashMap::new(),
             execution_budget: Some(astra_services::runs::ExecutionBudget {
                 initial_turns: Some(3),
@@ -577,6 +588,10 @@ mod tests {
         assert_eq!(obj["allow_skills"], serde_json::json!(["plan"]));
         assert_eq!(obj["allow_tools"], serde_json::json!(["bash"]));
         assert_eq!(obj["mcp_binding_ids"], serde_json::json!([301]));
+        assert_eq!(
+            obj["edge_profile"]["system_prompt_override"],
+            "override text"
+        );
         let messages = obj["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");

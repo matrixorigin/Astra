@@ -3703,7 +3703,18 @@ impl AgenticRunLifecycleService {
 
     /// Extract edge profile from the request context, or provide empty defaults.
     fn extract_edge_profile(request: &ChatRequestData) -> Map<String, Value> {
-        Self::extract_edge_context(request).edge_profile.to_map()
+        let mut profile = Self::extract_edge_context(request).edge_profile.to_map();
+        if let Some(raw_profile) = request
+            .context
+            .as_ref()
+            .and_then(|context| context.get("edge_profile"))
+            .and_then(Value::as_object)
+        {
+            for (key, value) in raw_profile {
+                profile.insert(key.clone(), value.clone());
+            }
+        }
+        profile
     }
 
     /// Provision a sandboxed workspace directory for server-side tool execution.
@@ -7735,7 +7746,11 @@ mod tests {
         let mut ctx = serde_json::Map::new();
         ctx.insert(
             "edge_profile".to_string(),
-            json!({"cwd": "/tmp", "git_branch": "main"}),
+            json!({
+                "cwd": "/tmp",
+                "git_branch": "main",
+                "system_prompt_override": "override text"
+            }),
         );
         let req = ChatRequestData {
             message: "hi".into(),
@@ -7757,6 +7772,7 @@ mod tests {
         let profile = AgenticRunLifecycleService::extract_edge_profile(&req);
         assert_eq!(profile["cwd"], "/tmp");
         assert_eq!(profile["git_branch"], "main");
+        assert_eq!(profile["system_prompt_override"], "override text");
     }
 
     #[test]
