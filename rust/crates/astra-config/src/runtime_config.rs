@@ -1336,22 +1336,7 @@ impl SessionTraceConfig {
             config.enabled_categories = if lower == "all" {
                 vec![TraceCategory::All]
             } else {
-                lower.split(',').filter_map(|s| match s.trim() {
-                    "tool_calls" => Some(TraceCategory::ToolCalls),
-                    "llm_exchanges" => Some(TraceCategory::LlmExchanges),
-                    "context_assembly" => Some(TraceCategory::ContextAssembly),
-                    "decision_explain" => Some(TraceCategory::DecisionExplain),
-                    "phase_transition" => Some(TraceCategory::PhaseTransition),
-                    "budget" => Some(TraceCategory::Budget),
-                    "reflection" => Some(TraceCategory::Reflection),
-                    "verification" => Some(TraceCategory::Verification),
-                    "thinking" => Some(TraceCategory::Thinking),
-                    "memory_retrieval" => Some(TraceCategory::MemoryRetrieval),
-                    "skill_execution" => Some(TraceCategory::SkillExecution),
-                    "prompt_assembly" => Some(TraceCategory::PromptAssembly),
-                    "guard_evaluation" => Some(TraceCategory::GuardEvaluation),
-                    _ => None,
-                }).collect()
+                lower.split(",").filter_map(|s| TraceCategory::from_str(s.trim())).collect()
             };
         }
         config
@@ -2050,9 +2035,7 @@ impl RuntimeConfig {
             min_level,
             TraceLevelSerde::default(),
         );
-        if !enabled_categories.is_empty() {
-            self.trace.enabled_categories = enabled_categories;
-        }
+        self.trace.enabled_categories = enabled_categories;
         if !sinks.is_empty() {
             self.trace.sinks = sinks;
         }

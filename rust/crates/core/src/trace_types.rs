@@ -40,6 +40,30 @@ pub enum TraceCategory {
 }
 
 impl TraceCategory {
+    /// Parse a [`TraceCategory`] from a snake_case string (e.g. "tool_calls", "llm_exchanges").
+    ///
+    /// Returns `None` for unknown strings.  Matching is case-sensitive —
+    /// callers should normalise (e.g. `.to_lowercase()`) beforehand.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "tool_calls" => Some(Self::ToolCalls),
+            "llm_exchanges" => Some(Self::LlmExchanges),
+            "context_assembly" => Some(Self::ContextAssembly),
+            "decision_explain" => Some(Self::DecisionExplain),
+            "phase_transition" => Some(Self::PhaseTransition),
+            "budget" => Some(Self::Budget),
+            "reflection" => Some(Self::Reflection),
+            "verification" => Some(Self::Verification),
+            "thinking" => Some(Self::Thinking),
+            "memory_retrieval" => Some(Self::MemoryRetrieval),
+            "skill_execution" => Some(Self::SkillExecution),
+            "prompt_assembly" => Some(Self::PromptAssembly),
+            "guard_evaluation" => Some(Self::GuardEvaluation),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
     /// Every individual category except `All`.
     pub fn individual_categories() -> &'static [TraceCategory] {
         &[
