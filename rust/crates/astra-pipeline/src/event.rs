@@ -32,6 +32,33 @@ pub fn set_global_min_level(level: TraceLevel) {
     let _ = GLOBAL_MIN_LEVEL.set(level);
 }
 
+// ── Trace categories ────────────────────────────────────────────────
+
+/// Categories for filtering pipeline events by domain.
+/// Mirrors [`astra_config::runtime_config::TraceCategory`] so callers can
+/// pass categories through without a dependency on the config crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TraceCategory {
+    ToolCalls,
+    LlmExchanges,
+    ContextAssembly,
+    DecisionExplain,
+    PhaseTransition,
+    Budget,
+    Reflection,
+    Verification,
+}
+
+/// Global set of enabled trace categories.
+/// If empty (unset), all categories pass through (no filtering).
+static GLOBAL_CATEGORIES: std::sync::OnceLock<Vec<TraceCategory>> = std::sync::OnceLock::new();
+
+/// Set the enabled trace categories for the session.
+/// Pass an empty vec to disable filtering (allow all).
+pub fn set_global_trace_categories(cats: Vec<TraceCategory>) {
+    let _ = GLOBAL_CATEGORIES.set(cats);
+}
+
 /// Trace severity level, mirroring log-level semantics for pipeline events.
 ///
 /// Used by [`EventLog::min_level`] to drop events below the configured threshold.
@@ -195,6 +222,28 @@ impl EventKind {
             EventKind::BudgetExpanded { .. } => TraceLevel::Trace,
         }
     }
+
+    /// The trace category for this event kind.
+    pub fn default_category(&self) -> TraceCategory {
+        match self {
+            EventKind::ToolCallStarted { .. } | EventKind::ToolCallCompleted { .. } | EventKind::ToolsSelected { .. } => {
+                TraceCategory::ToolCalls
+            }
+            EventKind::LlmChunk { .. } => TraceCategory::LlmExchanges,
+            EventKind::IntentDetected { .. } | EventKind::EntityExtracted { .. } => {
+                TraceCategory::ContextAssembly
+            }
+            EventKind::ReflectionGenerated { .. } => TraceCategory::Reflection,
+            EventKind::PhaseTransition { .. } => TraceCategory::PhaseTransition,
+            EventKind::BudgetSet { .. } | EventKind::BudgetUpdate { .. } | EventKind::BudgetExpanded { .. } => {
+                TraceCategory::Budget
+            }
+            EventKind::ProgressRecorded { .. } | EventKind::StallDetected { .. } | EventKind::CircuitBreakerTripped { .. } => {
+                TraceCategory::Verification
+            }
+            EventKind::TurnCompleted { .. } => TraceCategory::DecisionExplain,
+        }
+    }
 }
 
 /// Append-only causal event log.
@@ -246,6 +295,15 @@ impl EventLog {
         let level = kind.default_level();
         if level > self.min_level {
             return EventId(0);
+        }
+        // Category filter: if configured, events must match an enabled category.
+        if let Some(cats) = GLOBAL_CATEGORIES.get() {
+            if !cats.is_empty() {
+                let cat = kind.default_category();
+                if !cats.contains(&cat) {
+                    return EventId(0);
+                }
+            }
         }
         let id = EventId(self.next_id);
         self.next_id += 1;

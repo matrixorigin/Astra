@@ -228,6 +228,25 @@ fn create_pipeline_modules_inner(
         astra_config::runtime_config::TraceLevelSerde::Trace => astra_pipeline::event::TraceLevel::Trace,
     });
 
+    // Sync the enabled trace categories from the session config into the
+    // global pipeline filter. An empty list disables category filtering.
+    astra_pipeline::event::set_global_trace_categories(
+        trace_config.enabled_categories.iter().filter(|c| **c != astra_config::runtime_config::TraceCategory::All).map(|c| match c {
+            astra_config::runtime_config::TraceCategory::ToolCalls => astra_pipeline::event::TraceCategory::ToolCalls,
+            astra_config::runtime_config::TraceCategory::LlmExchanges => astra_pipeline::event::TraceCategory::LlmExchanges,
+            astra_config::runtime_config::TraceCategory::ContextAssembly => astra_pipeline::event::TraceCategory::ContextAssembly,
+            astra_config::runtime_config::TraceCategory::DecisionExplain => astra_pipeline::event::TraceCategory::DecisionExplain,
+            astra_config::runtime_config::TraceCategory::PhaseTransition => astra_pipeline::event::TraceCategory::PhaseTransition,
+            astra_config::runtime_config::TraceCategory::Budget => astra_pipeline::event::TraceCategory::Budget,
+            astra_config::runtime_config::TraceCategory::Reflection => astra_pipeline::event::TraceCategory::Reflection,
+            astra_config::runtime_config::TraceCategory::Verification => astra_pipeline::event::TraceCategory::Verification,
+            astra_config::runtime_config::TraceCategory::All => {
+                // unreachable: All is skipped before iteration
+                unreachable!("All variant filtered before iteration")
+            }
+        }).collect(),
+    );
+
     // Selector removed — the runtime now builds the turn-specific tool surface
     // directly from the local CLI catalog plus any mounted server/MCP schemas.
 
