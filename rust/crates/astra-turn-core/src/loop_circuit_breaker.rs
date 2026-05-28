@@ -173,6 +173,13 @@ impl LoopCircuitBreaker {
         self.consecutive_read_only
     }
 
+    /// Reset the read-only streak counter, giving the model a fresh start
+    /// after a harness checkpoint injection.
+    pub fn reset_read_only_streak(&mut self) {
+        self.consecutive_read_only = 0;
+        self.introspect_emissions_since_last_write = 0;
+    }
+
     /// Number of Introspect soft-signals emitted since the last write (mutation).
     pub fn introspect_emissions(&self) -> usize {
         self.introspect_emissions_since_last_write

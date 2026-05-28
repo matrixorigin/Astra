@@ -1560,6 +1560,11 @@ pub(crate) const CONSECUTIVE_ERROR_BUDGET: u32 = 3;
 /// Maximum number of recent file reads to track for post-compact restoration.
 pub(crate) const MAX_TRACKED_FILE_READS: usize = 20;
 
+/// Maximum number of times the harness pause signal triggers checkpoint
+/// injection and loop continuation before giving up and exiting with
+/// a `HarnessPaused` interruption.
+const MAX_HARNESS_PAUSE_RECOVERIES: u32 = 2;
+
 #[allow(unused_imports)]
 pub(crate) use super::super::agentic::adaptive_tuning::{
     DEFAULT_TUNING_CYCLE_INTERVAL, apply_adaptive_execution_profile, apply_per_turn_adaptation,
@@ -1686,6 +1691,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
     let loop_start_time = Instant::now();
     let mut turn_index = 0usize;
+    let mut harness_pause_recovery_count: u32 = 0;
     while turn_index < state.max_turns || state.remaining_turns == 0 {
         state.current_round_index = turn_index as u32;
         let TurnIterationPrep {
@@ -1924,14 +1930,32 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 return Ok(AgenticLoopOutcome::Completed);
             }
             astra_harness::HookVerdict::Pause { reason } => {
-                tracing::info!(reason = %reason, "harness paused session at PostTurn");
-                set_harness_interruption(
-                    state,
-                    astra_turn_core::interruption::InterruptionKind::HarnessPaused,
-                    &reason,
+                harness_pause_recovery_count += 1;
+                if harness_pause_recovery_count > MAX_HARNESS_PAUSE_RECOVERIES {
+                    tracing::warn!(
+                        count = harness_pause_recovery_count,
+                        reason = %reason,
+                        "harness pause recovery limit exceeded at PostTurn"
+                    );
+                    set_harness_interruption(
+                        state,
+                        astra_turn_core::interruption::InterruptionKind::HarnessPaused,
+                        &reason,
+                    );
+                    finalize_and_render(host, state).await;
+                    return Ok(AgenticLoopOutcome::Completed);
+                }
+                tracing::info!(
+                    count = harness_pause_recovery_count,
+                    reason = %reason,
+                    "harness pause recovered at PostTurn — injecting checkpoint guidance"
                 );
-                finalize_and_render(host, state).await;
-                return Ok(AgenticLoopOutcome::Completed);
+                state.messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": reason,
+                }));
+                state.stall.circuit_breaker.reset_read_only_streak();
+                // Fall through to continue the loop
             }
             astra_harness::HookVerdict::Continue => {}
         }
@@ -9675,12 +9699,31 @@ mod parallel_execution_tests {
                 sink as Arc<dyn SnapshotSink>,
             );
 
-            let mut host = MockHost::new(vec![edge_tool_result(
-                vec![make_edge_tool("bash", "output")],
-                100,
-                20,
-                Some(50),
-            )])
+            // PauseAtPostTurnKernel always returns Pause at PostTurn.
+            // The loop recovers up to MAX_HARNESS_PAUSE_RECOVERIES times
+            // by injecting checkpoint guidance. After that, it gives up
+            // and sets HarnessPaused. Provide enough turn results for
+            // the recovery attempts plus the final exit.
+            let mut host = MockHost::new(vec![
+                edge_tool_result(
+                    vec![make_edge_tool("bash", "output")],
+                    100,
+                    20,
+                    Some(50),
+                ),
+                edge_tool_result(
+                    vec![make_edge_tool("bash", "output")],
+                    100,
+                    20,
+                    Some(50),
+                ),
+                edge_tool_result(
+                    vec![make_edge_tool("bash", "output")],
+                    100,
+                    20,
+                    Some(50),
+                ),
+            ])
             .with_valid_tools(&["bash"]);
 
             let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;

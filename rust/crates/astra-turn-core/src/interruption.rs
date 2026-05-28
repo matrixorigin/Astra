@@ -478,6 +478,16 @@ pub fn build_resume_guidance_with_context(
                  and avoid the tool patterns that caused failures.\n",
             );
         }
+        "harness_paused" => {
+            guidance.push_str(
+                "  Action: The previous run was paused by the harness due to a \
+                 read-only stall — the agent was reading files without making edits. \
+                 Stop broad exploration; use the evidence already gathered and take \
+                 ONE concrete action: edit the relevant file, run targeted verification, \
+                 or explicitly report why the task cannot be completed. Do NOT continue \
+                 broad or duplicate reading.\n",
+            );
+        }
         "approval_rejected" => {
             guidance.push_str(
                 "  Action: Tool approvals were repeatedly denied. Use only read-only \
