@@ -378,6 +378,17 @@ fn toggle_category(cats: &mut Vec<TraceCategory>, cat: TraceCategory, enable: bo
     }
 }
 
+/// Add or remove a sink from the vec.
+fn toggle_trace_sink(sinks: &mut Vec<TraceSink>, sink: TraceSink, enable: bool) {
+    if enable {
+        if !sinks.contains(&sink) {
+            sinks.push(sink);
+        }
+    } else {
+        sinks.retain(|s| *s != sink);
+    }
+}
+
 /// Write `new_value` into the field identified by `id`.
 ///
 /// Returns a new `RuntimeConfig` (the edit is value-level; we don't
@@ -558,6 +569,107 @@ pub fn apply_edit(
             toggle_category(
                 &mut config.trace.enabled_categories,
                 TraceCategory::Thinking,
+                as_bool(&new_value, id)?,
+            );
+            return Ok(config);
+        }
+        "trace.context_assembly" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::ContextAssembly,
+                as_bool(&new_value, id)?,
+            );
+            return Ok(config);
+        }
+        "trace.decision_explain" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::DecisionExplain,
+                as_bool(&new_value, id)?,
+            );
+            return Ok(config);
+        }
+        "trace.phase_transition" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::PhaseTransition,
+                as_bool(&new_value, id)?,
+            );
+            return Ok(config);
+        }
+        "trace.budget" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::Budget,
+                as_bool(&new_value, id)?,
+            );
+            return Ok(config);
+        }
+        "trace.reflection" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::Reflection,
+                as_bool(&new_value, id)?,
+            );
+            return Ok(config);
+        }
+        "trace.verification" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::Verification,
+                as_bool(&new_value, id)?,
+            );
+            return Ok(config);
+        }
+        "trace.memory_retrieval" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::MemoryRetrieval,
+                as_bool(&new_value, id)?,
+            );
+            return Ok(config);
+        }
+        "trace.skill_execution" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::SkillExecution,
+                as_bool(&new_value, id)?,
+            );
+            return Ok(config);
+        }
+        "trace.prompt_assembly" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::PromptAssembly,
+                as_bool(&new_value, id)?,
+            );
+            return Ok(config);
+        }
+        "trace.guard_evaluation" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::GuardEvaluation,
+                as_bool(&new_value, id)?,
+            );
+            return Ok(config);
+        }
+        "trace.sampling_rate" => {
+            let n = as_f64(&new_value, id)?;
+            ensure_range(n, 0.0, 1.0, id)?;
+            config.trace.sampling_rate = n;
+        }
+        "trace.sinks.journal" => {
+            toggle_trace_sink(
+                &mut config.trace.sinks,
+                TraceSink::Journal,
+                as_bool(&new_value, id)?,
+            );
+            return Ok(config);
+        }
+        "trace.sinks.stderr" => {
+            toggle_trace_sink(
+                &mut config.trace.sinks,
+                TraceSink::Stderr,
                 as_bool(&new_value, id)?,
             );
             return Ok(config);

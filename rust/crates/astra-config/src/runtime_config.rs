@@ -1805,6 +1805,11 @@ impl RuntimeConfig {
             strategy.apply_to(&mut config.compression);
         }
 
+        // Propagate the resolved trace config into the per-session singleton
+        // so that SessionTraceConfig::current() reflects all merged layers
+        // (defaults + user config + project config + env + CLI overlay).
+        SessionTraceConfig::set_current(config.trace.clone());
+
         config
     }
 
