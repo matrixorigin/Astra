@@ -3,6 +3,8 @@
 //! These types are shared across `astra-config` and `astra-pipeline` to avoid
 //! duplication and ensure consistency.
 
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 
 /// Trace event categories that can be toggled on/off per session.
@@ -39,31 +41,31 @@ pub enum TraceCategory {
     All,
 }
 
-impl TraceCategory {
-    /// Parse a [`TraceCategory`] from a snake_case string (e.g. "tool_calls", "llm_exchanges").
-    ///
-    /// Returns `None` for unknown strings.  Matching is case-sensitive —
-    /// callers should normalise (e.g. `.to_lowercase()`) beforehand.
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for TraceCategory {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "tool_calls" => Some(Self::ToolCalls),
-            "llm_exchanges" => Some(Self::LlmExchanges),
-            "context_assembly" => Some(Self::ContextAssembly),
-            "decision_explain" => Some(Self::DecisionExplain),
-            "phase_transition" => Some(Self::PhaseTransition),
-            "budget" => Some(Self::Budget),
-            "reflection" => Some(Self::Reflection),
-            "verification" => Some(Self::Verification),
-            "thinking" => Some(Self::Thinking),
-            "memory_retrieval" => Some(Self::MemoryRetrieval),
-            "skill_execution" => Some(Self::SkillExecution),
-            "prompt_assembly" => Some(Self::PromptAssembly),
-            "guard_evaluation" => Some(Self::GuardEvaluation),
-            "all" => Some(Self::All),
-            _ => None,
+            "tool_calls" => Ok(Self::ToolCalls),
+            "llm_exchanges" => Ok(Self::LlmExchanges),
+            "context_assembly" => Ok(Self::ContextAssembly),
+            "decision_explain" => Ok(Self::DecisionExplain),
+            "phase_transition" => Ok(Self::PhaseTransition),
+            "budget" => Ok(Self::Budget),
+            "reflection" => Ok(Self::Reflection),
+            "verification" => Ok(Self::Verification),
+            "thinking" => Ok(Self::Thinking),
+            "memory_retrieval" => Ok(Self::MemoryRetrieval),
+            "skill_execution" => Ok(Self::SkillExecution),
+            "prompt_assembly" => Ok(Self::PromptAssembly),
+            "guard_evaluation" => Ok(Self::GuardEvaluation),
+            "all" => Ok(Self::All),
+            _ => Err(()),
         }
     }
+}
 
+impl TraceCategory {
     /// Every individual category except `All`.
     pub fn individual_categories() -> &'static [TraceCategory] {
         &[
@@ -87,7 +89,9 @@ impl TraceCategory {
 /// Trace severity level, mirroring log-level semantics for pipeline events.
 ///
 /// Used by `EventLog::min_level` to drop events below the configured threshold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum TraceLevel {
     /// Hard failures that require attention.
@@ -95,6 +99,7 @@ pub enum TraceLevel {
     /// Near-limit conditions, degraded quality signals.
     Warn = 1,
     /// Normal operational events — the baseline for production.
+    #[default]
     Info = 2,
     /// Reasoning signals useful for debugging.
     Debug = 3,
@@ -102,24 +107,17 @@ pub enum TraceLevel {
     Trace = 4,
 }
 
-impl Default for TraceLevel {
-    fn default() -> Self {
-        Self::Info
-    }
-}
+impl FromStr for TraceLevel {
+    type Err = ();
 
-impl TraceLevel {
-    /// Parse a [`TraceLevel`] from a lowercase string (e.g. "debug", "warn").
-    ///
-    /// Returns `None` for unknown strings.
-    pub fn from_str(s: &str) -> Option<Self> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "error" => Some(Self::Error),
-            "warn" => Some(Self::Warn),
-            "info" => Some(Self::Info),
-            "debug" => Some(Self::Debug),
-            "trace" => Some(Self::Trace),
-            _ => None,
+            "error" => Ok(Self::Error),
+            "warn" => Ok(Self::Warn),
+            "info" => Ok(Self::Info),
+            "debug" => Ok(Self::Debug),
+            "trace" => Ok(Self::Trace),
+            _ => Err(()),
         }
     }
 }

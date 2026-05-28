@@ -2,16 +2,27 @@ use super::*;
 use crate::{manifest_loader, mcp_client};
 
 /// Convert serde-friendly trace level to pipeline-native trace level.
-fn trace_level_from_config(level: astra_config::runtime_config::TraceLevelSerde) -> astra_pipeline::event::TraceLevel {
+fn trace_level_from_config(
+    level: astra_config::runtime_config::TraceLevelSerde,
+) -> astra_pipeline::event::TraceLevel {
     match level {
-        astra_config::runtime_config::TraceLevelSerde::Error => astra_pipeline::event::TraceLevel::Error,
-        astra_config::runtime_config::TraceLevelSerde::Warn => astra_pipeline::event::TraceLevel::Warn,
-        astra_config::runtime_config::TraceLevelSerde::Info => astra_pipeline::event::TraceLevel::Info,
-        astra_config::runtime_config::TraceLevelSerde::Debug => astra_pipeline::event::TraceLevel::Debug,
-        astra_config::runtime_config::TraceLevelSerde::Trace => astra_pipeline::event::TraceLevel::Trace,
+        astra_config::runtime_config::TraceLevelSerde::Error => {
+            astra_pipeline::event::TraceLevel::Error
+        }
+        astra_config::runtime_config::TraceLevelSerde::Warn => {
+            astra_pipeline::event::TraceLevel::Warn
+        }
+        astra_config::runtime_config::TraceLevelSerde::Info => {
+            astra_pipeline::event::TraceLevel::Info
+        }
+        astra_config::runtime_config::TraceLevelSerde::Debug => {
+            astra_pipeline::event::TraceLevel::Debug
+        }
+        astra_config::runtime_config::TraceLevelSerde::Trace => {
+            astra_pipeline::event::TraceLevel::Trace
+        }
     }
 }
-
 
 pub(crate) fn create_pipeline_modules(
     api: &astra_thin_client::ThinClient,

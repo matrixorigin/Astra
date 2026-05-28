@@ -225,7 +225,11 @@ async fn execute_headless_task_body(
 
     svc.update_status(&task_id, TaskStatus::InProgress).await?;
 
-    let pipeline_modules = session_runtime::create_pipeline_modules_quiet(api, profile, astra_config::runtime_config::SessionTraceConfig::current());
+    let pipeline_modules = session_runtime::create_pipeline_modules_quiet(
+        api,
+        profile,
+        astra_config::runtime_config::SessionTraceConfig::current(),
+    );
     let skill_search = astra_core::SkillSearchSettings::default();
     let project_root = std::env::current_dir().unwrap_or_default();
     let mut pm = PermissionManager::with_project(true, &project_root);
@@ -1377,7 +1381,11 @@ async fn execute_repl_bridge_command(
     state.task_notify_tx = task_notify_tx;
     maybe_load_project_instructions(&mut state);
 
-    let pipeline_modules = create_pipeline_modules(api, profile, astra_config::runtime_config::SessionTraceConfig::current());
+    let pipeline_modules = create_pipeline_modules(
+        api,
+        profile,
+        astra_config::runtime_config::SessionTraceConfig::current(),
+    );
     state.unified_skill_registry = pipeline_modules.unified_skill_registry.clone();
     state.mcp_manager = pipeline_modules.mcp_manager.clone();
 
@@ -1621,7 +1629,11 @@ pub(crate) async fn execute_cli_command(
             let mut continuation_messages = session_id
                 .as_deref()
                 .and_then(load_session_messages_for_continuation);
-            let _pipeline = create_pipeline_modules(api, profile.as_deref(), astra_config::runtime_config::SessionTraceConfig::current());
+            let _pipeline = create_pipeline_modules(
+                api,
+                profile.as_deref(),
+                astra_config::runtime_config::SessionTraceConfig::current(),
+            );
             let mode = if auto_approve {
                 PermissionMode::Auto
             } else {
@@ -2096,7 +2108,11 @@ pub(crate) async fn execute_cli_command(
                 .as_deref()
                 .and_then(load_session_messages_for_continuation);
             let is_tty = terminal::size().is_ok();
-            let _pipeline = create_pipeline_modules(api, profile.as_deref(), astra_config::runtime_config::SessionTraceConfig::current());
+            let _pipeline = create_pipeline_modules(
+                api,
+                profile.as_deref(),
+                astra_config::runtime_config::SessionTraceConfig::current(),
+            );
             let mut pm = {
                 let project_root = std::env::current_dir().unwrap_or_default();
                 if let Some(ref mode_str) = args.permission_mode {
@@ -2479,7 +2495,11 @@ pub(crate) async fn execute_cli_command(
         }
 
         Some(Command::Skill(SkillCmd::List(args))) => {
-            let pipeline_modules = create_pipeline_modules_quiet(api, profile.as_deref(), astra_config::runtime_config::SessionTraceConfig::current());
+            let pipeline_modules = create_pipeline_modules_quiet(
+                api,
+                profile.as_deref(),
+                astra_config::runtime_config::SessionTraceConfig::current(),
+            );
             let filter = SkillCatalogFilter {
                 query: (!args.query.is_empty()).then(|| args.query.join(" ").to_lowercase()),
                 source: args
@@ -2504,7 +2524,11 @@ pub(crate) async fn execute_cli_command(
         }
 
         Some(Command::Skill(SkillCmd::Show(args))) => {
-            let pipeline_modules = create_pipeline_modules_quiet(api, profile.as_deref(), astra_config::runtime_config::SessionTraceConfig::current());
+            let pipeline_modules = create_pipeline_modules_quiet(
+                api,
+                profile.as_deref(),
+                astra_config::runtime_config::SessionTraceConfig::current(),
+            );
             let body = serde_json::to_string(
                 &load_skill_record_from_registry(
                     &pipeline_modules.unified_skill_registry,
@@ -2957,7 +2981,11 @@ pub(crate) async fn run_print_mode(
     let mut continuation_messages = session_id
         .as_deref()
         .and_then(load_session_messages_for_continuation);
-    let _pipeline = create_pipeline_modules(api, profile, astra_config::runtime_config::SessionTraceConfig::current());
+    let _pipeline = create_pipeline_modules(
+        api,
+        profile,
+        astra_config::runtime_config::SessionTraceConfig::current(),
+    );
     // Issue #326 P0 / R1 Major 2: print mode (headless `astra -p`) is
     // non-interactive — there is no TUI to ask for approvals. We force
     // `auto_approve = true` (= PermissionMode::Auto) here. The

@@ -1170,6 +1170,7 @@ impl Default for TraceProfile {
 
 // Re-export shared trace types from astra-core
 pub use astra_core::TraceCategory;
+use std::str::FromStr;
 
 /// Where trace events are delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1230,7 +1231,11 @@ fn default_trace_level() -> TraceLevel {
 }
 
 fn default_trace_categories() -> Vec<TraceCategory> {
-    vec![TraceCategory::ToolCalls, TraceCategory::PhaseTransition, TraceCategory::Budget]
+    vec![
+        TraceCategory::ToolCalls,
+        TraceCategory::PhaseTransition,
+        TraceCategory::Budget,
+    ]
 }
 
 fn default_trace_sinks() -> Vec<TraceSink> {
@@ -1273,7 +1278,11 @@ impl SessionTraceConfig {
     /// Never — falls back to default on unset or lock poisoning.
     #[must_use]
     pub fn current() -> Self {
-        SESSION_TRACE_CONFIG.read().ok().and_then(|guard| guard.clone()).unwrap_or_default()
+        SESSION_TRACE_CONFIG
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .unwrap_or_default()
     }
 
     /// Apply a preset profile, overwriting relevant fields.
@@ -1281,7 +1290,8 @@ impl SessionTraceConfig {
         match profile {
             TraceProfile::Production => {
                 self.min_level = TraceLevel::Warn;
-                self.enabled_categories = vec![TraceCategory::ToolCalls, TraceCategory::PhaseTransition];
+                self.enabled_categories =
+                    vec![TraceCategory::ToolCalls, TraceCategory::PhaseTransition];
                 self.sinks = vec![TraceSink::Journal];
                 self.sampling_rate = 1.0;
             }
@@ -1304,15 +1314,12 @@ impl SessionTraceConfig {
         if cat == TraceCategory::All {
             return true;
         }
-        self.enabled_categories.contains(&TraceCategory::All) || self.enabled_categories.contains(&cat)
+        self.enabled_categories.contains(&TraceCategory::All)
+            || self.enabled_categories.contains(&cat)
     }
 
     /// Build from CLI flags (`--trace-profile`, `--trace-level`, `--trace-cat`).
-    pub fn from_cli(
-        profile: Option<&str>,
-        level: Option<&str>,
-        cats: Option<&str>,
-    ) -> Self {
+    pub fn from_cli(profile: Option<&str>, level: Option<&str>, cats: Option<&str>) -> Self {
         let mut config = Self::default();
         if let Some(p) = profile {
             config = config.apply_profile(match p {
@@ -1336,7 +1343,10 @@ impl SessionTraceConfig {
             config.enabled_categories = if lower == "all" {
                 vec![TraceCategory::All]
             } else {
-                lower.split(",").filter_map(|s| TraceCategory::from_str(s.trim())).collect()
+                lower
+                    .split(",")
+                    .filter_map(|s| TraceCategory::from_str(s.trim()).ok())
+                    .collect()
             };
         }
         config
@@ -1624,8 +1634,6 @@ fn merge_if_non_default<T: PartialEq>(slot: &mut T, incoming: T, default: T) {
 /// Stored as the already-parsed `RuntimeConfig` rather than raw JSON so the
 /// CLI boundary is the only place that can fail on malformed input — every
 /// `load()` call thereafter is infallible.
-
-
 static CLI_OVERLAY: std::sync::OnceLock<std::sync::RwLock<Option<RuntimeConfig>>> =
     std::sync::OnceLock::new();
 
@@ -2025,11 +2033,7 @@ impl RuntimeConfig {
             sinks,
             sampling_rate,
         } = trace;
-        merge_if_non_default(
-            &mut self.trace.profile,
-            profile,
-            TraceProfile::default(),
-        );
+        merge_if_non_default(&mut self.trace.profile, profile, TraceProfile::default());
         merge_if_non_default(
             &mut self.trace.min_level,
             min_level,
@@ -2039,11 +2043,7 @@ impl RuntimeConfig {
         if !sinks.is_empty() {
             self.trace.sinks = sinks;
         }
-        merge_if_non_default(
-            &mut self.trace.sampling_rate,
-            sampling_rate,
-            1.0,
-        );
+        merge_if_non_default(&mut self.trace.sampling_rate, sampling_rate, 1.0);
 
         let TokenBudgetConfig {
             max_prompt_tokens,
@@ -2274,8 +2274,14 @@ impl RuntimeConfig {
         }
         if let Ok(val) = std::env::var("ASTRA_CAPTURE_FULL_LLM") {
             if val == "1" || val.to_lowercase() == "true" {
-                if !self.trace.enabled_categories.contains(&TraceCategory::LlmExchanges) {
-                    self.trace.enabled_categories.push(TraceCategory::LlmExchanges);
+                if !self
+                    .trace
+                    .enabled_categories
+                    .contains(&TraceCategory::LlmExchanges)
+                {
+                    self.trace
+                        .enabled_categories
+                        .push(TraceCategory::LlmExchanges);
                 }
             }
         }
@@ -2574,7 +2580,11 @@ mod tests {
         assert_eq!(merged.trace.min_level, TraceLevelSerde::Debug);
         assert!(merged.trace.category_enabled(TraceCategory::ToolCalls));
         assert!(merged.trace.category_enabled(TraceCategory::LlmExchanges));
-        assert!(!merged.trace.category_enabled(TraceCategory::ContextAssembly));
+        assert!(
+            !merged
+                .trace
+                .category_enabled(TraceCategory::ContextAssembly)
+        );
         assert!(merged.trace.category_enabled(TraceCategory::Reflection));
         assert!(merged.trace.sinks.contains(&TraceSink::Stderr));
         assert!((merged.trace.sampling_rate - 0.5).abs() < 0.001);
@@ -3470,7 +3480,10 @@ mod tests {
         let cfg = SessionTraceConfig::from_cli(None, None, Some("tool_calls,llm_exchanges,budget"));
         assert_eq!(cfg.enabled_categories.len(), 3);
         assert!(cfg.enabled_categories.contains(&TraceCategory::ToolCalls));
-        assert!(cfg.enabled_categories.contains(&TraceCategory::LlmExchanges));
+        assert!(
+            cfg.enabled_categories
+                .contains(&TraceCategory::LlmExchanges)
+        );
         assert!(cfg.enabled_categories.contains(&TraceCategory::Budget));
     }
 
@@ -3479,7 +3492,10 @@ mod tests {
         let cfg = SessionTraceConfig::from_cli(None, None, Some("TOOL_CALLS,LLM_Exchanges"));
         assert_eq!(cfg.enabled_categories.len(), 2);
         assert!(cfg.enabled_categories.contains(&TraceCategory::ToolCalls));
-        assert!(cfg.enabled_categories.contains(&TraceCategory::LlmExchanges));
+        assert!(
+            cfg.enabled_categories
+                .contains(&TraceCategory::LlmExchanges)
+        );
     }
 
     #[test]
@@ -3487,7 +3503,10 @@ mod tests {
         let cfg = SessionTraceConfig::from_cli(None, None, Some(" tool_calls , llm_exchanges "));
         assert_eq!(cfg.enabled_categories.len(), 2);
         assert!(cfg.enabled_categories.contains(&TraceCategory::ToolCalls));
-        assert!(cfg.enabled_categories.contains(&TraceCategory::LlmExchanges));
+        assert!(
+            cfg.enabled_categories
+                .contains(&TraceCategory::LlmExchanges)
+        );
     }
 
     #[test]
@@ -3500,11 +3519,8 @@ mod tests {
 
     #[test]
     fn from_cli_combined_profile_level_categories() {
-        let cfg = SessionTraceConfig::from_cli(
-            Some("dev"),
-            Some("debug"),
-            Some("tool_calls,budget")
-        );
+        let cfg =
+            SessionTraceConfig::from_cli(Some("dev"), Some("debug"), Some("tool_calls,budget"));
         assert_eq!(cfg.profile, TraceProfile::Dev);
         assert_eq!(cfg.min_level, TraceLevelSerde::Debug);
         assert_eq!(cfg.enabled_categories.len(), 2);

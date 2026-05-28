@@ -690,7 +690,7 @@ fn print_help() {
 /// Esc from inquire is surfaced as a graceful cancel.
 fn run_config_edit() {
     use astra_config::config_overlay::{
-        apply_edit, build_settings_catalog, filter_settings, SettingItem,
+        SettingItem, apply_edit, build_settings_catalog, filter_settings,
     };
 
     let config = RuntimeConfig::load();
