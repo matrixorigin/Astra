@@ -138,21 +138,17 @@ pub fn classify_command_result(
 }
 
 fn command_family(command: &str) -> Option<String> {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-    let mut i = 0usize;
-    while i < tokens.len() && is_env_assignment(tokens[i]) {
-        i += 1;
-    }
-    let family = tokens
-        .get(i)
-        .map(|s| s.trim_matches('"').to_ascii_lowercase())?;
-    if matches!(family.as_str(), "python" | "python3" | "uv" | "poetry")
-        && tokens.get(i + 1).is_some_and(|token| *token == "-m")
-        && let Some(module) = tokens.get(i + 2)
-    {
-        let module = module.trim_matches('"').to_ascii_lowercase();
-        if matches!(module.as_str(), "pytest" | "unittest") {
-            return Some(module);
+    let mut tokens = command.split_whitespace().skip_while(|t| is_env_assignment(t));
+    let family = tokens.next().map(|s| s.trim_matches('"').to_ascii_lowercase())?;
+    if matches!(family.as_str(), "python" | "python3" | "uv" | "poetry") {
+        let mut peek = tokens.clone();
+        if peek.next() == Some("-m")
+            && let Some(module) = peek.next()
+        {
+            let module = module.trim_matches('"').to_ascii_lowercase();
+            if matches!(module.as_str(), "pytest" | "unittest") {
+                return Some(module);
+            }
         }
     }
     if is_test_runner_family(&family) && command_contains_word(command, "test") {
@@ -234,10 +230,11 @@ fn looks_like_env_failure(lower_output: &str) -> bool {
 fn looks_like_build_or_test_failure(lower_output: &str) -> bool {
     [
         "test result: failed",
-        " failed",
+        "test failed",
+        "tests failed",
+        "test suite failed",
         " failed,",
         " failures:",
-        "error:",
         "error[",
         "traceback (most recent call last)",
         "assertionerror",

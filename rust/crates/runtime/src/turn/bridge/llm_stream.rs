@@ -449,8 +449,8 @@ async fn anthropic_stream_with_retry(
             let idle_post = crate::turn::llm::client::stream_idle_timeout_after_progress();
             let cc = client_cancel.clone();
             let client_for_fallback = client.clone();
-            let messages_for_fallback: Vec<Value> = messages.to_vec();
-            let tools_for_fallback: Vec<Value> = tools.to_vec();
+            let messages_for_fallback: Arc<[Value]> = Arc::from(messages);
+            let tools_for_fallback: Arc<[Value]> = Arc::from(tools);
             let model_for_fallback = upstream_name.to_string();
             let api_key_for_fallback = api_key.to_string();
             let base_url_for_fallback = base_url.to_string();
@@ -1128,8 +1128,8 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
             let model_name = model_name.to_string();
 
             let client_for_fallback = client.clone();
-            let messages_for_fallback: Vec<Value> = messages.to_vec();
-            let tools_for_fallback: Vec<Value> = tools.to_vec();
+            let messages_for_fallback: Arc<[Value]> = Arc::from(messages.as_slice());
+            let tools_for_fallback: Arc<[Value]> = Arc::from(tools);
             let api_key_for_fallback = api_key.to_string();
             let base_url_for_fallback = base_url.to_string();
             let provider_for_fallback = provider.to_string();
