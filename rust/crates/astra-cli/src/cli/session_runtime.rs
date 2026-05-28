@@ -227,8 +227,8 @@ fn create_pipeline_modules_inner(
         .copied()
         .collect();
 
-    astra_pipeline::event::set_global_min_level(trace_config.min_level);
-    astra_pipeline::event::set_global_trace_categories(enabled_categories);
+    // Trace config is stored in RuntimeConfig; each turn's EventLog reads it
+    // from the config snapshot (not from process-global state).
 
     // Selector removed — the runtime now builds the turn-specific tool surface
     // directly from the local CLI catalog plus any mounted server/MCP schemas.
