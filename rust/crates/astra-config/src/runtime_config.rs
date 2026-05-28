@@ -1154,18 +1154,13 @@ impl Default for ToolSelectionConfig {
 /// - `Production`: minimal overhead — only `Error` + `Warn` events, core categories.
 /// - `Dev`: maximum introspection — `Trace` level, all categories.
 /// - `Custom`: fully user-controlled via the other fields on [`SessionTraceConfig`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TraceProfile {
+    #[default]
     Production,
     Dev,
     Custom,
-}
-
-impl Default for TraceProfile {
-    fn default() -> Self {
-        Self::Production
-    }
 }
 
 // Re-export shared trace types from astra-core
@@ -2267,23 +2262,21 @@ impl RuntimeConfig {
         {
             self.token_budget.max_turn_input_tokens = n;
         }
-        if let Ok(val) = std::env::var("ASTRA_CAPTURE_TRACES") {
-            if val == "1" || val.to_lowercase() == "true" {
-                self.trace.enabled_categories = vec![TraceCategory::All];
-            }
+        if let Ok(val) = std::env::var("ASTRA_CAPTURE_TRACES")
+            && (val == "1" || val.to_lowercase() == "true")
+        {
+            self.trace.enabled_categories = vec![TraceCategory::All];
         }
-        if let Ok(val) = std::env::var("ASTRA_CAPTURE_FULL_LLM") {
-            if val == "1" || val.to_lowercase() == "true" {
-                if !self
-                    .trace
-                    .enabled_categories
-                    .contains(&TraceCategory::LlmExchanges)
-                {
-                    self.trace
-                        .enabled_categories
-                        .push(TraceCategory::LlmExchanges);
-                }
-            }
+        if let Ok(val) = std::env::var("ASTRA_CAPTURE_FULL_LLM")
+            && (val == "1" || val.to_lowercase() == "true")
+            && !self
+                .trace
+                .enabled_categories
+                .contains(&TraceCategory::LlmExchanges)
+        {
+            self.trace
+                .enabled_categories
+                .push(TraceCategory::LlmExchanges);
         }
         // ASTRA_FORK_INHERIT_PREFIX env var is ignored — fork capture
         // is now always-on. The `enabled` field is a deprecated no-op.
