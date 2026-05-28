@@ -3233,6 +3233,17 @@ impl AgenticRunLifecycleService {
             validate_llm_token_service_config(request.llm_token_service.as_ref(), &trusted_domains)
                 .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
         }
+        if request
+            .mcp_binding_ids
+            .as_deref()
+            .is_some_and(|ids| !ids.is_empty())
+        {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "mcp_binding_ids is no longer supported on /chat/stream; use runtime_mcp_bindings"
+                    .to_string(),
+            ));
+        }
         let request_constraints = Self::try_request_constraints(request)
             .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
         let (_, resolver) = build_server_skill_resolver(self.skill_service.clone(), user_id);
@@ -3863,6 +3874,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
+        let edge_tools = Self::extract_edge_tools(&request);
+        let edge_profile = Self::extract_edge_profile(&request);
+        let mcp_bundle =
+            runtime_mcp::prepare_request_scoped_runtime_bundle(&request.runtime_mcp_bindings)
+                .await?;
+
         // Guard: reject if this session already has a blocking run.
         // Hold write lock across check+insert to prevent TOCTOU race.
         let (run_state, cancel_flag, pause_flag, llm_cancel_token) =
@@ -3888,8 +3905,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         // Spawn background agentic loop.
-        let edge_tools = Self::extract_edge_tools(&request);
-        let edge_profile = Self::extract_edge_profile(&request);
 
         // Provision workspace early so build_initial_state can load stop hooks
         // from the provisioned directory when no edge profile supplies cwd.
@@ -3915,6 +3930,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             edge_profile,
             plan_resume_hint,
         );
+        if let Some(ref bundle) = mcp_bundle {
+            host.install_runtime_tool_schemas(bundle.schemas.clone());
+        }
         let mut loop_state = self.build_initial_state(
             &user_id,
             &request,
@@ -3997,6 +4015,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             ))
             .with_cancel_token(loop_state.cancellation.token.clone())
             .with_task_store(task_store);
+
+            if let Some(ref bundle) = mcp_bundle {
+                executor.set_mcp_manager(bundle.manager.clone());
+                executor.set_plugin_schemas(bundle.schemas.clone());
+            }
+
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }
@@ -4354,20 +4378,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let edge_tools = Self::extract_edge_tools(&request);
         let edge_profile = Self::extract_edge_profile(&request);
 
-        // ── MCP: load registry bindings and validate cached tools ─────
-        let mcp_bundle = if let Some(binding_ids) = request
-            .mcp_binding_ids
-            .as_deref()
-            .filter(|binding_ids| !binding_ids.is_empty())
-        {
-            let records = self
-                .mcp_registry_service
-                .load_runtime_bindings(user_id.clone(), binding_ids)
+        // ── MCP: request-scoped discovery; schemas and credentials stay in memory.
+        let mcp_bundle =
+            runtime_mcp::prepare_request_scoped_runtime_bundle(&request.runtime_mcp_bindings)
                 .await?;
-            runtime_mcp::prepare_runtime_bundle(&records).await?
-        } else {
-            None
-        };
 
         // Provision workspace early for web-agent mode (no edge tools) so
         // build_initial_state loads stop hooks from the provisioned directory.
@@ -4474,7 +4488,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         host.set_event_tx(event_tx.clone());
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
 
-        // ── MCP: inject cached schemas into host tool surface ─────────
+        // ── MCP: inject request-scoped schemas into host tool surface ─
         if let Some(ref bundle) = mcp_bundle {
             host.install_runtime_tool_schemas(bundle.schemas.clone());
         }
@@ -6855,6 +6869,7 @@ mod tests {
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
+            runtime_mcp_bindings: Vec::new(),
             mcp_binding_ids: None,
             context: None,
             forward_headers: HashMap::new(),
@@ -6863,6 +6878,26 @@ mod tests {
             interaction_mode: None,
             interactive_client: false,
         }
+    }
+
+    #[tokio::test]
+    async fn validate_request_constraints_rejects_legacy_mcp_binding_ids() {
+        let service = test_service();
+        let mut request = test_request("hello");
+        request.mcp_binding_ids = Some(vec![301]);
+
+        let err = service
+            .validate_request_constraints("u1", &request)
+            .await
+            .expect_err("legacy mcp_binding_ids must be rejected on chat stream");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1
+                .0
+                .detail
+                .contains("mcp_binding_ids is no longer supported")
+        );
     }
 
     #[tokio::test]
@@ -7626,6 +7661,7 @@ mod tests {
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
+            runtime_mcp_bindings: Vec::new(),
             mcp_binding_ids: None,
             context: Some(ctx),
             forward_headers: HashMap::new(),
@@ -7775,6 +7811,7 @@ mod tests {
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
+            runtime_mcp_bindings: Vec::new(),
             mcp_binding_ids: None,
             context: Some(ctx),
             forward_headers: HashMap::new(),

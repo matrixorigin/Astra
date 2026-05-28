@@ -213,6 +213,43 @@ pub enum RequestedTurnInteractionMode {
     Headless,
 }
 
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeMcpBindingRequest {
+    pub id: String,
+    pub transport: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub headers: std::collections::HashMap<String, String>,
+}
+
+fn runtime_mcp_debug_url(raw: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return "[invalid-url]".to_string();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
+impl std::fmt::Debug for RuntimeMcpBindingRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut header_names = self.headers.keys().map(String::as_str).collect::<Vec<_>>();
+        header_names.sort_unstable();
+        let redacted_url = runtime_mcp_debug_url(&self.url);
+        f.debug_struct("RuntimeMcpBindingRequest")
+            .field("id", &self.id)
+            .field("transport", &self.transport)
+            .field("url", &redacted_url)
+            .field("auth_token_present", &self.auth_token.is_some())
+            .field("header_names", &header_names)
+            .finish()
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub struct ChatRequestData {
     pub message: String,
@@ -225,6 +262,7 @@ pub struct ChatRequestData {
     pub allow_skills: Option<Vec<String>>,
     pub allow_skill_sources: Option<Vec<String>>,
     pub allow_tools: Option<Vec<String>>,
+    pub runtime_mcp_bindings: Vec<RuntimeMcpBindingRequest>,
     pub mcp_binding_ids: Option<Vec<i64>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     pub forward_headers: std::collections::HashMap<String, String>,
@@ -268,7 +306,8 @@ impl std::fmt::Debug for ChatRequestData {
             .field("allow_skills", &self.allow_skills)
             .field("allow_skill_sources", &self.allow_skill_sources)
             .field("allow_tools", &self.allow_tools)
-            .field("mcp_binding_ids", &self.mcp_binding_ids)
+            .field("runtime_mcp_bindings", &self.runtime_mcp_bindings)
+            .field("deprecated_mcp_binding_ids", &self.mcp_binding_ids)
             .field("context", &self.context)
             .field(
                 "forward_headers",
@@ -3018,6 +3057,7 @@ mod tests {
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
+            runtime_mcp_bindings: Vec::new(),
             mcp_binding_ids: None,
             context: None,
             forward_headers,
@@ -3039,6 +3079,37 @@ mod tests {
         assert!(!rendered.contains("__astra_connection_tokens"));
     }
 
+    #[test]
+    fn runtime_mcp_binding_request_debug_redacts_credentials() {
+        let binding = RuntimeMcpBindingRequest {
+            id: "external_nl2sql".to_string(),
+            transport: "streamable_http".to_string(),
+            url: "http://user:url-secret@tool-server/mcp/http?token=query-secret#frag".to_string(),
+            auth_token: Some("secret-auth-token".to_string()),
+            headers: std::collections::HashMap::from([
+                (
+                    "Authorization".to_string(),
+                    "Bearer secret-runtime-grant".to_string(),
+                ),
+                ("X-External-Workspace".to_string(), "ws-secret".to_string()),
+            ]),
+        };
+
+        let rendered = format!("{binding:?}");
+
+        assert!(rendered.contains("external_nl2sql"));
+        assert!(rendered.contains("auth_token_present"));
+        assert!(rendered.contains("http://tool-server/mcp/http"));
+        assert!(rendered.contains("Authorization"));
+        assert!(rendered.contains("X-External-Workspace"));
+        assert!(!rendered.contains("url-secret"));
+        assert!(!rendered.contains("query-secret"));
+        assert!(!rendered.contains("#frag"));
+        assert!(!rendered.contains("secret-auth-token"));
+        assert!(!rendered.contains("secret-runtime-grant"));
+        assert!(!rendered.contains("ws-secret"));
+    }
+
     #[tokio::test]
     async fn unconfigured_service_uses_stable_error_code() {
         let service = UnconfiguredRunLifecycleService;
@@ -3055,6 +3126,7 @@ mod tests {
                     allow_skills: None,
                     allow_skill_sources: None,
                     allow_tools: None,
+                    runtime_mcp_bindings: Vec::new(),
                     mcp_binding_ids: None,
                     context: None,
                     forward_headers: std::collections::HashMap::new(),

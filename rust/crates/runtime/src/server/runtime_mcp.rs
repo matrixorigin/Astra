@@ -1,20 +1,20 @@
-//! Registry-backed runtime MCP wiring for server-side agent loops.
+//! Request-scoped runtime MCP wiring for server-side agent loops.
 //!
-//! The runtime never accepts MCP credentials in `/chat/stream`. Control-plane
-//! registration performs discovery and persists a binding-scoped catalog; chat
-//! requests reference those bindings by id.
+//! Chat requests may provide MCP server endpoints with opaque credentials for
+//! the current turn. The runtime discovers tools for that request and keeps the
+//! resulting schemas and connections in memory only.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use astra_core::{ErrorResponse, error_response_coded};
 use astra_mcp::{
-    McpClientManager, McpServerConfig, McpTool, Transport, mcp_tool_schema_from_parts,
-    sanitize_tool_name, tools_to_schemas_checked,
+    McpClientManager, McpServerConfig, McpTool, Transport, sanitize_tool_name,
+    tools_to_schemas_checked,
 };
 use astra_services::{
-    McpDiscoveredToolData, McpRegisterRequestData, McpRuntimeBindingRecord,
-    mcp_binding_tool_namespace, mcp_schema_hash,
+    McpDiscoveredToolData, McpRegisterRequestData, mcp_binding_tool_namespace, mcp_schema_hash,
+    runs::RuntimeMcpBindingRequest,
 };
 use axum::{Json, http::StatusCode};
 use regex::Regex;
@@ -58,6 +58,24 @@ fn validate_url(url: &str) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
             StatusCode::BAD_REQUEST,
             format!("MCP server url scheme '{other}' is unsupported"),
             "mcp_server_invalid",
+        )),
+    }
+}
+
+fn validate_runtime_url(url: &str) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let parsed = reqwest::Url::parse(url).map_err(|error| {
+        mcp_error(
+            StatusCode::BAD_REQUEST,
+            format!("runtime MCP binding url is invalid: {error}"),
+            "mcp_runtime_binding_invalid",
+        )
+    })?;
+    match parsed.scheme() {
+        "http" | "https" | "ws" | "wss" => Ok(()),
+        other => Err(mcp_error(
+            StatusCode::BAD_REQUEST,
+            format!("runtime MCP binding url scheme '{other}' is unsupported"),
+            "mcp_runtime_binding_invalid",
         )),
     }
 }
@@ -133,6 +151,55 @@ fn server_config(
     })
 }
 
+fn request_scoped_server_config(
+    binding: &RuntimeMcpBindingRequest,
+) -> Result<McpServerConfig, (StatusCode, Json<ErrorResponse>)> {
+    let tool_namespace = sanitize_tool_name(binding.id.trim());
+    if tool_namespace.is_empty() {
+        return Err(mcp_error(
+            StatusCode::BAD_REQUEST,
+            "runtime_mcp_bindings[].id must not be empty after sanitization",
+            "mcp_runtime_binding_invalid",
+        ));
+    }
+    validate_runtime_url(binding.url.trim())?;
+    let credential = McpCredentialTransport {
+        auth_token: binding.auth_token.clone(),
+        headers: binding.headers.clone(),
+    };
+    let transport = match binding.transport.trim().to_ascii_lowercase().as_str() {
+        "sse" => Transport::Sse {
+            url: binding.url.trim().to_string(),
+            auth_token: credential.auth_token,
+            headers: credential.headers,
+        },
+        "http" | "streamable_http" | "streamable-http" => Transport::StreamableHttp {
+            url: binding.url.trim().to_string(),
+            auth_token: credential.auth_token,
+            headers: credential.headers,
+        },
+        "ws" | "websocket" => Transport::Ws {
+            url: binding.url.trim().to_string(),
+            auth_token: credential.auth_token,
+            headers: credential.headers,
+        },
+        other => {
+            return Err(mcp_error(
+                StatusCode::BAD_REQUEST,
+                format!("unsupported MCP transport '{other}'"),
+                "mcp_runtime_binding_invalid",
+            ));
+        }
+    };
+    Ok(McpServerConfig {
+        name: tool_namespace,
+        transport,
+        description: String::new(),
+        enabled: true,
+        retry: Default::default(),
+    })
+}
+
 fn collect_secret_strings(value: &Value, out: &mut Vec<String>) {
     match value {
         Value::String(s) if s.len() >= 4 => {
@@ -162,6 +229,14 @@ fn redact_known_secrets(raw: &str, key_value: &Value) -> String {
         redacted = redacted.replace(&secret, "[REDACTED]");
     }
     redact_mcp_error_text(&redacted)
+}
+
+fn runtime_binding_secret_value(binding: &RuntimeMcpBindingRequest) -> Value {
+    json!({
+        "auth_token": &binding.auth_token,
+        "headers": &binding.headers,
+        "url": &binding.url,
+    })
 }
 
 pub(crate) fn redact_mcp_error_text(raw: &str) -> String {
@@ -272,72 +347,47 @@ pub(crate) async fn discover_binding_tools(
     Ok(discovered)
 }
 
-fn cached_tool_schema(
-    tool_namespace: &str,
-    tool: &McpDiscoveredToolData,
-) -> Result<Value, (StatusCode, Json<ErrorResponse>)> {
-    let schema = mcp_tool_schema_from_parts(
-        tool_namespace,
-        &tool.tool_name,
-        tool.description.as_deref().unwrap_or_default(),
-        tool.input_schema_json
-            .clone()
-            .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
-    );
-    let generated_name = schema["function"]["name"].as_str().unwrap_or_default();
-    if generated_name != tool.public_name {
-        return Err(mcp_error(
-            StatusCode::BAD_GATEWAY,
-            format!(
-                "cached MCP tool catalog is inconsistent for binding '{}'",
-                tool_namespace
-            ),
-            "mcp_tools_missing",
-        ));
-    }
-    Ok(schema)
-}
-
-pub(crate) async fn prepare_runtime_bundle(
-    records: &[McpRuntimeBindingRecord],
+pub(crate) async fn prepare_request_scoped_runtime_bundle(
+    bindings: &[RuntimeMcpBindingRequest],
 ) -> Result<Option<RuntimeMcpBundle>, (StatusCode, Json<ErrorResponse>)> {
-    if records.is_empty() {
+    if bindings.is_empty() {
         return Ok(None);
+    }
+
+    let mut namespaces = HashSet::new();
+    let mut configs = Vec::with_capacity(bindings.len());
+
+    for binding in bindings {
+        let config = request_scoped_server_config(binding)?;
+        let tool_namespace = config.name.clone();
+        if !namespaces.insert(tool_namespace.clone()) {
+            return Err(mcp_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "duplicate runtime MCP binding id after sanitization: {}",
+                    binding.id
+                ),
+                "mcp_runtime_binding_invalid",
+            ));
+        }
+        configs.push((binding, config, tool_namespace));
     }
 
     let mut manager = McpClientManager::new();
     let mut schemas = Vec::new();
     let mut public_names = HashSet::new();
 
-    for record in records {
-        if record.tools.is_empty() {
-            return Err(mcp_error(
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "MCP binding {} has no cached tools; register/update it again",
-                    record.binding_id
-                ),
-                "mcp_tools_missing",
-            ));
-        }
-
-        let config = server_config(
-            &mcp_binding_tool_namespace(record.binding_id),
-            &record.transport,
-            &record.url,
-            record.server_description.as_deref(),
-            &record.key_value,
-        )?;
-        let tool_namespace = config.name.clone();
+    for (binding, config, tool_namespace) in configs {
+        let secret_value = runtime_binding_secret_value(binding);
         manager.connect(config).await.map_err(|error| {
             mcp_error(
                 StatusCode::BAD_GATEWAY,
                 format!(
-                    "MCP connection failed for binding {}: {}",
-                    record.binding_id,
-                    redact_known_secrets(&error.to_string(), &record.key_value)
+                    "MCP connection failed for runtime binding '{}': {}",
+                    binding.id,
+                    redact_known_secrets(&error.to_string(), &secret_value)
                 ),
-                "mcp_discovery_failed",
+                "mcp_runtime_discovery_failed",
             )
         })?;
 
@@ -345,32 +395,36 @@ pub(crate) async fn prepare_runtime_bundle(
             mcp_error(
                 StatusCode::BAD_GATEWAY,
                 format!(
-                    "MCP binding {} connected without a session",
-                    record.binding_id
+                    "runtime MCP binding '{}' connected without a session",
+                    binding.id
                 ),
-                "mcp_discovery_failed",
+                "mcp_runtime_discovery_failed",
             )
         })?;
 
-        for tool in &record.tools {
-            if !conn.has_tool(&tool.tool_name) {
+        let discovered = conn.tools();
+        if discovered.is_empty() {
+            return Err(mcp_error(
+                StatusCode::BAD_GATEWAY,
+                format!("runtime MCP binding '{}' returned no tools", binding.id),
+                "mcp_runtime_discovery_failed",
+            ));
+        }
+        let binding_schemas = tools_to_schemas_checked(&tool_namespace, discovered)
+            .map_err(|error| mcp_error(StatusCode::CONFLICT, error, "mcp_public_name_conflict"))?;
+        for schema in binding_schemas {
+            let public_name = schema["function"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if !public_names.insert(public_name.clone()) {
                 return Err(mcp_error(
                     StatusCode::BAD_GATEWAY,
-                    format!(
-                        "cached MCP tool '{}' is no longer visible for binding {}; register/update it again",
-                        tool.tool_name, record.binding_id
-                    ),
-                    "mcp_tools_missing",
-                ));
-            }
-            if !public_names.insert(tool.public_name.clone()) {
-                return Err(mcp_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("duplicate MCP public tool name: {}", tool.public_name),
+                    format!("duplicate MCP public tool name: {public_name}"),
                     "mcp_public_name_conflict",
                 ));
             }
-            schemas.push(cached_tool_schema(&tool_namespace, tool)?);
+            schemas.push(schema);
         }
     }
 
@@ -394,19 +448,120 @@ mod tests {
     }
 
     #[test]
-    fn cached_tool_schema_preserves_public_name() {
-        let tool = McpDiscoveredToolData {
-            tool_name: "query_sql".to_string(),
-            public_name: "mcp__binding_42__query_sql".to_string(),
-            description: Some("Query SQL".to_string()),
-            input_schema_json: Some(json!({"type": "object", "properties": {}})),
-            output_schema_json: None,
-            schema_hash: "hash".to_string(),
+    fn runtime_binding_secret_value_redacts_secret_url() {
+        let binding = RuntimeMcpBindingRequest {
+            id: "external_nl2sql".to_string(),
+            transport: "streamable_http".to_string(),
+            url: "http://tool-server/mcp/http?token=url-secret".to_string(),
+            auth_token: None,
+            headers: HashMap::new(),
         };
-        let schema = cached_tool_schema("binding_42", &tool).unwrap();
+        let secret_value = runtime_binding_secret_value(&binding);
+        let redacted = redact_known_secrets(
+            "upstream failed at http://tool-server/mcp/http?token=url-secret",
+            &secret_value,
+        );
+
+        assert!(!redacted.contains("url-secret"));
+        assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn request_scoped_server_config_preserves_headers_and_sanitizes_namespace() {
+        let binding = RuntimeMcpBindingRequest {
+            id: "external nl2sql".to_string(),
+            transport: "streamable-http".to_string(),
+            url: "https://tools.example.test/mcp/http".to_string(),
+            auth_token: Some("token-value".to_string()),
+            headers: HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer runtime-grant".to_string(),
+            )]),
+        };
+
+        let config = request_scoped_server_config(&binding).expect("valid runtime binding");
+
+        assert_eq!(config.name, "external_nl2sql");
+        match config.transport {
+            Transport::StreamableHttp {
+                url,
+                auth_token,
+                headers,
+            } => {
+                assert_eq!(url, "https://tools.example.test/mcp/http");
+                assert_eq!(auth_token.as_deref(), Some("token-value"));
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer runtime-grant")
+                );
+            }
+            other => panic!("unexpected transport: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_scoped_server_config_reports_runtime_validation_errors() {
+        let invalid_url = RuntimeMcpBindingRequest {
+            id: "external_nl2sql".to_string(),
+            transport: "streamable_http".to_string(),
+            url: "file:///tmp/mcp.sock".to_string(),
+            auth_token: None,
+            headers: HashMap::new(),
+        };
+        let err = match request_scoped_server_config(&invalid_url) {
+            Ok(_) => panic!("url must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(
-            schema["function"]["name"].as_str(),
-            Some("mcp__binding_42__query_sql")
+            err.1.0.error_code.as_deref(),
+            Some("mcp_runtime_binding_invalid")
+        );
+
+        let invalid_transport = RuntimeMcpBindingRequest {
+            transport: "stdio".to_string(),
+            url: "http://127.0.0.1/mcp".to_string(),
+            ..invalid_url
+        };
+        let err = match request_scoped_server_config(&invalid_transport) {
+            Ok(_) => panic!("transport must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.1.0.error_code.as_deref(),
+            Some("mcp_runtime_binding_invalid")
+        );
+    }
+
+    #[tokio::test]
+    async fn request_scoped_runtime_bundle_rejects_duplicate_ids_before_connecting() {
+        let bindings = vec![
+            RuntimeMcpBindingRequest {
+                id: "external nl2sql".to_string(),
+                transport: "streamable_http".to_string(),
+                url: "http://127.0.0.1:1/mcp".to_string(),
+                auth_token: None,
+                headers: HashMap::new(),
+            },
+            RuntimeMcpBindingRequest {
+                id: "external/nl2sql".to_string(),
+                transport: "streamable_http".to_string(),
+                url: "http://127.0.0.1:1/mcp".to_string(),
+                auth_token: None,
+                headers: HashMap::new(),
+            },
+        ];
+
+        let err = match prepare_request_scoped_runtime_bundle(&bindings).await {
+            Ok(_) => panic!("duplicate sanitized binding ids should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.1.0.error_code.as_deref(),
+            Some("mcp_runtime_binding_invalid")
         );
     }
 }

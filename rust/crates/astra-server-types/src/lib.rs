@@ -94,6 +94,8 @@ pub struct ChatRequest {
     #[serde(default)]
     pub allow_tools: Option<Vec<String>>,
     #[serde(default)]
+    pub runtime_mcp_bindings: Vec<astra_services::runs::RuntimeMcpBindingRequest>,
+    #[serde(default)]
     pub mcp_binding_ids: Option<Vec<i64>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
@@ -1037,6 +1039,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         allow_skills: request.allow_skills,
         allow_skill_sources: request.allow_skill_sources,
         allow_tools: request.allow_tools,
+        runtime_mcp_bindings: request.runtime_mcp_bindings,
         mcp_binding_ids: request.mcp_binding_ids,
         context,
         forward_headers: std::collections::HashMap::new(),

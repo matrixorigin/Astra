@@ -149,7 +149,6 @@ fn chat_stream_bridge_fallback_payload(
         "allow_skills": allow_skills,
         "allow_skill_sources": allow_skill_sources,
         "allow_tools": allow_tools,
-        "mcp_binding_ids": chat_data.mcp_binding_ids.as_ref(),
         "context": chat_data.context.as_ref(),
         "edge_profile": edge_profile,
         "execution_budget": chat_data.execution_budget.as_ref(),
@@ -565,6 +564,7 @@ mod tests {
             allow_skills: Some(vec!["plan".to_string()]),
             allow_skill_sources: None,
             allow_tools: Some(vec!["bash".to_string()]),
+            runtime_mcp_bindings: Vec::new(),
             mcp_binding_ids: Some(vec![301]),
             context: Some(context),
             forward_headers: std::collections::HashMap::new(),
@@ -594,7 +594,7 @@ mod tests {
         assert_eq!(obj["allow_skills"], serde_json::json!(["plan"]));
         assert_eq!(obj["allow_skill_sources"], serde_json::Value::Null);
         assert_eq!(obj["allow_tools"], serde_json::json!(["bash"]));
-        assert_eq!(obj["mcp_binding_ids"], serde_json::json!([301]));
+        assert!(!obj.contains_key("mcp_binding_ids"));
         assert_eq!(
             obj["edge_profile"]["system_prompt_override"],
             "override text"
@@ -629,6 +629,7 @@ mod tests {
                 "BASH".to_string(),
                 "read_file".to_string(),
             ]),
+            runtime_mcp_bindings: Vec::new(),
             mcp_binding_ids: None,
             context: None,
             forward_headers: std::collections::HashMap::new(),
