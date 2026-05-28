@@ -107,6 +107,41 @@ pub enum TraceLevel {
     Trace = 4,
 }
 
+/// Tiered trace verbosity — a user-facing control that maps to `min_level`.
+///
+/// | Mode    | min_level  | What passes                          |
+/// |---------|-----------|--------------------------------------|
+/// | Off     | (none)    | Nothing is emitted                   |
+/// | Terse   | Warn      | Only Error + Warn (problems only)    |
+/// | Verbose | Trace     | Everything (LLM bodies, thinking…)   |
+///
+/// When unset, the default `min_level` is `Info` (normal operational events).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceVerbosity {
+    /// No events emitted — equivalent to disabling tracing entirely.
+    Off,
+    /// Error + Warn only (problems and degraded signals).
+    Terse,
+    /// Use default `min_level` (Info) — normal operational events.
+    #[default]
+    Normal,
+    /// All levels including Trace — LLM bodies, thinking, full detail.
+    Verbose,
+}
+
+impl TraceVerbosity {
+    /// Convert to the corresponding `TraceLevel` threshold, or `None` for `Off`.
+    pub fn min_level(self) -> Option<TraceLevel> {
+        match self {
+            TraceVerbosity::Off => None,
+            TraceVerbosity::Terse => Some(TraceLevel::Warn),
+            TraceVerbosity::Normal => Some(TraceLevel::Info),
+            TraceVerbosity::Verbose => Some(TraceLevel::Trace),
+        }
+    }
+}
+
 impl FromStr for TraceLevel {
     type Err = ();
 

@@ -19,7 +19,7 @@
 use std::time::Instant;
 
 // Re-export shared trace types from astra-core
-pub use astra_core::{TraceCategory, TraceLevel};
+pub use astra_core::{TraceCategory, TraceLevel, TraceVerbosity};
 
 /// Maximum Unicode scalars kept in [`EventKind::ToolCallOutput`]'s `output_preview`.
 pub const TOOL_OUTPUT_PREVIEW_CHARS: usize = 500;
@@ -309,6 +309,7 @@ pub struct EventLog {
     /// Enabled trace categories. If empty, all categories pass through.
     /// If non-empty, only events matching these categories are recorded.
     enabled_categories: Vec<TraceCategory>,
+    enabled: bool,
 }
 
 impl EventLog {
@@ -321,6 +322,7 @@ impl EventLog {
             start: Instant::now(),
             min_level: TraceLevel::Info,
             enabled_categories: Vec::new(),
+            enabled: true,
         }
     }
 
@@ -333,6 +335,7 @@ impl EventLog {
             start: Instant::now(),
             min_level,
             enabled_categories: Vec::new(),
+            enabled: true,
         }
     }
 
@@ -345,7 +348,28 @@ impl EventLog {
             start: Instant::now(),
             min_level,
             enabled_categories,
+            enabled: true,
         }
+    }
+
+    /// Configure EventLog from [`TraceVerbosity`].
+    ///
+    /// Maps user-facing verbosity to the internal `min_level` and `enabled` flag.
+    /// - `Off` → `enabled = false`, no events emitted.
+    /// - `Terse` → `min_level = Warn`, only problems and degraded signals.
+    /// - `Normal` → `min_level = Info`, normal operational events (default).
+    /// - `Verbose` → `min_level = Trace`, all events including LLM bodies and thinking.
+    pub fn with_verbosity(mut self, verbosity: TraceVerbosity) -> Self {
+        match verbosity.min_level() {
+            Some(level) => {
+                self.min_level = level;
+                self.enabled = true;
+            }
+            None => {
+                self.enabled = false;
+            }
+        }
+        self
     }
 
     /// Emit a new event, returning its ID for use as `caused_by` in future events.
