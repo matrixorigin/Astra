@@ -59,8 +59,14 @@ pub(crate) struct FileState {
     pub(super) cached_content: Option<String>,
     /// Merged line ranges already read (sorted, non-overlapping).
     /// Used to detect when a new ranged read is fully covered by prior reads.
-    /// Reset on write or mtime change.
+    /// Reset on write or mtime change. Dedup only trusts these ranges within
+    /// the turn that recorded them because older turn content may have been
+    /// compacted out of the model context.
     pub(super) read_ranges: Vec<(u64, u64)>,
+    /// Turn index that recorded the latest successful read. Read dedup is
+    /// scoped to this turn so later turns can re-read unchanged files and get
+    /// real content instead of "refer to earlier result" stubs.
+    pub(super) last_read_turn_index: u32,
 }
 
 /// Merge a new `(start, end)` into a sorted, non-overlapping range list.
@@ -185,6 +191,7 @@ impl ToolExecutor {
         content: Option<String>,
     ) {
         let ts = Self::file_mtime_ms(path);
+        let turn_index = self.journal_turn_index.load(Ordering::Acquire);
         let cached_content = content.filter(|c| c.len() <= MAX_CACHED_FILE_BYTES);
         let key = self.file_state_key(path);
         if let Ok(mut state) = self.file_state.lock() {
@@ -230,6 +237,7 @@ impl ToolExecutor {
                     last_dedup_key,
                     cached_content,
                     read_ranges: ranges,
+                    last_read_turn_index: turn_index,
                 },
             );
             enforce_limits(&mut state);
@@ -267,6 +275,7 @@ impl ToolExecutor {
                     last_dedup_key: ReadDedupKey::Full,
                     cached_content,
                     read_ranges: vec![],
+                    last_read_turn_index: self.journal_turn_index.load(Ordering::Acquire),
                 },
             );
             enforce_limits(&mut state);
@@ -354,6 +363,7 @@ impl ToolExecutor {
         if current_ts == 0 {
             return false;
         }
+        let current_turn = self.journal_turn_index.load(Ordering::Acquire);
         let key = self.file_state_key(path);
         self.file_state
             .lock()
@@ -362,6 +372,7 @@ impl ToolExecutor {
                 s.get(&key).and_then(|fs| {
                     (fs.from_read
                         && fs.timestamp_ms == current_ts
+                        && fs.last_read_turn_index == current_turn
                         && fs.last_dedup_key == *requested)
                         .then_some(())
                 })
@@ -369,19 +380,25 @@ impl ToolExecutor {
             .is_some()
     }
 
-    /// Check if we can dedup a read (previous op was a full read, unchanged mtime).
+    /// Check if we can dedup a read within the current turn (previous op was a
+    /// full read, unchanged mtime).
     pub(super) fn can_dedup_read(&self, path: &Path) -> bool {
         let current_ts = Self::file_mtime_ms(path);
         if current_ts == 0 {
             return false;
         }
+        let current_turn = self.journal_turn_index.load(Ordering::Acquire);
         let key = self.file_state_key(path);
         self.file_state
             .lock()
             .ok()
             .and_then(|s| {
-                s.get(&key)
-                    .map(|fs| fs.from_read && !fs.is_partial && fs.timestamp_ms == current_ts)
+                s.get(&key).map(|fs| {
+                    fs.from_read
+                        && !fs.is_partial
+                        && fs.timestamp_ms == current_ts
+                        && fs.last_read_turn_index == current_turn
+                })
             })
             .unwrap_or(false)
     }
@@ -395,6 +412,7 @@ impl ToolExecutor {
         if current_ts == 0 {
             return false;
         }
+        let current_turn = self.journal_turn_index.load(Ordering::Acquire);
         let key = self.file_state_key(path);
         self.file_state
             .lock()
@@ -403,6 +421,7 @@ impl ToolExecutor {
                 s.get(&key).and_then(|fs| {
                     (fs.from_read
                         && fs.timestamp_ms == current_ts
+                        && fs.last_read_turn_index == current_turn
                         && ranges_cover(&fs.read_ranges, start, end))
                     .then_some(())
                 })

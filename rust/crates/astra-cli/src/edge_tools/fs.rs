@@ -477,20 +477,20 @@ impl ToolExecutor {
 
         let is_ranged = has_range;
 
-        // Dedup: if file was fully read before and hasn't changed, return stub.
-        // Works for both ranged and non-ranged reads — once the model has the
-        // full file content, any further reads are wasteful.
+        // Dedup: if file was fully read earlier in this turn and hasn't
+        // changed, return a stub. Later turns may need the content again after
+        // prompt compaction, so cross-turn reads still return the file body.
         if self.can_dedup_read(&path) {
             let msg = if is_ranged {
                 format!(
-                    "[File already fully read and unchanged — refer to the earlier \
-                     read_file result for {path_str}. Do not re-read the same file \
-                     in multiple small ranges.]"
+                    "[File already fully read earlier in this turn and unchanged — \
+                     refer to the earlier read_file result for {path_str}. Do not \
+                     re-read the same file in multiple small ranges.]"
                 )
             } else {
                 format!(
-                    "[File unchanged since last read — refer to the earlier \
-                     read_file result for {path_str}]"
+                    "[File unchanged since the earlier read in this turn — refer \
+                     to the earlier read_file result for {path_str}]"
                 )
             };
             return msg;
@@ -3757,6 +3757,40 @@ type Handler interface {
     }
 
     #[test]
+    fn read_file_full_read_dedups_only_within_same_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("full.txt");
+        std::fs::write(&file_path, "MARK_A\nMARK_B\n").unwrap();
+
+        let executor = test_executor_in(dir.path());
+        executor
+            .journal_turn_index
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+
+        let first = executor.read_file(&serde_json::json!({ "path": "full.txt" }));
+        assert!(
+            first.contains("MARK_A"),
+            "first read should return content: {first}"
+        );
+
+        let second_same_turn = executor.read_file(&serde_json::json!({ "path": "full.txt" }));
+        assert!(
+            second_same_turn.contains("earlier read in this turn"),
+            "same-turn repeat should stub: {second_same_turn}"
+        );
+
+        executor
+            .journal_turn_index
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+
+        let next_turn = executor.read_file(&serde_json::json!({ "path": "full.txt" }));
+        assert!(
+            next_turn.contains("MARK_A") && !next_turn.contains("earlier read in this turn"),
+            "next turn must be able to re-read content: {next_turn}"
+        );
+    }
+
+    #[test]
     fn read_file_consecutive_identical_outline_dedups() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("o.rs");
@@ -3816,6 +3850,43 @@ type Handler interface {
         assert!(
             r_a_again.contains("already read"),
             "range 1-2 was already read — should stub: {r_a_again}"
+        );
+    }
+
+    #[test]
+    fn read_file_range_dedup_resets_across_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        write_large_file(dir.path(), "turns.txt", 200);
+
+        let executor = test_executor_in(dir.path());
+        executor
+            .journal_turn_index
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let args = serde_json::json!({
+            "path": "turns.txt",
+            "start_line": 1,
+            "end_line": 5
+        });
+
+        let first = executor.read_file(&args);
+        assert!(
+            first.contains("line 1"),
+            "first turn should read content: {first}"
+        );
+
+        let second_same_turn = executor.read_file(&args);
+        assert!(
+            second_same_turn.contains("Same read_file request"),
+            "same-turn repeat should stub: {second_same_turn}"
+        );
+
+        executor
+            .journal_turn_index
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        let next_turn = executor.read_file(&args);
+        assert!(
+            next_turn.contains("line 1") && !next_turn.contains("Same read_file request"),
+            "next turn must be able to re-read the same range: {next_turn}"
         );
     }
 
