@@ -98,23 +98,20 @@ pub fn extract_result_text_with_limit(result: &CallToolResult, max_len: usize) -
     let mut total_len = 0;
 
     for content in &result.content {
-        match &content.raw {
-            RawContent::Text(text) => {
-                let remaining = max_len.saturating_sub(total_len);
-                if remaining == 0 {
-                    break;
-                }
-                if text.text.len() <= remaining {
-                    total_len += text.text.len();
-                    parts.push(text.text.clone());
-                } else {
-                    let end = text.text.floor_char_boundary(remaining);
-                    parts.push(text.text[..end].to_string());
-                    total_len += end;
-                    break;
-                }
+        if let RawContent::Text(text) = &content.raw {
+            let remaining = max_len.saturating_sub(total_len);
+            if remaining == 0 {
+                break;
             }
-            _ => {}
+            if text.text.len() <= remaining {
+                total_len += text.text.len();
+                parts.push(text.text.clone());
+            } else {
+                let end = text.text.floor_char_boundary(remaining);
+                parts.push(text.text[..end].to_string());
+                total_len += end;
+                break;
+            }
         }
     }
 

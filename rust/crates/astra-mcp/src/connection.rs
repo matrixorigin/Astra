@@ -321,12 +321,11 @@ impl McpConnection {
 
         let mut skills = Vec::new();
         for res in &resources {
-            if res.raw.uri.starts_with("skill://") {
-                if let Ok(content) = self.read_resource(&res.raw.uri).await {
-                    if !content.is_empty() {
-                        skills.push((res.raw.name.clone(), content));
-                    }
-                }
+            if res.raw.uri.starts_with("skill://")
+                && let Ok(content) = self.read_resource(&res.raw.uri).await
+                && !content.is_empty()
+            {
+                skills.push((res.raw.name.clone(), content));
             }
         }
         skills
@@ -699,14 +698,13 @@ async fn connect_ws(
                 Ok(0) => break,
                 Ok(_) => {
                     let trimmed = line.trim_end();
-                    if !trimmed.is_empty() {
-                        if ws_sink
+                    if !trimmed.is_empty()
+                        && ws_sink
                             .send(tungstenite::Message::Text(trimmed.to_owned().into()))
                             .await
                             .is_err()
-                        {
-                            break;
-                        }
+                    {
+                        break;
                     }
                     line.clear();
                 }

@@ -13,18 +13,10 @@ use crate::tools::{extract_result_text, mcp_tool_to_schema, sanitize_tool_name};
 use crate::types::{ConnectionState, McpServerConfig};
 
 /// MCP client manager for multiple server connections.
+#[derive(Default)]
 pub struct McpClientManager {
     connections: HashMap<String, Arc<McpConnection>>,
     states: HashMap<String, ConnectionState>,
-}
-
-impl Default for McpClientManager {
-    fn default() -> Self {
-        Self {
-            connections: HashMap::new(),
-            states: HashMap::new(),
-        }
-    }
 }
 
 impl McpClientManager {
@@ -226,13 +218,13 @@ impl McpClientManager {
     pub async fn refresh_changed_tools(&mut self) -> Vec<String> {
         let mut refreshed = Vec::new();
         for (name, conn) in &mut self.connections {
-            if conn.has_pending_tool_change() {
-                if let Some(inner) = Arc::get_mut(conn) {
-                    match inner.refresh_tools_if_changed().await {
-                        Ok(true) => refreshed.push(name.clone()),
-                        Ok(false) => {}
-                        Err(e) => tracing::warn!("Failed to refresh tools for {name}: {e}"),
-                    }
+            if conn.has_pending_tool_change()
+                && let Some(inner) = Arc::get_mut(conn)
+            {
+                match inner.refresh_tools_if_changed().await {
+                    Ok(true) => refreshed.push(name.clone()),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!("Failed to refresh tools for {name}: {e}"),
                 }
             }
         }
