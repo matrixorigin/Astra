@@ -22,7 +22,9 @@
 //!    write-back goes through `apply_edit`, the two ends close a loop
 //!    that's regression-guarded by `every_catalog_item_is_editable_via_apply_edit`.
 
-use crate::runtime_config::{RuntimeConfig, TraceCategory, TraceLevelSerde, TraceProfile};
+use crate::runtime_config::{
+    RuntimeConfig, TraceCategory, TraceLevelSerde, TraceProfile, TraceSink,
+};
 use astra_core::runtime_limits::{context_window_for_model, RuntimeLimits};
 use serde_json::Value;
 use std::path::Path;
