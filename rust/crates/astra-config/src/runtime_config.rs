@@ -1391,6 +1391,51 @@ impl SessionTraceConfig {
         }
         self.enabled_categories.contains(&TraceCategory::All) || self.enabled_categories.contains(&cat)
     }
+
+    /// Build from CLI flags (`--trace-profile`, `--trace-level`, `--trace-cat`).
+    pub fn from_cli(
+        profile: Option<&str>,
+        level: Option<&str>,
+        cats: Option<&str>,
+    ) -> Self {
+        let mut config = Self::default();
+        if let Some(p) = profile {
+            config = config.apply_profile(match p {
+                "production" => TraceProfile::Production,
+                "dev" => TraceProfile::Dev,
+                _ => TraceProfile::Custom,
+            });
+        }
+        if let Some(l) = level {
+            config.min_level = match l {
+                "error" => TraceLevelSerde::Error,
+                "warn" => TraceLevelSerde::Warn,
+                "info" => TraceLevelSerde::Info,
+                "debug" => TraceLevelSerde::Debug,
+                "trace" => TraceLevelSerde::Trace,
+                _ => TraceLevelSerde::Info,
+            };
+        }
+        if let Some(c) = cats {
+            let lower = c.to_lowercase();
+            config.enabled_categories = if lower == "all" {
+                vec![TraceCategory::All]
+            } else {
+                lower.split(',').filter_map(|s| match s.trim() {
+                    "tool_calls" => Some(TraceCategory::ToolCalls),
+                    "llm_exchanges" => Some(TraceCategory::LlmExchanges),
+                    "context_assembly" => Some(TraceCategory::ContextAssembly),
+                    "decision_explain" => Some(TraceCategory::DecisionExplain),
+                    "phase_transition" => Some(TraceCategory::PhaseTransition),
+                    "budget" => Some(TraceCategory::Budget),
+                    "reflection" => Some(TraceCategory::Reflection),
+                    "verification" => Some(TraceCategory::Verification),
+                    _ => None,
+                }).collect()
+            };
+        }
+        config
+    }
 }
 
 // ─── Token Budget Configuration ──────────────────────────────────────────────
