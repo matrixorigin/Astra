@@ -1,43 +1,18 @@
 use super::*;
 use crate::{manifest_loader, mcp_client};
 
-/// Convert serde-friendly trace level to pipeline-native trace level.
-fn trace_level_from_config(
-    level: astra_config::runtime_config::TraceLevelSerde,
-) -> astra_pipeline::event::TraceLevel {
-    match level {
-        astra_config::runtime_config::TraceLevelSerde::Error => {
-            astra_pipeline::event::TraceLevel::Error
-        }
-        astra_config::runtime_config::TraceLevelSerde::Warn => {
-            astra_pipeline::event::TraceLevel::Warn
-        }
-        astra_config::runtime_config::TraceLevelSerde::Info => {
-            astra_pipeline::event::TraceLevel::Info
-        }
-        astra_config::runtime_config::TraceLevelSerde::Debug => {
-            astra_pipeline::event::TraceLevel::Debug
-        }
-        astra_config::runtime_config::TraceLevelSerde::Trace => {
-            astra_pipeline::event::TraceLevel::Trace
-        }
-    }
-}
-
 pub(crate) fn create_pipeline_modules(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    trace_config: astra_config::runtime_config::SessionTraceConfig,
 ) -> PipelineModules {
-    create_pipeline_modules_inner(api, profile, true, trace_config)
+    create_pipeline_modules_inner(api, profile, true)
 }
 
 pub(crate) fn create_pipeline_modules_quiet(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    trace_config: astra_config::runtime_config::SessionTraceConfig,
 ) -> PipelineModules {
-    create_pipeline_modules_inner(api, profile, false, trace_config)
+    create_pipeline_modules_inner(api, profile, false)
 }
 
 pub(crate) fn local_task_service() -> std::sync::Arc<dyn astra_services::TaskService> {
@@ -190,8 +165,6 @@ pub(crate) struct PipelineModules {
     pub mcp_manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
     /// File-system watcher for skill hot-reload (kept alive while REPL runs).
     pub _skill_watcher: Option<astra_runtime::skills::watcher::SkillWatcherHandle>,
-    /// Per-session trace configuration.
-    pub trace_config: astra_config::runtime_config::SessionTraceConfig,
 }
 
 /// Format an [`McpError`] as a concise user-facing message without redundant
@@ -227,12 +200,7 @@ fn create_pipeline_modules_inner(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     announce_skills: bool,
-    trace_config: astra_config::runtime_config::SessionTraceConfig,
 ) -> PipelineModules {
-    // Trace config is stored in RuntimeConfig; each turn's EventLog reads it
-    // from the config snapshot (not from process-global state).
-    let _ = &trace_config; // consumed by RuntimeConfig snapshot; unused locally after global-setter removal
-
     // Selector removed — the runtime now builds the turn-specific tool surface
     // directly from the local CLI catalog plus any mounted server/MCP schemas.
 
@@ -397,7 +365,6 @@ fn create_pipeline_modules_inner(
         unified_skill_registry,
         mcp_manager,
         _skill_watcher: skill_watcher,
-        trace_config,
     }
 }
 

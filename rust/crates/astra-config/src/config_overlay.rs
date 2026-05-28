@@ -25,7 +25,7 @@
 use crate::runtime_config::{
     RuntimeConfig, TraceCategory, TraceLevelSerde, TraceProfile, TraceSink,
 };
-use astra_core::runtime_limits::{context_window_for_model, RuntimeLimits};
+use astra_core::runtime_limits::{RuntimeLimits, context_window_for_model};
 use serde_json::Value;
 use std::path::Path;
 
@@ -111,11 +111,7 @@ pub fn effective_budget_for_model(config: &RuntimeConfig, model: Option<&str>) -
         // Keep the local-limit fallback consistent with RuntimeLimits:
         // env can override the configured value, so consult it too.
         let env_limit = RuntimeLimits::global().max_turn_input_tokens;
-        if env_limit > 0 {
-            env_limit
-        } else {
-            configured
-        }
+        if env_limit > 0 { env_limit } else { configured }
     }
 }
 
@@ -371,6 +367,9 @@ pub fn filter_settings(items: &[SettingItem], query: &str) -> Vec<SettingItem> {
 
 /// Add or remove a category from the vec.
 fn toggle_category(cats: &mut Vec<TraceCategory>, cat: TraceCategory, enable: bool) {
+    if cats.contains(&TraceCategory::All) {
+        *cats = TraceCategory::individual_categories().to_vec();
+    }
     if enable {
         if !cats.contains(&cat) {
             cats.push(cat);
@@ -378,6 +377,8 @@ fn toggle_category(cats: &mut Vec<TraceCategory>, cat: TraceCategory, enable: bo
     } else {
         cats.retain(|c| *c != cat);
     }
+    cats.sort();
+    cats.dedup();
 }
 
 /// Add or remove a sink from the vec.
@@ -465,6 +466,10 @@ pub fn apply_edit(
             Value::Object(_) => "object".into(),
         }
     }
+    fn mark_trace_custom(config: &mut RuntimeConfig) {
+        config.trace.profile = TraceProfile::Custom;
+        config.trace = std::mem::take(&mut config.trace).normalize();
+    }
 
     match id {
         "token_budget.max_turn_input_tokens" => {
@@ -550,6 +555,7 @@ pub fn apply_edit(
                     "trace" => TraceLevelSerde::Trace,
                     _ => return Ok(config),
                 };
+                mark_trace_custom(&mut config);
             }
         }
         "trace.tool_calls" => {
@@ -558,6 +564,7 @@ pub fn apply_edit(
                 TraceCategory::ToolCalls,
                 as_bool(&new_value, id)?,
             );
+            mark_trace_custom(&mut config);
             return Ok(config);
         }
         "trace.llm_exchanges" => {
@@ -566,6 +573,7 @@ pub fn apply_edit(
                 TraceCategory::LlmExchanges,
                 as_bool(&new_value, id)?,
             );
+            mark_trace_custom(&mut config);
             return Ok(config);
         }
         "trace.thinking" => {
@@ -574,6 +582,7 @@ pub fn apply_edit(
                 TraceCategory::Thinking,
                 as_bool(&new_value, id)?,
             );
+            mark_trace_custom(&mut config);
             return Ok(config);
         }
         "trace.context_assembly" => {
@@ -582,6 +591,7 @@ pub fn apply_edit(
                 TraceCategory::ContextAssembly,
                 as_bool(&new_value, id)?,
             );
+            mark_trace_custom(&mut config);
             return Ok(config);
         }
         "trace.decision_explain" => {
@@ -590,6 +600,7 @@ pub fn apply_edit(
                 TraceCategory::DecisionExplain,
                 as_bool(&new_value, id)?,
             );
+            mark_trace_custom(&mut config);
             return Ok(config);
         }
         "trace.phase_transition" => {
@@ -598,6 +609,7 @@ pub fn apply_edit(
                 TraceCategory::PhaseTransition,
                 as_bool(&new_value, id)?,
             );
+            mark_trace_custom(&mut config);
             return Ok(config);
         }
         "trace.budget" => {
@@ -606,6 +618,7 @@ pub fn apply_edit(
                 TraceCategory::Budget,
                 as_bool(&new_value, id)?,
             );
+            mark_trace_custom(&mut config);
             return Ok(config);
         }
         "trace.reflection" => {
@@ -614,6 +627,7 @@ pub fn apply_edit(
                 TraceCategory::Reflection,
                 as_bool(&new_value, id)?,
             );
+            mark_trace_custom(&mut config);
             return Ok(config);
         }
         "trace.verification" => {
@@ -622,6 +636,7 @@ pub fn apply_edit(
                 TraceCategory::Verification,
                 as_bool(&new_value, id)?,
             );
+            mark_trace_custom(&mut config);
             return Ok(config);
         }
         "trace.memory_retrieval" => {
@@ -630,6 +645,7 @@ pub fn apply_edit(
                 TraceCategory::MemoryRetrieval,
                 as_bool(&new_value, id)?,
             );
+            mark_trace_custom(&mut config);
             return Ok(config);
         }
         "trace.skill_execution" => {
@@ -638,6 +654,7 @@ pub fn apply_edit(
                 TraceCategory::SkillExecution,
                 as_bool(&new_value, id)?,
             );
+            mark_trace_custom(&mut config);
             return Ok(config);
         }
         "trace.prompt_assembly" => {
@@ -646,6 +663,7 @@ pub fn apply_edit(
                 TraceCategory::PromptAssembly,
                 as_bool(&new_value, id)?,
             );
+            mark_trace_custom(&mut config);
             return Ok(config);
         }
         "trace.guard_evaluation" => {
@@ -654,12 +672,14 @@ pub fn apply_edit(
                 TraceCategory::GuardEvaluation,
                 as_bool(&new_value, id)?,
             );
+            mark_trace_custom(&mut config);
             return Ok(config);
         }
         "trace.sampling_rate" => {
             let n = as_f64(&new_value, id)?;
             ensure_range(n, 0.0, 1.0, id)?;
             config.trace.sampling_rate = n;
+            mark_trace_custom(&mut config);
         }
         "trace.sinks.journal" => {
             toggle_trace_sink(
@@ -667,6 +687,7 @@ pub fn apply_edit(
                 TraceSink::Journal,
                 as_bool(&new_value, id)?,
             );
+            mark_trace_custom(&mut config);
             return Ok(config);
         }
         "trace.sinks.stderr" => {
@@ -675,6 +696,7 @@ pub fn apply_edit(
                 TraceSink::Stderr,
                 as_bool(&new_value, id)?,
             );
+            mark_trace_custom(&mut config);
             return Ok(config);
         }
         "runtime_limits.max_turns" => {
@@ -716,9 +738,30 @@ mod tests {
             Value::Bool(true),
         )
         .expect("toggle edit should succeed");
-        assert!(updated
-            .trace
-            .enabled_categories
-            .contains(&TraceCategory::LlmExchanges));
+        assert!(
+            updated
+                .trace
+                .enabled_categories
+                .contains(&TraceCategory::LlmExchanges)
+        );
+    }
+
+    #[test]
+    fn apply_edit_on_trace_toggle_breaks_out_of_preset_profile() {
+        let config = RuntimeConfig {
+            trace: RuntimeConfig::default()
+                .trace
+                .apply_profile(TraceProfile::Dev),
+            ..RuntimeConfig::default()
+        };
+        let updated = apply_edit(config, "trace.llm_exchanges", Value::Bool(false))
+            .expect("toggle edit should succeed");
+        assert_eq!(updated.trace.profile, TraceProfile::Custom);
+        assert!(
+            !updated
+                .trace
+                .enabled_categories
+                .contains(&TraceCategory::LlmExchanges)
+        );
     }
 }

@@ -86,6 +86,60 @@ use cli::project_instructions::{
 
 // ════════════════════════════════════════════════════════════════ main ════
 
+fn apply_trace_cli_overlay(
+    overlay: &mut astra_config::runtime_config::RuntimeConfig,
+    trace_profile: Option<&str>,
+    trace_level: Option<&str>,
+    trace_cat: Option<&str>,
+) -> Result<bool, String> {
+    if trace_profile.is_none() && trace_level.is_none() && trace_cat.is_none() {
+        return Ok(false);
+    }
+    overlay.trace =
+        overlay
+            .trace
+            .clone()
+            .with_cli_overrides(trace_profile, trace_level, trace_cat)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod trace_overlay_tests {
+    use super::apply_trace_cli_overlay;
+
+    #[test]
+    fn apply_trace_cli_overlay_preserves_existing_overlay_fields() {
+        let mut overlay = astra_config::runtime_config::RuntimeConfig::default();
+        overlay.runtime_limits.max_turns = 17;
+
+        let changed = apply_trace_cli_overlay(&mut overlay, Some("dev"), None, None)
+            .expect("trace overlay should parse");
+
+        assert!(changed);
+        assert_eq!(overlay.runtime_limits.max_turns, 17);
+        assert_eq!(
+            overlay.trace.enabled_categories,
+            astra_config::runtime_config::TraceCategory::individual_categories().to_vec()
+        );
+    }
+
+    #[test]
+    fn apply_trace_cli_overlay_is_noop_without_trace_flags() {
+        let mut overlay = astra_config::runtime_config::RuntimeConfig::default();
+        overlay.runtime_limits.max_turns = 23;
+
+        let changed =
+            apply_trace_cli_overlay(&mut overlay, None, None, None).expect("no-op should succeed");
+
+        assert!(!changed);
+        assert_eq!(overlay.runtime_limits.max_turns, 23);
+        assert_eq!(
+            overlay.trace,
+            astra_config::runtime_config::SessionTraceConfig::default()
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
@@ -136,6 +190,20 @@ async fn main() {
         };
         cli_overlay.runtime_limits.max_turns = turns;
         has_cli_overlay = true;
+    }
+    match apply_trace_cli_overlay(
+        &mut cli_overlay,
+        cli.trace_profile.as_deref(),
+        cli.trace_level.as_deref(),
+        cli.trace_cat.as_deref(),
+    ) {
+        Ok(changed) => {
+            has_cli_overlay |= changed;
+        }
+        Err(err) => {
+            eprintln!("{}", format!("Error: {err}").red());
+            std::process::exit(2);
+        }
     }
     // Apply safety.trust_mode from runtime config to the global guard.
     // Defaults to Strict — users must explicitly opt in via
@@ -205,24 +273,13 @@ async fn main() {
         startup_trace,
         diagnostic_log: _,
         log_file: _,
-        trace_profile,
-        trace_level,
-        trace_cat,
+        trace_profile: _trace_profile_already_applied,
+        trace_level: _trace_level_already_applied,
+        trace_cat: _trace_cat_already_applied,
         command,
     } = cli;
 
     let _ = (startup_trace, bare);
-    // CLI trace flags are now applied through the RuntimeConfig overlay mechanism
-    // (set_cli_overlay). The trace config is resolved by load() → merge(cli_overlay).
-    let cli_overlay = astra_config::runtime_config::RuntimeConfig {
-        trace: astra_config::runtime_config::SessionTraceConfig::from_cli(
-            trace_profile.as_deref(),
-            trace_level.as_deref(),
-            trace_cat.as_deref(),
-        ),
-        ..Default::default()
-    };
-    astra_config::runtime_config::set_cli_overlay(Some(cli_overlay));
     let cli_context = match cli::cli_context::CliContext::from_launch_options(
         no_journal_content,
         max_turns,

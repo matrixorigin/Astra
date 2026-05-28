@@ -131,8 +131,8 @@ pub(crate) struct Cli {
     /// Append JSON tracing lines to this file (overrides ASTRA_LOG_FILE env); hidden from --help
     #[arg(long = "log-file", value_name = "PATH", hide = true)]
     pub log_file: Option<String>,
-    /// Trace profile for this session: "production" (minimal) or "dev" (verbose).
-    /// Production keeps only Error/Warn events; Dev enables full Trace-level capture.
+    /// Trace profile for this session: "production" (lean) or "dev" (verbose).
+    /// Production keeps coarse operational traces; Dev enables full Trace-level capture.
     #[arg(long = "trace-profile", value_parser = ["production", "dev", "custom"])]
     pub trace_profile: Option<String>,
     /// Minimum trace level for this session: error, warn, info, debug, trace.

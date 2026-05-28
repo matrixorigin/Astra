@@ -25,14 +25,6 @@ pub use astra_core::{TraceCategory, TraceLevel};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EventId(pub u64);
 
-// Re-export global trace state (now shared from astra_core)
-pub use astra_core::set_global_enabled_categories;
-pub use astra_core::set_global_min_level;
-pub use astra_core::GLOBAL_ENABLED_CATEGORIES;
-pub use astra_core::GLOBAL_MIN_LEVEL;
-
-// TraceLevel is re-exported from astra_core above.
-
 /// A single event in the causal event log.
 #[derive(Debug, Clone)]
 pub struct TurnEvent {
@@ -218,16 +210,8 @@ impl EventLog {
             events: Vec::new(),
             next_id: 0,
             start: Instant::now(),
-            min_level: GLOBAL_MIN_LEVEL
-                .read()
-                .ok()
-                .and_then(|guard| *guard)
-                .unwrap_or(TraceLevel::Info),
-            enabled_categories: GLOBAL_ENABLED_CATEGORIES
-                .read()
-                .ok()
-                .and_then(|guard| guard.clone())
-                .unwrap_or_default(),
+            min_level: TraceLevel::Info,
+            enabled_categories: Vec::new(),
         }
     }
 
@@ -268,7 +252,9 @@ impl EventLog {
         // Category filter: if configured, events must match an enabled category.
         if !self.enabled_categories.is_empty() {
             let cat = kind.default_category();
-            if !self.enabled_categories.contains(&cat) {
+            if !self.enabled_categories.contains(&TraceCategory::All)
+                && !self.enabled_categories.contains(&cat)
+            {
                 return None;
             }
         }

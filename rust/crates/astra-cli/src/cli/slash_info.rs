@@ -1224,11 +1224,8 @@ pub(crate) async fn handle_info_command(
                     .bold()
                     .magenta()
             );
-            let _pipeline_modules = crate::cli::session_runtime::create_pipeline_modules_quiet(
-                api,
-                None,
-                astra_config::runtime_config::SessionTraceConfig::current(),
-            );
+            let _pipeline_modules =
+                crate::cli::session_runtime::create_pipeline_modules_quiet(api, None);
             let mut pm = PermissionManager::with_workspace_trust(false, &project_root);
             let turn_start = std::time::Instant::now();
             let sr = stream_chat_sse(ChatTurnParams {
