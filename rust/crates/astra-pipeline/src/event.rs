@@ -22,6 +22,16 @@ use std::time::Instant;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EventId(pub u64);
 
+/// Global default minimum trace level, settable once per session from CLI flags.
+/// `EventLog::new()` reads this; if unset, falls back to [`TraceLevel::Info`].
+static GLOBAL_MIN_LEVEL: std::sync::OnceLock<TraceLevel> = std::sync::OnceLock::new();
+
+/// Set the global default min_level for all `EventLog::new()` instances.
+/// Call once before any pipeline runs, typically from CLI startup code.
+pub fn set_global_min_level(level: TraceLevel) {
+    let _ = GLOBAL_MIN_LEVEL.set(level);
+}
+
 /// Trace severity level, mirroring log-level semantics for pipeline events.
 ///
 /// Used by [`EventLog::min_level`] to drop events below the configured threshold.
@@ -213,7 +223,7 @@ impl EventLog {
             events: Vec::new(),
             next_id: 0,
             start: Instant::now(),
-            min_level: TraceLevel::Info,
+            min_level: GLOBAL_MIN_LEVEL.get().copied().unwrap_or(TraceLevel::Info),
         }
     }
 

@@ -218,6 +218,16 @@ fn create_pipeline_modules_inner(
     announce_skills: bool,
     trace_config: astra_config::runtime_config::SessionTraceConfig,
 ) -> PipelineModules {
+    // Set the global pipeline event log min_level from the per-session trace config.
+    // All EventLog::new() instances in this session will inherit this level.
+    astra_pipeline::event::set_global_min_level(match trace_config.min_level {
+        astra_config::runtime_config::TraceLevelSerde::Error => astra_pipeline::event::TraceLevel::Error,
+        astra_config::runtime_config::TraceLevelSerde::Warn => astra_pipeline::event::TraceLevel::Warn,
+        astra_config::runtime_config::TraceLevelSerde::Info => astra_pipeline::event::TraceLevel::Info,
+        astra_config::runtime_config::TraceLevelSerde::Debug => astra_pipeline::event::TraceLevel::Debug,
+        astra_config::runtime_config::TraceLevelSerde::Trace => astra_pipeline::event::TraceLevel::Trace,
+    });
+
     // Selector removed — the runtime now builds the turn-specific tool surface
     // directly from the local CLI catalog plus any mounted server/MCP schemas.
 
