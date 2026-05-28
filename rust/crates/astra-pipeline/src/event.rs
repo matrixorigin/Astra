@@ -73,6 +73,13 @@ pub enum EventKind {
     LlmChunk {
         text: String,
     },
+    /// A reasoning/thinking chunk emitted by extended-thinking models
+    /// (e.g. Claude thinking mode, Bedrock reasoning).
+    /// Only captured when `TraceCategory::Thinking` is enabled and
+    /// `min_level` ≤ `Trace`.
+    ThinkingChunk {
+        text: String,
+    },
     ToolCallStarted {
         call_id: String,
         tool_name: String,
@@ -152,6 +159,7 @@ impl EventKind {
             EventKind::ReflectionGenerated { .. } => TraceLevel::Debug,
             // ── Trace ── fine-grained detail
             EventKind::LlmChunk { .. } => TraceLevel::Trace,
+            EventKind::ThinkingChunk { .. } => TraceLevel::Trace,
             EventKind::BudgetExpanded { .. } => TraceLevel::Trace,
         }
     }
@@ -163,6 +171,7 @@ impl EventKind {
             | EventKind::ToolCallCompleted { .. }
             | EventKind::ToolsSelected { .. } => TraceCategory::ToolCalls,
             EventKind::LlmChunk { .. } => TraceCategory::LlmExchanges,
+            EventKind::ThinkingChunk { .. } => TraceCategory::Thinking,
             EventKind::IntentDetected { .. } | EventKind::EntityExtracted { .. } => {
                 TraceCategory::ContextAssembly
             }
