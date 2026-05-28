@@ -559,3 +559,95 @@ mod tests {
         assert_eq!(chain.len(), 1);
     }
 }
+
+// ─── Category/level contract tests for new variants ──────────────────────────
+
+#[cfg(test)]
+mod new_variant_contracts {
+    use super::*;
+
+    fn level(k: &EventKind) -> TraceLevel {
+        k.default_level()
+    }
+    fn cat(k: &EventKind) -> TraceCategory {
+        k.default_category()
+    }
+
+    #[test]
+    fn thinking_chunk_is_trace_and_thinking() {
+        let e = EventKind::ThinkingChunk { text: "step 1".into() };
+        assert_eq!(level(&e), TraceLevel::Trace);
+        assert_eq!(cat(&e), TraceCategory::Thinking);
+    }
+
+    #[test]
+    fn llm_request_is_trace_and_llm_exchanges() {
+        let e = EventKind::LlmRequest {
+            model: "claude".into(),
+            provider: "anthropic".into(),
+            message_count: 4,
+            tool_count: 2,
+            max_output_tokens: Some(8192),
+            round: 1,
+        };
+        assert_eq!(level(&e), TraceLevel::Trace);
+        assert_eq!(cat(&e), TraceCategory::LlmExchanges);
+    }
+
+    #[test]
+    fn tool_call_output_is_trace_and_tool_calls() {
+        let e = EventKind::ToolCallOutput {
+            call_id: "c1".into(),
+            tool_name: "bash".into(),
+            output_preview: "ok".into(),
+        };
+        assert_eq!(level(&e), TraceLevel::Trace);
+        assert_eq!(cat(&e), TraceCategory::ToolCalls);
+    }
+
+    #[test]
+    fn memory_events_are_debug_and_memory_retrieval() {
+        let q = EventKind::MemoryQuery {
+            query: "rust tips".into(),
+            top_k: 5,
+            source: "hybrid".into(),
+        };
+        let r = EventKind::MemoryRetrieved { result_count: 3, duration_ms: 12 };
+        for e in [&q, &r] {
+            assert_eq!(level(e), TraceLevel::Debug);
+            assert_eq!(cat(e), TraceCategory::MemoryRetrieval);
+        }
+    }
+
+    #[test]
+    fn skill_events_are_info_and_skill_execution() {
+        let s = EventKind::SkillStarted { skill_name: "review-changes".into() };
+        let c = EventKind::SkillCompleted {
+            skill_name: "review-changes".into(),
+            duration_ms: 300,
+            success: true,
+        };
+        for e in [&s, &c] {
+            assert_eq!(level(e), TraceLevel::Info);
+            assert_eq!(cat(e), TraceCategory::SkillExecution);
+        }
+    }
+
+    #[test]
+    fn prompt_assembled_is_debug_and_prompt_assembly() {
+        let e = EventKind::PromptAssembled { component_count: 3, estimated_tokens: 512 };
+        assert_eq!(level(&e), TraceLevel::Debug);
+        assert_eq!(cat(&e), TraceCategory::PromptAssembly);
+    }
+
+    #[test]
+    fn guard_evaluated_is_info_and_guard_evaluation() {
+        let e = EventKind::GuardEvaluated {
+            guard_name: "malware-check".into(),
+            allowed: true,
+            reason: None,
+        };
+        assert_eq!(level(&e), TraceLevel::Info);
+        assert_eq!(cat(&e), TraceCategory::GuardEvaluation);
+    }
+}
