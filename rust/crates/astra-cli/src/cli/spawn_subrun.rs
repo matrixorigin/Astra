@@ -557,7 +557,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 .is_some_and(|thinking| thinking.enabled)
                 || astra_turn_core::edge_ledger::history_has_reasoning(&ip.prefix_messages)
         }) || effective_model.as_deref().is_some_and(|model| {
-            astra_turn_core::reasoning_capabilities::reasoning_capabilities("", model).requires_replay()
+            astra_turn_core::reasoning_capabilities::reasoning_capabilities("", model)
+                .requires_replay()
         });
 
         let messages = build_child_messages(

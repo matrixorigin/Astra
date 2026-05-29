@@ -7637,11 +7637,8 @@ mod turn_event_buffer_tests {
         let _guard = JournalDirGuard::new(tmp.path());
         let sid = "prepend-parse-failure";
         let path = journal_dir().join(format!("{sid}.jsonl"));
-        let mut interruption = JournalEvent::interruption_recorded(
-            Some(sid),
-            1,
-            serde_json::json!({"kind":"test"}),
-        );
+        let mut interruption =
+            JournalEvent::interruption_recorded(Some(sid), 1, serde_json::json!({"kind":"test"}));
         interruption.ts = "not-a-valid-timestamp-2026".to_string();
 
         let batch = [interruption.clone()];
@@ -7687,14 +7684,15 @@ mod turn_event_buffer_tests {
             .count();
         assert_eq!(session_start_count, 1);
         assert_eq!(interruption_count, 8);
-        assert_eq!(events.len(), 9, "exactly 1 SessionStart + 8 InterruptionRecorded");
+        assert_eq!(
+            events.len(),
+            9,
+            "exactly 1 SessionStart + 8 InterruptionRecorded"
+        );
         // SessionStart must be chronologically first (read_journal returns sorted).
         assert_eq!(events[0].event_type, JournalEventType::SessionStart);
         // All 8 interruption events must be present with distinct turns 1..=8.
-        let mut turns: Vec<u32> = events[1..]
-            .iter()
-            .map(|e| e.turn.unwrap())
-            .collect();
+        let mut turns: Vec<u32> = events[1..].iter().map(|e| e.turn.unwrap()).collect();
         turns.sort();
         assert_eq!(turns, (1..=8u32).collect::<Vec<_>>());
     }

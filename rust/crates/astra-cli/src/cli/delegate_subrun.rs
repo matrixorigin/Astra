@@ -28,7 +28,7 @@ use astra_runtime::{
 use astra_services::coordination::AgentResult;
 
 use super::permission_manager::PermissionMode;
-use super::skill_subrun::{persist_failed_subrun, SubRunHost};
+use super::skill_subrun::{SubRunHost, persist_failed_subrun};
 use crate::edge_tools;
 
 const DELEGATE_MAX_TURNS: usize = 25;
@@ -304,8 +304,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         // Build system message from agent profile.
         // Always append the non-interactive directive so sub-agents never stall
         // waiting for user input — they must make autonomous decisions.
-        const NON_INTERACTIVE: &str =
-            "\n\nIMPORTANT: You are running as an autonomous sub-agent with no user present. \
+        const NON_INTERACTIVE: &str = "\n\nIMPORTANT: You are running as an autonomous sub-agent with no user present. \
             Do NOT ask clarifying questions or prompt for input. \
             Make reasonable assumptions and proceed to completion.";
 

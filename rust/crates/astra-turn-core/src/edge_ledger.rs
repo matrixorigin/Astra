@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use astra_pipeline::journal_crypto::{hex_decode, hex_encode, JournalCrypto};
+use astra_pipeline::journal_crypto::{JournalCrypto, hex_decode, hex_encode};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 /// Cap in-memory map size. New entries are REJECTED (not evicted) when this
@@ -779,7 +779,7 @@ pub fn strip_stale_reasoning_with_policy(messages: &mut [Value], policy: &Reason
 mod tests {
     use super::*;
 
-    use crate::history::{append_recovered_events, RecoveredEventRow};
+    use crate::history::{RecoveredEventRow, append_recovered_events};
     use tempfile::tempdir;
 
     #[test]
@@ -1459,10 +1459,12 @@ mod tests {
                         .is_some_and(|s| !s.is_empty())
             })
             .expect("should have at least one message with non-empty reasoning");
-        assert!(!last_reasoning["reasoning_content"]
-            .as_str()
-            .unwrap()
-            .is_empty());
+        assert!(
+            !last_reasoning["reasoning_content"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

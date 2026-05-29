@@ -7,7 +7,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Provider-agnostic thinking configuration.
 ///
@@ -1324,21 +1324,14 @@ mod fork_capture_thinking_slice_tests {
 
     #[test]
     fn off_mode_returns_none_for_non_replay_model() {
-        let result = fork_capture_thinking_slice(
-            &ThinkingConfig::Off,
-            "openai",
-            "gpt-4",
-        );
+        let result = fork_capture_thinking_slice(&ThinkingConfig::Off, "openai", "gpt-4");
         assert!(result.is_none());
     }
 
     #[test]
     fn off_mode_returns_slice_for_replay_model() {
-        let result = fork_capture_thinking_slice(
-            &ThinkingConfig::Off,
-            "deepseek",
-            "deepseek-reasoner",
-        );
+        let result =
+            fork_capture_thinking_slice(&ThinkingConfig::Off, "deepseek", "deepseek-reasoner");
         assert!(result.is_some());
         let slice = result.unwrap();
         assert!(slice.enabled);
@@ -1349,7 +1342,9 @@ mod fork_capture_thinking_slice_tests {
     #[test]
     fn enabled_mode_returns_slice_with_budget() {
         let result = fork_capture_thinking_slice(
-            &ThinkingConfig::Enabled { budget_tokens: 10000 },
+            &ThinkingConfig::Enabled {
+                budget_tokens: 10000,
+            },
             "openai",
             "gpt-4",
         );
@@ -1363,7 +1358,9 @@ mod fork_capture_thinking_slice_tests {
     #[test]
     fn adaptive_mode_returns_slice_without_budget() {
         let result = fork_capture_thinking_slice(
-            &ThinkingConfig::Adaptive { effort: ThinkingEffort::High },
+            &ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High,
+            },
             "anthropic",
             "claude-3-5-sonnet",
         );
@@ -1377,7 +1374,9 @@ mod fork_capture_thinking_slice_tests {
     #[test]
     fn enabled_mode_works_for_replay_model() {
         let result = fork_capture_thinking_slice(
-            &ThinkingConfig::Enabled { budget_tokens: 5000 },
+            &ThinkingConfig::Enabled {
+                budget_tokens: 5000,
+            },
             "deepseek",
             "deepseek-reasoner",
         );

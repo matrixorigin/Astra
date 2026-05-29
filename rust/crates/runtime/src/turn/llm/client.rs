@@ -2011,15 +2011,15 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
             carry_cache_annotations(msg, &mut out);
             Some(out)
         }
-    "assistant" => {
-        let mut blocks = Vec::new();
-        // Unsigned `reasoning_content` (no `reasoning_signature`) is
-        // silently dropped because Anthropic requires a signature for
-        // every `thinking` block.  This is the request-builder-side
-        // guard; see also `ReasoningReplayPolicy::can_strip_unsigned_reasoning`
-        // in `edge_ledger.rs` for the message-history-side policy
-        // (`strip_stale_reasoning_with_policy`).
-        let has_thinking =
+        "assistant" => {
+            let mut blocks = Vec::new();
+            // Unsigned `reasoning_content` (no `reasoning_signature`) is
+            // silently dropped because Anthropic requires a signature for
+            // every `thinking` block.  This is the request-builder-side
+            // guard; see also `ReasoningReplayPolicy::can_strip_unsigned_reasoning`
+            // in `edge_ledger.rs` for the message-history-side policy
+            // (`strip_stale_reasoning_with_policy`).
+            let has_thinking =
                 if let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str) {
                     if rc.is_empty() {
                         false

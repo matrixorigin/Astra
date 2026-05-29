@@ -1032,8 +1032,7 @@ mod tests {
     #[test]
     fn runtime_tool_allowlist_notice_warns_when_request_policy_excludes_all() {
         let mut state = make_state();
-        state.skills.request_constraints.allowed_tools =
-            Some(HashSet::new());
+        state.skills.request_constraints.allowed_tools = Some(HashSet::new());
 
         let notice = runtime_tool_allowlist_notice(&state).expect("notice should be emitted");
 
@@ -1043,13 +1042,12 @@ mod tests {
     #[test]
     fn runtime_tool_allowlist_notice_lists_all_request_permitted_tools() {
         let mut state = make_state();
-        state.skills.request_constraints.allowed_tools =
-            Some(
-                ["read_file", "task", "notify", "ask_user"]
-                    .into_iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-            );
+        state.skills.request_constraints.allowed_tools = Some(
+            ["read_file", "task", "notify", "ask_user"]
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
 
         let notice = runtime_tool_allowlist_notice(&state).expect("notice should be emitted");
 
