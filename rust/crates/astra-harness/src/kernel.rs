@@ -34,7 +34,7 @@ impl StandardKernel {
             Box::new(crate::verifiers::DelegationVerifier::default()),
             Box::new(crate::verifiers::ConfidenceVerifier::default()),
             Box::new(crate::verifiers::ProgressVerifier::default()),
-            Box::new(crate::verifiers::CompletionVerifier::default()),
+            Box::new(crate::verifiers::CompletionVerifier),
         ];
         if let Some(max_cost) = limits.max_session_cost_usd {
             verifiers.push(Box::new(crate::verifiers::CostVerifier {

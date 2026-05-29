@@ -115,9 +115,10 @@ impl RuntimeLimits {
     ///
     /// When the model has a known context window, derive the model-safe
     /// ceiling from it (roughly 80% — the remaining ~20% covers output
-    /// tokens and protocol overhead), then cap it by the configured
-    /// per-turn working budget. This keeps provider capacity separate from
-    /// how much live history the agent should carry by default.
+    /// tokens and protocol overhead). The historical 200K default remains
+    /// the fallback for unknown models, but it should not clamp known
+    /// 1M-window models down to 200K unless the operator explicitly chose
+    /// a non-default limit.
     ///
     /// `max_turn_input_tokens = 0` keeps the legacy "unlimited" sentinel:
     /// known models use their model-safe ceiling, unknown models stay
@@ -126,9 +127,11 @@ impl RuntimeLimits {
         let model_budget = model
             .and_then(context_window_for_model)
             .map(|window| (window as f64 * 0.80) as u64);
+        let default_budget = Self::default().max_turn_input_tokens;
 
         match (model_budget, self.max_turn_input_tokens) {
             (Some(budget), 0) => budget,
+            (Some(budget), configured) if configured == default_budget => budget,
             (Some(budget), configured) => budget.min(configured),
             (None, configured) => configured,
         }
@@ -328,14 +331,14 @@ mod tests {
     }
 
     #[test]
-    fn effective_max_turn_input_tokens_caps_large_known_models() {
+    fn effective_max_turn_input_tokens_uses_model_ceiling_for_default_budget() {
         let limits = RuntimeLimits {
             max_turn_input_tokens: 200_000,
             ..Default::default()
         };
         assert_eq!(
             limits.effective_max_turn_input_tokens(Some("deepseek-v4-pro")),
-            200_000
+            800_000
         );
     }
 
@@ -348,6 +351,18 @@ mod tests {
         assert_eq!(
             limits.effective_max_turn_input_tokens(Some("deepseek-chat")),
             51_200
+        );
+    }
+
+    #[test]
+    fn effective_max_turn_input_tokens_honors_explicit_nondefault_cap() {
+        let limits = RuntimeLimits {
+            max_turn_input_tokens: 150_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            limits.effective_max_turn_input_tokens(Some("deepseek-v4-pro")),
+            150_000
         );
     }
 

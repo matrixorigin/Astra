@@ -15,9 +15,9 @@ pub enum HarnessQuery {
 /// Response to a HarnessQuery.
 #[derive(Debug)]
 pub enum HarnessQueryResponse {
-    Snapshot(Option<RuntimeSnapshot>),
+    Snapshot(Box<Option<RuntimeSnapshot>>),
     History(Vec<RuntimeSnapshot>),
-    Diff(Option<SnapshotDiff>),
+    Diff(Box<Option<SnapshotDiff>>),
 }
 
 /// Handle held by the loop (or the sink owner) to receive queries.
@@ -59,7 +59,7 @@ impl HarnessQuerySender {
     /// Convenience: get latest snapshot.
     pub fn latest(&self) -> Option<RuntimeSnapshot> {
         match self.query(HarnessQuery::Latest)? {
-            HarnessQueryResponse::Snapshot(s) => s,
+            HarnessQueryResponse::Snapshot(s) => *s,
             _ => None,
         }
     }
@@ -75,7 +75,7 @@ impl HarnessQuerySender {
     /// Convenience: get diff.
     pub fn diff(&self) -> Option<SnapshotDiff> {
         match self.query(HarnessQuery::Diff)? {
-            HarnessQueryResponse::Diff(d) => d,
+            HarnessQueryResponse::Diff(d) => *d,
             _ => None,
         }
     }
@@ -93,7 +93,7 @@ impl HarnessQueryReceiver {
 
     fn handle(&self, query: HarnessQuery) -> HarnessQueryResponse {
         match query {
-            HarnessQuery::Latest => HarnessQueryResponse::Snapshot(self.sink.latest()),
+            HarnessQuery::Latest => HarnessQueryResponse::Snapshot(Box::new(self.sink.latest())),
             HarnessQuery::History(n) => HarnessQueryResponse::History(self.sink.history(n)),
             HarnessQuery::Diff => {
                 let history = self.sink.history(2);
@@ -102,7 +102,7 @@ impl HarnessQueryReceiver {
                 } else {
                     None
                 };
-                HarnessQueryResponse::Diff(diff)
+                HarnessQueryResponse::Diff(Box::new(diff))
             }
         }
     }
@@ -225,7 +225,10 @@ mod tests {
         let r1 = resp_rx1.recv().unwrap();
         let r2 = resp_rx2.recv().unwrap();
 
-        assert!(matches!(r1, HarnessQueryResponse::Snapshot(Some(_))));
+        assert!(matches!(
+            r1,
+            HarnessQueryResponse::Snapshot(ref s) if s.is_some()
+        ));
         assert!(matches!(r2, HarnessQueryResponse::History(ref h) if h.len() == 2));
     }
 
