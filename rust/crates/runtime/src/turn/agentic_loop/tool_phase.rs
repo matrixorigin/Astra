@@ -291,7 +291,9 @@ fn append_session_journal_event(
     session_id: &str,
     event: astra_services::session_journal::JournalEvent,
 ) {
-    let _ = astra_services::session_journal::ensure_session_start_event(session_id, None);
+    // `JournalWriter::append` auto-prepends `SessionStart` under the same
+    // file lock; an eager `ensure_session_start_event` here would reacquire
+    // flock + restat the journal on every event without changing behavior.
     match astra_services::session_journal::JournalWriter::new(session_id) {
         Ok(journal) => {
             if let Err(err) = journal.append(&event) {

@@ -1115,10 +1115,12 @@ fn write_session_journal_event(
     let Some(session_id) = state.current_session_id.as_deref() else {
         return;
     };
-    let _ = astra_services::session_journal::ensure_session_start_event(
-        session_id,
-        state.context_manifest_model_name.as_deref(),
-    );
+    // `JournalWriter::append` auto-prepends a `SessionStart` under the same
+    // file lock when one is needed (see
+    // `prepend_session_start_if_needed`).  A separate
+    // `ensure_session_start_event` call here would re-acquire the file
+    // lock and re-stat the journal solely to check a condition the
+    // append path will recheck atomically — wasted I/O on every event.
     let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) else {
         return;
     };

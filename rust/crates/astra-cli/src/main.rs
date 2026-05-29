@@ -1676,12 +1676,20 @@ total_tokens_out: 500
         let prefs = vec!["explain_mode".to_string()];
         append_cloud_pull_sync_journal(&state, "work", "session_startup", &pull, &prefs);
         let events = session_journal::read_journal(&sid).expect("read journal");
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert_eq!(
             events[0].event_type,
+            session_journal::JournalEventType::SessionStart
+        );
+        let marker = events
+            .iter()
+            .find(|event| event.event_type == session_journal::JournalEventType::SyncMarker)
+            .expect("sync marker");
+        assert_eq!(
+            marker.event_type,
             session_journal::JournalEventType::SyncMarker
         );
-        let cp = events[0]
+        let cp = marker
             .metadata
             .as_ref()
             .and_then(|m| m.get("cloud_pull"))
@@ -1706,8 +1714,16 @@ total_tokens_out: 500
         };
         append_cloud_pull_sync_journal(&state, "default", "post_login", &pull, &[]);
         let events = session_journal::read_journal(&sid).expect("read journal");
-        assert_eq!(events.len(), 1);
-        let cp = events[0]
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].event_type,
+            session_journal::JournalEventType::SessionStart
+        );
+        let marker = events
+            .iter()
+            .find(|event| event.event_type == session_journal::JournalEventType::SyncMarker)
+            .expect("sync marker");
+        let cp = marker
             .metadata
             .as_ref()
             .and_then(|m| m.get("cloud_pull"))

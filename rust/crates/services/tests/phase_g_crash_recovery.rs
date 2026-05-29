@@ -197,9 +197,18 @@ fn flush_interrupted_then_regular_flush_preserves_both() {
     buf2.flush(&writer).unwrap();
 
     let events = read_journal("sess-mixed").unwrap();
-    assert_eq!(events.len(), 2, "both rounds must be recoverable");
+    assert_eq!(
+        events.len(),
+        3,
+        "session_start plus both flushed rounds must be recoverable"
+    );
+    let rounds: Vec<_> = events
+        .iter()
+        .filter(|event| event.event_type == JournalEventType::LlmRound)
+        .collect();
+    assert_eq!(rounds.len(), 2, "both rounds must be present");
 
-    let partial_flag = events[0]
+    let partial_flag = rounds[0]
         .metadata
         .as_ref()
         .and_then(|m| m.get("partial"))
@@ -210,7 +219,7 @@ fn flush_interrupted_then_regular_flush_preserves_both() {
         "interrupted event must keep partial:true marker"
     );
 
-    let second_partial = events[1]
+    let second_partial = rounds[1]
         .metadata
         .as_ref()
         .and_then(|m| m.get("partial"))

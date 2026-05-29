@@ -84,9 +84,13 @@ pub fn reasoning_capabilities(provider: &str, model: &str) -> ReasoningCapabilit
     let model_lower = model.to_ascii_lowercase();
 
     // Moonshot / Kimi: always replay, uses " " as placeholder for empty reasoning.
-    let is_moonshot = provider_lower == "moonshot"
-        || model_lower.contains("moonshot")
-        || model_lower.contains("kimi");
+    // Both `moonshot` and `kimi` appear as canonical provider names in real
+    // configs (Moonshot's vendor brand vs the model line they ship), so
+    // accept either as a provider prefix.
+    let is_moonshot = matches_provider_token(&provider_lower, "moonshot")
+        || matches_provider_token(&provider_lower, "kimi")
+        || model_id_contains_token(&model_lower, "moonshot")
+        || model_id_contains_token(&model_lower, "kimi");
     if is_moonshot {
         return ReasoningCapabilities {
             replay_mode: ReasoningReplayMode::AlwaysReplay,
@@ -95,7 +99,8 @@ pub fn reasoning_capabilities(provider: &str, model: &str) -> ReasoningCapabilit
     }
 
     // DeepSeek: always replay, uses "" as placeholder.
-    let is_deepseek = provider_lower.contains("deepseek") || model_lower.contains("deepseek");
+    let is_deepseek = matches_provider_token(&provider_lower, "deepseek")
+        || model_id_contains_token(&model_lower, "deepseek");
     if is_deepseek {
         return ReasoningCapabilities {
             replay_mode: ReasoningReplayMode::AlwaysReplay,
@@ -108,6 +113,68 @@ pub fn reasoning_capabilities(provider: &str, model: &str) -> ReasoningCapabilit
         replay_mode: ReasoningReplayMode::OnDemand,
         reasoning_placeholder: "",
     }
+}
+
+/// Whether the provider string is exactly `needle` or `<needle>-<variant>`.
+///
+/// Provider strings are short, vendor-controlled identifiers (`"deepseek"`,
+/// `"deepseek-anthropic"`, `"moonshot"`, `"openai"`).  Plain `==` misses
+/// variant suffixes (`"deepseek-v4-pro-anthropic"`); plain `contains` would
+/// match `"openai-deepseek-shim"` against `"deepseek"`.  The shape is the
+/// same as `model_id_contains_token` but anchored at the start because
+/// variant suffixes are always *after* the canonical name.
+///
+/// Both arguments are expected to be already lowercased.
+#[inline]
+fn matches_provider_token(provider: &str, needle: &str) -> bool {
+    if provider == needle {
+        return true;
+    }
+    if let Some(rest) = provider.strip_prefix(needle) {
+        return rest.chars().next().is_some_and(is_model_id_token_boundary);
+    }
+    false
+}
+
+/// Token-bounded `contains` for model identifiers.
+///
+/// Returns true when `needle` appears as a whole token inside `haystack` —
+/// i.e. surrounded by either start/end of string or one of the model-id
+/// separator characters (`-`, `_`, `.`, `/`, `:`, `@`). This rejects
+/// false-positive substrings like `kimi-mock`, `deepseek-helper-shim`, or
+/// `kimimaru-7b` that should not be classified as the real provider.
+///
+/// Both arguments are expected to be already lowercased; the helper does
+/// not normalize case so callers can amortize the lowercasing.
+fn model_id_contains_token(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(idx) = haystack[start..].find(needle) {
+        let abs = start + idx;
+        let end = abs + needle.len();
+        let before_ok = abs == 0
+            || haystack[..abs]
+                .chars()
+                .next_back()
+                .is_some_and(is_model_id_token_boundary);
+        let after_ok = end == haystack.len()
+            || haystack[end..]
+                .chars()
+                .next()
+                .is_some_and(is_model_id_token_boundary);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
+}
+
+#[inline]
+fn is_model_id_token_boundary(ch: char) -> bool {
+    matches!(ch, '-' | '_' | '.' | '/' | ':' | '@' | ' ')
 }
 
 #[cfg(test)]
@@ -159,6 +226,94 @@ mod tests {
     }
 
     // ── OnDemand providers ───────────────────────────────────────────────
+
+    #[test]
+    fn word_boundary_matching_rejects_accidental_substrings() {
+        // Names that *contain* a provider keyword but only as a non-token
+        // substring (no model-id separator delimits the keyword) must not
+        // trigger AlwaysReplay. Without word-boundary matching, future model
+        // catalogs adding e.g. `kimimaru-7b` or `deepseekers-fictional` would
+        // silently inherit a reasoning-replay policy that breaks their wire.
+        for (provider, model) in [
+            ("openai", "kimimaru-7b"),
+            ("openai", "deepseekers-fictional"),
+            ("openai", "promoonshot-decoy"), // "moonshot" only as suffix of "promoonshot"
+        ] {
+            let caps = reasoning_capabilities(provider, model);
+            assert_eq!(
+                caps.replay_mode,
+                ReasoningReplayMode::OnDemand,
+                "expected OnDemand for {provider}/{model} (substring match must be word-bounded)",
+            );
+        }
+    }
+
+    #[test]
+    fn provider_prefix_matching_is_symmetric_across_vendors() {
+        // Vendor-routed provider strings often carry a variant suffix
+        // (`deepseek-anthropic`, `moonshot-v2`, `kimi-direct`).  Both
+        // DeepSeek and Moonshot must accept the same shape, otherwise
+        // identical wire policy depends on which vendor's gateway you
+        // happen to be talking to today.
+        for provider in [
+            "deepseek",
+            "deepseek-anthropic",
+            "deepseek-v4-pro-official",
+            "moonshot",
+            "moonshot-v2",
+            "kimi",
+            "kimi-direct",
+        ] {
+            let caps = reasoning_capabilities(provider, "");
+            assert_eq!(
+                caps.replay_mode,
+                ReasoningReplayMode::AlwaysReplay,
+                "provider {provider:?} (no model hint) must classify as AlwaysReplay",
+            );
+        }
+    }
+
+    #[test]
+    fn provider_prefix_matching_rejects_collision_substrings() {
+        // Strings that contain a vendor name as a non-prefix substring
+        // must not match — the prefix shape protects against future
+        // wrappers like `openai-deepseek-shim` accidentally inheriting
+        // the wire policy.
+        for provider in [
+            "openai-deepseek-shim",
+            "fake-moonshot",
+            "kimimaru",
+            "deepseekers",
+        ] {
+            let caps = reasoning_capabilities(provider, "");
+            assert_eq!(
+                caps.replay_mode,
+                ReasoningReplayMode::OnDemand,
+                "non-prefix substring {provider:?} must not match the vendor policy",
+            );
+        }
+    }
+
+    #[test]
+    fn word_boundary_matching_accepts_real_variants() {
+        // Real model names must still match — we are tightening, not breaking.
+        for (provider, model) in [
+            ("openai", "deepseek-v4-pro-official"),
+            ("openai", "deepseek-v4-pro-anthropic"),
+            ("openai", "kimi-k2"),
+            ("openai", "kimi-k2.5"),
+            ("openai", "moonshot-v1-128k"),
+            ("openai", "kimi"),     // bare token
+            ("openai", "deepseek"), // bare token
+        ] {
+            let caps = reasoning_capabilities(provider, model);
+            assert_eq!(
+                caps.replay_mode,
+                ReasoningReplayMode::AlwaysReplay,
+                "expected AlwaysReplay for real variant {provider}/{model}",
+            );
+        }
+    }
 
     #[test]
     fn standard_providers_are_on_demand() {

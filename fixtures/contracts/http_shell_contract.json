@@ -21,7 +21,7 @@
       "status": 200,
       "json": {
         "status": "unhealthy",
-        "database": "disconnected",
+        "database": "unavailable",
         "persist_ok": 0,
         "persist_fail": 0
       }

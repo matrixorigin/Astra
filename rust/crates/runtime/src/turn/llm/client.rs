@@ -1530,13 +1530,20 @@ pub(crate) fn build_provider_request_body_with_overrides(
     // the earlier edge-ledger normalization pass. Repair reasoning replay here
     // as the last line of defense so thinking providers never see a malformed
     // assistant history just because an intermediate path skipped assembly.
-    let reasoning_repaired = {
-        let mut repaired = messages.to_vec();
-        let policy = astra_turn_core::edge_ledger::ReasoningReplayPolicy::infer(
-            &repaired, thinking, provider, model_name,
-        );
-        astra_turn_core::edge_ledger::strip_stale_reasoning_with_policy(&mut repaired, &policy);
-        repaired
+    //
+    // Hot-path optimisation: the common case (standard OpenAI/Anthropic, no
+    // thinking, no prior reasoning) yields a no-op policy. We skip the
+    // `messages.to_vec()` clone in that case using `Cow::Borrowed`, falling
+    // back to an owned clone only when the policy may actually mutate.
+    let policy = astra_turn_core::edge_ledger::ReasoningReplayPolicy::infer(
+        messages, thinking, provider, model_name,
+    );
+    let reasoning_repaired: std::borrow::Cow<'_, [Value]> = if policy.is_no_op() {
+        std::borrow::Cow::Borrowed(messages)
+    } else {
+        let mut owned = messages.to_vec();
+        astra_turn_core::edge_ledger::strip_stale_reasoning_with_policy(&mut owned, &policy);
+        std::borrow::Cow::Owned(owned)
     };
     match llm_provider_protocol(provider) {
         LlmProviderProtocol::BedrockConverse => {

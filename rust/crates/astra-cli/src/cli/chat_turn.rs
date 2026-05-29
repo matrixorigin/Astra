@@ -2589,6 +2589,10 @@ fn print_turn_status_line(state: &SessionState, result: &StreamResult, turn_star
         eprintln!("{}", session_line.dim());
     }
 
+    if let Some(notice) = interruption_status_notice(result) {
+        eprintln!("{}", format!("  ⚠ {notice}").yellow());
+    }
+
     // Context window warning at 70% and 85% budget pressure
     print_context_window_warning(result.budget_pressure);
 
@@ -2597,6 +2601,33 @@ fn print_turn_status_line(state: &SessionState, result: &StreamResult, turn_star
         .unwrap_or(80);
     let rule = "─".repeat(w.min(72));
     eprintln!("{}", rule.dim());
+}
+
+fn interruption_status_notice(result: &StreamResult) -> Option<String> {
+    let interruption = result.interruption.as_ref()?;
+    if let Some(user_message) = interruption
+        .get("user_message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+    {
+        return Some(user_message.to_string());
+    }
+
+    let kind = result
+        .interruption_kind
+        .as_deref()
+        .or_else(|| interruption.get("kind").and_then(serde_json::Value::as_str))?;
+    let resumable = interruption
+        .get("resumable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let suffix = if resumable {
+        " You can continue in the next message."
+    } else {
+        ""
+    };
+    Some(format!("[{kind}] Turn interrupted.{suffix}"))
 }
 
 /// Print a context window warning when budget pressure exceeds thresholds.
@@ -4980,6 +5011,39 @@ mod tests {
         let total_input = prompt + cache_read + cache_creation;
         let cache_pct = cache_read as f64 / total_input.max(1) as f64 * 100.0;
         assert!((cache_pct - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn interruption_status_notice_prefers_user_message() {
+        let mut result = stub_stream_result("partial");
+        result.interruption = Some(serde_json::json!({
+            "kind": "budget_exhausted",
+            "resumable": true,
+            "user_message": "[budget_exhausted] 3 tool call(s) completed. A checkpoint was saved. You can continue in the next message."
+        }));
+        result.interruption_kind = Some("budget_exhausted".into());
+
+        assert_eq!(
+            interruption_status_notice(&result).as_deref(),
+            Some(
+                "[budget_exhausted] 3 tool call(s) completed. A checkpoint was saved. You can continue in the next message."
+            )
+        );
+    }
+
+    #[test]
+    fn interruption_status_notice_falls_back_to_kind_and_resumable_hint() {
+        let mut result = stub_stream_result("partial");
+        result.interruption = Some(serde_json::json!({
+            "kind": "budget_exhausted",
+            "resumable": true,
+        }));
+        result.interruption_kind = Some("budget_exhausted".into());
+
+        assert_eq!(
+            interruption_status_notice(&result).as_deref(),
+            Some("[budget_exhausted] Turn interrupted. You can continue in the next message.")
+        );
     }
 
     #[test]

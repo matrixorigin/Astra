@@ -489,10 +489,11 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     // Emit structured interruption to journal if one was recorded.
     if let Some(ref interruption) = state.interruption {
         if let Some(ref sid) = state.current_session_id {
-            let _ = astra_services::session_journal::ensure_session_start_event(
-                sid,
-                state.context_manifest_model_name.as_deref(),
-            );
+            // `JournalWriter::append` auto-prepends `SessionStart` under
+            // the same file lock; the eager `ensure_session_start_event`
+            // call previously here re-acquired flock + re-stat'd the
+            // journal solely to recheck a condition the append path
+            // rechecks atomically. See `prepend_session_start_if_needed`.
             // Best-effort flush of turn observability events on interruption.
             if let Some(buf) = state.turn_event_buffer.as_mut() {
                 if !buf.is_empty() {

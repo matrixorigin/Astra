@@ -1116,10 +1116,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                                     state.consecutive_context_window_errors,
                                 )
                                 .with_agentic_step(Some(current_agentic_step(state)));
-                            let _ = astra_services::session_journal::ensure_session_start_event(
-                                sid,
-                                state.context_manifest_model_name.as_deref(),
-                            );
+                            // `JournalWriter::append` auto-prepends
+                            // `SessionStart` under the same file lock;
+                            // see `prepend_session_start_if_needed`.
                             if let Ok(writer) =
                                 astra_services::session_journal::JournalWriter::new(sid)
                             {

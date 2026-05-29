@@ -122,6 +122,13 @@ fn extract_tool_call_count(event: &JournalEvent) -> usize {
         .unwrap_or(0) as usize
 }
 
+fn find_event(events: &[JournalEvent], event_type: JournalEventType) -> &JournalEvent {
+    events
+        .iter()
+        .find(|event| event.event_type == event_type)
+        .unwrap_or_else(|| panic!("missing event type: {event_type:?}"))
+}
+
 // ─── E2E: Full pipeline — skill interception → journal → evaluation ─────────
 
 #[test]
@@ -181,10 +188,14 @@ fn e2e_skill_interception_produces_accurate_journal_and_evaluation() {
 
     // --- Phase 4: Read back and verify ---
     let events = session_journal::read_journal(session_id).unwrap();
-    assert_eq!(events.len(), 2, "should have turn + evaluation events");
+    assert_eq!(
+        events.len(),
+        3,
+        "should have session_start + turn + evaluation events"
+    );
 
     // Verify turn event has all 8 records (including surgical removals for audit)
-    let turn = &events[0];
+    let turn = find_event(&events, JournalEventType::Turn);
     assert_eq!(turn.event_type, JournalEventType::Turn);
     let tool_calls = turn.tool_calls.as_ref().unwrap();
     assert_eq!(
@@ -217,7 +228,7 @@ fn e2e_skill_interception_produces_accurate_journal_and_evaluation() {
     assert!(real_records.iter().all(|r| r.surgically_removed.is_none()));
 
     // Verify evaluation event has correct tool_call_count (EXCLUDES synthetics)
-    let eval = &events[1];
+    let eval = find_event(&events, JournalEventType::TurnEvaluation);
     assert_eq!(eval.event_type, JournalEventType::TurnEvaluation);
     let tool_call_count = extract_tool_call_count(eval);
     assert_eq!(
@@ -288,7 +299,11 @@ fn e2e_multi_turn_session_turn_numbering_consistent() {
 
     // Read back and verify turn numbering consistency
     let events = session_journal::read_journal(session_id).unwrap();
-    assert_eq!(events.len(), 9, "3 turns × 3 events each");
+    assert_eq!(
+        events.len(),
+        10,
+        "3 turns × 3 events each plus the initial session_start"
+    );
 
     // Verify all turn numbers are 1, 2, 3 (never internal loop counters like 5, 10, 15)
     let turn_numbers: Vec<u32> = events.iter().filter_map(|e| e.turn).collect();
@@ -365,7 +380,7 @@ fn e2e_mixed_legacy_and_new_surgical_records_both_filtered() {
 
     // Read back
     let events = session_journal::read_journal(session_id).unwrap();
-    let turn = &events[0];
+    let turn = find_event(&events, JournalEventType::Turn);
     let tool_calls = turn.tool_calls.as_ref().unwrap();
 
     // ALL synthetic types should be detected
@@ -385,7 +400,7 @@ fn e2e_mixed_legacy_and_new_surgical_records_both_filtered() {
     );
 
     // tool_call_count in evaluation should match real count
-    let eval = &events[1];
+    let eval = find_event(&events, JournalEventType::TurnEvaluation);
     assert_eq!(extract_tool_call_count(eval), 3);
 }
 
@@ -435,7 +450,7 @@ fn e2e_all_surgical_removals_zero_real_tool_count() {
     writer.append(&eval_event).unwrap();
 
     let events = session_journal::read_journal(session_id).unwrap();
-    let eval = &events[1];
+    let eval = find_event(&events, JournalEventType::TurnEvaluation);
 
     // tool_call_count should be 0, not 4
     assert_eq!(
@@ -485,12 +500,15 @@ fn e2e_zero_tool_calls_conversational() {
     writer.append(&eval_event).unwrap();
 
     let events = session_journal::read_journal(session_id).unwrap();
-    let turn = &events[0];
+    let turn = find_event(&events, JournalEventType::Turn);
     assert!(
         turn.tool_calls.is_none(),
         "no tool_calls field for empty turns"
     );
-    assert_eq!(extract_tool_call_count(&events[1]), 0);
+    assert_eq!(
+        extract_tool_call_count(find_event(&events, JournalEventType::TurnEvaluation)),
+        0
+    );
 }
 
 // ─── Unhappy path: backward compat — deserialize legacy JSONL without new fields
@@ -664,11 +682,14 @@ fn e2e_session_3f4389fe_scenario_turn1_surgical_removal_accuracy() {
     let events = session_journal::read_journal(session_id).unwrap();
 
     // Journal should persist ALL 21 records for audit
-    let tool_calls = events[0].tool_calls.as_ref().unwrap();
+    let tool_calls = find_event(&events, JournalEventType::Turn)
+        .tool_calls
+        .as_ref()
+        .unwrap();
     assert_eq!(tool_calls.len(), 21);
 
     // But evaluation tool_call_count should be 12 (only real)
-    let eval = &events[1];
+    let eval = find_event(&events, JournalEventType::TurnEvaluation);
     assert_eq!(
         extract_tool_call_count(eval),
         12,
@@ -777,7 +798,10 @@ fn e2e_unicode_in_tool_records_survives_journal_roundtrip() {
     writer.append(&turn_event).unwrap();
 
     let events = session_journal::read_journal(session_id).unwrap();
-    let tool_calls = events[0].tool_calls.as_ref().unwrap();
+    let tool_calls = find_event(&events, JournalEventType::Turn)
+        .tool_calls
+        .as_ref()
+        .unwrap();
     assert_eq!(tool_calls.len(), 2);
 
     // Verify Chinese characters survived JSON roundtrip
@@ -836,7 +860,10 @@ fn e2e_many_surgical_removals_performance_and_accuracy() {
     writer.append(&eval_event).unwrap();
 
     let events = session_journal::read_journal(session_id).unwrap();
-    let tool_calls = events[0].tool_calls.as_ref().unwrap();
+    let tool_calls = find_event(&events, JournalEventType::Turn)
+        .tool_calls
+        .as_ref()
+        .unwrap();
     assert_eq!(tool_calls.len(), 55, "all 55 records persisted");
 
     let surgical: Vec<_> = tool_calls
@@ -853,5 +880,8 @@ fn e2e_many_surgical_removals_performance_and_accuracy() {
         );
     }
 
-    assert_eq!(extract_tool_call_count(&events[1]), 5);
+    assert_eq!(
+        extract_tool_call_count(find_event(&events, JournalEventType::TurnEvaluation)),
+        5
+    );
 }

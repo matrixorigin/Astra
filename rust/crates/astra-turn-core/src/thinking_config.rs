@@ -205,10 +205,15 @@ pub fn fork_capture_thinking_slice(
                 kind: "enabled".to_string(),
             })
         }
-        ThinkingConfig::Adaptive { .. } => Some(crate::fork_prefix::ThinkingConfigSlice {
+        ThinkingConfig::Adaptive { effort } => Some(crate::fork_prefix::ThinkingConfigSlice {
             enabled: true,
             budget_tokens: 0,
-            kind: "adaptive".to_string(),
+            // Effort level participates in cache identity: a `low` parent
+            // and a `max` parent send different `output_config.effort` on
+            // the wire, so reusing one's cache for the other corrupts the
+            // child's first-round response. Encode it into `kind` so
+            // `ForkPrefix::identity_hash` separates the buckets.
+            kind: format!("adaptive:{}", effort.as_str()),
         }),
     }
 }
@@ -1320,7 +1325,6 @@ mod tests {
 #[cfg(test)]
 mod fork_capture_thinking_slice_tests {
     use super::*;
-    use crate::fork_prefix::ThinkingConfigSlice;
 
     #[test]
     fn off_mode_returns_none_for_non_replay_model() {
@@ -1356,7 +1360,7 @@ mod fork_capture_thinking_slice_tests {
     }
 
     #[test]
-    fn adaptive_mode_returns_slice_without_budget() {
+    fn adaptive_mode_returns_slice_with_effort_in_kind() {
         let result = fork_capture_thinking_slice(
             &ThinkingConfig::Adaptive {
                 effort: ThinkingEffort::High,
@@ -1364,11 +1368,39 @@ mod fork_capture_thinking_slice_tests {
             "anthropic",
             "claude-3-5-sonnet",
         );
-        assert!(result.is_some());
-        let slice = result.unwrap();
+        let slice = result.expect("adaptive must capture a slice");
         assert!(slice.enabled);
         assert_eq!(slice.budget_tokens, 0);
-        assert_eq!(slice.kind, "adaptive");
+        assert_eq!(
+            slice.kind, "adaptive:high",
+            "effort level participates in cache identity",
+        );
+    }
+
+    #[test]
+    fn adaptive_effort_levels_produce_distinct_slices() {
+        // Cache-correctness invariant: two parents that differ only in
+        // adaptive effort must NOT collapse to the same ThinkingConfigSlice
+        // (and therefore the same ForkPrefix::identity_hash). Without this,
+        // a Low-effort parent's cache entry would be reused by a Max-effort
+        // child, producing a wire mismatch on the next round.
+        let low = fork_capture_thinking_slice(
+            &ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Low,
+            },
+            "anthropic",
+            "claude-3-5-sonnet",
+        )
+        .unwrap();
+        let max = fork_capture_thinking_slice(
+            &ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Max,
+            },
+            "anthropic",
+            "claude-3-5-sonnet",
+        )
+        .unwrap();
+        assert_ne!(low, max, "adaptive effort must influence the slice");
     }
 
     #[test]
