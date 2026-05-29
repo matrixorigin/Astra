@@ -1961,10 +1961,8 @@ fn check_shell_loop_path_boundary(
             }
             _ => None,
         };
-        let fanout_subcommand = loop_fanout_kind.and_then(|kind| {
-            shell_loop_body_subcommand_requires_boundary_review(body)
-                .map(|subcommand| (kind, subcommand))
-        });
+        let fanout_subcommand =
+            loop_fanout_kind.zip(shell_loop_body_subcommand_requires_boundary_review(body));
 
         if let Some(msg) = (!body.is_empty())
             .then(|| check_bash_path_boundary_with_oldpwd(policy, body, oldpwd))
