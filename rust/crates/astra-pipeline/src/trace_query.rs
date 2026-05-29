@@ -11,7 +11,7 @@
 use crate::event::{EventLog, TurnEvent};
 use crate::step_protocol::{StepEvent, StepEventStore};
 
-fn collect_step_events<'a>(step_store: &'a dyn StepEventStore) -> Vec<&'a StepEvent> {
+fn collect_step_events(step_store: &dyn StepEventStore) -> Vec<&StepEvent> {
     let mut seen = std::collections::HashSet::new();
     let mut events = Vec::new();
     for leaf in step_store.leaves() {
