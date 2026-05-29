@@ -239,7 +239,7 @@ impl LedgerPersistence {
             .append(true)
             .open(self.file_path())?;
         writeln!(file, "{line}")?;
-        file.sync_all()?;
+        file.sync_data()?;
         Ok(())
     }
 
@@ -291,7 +291,7 @@ impl LedgerPersistence {
             });
             writeln!(file, "{line}")?;
         }
-        file.sync_all()?;
+        file.sync_data()?;
         std::fs::rename(&tmp, &path)?;
         Ok(())
     }
