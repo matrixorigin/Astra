@@ -24,6 +24,7 @@ members = [
     "crates/astra-test-harness",
     "crates/astra-harness",
     "crates/astra-credentials",
+    "crates/astra-mcp",
 ]
 resolver = "2"
 
@@ -51,6 +52,7 @@ astra-skills = { path = "crates/astra-skills" }
 astra-tools = { path = "crates/astra-tools" }
 astra-services = { path = "crates/services" }
 astra-runtime = { path = "crates/runtime" }
+astra-mcp = { path = "crates/astra-mcp" }
 astra-thin-client = { path = "crates/astra-thin-client" }
 async-stream = "0.3.6"
 async-trait = "0.1.89"

@@ -131,6 +131,18 @@ pub(crate) struct Cli {
     /// Append JSON tracing lines to this file (overrides ASTRA_LOG_FILE env); hidden from --help
     #[arg(long = "log-file", value_name = "PATH", hide = true)]
     pub log_file: Option<String>,
+    /// Trace profile for this session: "production" (lean) or "dev" (verbose).
+    /// Production keeps coarse operational traces; Dev enables full Trace-level capture.
+    #[arg(long = "trace-profile", value_parser = ["production", "dev", "custom"])]
+    pub trace_profile: Option<String>,
+    /// Minimum trace level for this session: error, warn, info, debug, trace.
+    /// Overrides the profile default.
+    #[arg(long = "trace-level", value_parser = ["error", "warn", "info", "debug", "trace"])]
+    pub trace_level: Option<String>,
+    /// Comma-separated trace categories to enable (e.g. "tool_calls,llm_exchanges,phase_transition").
+    /// Use "all" for every category.
+    #[arg(long = "trace-cat", value_name = "CATS")]
+    pub trace_cat: Option<String>,
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
 }
@@ -1220,6 +1232,10 @@ pub(crate) enum McpCmd {
     Remove(McpRemoveArgs),
     /// Show details of a configured MCP server
     Get(McpGetArgs),
+    /// Test connection to an MCP server and list its tools
+    Test(McpTestArgs),
+    /// Ping an MCP server to check connectivity
+    Ping(McpPingArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1267,6 +1283,24 @@ pub(crate) struct McpRemoveArgs {
 pub(crate) struct McpGetArgs {
     /// Server name to inspect
     pub name: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct McpTestArgs {
+    /// Server name to test
+    pub name: String,
+    /// Config scope: project or user
+    #[arg(short = 's', long, default_value = "project")]
+    pub scope: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct McpPingArgs {
+    /// Server name to ping
+    pub name: String,
+    /// Config scope: project or user
+    #[arg(short = 's', long, default_value = "project")]
+    pub scope: String,
 }
 
 #[derive(Args, Debug)]

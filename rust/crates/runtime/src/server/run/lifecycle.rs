@@ -72,6 +72,7 @@ use astra_core::{
 
 use crate::server::run::engine::{RunEngine, RunStartContext};
 use crate::server::run::handlers as run_handlers;
+use crate::server::runtime_mcp;
 use crate::server::server_loop_host::{self, ServerAgenticLoopHostBuilder};
 use crate::server::{server_skill_subrun, server_tool_executor};
 
@@ -2389,6 +2390,8 @@ pub struct AgenticRunLifecycleService {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     /// Optional database skill provider for runtime skill resolution.
     skill_service: Option<Arc<dyn SkillService>>,
+    /// Registry-backed MCP bindings available to server-side chat loops.
+    mcp_registry_service: Arc<dyn astra_services::McpRegistryService>,
     /// Per-run approval request channel receivers (Phase E).
     /// Key: run_id → receiver that the WS handler drains.
     approval_channels: Arc<TokioMutex<HashMap<String, mpsc::UnboundedReceiver<serde_json::Value>>>>,
@@ -2445,6 +2448,7 @@ impl AgenticRunLifecycleService {
             resource_governor: None,
             edge_connection_pool: None,
             skill_service: None,
+            mcp_registry_service: Arc::new(astra_services::UnconfiguredMcpRegistryService),
             approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
             user_prompt_channels: Arc::new(TokioMutex::new(HashMap::new())),
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
@@ -2507,6 +2511,14 @@ impl AgenticRunLifecycleService {
 
     pub fn with_skill_service(mut self, service: Arc<dyn SkillService>) -> Self {
         self.skill_service = Some(service);
+        self
+    }
+
+    pub fn with_mcp_registry_service(
+        mut self,
+        service: Arc<dyn astra_services::McpRegistryService>,
+    ) -> Self {
+        self.mcp_registry_service = service;
         self
     }
 
@@ -3221,6 +3233,17 @@ impl AgenticRunLifecycleService {
             validate_llm_token_service_config(request.llm_token_service.as_ref(), &trusted_domains)
                 .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
         }
+        if request
+            .mcp_binding_ids
+            .as_deref()
+            .is_some_and(|ids| !ids.is_empty())
+        {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "mcp_binding_ids is no longer supported on /chat/stream; use runtime_mcp_bindings"
+                    .to_string(),
+            ));
+        }
         let request_constraints = Self::try_request_constraints(request)
             .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
         let (_, resolver) = build_server_skill_resolver(self.skill_service.clone(), user_id);
@@ -3637,7 +3660,18 @@ impl AgenticRunLifecycleService {
 
     /// Extract edge profile from the request context, or provide empty defaults.
     fn extract_edge_profile(request: &ChatRequestData) -> Map<String, Value> {
-        Self::extract_edge_context(request).edge_profile.to_map()
+        let mut profile = Self::extract_edge_context(request).edge_profile.to_map();
+        if let Some(raw_profile) = request
+            .context
+            .as_ref()
+            .and_then(|context| context.get("edge_profile"))
+            .and_then(Value::as_object)
+        {
+            for (key, value) in raw_profile {
+                profile.insert(key.clone(), value.clone());
+            }
+        }
+        profile
     }
 
     /// Provision a sandboxed workspace directory for server-side tool execution.
@@ -3840,6 +3874,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
+        let edge_tools = Self::extract_edge_tools(&request);
+        let edge_profile = Self::extract_edge_profile(&request);
+        let mcp_bundle =
+            runtime_mcp::prepare_request_scoped_runtime_bundle(&request.runtime_mcp_bindings)
+                .await?;
+
         // Guard: reject if this session already has a blocking run.
         // Hold write lock across check+insert to prevent TOCTOU race.
         let (run_state, cancel_flag, pause_flag, llm_cancel_token) =
@@ -3865,8 +3905,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         // Spawn background agentic loop.
-        let edge_tools = Self::extract_edge_tools(&request);
-        let edge_profile = Self::extract_edge_profile(&request);
 
         // Provision workspace early so build_initial_state can load stop hooks
         // from the provisioned directory when no edge profile supplies cwd.
@@ -3892,6 +3930,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             edge_profile,
             plan_resume_hint,
         );
+        if let Some(ref bundle) = mcp_bundle {
+            host.install_runtime_tool_schemas(bundle.schemas.clone());
+        }
         let mut loop_state = self.build_initial_state(
             &user_id,
             &request,
@@ -3974,6 +4015,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             ))
             .with_cancel_token(loop_state.cancellation.token.clone())
             .with_task_store(task_store);
+
+            if let Some(ref bundle) = mcp_bundle {
+                executor.set_mcp_manager(bundle.manager.clone());
+                executor.set_plugin_schemas(bundle.schemas.clone());
+            }
+
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }
@@ -4331,6 +4378,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let edge_tools = Self::extract_edge_tools(&request);
         let edge_profile = Self::extract_edge_profile(&request);
 
+        // ── MCP: request-scoped discovery; schemas and credentials stay in memory.
+        let mcp_bundle =
+            runtime_mcp::prepare_request_scoped_runtime_bundle(&request.runtime_mcp_bindings)
+                .await?;
+
         // Provision workspace early for web-agent mode (no edge tools) so
         // build_initial_state loads stop hooks from the provisioned directory.
         let server_workspace = if edge_tools.is_empty() {
@@ -4436,6 +4488,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         host.set_event_tx(event_tx.clone());
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
 
+        // ── MCP: inject request-scoped schemas into host tool surface ─
+        if let Some(ref bundle) = mcp_bundle {
+            host.install_runtime_tool_schemas(bundle.schemas.clone());
+        }
+
         // Guard: reject if this session already has a blocking run.
         // Hold write lock across check+insert to prevent TOCTOU race.
         {
@@ -4500,6 +4557,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             ))
             .with_cancel_token(state.cancellation.token.clone())
             .with_task_store(task_store);
+
+            // ── MCP: inject manager + plugin schemas into executor ────
+            if let Some(ref bundle) = mcp_bundle {
+                executor.set_mcp_manager(bundle.manager.clone());
+                executor.set_plugin_schemas(bundle.schemas.clone());
+            }
+
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }
@@ -6805,6 +6869,8 @@ mod tests {
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
+            runtime_mcp_bindings: Vec::new(),
+            mcp_binding_ids: None,
             context: None,
             forward_headers: HashMap::new(),
             execution_budget: None,
@@ -6812,6 +6878,26 @@ mod tests {
             interaction_mode: None,
             interactive_client: false,
         }
+    }
+
+    #[tokio::test]
+    async fn validate_request_constraints_rejects_legacy_mcp_binding_ids() {
+        let service = test_service();
+        let mut request = test_request("hello");
+        request.mcp_binding_ids = Some(vec![301]);
+
+        let err = service
+            .validate_request_constraints("u1", &request)
+            .await
+            .expect_err("legacy mcp_binding_ids must be rejected on chat stream");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1
+                .0
+                .detail
+                .contains("mcp_binding_ids is no longer supported")
+        );
     }
 
     #[tokio::test]
@@ -7575,6 +7661,8 @@ mod tests {
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
+            runtime_mcp_bindings: Vec::new(),
+            mcp_binding_ids: None,
             context: Some(ctx),
             forward_headers: HashMap::new(),
             execution_budget: None,
@@ -7706,7 +7794,11 @@ mod tests {
         let mut ctx = serde_json::Map::new();
         ctx.insert(
             "edge_profile".to_string(),
-            json!({"cwd": "/tmp", "git_branch": "main"}),
+            json!({
+                "cwd": "/tmp",
+                "git_branch": "main",
+                "system_prompt_override": "override text"
+            }),
         );
         let req = ChatRequestData {
             message: "hi".into(),
@@ -7719,6 +7811,8 @@ mod tests {
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
+            runtime_mcp_bindings: Vec::new(),
+            mcp_binding_ids: None,
             context: Some(ctx),
             forward_headers: HashMap::new(),
             execution_budget: None,
@@ -7729,6 +7823,7 @@ mod tests {
         let profile = AgenticRunLifecycleService::extract_edge_profile(&req);
         assert_eq!(profile["cwd"], "/tmp");
         assert_eq!(profile["git_branch"], "main");
+        assert_eq!(profile["system_prompt_override"], "override text");
     }
 
     #[test]

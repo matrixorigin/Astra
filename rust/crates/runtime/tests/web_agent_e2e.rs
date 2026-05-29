@@ -4864,21 +4864,16 @@ async fn context_meta_exposes_builder_supplied_context_signals() {
     )
     .await;
 
-    // With pipeline-based system assembly, context_signals in the breakdown
-    // are not individually populated (the pipeline serializer doesn't track
-    // which dynamic fragments were bound). Verify:
-    //   1. A context_meta event IS emitted
-    //   2. The system_prompt_breakdown is present and has a non-zero total
     let context_meta = find_events(&events, "context_meta")
         .into_iter()
         .find(|event| event["system_prompt_breakdown"].is_object())
         .expect("builder-supplied context_meta event");
 
     let breakdown = &context_meta["system_prompt_breakdown"];
-    // The breakdown must contain a context_signals object (even if all default)
-    assert!(
-        breakdown["context_signals"].is_object(),
-        "context_signals must be present in breakdown"
+    assert_eq!(
+        breakdown["context_signals"]["system_prompt_override"].as_bool(),
+        Some(true),
+        "server loop context_meta must report edge_profile.system_prompt_override"
     );
 }
 

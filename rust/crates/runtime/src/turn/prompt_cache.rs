@@ -257,6 +257,7 @@ pub(crate) fn assemble_system_message_via_pipeline(
         extra_dynamic_sections,
         &[],
         None,
+        None,
         confidence,
         task_type,
         cache_cfg,
@@ -307,6 +308,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     extra_volatile_sections: &[prompts::PromptSection],
     memory_entries: &[astra_turn_core::context_sources::MemoryEntry],
     session_memory_entry: Option<&astra_turn_core::context_sources::MemoryEntry>,
+    system_override: Option<&str>,
     confidence: f64,
     task_type: Option<&str>,
     cache_cfg: &PromptCacheConfig,
@@ -355,6 +357,23 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
             prompts::PromptTokenBucket::UserPreferences,
         ));
     }
+    let system_override = system_override
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| format!("\n\n{text}"));
+    let system_override_trace_section = system_override.as_ref().map(|text| {
+        prompts::PromptSection::stable(text.clone(), prompts::CacheScope::Session)
+            .with_trace_signals(
+                astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                    context_signals:
+                        astra_turn_core::context_assembly_trace::PromptContextSignals {
+                            system_prompt_override: true,
+                            ..Default::default()
+                        },
+                    ..Default::default()
+                },
+            )
+    });
     let mut volatile = extra_volatile_sections.to_vec();
     if let Some(ref text) = self_model_text {
         volatile.push(prompts::PromptSection::dynamic(
@@ -370,6 +389,9 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     }
     let all_sections_for_trace = {
         let mut v = stable.clone();
+        if let Some(section) = system_override_trace_section {
+            v.push(section);
+        }
         v.extend(volatile.iter().cloned());
         v
     };
@@ -381,7 +403,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         spill_backend: None,
 
         effort_hint: None,
-        system_override: None,
+        system_override,
         plan_context: None,
         tool_guidance,
         extra_stable_sections: stable,
@@ -953,6 +975,7 @@ mod tests {
             &[], // volatile
             &[],
             None,
+            None,
             0.8,
             None,
             &cache_cfg,
@@ -1010,6 +1033,7 @@ mod tests {
             &[],
             &memory_entries,
             None,
+            None,
             0.8,
             None,
             &cache_cfg,
@@ -1060,6 +1084,7 @@ mod tests {
             &[],
             &[],
             Some(&session_memory),
+            None,
             0.8,
             None,
             &cache_cfg,
@@ -1102,6 +1127,63 @@ mod tests {
     }
 
     #[test]
+    fn bridge_pipeline_outcome_routes_system_override_through_runtime_identity() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        remove_test_env("ASTRA_OUTPUT_STYLE");
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+
+        let outcome = assemble_bridge_pipeline_outcome(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            Some("You must answer using the MOI agent contract."),
+            0.8,
+            None,
+            &cache_cfg,
+            None,
+            "sid-system-override",
+            "gpt-4o",
+            "openai",
+            None,
+            None,
+            None,
+            "",
+            "",
+            "2026-05-25",
+        );
+
+        let primary_text = outcome
+            .primary_system
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let dynamic_text = outcome
+            .dynamic_system
+            .as_ref()
+            .and_then(|msg| msg.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let breakdown =
+            prompts::build_system_prompt_trace(&outcome.prompt_sections, vec![], vec![], None);
+
+        assert!(
+            primary_text.contains("MOI agent contract"),
+            "system override should be session-stable runtime identity: {primary_text}"
+        );
+        assert!(
+            !dynamic_text.contains("MOI agent contract"),
+            "system override should not enter volatile dynamic prompt: {dynamic_text}"
+        );
+        assert!(breakdown.context_signals.system_prompt_override);
+    }
+
+    #[test]
     fn bridge_pipeline_outcome_keeps_session_memory_out_of_anthropic_cached_prefix() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         remove_test_env("ASTRA_OUTPUT_STYLE");
@@ -1120,6 +1202,7 @@ mod tests {
             &[],
             &[],
             Some(&session_memory),
+            None,
             0.8,
             None,
             &cache_cfg,
@@ -1176,6 +1259,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
             0.8,
             None,
             &cache_cfg,
@@ -1222,6 +1306,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
             0.1,
             None,
@@ -1770,6 +1855,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
             0.8,
             None,

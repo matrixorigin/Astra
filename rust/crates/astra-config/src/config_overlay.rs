@@ -22,7 +22,9 @@
 //!    write-back goes through `apply_edit`, the two ends close a loop
 //!    that's regression-guarded by `every_catalog_item_is_editable_via_apply_edit`.
 
-use crate::runtime_config::RuntimeConfig;
+use crate::runtime_config::{
+    RuntimeConfig, TraceCategory, TraceLevelSerde, TraceProfile, TraceSink,
+};
 use astra_core::runtime_limits::{RuntimeLimits, context_window_for_model};
 use serde_json::Value;
 use std::path::Path;
@@ -284,24 +286,46 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
             kind: SettingKind::Bool,
             value: Value::from(config.tool_selection.prefer_recent_tools),
         },
-        // ── Telemetry ──
+        // ── Trace ──
         SettingItem {
-            id: "telemetry.capture_context_traces".to_string(),
-            label: "Capture context-assembly traces".to_string(),
-            kind: SettingKind::Bool,
-            value: Value::from(config.telemetry.capture_context_traces),
+            id: "trace.profile".to_string(),
+            label: "Trace profile (production/dev/custom)".to_string(),
+            kind: SettingKind::Enum {
+                options: vec!["production".into(), "dev".into(), "custom".into()],
+            },
+            value: Value::from(format!("{:?}", config.trace.profile).to_lowercase()),
         },
         SettingItem {
-            id: "telemetry.capture_full_llm_exchanges".to_string(),
+            id: "trace.min_level".to_string(),
+            label: "Minimum trace level (error/warn/info/debug/trace)".to_string(),
+            kind: SettingKind::Enum {
+                options: vec![
+                    "error".into(),
+                    "warn".into(),
+                    "info".into(),
+                    "debug".into(),
+                    "trace".into(),
+                ],
+            },
+            value: Value::from(format!("{:?}", config.trace.min_level).to_lowercase()),
+        },
+        SettingItem {
+            id: "trace.tool_calls".to_string(),
+            label: "Trace tool calls".to_string(),
+            kind: SettingKind::Bool,
+            value: Value::from(config.trace.category_enabled(TraceCategory::ToolCalls)),
+        },
+        SettingItem {
+            id: "trace.llm_exchanges".to_string(),
             label: "Capture full LLM request/response payloads".to_string(),
             kind: SettingKind::Bool,
-            value: Value::from(config.telemetry.capture_full_llm_exchanges),
+            value: Value::from(config.trace.category_enabled(TraceCategory::LlmExchanges)),
         },
         SettingItem {
-            id: "telemetry.persist_to_journal".to_string(),
-            label: "Persist telemetry to journal".to_string(),
+            id: "trace.thinking".to_string(),
+            label: "Trace LLM thinking/reasoning".to_string(),
             kind: SettingKind::Bool,
-            value: Value::from(config.telemetry.persist_to_journal),
+            value: Value::from(config.trace.category_enabled(TraceCategory::Thinking)),
         },
         // ── Runtime limits (per-turn agentic budget) ──
         SettingItem {
@@ -341,6 +365,33 @@ pub fn filter_settings(items: &[SettingItem], query: &str) -> Vec<SettingItem> {
         })
         .cloned()
         .collect()
+}
+
+/// Add or remove a category from the vec.
+fn toggle_category(cats: &mut Vec<TraceCategory>, cat: TraceCategory, enable: bool) {
+    if cats.contains(&TraceCategory::All) {
+        *cats = TraceCategory::individual_categories().to_vec();
+    }
+    if enable {
+        if !cats.contains(&cat) {
+            cats.push(cat);
+        }
+    } else {
+        cats.retain(|c| *c != cat);
+    }
+    cats.sort();
+    cats.dedup();
+}
+
+/// Add or remove a sink from the vec.
+fn toggle_trace_sink(sinks: &mut Vec<TraceSink>, sink: TraceSink, enable: bool) {
+    if enable {
+        if !sinks.contains(&sink) {
+            sinks.push(sink);
+        }
+    } else {
+        sinks.retain(|s| *s != sink);
+    }
 }
 
 /// Write `new_value` into the field identified by `id`.
@@ -417,6 +468,10 @@ pub fn apply_edit(
             Value::Object(_) => "object".into(),
         }
     }
+    fn mark_trace_custom(config: &mut RuntimeConfig) {
+        config.trace.profile = TraceProfile::Custom;
+        config.trace = std::mem::take(&mut config.trace).normalize();
+    }
 
     match id {
         "token_budget.max_turn_input_tokens" => {
@@ -481,14 +536,170 @@ pub fn apply_edit(
         "tool_selection.prefer_recent_tools" => {
             config.tool_selection.prefer_recent_tools = as_bool(&new_value, id)?;
         }
-        "telemetry.capture_context_traces" => {
-            config.telemetry.capture_context_traces = as_bool(&new_value, id)?;
+        "trace.profile" => {
+            if let Some(s) = new_value.as_str() {
+                let profile = match s {
+                    "production" => TraceProfile::Production,
+                    "dev" => TraceProfile::Dev,
+                    _ => TraceProfile::Custom,
+                };
+                // Re-apply full profile effects (min_level, categories, sinks)
+                config.trace = std::mem::take(&mut config.trace).apply_profile(profile);
+            }
         }
-        "telemetry.capture_full_llm_exchanges" => {
-            config.telemetry.capture_full_llm_exchanges = as_bool(&new_value, id)?;
+        "trace.min_level" => {
+            if let Some(s) = new_value.as_str() {
+                config.trace.min_level = match s {
+                    "error" => TraceLevelSerde::Error,
+                    "warn" => TraceLevelSerde::Warn,
+                    "info" => TraceLevelSerde::Info,
+                    "debug" => TraceLevelSerde::Debug,
+                    "trace" => TraceLevelSerde::Trace,
+                    _ => return Ok(config),
+                };
+                mark_trace_custom(&mut config);
+            }
         }
-        "telemetry.persist_to_journal" => {
-            config.telemetry.persist_to_journal = as_bool(&new_value, id)?;
+        "trace.tool_calls" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::ToolCalls,
+                as_bool(&new_value, id)?,
+            );
+            mark_trace_custom(&mut config);
+            return Ok(config);
+        }
+        "trace.llm_exchanges" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::LlmExchanges,
+                as_bool(&new_value, id)?,
+            );
+            mark_trace_custom(&mut config);
+            return Ok(config);
+        }
+        "trace.thinking" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::Thinking,
+                as_bool(&new_value, id)?,
+            );
+            mark_trace_custom(&mut config);
+            return Ok(config);
+        }
+        "trace.context_assembly" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::ContextAssembly,
+                as_bool(&new_value, id)?,
+            );
+            mark_trace_custom(&mut config);
+            return Ok(config);
+        }
+        "trace.decision_explain" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::DecisionExplain,
+                as_bool(&new_value, id)?,
+            );
+            mark_trace_custom(&mut config);
+            return Ok(config);
+        }
+        "trace.phase_transition" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::PhaseTransition,
+                as_bool(&new_value, id)?,
+            );
+            mark_trace_custom(&mut config);
+            return Ok(config);
+        }
+        "trace.budget" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::Budget,
+                as_bool(&new_value, id)?,
+            );
+            mark_trace_custom(&mut config);
+            return Ok(config);
+        }
+        "trace.reflection" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::Reflection,
+                as_bool(&new_value, id)?,
+            );
+            mark_trace_custom(&mut config);
+            return Ok(config);
+        }
+        "trace.verification" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::Verification,
+                as_bool(&new_value, id)?,
+            );
+            mark_trace_custom(&mut config);
+            return Ok(config);
+        }
+        "trace.memory_retrieval" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::MemoryRetrieval,
+                as_bool(&new_value, id)?,
+            );
+            mark_trace_custom(&mut config);
+            return Ok(config);
+        }
+        "trace.skill_execution" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::SkillExecution,
+                as_bool(&new_value, id)?,
+            );
+            mark_trace_custom(&mut config);
+            return Ok(config);
+        }
+        "trace.prompt_assembly" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::PromptAssembly,
+                as_bool(&new_value, id)?,
+            );
+            mark_trace_custom(&mut config);
+            return Ok(config);
+        }
+        "trace.guard_evaluation" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::GuardEvaluation,
+                as_bool(&new_value, id)?,
+            );
+            mark_trace_custom(&mut config);
+            return Ok(config);
+        }
+        "trace.sampling_rate" => {
+            let n = as_f64(&new_value, id)?;
+            ensure_range(n, 0.0, 1.0, id)?;
+            config.trace.sampling_rate = n;
+            mark_trace_custom(&mut config);
+        }
+        "trace.sinks.journal" => {
+            toggle_trace_sink(
+                &mut config.trace.sinks,
+                TraceSink::Journal,
+                as_bool(&new_value, id)?,
+            );
+            mark_trace_custom(&mut config);
+            return Ok(config);
+        }
+        "trace.sinks.stderr" => {
+            toggle_trace_sink(
+                &mut config.trace.sinks,
+                TraceSink::Stderr,
+                as_bool(&new_value, id)?,
+            );
+            mark_trace_custom(&mut config);
+            return Ok(config);
         }
         "runtime_limits.max_turns" => {
             let n = as_u32(&new_value, id)?;
@@ -510,25 +721,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_includes_full_llm_capture_toggle() {
+    fn catalog_includes_llm_exchanges_toggle() {
         let config = RuntimeConfig::default();
         let catalog = build_settings_catalog(&config);
         let item = catalog
             .iter()
-            .find(|item| item.id == "telemetry.capture_full_llm_exchanges")
-            .expect("catalog must expose the full LLM capture toggle");
+            .find(|item| item.id == "trace.llm_exchanges")
+            .expect("catalog must expose the LLM exchanges trace toggle");
         assert_eq!(item.label, "Capture full LLM request/response payloads");
         assert_eq!(item.value, Value::Bool(false));
     }
 
     #[test]
-    fn apply_edit_updates_full_llm_capture_toggle() {
+    fn apply_edit_updates_llm_exchanges_toggle() {
         let updated = apply_edit(
             RuntimeConfig::default(),
-            "telemetry.capture_full_llm_exchanges",
+            "trace.llm_exchanges",
             Value::Bool(true),
         )
         .expect("toggle edit should succeed");
-        assert!(updated.telemetry.capture_full_llm_exchanges);
+        assert!(
+            updated
+                .trace
+                .enabled_categories
+                .contains(&TraceCategory::LlmExchanges)
+        );
+    }
+
+    #[test]
+    fn apply_edit_on_trace_toggle_breaks_out_of_preset_profile() {
+        let config = RuntimeConfig {
+            trace: RuntimeConfig::default()
+                .trace
+                .apply_profile(TraceProfile::Dev),
+            ..RuntimeConfig::default()
+        };
+        let updated = apply_edit(config, "trace.llm_exchanges", Value::Bool(false))
+            .expect("toggle edit should succeed");
+        assert_eq!(updated.trace.profile, TraceProfile::Custom);
+        assert!(
+            !updated
+                .trace
+                .enabled_categories
+                .contains(&TraceCategory::LlmExchanges)
+        );
     }
 }

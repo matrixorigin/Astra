@@ -52,130 +52,13 @@ use rmcp::{
 };
 use tokio::sync::RwLock;
 
-/// MCP server transport configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum Transport {
-    /// Stdio transport: communicates via stdin/stdout with a child process.
-    Stdio {
-        /// Command to spawn (e.g., "npx", "python").
-        command: Vec<String>,
-        /// Additional arguments for the command.
-        #[serde(default)]
-        args: Vec<String>,
-        /// Environment variables for the child process.
-        #[serde(default)]
-        env: HashMap<String, String>,
-    },
-    /// HTTP SSE transport: communicates via Streamable HTTP (MCP 2025-03-26 spec).
-    #[serde(alias = "sse", alias = "http")]
-    Sse {
-        /// Server URL (e.g., "http://localhost:8080/mcp" or "https://api.example.com/mcp").
-        url: String,
-        /// Optional bearer token for authentication.
-        #[serde(default)]
-        auth_token: Option<String>,
-        /// Custom HTTP headers.
-        #[serde(default)]
-        headers: HashMap<String, String>,
-    },
-    /// WebSocket transport: communicates over a persistent WebSocket connection.
-    #[serde(alias = "websocket")]
-    Ws {
-        /// WebSocket URL (e.g., "ws://localhost:8080/mcp" or "wss://api.example.com/mcp").
-        url: String,
-        /// Optional bearer token for authentication (sent as Authorization header).
-        #[serde(default)]
-        auth_token: Option<String>,
-        /// Optional extra headers for the WebSocket upgrade request.
-        #[serde(default)]
-        headers: HashMap<String, String>,
-    },
-}
-
-/// Connection state for an MCP server.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConnectionState {
-    /// Not connected.
-    Disconnected,
-    /// Connection attempt in progress.
-    Connecting,
-    /// Fully connected and operational.
-    Connected,
-    /// Lost connection, attempting to reconnect.
-    Reconnecting,
-    /// Connection failed after all retries exhausted.
-    Failed,
-}
-
-impl std::fmt::Display for ConnectionState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Disconnected => write!(f, "disconnected"),
-            Self::Connecting => write!(f, "connecting"),
-            Self::Connected => write!(f, "connected"),
-            Self::Reconnecting => write!(f, "reconnecting"),
-            Self::Failed => write!(f, "failed"),
-        }
-    }
-}
-
-/// Retry configuration for MCP server connections.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryConfig {
-    /// Maximum number of retry attempts (0 = no retries).
-    #[serde(default = "default_max_retries")]
-    pub max_retries: u32,
-    /// Initial delay between retries in milliseconds.
-    #[serde(default = "default_initial_delay_ms")]
-    pub initial_delay_ms: u64,
-    /// Maximum delay between retries in milliseconds.
-    #[serde(default = "default_max_delay_ms")]
-    pub max_delay_ms: u64,
-}
-
-fn default_max_retries() -> u32 {
-    5
-}
-fn default_initial_delay_ms() -> u64 {
-    1000
-}
-fn default_max_delay_ms() -> u64 {
-    30_000
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: default_max_retries(),
-            initial_delay_ms: default_initial_delay_ms(),
-            max_delay_ms: default_max_delay_ms(),
-        }
-    }
-}
-
-/// Configuration for an MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpServerConfig {
-    /// Unique name for this server.
-    pub name: String,
-    /// Transport configuration.
-    pub transport: Transport,
-    /// Optional description.
-    #[serde(default)]
-    pub description: String,
-    /// Whether the server is enabled.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Retry configuration for connection attempts.
-    #[serde(default)]
-    pub retry: RetryConfig,
-}
-
-fn default_true() -> bool {
-    true
-}
+// ── Re-exports from the shared astra-mcp crate ──────────────────────────
+#[allow(unused_imports)]
+pub use astra_mcp::{
+    ConnectionState, MAX_DESCRIPTION_LENGTH, MAX_RESULT_CONTENT_LENGTH, McpError, McpServerConfig,
+    RetryConfig, Transport, extract_result_text, extract_result_text_with_limit,
+    is_dangerous_env_var, mcp_tool_to_schema, sanitize_tool_name,
+};
 
 /// Configuration for MCP sampling — allows the handler to forward
 /// `sampling/createMessage` requests to our LLM API.
@@ -1554,7 +1437,7 @@ impl McpClientManager {
     pub fn find_tool_by_mcp_name(&self, mcp_name: &str) -> Option<(&str, &str)> {
         for (server_name, conn) in &self.connections {
             for tool in &conn.tools {
-                let sanitized = sanitize_tool_name(&format!("mcp_{}_{}", server_name, tool.name));
+                let sanitized = sanitize_tool_name(&format!("mcp__{}__{}", server_name, tool.name));
                 if sanitized == mcp_name {
                     return Some((server_name, tool.name.as_ref()));
                 }
@@ -1944,6 +1827,11 @@ async fn connect_once(
             .await
         }
         Transport::Sse {
+            url,
+            auth_token,
+            headers,
+        }
+        | Transport::StreamableHttp {
             url,
             auth_token,
             headers,
@@ -2513,188 +2401,11 @@ async fn fetch_tools_with_timeout(
     .map_err(McpError::Service)
 }
 
-/// MCP client errors.
-#[derive(Debug, thiserror::Error)]
-pub enum McpError {
-    #[error("Invalid configuration: {0}")]
-    InvalidConfig(String),
-
-    #[error("Failed to spawn MCP server: {0}")]
-    Spawn(String),
-
-    #[error("Failed to initialize MCP connection: {0}")]
-    Initialize(String),
-
-    #[error("MCP service error: {0}")]
-    Service(#[from] ServiceError),
-
-    #[error("Tool not found: {0}")]
-    ToolNotFound(String),
-
-    #[error("Server not connected: {0}")]
-    ServerNotConnected(String),
-
-    #[error("Connection lost to server {0}: {1}")]
-    ConnectionLost(String, String),
-
-    #[error("Reconnection failed for server {0} after {1} attempts")]
-    ReconnectionFailed(String, u32),
-}
-
-/// Maximum length for tool descriptions sent to the model.
-pub const MAX_DESCRIPTION_LENGTH: usize = 2048;
-
-/// Maximum character length for tool call result content.
-/// ~25K tokens × 4 chars/token = 100K chars.
-pub const MAX_RESULT_CONTENT_LENGTH: usize = 100_000;
-
 /// Default timeout for MCP tool calls (seconds).
 const MCP_TOOL_CALL_TIMEOUT_SECS: u64 = 120;
 
 /// Default timeout for MCP server connection (seconds).
 const MCP_CONNECT_TIMEOUT_SECS: u64 = 30;
-
-/// Environment variable prefixes/names that are blocked for MCP server processes.
-/// These could enable privilege escalation, library injection, or secret exfiltration.
-const BLOCKED_ENV_PREFIXES: &[&str] = &[
-    "LD_",           // LD_PRELOAD, LD_LIBRARY_PATH — library injection
-    "DYLD_",         // macOS equivalent of LD_*
-    "SUDO_",         // SUDO_ASKPASS, SUDO_USER — privilege escalation
-    "SSH_AUTH_SOCK", // SSH agent socket hijacking
-];
-
-const BLOCKED_ENV_EXACT: &[&str] = &[
-    // Note: PATH is intentionally NOT blocked — MCP servers (especially Node.js)
-    // need it to find executables. The server's env config can override if needed.
-    "IFS",               // Shell word-splitting attacks
-    "BASH_ENV",          // Bash startup injection
-    "ENV",               // POSIX shell startup injection
-    "CDPATH",            // Directory traversal manipulation
-    "GLOBIGNORE",        // Glob bypass
-    "SHELLOPTS",         // Shell option manipulation
-    "BASHOPTS",          // Bash option manipulation
-    "PROMPT_COMMAND",    // Bash prompt injection
-    "PYTHONPATH",        // Python import path injection
-    "NODE_PATH",         // Node.js module resolution injection
-    "JAVA_TOOL_OPTIONS", // JVM agent / property injection
-    "HOME",              // Tooling that follows $HOME (credentials, RC files)
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "DISPLAY",        // X11 socket hijack / GUI side channels
-    "RUST_BACKTRACE", // Verbose panic paths may leak paths / secrets
-];
-
-/// Check if an environment variable name is dangerous and should be blocked.
-pub fn is_dangerous_env_var(key: &str) -> bool {
-    let upper = key.to_uppercase();
-    if BLOCKED_ENV_EXACT.iter().any(|&e| upper == e) {
-        return true;
-    }
-    BLOCKED_ENV_PREFIXES
-        .iter()
-        .any(|&prefix| upper.starts_with(prefix))
-}
-
-/// Truncate a string to `max_len` chars, appending a marker if truncated.
-const TRUNCATION_MARKER: &str = "… [truncated]";
-
-fn truncate_with_marker(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        return s.to_string();
-    }
-    // Reserve space for the marker so total output stays within max_len
-    let content_budget = max_len.saturating_sub(TRUNCATION_MARKER.len());
-    let end = s.floor_char_boundary(content_budget);
-    format!("{}{TRUNCATION_MARKER}", &s[..end])
-}
-
-/// Sanitize a tool name: only alphanumeric, underscore, hyphen allowed.
-/// Replaces invalid chars with underscore.
-pub fn sanitize_tool_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// Convert MCP Tool to astra tool schema format.
-/// Applies description truncation and name sanitization.
-pub fn mcp_tool_to_schema(server_name: &str, tool: &Tool) -> serde_json::Value {
-    // input_schema is Arc<JsonObject>, convert to Value
-    let params = serde_json::to_value(tool.input_schema.as_ref()).unwrap_or_else(|_| {
-        serde_json::json!({
-            "type": "object",
-            "properties": {},
-        })
-    });
-
-    let raw_desc = tool.description.as_deref().unwrap_or("");
-    let description = truncate_with_marker(raw_desc, MAX_DESCRIPTION_LENGTH);
-    let tool_name = sanitize_tool_name(&format!("mcp_{}_{}", server_name, tool.name));
-
-    serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": tool_name,
-            "description": description,
-            "parameters": params,
-        }
-    })
-}
-
-/// Extract tool call result content as string, with truncation.
-pub fn extract_result_text(result: &CallToolResult) -> String {
-    extract_result_text_with_limit(result, MAX_RESULT_CONTENT_LENGTH)
-}
-
-/// Extract tool call result content as string, truncated to `max_len` chars.
-pub fn extract_result_text_with_limit(result: &CallToolResult, max_len: usize) -> String {
-    use rmcp::model::RawContent;
-
-    let mut parts = Vec::new();
-    let mut total_len = 0;
-
-    for content in &result.content {
-        match &content.raw {
-            RawContent::Text(text) => {
-                let remaining = max_len.saturating_sub(total_len);
-                if remaining == 0 {
-                    break;
-                }
-                if text.text.len() <= remaining {
-                    total_len += text.text.len();
-                    parts.push(text.text.clone());
-                } else {
-                    let end = text.text.floor_char_boundary(remaining);
-                    parts.push(text.text[..end].to_string());
-                    total_len += end;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let joined = parts.join("\n");
-    if total_len >= max_len {
-        tracing::warn!(
-            chars = total_len,
-            limit = max_len,
-            "MCP: tool result truncated"
-        );
-        format!(
-            "{}\n\n[OUTPUT TRUNCATED - exceeded {} char limit]",
-            joined, max_len
-        )
-    } else {
-        joined
-    }
-}
 
 #[cfg(test)]
 pub(crate) fn ensure_mock_mcp_server_binary() -> std::path::PathBuf {
@@ -2834,7 +2545,7 @@ mod tests {
 
         let schema = mcp_tool_to_schema("filesystem", &tool);
         let func = schema["function"].as_object().unwrap();
-        assert_eq!(func["name"], "mcp_filesystem_read_file");
+        assert_eq!(func["name"], "mcp__filesystem__read_file");
         assert_eq!(func["description"], "Read a file");
     }
 
@@ -3006,7 +2717,7 @@ mcp_servers:
         let func = schema["function"].as_object().unwrap();
 
         // Name should be prefixed
-        assert_eq!(func["name"], "mcp_fs_read_file");
+        assert_eq!(func["name"], "mcp__fs__read_file");
 
         // Description preserved
         assert_eq!(
@@ -3035,7 +2746,7 @@ mcp_servers:
         let schema = mcp_tool_to_schema("server", &tool);
         let func = schema["function"].as_object().unwrap();
 
-        assert_eq!(func["name"], "mcp_server_simple_action");
+        assert_eq!(func["name"], "mcp__server__simple_action");
         assert!(func["parameters"].as_object().unwrap().is_empty());
     }
 
@@ -3291,23 +3002,6 @@ transport:
     }
 
     #[test]
-    fn truncate_with_marker_short() {
-        assert_eq!(truncate_with_marker("hello", 10), "hello");
-        assert_eq!(truncate_with_marker("hello", 5), "hello");
-    }
-
-    #[test]
-    fn truncate_with_marker_long() {
-        let long = "a".repeat(3000);
-        let result = truncate_with_marker(&long, MAX_DESCRIPTION_LENGTH);
-        assert!(
-            result.len() <= MAX_DESCRIPTION_LENGTH,
-            "truncated output should not exceed max_len"
-        );
-        assert!(result.ends_with("… [truncated]"));
-    }
-
-    #[test]
     fn mcp_tool_to_schema_truncates_description() {
         use std::sync::Arc;
         let empty_schema: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
@@ -3336,7 +3030,7 @@ transport:
         let schema = mcp_tool_to_schema("my.server", &tool);
 
         let name = schema["function"]["name"].as_str().unwrap();
-        assert_eq!(name, "mcp_my_server_read_file");
+        assert_eq!(name, "mcp__my_server__read_file");
     }
 
     #[test]
@@ -3401,7 +3095,7 @@ transport:
     }
 
     #[test]
-    fn sse_transport_http_alias() {
+    fn streamable_http_transport_http_alias() {
         let yaml = r#"
 name: http-server
 transport:
@@ -3410,7 +3104,7 @@ transport:
 "#;
         let config: McpServerConfig = serde_yaml_ng::from_str(yaml).unwrap();
         match &config.transport {
-            Transport::Sse {
+            Transport::StreamableHttp {
                 url,
                 auth_token,
                 headers,
@@ -3419,7 +3113,7 @@ transport:
                 assert!(auth_token.is_none());
                 assert!(headers.is_empty());
             }
-            _ => panic!("expected SSE transport"),
+            _ => panic!("expected StreamableHttp transport"),
         }
     }
 
@@ -4343,39 +4037,6 @@ mcp_servers:
         assert!(normalized.is_some());
         let map = normalized.unwrap();
         assert!(map.get("input").unwrap().is_array());
-    }
-
-    // --- truncate_with_marker edge cases ---
-
-    #[test]
-    fn truncate_with_marker_exact_boundary() {
-        let s = "a".repeat(MAX_DESCRIPTION_LENGTH);
-        let result = truncate_with_marker(&s, MAX_DESCRIPTION_LENGTH);
-        assert_eq!(result.len(), MAX_DESCRIPTION_LENGTH);
-        assert!(!result.contains(TRUNCATION_MARKER));
-    }
-
-    #[test]
-    fn truncate_with_marker_one_over() {
-        let s = "a".repeat(MAX_DESCRIPTION_LENGTH + 1);
-        let result = truncate_with_marker(&s, MAX_DESCRIPTION_LENGTH);
-        assert!(result.len() <= MAX_DESCRIPTION_LENGTH);
-        assert!(result.ends_with(TRUNCATION_MARKER));
-    }
-
-    #[test]
-    fn truncate_with_marker_empty_string() {
-        let result = truncate_with_marker("", 100);
-        assert_eq!(result, "");
-    }
-
-    #[test]
-    fn truncate_with_marker_multibyte_doesnt_split_char() {
-        // CJK chars are 3 bytes each - truncation should not split a character
-        let s = "你好世界你好世界"; // 8 chars, 24 bytes
-        let result = truncate_with_marker(s, 20);
-        assert!(result.is_char_boundary(result.len() - TRUNCATION_MARKER.len()));
-        assert!(result.ends_with(TRUNCATION_MARKER));
     }
 
     // --- MCP Security Tests ---

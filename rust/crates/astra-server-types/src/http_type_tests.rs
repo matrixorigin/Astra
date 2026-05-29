@@ -51,6 +51,8 @@ fn chat_request_defaults_applied() {
     assert!(req.agent_id.is_none());
     assert!(req.model.is_none());
     assert!(req.llm_token_service.is_none());
+    assert!(req.runtime_mcp_bindings.is_empty());
+    assert!(req.mcp_binding_ids.is_none());
     assert!(req.context.is_none());
 }
 
@@ -128,6 +130,14 @@ fn chat_request_all_fields() {
             "url": "http://catalog:8081/api/v1/llm-token",
             "timeout_ms": 2500
         },
+        "runtime_mcp_bindings": [
+            {
+                "id": "external_nl2sql",
+                "transport": "streamable_http",
+                "url": "http://tool-server/api/v1/workspaces/ws-1/mcp/http",
+                "headers": {"Authorization": "Bearer runtime-token"}
+            }
+        ],
         "context": {"key": "value"},
         "execution_budget": {"initial_turns": 10, "hard_turn_limit": 18},
         "explain": true
@@ -144,6 +154,15 @@ fn chat_request_all_fields() {
     assert_eq!(
         req.llm_token_service.as_ref().and_then(|v| v.timeout_ms),
         Some(2500)
+    );
+    assert_eq!(req.runtime_mcp_bindings.len(), 1);
+    assert_eq!(req.runtime_mcp_bindings[0].id, "external_nl2sql");
+    assert_eq!(
+        req.runtime_mcp_bindings[0]
+            .headers
+            .get("Authorization")
+            .map(String::as_str),
+        Some("Bearer runtime-token")
     );
     assert_eq!(
         req.execution_budget,
@@ -918,6 +937,17 @@ fn chat_request_into_data_maps_all_fields() {
         allow_skills: None,
         allow_skill_sources: None,
         allow_tools: None,
+        runtime_mcp_bindings: vec![astra_services::runs::RuntimeMcpBindingRequest {
+            id: "external_nl2sql".into(),
+            transport: "streamable_http".into(),
+            url: "http://tool-server/api/v1/workspaces/ws-1/mcp/http".into(),
+            auth_token: None,
+            headers: std::collections::HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer runtime-token".to_string(),
+            )]),
+        }],
+        mcp_binding_ids: None,
         context: Some(ctx.clone()),
         execution_budget: Some(ExecutionBudget {
             initial_turns: Some(3),
@@ -946,6 +976,9 @@ fn chat_request_into_data_maps_all_fields() {
         data.skill_search,
         Some(astra_core::SkillSearchSettings::default())
     );
+    assert_eq!(data.runtime_mcp_bindings.len(), 1);
+    assert_eq!(data.runtime_mcp_bindings[0].id, "external_nl2sql");
+    assert!(data.mcp_binding_ids.is_none());
     assert_eq!(data.context, Some(ctx));
     assert_eq!(
         data.execution_budget,
@@ -971,6 +1004,8 @@ fn chat_request_into_data_maps_defaults() {
     assert!(data.agent_id.is_none());
     assert!(data.model.is_none());
     assert!(data.llm_token_service.is_none());
+    assert!(data.runtime_mcp_bindings.is_empty());
+    assert!(data.mcp_binding_ids.is_none());
     assert!(data.context.is_none());
     assert!(data.execution_budget.is_none());
     assert!(!data.explain);
@@ -990,6 +1025,8 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         allow_skills: None,
         allow_skill_sources: None,
         allow_tools: None,
+        runtime_mcp_bindings: Vec::new(),
+        mcp_binding_ids: None,
         context: None,
         execution_budget: None,
         explain: false,

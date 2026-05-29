@@ -384,6 +384,23 @@ async fn add_index_if_missing(
     Ok(())
 }
 
+async fn drop_index_if_exists(
+    pool: &Pool<MySql>,
+    schema: &str,
+    table: &str,
+    index: &str,
+) -> Result<(), sqlx::Error> {
+    debug_assert!(
+        !table.contains('`') && !index.contains('`'),
+        "identifiers must not contain backticks"
+    );
+    if index_exists(pool, schema, table, index).await? {
+        let ddl = format!("ALTER TABLE `{table}` DROP INDEX `{index}`");
+        query(&ddl).execute(pool).await?;
+    }
+    Ok(())
+}
+
 fn sql_decode_error(message: impl Into<String>) -> sqlx::Error {
     sqlx::Error::Decode(Box::new(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -2135,6 +2152,86 @@ pub async fn ensure_core_schema(
             last_heartbeat_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             UNIQUE KEY uq_edge_registry_user_agent (user_id, edge_agent_id),
             INDEX idx_edge_registry_user_heartbeat (user_id, last_heartbeat_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS mcp_servers (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            owner_user_id VARCHAR(128) NOT NULL,
+            name VARCHAR(128) NOT NULL,
+            description TEXT NULL,
+            transport VARCHAR(32) NOT NULL,
+            url TEXT NOT NULL,
+            is_active SMALLINT NOT NULL DEFAULT 1,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_mcp_servers_owner_name (owner_user_id, name),
+            INDEX idx_mcp_servers_owner_active (owner_user_id, is_active, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS mcp_bindings (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            owner_user_id VARCHAR(128) NOT NULL,
+            mcp_id BIGINT NOT NULL,
+            key_hash VARCHAR(128) NOT NULL,
+            key_value_encrypted TEXT NOT NULL,
+            comment TEXT NULL,
+            is_active SMALLINT NOT NULL DEFAULT 1,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_mcp_bindings_owner_mcp_key (owner_user_id, mcp_id, key_hash),
+            INDEX idx_mcp_bindings_owner_active (owner_user_id, is_active, updated_at),
+            INDEX idx_mcp_bindings_mcp_id (mcp_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "mcp_bindings",
+        "key_hash",
+        "ALTER TABLE mcp_bindings ADD COLUMN key_hash VARCHAR(128) NULL",
+    )
+    .await?;
+    drop_index_if_exists(
+        &pool,
+        &settings.database,
+        "mcp_bindings",
+        "uq_mcp_bindings_owner_alias",
+    )
+    .await?;
+    drop_column_if_exists(&pool, &settings.database, "mcp_bindings", "alias").await?;
+    add_index_if_missing(
+        &pool,
+        &settings.database,
+        "mcp_bindings",
+        "uq_mcp_bindings_owner_mcp_key",
+        "ALTER TABLE mcp_bindings ADD UNIQUE KEY uq_mcp_bindings_owner_mcp_key (owner_user_id, mcp_id, key_hash)",
+    )
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS mcp_tools (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            binding_id BIGINT NOT NULL,
+            tool_name VARCHAR(256) NOT NULL,
+            public_name VARCHAR(384) NOT NULL,
+            description TEXT NULL,
+            input_schema_json JSON NULL,
+            output_schema_json JSON NULL,
+            schema_hash VARCHAR(128) NOT NULL,
+            discovered_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_mcp_tools_binding_tool (binding_id, tool_name),
+            UNIQUE KEY uq_mcp_tools_binding_public (binding_id, public_name),
+            INDEX idx_mcp_tools_binding (binding_id)
         )",
     )
     .execute(&pool)

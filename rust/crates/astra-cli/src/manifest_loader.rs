@@ -571,9 +571,17 @@ fn json_entry_to_config(name: &str, entry: &McpJsonServerEntry) -> Option<McpSer
                 env: entry.env.clone(),
             }
         }
-        "sse" | "http" => {
+        "sse" => {
             let url = entry.url.as_deref()?;
             Transport::Sse {
+                url: url.to_string(),
+                auth_token: entry.auth_token.clone(),
+                headers: entry.headers.clone(),
+            }
+        }
+        "http" | "streamable_http" | "streamable-http" => {
+            let url = entry.url.as_deref()?;
+            Transport::StreamableHttp {
                 url: url.to_string(),
                 auth_token: entry.auth_token.clone(),
                 headers: entry.headers.clone(),

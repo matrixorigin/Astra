@@ -927,6 +927,9 @@ pub struct ServerToolExecutor {
     /// plan-mode state write through this so the next turn's system prompt
     /// reflects current state instead of the loop-start snapshot.
     plan_resume_hint_handle: Option<Arc<std::sync::RwLock<Option<String>>>>,
+    /// MCP client manager for forwarding `mcp__*` tool calls to connected
+    /// MCP servers. Set by `stream_chat()` after MCP discovery.
+    mcp_manager: Option<Arc<tokio::sync::RwLock<astra_mcp::McpClientManager>>>,
     /// Plugin-registered tool schemas (e.g. MCP servers). Joined with the
     /// server-side allowlist when `tool_search(select:NAME)` runs so
     /// deferred activation reaches plugin tools. Populated by the server
@@ -1023,6 +1026,7 @@ impl ServerToolExecutor {
             plan_mode_cache: Arc::new(tokio::sync::RwLock::new(PlanModeSnapshot::default())),
             plan_resume_hint_handle: None,
             plugin_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
+            mcp_manager: None,
             agent_tool_context: None,
             capabilities,
             server_tool_names,
@@ -1049,6 +1053,14 @@ impl ServerToolExecutor {
         self.server_tool_names = resolved_server_tool_names(&capabilities);
         self.capabilities = capabilities;
         self
+    }
+
+    /// Set the MCP client manager for forwarding `mcp__*` tool calls.
+    pub fn set_mcp_manager(
+        &mut self,
+        manager: Arc<tokio::sync::RwLock<astra_mcp::McpClientManager>>,
+    ) {
+        self.mcp_manager = Some(manager);
     }
 
     /// Install plugin-registered schemas (MCP, etc.) so
@@ -2076,6 +2088,27 @@ impl ServerToolExecutor {
                     )
                 } else {
                     astra_tools::ToolResult::text(format!("Notification: {message}"))
+                }
+            }
+            // ── MCP tool forwarding ──────────────────────────────────
+            _ if name.starts_with("mcp__") => {
+                let Some(mgr) = &self.mcp_manager else {
+                    return astra_tools::ToolResult::error(format!(
+                        "Error: Tool '{name}' is not available — no MCP manager configured."
+                    ));
+                };
+                match mgr
+                    .read()
+                    .await
+                    .call_tool_by_mcp_name(name, args.clone())
+                    .await
+                {
+                    Ok(content) => astra_tools::ToolResult::text(content),
+                    Err(e) => {
+                        astra_tools::ToolResult::error(super::runtime_mcp::redact_mcp_error_text(
+                            &format!("MCP tool '{name}' failed: {e}"),
+                        ))
+                    }
                 }
             }
             // ── Unknown tool fallback ──────────────────────────────────

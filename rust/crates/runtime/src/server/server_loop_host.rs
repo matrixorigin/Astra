@@ -1148,6 +1148,23 @@ impl ServerAgenticLoopHost {
         Arc::clone(&self.plan_resume_hint)
     }
 
+    /// Install runtime MCP tool schemas into the LLM tool surface.
+    /// Updates `edge_tools`, `valid_tools`, and `admissible_extras`
+    /// so the LLM sees MCP tools and the validator admits them.
+    pub fn install_runtime_tool_schemas(&mut self, schemas: Vec<Value>) {
+        for schema in &schemas {
+            if let Some(name) = schema
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+            {
+                self.valid_tools.insert(name.to_string());
+                self.admissible_extras.push(name.to_string());
+            }
+        }
+        self.edge_tools.extend(schemas);
+    }
+
     fn read_plan_resume_hint(&self) -> Option<String> {
         match self.plan_resume_hint.read() {
             Ok(guard) => guard.clone(),

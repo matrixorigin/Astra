@@ -25,6 +25,7 @@ pub mod learning;
 pub mod llm_trusted_domains;
 pub mod marketplace;
 pub mod marketplace_stats;
+pub mod mcp_registry;
 pub mod models;
 pub mod multi_agent;
 pub mod pagination;
@@ -169,6 +170,12 @@ pub use marketplace_stats::{
     DatabaseMarketplaceStatsService, MarketplaceStatsService, NoopMarketplaceStatsService,
     QualityReportData, SkillMarketplaceStats, SkillSearchQuery, SkillSearchResponse,
     SkillSearchResult,
+};
+pub use mcp_registry::{
+    DatabaseMcpRegistryService, McpBindingRequestData, McpDiscoveredToolData, McpRegisterRecord,
+    McpRegisterRequestData, McpRegisteredBindingRecord, McpRegisteredToolRecord,
+    McpRegistryService, McpRuntimeBindingRecord, McpServerRequestData,
+    UnconfiguredMcpRegistryService, mcp_binding_tool_namespace, mcp_schema_hash,
 };
 pub use models::{
     DatabaseModelService, ModelCreateRequestData, ModelListItem, ModelRecord, ModelService,

@@ -123,6 +123,7 @@ pub struct AppState {
     pub(crate) session_audit_service: Arc<dyn SessionAuditService>,
     pub(crate) skill_service: Arc<dyn SkillService>,
     pub(crate) skill_config_service: Arc<dyn SkillConfigService>,
+    pub(crate) mcp_registry_service: Arc<dyn astra_services::McpRegistryService>,
     pub(crate) llm_trusted_domain_service:
         Arc<dyn astra_services::llm_trusted_domains::LlmTrustedDomainService>,
     pub(crate) evaluation_service: Arc<dyn EvaluationService>,
@@ -208,6 +209,7 @@ impl AppState {
             session_audit_service: Arc::new(UnconfiguredSessionAuditService),
             skill_service: Arc::new(UnconfiguredSkillService),
             skill_config_service: Arc::new(UnconfiguredSkillConfigService),
+            mcp_registry_service: Arc::new(astra_services::UnconfiguredMcpRegistryService),
             llm_trusted_domain_service: Arc::new(
                 astra_services::llm_trusted_domains::UnconfiguredLlmTrustedDomainService,
             ),
@@ -423,6 +425,14 @@ impl AppState {
         skill_config_service: Arc<dyn SkillConfigService>,
     ) -> Self {
         self.skill_config_service = skill_config_service;
+        self
+    }
+
+    pub fn with_mcp_registry_service(
+        mut self,
+        mcp_registry_service: Arc<dyn astra_services::McpRegistryService>,
+    ) -> Self {
+        self.mcp_registry_service = mcp_registry_service;
         self
     }
 

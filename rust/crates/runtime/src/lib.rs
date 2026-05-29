@@ -174,6 +174,10 @@ pub use astra_services::{
     marketplace_stats::{
         DatabaseMarketplaceStatsService, MarketplaceStatsService, NoopMarketplaceStatsService,
     },
+    mcp_registry::{
+        DatabaseMcpRegistryService, McpRegisterRecord, McpRegisterRequestData, McpRegistryService,
+        UnconfiguredMcpRegistryService,
+    },
     models::{
         DatabaseModelService, ModelCreateRequestData, ModelListItem, ModelRecord, ModelService,
         ModelUpdateRequestData, PricingData, QuirksData, UnconfiguredModelService,

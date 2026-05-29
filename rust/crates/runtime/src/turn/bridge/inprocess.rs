@@ -2198,6 +2198,9 @@ impl InProcessChatTurnBridge {
                                         &effective_dynamic_sections,
                                         &memoria_prefetch_entries,
                                         initial_session_memory_entry.clone(),
+                                        edge_profile
+                                            .get("system_prompt_override")
+                                            .and_then(Value::as_str),
                                         selection_confidence,
                                         task_type,
                                     ),
@@ -2330,6 +2333,9 @@ impl InProcessChatTurnBridge {
                                             &effective_dynamic_sections,
                                             &memoria_prefetch_entries,
                                             Some(session_memory_entry),
+                                            edge_profile
+                                                .get("system_prompt_override")
+                                                .and_then(Value::as_str),
                                             selection_confidence,
                                             task_type,
                                         ),

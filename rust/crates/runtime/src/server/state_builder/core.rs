@@ -98,6 +98,10 @@ pub(super) fn build_core_state(
     .with_skill_config_service(Arc::new(
         DatabaseSkillConfigService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
+    .with_mcp_registry_service(Arc::new(
+        DatabaseMcpRegistryService::new(settings.matrixone.clone(), Arc::clone(shared_encryptor))
+            .with_pool(shared_pool.clone()),
+    ))
     .with_llm_trusted_domain_service(Arc::new(
         astra_services::DatabaseLlmTrustedDomainService::new(settings.matrixone.clone())
             .with_pool(shared_pool.clone()),
