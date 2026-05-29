@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -77,6 +77,7 @@ impl LedgerEntryMeta {
             .as_millis() as u64;
     }
 
+    #[allow(dead_code)]
     fn age_ms(&self) -> u64 {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

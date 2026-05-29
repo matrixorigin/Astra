@@ -22,20 +22,29 @@ pub struct UnifiedEvent {
     pub payload: serde_json::Value,
 }
 
+/// Default max results returned by query methods.
+const DEFAULT_QUERY_LIMIT: usize = 1000;
+
 /// Cross-layer query using EventLog iteration + StepEventStore DAG traversal.
 pub struct TraceQuery;
 
 impl TraceQuery {
     /// Find events across all layers matching a canonical_event_id.
+    /// Returns at most `limit` results (default 1000).
     pub fn find_by_canonical_id(
         event_log: &EventLog,
         step_store: &dyn StepEventStore,
         canonical_id: &str,
+        limit: Option<usize>,
     ) -> Vec<UnifiedEvent> {
-        let mut results = Vec::new();
+        let max = limit.unwrap_or(DEFAULT_QUERY_LIMIT);
+        let mut results = Vec::with_capacity(max.min(64));
 
         // Layer 1: EventLog — canonical_event_id is Uuid
         for event in event_log.events() {
+            if results.len() >= max {
+                return results;
+            }
             if event.canonical_event_id.to_string() == canonical_id {
                 results.push(event_to_unified(event, "EventLog"));
             }
@@ -43,10 +52,16 @@ impl TraceQuery {
 
         // Layer 2: StepRecorder — search from leaves + ancestors
         for leaf in step_store.leaves() {
+            if results.len() >= max {
+                return results;
+            }
             if leaf.canonical_event_id.as_deref() == Some(canonical_id) {
                 results.push(step_to_unified(leaf, "StepRecorder"));
             }
             for a in step_store.ancestors(&leaf.event_id) {
+                if results.len() >= max {
+                    return results;
+                }
                 if a.canonical_event_id.as_deref() == Some(canonical_id)
                     && !results
                         .iter()
@@ -61,12 +76,15 @@ impl TraceQuery {
     }
 
     /// Walk the causal chain from a given canonical_event_id, across layers.
+    /// Returns at most `limit` events (default 1000).
     pub fn causal_chain(
         event_log: &EventLog,
         step_store: &dyn StepEventStore,
         start_canonical_id: &str,
+        limit: Option<usize>,
     ) -> Vec<UnifiedEvent> {
-        let mut chain = Vec::new();
+        let max = limit.unwrap_or(DEFAULT_QUERY_LIMIT);
+        let mut chain = Vec::with_capacity(max.min(64));
 
         // Build EventLog lookup by canonical_id string
         let log_by_canonical: std::collections::HashMap<String, &TurnEvent> = event_log
@@ -92,6 +110,9 @@ impl TraceQuery {
         let mut current_id = Some(start_canonical_id.to_string());
         // Walk causal chain using take() to avoid borrow conflicts
         while let Some(id) = current_id.take() {
+            if chain.len() >= max {
+                break;
+            }
             let mut found = false;
 
             // Check EventLog
@@ -166,11 +187,14 @@ impl TraceQuery {
     }
 
     /// Find events appearing in multiple layers (dedup candidates).
+    /// Returns at most `limit` results (default 1000).
     pub fn cross_layer_duplicates(
         event_log: &EventLog,
         step_store: &dyn StepEventStore,
+        limit: Option<usize>,
     ) -> Vec<UnifiedEvent> {
-        let mut duplicates = Vec::new();
+        let max = limit.unwrap_or(DEFAULT_QUERY_LIMIT);
+        let mut duplicates = Vec::with_capacity(max.min(64));
 
         let mut step_ids = std::collections::HashSet::new();
         for leaf in step_store.leaves() {
@@ -185,6 +209,9 @@ impl TraceQuery {
         }
 
         for event in event_log.events() {
+            if duplicates.len() >= max {
+                break;
+            }
             let id_str = event.canonical_event_id.to_string();
             if step_ids.contains(&id_str) {
                 duplicates.push(event_to_unified(event, "EventLog (dup in StepRecorder)"));
@@ -192,6 +219,74 @@ impl TraceQuery {
         }
 
         duplicates
+    }
+
+    /// Filter events by time range (timestamp_ms).
+    pub fn filter_by_time_range(
+        events: Vec<UnifiedEvent>,
+        start_ms: Option<u64>,
+        end_ms: Option<u64>,
+    ) -> Vec<UnifiedEvent> {
+        events
+            .into_iter()
+            .filter(|e| {
+                if let Some(ts) = e.timestamp_ms {
+                    let after_start = start_ms.map(|s| ts >= s).unwrap_or(true);
+                    let before_end = end_ms.map(|e| ts <= e).unwrap_or(true);
+                    after_start && before_end
+                } else {
+                    // Events without timestamp are excluded from time filtering
+                    start_ms.is_none() && end_ms.is_none()
+                }
+            })
+            .collect()
+    }
+
+    /// Filter events by event kind (substring match).
+    pub fn filter_by_event_kind(events: Vec<UnifiedEvent>, pattern: &str) -> Vec<UnifiedEvent> {
+        let pattern_lower = pattern.to_lowercase();
+        events
+            .into_iter()
+            .filter(|e| e.event_kind.to_lowercase().contains(&pattern_lower))
+            .collect()
+    }
+
+    /// Filter events by source layer.
+    pub fn filter_by_layer(events: Vec<UnifiedEvent>, layer: &str) -> Vec<UnifiedEvent> {
+        events
+            .into_iter()
+            .filter(|e| e.source_layer == layer)
+            .collect()
+    }
+
+    /// Export events to JSON format.
+    pub fn export_json(events: &[UnifiedEvent]) -> serde_json::Value {
+        serde_json::json!({
+            "total_events": events.len(),
+            "events": events,
+            "exported_at": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        })
+    }
+
+    /// Export events to CSV format (simplified: id, layer, kind, timestamp).
+    pub fn export_csv(events: &[UnifiedEvent]) -> String {
+        let mut csv = String::from(
+            "canonical_event_id,layer_event_id,source_layer,event_kind,timestamp_ms\n",
+        );
+        for e in events {
+            csv.push_str(&format!(
+                "{},{},{},{},{}\n",
+                e.canonical_event_id.as_deref().unwrap_or(""),
+                e.layer_event_id.as_deref().unwrap_or(""),
+                e.source_layer,
+                e.event_kind.replace(',', "_"),
+                e.timestamp_ms.map(|t| t.to_string()).unwrap_or_default()
+            ));
+        }
+        csv
     }
 }
 
@@ -222,6 +317,7 @@ fn step_to_unified(event: &StepEvent, layer: &'static str) -> UnifiedEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::TraceLevel;
     use crate::event::{EventKind, EventLog};
     use crate::step_protocol::{StepEvent, StepEventStore, StepEventType};
 
@@ -241,16 +337,23 @@ mod tests {
         }
         fn ancestors(&self, event_id: &str) -> Vec<&StepEvent> {
             let mut result = Vec::new();
-            let mut current_ids: Vec<String> = vec![event_id.to_string()];
+            let mut to_visit = vec![event_id.to_string()];
             let mut visited = std::collections::HashSet::new();
-            while let Some(id) = current_ids.pop() {
+            while let Some(id) = to_visit.pop() {
                 if !visited.insert(id.clone()) {
                     continue;
                 }
-                for e in &self.events {
-                    if e.caused_by.contains(&id) && visited.insert(e.event_id.clone()) {
-                        result.push(e);
-                        current_ids.push(e.event_id.clone());
+                // Find the event with this id and walk UP its caused_by chain
+                if let Some(event) = self.events.iter().find(|e| e.event_id == id) {
+                    for parent_id in &event.caused_by {
+                        if visited.insert(parent_id.clone()) {
+                            if let Some(parent) =
+                                self.events.iter().find(|e| e.event_id == *parent_id)
+                            {
+                                result.push(parent);
+                                to_visit.push(parent_id.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -309,8 +412,9 @@ mod tests {
     fn find_by_canonical_id_cross_layer() {
         let mut log = EventLog::new();
         log.emit(
-            EventKind::PhaseEntered {
-                phase: "plan".into(),
+            EventKind::PhaseTransition {
+                from: crate::state::AgentPhase::Plan,
+                to: crate::state::AgentPhase::Execute,
             },
             None,
         );
@@ -319,22 +423,24 @@ mod tests {
         let mut store = MockStepStore { events: vec![] };
         store.append(make_step("e1", "step-1", Some(&id), &[]));
 
-        let results = TraceQuery::find_by_canonical_id(&log, &store, &id);
+        let results = TraceQuery::find_by_canonical_id(&log, &store, &id, None);
         assert_eq!(results.len(), 2);
     }
 
     #[test]
     fn layer_counts_accurate() {
-        let mut log = EventLog::new();
+        let mut log = EventLog::with_min_level(TraceLevel::Debug);
         log.emit(
-            EventKind::PhaseEntered {
-                phase: "plan".into(),
+            EventKind::PhaseTransition {
+                from: crate::state::AgentPhase::Plan,
+                to: crate::state::AgentPhase::Execute,
             },
             None,
         );
         log.emit(
-            EventKind::PhaseExited {
-                phase: "plan".into(),
+            EventKind::PhaseTransition {
+                from: crate::state::AgentPhase::Execute,
+                to: crate::state::AgentPhase::Complete,
             },
             None,
         );
@@ -352,8 +458,9 @@ mod tests {
     fn cross_layer_duplicates_finds_overlap() {
         let mut log = EventLog::new();
         log.emit(
-            EventKind::PhaseEntered {
-                phase: "plan".into(),
+            EventKind::PhaseTransition {
+                from: crate::state::AgentPhase::Plan,
+                to: crate::state::AgentPhase::Execute,
             },
             None,
         );
@@ -362,7 +469,7 @@ mod tests {
         let mut store = MockStepStore { events: vec![] };
         store.append(make_step("e1", "s1", Some(&id), &[]));
 
-        let dups = TraceQuery::cross_layer_duplicates(&log, &store);
+        let dups = TraceQuery::cross_layer_duplicates(&log, &store, None);
         assert_eq!(dups.len(), 1);
     }
 
@@ -370,7 +477,121 @@ mod tests {
     fn causal_chain_empty_for_missing_id() {
         let log = EventLog::new();
         let store = MockStepStore { events: vec![] };
-        let chain = TraceQuery::causal_chain(&log, &store, "nonexistent");
+        let chain = TraceQuery::causal_chain(&log, &store, "nonexistent", None);
         assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn filter_by_time_range_inclusive() {
+        let events = vec![
+            UnifiedEvent {
+                canonical_event_id: Some("a".into()),
+                layer_event_id: Some("1".into()),
+                source_layer: "Test",
+                event_kind: "A".into(),
+                timestamp_ms: Some(100),
+                payload: serde_json::Value::Null,
+            },
+            UnifiedEvent {
+                canonical_event_id: Some("b".into()),
+                layer_event_id: Some("2".into()),
+                source_layer: "Test",
+                event_kind: "B".into(),
+                timestamp_ms: Some(200),
+                payload: serde_json::Value::Null,
+            },
+            UnifiedEvent {
+                canonical_event_id: Some("c".into()),
+                layer_event_id: Some("3".into()),
+                source_layer: "Test",
+                event_kind: "C".into(),
+                timestamp_ms: Some(300),
+                payload: serde_json::Value::Null,
+            },
+        ];
+        let filtered = TraceQuery::filter_by_time_range(events, Some(100), Some(200));
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].event_kind, "A");
+        assert_eq!(filtered[1].event_kind, "B");
+    }
+
+    #[test]
+    fn filter_by_event_kind_case_insensitive() {
+        let events = vec![
+            UnifiedEvent {
+                canonical_event_id: None,
+                layer_event_id: None,
+                source_layer: "Test",
+                event_kind: "ToolCallStarted".into(),
+                timestamp_ms: None,
+                payload: serde_json::Value::Null,
+            },
+            UnifiedEvent {
+                canonical_event_id: None,
+                layer_event_id: None,
+                source_layer: "Test",
+                event_kind: "PhaseTransition".into(),
+                timestamp_ms: None,
+                payload: serde_json::Value::Null,
+            },
+        ];
+        let filtered = TraceQuery::filter_by_event_kind(events, "tool");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].event_kind, "ToolCallStarted");
+    }
+
+    #[test]
+    fn filter_by_layer_exact() {
+        let events = vec![
+            UnifiedEvent {
+                canonical_event_id: None,
+                layer_event_id: None,
+                source_layer: "EventLog",
+                event_kind: "A".into(),
+                timestamp_ms: None,
+                payload: serde_json::Value::Null,
+            },
+            UnifiedEvent {
+                canonical_event_id: None,
+                layer_event_id: None,
+                source_layer: "StepRecorder",
+                event_kind: "B".into(),
+                timestamp_ms: None,
+                payload: serde_json::Value::Null,
+            },
+        ];
+        let filtered = TraceQuery::filter_by_layer(events, "StepRecorder");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].event_kind, "B");
+    }
+
+    #[test]
+    fn export_json_includes_metadata() {
+        let events = vec![UnifiedEvent {
+            canonical_event_id: Some("test".into()),
+            layer_event_id: Some("1".into()),
+            source_layer: "EventLog",
+            event_kind: "Test".into(),
+            timestamp_ms: None,
+            payload: serde_json::Value::Null,
+        }];
+        let json = TraceQuery::export_json(&events);
+        assert_eq!(json["total_events"], 1);
+        assert!(json["exported_at"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn export_csv_header_and_rows() {
+        let events = vec![UnifiedEvent {
+            canonical_event_id: Some("id1".into()),
+            layer_event_id: Some("e1".into()),
+            source_layer: "EventLog",
+            event_kind: "Test".into(),
+            timestamp_ms: Some(12345),
+            payload: serde_json::Value::Null,
+        }];
+        let csv = TraceQuery::export_csv(&events);
+        assert!(csv.starts_with("canonical_event_id,"));
+        assert!(csv.contains("id1,e1,EventLog,Test,12345"));
     }
 }

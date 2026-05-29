@@ -74,7 +74,35 @@ fn redact_credentials_for_storage(text: &str) -> (String, usize) {
             }
         })
         .collect();
-    (lines.join("\n"), count)
+    let mut result = lines.join("\n");
+
+    // Inline redaction for JWT tokens (eyJ...), AWS keys (AKIA...), GitHub tokens (ghp_...)
+    let inline_patterns = [
+        ("eyJ", 30, "JWT_TOKEN"),
+        ("AKIA", 20, "AWS_ACCESS_KEY"),
+        ("ghp_", 36, "GITHUB_PAT"),
+        ("gho_", 36, "GITHUB_OAUTH"),
+        ("ghu_", 36, "GITHUB_USER"),
+        ("ghs_", 36, "GITHUB_SERVER"),
+        ("ghr_", 36, "GITHUB_REFRESH"),
+    ];
+    for (prefix, min_len, label) in inline_patterns {
+        while let Some(start) = result.find(prefix) {
+            // Find end: next whitespace or end of string
+            let end = result[start..]
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',')
+                .map(|i| start + i)
+                .unwrap_or(result.len());
+            if end - start >= min_len {
+                result.replace_range(start..end, &format!("[REDACTED_{}]", label));
+                count += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    (result, count)
 }
 
 /// Records chat_stream execution as Step lifecycle events.
@@ -1547,7 +1575,14 @@ mod tests {
 
         let adopted_path = tmp.path().join("sess-adopted").join("step_events.jsonl");
         let persisted = std::fs::read_to_string(adopted_path).unwrap();
-        assert!(persisted.contains("\"step_id\":\"sess-adopted-turn-0-step-0\""));
+        // Decrypt each line (hex-encoded encrypted JSONL)
+        let decrypted: Vec<String> = persisted
+            .lines()
+            .filter_map(|line| crate::step_checkpoint::decrypt_checkpoint(line))
+            .collect();
+        let decrypted_str = decrypted.join("
+");
+        assert!(decrypted_str.contains("\"step_id\":\"sess-adopted-turn-0-step-0\""));
         assert!(
             !tmp.path()
                 .join("ephemeral")

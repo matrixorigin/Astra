@@ -6,6 +6,8 @@
 
 use super::event::{EventKind, EventLog};
 use super::state::{AgentPhase, TurnState};
+use super::trace_retention::RetentionPolicy;
+use super::trace_volume::TraceVolume;
 
 // ─── Stage trait ─────────────────────────────────────────────────────────────
 
@@ -163,6 +165,20 @@ impl ExecutionEngine {
             },
             None,
         );
+
+        // Emit trace volume summary for observability (dim 1 & 4 integration).
+        let volume_summary = TraceVolume::summary(event_log);
+        tracing::debug!(
+            trace_volume = %serde_json::to_string(&volume_summary).unwrap_or_default(),
+            "Turn trace volume summary"
+        );
+
+        // Apply retention cleanup if session is known.
+        if let Some(ref sid) = state.session_id {
+            if RetentionPolicy::default().needs_cleanup(sid) {
+                let _ = RetentionPolicy::default().cleanup(sid);
+            }
+        }
 
         Ok(())
     }

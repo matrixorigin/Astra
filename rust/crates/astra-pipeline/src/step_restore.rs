@@ -535,6 +535,7 @@ mod tests {
         let events = vec![
             StepEvent {
                 event_id: "e1".to_string(),
+                canonical_event_id: None,
                 step_id: "s1".to_string(),
                 event_type: StepEventType::ToolCallStarted,
                 agent_id: None,
@@ -544,6 +545,7 @@ mod tests {
             },
             StepEvent {
                 event_id: "e2".to_string(),
+                canonical_event_id: None,
                 step_id: "s1".to_string(),
                 event_type: StepEventType::ToolCallCompleted,
                 agent_id: None,
@@ -568,6 +570,7 @@ mod tests {
         let events = vec![
             StepEvent {
                 event_id: "e1".to_string(),
+                canonical_event_id: None,
                 step_id: "s1".to_string(),
                 event_type: StepEventType::ToolCallStarted,
                 agent_id: None,
@@ -577,6 +580,7 @@ mod tests {
             },
             StepEvent {
                 event_id: "e2".to_string(),
+                canonical_event_id: None,
                 step_id: "s1".to_string(),
                 event_type: StepEventType::ToolCallFailed,
                 agent_id: None,
@@ -601,6 +605,7 @@ mod tests {
         let events = vec![
             StepEvent {
                 event_id: "e1".to_string(),
+                canonical_event_id: None,
                 step_id: "s1".to_string(),
                 event_type: StepEventType::ToolCallStarted,
                 agent_id: None,
@@ -610,6 +615,7 @@ mod tests {
             },
             StepEvent {
                 event_id: "e2".to_string(),
+                canonical_event_id: None,
                 step_id: "s1".to_string(),
                 event_type: StepEventType::ToolCallStarted,
                 agent_id: None,
@@ -619,6 +625,7 @@ mod tests {
             },
             StepEvent {
                 event_id: "e3".to_string(),
+                canonical_event_id: None,
                 step_id: "s1".to_string(),
                 event_type: StepEventType::ToolCallCompleted,
                 agent_id: None,
@@ -631,6 +638,7 @@ mod tests {
             },
             StepEvent {
                 event_id: "e4".to_string(),
+                canonical_event_id: None,
                 step_id: "s1".to_string(),
                 event_type: StepEventType::ToolCallCompleted,
                 agent_id: None,

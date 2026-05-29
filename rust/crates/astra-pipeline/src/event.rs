@@ -26,6 +26,9 @@ pub use astra_core::{TraceCategory, TraceLevel, TraceVerbosity};
 /// Maximum Unicode scalars kept in [`EventKind::ToolCallOutput`]'s `output_preview`.
 pub const TOOL_OUTPUT_PREVIEW_CHARS: usize = 500;
 
+/// Maximum Unicode scalars in non-verbose mode.
+pub const TOOL_OUTPUT_PREVIEW_CHARS_COMPACT: usize = 200;
+
 /// Clip `s` to at most [`TOOL_OUTPUT_PREVIEW_CHARS`] Unicode scalars,
 /// appending … when the output was longer.
 ///

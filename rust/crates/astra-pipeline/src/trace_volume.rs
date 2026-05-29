@@ -194,7 +194,11 @@ impl TraceVolume {
         step_store_event_count: usize,
         step_store_estimated_bytes: usize,
     ) -> serde_json::Value {
-        let log_bytes: usize = event_log.events().iter().map(|e| e.kind.estimated_bytes()).sum();
+        let log_bytes: usize = event_log
+            .events()
+            .iter()
+            .map(|e| e.kind.estimated_bytes())
+            .sum();
 
         serde_json::json!({
             "event_log": {
@@ -235,46 +239,70 @@ mod tests {
 
     #[test]
     fn projection_scales_with_verbosity() {
-        let mut log = EventLog::new();
+        let mut log = EventLog::with_min_level(TraceLevel::Trace);
         // Info-level events
-        log.emit(EventKind::PhaseTransition {
-            phase: "plan".into(),
-            direction: "enter".into(),
-        }, None);
-        log.emit(EventKind::ToolCallStarted {
-            tool_name: "bash".into(),
-            tool_call_id: "t1".into(),
-        }, None);
+        log.emit(
+            EventKind::PhaseTransition {
+                from: crate::state::AgentPhase::Plan,
+                to: crate::state::AgentPhase::Execute,
+            },
+            None,
+        );
+        log.emit(
+            EventKind::ToolCallStarted {
+                call_id: "t1".into(),
+                tool_name: "bash".into(),
+            },
+            None,
+        );
         // Debug-level (verbose-only)
-        log.emit(EventKind::ThinkingChunk {
-            content: "test".into(),
-        }, None);
-        log.emit(EventKind::PromptAssembled {
-            model: "claude".into(),
-            token_count: 100,
-        }, None);
+        log.emit(
+            EventKind::ThinkingChunk {
+                text: "test".into(),
+            },
+            None,
+        );
+        log.emit(
+            EventKind::PromptAssembled {
+                component_count: 3,
+                estimated_tokens: 100,
+            },
+            None,
+        );
 
         let projections = TraceVolume::project(&log);
 
-        let info = projections.iter().find(|p| p.level == "Info (non-verbose)").unwrap();
+        let info = projections
+            .iter()
+            .find(|p| p.level == "Info (non-verbose)")
+            .unwrap();
         assert_eq!(info.event_count, 2);
         assert_eq!(info.filtered_out, 2);
 
-        let trace = projections.iter().find(|p| p.level == "Trace (all)").unwrap();
+        let trace = projections
+            .iter()
+            .find(|p| p.level == "Trace (all)")
+            .unwrap();
         assert_eq!(trace.event_count, 4);
         assert_eq!(trace.filtered_out, 0);
     }
 
     #[test]
     fn non_verbose_saves_data() {
-        let mut log = EventLog::new();
-        log.emit(EventKind::PhaseTransition {
-            phase: "plan".into(),
-            direction: "enter".into(),
-        }, None);
-        log.emit(EventKind::ThinkingChunk {
-            content: "long thinking...".into(),
-        }, None);
+        let mut log = EventLog::with_min_level(TraceLevel::Trace);
+        log.emit(
+            EventKind::PhaseTransition {
+                from: crate::state::AgentPhase::Plan,
+                to: crate::state::AgentPhase::Execute,
+            },
+            None,
+        );
+        log.emit(
+            EventKind::ThinkingChunk {
+                text: "long thinking...".into(),
+            },
+            None,
+        );
 
         let nv = TraceVolume::non_verbose_estimate(&log);
         assert_eq!(nv["non_verbose_events"], 1);
@@ -284,14 +312,20 @@ mod tests {
     #[test]
     fn summary_includes_categories() {
         let mut log = EventLog::new();
-        log.emit(EventKind::PhaseTransition {
-            phase: "plan".into(),
-            direction: "enter".into(),
-        }, None);
-        log.emit(EventKind::ToolCallStarted {
-            tool_name: "bash".into(),
-            tool_call_id: "t1".into(),
-        }, None);
+        log.emit(
+            EventKind::PhaseTransition {
+                from: crate::state::AgentPhase::Plan,
+                to: crate::state::AgentPhase::Execute,
+            },
+            None,
+        );
+        log.emit(
+            EventKind::ToolCallStarted {
+                call_id: "t1".into(),
+                tool_name: "bash".into(),
+            },
+            None,
+        );
 
         let s = TraceVolume::summary(&log);
         assert_eq!(s["total_events"], 2);

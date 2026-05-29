@@ -25,10 +25,10 @@ impl JournalCrypto {
 
     /// Derive key from env var `ASTRA_JOURNAL_KEY` (hex), or generate from machine-id.
     pub fn from_env_or_machine() -> Self {
-        if let Ok(hex) = std::env::var("ASTRA_JOURNAL_KEY") {
-            if let Some(bytes) = parse_hex_32(&hex) {
-                return Self::new(&bytes);
-            }
+        if let Ok(hex) = std::env::var("ASTRA_JOURNAL_KEY")
+            && let Some(bytes) = parse_hex_32(&hex)
+        {
+            return Self::new(&bytes);
         }
         Self::from_machine_id()
     }
@@ -122,7 +122,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 
 /// Hex-decode a hex string back to bytes. Returns None on odd length or invalid chars.
 pub fn hex_decode(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
@@ -186,8 +186,9 @@ mod tests {
         let crypto = JournalCrypto::new(&key);
 
         let mut encrypted = crypto.encrypt(b"tamper test");
-        if encrypted.len() > 15 {
-            encrypted[encrypted.len() - 1] ^= 1; // flip last byte
+        let enc_len = encrypted.len();
+        if enc_len > 15 {
+            encrypted[enc_len - 1] ^= 1; // flip last byte
         }
         assert!(crypto.decrypt(&encrypted).is_none());
     }
@@ -202,14 +203,18 @@ mod tests {
 
     #[test]
     fn from_env_key_hex() {
-        std::env::set_var(
-            "ASTRA_JOURNAL_KEY",
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        );
+        unsafe {
+            std::env::set_var(
+                "ASTRA_JOURNAL_KEY",
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            );
+        }
         let crypto = JournalCrypto::from_env_or_machine();
         let pt = b"env key test";
         let ct = crypto.encrypt(pt);
         assert_eq!(crypto.decrypt(&ct).unwrap(), pt);
-        std::env::remove_var("ASTRA_JOURNAL_KEY");
+        unsafe {
+            std::env::remove_var("ASTRA_JOURNAL_KEY");
+        }
     }
 }

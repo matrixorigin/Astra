@@ -27,6 +27,8 @@ pub mod step_restore;
 pub use routing::{CalibrationAxis, DomainHint, TaskType, ToolFilter, domain_hint_to_label};
 pub mod tool_health_types;
 pub mod trace_query;
+pub mod trace_retention;
+pub mod trace_usage;
 pub mod trace_volume;
 pub use tool_health_types::{
     TOOL_OUTCOME_RING_CAPACITY, ToolHealthEntry, ToolOutcome, ToolOutcomeCacheEntry,

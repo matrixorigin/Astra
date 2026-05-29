@@ -117,7 +117,15 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
         .expect("step events should persist under adopted session");
 
     assert!(!adopted_events.trim().is_empty());
-    assert!(adopted_events.contains("\"step_id\":\"sess-step-adopt-turn-0-step-0\""));
+
+    // Load events via FileBackedEventStore (handles hex-decode + decrypt)
+    let store = astra_pipeline::step_checkpoint::FileBackedEventStore::new("sess-step-adopt");
+    let events = store.all_events();
+    assert!(
+        events.iter().any(|e| e.step_id == "sess-step-adopt-turn-0-step-0"),
+        "expected step_id sess-step-adopt-turn-0-step-0, found: {:?}",
+        events.iter().map(|e| &e.step_id).collect::<Vec<_>>()
+    );
     assert!(
         !ephemeral_path.exists(),
         "new-session first turn must not persist step events under ephemeral/"
@@ -551,13 +559,11 @@ async fn drain_root_mailbox_into_idle_queue_collects_pending_messages() {
 
     assert_eq!(state.pending_idle_agent_messages.len(), 1);
     assert_eq!(state.pending_idle_agent_messages[0].from.agent_id, "worker");
-    assert!(
-        state
-            .root_mailbox
-            .as_mut()
-            .and_then(|mailbox| mailbox.try_recv())
-            .is_none()
-    );
+    assert!(state
+        .root_mailbox
+        .as_mut()
+        .and_then(|mailbox| mailbox.try_recv())
+        .is_none());
 }
 
 #[tokio::test]

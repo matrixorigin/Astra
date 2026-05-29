@@ -2353,6 +2353,7 @@ mod tests {
             &mut store,
             StepEvent {
                 event_id: "e1".into(),
+                canonical_event_id: None,
                 step_id: "s1".into(),
                 event_type: StepEventType::StepStarted,
                 agent_id: None,
@@ -2370,6 +2371,7 @@ mod tests {
         let mut store = FileBackedEventStore::empty("test-events-for-step");
         store.append(StepEvent {
             event_id: "e1".into(),
+                canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::StepStarted,
             agent_id: None,
@@ -2379,6 +2381,7 @@ mod tests {
         });
         store.append(StepEvent {
             event_id: "e2".into(),
+                canonical_event_id: None,
             step_id: "s2".into(),
             event_type: StepEventType::StepStarted,
             agent_id: None,
@@ -2388,6 +2391,7 @@ mod tests {
         });
         store.append(StepEvent {
             event_id: "e3".into(),
+                canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::StepCompleted,
             agent_id: None,
@@ -2407,6 +2411,7 @@ mod tests {
         let mut store = FileBackedEventStore::empty("test-chain");
         store.append(StepEvent {
             event_id: "e1".into(),
+                canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::StepStarted,
             agent_id: None,
@@ -2416,6 +2421,7 @@ mod tests {
         });
         store.append(StepEvent {
             event_id: "e2".into(),
+                canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::ToolCallStarted,
             agent_id: None,
@@ -2425,6 +2431,7 @@ mod tests {
         });
         store.append(StepEvent {
             event_id: "e3".into(),
+                canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::ToolCallCompleted,
             agent_id: None,
@@ -2448,6 +2455,7 @@ mod tests {
         let mut store = FileBackedEventStore::empty("test-convergence");
         store.append(StepEvent {
             event_id: "start".into(),
+                canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::StepStarted,
             agent_id: None,
@@ -2458,6 +2466,7 @@ mod tests {
         for (i, tool) in ["grep", "read_file", "git_log"].iter().enumerate() {
             store.append(StepEvent {
                 event_id: format!("tool_start_{i}"),
+                canonical_event_id: None,
                 step_id: "s1".into(),
                 event_type: StepEventType::ToolCallStarted,
                 agent_id: None,
@@ -2469,6 +2478,7 @@ mod tests {
         for i in 0..3 {
             store.append(StepEvent {
                 event_id: format!("tool_done_{i}"),
+                canonical_event_id: None,
                 step_id: "s1".into(),
                 event_type: StepEventType::ToolCallCompleted,
                 agent_id: None,
@@ -2479,6 +2489,7 @@ mod tests {
         }
         store.append(StepEvent {
             event_id: "converge".into(),
+                canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::ToolsConverged,
             agent_id: None,

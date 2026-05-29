@@ -35,7 +35,7 @@ const MAX_LIGHT_CHECKPOINTS: usize = 50;
 
 /// Get the step checkpoint directory for a session.
 /// Try to decrypt checkpoint content. Falls back to plain JSON for backward compat.
-fn decrypt_checkpoint(content: &str) -> Option<String> {
+pub(crate) fn decrypt_checkpoint(content: &str) -> Option<String> {
     if content.starts_with('{') {
         // Backward compat: unencrypted JSON
         return Some(content.to_string());
@@ -337,11 +337,11 @@ pub fn read_composite_snapshot_index(
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// File path for step events JSONL.
-fn events_path_for(session_id: &str) -> PathBuf {
+pub(crate) fn events_path_for(session_id: &str) -> PathBuf {
     session_dir_for(session_id).join("step_events.jsonl")
 }
 
-fn session_dir_for(session_id: &str) -> PathBuf {
+pub(crate) fn session_dir_for(session_id: &str) -> PathBuf {
     astra_services::local_session_artifact_store()
         .session_dir(session_id)
         .expect("validated session_id must resolve step session dir")
@@ -729,9 +729,10 @@ mod tests {
         let path = result.unwrap();
         assert!(path.exists());
 
-        // Read back
-        let content = std::fs::read_to_string(&path).unwrap();
-        let restored: StepCheckpoint = serde_json::from_str(&content).unwrap();
+        // Read back (decrypt the hex-encoded encrypted content)
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let json = decrypt_checkpoint(&raw).expect("decrypt checkpoint");
+        let restored: StepCheckpoint = serde_json::from_str(&json).unwrap();
         match restored {
             StepCheckpoint::Light(l) => assert_eq!(l.step_id, "step-write-test"),
             _ => panic!("Expected Light"),
@@ -760,6 +761,7 @@ mod tests {
             agent_id: None,
             caused_by: vec![],
             payload: None,
+            canonical_event_id: None,
             created_at: 1000,
         }
     }
