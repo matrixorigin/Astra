@@ -10,7 +10,7 @@ pub struct ProgressVerifier {
 impl Default for ProgressVerifier {
     fn default() -> Self {
         Self {
-            max_read_only_round_streak: 8,
+            max_read_only_round_streak: 25,
             max_redundant_read_count: 4,
         }
     }
