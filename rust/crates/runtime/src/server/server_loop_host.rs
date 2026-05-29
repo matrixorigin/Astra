@@ -3351,11 +3351,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             parent_run_id,
             parent_turn_seq: state.llm_rounds_completed,
             provider,
-            model_id,
+            model_id: model_id.clone(),
             thinking: astra_turn_core::thinking_config::fork_capture_thinking_slice(
                 &state.thinking,
                 &raw_provider,
-                &self.model_override.clone().unwrap_or_default(),
+                &model_id,
             ),
             system_blocks: vec![],
             tool_schemas,

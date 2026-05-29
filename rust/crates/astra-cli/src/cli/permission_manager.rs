@@ -207,11 +207,11 @@ fn token_matches_any_intent(token: &str, cues: &[&str]) -> bool {
 fn path_token_has_positive_intent(message_tokens: &[&str], path_index: usize) -> bool {
     const POSITIVE_PATH_INTENT_CUES: &[&str] = &[
         "read", "open", "inspect", "analyze", "analyse", "check", "review", "debug", "fix",
-        "repair", "patch", "examine", "load", "scan", "查看", "读取", "读", "打开", "分析", "检查",
+        "repair", "patch", "examine", "load", "scan", "查看", "读取", "打开", "分析", "检查",
         "修复", "处理", "审查", "排查", "看看", "看下",
     ];
     const NEGATIVE_PATH_INTENT_CUES: &[&str] = &[
-        "don't", "dont", "not", "never", "avoid", "skip", "ignore", "禁止", "不要", "别", "勿",
+        "don't", "dont", "not", "never", "avoid", "skip", "ignore", "禁止", "不要",
         "忽略", "跳过",
     ];
 

@@ -89,7 +89,13 @@ fn update_cached_session_start_state_from_events(path: &Path, events: &[JournalE
 }
 
 fn stabilize_event_order(events: &mut [JournalEvent]) {
-    events.sort_by(|left, right| left.ts.cmp(&right.ts));
+    // Stable sort by timestamp, with event_type as tiebreaker for equal timestamps.
+    // This guarantees deterministic ordering regardless of JSONL file layout.
+    events.sort_by(|left, right| {
+        left.ts
+            .cmp(&right.ts)
+            .then_with(|| left.event_type.cmp(&right.event_type))
+    });
     if let Some(first_session_start) = events
         .iter()
         .position(|event| event.event_type == JournalEventType::SessionStart)
@@ -946,7 +952,7 @@ pub struct JournalEvent {
 }
 
 /// Event type discriminator.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Ord, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum JournalEventType {
     /// Session started.
