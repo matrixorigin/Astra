@@ -1,0 +1,27 @@
+name: "Rust CI Setup"
+description: "Checkout, install Rust toolchain + nextest, configure build cache"
+
+inputs:
+  shared-key:
+    description: "Cache shared-key suffix (e.g. ci-test-main, ci-check-main)"
+    required: false
+    default: "ci-test"
+  save-cache:
+    description: "Whether to save cache (true/false)"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/checkout@v4
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - uses: taiki-e/install-action@nextest
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: rust
+        shared-key: ${{ inputs.shared-key }}-${{ github.base_ref || github.ref_name }}
+        save-if: ${{ inputs.save-cache }}

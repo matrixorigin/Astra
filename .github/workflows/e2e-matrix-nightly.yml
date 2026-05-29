@@ -42,12 +42,9 @@ jobs:
           } >> .env
       - name: Start dependencies
         run: make dev-deps-up
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-setup
         with:
-          workspaces: rust
-          shared-key: ci-test
-          save-if: false
+          shared-key: ci-e2e
       - name: Wait for dependencies
         run: make dev-deps-wait
 
