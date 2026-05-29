@@ -186,6 +186,9 @@ pub struct Violation {
     pub severity: Severity,
     pub verifier: String,
     pub message: String,
+    /// Optional tighter threshold to apply after recovery (e.g., reduced read-only streak limit).
+    /// Verifiers set this to signal that recovery should use stricter parameters.
+    pub recovery_threshold: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -201,8 +204,15 @@ pub enum Severity {
 #[derive(Debug)]
 pub enum HookVerdict {
     Continue,
-    Block { reason: String },
-    Pause { reason: String },
+    Block {
+        reason: String,
+    },
+    Pause {
+        reason: String,
+        /// Optional tighter threshold to apply after recovery (e.g., reduced read-only streak limit).
+        /// When present, the runtime should use this instead of resetting to the default threshold.
+        recovery_threshold: Option<u32>,
+    },
 }
 
 // ─── Verifier Trait ─────────────────────────────────────────────────────────

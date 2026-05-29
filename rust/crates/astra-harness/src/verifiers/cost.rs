@@ -47,6 +47,7 @@ impl Verifier for CostVerifier {
                     "session cost ${:.4} exceeds limit ${:.4}",
                     cost, self.max_session_cost_usd
                 ),
+                recovery_threshold: None,
             }]
         } else if cost > self.max_session_cost_usd * 0.8 {
             vec![Violation {
@@ -58,6 +59,7 @@ impl Verifier for CostVerifier {
                     (cost / self.max_session_cost_usd) * 100.0,
                     self.max_session_cost_usd
                 ),
+                recovery_threshold: None,
             }]
         } else {
             vec![]

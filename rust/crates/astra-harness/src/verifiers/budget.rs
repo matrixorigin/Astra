@@ -30,6 +30,7 @@ impl Verifier for BudgetVerifier {
                 severity: Severity::Fatal,
                 verifier: self.name().to_string(),
                 message: format!("turn budget exceeded: {} / {}", snap.turns_used, max),
+                recovery_threshold: None,
             });
         }
 
@@ -43,6 +44,7 @@ impl Verifier for BudgetVerifier {
                     "token budget exceeded: {} / {}",
                     snap.tokens_used_session, max
                 ),
+                recovery_threshold: None,
             });
         }
 
@@ -56,6 +58,7 @@ impl Verifier for BudgetVerifier {
                     "duration budget exceeded: {}ms / {}ms",
                     snap.elapsed_millis, max
                 ),
+                recovery_threshold: None,
             });
         }
 

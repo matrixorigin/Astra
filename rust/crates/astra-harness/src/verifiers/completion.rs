@@ -27,6 +27,7 @@ impl Verifier for CompletionVerifier {
                 message:
                     "terminal snapshot is missing final_state; completion cannot be classified"
                         .into(),
+                recovery_threshold: None,
             });
         }
 
@@ -37,6 +38,7 @@ impl Verifier for CompletionVerifier {
                 message:
                     "completion is marked completed but has no final text; refusing empty success"
                         .into(),
+                recovery_threshold: None,
             });
         }
 
@@ -47,6 +49,7 @@ impl Verifier for CompletionVerifier {
                 message:
                     "run ended with empty final_state; this must be represented as an interruption or explicit failure"
                         .into(),
+            recovery_threshold: None,
             });
         }
 
@@ -55,6 +58,7 @@ impl Verifier for CompletionVerifier {
                 severity: Severity::Error,
                 verifier: self.name().to_string(),
                 message: "run is interrupted but interruption_kind is missing".into(),
+                recovery_threshold: None,
             });
         }
 
@@ -67,6 +71,7 @@ impl Verifier for CompletionVerifier {
                 message: format!(
                     "run ended interrupted by {kind}; do not treat this as normal completion"
                 ),
+                recovery_threshold: None,
             });
         }
 

@@ -39,6 +39,7 @@ impl Verifier for ConfidenceVerifier {
                     "agent appears stuck: {} consecutive errors",
                     snap.consecutive_errors
                 ),
+                recovery_threshold: None,
             });
         }
 
@@ -52,6 +53,7 @@ impl Verifier for ConfidenceVerifier {
                     "low confidence signal: tool stall ({} repeats) with errors ({})",
                     snap.consecutive_same_tool, snap.consecutive_errors
                 ),
+                recovery_threshold: None,
             });
         }
 

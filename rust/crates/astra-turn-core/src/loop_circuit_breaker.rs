@@ -180,6 +180,12 @@ impl LoopCircuitBreaker {
         self.introspect_emissions_since_last_write = 0;
     }
 
+    /// Override the read-only stall threshold (e.g., use a tighter threshold
+    /// after recovery to prevent repeated waste).
+    pub fn set_read_only_threshold(&mut self, threshold: usize) {
+        self.config.read_only_stall_threshold = threshold;
+    }
+
     /// Number of Introspect soft-signals emitted since the last write (mutation).
     pub fn introspect_emissions(&self) -> usize {
         self.introspect_emissions_since_last_write

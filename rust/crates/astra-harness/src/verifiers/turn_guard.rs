@@ -38,6 +38,7 @@ impl Verifier for TurnGuardVerifierAdapter {
                      (fatal threshold: {})",
                     self.fatal_threshold
                 ),
+                recovery_threshold: None,
             }]
         } else if streak >= self.warn_threshold {
             vec![Violation {
@@ -48,6 +49,7 @@ impl Verifier for TurnGuardVerifierAdapter {
                      (warn threshold: {})",
                     self.warn_threshold
                 ),
+                recovery_threshold: None,
             }]
         } else {
             vec![]

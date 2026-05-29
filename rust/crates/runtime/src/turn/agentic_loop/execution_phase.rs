@@ -772,7 +772,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 super::host::AgenticLoopOutcome::Completed,
             ));
         }
-        astra_harness::HookVerdict::Pause { reason } => {
+        astra_harness::HookVerdict::Pause { reason, .. } => {
             tracing::info!(reason = %reason, "harness paused LLM call at PreLlmRequest");
             super::host::set_harness_interruption(
                 state,

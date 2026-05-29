@@ -32,6 +32,7 @@ impl Verifier for ToolGuardVerifier {
                 severity: Severity::Warning,
                 verifier: self.name().to_string(),
                 message: format!("sensitive tool invoked: {last_tool}"),
+                recovery_threshold: None,
             });
         }
 
@@ -45,6 +46,7 @@ impl Verifier for ToolGuardVerifier {
                     "session tool call limit exceeded: {} / {}",
                     snap.tool_calls_this_session, max
                 ),
+                recovery_threshold: None,
             });
         }
 

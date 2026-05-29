@@ -84,7 +84,7 @@ impl HarnessKernel for StandardKernel {
     fn on_record(&self, record: &DecisionRecord) -> HookVerdict {
         self.sink.update(record);
 
-        let mut first_pause: Option<String> = None;
+        let mut first_pause: Option<(String, Option<u32>)> = None;
 
         for v in &self.verifiers {
             if !v.trigger_points().contains(&record.point) {
@@ -127,14 +127,20 @@ impl HarnessKernel for StandardKernel {
                         };
                     }
                     Severity::Pause if first_pause.is_none() => {
-                        first_pause = Some(format!("[{}] {}", v.name(), violation.message));
+                        first_pause = Some((
+                            format!("[{}] {}", v.name(), violation.message),
+                            violation.recovery_threshold,
+                        ));
                     }
                     Severity::Pause | Severity::Error | Severity::Warning => {}
                 }
             }
         }
-        if let Some(reason) = first_pause {
-            return HookVerdict::Pause { reason };
+        if let Some((reason, recovery_threshold)) = first_pause {
+            return HookVerdict::Pause {
+                reason,
+                recovery_threshold,
+            };
         }
         HookVerdict::Continue
     }
@@ -202,15 +208,18 @@ mod tests {
             vec![Box::new(ProgressVerifier {
                 max_read_only_round_streak: 2,
                 max_redundant_read_count: 10,
+                recovery_read_only_round_streak: 1,
+                min_redundant_reads_for_pause: 2,
             })],
         );
 
         let mut record = make_record(HookPoint::PostTurn, 1, 0);
         record.snapshot.final_state = Some("empty".into());
         record.snapshot.read_only_round_streak = 2;
+        record.snapshot.redundant_read_count = 2;
 
         match kernel.on_record(&record) {
-            HookVerdict::Pause { reason } => {
+            HookVerdict::Pause { reason, .. } => {
                 assert!(reason.contains("decision checkpoint"));
             }
             other => panic!("expected pause verdict, got {other:?}"),

@@ -95,6 +95,7 @@ impl HarnessKernel for DebugKernel {
                     }
                     return HookVerdict::Pause {
                         reason: format!("breakpoint hit: {}", bp.description()),
+                        recovery_threshold: None,
                     };
                 }
             }
@@ -244,7 +245,7 @@ mod tests {
 
         let verdict = kernel.on_record(&make_record(1, HookPoint::PostTurn, 1000));
         match verdict {
-            HookVerdict::Pause { reason } => assert!(reason.contains("turn == 1")),
+            HookVerdict::Pause { reason, .. } => assert!(reason.contains("turn == 1")),
             _ => panic!("expected Pause"),
         }
         assert_eq!(kernel.hit_count(), 1);

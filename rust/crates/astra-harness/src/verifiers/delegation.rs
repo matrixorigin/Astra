@@ -36,6 +36,7 @@ impl Verifier for DelegationVerifier {
                     "delegation loop detected: {} delegations this turn (limit: {})",
                     snap.delegations_this_turn, self.max_delegations_per_turn
                 ),
+                recovery_threshold: None,
             });
         }
 
@@ -47,6 +48,7 @@ impl Verifier for DelegationVerifier {
                     "recursion depth {} exceeds limit {}",
                     snap.recursion_depth, self.max_recursion_depth
                 ),
+                recovery_threshold: None,
             });
         }
 
