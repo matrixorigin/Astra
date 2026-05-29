@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 
 fn journal_crypto() -> &'static JournalCrypto {
     static CRYPTO: OnceLock<JournalCrypto> = OnceLock::new();
-    CRYPTO.get_or_init(JournalCrypto::from_env_or_machine)
+    CRYPTO.get_or_init(JournalCrypto::from_env_or_local_key)
 }
 
 /// Directory name within session workspace for step checkpoints.
@@ -41,8 +41,69 @@ pub(crate) fn decrypt_checkpoint(content: &str) -> Option<String> {
         return Some(content.to_string());
     }
     let bytes = hex_decode(content.trim())?;
-    let decrypted = journal_crypto().decrypt(&bytes)?;
+    let decrypted = journal_crypto().decrypt_with_legacy_support(&bytes)?;
     String::from_utf8(decrypted).ok()
+}
+
+fn encrypt_checkpoint(content: &str) -> String {
+    let encrypted = journal_crypto().encrypt(content.as_bytes());
+    hex_encode(&encrypted)
+}
+
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)?.sync_all()
+}
+
+fn write_atomic_encrypted_text(path: &Path, content: &str) -> std::io::Result<()> {
+    let Some(dir) = path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "encrypted artifact path must have a parent directory",
+        ));
+    };
+    std::fs::create_dir_all(dir)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid file name")
+        })?;
+    let tmp_path = dir.join(format!(".tmp-{file_name}"));
+    let encrypted = encrypt_checkpoint(content);
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(encrypted.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, path)?;
+    sync_parent_dir(path)
+}
+
+fn append_encrypted_line(path: &Path, content: &str) -> std::io::Result<()> {
+    let Some(dir) = path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "encrypted artifact path must have a parent directory",
+        ));
+    };
+    std::fs::create_dir_all(dir)?;
+    let existed = path.exists();
+    let encrypted = encrypt_checkpoint(content);
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{encrypted}")?;
+    file.sync_data()?;
+    if !existed {
+        sync_parent_dir(path)?;
+    }
+    Ok(())
 }
 
 fn checkpoint_dir_for(session_id: &str) -> PathBuf {
@@ -71,17 +132,7 @@ pub fn write_step_checkpoint(
     let json = serde_json::to_string(checkpoint)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    // Atomic write: write to temp file, fsync, then rename
-    let tmp_path = dir.join(format!(".tmp-{}", filename));
-    {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&tmp_path)?;
-        let encrypted = journal_crypto().encrypt(json.as_bytes());
-        let hex_str = hex_encode(&encrypted);
-        file.write_all(hex_str.as_bytes())?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, &path)?;
+    write_atomic_encrypted_text(&path, &json)?;
 
     // Prune old light checkpoints if too many
     if tier == "light" {
@@ -308,10 +359,7 @@ pub fn write_composite_snapshot_index(
     let path = dir.join("composite_snapshots.json");
     let json = serde_json::to_string_pretty(index)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let tmp = dir.join(".composite_snapshots.json.tmp");
-    std::fs::write(&tmp, &json)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    write_atomic_encrypted_text(&path, &json)
 }
 
 /// Read the composite snapshot index from disk.
@@ -323,8 +371,9 @@ pub fn read_composite_snapshot_index(
         return Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default());
     }
     let content = std::fs::read_to_string(&path)?;
+    let decrypted = decrypt_checkpoint(&content).unwrap_or(content);
     let mut index: astra_core::composite_snapshot::CompositeSnapshotIndex =
-        serde_json::from_str(&content)
+        serde_json::from_str(&decrypted)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     index.normalize_versions();
     Ok(index)
@@ -399,15 +448,7 @@ impl FileBackedEventStore {
         let path = events_path_for(&self.session_id);
         let json = serde_json::to_string(event)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let encrypted = journal_crypto().encrypt(json.as_bytes());
-        let hex_str = hex_encode(&encrypted);
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        writeln!(file, "{}", hex_str)?;
-        Ok(())
+        append_encrypted_line(&path, &json)
     }
 
     /// Get all events (for audit/replay).
@@ -738,6 +779,28 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn composite_snapshot_index_is_encrypted_at_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = "test-composite-snapshot-index";
+
+        let index = astra_core::composite_snapshot::CompositeSnapshotIndex::default();
+        write_composite_snapshot_index(session_id, &index).unwrap();
+
+        let raw = std::fs::read_to_string(
+            checkpoint_dir_for(session_id).join("composite_snapshots.json"),
+        )
+        .unwrap();
+        assert!(
+            !raw.trim_start().starts_with('{'),
+            "composite snapshot index should be encrypted at rest"
+        );
+
+        let restored = read_composite_snapshot_index(session_id).unwrap();
+        assert!(restored.snapshots.is_empty());
     }
 
     #[test]

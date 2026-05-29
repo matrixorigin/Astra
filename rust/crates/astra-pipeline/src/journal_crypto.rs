@@ -1,13 +1,22 @@
-//! Journal at-rest encryption for Edge mode.
+//! Journal at-rest encryption for local trace/session artifacts.
 //!
 //! Wraps file I/O with AES-256-GCM encryption via the `ring` crate.
-//! Key is derived from `ASTRA_JOURNAL_KEY` env var or auto-generated
-//! from the machine-id, ensuring journal files on disk are encrypted.
+//! The active key comes from `ASTRA_JOURNAL_KEY` (hex) or a locally persisted
+//! random secret under the session-artifact root. Legacy machine-id-derived
+//! ciphertext remains readable on a best-effort basis during migration, but
+//! new writes never derive keys from public host identity.
 
+use astra_services::SessionArtifactStore;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const NONCE_LEN: usize = 12; // AES-256-GCM uses 96-bit (12-byte) nonces
+const KEY_LEN: usize = 32;
+const JOURNAL_KEY_ENV: &str = "ASTRA_JOURNAL_KEY";
+const JOURNAL_KEY_FILE: &str = ".journal.key";
 
 /// Encryption context for journal files.
 pub struct JournalCrypto {
@@ -23,26 +32,21 @@ impl JournalCrypto {
         }
     }
 
-    /// Derive key from env var `ASTRA_JOURNAL_KEY` (hex), or generate from machine-id.
-    pub fn from_env_or_machine() -> Self {
-        if let Ok(hex) = std::env::var("ASTRA_JOURNAL_KEY")
-            && let Some(bytes) = parse_hex_32(&hex)
-        {
+    /// Load from `ASTRA_JOURNAL_KEY` (hex) or a locally persisted random key.
+    pub fn from_env_or_local_key() -> Self {
+        if let Ok(hex) = std::env::var(JOURNAL_KEY_ENV) {
+            let trimmed = hex.trim();
+            let bytes = parse_hex_32(trimmed)
+                .unwrap_or_else(|| panic!("{JOURNAL_KEY_ENV} must be exactly 64 hex characters"));
             return Self::new(&bytes);
         }
-        Self::from_machine_id()
-    }
-
-    fn from_machine_id() -> Self {
-        use sha2::{Digest, Sha256};
-        let machine_id = machine_identity();
-        let mut hasher = Sha256::new();
-        hasher.update(b"astra-journal-v1:");
-        hasher.update(machine_id.as_bytes());
-        let hash = hasher.finalize();
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&hash);
-        Self::new(&key)
+        let bytes = load_or_create_local_key_bytes().unwrap_or_else(|err| {
+            panic!(
+                "failed to load or create journal key {}: {err}",
+                local_key_path().display()
+            )
+        });
+        Self::new(&bytes)
     }
 
     pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
@@ -73,13 +77,17 @@ impl JournalCrypto {
         let nonce = Nonce::assume_unique_for_key(nonce_bytes.try_into().ok()?);
 
         let mut in_out = ciphertext.to_vec();
-        self.key
+        let plaintext = self
+            .key
             .open_in_place(nonce, Aad::empty(), &mut in_out)
             .ok()?;
+        Some(plaintext.to_vec())
+    }
 
-        // Remove the appended tag
-        in_out.truncate(in_out.len().saturating_sub(16));
-        Some(in_out)
+    /// Decrypt with a best-effort legacy machine-id fallback for pre-rotation data.
+    pub fn decrypt_with_legacy_support(&self, encrypted: &[u8]) -> Option<Vec<u8>> {
+        self.decrypt(encrypted)
+            .or_else(|| legacy_machine_crypto().and_then(|legacy| legacy.decrypt(encrypted)))
     }
 }
 
@@ -134,21 +142,105 @@ pub fn hex_decode(hex: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Best-effort machine identity for deterministic key derivation.
-fn machine_identity() -> String {
-    // Try /etc/machine-id (Linux/systemd)
-    if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
-        return id.trim().to_string();
+fn load_or_create_local_key_bytes() -> io::Result<[u8; KEY_LEN]> {
+    let path = local_key_path();
+    match read_key_file(&path)? {
+        Some(bytes) => Ok(bytes),
+        None => create_key_file(&path),
     }
-    // Try /var/lib/dbus/machine-id (alternative Linux)
-    if let Ok(id) = std::fs::read_to_string("/var/lib/dbus/machine-id") {
-        return id.trim().to_string();
+}
+
+fn read_key_file(path: &Path) -> io::Result<Option<[u8; KEY_LEN]>> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let trimmed = content.trim();
+    let bytes = parse_hex_32(trimmed).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid hex in journal key file {}", path.display()),
+        )
+    })?;
+    Ok(Some(bytes))
+}
+
+fn create_key_file(path: &Path) -> io::Result<[u8; KEY_LEN]> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    // Fallback: hostname
-    if let Ok(host) = std::process::Command::new("hostname").output() {
-        return String::from_utf8_lossy(&host.stdout).trim().to_string();
+
+    let mut key = [0u8; KEY_LEN];
+    SystemRandom::new()
+        .fill(&mut key)
+        .map_err(|_| io::Error::other("system random unavailable"))?;
+
+    let encoded = format!("{}\n", hex_encode(&key));
+    #[cfg(unix)]
+    let file_result = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let file_result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path);
+
+    match file_result {
+        Ok(mut file) => {
+            file.write_all(encoded.as_bytes())?;
+            file.sync_all()?;
+            sync_parent_dir(path)?;
+            Ok(key)
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => read_key_file(path)?
+            .ok_or_else(|| io::Error::other("journal key file disappeared after creation race")),
+        Err(err) => Err(err),
     }
-    "astra-default-key-00000000".to_string()
+}
+
+fn local_key_path() -> PathBuf {
+    let sessions_root = astra_services::local_session_artifact_store().sessions_root();
+    sessions_root.join(JOURNAL_KEY_FILE)
+}
+
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)?.sync_all()
+}
+
+fn legacy_machine_crypto() -> Option<&'static JournalCrypto> {
+    static LEGACY: OnceLock<Option<JournalCrypto>> = OnceLock::new();
+    LEGACY
+        .get_or_init(|| legacy_machine_key().map(|bytes| JournalCrypto::new(&bytes)))
+        .as_ref()
+}
+
+fn legacy_machine_key() -> Option<[u8; KEY_LEN]> {
+    use sha2::{Digest, Sha256};
+
+    let machine_id = std::fs::read_to_string("/etc/machine-id")
+        .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
+        .ok()?;
+    let trimmed = machine_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"astra-journal-v1:");
+    hasher.update(trimmed.as_bytes());
+    let hash = hasher.finalize();
+    let mut key = [0u8; KEY_LEN];
+    key.copy_from_slice(&hash);
+    Some(key)
 }
 
 #[cfg(test)]
@@ -205,16 +297,51 @@ mod tests {
     fn from_env_key_hex() {
         unsafe {
             std::env::set_var(
-                "ASTRA_JOURNAL_KEY",
+                JOURNAL_KEY_ENV,
                 "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
             );
         }
-        let crypto = JournalCrypto::from_env_or_machine();
+        let crypto = JournalCrypto::from_env_or_local_key();
         let pt = b"env key test";
         let ct = crypto.encrypt(pt);
         assert_eq!(crypto.decrypt(&ct).unwrap(), pt);
         unsafe {
-            std::env::remove_var("ASTRA_JOURNAL_KEY");
+            std::env::remove_var(JOURNAL_KEY_ENV);
         }
+    }
+
+    #[test]
+    fn local_key_file_round_trips_and_is_reused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_root = tmp.path().join("sessions");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+
+        unsafe {
+            std::env::remove_var(JOURNAL_KEY_ENV);
+        }
+
+        let crypto = JournalCrypto::from_env_or_local_key();
+        let encrypted = crypto.encrypt(b"persisted key");
+        assert_eq!(crypto.decrypt(&encrypted).unwrap(), b"persisted key");
+
+        let key_path = sessions_root.join(JOURNAL_KEY_FILE);
+        assert!(key_path.exists(), "local key file should be created");
+
+        let crypto_reloaded = JournalCrypto::from_env_or_local_key();
+        assert_eq!(
+            crypto_reloaded.decrypt(&encrypted).unwrap(),
+            b"persisted key",
+            "reloaded crypto should reuse the same local key"
+        );
+    }
+
+    #[test]
+    fn decrypt_preserves_full_plaintext_length() {
+        let mut key = [0u8; KEY_LEN];
+        SystemRandom::new().fill(&mut key).unwrap();
+        let crypto = JournalCrypto::new(&key);
+        let plaintext = b"0123456789abcdef-tail";
+        let encrypted = crypto.encrypt(plaintext);
+        assert_eq!(crypto.decrypt(&encrypted).unwrap(), plaintext);
     }
 }

@@ -11,6 +11,22 @@
 use crate::event::{EventLog, TurnEvent};
 use crate::step_protocol::{StepEvent, StepEventStore};
 
+fn collect_step_events<'a>(step_store: &'a dyn StepEventStore) -> Vec<&'a StepEvent> {
+    let mut seen = std::collections::HashSet::new();
+    let mut events = Vec::new();
+    for leaf in step_store.leaves() {
+        if seen.insert(leaf.event_id.clone()) {
+            events.push(leaf);
+        }
+        for ancestor in step_store.ancestors(&leaf.event_id) {
+            if seen.insert(ancestor.event_id.clone()) {
+                events.push(ancestor);
+            }
+        }
+    }
+    events
+}
+
 /// Normalized event from any storage layer.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UnifiedEvent {
@@ -39,6 +55,7 @@ impl TraceQuery {
     ) -> Vec<UnifiedEvent> {
         let max = limit.unwrap_or(DEFAULT_QUERY_LIMIT);
         let mut results = Vec::with_capacity(max.min(64));
+        let step_events = collect_step_events(step_store);
 
         // Layer 1: EventLog — canonical_event_id is Uuid
         for event in event_log.events() {
@@ -50,25 +67,13 @@ impl TraceQuery {
             }
         }
 
-        // Layer 2: StepRecorder — search from leaves + ancestors
-        for leaf in step_store.leaves() {
+        // Layer 2: StepRecorder — traverse the DAG once, then filter.
+        for event in step_events {
             if results.len() >= max {
                 return results;
             }
-            if leaf.canonical_event_id.as_deref() == Some(canonical_id) {
-                results.push(step_to_unified(leaf, "StepRecorder"));
-            }
-            for a in step_store.ancestors(&leaf.event_id) {
-                if results.len() >= max {
-                    return results;
-                }
-                if a.canonical_event_id.as_deref() == Some(canonical_id)
-                    && !results
-                        .iter()
-                        .any(|r| r.layer_event_id.as_deref() == Some(&a.event_id))
-                {
-                    results.push(step_to_unified(a, "StepRecorder"));
-                }
+            if event.canonical_event_id.as_deref() == Some(canonical_id) {
+                results.push(step_to_unified(event, "StepRecorder"));
             }
         }
 
@@ -96,14 +101,9 @@ impl TraceQuery {
         // Build StepRecorder lookup from leaves + ancestors
         let mut step_by_canonical: std::collections::HashMap<String, &StepEvent> =
             std::collections::HashMap::new();
-        for leaf in step_store.leaves() {
-            if let Some(ref id) = leaf.canonical_event_id {
-                step_by_canonical.entry(id.clone()).or_insert(leaf);
-            }
-            for a in step_store.ancestors(&leaf.event_id) {
-                if let Some(ref id) = a.canonical_event_id {
-                    step_by_canonical.entry(id.clone()).or_insert(a);
-                }
+        for event in collect_step_events(step_store) {
+            if let Some(ref id) = event.canonical_event_id {
+                step_by_canonical.entry(id.clone()).or_insert(event);
             }
         }
 
@@ -168,18 +168,7 @@ impl TraceQuery {
         event_log: &EventLog,
         step_store: &dyn StepEventStore,
     ) -> serde_json::Value {
-        let mut seen_ids = std::collections::HashSet::new();
-        let mut step_count = 0usize;
-        for leaf in step_store.leaves() {
-            if seen_ids.insert(leaf.event_id.clone()) {
-                step_count += 1;
-            }
-            for a in step_store.ancestors(&leaf.event_id) {
-                if seen_ids.insert(a.event_id.clone()) {
-                    step_count += 1;
-                }
-            }
-        }
+        let step_count = collect_step_events(step_store).len();
         serde_json::json!({
             "event_log": event_log.len(),
             "step_recorder": step_count,
@@ -197,14 +186,9 @@ impl TraceQuery {
         let mut duplicates = Vec::with_capacity(max.min(64));
 
         let mut step_ids = std::collections::HashSet::new();
-        for leaf in step_store.leaves() {
-            if let Some(ref id) = leaf.canonical_event_id {
+        for event in collect_step_events(step_store) {
+            if let Some(ref id) = event.canonical_event_id {
                 step_ids.insert(id.clone());
-            }
-            for a in step_store.ancestors(&leaf.event_id) {
-                if let Some(ref id) = a.canonical_event_id {
-                    step_ids.insert(id.clone());
-                }
             }
         }
 

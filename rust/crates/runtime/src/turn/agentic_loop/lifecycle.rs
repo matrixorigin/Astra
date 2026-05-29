@@ -2028,7 +2028,9 @@ mod tests {
             state.tool_results[0]["result"]
                 .as_str()
                 .is_some_and(|content| {
-                    content.contains("only these non-skill tools are callable: read_file")
+                    content.contains(
+                        "only these allowlist-governed non-skill tools are callable: read_file",
+                    )
                 })
         );
         assert!(state.messages.iter().any(|msg| {

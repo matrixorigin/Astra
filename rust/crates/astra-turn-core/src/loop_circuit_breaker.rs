@@ -173,9 +173,24 @@ impl LoopCircuitBreaker {
         self.consecutive_read_only
     }
 
-    /// Reset the read-only streak counter, giving the model a fresh start
-    /// after a harness checkpoint injection.
-    pub fn reset_read_only_streak(&mut self) {
+    /// Apply a harness-pause recovery action.
+    ///
+    /// A recovery checkpoint may optionally tighten the read-only threshold
+    /// for the next streak. Invalid thresholds are rejected and return `false`.
+    /// Successful recovery always resets the current read-only streak budget.
+    pub fn apply_pause_recovery(&mut self, tighter_threshold: Option<usize>) -> bool {
+        if let Some(tighter_threshold) = tighter_threshold {
+            let current = self.config.read_only_stall_threshold;
+            if tighter_threshold == 0 || tighter_threshold >= current {
+                return false;
+            }
+            self.config.read_only_stall_threshold = tighter_threshold;
+        }
+        self.reset_read_only_streak();
+        true
+    }
+
+    fn reset_read_only_streak(&mut self) {
         self.consecutive_read_only = 0;
         self.introspect_emissions_since_last_write = 0;
     }

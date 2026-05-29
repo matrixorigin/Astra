@@ -299,6 +299,7 @@ dependencies = [
 name = "astra-harness"
 version = "0.1.0"
 dependencies = [
+ "astra-turn-core",
  "serde",
  "serde_json",
  "tracing",

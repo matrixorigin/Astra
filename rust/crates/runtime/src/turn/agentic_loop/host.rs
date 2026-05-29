@@ -1569,22 +1569,15 @@ fn apply_harness_pause_recovery_threshold(
     state: &mut AgenticLoopState,
     recovery_threshold: Option<u32>,
 ) {
-    let Some(tighter) = recovery_threshold else {
-        state.stall.circuit_breaker.reset_read_only_streak();
-        return;
-    };
-
-    let tighter = tighter as usize;
     let current = state.stall.circuit_breaker.read_only_threshold();
-    if tighter > 0 && tighter < current {
-        state.stall.circuit_breaker.set_read_only_threshold(tighter);
-    } else {
+    let tighter = recovery_threshold.map(|value| value as usize);
+    if !state.stall.circuit_breaker.apply_pause_recovery(tighter) {
         tracing::warn!(
-            proposed_threshold = tighter,
+            proposed_threshold = tighter.unwrap_or(0),
             current_threshold = current,
             "ignoring invalid harness recovery threshold"
         );
-        state.stall.circuit_breaker.reset_read_only_streak();
+        let _ = state.stall.circuit_breaker.apply_pause_recovery(None);
     }
 }
 

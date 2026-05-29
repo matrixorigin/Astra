@@ -5,10 +5,11 @@
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use astra_pipeline::journal_crypto::{JournalCrypto, hex_decode, hex_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -35,6 +36,7 @@ pub const MSG_TOOL_LEDGER_TIMEOUT: &str =
 const BACKOFF_BASE_MS: u64 = 50;
 const BACKOFF_CAP_MS: u64 = 2_000;
 const BACKOFF_MULTIPLIER: u64 = 2;
+const LEDGER_COMPACT_BYTES_THRESHOLD: u64 = 256 * 1024;
 
 /// Compute next poll interval with exponential backoff.
 /// Starts at `BACKOFF_BASE_MS`, doubles each retry, caps at `BACKOFF_CAP_MS`.
@@ -43,6 +45,29 @@ fn backoff_delay(retry_count: u32) -> Duration {
         .saturating_mul(BACKOFF_MULTIPLIER.saturating_pow(retry_count))
         .min(BACKOFF_CAP_MS);
     Duration::from_millis(ms)
+}
+
+fn ledger_crypto() -> &'static JournalCrypto {
+    static CRYPTO: OnceLock<JournalCrypto> = OnceLock::new();
+    CRYPTO.get_or_init(JournalCrypto::from_env_or_local_key)
+}
+
+fn encrypt_persisted_ledger_line(line: &str) -> String {
+    let encrypted = ledger_crypto().encrypt(line.as_bytes());
+    hex_encode(&encrypted)
+}
+
+fn decrypt_persisted_ledger_line(line: &str) -> Option<String> {
+    if line.starts_with('{') {
+        return Some(line.to_string());
+    }
+    let bytes = hex_decode(line.trim())?;
+    let decrypted = ledger_crypto().decrypt_with_legacy_support(&bytes)?;
+    String::from_utf8(decrypted).ok()
+}
+
+fn sync_parent_dir(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// Metadata tracked alongside each ledger entry for retry and expiry.
@@ -92,6 +117,21 @@ fn ledger_meta() -> &'static StdMutex<HashMap<String, LedgerEntryMeta>> {
     static META: std::sync::OnceLock<StdMutex<HashMap<String, LedgerEntryMeta>>> =
         std::sync::OnceLock::new();
     META.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn prune_ledger_meta(meta: &mut HashMap<String, LedgerEntryMeta>) {
+    if meta.len() <= LEDGER_MAX_ENTRIES {
+        return;
+    }
+    let remove_count = meta.len() - LEDGER_MAX_ENTRIES;
+    let mut victims: Vec<_> = meta
+        .iter()
+        .map(|(key, entry)| (key.clone(), entry.last_poll_at_ms, entry.created_at_ms))
+        .collect();
+    victims.sort_by_key(|(_, last_poll_at_ms, created_at_ms)| (*last_poll_at_ms, *created_at_ms));
+    for (key, _, _) in victims.into_iter().take(remove_count) {
+        meta.remove(&key);
+    }
 }
 
 /// Side-channel of "first-observed" timestamps for the ledger. We cannot
@@ -195,6 +235,7 @@ pub fn on_ledger_insert(key: &str) {
     if let Ok(mut meta) = ledger_meta().lock() {
         meta.entry(key.to_string())
             .or_insert_with(LedgerEntryMeta::now);
+        prune_ledger_meta(&mut meta);
     }
     // Persist if configured.
     if let Some(p) = ledger_persistence() {
@@ -226,6 +267,9 @@ impl LedgerPersistence {
 
     /// Append an operation line to the JSONL journal.
     fn write_op(&self, op: &str, key: &str) -> io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let path = self.file_path();
+        let existed = path.exists();
         let line = serde_json::json!({
             "op": op,
             "key": key,
@@ -234,13 +278,42 @@ impl LedgerPersistence {
                 .unwrap_or_default()
                 .as_millis() as u64,
         });
+        let encrypted = encrypt_persisted_ledger_line(&line.to_string());
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&path)?
+        };
+        #[cfg(not(unix))]
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(self.file_path())?;
-        writeln!(file, "{line}")?;
+            .open(&path)?;
+        writeln!(file, "{encrypted}")?;
         file.sync_data()?;
+        drop(file);
+        if !existed {
+            sync_parent_dir(&self.dir)?;
+        }
+        self.maybe_compact(op)?;
         Ok(())
+    }
+
+    fn maybe_compact(&self, op: &str) -> io::Result<()> {
+        if op != "remove" {
+            return Ok(());
+        }
+        let path = self.file_path();
+        let len = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if len < LEDGER_COMPACT_BYTES_THRESHOLD {
+            return Ok(());
+        }
+        let active = self.recover()?;
+        self.compact(&active)
     }
 
     /// Read all insert/remove operations and build a recovered ledger.
@@ -251,13 +324,15 @@ impl LedgerPersistence {
             return Ok(Vec::new());
         }
         let file = std::fs::File::open(&path)?;
-        let mut recovered: Vec<String> = Vec::new();
+        let mut active = std::collections::HashSet::new();
+        let mut order = Vec::new();
         for line in io::BufReader::new(file).lines() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+            let json = decrypt_persisted_ledger_line(&line).unwrap_or(line);
+            let entry: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
             let Some(op) = entry.get("op").and_then(|v| v.as_str()) else {
                 continue;
             };
@@ -265,21 +340,48 @@ impl LedgerPersistence {
                 continue;
             };
             match op {
-                "insert" => recovered.push(key.to_string()),
+                "insert" => {
+                    active.insert(key.to_string());
+                    order.push(key.to_string());
+                }
                 "remove" => {
-                    recovered.retain(|k| k != key);
+                    active.remove(key);
                 }
                 _ => {}
             }
         }
+        let mut recovered = Vec::with_capacity(active.len());
+        let mut seen = std::collections::HashSet::with_capacity(active.len());
+        for key in order.into_iter().rev() {
+            if active.contains(&key) && seen.insert(key.clone()) {
+                recovered.push(key);
+            }
+        }
+        recovered.reverse();
         Ok(recovered)
     }
 
     /// Compact the journal: rewrite with only active (non-removed) entries.
     pub fn compact(&self, active_keys: &[String]) -> io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
         let path = self.file_path();
         let tmp = path.with_extension("jsonl.tmp");
-        let mut file = std::fs::File::create(&tmp)?;
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
         for key in active_keys {
             let line = serde_json::json!({
                 "op": "insert",
@@ -289,11 +391,13 @@ impl LedgerPersistence {
                     .unwrap_or_default()
                     .as_millis() as u64,
             });
-            writeln!(file, "{line}")?;
+            let encrypted = encrypt_persisted_ledger_line(&line.to_string());
+            writeln!(file, "{encrypted}")?;
         }
-        file.sync_data()?;
+        file.sync_all()?;
+        drop(file);
         std::fs::rename(&tmp, &path)?;
-        Ok(())
+        sync_parent_dir(&self.dir)
     }
 }
 
@@ -332,6 +436,7 @@ pub async fn take_ledger_entry(
                 meta.entry(key.to_string())
                     .or_insert_with(LedgerEntryMeta::now)
                     .record_poll();
+                prune_ledger_meta(&mut meta);
             }
         }
         {
@@ -1765,8 +1870,50 @@ mod tests {
         let persisted = std::fs::read_to_string(tmp.path().join("edge_ledger.jsonl")).unwrap();
         let lines: Vec<_> = persisted.lines().collect();
         assert_eq!(lines.len(), 1, "compact must rewrite a single active entry");
-        assert!(lines[0].contains("\"key\":\"keep\""));
+        assert!(
+            !lines[0].contains("\"key\":\"keep\""),
+            "persisted ledger lines should be encrypted at rest"
+        );
         assert_eq!(persistence.recover().unwrap(), vec!["keep".to_string()]);
+    }
+
+    #[test]
+    fn ledger_persistence_encrypts_raw_journal_lines() {
+        let tmp = tempdir().unwrap();
+        let persistence = LedgerPersistence::new(tmp.path().to_path_buf());
+
+        persistence.write_op("insert", "secret-key").unwrap();
+
+        let raw = std::fs::read_to_string(tmp.path().join("edge_ledger.jsonl")).unwrap();
+        assert!(
+            !raw.contains("secret-key"),
+            "raw persisted ledger should not expose callback keys"
+        );
+        assert_eq!(
+            persistence.recover().unwrap(),
+            vec!["secret-key".to_string()]
+        );
+    }
+
+    #[test]
+    fn prune_ledger_meta_caps_side_table_growth() {
+        let mut meta = HashMap::new();
+        for index in 0..(LEDGER_MAX_ENTRIES + 8) {
+            meta.insert(
+                format!("k-{index}"),
+                LedgerEntryMeta {
+                    created_at_ms: index as u64,
+                    retry_count: 0,
+                    last_poll_at_ms: index as u64,
+                },
+            );
+        }
+
+        prune_ledger_meta(&mut meta);
+
+        assert_eq!(meta.len(), LEDGER_MAX_ENTRIES);
+        assert!(!meta.contains_key("k-0"));
+        assert!(meta.contains_key(&format!("k-{}", LEDGER_MAX_ENTRIES + 7)));
     }
 
     /// Polling wakes on new insert within roughly one poll interval (~50ms).

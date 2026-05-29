@@ -87,6 +87,15 @@ fn redact_credentials_for_storage(text: &str) -> (String, usize) {
     (result, count)
 }
 
+fn sanitize_args_preview_for_storage(args_preview: Option<&str>) -> (Option<String>, usize) {
+    let Some(args_preview) = args_preview else {
+        return (None, 0);
+    };
+    let clipped = clip_output_preview(args_preview);
+    let (redacted, count) = redact_credentials_for_storage(&clipped);
+    (Some(redacted), count)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SensitiveKeyKind {
     SecretValue,
@@ -470,6 +479,7 @@ impl StepRecorder {
         idempotency_key: Option<&str>,
         args_preview: Option<&str>,
     ) {
+        let (sanitized_args_preview, redactions) = sanitize_args_preview_for_storage(args_preview);
         let slot_idx = self.slot_counter;
         self.slot_counter += 1;
 
@@ -480,7 +490,7 @@ impl StepRecorder {
             slot.call_id = call_id.to_string();
             slot.state = SlotState::Running;
             slot.idempotency_key = idempotency_key.map(|k| k.to_string());
-            slot.args_preview = args_preview.map(|a| a.to_string());
+            slot.args_preview = sanitized_args_preview.clone();
         }
 
         let mut payload = serde_json::json!({
@@ -489,8 +499,11 @@ impl StepRecorder {
             "call_id": call_id,
             "idempotency_key": idempotency_key,
         });
-        if let Some(args_preview) = args_preview {
+        if let Some(args_preview) = sanitized_args_preview {
             payload["args_preview"] = serde_json::json!(args_preview);
+        }
+        if redactions > 0 {
+            payload["args_preview_redactions"] = serde_json::json!(redactions);
         }
         self.emit_with_payload(StepEventType::ToolCallStarted, payload);
     }
@@ -573,7 +586,12 @@ impl StepRecorder {
             }
         }
         if let Some(output) = output {
-            payload["output"] = serde_json::json!(output);
+            let clipped = clip_output_preview(output);
+            let (redacted, redactions) = redact_credentials_for_storage(&clipped);
+            if redactions > 0 {
+                payload["redactions"] = serde_json::json!(redactions);
+            }
+            payload["output"] = serde_json::json!(redacted);
         }
         self.emit_with_payload(StepEventType::ToolCallSkipped, payload);
         self.checkpoint_count += 1;
@@ -660,6 +678,8 @@ impl StepRecorder {
         fallback_args_preview: Option<&str>,
     ) {
         let slot_idx = self.slot_counter.saturating_sub(1);
+        let (sanitized_fallback_args_preview, fallback_preview_redactions) =
+            sanitize_args_preview_for_storage(fallback_args_preview);
 
         // Guarantee the event stream is always a valid span:
         // ToolCallStarted → ToolCallCompleted/Failed/Skipped.
@@ -674,7 +694,6 @@ impl StepRecorder {
             .is_some_and(|slot| slot.state == crate::step_protocol::SlotState::Pending);
         if needs_started {
             let call_id = fallback_call_id.unwrap_or("");
-            let args_preview = fallback_args_preview;
             // Mark slot as Running (same as begin_tool does).
             if let Some(ref mut step) = self.current_step
                 && let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize)
@@ -682,15 +701,19 @@ impl StepRecorder {
                 slot.tool_name = tool_name.to_string();
                 slot.call_id = call_id.to_string();
                 slot.state = crate::step_protocol::SlotState::Running;
-                slot.args_preview = args_preview.map(|a| a.to_string());
+                slot.args_preview = sanitized_fallback_args_preview.clone();
             }
             let mut started_payload = serde_json::json!({
                 "tool_name": tool_name,
                 "slot_index": slot_idx,
                 "call_id": call_id,
             });
-            if let Some(ap) = args_preview {
+            if let Some(ap) = sanitized_fallback_args_preview.as_deref() {
                 started_payload["args_preview"] = serde_json::json!(ap);
+            }
+            if fallback_preview_redactions > 0 {
+                started_payload["args_preview_redactions"] =
+                    serde_json::json!(fallback_preview_redactions);
             }
             self.emit_with_payload(StepEventType::ToolCallStarted, started_payload);
         }
@@ -752,14 +775,20 @@ impl StepRecorder {
             if let Some(key) = idem_key {
                 payload["idempotency_key"] = serde_json::json!(key);
             }
-            if let Some(args_preview) = args_preview.as_deref().or(fallback_args_preview) {
+            if let Some(args_preview) = args_preview
+                .as_deref()
+                .or(sanitized_fallback_args_preview.as_deref())
+            {
                 payload["args_preview"] = serde_json::json!(args_preview);
             }
         } else if let Some(call_id) = fallback_call_id.filter(|value| !value.is_empty()) {
             payload["call_id"] = serde_json::json!(call_id);
-            if let Some(args_preview) = fallback_args_preview {
+            if let Some(args_preview) = sanitized_fallback_args_preview.as_deref() {
                 payload["args_preview"] = serde_json::json!(args_preview);
             }
+        }
+        if fallback_preview_redactions > 0 {
+            payload["args_preview_redactions"] = serde_json::json!(fallback_preview_redactions);
         }
         if let Some(out) = output {
             // Security: clip and redact tool output before persisting to disk.
@@ -1273,6 +1302,17 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_args_preview_redacts_secrets_before_persistence() {
+        let (sanitized, count) = sanitize_args_preview_for_storage(Some(
+            "Authorization: Bearer sk-test-secret-value path=src/main.rs",
+        ));
+        assert_eq!(count, 1);
+        let sanitized = sanitized.expect("sanitized preview");
+        assert!(sanitized.contains("Authorization: [REDACTED]"));
+        assert!(!sanitized.contains("sk-test-secret-value"));
+    }
+
+    #[test]
     fn recorder_basic_lifecycle() {
         let mut rec = StepRecorder::new("sess-1", "task-1");
         rec.begin_turn(0);
@@ -1561,6 +1601,81 @@ mod tests {
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|error| error.contains("old_str not found")),
             "failed event should carry actionable error, got: {payload:?}"
+        );
+    }
+
+    #[test]
+    fn recorder_redacts_args_preview_in_started_and_completed_events() {
+        let mut rec = StepRecorder::new("sess-redaction", "task-1");
+        rec.begin_turn(0);
+        rec.begin_act(1);
+        rec.begin_tool_with_key_and_args_preview(
+            "write_file",
+            "call-1",
+            None,
+            Some("path=secret.txt Authorization: Bearer sk-test-secret-value"),
+        );
+        rec.complete_tool_with_result("write_file", false, 8, false, "ok");
+
+        let started = rec
+            .events()
+            .iter()
+            .find(|event| event.event_type == StepEventType::ToolCallStarted)
+            .expect("started event");
+        let started_payload = started.payload.as_ref().unwrap();
+        let started_preview = started_payload
+            .get("args_preview")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(started_preview.contains("Authorization:"));
+        assert!(started_preview.contains("[REDACTED"));
+        assert!(!started_preview.contains("sk-test-secret-value"));
+        assert_eq!(
+            started_payload
+                .get("args_preview_redactions")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+
+        let completed = rec
+            .events()
+            .iter()
+            .find(|event| event.event_type == StepEventType::ToolCallCompleted)
+            .expect("completed event");
+        let completed_payload = completed.payload.as_ref().unwrap();
+        let completed_preview = completed_payload
+            .get("args_preview")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(completed_preview.contains("Authorization:"));
+        assert!(completed_preview.contains("[REDACTED"));
+        assert!(!completed_preview.contains("sk-test-secret-value"));
+    }
+
+    #[test]
+    fn skip_tool_with_reason_redacts_persisted_output() {
+        let mut rec = StepRecorder::new("sess-redaction", "task-1");
+        rec.begin_turn(0);
+        rec.begin_act(1);
+        rec.begin_tool("bash", "call-1");
+        rec.skip_tool_with_reason(
+            "bash",
+            "duplicate_within_turn",
+            false,
+            Some("Authorization: Bearer sk-test-secret-value"),
+        );
+
+        let payload = rec.events().last().unwrap().payload.as_ref().unwrap();
+        let output = payload
+            .get("output")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert_eq!(output, "Authorization: [REDACTED]");
+        assert_eq!(
+            payload
+                .get("redactions")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
         );
     }
 
