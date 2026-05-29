@@ -65,8 +65,9 @@ pub(crate) struct FileState {
     pub(super) read_ranges: Vec<(u64, u64)>,
     /// Turn index that recorded the latest successful read. Read dedup is
     /// scoped to this turn so later turns can re-read unchanged files and get
-    /// real content instead of "refer to earlier result" stubs.
-    pub(super) last_read_turn_index: u32,
+    /// real content instead of "refer to earlier result" stubs. `None` means
+    /// the latest state came from a write/edit rather than a successful read.
+    pub(super) last_read_turn_index: Option<u32>,
 }
 
 /// Merge a new `(start, end)` into a sorted, non-overlapping range list.
@@ -198,9 +199,15 @@ impl ToolExecutor {
             let prev = state.get(&key);
             let prev_count = prev.map(|fs| fs.read_count).unwrap_or(0);
             let prev_ranged = prev.map(|fs| fs.ranged_read_count).unwrap_or(0);
-            // Carry forward read_ranges if mtime unchanged, else reset.
+            // Carry forward read_ranges only when they were produced by a read
+            // in this same turn; earlier-turn coverage may no longer be in the
+            // model context after compaction/replay.
             let mut ranges = prev
-                .filter(|fs| fs.timestamp_ms == ts)
+                .filter(|fs| {
+                    fs.from_read
+                        && fs.timestamp_ms == ts
+                        && fs.last_read_turn_index == Some(turn_index)
+                })
                 .map(|fs| fs.read_ranges.clone())
                 .unwrap_or_default();
             // Merge the new range into the list.
@@ -237,7 +244,7 @@ impl ToolExecutor {
                     last_dedup_key,
                     cached_content,
                     read_ranges: ranges,
-                    last_read_turn_index: turn_index,
+                    last_read_turn_index: Some(turn_index),
                 },
             );
             enforce_limits(&mut state);
@@ -275,7 +282,7 @@ impl ToolExecutor {
                     last_dedup_key: ReadDedupKey::Full,
                     cached_content,
                     read_ranges: vec![],
-                    last_read_turn_index: self.journal_turn_index.load(Ordering::Acquire),
+                    last_read_turn_index: None,
                 },
             );
             enforce_limits(&mut state);
@@ -372,7 +379,7 @@ impl ToolExecutor {
                 s.get(&key).and_then(|fs| {
                     (fs.from_read
                         && fs.timestamp_ms == current_ts
-                        && fs.last_read_turn_index == current_turn
+                        && fs.last_read_turn_index == Some(current_turn)
                         && fs.last_dedup_key == *requested)
                         .then_some(())
                 })
@@ -397,7 +404,7 @@ impl ToolExecutor {
                     fs.from_read
                         && !fs.is_partial
                         && fs.timestamp_ms == current_ts
-                        && fs.last_read_turn_index == current_turn
+                        && fs.last_read_turn_index == Some(current_turn)
                 })
             })
             .unwrap_or(false)
@@ -421,7 +428,7 @@ impl ToolExecutor {
                 s.get(&key).and_then(|fs| {
                     (fs.from_read
                         && fs.timestamp_ms == current_ts
-                        && fs.last_read_turn_index == current_turn
+                        && fs.last_read_turn_index == Some(current_turn)
                         && ranges_cover(&fs.read_ranges, start, end))
                     .then_some(())
                 })
@@ -669,5 +676,60 @@ mod tests {
             exe2.check_staleness(&file).is_err(),
             "externally modified file must be rejected even with shared state"
         );
+    }
+
+    #[test]
+    fn read_ranges_reset_when_turn_advances_without_mtime_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ranges.rs");
+        std::fs::write(&file, "line1\nline2\nline3\nline4\n").unwrap();
+
+        let exe = crate::edge_tools::ToolExecutor::new(dir.path());
+        let key = exe.file_state_key(&file);
+
+        exe.journal_turn_index.store(1, Ordering::Release);
+        exe.record_read(
+            &file,
+            true,
+            ReadDedupKey::Range {
+                start_line: Some(1),
+                end_line: Some(2),
+            },
+        );
+
+        exe.journal_turn_index.store(2, Ordering::Release);
+        exe.record_read(
+            &file,
+            true,
+            ReadDedupKey::Range {
+                start_line: Some(3),
+                end_line: Some(4),
+            },
+        );
+
+        let state = exe.file_state.lock().unwrap();
+        let fs = state.get(&key).unwrap();
+        assert_eq!(fs.last_read_turn_index, Some(2));
+        assert_eq!(fs.read_ranges, vec![(3, 4)]);
+    }
+
+    #[test]
+    fn record_write_clears_last_successful_read_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("write.rs");
+        std::fs::write(&file, "fn before() {}\n").unwrap();
+
+        let exe = crate::edge_tools::ToolExecutor::new(dir.path());
+        let key = exe.file_state_key(&file);
+
+        exe.journal_turn_index.store(7, Ordering::Release);
+        exe.record_read(&file, false, ReadDedupKey::Full);
+        exe.record_write(&file);
+
+        let state = exe.file_state.lock().unwrap();
+        let fs = state.get(&key).unwrap();
+        assert!(!fs.from_read);
+        assert_eq!(fs.last_read_turn_index, None);
+        assert!(fs.read_ranges.is_empty());
     }
 }
