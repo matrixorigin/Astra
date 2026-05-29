@@ -239,6 +239,7 @@ impl LedgerPersistence {
             .append(true)
             .open(self.file_path())?;
         writeln!(file, "{line}")?;
+        file.sync_all()?;
         Ok(())
     }
 
@@ -290,6 +291,7 @@ impl LedgerPersistence {
             });
             writeln!(file, "{line}")?;
         }
+        file.sync_all()?;
         std::fs::rename(&tmp, &path)?;
         Ok(())
     }
@@ -667,6 +669,7 @@ mod tests {
     use super::*;
 
     use crate::history::{RecoveredEventRow, append_recovered_events};
+    use tempfile::tempdir;
 
     #[test]
     fn callback_keys_match_handler_convention() {
@@ -1736,6 +1739,34 @@ mod tests {
                 .is_none(),
             "fresh ledger must not see the old entry"
         );
+    }
+
+    #[test]
+    fn ledger_persistence_recover_round_trips_insert_and_remove() {
+        let tmp = tempdir().unwrap();
+        let persistence = LedgerPersistence::new(tmp.path().to_path_buf());
+
+        persistence.write_op("insert", "k1").unwrap();
+        persistence.write_op("insert", "k2").unwrap();
+        persistence.write_op("remove", "k1").unwrap();
+
+        assert_eq!(persistence.recover().unwrap(), vec!["k2".to_string()]);
+    }
+
+    #[test]
+    fn ledger_persistence_compact_rewrites_only_active_keys() {
+        let tmp = tempdir().unwrap();
+        let persistence = LedgerPersistence::new(tmp.path().to_path_buf());
+
+        persistence.write_op("insert", "stale").unwrap();
+        persistence.write_op("insert", "keep").unwrap();
+        persistence.compact(&["keep".to_string()]).unwrap();
+
+        let persisted = std::fs::read_to_string(tmp.path().join("edge_ledger.jsonl")).unwrap();
+        let lines: Vec<_> = persisted.lines().collect();
+        assert_eq!(lines.len(), 1, "compact must rewrite a single active entry");
+        assert!(lines[0].contains("\"key\":\"keep\""));
+        assert_eq!(persistence.recover().unwrap(), vec!["keep".to_string()]);
     }
 
     /// Polling wakes on new insert within roughly one poll interval (~50ms).

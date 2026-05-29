@@ -58,13 +58,26 @@ impl Verifier for ProgressVerifier {
                 "decision checkpoint: {} consecutive read-only round(s), {} redundant read(s), and no mutation signal. Use the evidence already gathered and choose one next action: edit, run targeted verification, or explicitly report why the task cannot be completed; do not continue broad or duplicate reading.",
                 snap.read_only_round_streak, snap.redundant_read_count
             ),
-            recovery_threshold: Some(self.recovery_read_only_round_streak),
+            recovery_threshold: normalized_recovery_threshold(
+                self.max_read_only_round_streak,
+                self.recovery_read_only_round_streak,
+            ),
         }]
     }
 }
 
 fn is_terminal(final_state: Option<&str>) -> bool {
     matches!(final_state, Some("completed" | "interrupted"))
+}
+
+fn normalized_recovery_threshold(
+    max_read_only_round_streak: u32,
+    recovery_read_only_round_streak: u32,
+) -> Option<u32> {
+    if max_read_only_round_streak <= 1 || recovery_read_only_round_streak == 0 {
+        return None;
+    }
+    Some(recovery_read_only_round_streak.min(max_read_only_round_streak - 1))
 }
 
 #[cfg(test)]
@@ -188,5 +201,23 @@ mod tests {
         };
         // 20 rounds but only 2 redundant reads
         assert!(verifier.check(&record(20, 2)).is_empty());
+    }
+
+    #[test]
+    fn progress_verifier_clamps_recovery_threshold_below_pause_threshold() {
+        let verifier = ProgressVerifier {
+            max_read_only_round_streak: 4,
+            max_redundant_read_count: 10,
+            recovery_read_only_round_streak: 99,
+            min_redundant_reads_for_pause: 3,
+        };
+        let violations = verifier.check(&record(4, 3));
+        assert_eq!(violations[0].recovery_threshold, Some(3));
+    }
+
+    #[test]
+    fn progress_verifier_omits_invalid_recovery_thresholds() {
+        assert_eq!(normalized_recovery_threshold(1, 1), None);
+        assert_eq!(normalized_recovery_threshold(4, 0), None);
     }
 }

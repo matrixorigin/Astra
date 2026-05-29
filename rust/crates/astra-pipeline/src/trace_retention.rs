@@ -95,7 +95,7 @@ impl RetentionPolicy {
                 .map(|d| d.as_secs())
                 .unwrap_or(u64::MAX);
 
-            if now.saturating_sub(mtime) > max_age_secs {
+            if archive_exceeds_max_age(now, mtime, max_age_secs) {
                 if let Ok(meta) = archive.metadata() {
                     stats.bytes_freed += meta.len();
                 }
@@ -206,6 +206,10 @@ impl RetentionPolicy {
     }
 }
 
+fn archive_exceeds_max_age(now: u64, mtime: u64, max_age_secs: u64) -> bool {
+    now.saturating_sub(mtime) >= max_age_secs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +235,11 @@ mod tests {
     fn needs_cleanup_returns_false_for_missing_dir() {
         let policy = RetentionPolicy::default();
         assert!(!policy.needs_cleanup("nonexistent-session-id"));
+    }
+
+    #[test]
+    fn archive_expires_at_exact_boundary() {
+        assert!(archive_exceeds_max_age(86_400, 0, 86_400));
+        assert!(!archive_exceeds_max_age(86_399, 0, 86_400));
     }
 }

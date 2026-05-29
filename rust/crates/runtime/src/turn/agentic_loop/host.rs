@@ -1565,6 +1565,29 @@ pub(crate) const MAX_TRACKED_FILE_READS: usize = 20;
 /// a `HarnessPaused` interruption.
 const MAX_HARNESS_PAUSE_RECOVERIES: u32 = 2;
 
+fn apply_harness_pause_recovery_threshold(
+    state: &mut AgenticLoopState,
+    recovery_threshold: Option<u32>,
+) {
+    let Some(tighter) = recovery_threshold else {
+        state.stall.circuit_breaker.reset_read_only_streak();
+        return;
+    };
+
+    let tighter = tighter as usize;
+    let current = state.stall.circuit_breaker.read_only_threshold();
+    if tighter > 0 && tighter < current {
+        state.stall.circuit_breaker.set_read_only_threshold(tighter);
+    } else {
+        tracing::warn!(
+            proposed_threshold = tighter,
+            current_threshold = current,
+            "ignoring invalid harness recovery threshold"
+        );
+        state.stall.circuit_breaker.reset_read_only_streak();
+    }
+}
+
 #[allow(unused_imports)]
 pub(crate) use super::super::agentic::adaptive_tuning::{
     DEFAULT_TUNING_CYCLE_INTERVAL, apply_adaptive_execution_profile, apply_per_turn_adaptation,
@@ -1957,14 +1980,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     "role": "user",
                     "content": reason,
                 }));
-                if let Some(tighter) = recovery_threshold {
-                    state
-                        .stall
-                        .circuit_breaker
-                        .set_read_only_threshold(tighter as usize);
-                } else {
-                    state.stall.circuit_breaker.reset_read_only_streak();
-                }
+                apply_harness_pause_recovery_threshold(state, recovery_threshold);
                 // Fall through to continue the loop
             }
             astra_harness::HookVerdict::Continue => {}
@@ -2580,6 +2596,36 @@ pub(crate) mod tests {
             turn_event_buffer: None,
             harness: crate::turn::harness_adapter::HarnessSlot::empty(),
         }
+    }
+
+    #[test]
+    fn invalid_harness_recovery_threshold_resets_streak_instead_of_overriding() {
+        let mut state = make_state();
+        state.stall.circuit_breaker.set_read_only_threshold(12);
+        state
+            .stall
+            .circuit_breaker
+            .observe(astra_turn_core::loop_circuit_breaker::RoundSignal {
+                tool_signatures: std::iter::once("read_file:/tmp/test".to_string()).collect(),
+                produced_mutation: false,
+                task_completed: false,
+                tool_count: 1,
+            });
+
+        apply_harness_pause_recovery_threshold(&mut state, Some(0));
+
+        assert_eq!(state.stall.circuit_breaker.read_only_threshold(), 12);
+        assert_eq!(state.stall.circuit_breaker.consecutive_read_only(), 0);
+    }
+
+    #[test]
+    fn valid_harness_recovery_threshold_tightens_breaker() {
+        let mut state = make_state();
+        state.stall.circuit_breaker.set_read_only_threshold(12);
+
+        apply_harness_pause_recovery_threshold(&mut state, Some(4));
+
+        assert_eq!(state.stall.circuit_breaker.read_only_threshold(), 4);
     }
 
     #[test]

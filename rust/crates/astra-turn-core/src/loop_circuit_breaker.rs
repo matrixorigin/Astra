@@ -186,6 +186,11 @@ impl LoopCircuitBreaker {
         self.config.read_only_stall_threshold = threshold;
     }
 
+    /// Current read-only stall threshold.
+    pub fn read_only_threshold(&self) -> usize {
+        self.config.read_only_stall_threshold
+    }
+
     /// Number of Introspect soft-signals emitted since the last write (mutation).
     pub fn introspect_emissions(&self) -> usize {
         self.introspect_emissions_since_last_write

@@ -40,49 +40,33 @@ fn redact_credentials_for_storage(text: &str) -> (String, usize) {
     let lines: Vec<String> = text
         .lines()
         .map(|line| {
-            let lowered = line.to_lowercase();
-            let is_sensitive = lowered.contains("api_key")
-                || lowered.contains("apikey")
-                || lowered.contains("secret_key")
-                || lowered.contains("secretkey")
-                || lowered.contains("access_key")
-                || lowered.contains("private_key")
-                || lowered.contains("password")
-                || lowered.contains("passwd")
-                || lowered.contains("token")
-                || lowered.contains("bearer")
-                || lowered.contains("credential")
-                || lowered.contains("authorization");
-            let has_sk_prefix = line.contains("sk-") || line.contains("SK-");
-            if (is_sensitive || has_sk_prefix) && (line.contains('=') || line.contains(':')) {
-                let sep = if line.contains(':') && !line.contains("://") {
-                    line.find(':')
-                } else {
-                    line.find('=')
-                };
-                if let Some(idx) = sep {
-                    count += 1;
-                    format!("{}[REDACTED]", &line[..=idx])
-                } else {
-                    count += 1;
-                    "[REDACTED]".to_string()
-                }
+            if let Some(redacted) = redact_sensitive_assignment_line(line) {
+                count += 1;
+                redacted
             } else {
                 line.to_string()
             }
         })
         .collect();
     let mut result = lines.join("\n");
+    count += redact_pem_blocks(&mut result);
 
-    // Inline redaction for JWT tokens (eyJ...), AWS keys (AKIA...), GitHub tokens (ghp_...)
+    // Inline redaction for common standalone token shapes.
     let inline_patterns = [
         ("eyJ", 30, "JWT_TOKEN"),
+        ("sk-", 20, "API_KEY"),
+        ("sk-proj-", 20, "API_KEY"),
         ("AKIA", 20, "AWS_ACCESS_KEY"),
+        ("ASIA", 20, "AWS_SESSION_KEY"),
         ("ghp_", 36, "GITHUB_PAT"),
         ("gho_", 36, "GITHUB_OAUTH"),
         ("ghu_", 36, "GITHUB_USER"),
         ("ghs_", 36, "GITHUB_SERVER"),
         ("ghr_", 36, "GITHUB_REFRESH"),
+        ("xoxb-", 20, "SLACK_TOKEN"),
+        ("xoxp-", 20, "SLACK_TOKEN"),
+        ("xoxa-", 20, "SLACK_TOKEN"),
+        ("xoxs-", 20, "SLACK_TOKEN"),
     ];
     for (prefix, min_len, label) in inline_patterns {
         while let Some(start) = result.find(prefix) {
@@ -101,6 +85,132 @@ fn redact_credentials_for_storage(text: &str) -> (String, usize) {
     }
 
     (result, count)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SensitiveKeyKind {
+    SecretValue,
+    AuthValue,
+}
+
+fn redact_sensitive_assignment_line(line: &str) -> Option<String> {
+    let separator = find_sensitive_separator(line)?;
+    let key = line[..separator].trim();
+    let suffix = &line[separator + 1..];
+    let leading_ws_len = suffix.len() - suffix.trim_start().len();
+    let value = suffix.trim();
+    let kind = classify_sensitive_key(key)?;
+    if value.is_empty() {
+        return None;
+    }
+    let normalized_value = value.trim_matches(|c| matches!(c, '"' | '\'' | '`'));
+    let should_redact = match kind {
+        SensitiveKeyKind::SecretValue => true,
+        SensitiveKeyKind::AuthValue => looks_like_auth_or_secret_value(normalized_value),
+    };
+    should_redact.then(|| {
+        format!(
+            "{}{}[REDACTED]",
+            &line[..=separator],
+            &suffix[..leading_ws_len]
+        )
+    })
+}
+
+fn find_sensitive_separator(line: &str) -> Option<usize> {
+    let equals = line.find('=');
+    let colon = (!line.contains("://")).then(|| line.find(':')).flatten();
+    match (equals, colon) {
+        (Some(eq), Some(colon)) => Some(eq.min(colon)),
+        (Some(eq), None) => Some(eq),
+        (None, Some(colon)) => Some(colon),
+        (None, None) => None,
+    }
+}
+
+fn classify_sensitive_key(key: &str) -> Option<SensitiveKeyKind> {
+    let normalized = key
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_")
+        .trim_matches('_')
+        .to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let strong_secret = normalized == "apikey"
+        || normalized.ends_with("api_key")
+        || normalized == "secret"
+        || normalized.ends_with("_secret")
+        || normalized.ends_with("secret_key")
+        || normalized.ends_with("access_key")
+        || normalized.ends_with("private_key")
+        || normalized.ends_with("password")
+        || normalized.ends_with("passwd")
+        || normalized.ends_with("credential")
+        || normalized.ends_with("credentials");
+    if strong_secret {
+        return Some(SensitiveKeyKind::SecretValue);
+    }
+
+    let auth_like = normalized == "authorization"
+        || normalized.ends_with("_authorization")
+        || normalized.ends_with("auth_token")
+        || normalized.ends_with("_token")
+        || normalized == "token"
+        || normalized.ends_with("_bearer")
+        || normalized == "bearer";
+    auth_like.then_some(SensitiveKeyKind::AuthValue)
+}
+
+fn looks_like_auth_or_secret_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    if lowered.starts_with("bearer ") || lowered.starts_with("basic ") {
+        return true;
+    }
+    let compact = trimmed.trim_matches(|c| matches!(c, ',' | ';'));
+    let known_prefix = [
+        "eyJ", "sk-", "sk-proj-", "AKIA", "ASIA", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "xoxb-",
+        "xoxp-", "xoxa-", "xoxs-",
+    ]
+    .iter()
+    .any(|prefix| compact.starts_with(prefix));
+    if known_prefix {
+        return true;
+    }
+    compact.len() >= 20
+        && !compact.chars().any(char::is_whitespace)
+        && compact
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '+' | '='))
+}
+
+fn redact_pem_blocks(text: &mut String) -> usize {
+    let mut count = 0usize;
+    let mut search_start = 0usize;
+    const REDACTION: &str = "[REDACTED_PEM_BLOCK]";
+
+    while let Some(begin_rel) = text[search_start..].find("-----BEGIN ") {
+        let begin = search_start + begin_rel;
+        let Some(end_marker_rel) = text[begin..].find("-----END ") else {
+            break;
+        };
+        let end_marker = begin + end_marker_rel;
+        let Some(end_suffix_rel) = text[end_marker + "-----END ".len()..].find("-----") else {
+            break;
+        };
+        let end = end_marker + "-----END ".len() + end_suffix_rel + "-----".len();
+        text.replace_range(begin..end, REDACTION);
+        count += 1;
+        search_start = begin + REDACTION.len();
+    }
+
+    count
 }
 
 /// Records chat_stream execution as Step lifecycle events.
@@ -1133,6 +1243,34 @@ fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_credentials_redacts_assignments_but_keeps_token_counters() {
+        let input = "OPENAI_API_KEY=sk-test-secret\npassword: hunter2\ntoken_count: 3";
+        let (redacted, count) = redact_credentials_for_storage(input);
+        assert_eq!(count, 2);
+        assert!(redacted.contains("OPENAI_API_KEY=[REDACTED]"));
+        assert!(redacted.contains("password: [REDACTED]"));
+        assert!(redacted.contains("token_count: 3"));
+    }
+
+    #[test]
+    fn redact_credentials_redacts_auth_headers_and_standalone_tokens() {
+        let input = "Authorization: Bearer sk-test-secret-value\nclipboard sk-test-secret-value";
+        let (redacted, count) = redact_credentials_for_storage(input);
+        assert_eq!(count, 2);
+        assert!(redacted.contains("Authorization: [REDACTED]"));
+        assert!(redacted.contains("clipboard [REDACTED_API_KEY]"));
+    }
+
+    #[test]
+    fn redact_credentials_redacts_pem_blocks() {
+        let input = "-----BEGIN PRIVATE KEY-----\nabc123\n-----END PRIVATE KEY-----\nstatus: ok";
+        let (redacted, count) = redact_credentials_for_storage(input);
+        assert_eq!(count, 1);
+        assert!(redacted.contains("[REDACTED_PEM_BLOCK]"));
+        assert!(redacted.contains("status: ok"));
+    }
 
     #[test]
     fn recorder_basic_lifecycle() {
