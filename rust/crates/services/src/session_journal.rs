@@ -121,10 +121,10 @@ fn journal_needs_session_start_impl(path: &Path, skip_cache: bool) -> std::io::R
         set_cached_session_start_state(path, false);
         return Ok(true);
     }
-    if !skip_cache {
-        if let Some(has_open_session_start) = cached_session_start_state(path) {
-            return Ok(!has_open_session_start);
-        }
+    if !skip_cache
+        && let Some(has_open_session_start) = cached_session_start_state(path)
+    {
+        return Ok(!has_open_session_start);
     }
     let content = std::fs::read_to_string(path)?;
     let mut events = parse_journal_text(&content).0;
