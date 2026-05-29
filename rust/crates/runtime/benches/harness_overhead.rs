@@ -39,13 +39,19 @@ fn make_snapshot() -> RuntimeSnapshot {
         unique_tools_used: vec!["bash".into(), "read_file".into(), "edit_file".into()],
         last_tool_called: Some("bash".into()),
         consecutive_same_tool: 1,
+        final_state: None,
+        interruption_kind: None,
+        has_final_text: false,
+        last_tool_result_class: None,
+        read_only_round_streak: 0,
+        redundant_read_count: 0,
         delegations_this_turn: 0,
         recursion_depth: 0,
         consecutive_errors: 0,
         captured_at_unix_millis: 1_700_000_000_000,
         session_start_unix_millis: 1_700_000_000_000 - 30_000,
         causal_chain_id: None,
-        schema_version: 2,
+        schema_version: 3,
     }
 }
 
