@@ -472,6 +472,7 @@ pub(crate) struct LlmWireAssemblyInput<'a> {
     pub volatile_preamble: Vec<Value>,
     pub compacted_messages: Vec<Value>,
     pub state: &'a mut AgenticLoopState,
+    pub thinking: &'a astra_turn_core::thinking_config::ThinkingConfig,
     pub edge_profile: &'a Map<String, Value>,
     pub session_id: &'a str,
     pub provider: &'a str,
@@ -1053,6 +1054,7 @@ pub(crate) fn assemble_wire_messages(input: LlmWireAssemblyInput<'_>) -> Vec<Val
         input.session_id,
         input.provider,
         input.model_name,
+        input.thinking,
         input.cache_capability,
         input.cache_cfg,
     )
@@ -1135,9 +1137,19 @@ pub(crate) fn finalize_bridge_wire_messages(
     volatile_text: Option<String>,
     provider: &str,
     model_name: &str,
+    thinking: &astra_turn_core::thinking_config::ThinkingConfig,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
 ) -> Option<usize> {
-    astra_turn_core::edge_ledger::strip_stale_reasoning(llm_messages, provider, model_name);
+    let reasoning_policy = astra_turn_core::edge_ledger::ReasoningReplayPolicy::infer(
+        llm_messages,
+        thinking,
+        provider,
+        model_name,
+    );
+    astra_turn_core::edge_ledger::strip_stale_reasoning_with_policy(
+        llm_messages,
+        &reasoning_policy,
+    );
     let cache_cap =
         astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider_model(
             cache_capability,
@@ -1385,6 +1397,7 @@ mod context_cache_contract_tests {
             Some("volatile".to_string()),
             "openai",
             "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
         );
 
@@ -1420,6 +1433,7 @@ mod context_cache_contract_tests {
             Some("volatile".to_string()),
             "bedrock",
             "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
         );
         apply_bridge_message_cache_metadata(
@@ -1449,6 +1463,7 @@ mod context_cache_contract_tests {
             Some("volatile".to_string()),
             "openai",
             "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
         );
 
@@ -1468,6 +1483,7 @@ mod context_cache_contract_tests {
             Some("<system-reminder>\nvolatile</system-reminder>".to_string()),
             "openai",
             "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
         );
 
@@ -1482,8 +1498,14 @@ mod context_cache_contract_tests {
     fn finalize_bridge_wire_messages_noops_when_volatile_text_is_absent() {
         let mut messages = vec![json!({"role": "assistant", "content": "stable"})];
 
-        let synthetic_tail_prefix_end =
-            finalize_bridge_wire_messages(&mut messages, None, "openai", "gpt-4", None);
+        let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
+            &mut messages,
+            None,
+            "openai",
+            "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
+        );
 
         assert!(synthetic_tail_prefix_end.is_none());
         assert_eq!(
@@ -1501,6 +1523,7 @@ mod context_cache_contract_tests {
             Some("volatile".to_string()),
             "openai",
             "deepseek-v4-flash",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
         );
 
@@ -1524,6 +1547,7 @@ mod context_cache_contract_tests {
             Some("volatile".to_string()),
             "openai",
             "gpt-4o",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
             Some(explicit),
         );
 

@@ -16,6 +16,7 @@ allowed_tools:
   - grep
   - glob
 ---
+
 # Optimize Prompt
 
 Analyze and optimize everything astra sends to the LLM — the system prompt, tool
@@ -36,11 +37,11 @@ Same as other skills — journal JSONL or debug JSON files.
 
 ### 1.2 Best Data Sources for Prompt Analysis
 
-| Source | What It Shows | Path |
-|--------|-------------|------|
-| Heavy checkpoint | Full message array sent to LLM | `~/.astra/sessions/<id>/step_checkpoints/*-heavy.json` |
-| Debug dump (full) | Complete turn snapshot with schema `astra-debug-turn-full-v1` | `/tmp/debug-<id>-turn<N>-full.json` |
-| Journal | Per-turn token counts, tools_selected, budget_pressure | `~/.astra/sessions/<id>.jsonl` |
+| Source            | What It Shows                                                 | Path                                                   |
+| ----------------- | ------------------------------------------------------------- | ------------------------------------------------------ |
+| Heavy checkpoint  | Full message array sent to LLM                                | `~/.astra/sessions/<id>/step_checkpoints/*-heavy.json` |
+| Debug dump (full) | Complete turn snapshot with schema `astra-debug-turn-full-v1` | `/tmp/debug-<id>-turn<N>-full.json`                    |
+| Journal           | Per-turn token counts, tools_selected, budget_pressure        | `~/.astra/sessions/<id>.jsonl`                         |
 
 **Heavy checkpoints are the gold standard** — they contain the exact messages sent to the LLM.
 
@@ -69,16 +70,16 @@ for i, m in enumerate(msgs):
 
 Astra's system prompt is built from layered sections (`prompts/system.rs`):
 
-| Component | Cache Scope | Typical Size | Purpose |
-|-----------|-------------|-------------|---------|
-| Base identity | Global | ~200 tokens | "You are an expert software engineer..." |
-| Core rules | Global | ~500 tokens | Think step-by-step, no fabrication, tool usage |
-| Tool-conditional guidance | Session | ~2-8K tokens | Guidance per available tool category |
-| Task type rules | Session | ~500 tokens | Classification-specific behavior |
-| Output style | Session | ~200 tokens | Markdown, code style preferences |
-| Project profile (edge_profile) | None | ~500-2K tokens | Git branch, workspace state, project type |
-| Active skills | None | ~0-5K tokens | Injected skill instructions |
-| Memory signals | None | ~0-1K tokens | Relevant memories from learning system |
+| Component                      | Cache Scope | Typical Size   | Purpose                                        |
+| ------------------------------ | ----------- | -------------- | ---------------------------------------------- |
+| Base identity                  | Global      | ~200 tokens    | "You are an expert software engineer..."       |
+| Core rules                     | Global      | ~500 tokens    | Think step-by-step, no fabrication, tool usage |
+| Tool-conditional guidance      | Session     | ~2-8K tokens   | Guidance per available tool category           |
+| Task type rules                | Session     | ~500 tokens    | Classification-specific behavior               |
+| Output style                   | Session     | ~200 tokens    | Markdown, code style preferences               |
+| Project profile (edge_profile) | None        | ~500-2K tokens | Git branch, workspace state, project type      |
+| Active skills                  | None        | ~0-5K tokens   | Injected skill instructions                    |
+| Memory signals                 | None        | ~0-1K tokens   | Relevant memories from learning system         |
 
 **Default total**: ~14,000 tokens (baseline estimate used by `estimate_tokens_precise`)
 
@@ -102,6 +103,7 @@ for i, m in enumerate(system_msgs):
 ```
 
 Flag:
+
 - 🔴 System prompt >20K tokens (excessive — model will deprioritize later instructions)
 - 🟡 System prompt >15K tokens (room for optimization)
 - 🟢 System prompt <10K tokens (lean)
@@ -109,6 +111,7 @@ Flag:
 ### 2.3 Tool-Conditional Guidance Audit
 
 Astra injects guidance blocks based on which tools are available:
+
 - Memory tools present → memory usage instructions
 - GitHub tools present → PR/issue workflow guidance
 - Git tools present → branching, commit message format
@@ -116,6 +119,7 @@ Astra injects guidance blocks based on which tools are available:
 - Glob/grep tools → search strategy
 
 Check: Are all guidance blocks relevant to the current task?
+
 - If task is "fix a typo in README.md", do we need GitHub PR guidance? Memory instructions?
 - Each unnecessary guidance block wastes ~200-500 tokens.
 
@@ -129,6 +133,7 @@ From journal `selected_skills` fields and checkpoint system messages:
 ```
 
 Flag:
+
 - 🔴 Skill injected but never referenced in assistant output (pure waste)
 - 🟡 Same skill injected every turn (should be cached, not re-injected)
 - 📛 Multiple large skills injected simultaneously (>3K tokens total)
@@ -148,7 +153,7 @@ From journal `tools_selected` per turn:
 
 ```
 | Turn | Tools Selected | Est. Schema Tokens | Tools Actually Used | Waste% |
-|------|---------------|-------------------|--------------------|---------| 
+|------|---------------|-------------------|--------------------|---------|
 ```
 
 ### 3.2 Pinned vs Dynamic Schemas
@@ -156,7 +161,6 @@ From journal `tools_selected` per turn:
 - **Pinned schemas**: Always sent (core tools like bash, read_file, etc.)
   - Count: typically 5-10 tools
   - Cost: ~2-4K tokens (always paid)
-  
 - **Dynamic schemas**: Selected by tool selector per turn
   - Count: varies (5-25 tools)
   - Cost: ~2-10K tokens
@@ -164,6 +168,7 @@ From journal `tools_selected` per turn:
 **Total schema cost per turn**: `pinned_tokens + dynamic_tokens`
 
 Flag:
+
 - 🔴 >30 tools selected (>12K schema tokens — significant context waste)
 - 🟡 >20 tools selected (>8K tokens)
 - 🟢 <15 tools selected (<6K tokens — well-optimized)
@@ -176,11 +181,11 @@ Compare `tools_selected` vs `tools_used`:
 Accuracy = |tools_used| / |tools_selected|
 ```
 
-| Accuracy | Assessment |
-|----------|-----------|
-| >70% | 🟢 Excellent — selector is precise |
-| 50-70% | 🟡 Acceptable — some waste |
-| <50% | 🔴 Poor — more than half the schemas are unused |
+| Accuracy | Assessment                                      |
+| -------- | ----------------------------------------------- |
+| >70%     | 🟢 Excellent — selector is precise              |
+| 50-70%   | 🟡 Acceptable — some waste                      |
+| <50%     | 🔴 Poor — more than half the schemas are unused |
 
 ### 3.4 Per-Tool Schema Size
 
@@ -193,7 +198,7 @@ import json, sys
 msgs = json.load(sys.stdin)
 # Tool schemas are typically in the first system message or as 'tools' array
 # Look for function definitions
-" 
+"
 ```
 
 Flag tools with schemas >500 tokens — candidates for schema trimming at high budget pressure.
@@ -237,6 +242,7 @@ for idx, (i, m) in enumerate(tool_msgs[:10]):
 ```
 
 Flag:
+
 - 🔴 Single tool result >10K bytes (~2.5K tokens) — should be truncated
 - 🔴 Same file read multiple times in history (redundant)
 - 🟡 Tool result >5K bytes — consider summarization
@@ -263,7 +269,7 @@ for p, indices in sorted(paths.items(), key=lambda x: -len(x[1])):
 
 ### 4.4 Stale Reasoning Detection
 
-Astra calls `strip_stale_reasoning()` to remove old `reasoning_content` fields.
+Astra calls `strip_stale_reasoning_with_policy()` to remove old `reasoning_content` fields.
 Check if any survive:
 
 ```bash
@@ -278,6 +284,7 @@ for i, m in enumerate(msgs):
 ```
 
 Flag:
+
 - 🔴 reasoning_content on messages older than 3 turns (should have been stripped)
 
 ---
@@ -288,12 +295,12 @@ Flag:
 
 Astra's budget pressure tiers (from `prompts/context.rs`):
 
-| Tier | Token Ratio | Pressure | Action |
-|------|-------------|----------|--------|
-| Normal | <60% | 0.0 | No action |
-| TrimSchemas | 60-75% | 0.3 | Reduce dynamic tool schemas |
-| CompactHistory | 75-85% | 0.6 | Compact older turns, keep recent 6 |
-| AggressivePrune | >85% | 0.9 | Aggressive pruning, summarize history |
+| Tier            | Token Ratio | Pressure | Action                                |
+| --------------- | ----------- | -------- | ------------------------------------- |
+| Normal          | <60%        | 0.0      | No action                             |
+| TrimSchemas     | 60-75%      | 0.3      | Reduce dynamic tool schemas           |
+| CompactHistory  | 75-85%      | 0.6      | Compact older turns, keep recent 6    |
+| AggressivePrune | >85%        | 0.9      | Aggressive pruning, summarize history |
 
 ### 5.2 Budget Pressure Timeline
 
@@ -305,10 +312,12 @@ From journal `budget_pressure` fields:
 ```
 
 Healthy patterns:
+
 - 🟢 **Sawtooth**: pressure rises gradually, drops after compaction
 - 🟢 **Flat low**: stays below 0.3 (context fits comfortably)
 
 Unhealthy patterns:
+
 - 🔴 **Monotonic rise**: pressure increases every turn, never drops
 - 🔴 **Sustained high**: pressure ≥0.6 for 5+ consecutive turns
 - 🔴 **Oscillating high**: rapid 0.9→0.0→0.9 (aggressive compact then immediate refill)
@@ -316,11 +325,13 @@ Unhealthy patterns:
 ### 5.3 Compaction Effectiveness
 
 From journal `"type":"Compact"` events:
+
 - How many turns were compacted?
 - How many facts were extracted?
 - What was the token reduction?
 
 After compaction:
+
 - Did `tokens_in` actually decrease on the next turn?
 - Did the agent lose important context? (asks questions already answered)
 
@@ -377,48 +388,52 @@ Peak tokens_in: {peak} tokens ({peak/effective * 100}% utilization)
 ## Optimization Recommendations by Component
 
 ### System Prompt
-| Issue | Fix | Savings |
-|-------|-----|---------|
+
+| Issue                       | Fix                                              | Savings        |
+| --------------------------- | ------------------------------------------------ | -------------- |
 | Unused tool guidance blocks | Remove guidance for tools not in current session | 200-500 tokens |
-| Verbose core rules | Compress instruction language | 100-300 tokens |
-| Large project profile | Summarize workspace state | 200-500 tokens |
+| Verbose core rules          | Compress instruction language                    | 100-300 tokens |
+| Large project profile       | Summarize workspace state                        | 200-500 tokens |
 
 ### Tool Schemas
-| Issue | Fix | Savings |
-|-------|-----|---------|
-| Low selection accuracy (<50%) | Strengthen TF-IDF signals (routing, entity graph, patterns, boost terms); tighten tool budget / thresholds — CLI does not use an LLM tool pre-selector | 2-5K tokens |
-| >25 tools selected | Tighten TF-IDF threshold | 2-4K tokens |
-| Large individual schemas | Trim verbose parameter descriptions | 100-500 tokens/tool |
+
+| Issue                         | Fix                                                                                                                                                    | Savings             |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------- |
+| Low selection accuracy (<50%) | Strengthen TF-IDF signals (routing, entity graph, patterns, boost terms); tighten tool budget / thresholds — CLI does not use an LLM tool pre-selector | 2-5K tokens         |
+| >25 tools selected            | Tighten TF-IDF threshold                                                                                                                               | 2-4K tokens         |
+| Large individual schemas      | Trim verbose parameter descriptions                                                                                                                    | 100-500 tokens/tool |
 
 ### History
-| Issue | Fix | Savings |
-|-------|-----|---------|
-| Tool result >10K bytes | Auto-truncate large results | 1-5K tokens |
-| Same file read 3+ times | Deduplicate in history compaction | 1-3K tokens |
-| Stale reasoning_content | Fix strip_stale_reasoning() | 500-2K tokens |
+
+| Issue                   | Fix                                     | Savings       |
+| ----------------------- | --------------------------------------- | ------------- |
+| Tool result >10K bytes  | Auto-truncate large results             | 1-5K tokens   |
+| Same file read 3+ times | Deduplicate in history compaction       | 1-3K tokens   |
+| Stale reasoning_content | Fix strip_stale_reasoning_with_policy() | 500-2K tokens |
 
 ### Budget Pressure
-| Issue | Fix | Savings |
-|-------|-----|---------|
-| Never compacts (pressure stays low) | Lower compact_threshold if context growing | Prevents future bloat |
-| Too frequent compaction | Use larger model or reduce tool count | Preserves context quality |
-| Oscillating high pressure | Task too complex for context window | Split into subtasks |
+
+| Issue                               | Fix                                        | Savings                   |
+| ----------------------------------- | ------------------------------------------ | ------------------------- |
+| Never compacts (pressure stays low) | Lower compact_threshold if context growing | Prevents future bloat     |
+| Too frequent compaction             | Use larger model or reduce tool count      | Preserves context quality |
+| Oscillating high pressure           | Task too complex for context window        | Split into subtasks       |
 
 ---
 
 ## Reference: Key Source Files
 
-| Component | File |
-|-----------|------|
-| System prompt builder | `rust/crates/runtime/src/prompts/system.rs` |
-| Context budget & tiers | `rust/crates/runtime/src/prompts/context.rs` |
-| Token estimation | `rust/crates/runtime/src/prompts/context.rs` (`estimate_tokens_precise`) |
-| Budget pressure calc | `rust/crates/runtime/src/turn/chat_turn_budget_pressure.rs` |
-| Payload assembly | `rust/crates/runtime/src/turn/chat_turn_payload.rs` |
-| Tool registry & costs | `rust/crates/runtime/src/tool_registry/registry.rs` |
-| Tool selector | `rust/crates/runtime/src/tool_selector.rs` |
-| Compaction | `rust/crates/runtime/src/turn/cloud/compaction.rs` |
-| History management | `rust/crates/runtime/src/turn/history.rs` |
+| Component              | File                                                                     |
+| ---------------------- | ------------------------------------------------------------------------ |
+| System prompt builder  | `rust/crates/runtime/src/prompts/system.rs`                              |
+| Context budget & tiers | `rust/crates/runtime/src/prompts/context.rs`                             |
+| Token estimation       | `rust/crates/runtime/src/prompts/context.rs` (`estimate_tokens_precise`) |
+| Budget pressure calc   | `rust/crates/runtime/src/turn/chat_turn_budget_pressure.rs`              |
+| Payload assembly       | `rust/crates/runtime/src/turn/chat_turn_payload.rs`                      |
+| Tool registry & costs  | `rust/crates/runtime/src/tool_registry/registry.rs`                      |
+| Tool selector          | `rust/crates/runtime/src/tool_selector.rs`                               |
+| Compaction             | `rust/crates/runtime/src/turn/cloud/compaction.rs`                       |
+| History management     | `rust/crates/runtime/src/turn/history.rs`                                |
 
 ---
 

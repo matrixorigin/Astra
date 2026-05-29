@@ -225,7 +225,7 @@ pub(crate) struct PostCompactAttachments<'a> {
     pub cwd: Option<&'a str>,
 }
 
-/// Minimal view of a single invoked skill that `assemble_llm_messages` needs.
+/// Minimal view of a single invoked skill that `assemble_llm_messages_with_cache_capability` needs.
 /// Copied out of the full `SkillInvocationRecord` so this module doesn't pull
 /// in the runtime's full state types. The caller is responsible for ordering
 /// (most-recent-first); we emit in the supplied order.
@@ -338,32 +338,6 @@ fn is_completion_signal(content: &str) -> bool {
 /// 5. Invoked-skill attachments (server path only).
 /// 6. Recent-file attachments (server path only).
 /// 7. `apply_anthropic_cache_metadata` (Anthropic path only).
-#[cfg(test)]
-pub(crate) fn assemble_llm_messages(
-    system_messages: Vec<Value>,
-    volatile_preamble: Vec<Value>,
-    drained_volatile: Vec<crate::turn::agentic_loop::host::VolatileInjection>,
-    compacted_messages: Vec<Value>,
-    attachments: &PostCompactAttachments<'_>,
-    session_id: &str,
-    provider: &str,
-    model_name: &str,
-    cache_cfg: &PromptCacheConfig,
-) -> Vec<Value> {
-    assemble_llm_messages_with_cache_capability(
-        system_messages,
-        volatile_preamble,
-        drained_volatile,
-        compacted_messages,
-        attachments,
-        session_id,
-        provider,
-        model_name,
-        None,
-        cache_cfg,
-    )
-}
-
 pub(crate) fn assemble_llm_messages_with_cache_capability(
     system_messages: Vec<Value>,
     volatile_preamble: Vec<Value>,
@@ -373,6 +347,7 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
     session_id: &str,
     provider: &str,
     model_name: &str,
+    thinking: &astra_turn_core::thinking_config::ThinkingConfig,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     cache_cfg: &PromptCacheConfig,
 ) -> Vec<Value> {
@@ -467,7 +442,16 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
             }
         }
     }
-    astra_turn_core::edge_ledger::strip_stale_reasoning(&mut llm_messages, provider, model_name);
+    let reasoning_policy = astra_turn_core::edge_ledger::ReasoningReplayPolicy::infer(
+        &llm_messages,
+        thinking,
+        provider,
+        model_name,
+    );
+    astra_turn_core::edge_ledger::strip_stale_reasoning_with_policy(
+        &mut llm_messages,
+        &reasoning_policy,
+    );
 
     if !attachments.invoked_skills.is_empty() {
         let mut builder = astra_turn_core::cloud_attachments::AttachmentBuilder::new();
@@ -560,7 +544,7 @@ pub(crate) fn render_drained_volatile(
 ///
 /// We keep only the FINAL occurrence of each known pattern (the most
 /// recent round's state is always the authoritative one) and return
-/// their concatenated text so [`assemble_llm_messages`] can prepend it
+/// their concatenated text so [`assemble_llm_messages_with_cache_capability`] can prepend it
 /// to the last user message. Stripping them out of history removes the
 /// mid-history byte churn; the agent still sees the same up-to-date
 /// nudges in the tail.
@@ -745,7 +729,7 @@ mod tests {
     fn assemble_empty_attachments_matches_simple_concat() {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let compacted = vec![json!({"role": "user", "content": "hi"})];
-        let msgs = assemble_llm_messages(
+        let msgs = assemble_llm_messages_with_cache_capability(
             system.clone(),
             Vec::new(),
             Vec::new(),
@@ -754,6 +738,8 @@ mod tests {
             "s1",
             "openai",
             "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
             &cache_cfg(),
         );
         // Expect system first, then compacted. No attachments injected.
@@ -767,7 +753,7 @@ mod tests {
     fn assemble_injects_invoked_skills_after_compacted_messages() {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let compacted = vec![json!({"role": "user", "content": "hi"})];
-        let msgs = assemble_llm_messages(
+        let msgs = assemble_llm_messages_with_cache_capability(
             system,
             Vec::new(),
             Vec::new(),
@@ -782,6 +768,8 @@ mod tests {
             "s1",
             "openai",
             "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
             &cache_cfg(),
         );
         // Skill attachment appears after the compacted user message.
@@ -897,7 +885,7 @@ mod tests {
     // Cross-caller parity pins
     //
     // Both `ServerAgenticLoopHost::execute_turn` and
-    // `InProcessChatTurnBridge::forward` call `assemble_llm_messages`.
+    // `InProcessChatTurnBridge::forward` call `assemble_llm_messages_with_cache_capability`.
     // These tests pin the convergence invariants the two callers rely on:
     // any drift here means one caller's wire output no longer matches the
     // other's for the same logical input.
@@ -914,7 +902,7 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "content": "hello"}),
         ];
-        let bridge_msgs = assemble_llm_messages(
+        let bridge_msgs = assemble_llm_messages_with_cache_capability(
             system.clone(),
             Vec::new(),
             Vec::new(),
@@ -923,9 +911,11 @@ mod tests {
             "sid",
             "openai",
             "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
             &cache_cfg(),
         );
-        let server_msgs = assemble_llm_messages(
+        let server_msgs = assemble_llm_messages_with_cache_capability(
             system,
             Vec::new(),
             Vec::new(),
@@ -938,6 +928,8 @@ mod tests {
             "sid",
             "openai",
             "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
             &cache_cfg(),
         );
         assert_eq!(
@@ -952,7 +944,7 @@ mod tests {
         // The server + bridge call sequence is:
         //   1. memoria.compact() → CompactResult
         //   2. maybe_append_continuation_prompt(&mut result.messages, hit)
-        //   3. assemble_llm_messages(system, preamble, result.messages, ...)
+        //   3. assemble_llm_messages_with_cache_capability(system, preamble, result.messages, ...)
         //
         // Running the same sequence twice on equal inputs must produce
         // byte-identical outputs — no hidden state, no call-count side effects.
@@ -966,7 +958,7 @@ mod tests {
 
         let mut first = make_compacted();
         maybe_append_continuation_prompt(&mut first, true);
-        let first_out = assemble_llm_messages(
+        let first_out = assemble_llm_messages_with_cache_capability(
             system.clone(),
             Vec::new(),
             Vec::new(),
@@ -975,12 +967,14 @@ mod tests {
             "sid",
             "openai",
             "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
             &cache_cfg(),
         );
 
         let mut second = make_compacted();
         maybe_append_continuation_prompt(&mut second, true);
-        let second_out = assemble_llm_messages(
+        let second_out = assemble_llm_messages_with_cache_capability(
             system,
             Vec::new(),
             Vec::new(),
@@ -989,6 +983,8 @@ mod tests {
             "sid",
             "openai",
             "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
             &cache_cfg(),
         );
 
@@ -1010,7 +1006,7 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "content": "there"}),
         ];
-        let bridge_out = assemble_llm_messages(
+        let bridge_out = assemble_llm_messages_with_cache_capability(
             system.clone(),
             Vec::new(),
             Vec::new(),
@@ -1019,9 +1015,11 @@ mod tests {
             "sid",
             "openai",
             "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
             &cache_cfg(),
         );
-        let server_out = assemble_llm_messages(
+        let server_out = assemble_llm_messages_with_cache_capability(
             system,
             Vec::new(),
             Vec::new(),
@@ -1037,6 +1035,8 @@ mod tests {
             "sid",
             "openai",
             "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
             &cache_cfg(),
         );
         // Server output must be a strict prefix extension of bridge output:
@@ -1066,7 +1066,7 @@ mod tests {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let compacted = vec![json!({"role": "user", "content": "hi"})];
 
-        let bridge_out = assemble_llm_messages(
+        let bridge_out = assemble_llm_messages_with_cache_capability(
             system.clone(),
             Vec::new(),
             Vec::new(),
@@ -1075,9 +1075,11 @@ mod tests {
             "sid",
             "anthropic", // anthropic triggers cache_control annotation
             "claude-sonnet-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4"),
         );
-        let server_out = assemble_llm_messages(
+        let server_out = assemble_llm_messages_with_cache_capability(
             system,
             Vec::new(),
             Vec::new(),
@@ -1093,6 +1095,8 @@ mod tests {
             "sid",
             "anthropic",
             "claude-sonnet-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4"),
         );
 
@@ -1107,7 +1111,7 @@ mod tests {
 
     #[test]
     fn prefix_only_providers_skip_anthropic_cache_annotations() {
-        let msgs = assemble_llm_messages(
+        let msgs = assemble_llm_messages_with_cache_capability(
             vec![json!({"role": "system", "content": "sys"})],
             Vec::new(),
             Vec::new(),
@@ -1116,6 +1120,8 @@ mod tests {
             "sid",
             "openai",
             "gpt-4o",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
             &PromptCacheConfig::latch("openai", "gpt-4o"),
         );
 
@@ -1143,7 +1149,7 @@ mod tests {
             json!({"role": "user", "content": "second question"}),
         ];
 
-        let msgs = assemble_llm_messages(
+        let msgs = assemble_llm_messages_with_cache_capability(
             stable_sys,
             volatile_preamble,
             Vec::new(),
@@ -1152,6 +1158,8 @@ mod tests {
             "sid",
             "deepseek",
             "deepseek-v4-pro",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
             &cache_cfg(),
         );
 
@@ -1193,7 +1201,7 @@ mod tests {
             json!({"role": "assistant", "content": "Understood."}),
         ];
         let compacted = vec![json!({"role": "user", "content": "hi"})];
-        let msgs = assemble_llm_messages(
+        let msgs = assemble_llm_messages_with_cache_capability(
             system,
             preamble,
             Vec::new(),
@@ -1202,6 +1210,8 @@ mod tests {
             "sid",
             "openai",
             "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
             &cache_cfg(),
         );
         // 2 messages: system + combined last user (volatile prepended to "hi")
@@ -1225,7 +1235,7 @@ mod tests {
             json!({"role": "assistant", "content": ""}),
             json!({"role": "tool", "content": "tool output", "tool_call_id": "c1"}),
         ];
-        let msgs = assemble_llm_messages(
+        let msgs = assemble_llm_messages_with_cache_capability(
             system,
             preamble,
             Vec::new(),
@@ -1234,6 +1244,8 @@ mod tests {
             "sid",
             "openai",
             "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
             &cache_cfg(),
         );
         assert_eq!(
@@ -1263,7 +1275,7 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "content": "tail assistant"}),
         ];
-        let msgs = assemble_llm_messages(
+        let msgs = assemble_llm_messages_with_cache_capability(
             system,
             preamble,
             Vec::new(),
@@ -1272,6 +1284,8 @@ mod tests {
             "sid",
             "openai",
             "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
             &cache_cfg(),
         );
 
@@ -1297,7 +1311,7 @@ mod tests {
             json!({"role": "assistant", "content": ""}),
             json!({"role": "tool", "content": "tool output", "tool_call_id": "c1"}),
         ];
-        let msgs = assemble_llm_messages(
+        let msgs = assemble_llm_messages_with_cache_capability(
             system,
             preamble,
             Vec::new(),
@@ -1306,6 +1320,8 @@ mod tests {
             "sid",
             "anthropic",
             "claude-sonnet-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
             &anthropic_cache_cfg(),
         );
 
@@ -1338,7 +1354,7 @@ mod tests {
             json!({"role": "tool", "content": "tool output", "tool_call_id": "c1"}),
             json!({"role": "system", "content": "✓ 2 tools executed in parallel — excellent. Keep batching independent operations."}),
         ];
-        let msgs = assemble_llm_messages(
+        let msgs = assemble_llm_messages_with_cache_capability(
             system,
             preamble,
             drained,
@@ -1347,6 +1363,8 @@ mod tests {
             "sid",
             "openai",
             "deepseek-v4-flash",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
             &cache_cfg(),
         );
         assert_eq!(msgs.len(), 4, "no synthetic volatile tail should remain");

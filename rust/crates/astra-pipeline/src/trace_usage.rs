@@ -40,7 +40,13 @@ impl ResourceTracker {
         }
     }
 
-    pub fn record(&mut self, event_count: usize, byte_usage: usize, tool_call_count: usize, turn_duration_ms: u64) {
+    pub fn record(
+        &mut self,
+        event_count: usize,
+        byte_usage: usize,
+        tool_call_count: usize,
+        turn_duration_ms: u64,
+    ) {
         let snapshot = ResourceSnapshot {
             timestamp_secs: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -59,54 +65,97 @@ impl ResourceTracker {
         self.snapshots.push_back(snapshot);
     }
 
-    pub fn total_events(&self) -> usize { self.total_events }
-    pub fn total_bytes(&self) -> usize { self.total_bytes }
-    pub fn turn_count(&self) -> usize { self.snapshots.len() }
+    pub fn total_events(&self) -> usize {
+        self.total_events
+    }
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+    pub fn turn_count(&self) -> usize {
+        self.snapshots.len()
+    }
 
     pub fn avg_events_per_turn(&self) -> f64 {
-        if self.snapshots.is_empty() { return 0.0; }
+        if self.snapshots.is_empty() {
+            return 0.0;
+        }
         self.total_events as f64 / self.snapshots.len() as f64
     }
 
     pub fn avg_bytes_per_turn(&self) -> f64 {
-        if self.snapshots.is_empty() { return 0.0; }
+        if self.snapshots.is_empty() {
+            return 0.0;
+        }
         self.total_bytes as f64 / self.snapshots.len() as f64
     }
 
     pub fn peak_events(&self) -> usize {
-        self.snapshots.iter().map(|s| s.event_count).max().unwrap_or(0)
+        self.snapshots
+            .iter()
+            .map(|s| s.event_count)
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn peak_bytes(&self) -> usize {
-        self.snapshots.iter().map(|s| s.byte_usage).max().unwrap_or(0)
+        self.snapshots
+            .iter()
+            .map(|s| s.byte_usage)
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn event_trend(&self) -> f64 {
-        if self.snapshots.len() < 2 { return 0.0; }
+        if self.snapshots.len() < 2 {
+            return 0.0;
+        }
         let half = self.snapshots.len() / 2;
         let older: Vec<_> = self.snapshots.iter().take(half).collect();
         let recent: Vec<_> = self.snapshots.iter().rev().take(half).collect();
-        let older_avg = if older.is_empty() { 0.0 } else {
+        let older_avg = if older.is_empty() {
+            0.0
+        } else {
             older.iter().map(|s| s.event_count as f64).sum::<f64>() / older.len() as f64
         };
-        let recent_avg = if recent.is_empty() { 0.0 } else {
+        let recent_avg = if recent.is_empty() {
+            0.0
+        } else {
             recent.iter().map(|s| s.event_count as f64).sum::<f64>() / recent.len() as f64
         };
-        if older_avg == 0.0 { recent_avg } else { recent_avg - older_avg }
+        if older_avg == 0.0 {
+            recent_avg
+        } else {
+            recent_avg - older_avg
+        }
     }
 
     pub fn avg_tool_calls_per_turn(&self) -> f64 {
-        if self.snapshots.is_empty() { return 0.0; }
-        self.snapshots.iter().map(|s| s.tool_call_count as f64).sum::<f64>() / self.snapshots.len() as f64
+        if self.snapshots.is_empty() {
+            return 0.0;
+        }
+        self.snapshots
+            .iter()
+            .map(|s| s.tool_call_count as f64)
+            .sum::<f64>()
+            / self.snapshots.len() as f64
     }
 
     pub fn avg_turn_duration_ms(&self) -> f64 {
-        if self.snapshots.is_empty() { return 0.0; }
-        self.snapshots.iter().map(|s| s.turn_duration_ms as f64).sum::<f64>() / self.snapshots.len() as f64
+        if self.snapshots.is_empty() {
+            return 0.0;
+        }
+        self.snapshots
+            .iter()
+            .map(|s| s.turn_duration_ms as f64)
+            .sum::<f64>()
+            / self.snapshots.len() as f64
     }
 
     pub fn session_elapsed_secs(&self) -> u64 {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         now.saturating_sub(self.session_start_secs)
     }
 
@@ -128,7 +177,9 @@ impl ResourceTracker {
 }
 
 impl Default for ResourceTracker {
-    fn default() -> Self { Self::new(100) }
+    fn default() -> Self {
+        Self::new(100)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,7 +189,11 @@ pub enum ResourceHealth {
     Critical,
 }
 
-pub fn evaluate_health(tracker: &ResourceTracker, max_events: usize, max_bytes_mb: u64) -> ResourceHealth {
+pub fn evaluate_health(
+    tracker: &ResourceTracker,
+    max_events: usize,
+    max_bytes_mb: u64,
+) -> ResourceHealth {
     let max_bytes = (max_bytes_mb * 1024 * 1024) as usize;
     if tracker.total_events > max_events || tracker.total_bytes > max_bytes {
         return ResourceHealth::Critical;
@@ -208,23 +263,33 @@ mod tests {
     #[test]
     fn event_trend_increasing() {
         let mut t = ResourceTracker::new(6);
-        for _ in 0..3 { t.record(10, 100, 1, 10); }
-        for _ in 0..3 { t.record(30, 100, 1, 10); }
+        for _ in 0..3 {
+            t.record(10, 100, 1, 10);
+        }
+        for _ in 0..3 {
+            t.record(30, 100, 1, 10);
+        }
         assert!(t.event_trend() > 0.0);
     }
 
     #[test]
     fn event_trend_decreasing() {
         let mut t = ResourceTracker::new(6);
-        for _ in 0..3 { t.record(30, 100, 1, 10); }
-        for _ in 0..3 { t.record(10, 100, 1, 10); }
+        for _ in 0..3 {
+            t.record(30, 100, 1, 10);
+        }
+        for _ in 0..3 {
+            t.record(10, 100, 1, 10);
+        }
         assert!(t.event_trend() < 0.0);
     }
 
     #[test]
     fn event_trend_stable() {
         let mut t = ResourceTracker::new(4);
-        for _ in 0..4 { t.record(20, 100, 1, 10); }
+        for _ in 0..4 {
+            t.record(20, 100, 1, 10);
+        }
         assert!((t.event_trend() - 0.0).abs() < 0.01);
     }
 

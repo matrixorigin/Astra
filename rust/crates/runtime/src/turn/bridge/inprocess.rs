@@ -2426,6 +2426,7 @@ impl InProcessChatTurnBridge {
                 bridge_volatile_text.take(),
                 &provider,
                 &model_name,
+                &thinking_config,
                 cache_capability,
             );
 
@@ -5081,6 +5082,7 @@ mod tests {
                 Some("volatile".to_string()),
                 "anthropic",
                 "claude-sonnet-4",
+                &astra_turn_core::thinking_config::ThinkingConfig::Off,
                 None,
             );
         crate::turn::llm::context::apply_bridge_message_cache_metadata(

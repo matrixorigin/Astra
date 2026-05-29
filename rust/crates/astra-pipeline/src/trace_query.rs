@@ -346,13 +346,12 @@ mod tests {
                 // Find the event with this id and walk UP its caused_by chain
                 if let Some(event) = self.events.iter().find(|e| e.event_id == id) {
                     for parent_id in &event.caused_by {
-                        if visited.insert(parent_id.clone()) {
-                            if let Some(parent) =
+                        if visited.insert(parent_id.clone())
+                            && let Some(parent) =
                                 self.events.iter().find(|e| e.event_id == *parent_id)
-                            {
-                                result.push(parent);
-                                to_visit.push(parent_id.clone());
-                            }
+                        {
+                            result.push(parent);
+                            to_visit.push(parent_id.clone());
                         }
                     }
                 }

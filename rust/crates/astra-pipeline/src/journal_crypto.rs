@@ -4,7 +4,7 @@
 //! Key is derived from `ASTRA_JOURNAL_KEY` env var or auto-generated
 //! from the machine-id, ensuring journal files on disk are encrypted.
 
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 
 const NONCE_LEN: usize = 12; // AES-256-GCM uses 96-bit (12-byte) nonces

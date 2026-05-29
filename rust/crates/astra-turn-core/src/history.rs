@@ -258,8 +258,8 @@ pub fn merge_tool_results_into_history(
 }
 
 /// Check if any assistant message in the history has reasoning_content.
-/// When thinking is enabled, ALL assistant messages with tool_calls must have
-/// this field (even empty string) or the API returns 400.
+/// When thinking is enabled, assistant history replay must preserve this field
+/// on every assistant message, even when the replayed value is empty.
 fn history_has_reasoning(history: &[Value]) -> bool {
     history.iter().any(|m| {
         m.get("role").and_then(Value::as_str) == Some("assistant")
@@ -348,7 +348,9 @@ pub fn append_recovered_events(history: &mut Vec<Value>, rows: &[RecoveredEventR
                             Value::Array(pending_tool_calls.clone()),
                         ),
                     ]);
-                    // When thinking is enabled, ALL assistant+tool_calls messages must have reasoning_content
+                    // Thinking-mode replay must preserve reasoning_content on
+                    // every assistant message, including flushed tool-call
+                    // wrappers that only exist in recovered history.
                     if force_reasoning_field || !pending_reasoning.is_empty() {
                         assistant.insert(
                             "reasoning_content".to_string(),
@@ -412,7 +414,9 @@ pub fn append_recovered_events(history: &mut Vec<Value>, rows: &[RecoveredEventR
                             Value::Array(pending_tool_calls.clone()),
                         ),
                     ]);
-                    // When thinking is enabled, ALL assistant+tool_calls messages must have reasoning_content
+                    // Thinking-mode replay must preserve reasoning_content on
+                    // every assistant message, including flushed tool-call
+                    // wrappers that only exist in recovered history.
                     if force_reasoning_field || !pending_reasoning.is_empty() {
                         flushed.insert(
                             "reasoning_content".to_string(),
@@ -427,7 +431,7 @@ pub fn append_recovered_events(history: &mut Vec<Value>, rows: &[RecoveredEventR
                     ("role".to_string(), Value::String("assistant".to_string())),
                     ("content".to_string(), Value::String(content)),
                 ]);
-                if !row_reasoning.is_empty() {
+                if force_reasoning_field || !row_reasoning.is_empty() {
                     assistant.insert(
                         "reasoning_content".to_string(),
                         Value::String(row_reasoning),
@@ -445,7 +449,8 @@ pub fn append_recovered_events(history: &mut Vec<Value>, rows: &[RecoveredEventR
             ("content".to_string(), Value::String(String::new())),
             ("tool_calls".to_string(), Value::Array(pending_tool_calls)),
         ]);
-        // When thinking is enabled, ALL assistant+tool_calls messages must have reasoning_content
+        // Thinking-mode replay must preserve reasoning_content on every
+        // assistant message, including terminal flushed tool-call batches.
         if force_reasoning_field || !pending_reasoning.is_empty() {
             assistant.insert(
                 "reasoning_content".to_string(),
@@ -806,6 +811,53 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0]["content"], "The answer is 42");
         assert_eq!(history[0]["reasoning_content"], "thinking hard");
+    }
+
+    #[test]
+    fn append_llm_response_without_reasoning_keeps_empty_field_in_thinking_history() {
+        let mut history = Vec::new();
+        let rows = vec![
+            RecoveredEventRow {
+                event_type: "llm_response".to_string(),
+                content: Some("First answer".to_string()),
+                metadata: None,
+                reasoning_content: Some("reason step 1".to_string()),
+            },
+            RecoveredEventRow {
+                event_type: "user_query".to_string(),
+                content: Some("follow up".to_string()),
+                metadata: None,
+                reasoning_content: None,
+            },
+            RecoveredEventRow {
+                event_type: "llm_response".to_string(),
+                content: Some("Second answer".to_string()),
+                metadata: None,
+                reasoning_content: None,
+            },
+        ];
+
+        append_recovered_events(&mut history, &rows);
+
+        assert_eq!(history.len(), 3);
+        assert_eq!(
+            history[0]["reasoning_content"].as_str(),
+            Some("reason step 1")
+        );
+        // thinking-enabled models (DeepSeek-R1, Kimi-k2.5, Claude extended
+        // thinking) reject replayed history with HTTP 400 if any assistant
+        // message lacks `reasoning_content` once any turn in the session
+        // emitted reasoning.  Plain assistant messages (no tool_calls) are
+        // NOT exempt — the API enforces the field pervasively.  This test
+        // validates that `append_recovered_events` corrects historical
+        // events to include the empty field when a prior message proves
+        // thinking was active.  The wire-assembly path
+        // (`strip_stale_reasoning_with_policy`) applies the same rule.
+        assert_eq!(
+            history[2]["reasoning_content"].as_str(),
+            Some(""),
+            "thinking history must keep an explicit empty reasoning_content field",
+        );
     }
 
     #[test]

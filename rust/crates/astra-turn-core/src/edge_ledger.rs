@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 /// Cap in-memory map size. New entries are REJECTED (not evicted) when this
@@ -209,7 +209,6 @@ pub fn on_ledger_insert(key: &str) {
 /// removal is appended to `edge_ledger.jsonl`. On process restart,
 /// [`recover_from_persistence`] replays the journal to restore
 /// un-consumed entries.
-
 /// Persistence handle for the edge callback ledger.
 #[derive(Debug, Clone)]
 pub struct LedgerPersistence {
@@ -322,7 +321,7 @@ pub async fn take_ledger_entry(
     let mut retries: u32 = 0;
     loop {
         // Sweep stale entries every 5th retry (avoid lock contention).
-        if retries % 5 == 0 {
+        if retries.is_multiple_of(5) {
             let _ = sweep_expired_entries(ledger).await;
         }
         // Record poll in metadata.
@@ -501,74 +500,92 @@ pub fn assistant_message_with_tool_calls_and_reasoning(
     msg
 }
 
-/// Returns `true` when the provider requires **full** `reasoning_content` to be
-/// preserved on every assistant message in multi-turn tool-call conversations.
-///
-/// Moonshot (Kimi-k2.5, kimi-k2-thinking) rejects requests with empty-string
-/// `reasoning_content` on assistant+tool_calls messages when thinking mode is
-/// active (which is the default for kimi-k2.5).  Other providers (OpenAI,
-/// Anthropic, DeepSeek) accept empty strings and benefit from the token savings.
-pub fn provider_preserves_reasoning(provider: &str, model: &str) -> bool {
-    provider == "moonshot" || model.starts_with("kimi-k2")
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReasoningReplayPolicy {
+    enforce_reasoning_field: bool,
+    placeholder: String,
+    can_strip_unsigned_reasoning: bool,
+}
+
+impl ReasoningReplayPolicy {
+    pub fn infer(
+        messages: &[Value],
+        thinking: &crate::thinking_config::ThinkingConfig,
+        provider: &str,
+        model: &str,
+    ) -> Self {
+        let enforce_reasoning_field =
+            !matches!(thinking, crate::thinking_config::ThinkingConfig::Off)
+                || history_has_reasoning(messages);
+        let observed_placeholder = observed_reasoning_placeholder(messages);
+        let placeholder = observed_placeholder
+            .unwrap_or_else(|| fallback_reasoning_placeholder(provider, model))
+            .to_string();
+        Self {
+            enforce_reasoning_field,
+            placeholder,
+            can_strip_unsigned_reasoning: observed_placeholder.is_some()
+                || fallback_reasoning_placeholder(provider, model).is_empty(),
+        }
+    }
+
+    fn placeholder_value(&self) -> Value {
+        Value::String(self.placeholder.clone())
+    }
+}
+
+/// Inspect the message history for an assistant reasoning_content string that
+/// is all-whitespace but non-empty.  This is the pattern used by Moonshot
+/// (Kimi) to mark a turn where thinking is enabled but the model produced no
+/// reasoning — it emits `" "` rather than `""`.  If we observe this pattern,
+/// we adopt it as our own placeholder so that replayed messages match what the
+/// upstream provider sent.  Falls back to `""` if the history only contains
+/// genuinely empty strings, and `None` if no reasoning_content fields exist
+/// at all (leaving the choice entirely to [`fallback_reasoning_placeholder`]).
+fn observed_reasoning_placeholder(messages: &[Value]) -> Option<&str> {
+    let mut saw_empty = false;
+    for msg in messages {
+        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(reasoning) = msg.get("reasoning_content").and_then(Value::as_str) else {
+            continue;
+        };
+        if reasoning.trim().is_empty() {
+            if !reasoning.is_empty() {
+                return Some(reasoning);
+            }
+            saw_empty = true;
+        }
+    }
+    saw_empty.then_some("")
+}
+
+fn fallback_reasoning_placeholder(provider: &str, model: &str) -> &'static str {
+    if provider == "moonshot" || model.starts_with("kimi-k2") {
+        " "
+    } else {
+        ""
+    }
+}
+
+fn needs_reasoning_placeholder(msg: &Value, placeholder: &str) -> bool {
+    match msg.get("reasoning_content").and_then(Value::as_str) {
+        None => true,
+        Some(existing) if existing.trim().is_empty() && existing != placeholder => true,
+        _ => false,
+    }
 }
 
 /// Strip `reasoning_content` values from older assistant messages to reduce token usage.
 ///
 /// Thinking-model sessions accumulate large reasoning chains on every assistant message.
-/// Since the LLM gains no benefit from re-reading old reasoning, we clear the value
-/// (replace with empty string) on all assistant messages **except** the last one.
-/// The field is kept (as empty string) so thinking-model API contracts are satisfied.
-///
-/// **Skipped entirely** when `provider_preserves_reasoning` returns true (e.g. Moonshot),
-/// because those providers reject empty-string reasoning_content.
-///
-/// **Signature-bearing assistant messages are preserved verbatim** regardless of
-/// position. Anthropic's Messages API (and proxies like DeepSeek's
-/// `/anthropic` endpoint) require the full original `thinking` block plus
-/// its HMAC `signature` to be echoed on every assistant+tool_use turn in
-/// a thinking-enabled request. Stripping the content would work the first
-/// time but fail on the next round when the signature references a
-/// now-empty thinking block — session effccfcd-28d8-41f4-a4b0-ecd0ec503625
-/// t4_r2 hit `content[].thinking in the thinking mode must be passed
-/// back to the API`. Presence of a non-empty `reasoning_signature` is
-/// authoritative evidence that the upstream emitted a signed thinking
-/// block and will reject replay without it.
-///
-/// **Only affects the in-flight messages array** — heavy checkpoints and persisted events
-/// retain the full reasoning for debugging and audit.
-pub fn strip_stale_reasoning(messages: &mut [Value], provider: &str, model: &str) {
-    if provider_preserves_reasoning(provider, model) {
-        // Provider requires full reasoning on every assistant message — ensure
-        // the field exists on all assistant+tool_calls messages but do NOT clear
-        // any existing content.
-        //
-        // Moonshot rejects both absent and empty-string `reasoning_content` when
-        // thinking is enabled.  For messages that genuinely never had reasoning
-        // (e.g. pre-thinking-model messages in a mid-session switch), we insert
-        // a single space — the minimum non-empty value Moonshot accepts.
-        if !history_has_reasoning(messages) {
-            return;
-        }
-        let placeholder = Value::String(" ".to_string());
-        for msg in messages.iter_mut() {
-            if msg.get("role").and_then(Value::as_str) != Some("assistant") {
-                continue;
-            }
-            if msg.get("tool_calls").is_none() {
-                continue;
-            }
-            match msg.get("reasoning_content").and_then(Value::as_str) {
-                None => {
-                    msg["reasoning_content"] = placeholder.clone();
-                }
-                Some("") => {
-                    msg["reasoning_content"] = placeholder.clone();
-                }
-                Some(_) => {} // non-empty — keep as-is
-            }
-        }
+/// Since the LLM gains no benefit from re-reading old reasoning, we normalize
+pub fn strip_stale_reasoning_with_policy(messages: &mut [Value], policy: &ReasoningReplayPolicy) {
+    if !policy.enforce_reasoning_field {
         return;
     }
+    let placeholder = policy.placeholder_value();
     // Find index of the last assistant message that has non-empty reasoning.
     let last_reasoning_idx = messages
         .iter()
@@ -583,11 +600,20 @@ pub fn strip_stale_reasoning(messages: &mut [Value], provider: &str, model: &str
         .map(|(i, _)| i);
 
     let Some(last_idx) = last_reasoning_idx else {
-        return; // No reasoning in history — nothing to strip.
+        for msg in messages.iter_mut() {
+            if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+                continue;
+            }
+            if needs_reasoning_placeholder(msg, policy.placeholder.as_str()) {
+                msg["reasoning_content"] = placeholder.clone();
+            }
+        }
+        return;
     };
 
-    // Thinking is active — every assistant message with tool_calls must have
-    // `reasoning_content` (even empty string) or providers like Kimi return 400.
+    // Thinking is active — every assistant message must keep an explicit
+    // `reasoning_content` field (even empty string) or providers such as
+    // DeepSeek/Kimi reject the replayed history with HTTP 400.
     for (i, msg) in messages.iter_mut().enumerate() {
         if msg.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
@@ -611,9 +637,10 @@ pub fn strip_stale_reasoning(messages: &mut [Value], provider: &str, model: &str
                 .get("reasoning_content")
                 .and_then(Value::as_str)
                 .is_some_and(|s| !s.is_empty())
+                && policy.can_strip_unsigned_reasoning
             {
-                // Replace with empty string (keep field for API compat).
-                msg["reasoning_content"] = Value::String(String::new());
+                // Replace with the policy placeholder (keep field for API compat).
+                msg["reasoning_content"] = placeholder.clone();
                 // Signature is meaningless without reasoning text — and
                 // defensively stripped in case an empty signature leaked
                 // through. The signed-message guard above already skipped
@@ -621,14 +648,16 @@ pub fn strip_stale_reasoning(messages: &mut [Value], provider: &str, model: &str
                 if let Some(obj) = msg.as_object_mut() {
                     obj.remove("reasoning_signature");
                 }
-            } else if msg.get("reasoning_content").is_none() && msg.get("tool_calls").is_some() {
-                // Assistant tool_call message from before thinking was enabled —
-                // add the field so the provider doesn't reject it.
-                msg["reasoning_content"] = Value::String(String::new());
+            } else if needs_reasoning_placeholder(msg, policy.placeholder.as_str()) {
+                // Assistant message from before thinking was enabled — add the
+                // field so replay stays valid after a mid-session switch or a
+                // provider that requires explicit reasoning placeholders.
+                msg["reasoning_content"] = placeholder.clone();
             }
-        } else if msg.get("reasoning_content").is_none() && msg.get("tool_calls").is_some() {
-            // Even at or after last_idx, ensure the field exists on tool_call messages.
-            msg["reasoning_content"] = Value::String(String::new());
+        } else if needs_reasoning_placeholder(msg, policy.placeholder.as_str()) {
+            // Even at or after last_idx, ensure the field exists on assistant
+            // messages that replay into a thinking-mode request.
+            msg["reasoning_content"] = placeholder.clone();
         }
     }
 }
@@ -637,7 +666,7 @@ pub fn strip_stale_reasoning(messages: &mut [Value], provider: &str, model: &str
 mod tests {
     use super::*;
 
-    use crate::history::{append_recovered_events, RecoveredEventRow};
+    use crate::history::{RecoveredEventRow, append_recovered_events};
 
     #[test]
     fn callback_keys_match_handler_convention() {
@@ -900,7 +929,14 @@ mod tests {
             json!({"role": "assistant", "content": null, "reasoning_content": "think2", "tool_calls": []}),
             json!({"role": "tool", "tool_call_id": "t2", "content": "r2"}),
         ];
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         // First assistant: reasoning cleared to empty
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some(""));
         // Second assistant: reasoning preserved
@@ -914,7 +950,14 @@ mod tests {
             json!({"role": "assistant", "content": "hello"}),
         ];
         let original = msgs.clone();
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_eq!(msgs, original);
     }
 
@@ -924,7 +967,14 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "reasoning_content": "deep thought", "content": "42"}),
         ];
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("deep thought"));
     }
 
@@ -934,7 +984,14 @@ mod tests {
             json!({"role": "assistant", "reasoning_content": "", "content": "a"}),
             json!({"role": "assistant", "reasoning_content": "real", "content": "b"}),
         ];
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         // Already-empty field stays empty (not removed).
         assert_eq!(msgs[0]["reasoning_content"].as_str(), Some(""));
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("real"));
@@ -973,7 +1030,14 @@ mod tests {
             }),
             json!({"role": "tool", "tool_call_id": "t2", "content": "r2"}),
         ];
-        strip_stale_reasoning(&mut msgs, "anthropic", "deepseek-v4-pro-anthropic");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "anthropic",
+            "deepseek-v4-pro-anthropic",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         // Older assistant (idx 1) has a signature — MUST be preserved verbatim,
         // not cleared to empty. That's the effccfcd regression.
         assert_eq!(
@@ -1022,7 +1086,14 @@ mod tests {
                 ]
             }),
         ];
-        strip_stale_reasoning(&mut msgs, "anthropic", "claude-sonnet-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "anthropic",
+            "claude-sonnet-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_eq!(
             msgs[1]["reasoning_content"].as_str(),
             Some("signed thought")
@@ -1070,7 +1141,14 @@ mod tests {
                 ]
             }),
         ];
-        strip_stale_reasoning(&mut msgs, "anthropic", "claude-sonnet-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "anthropic",
+            "claude-sonnet-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         // Unsigned older → stripped to empty
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some(""));
         assert!(msgs[1].get("reasoning_signature").is_none());
@@ -1094,7 +1172,14 @@ mod tests {
             json!({"role": "assistant", "content": null, "reasoning_content": "think", "tool_calls": [{"id":"t2","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
             json!({"role": "tool", "tool_call_id": "t2", "content": "ok2"}),
         ];
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         // Old assistant+tool_calls at index 1 must now have reasoning_content
         assert_eq!(
             msgs[1]["reasoning_content"].as_str(),
@@ -1103,6 +1188,54 @@ mod tests {
         );
         // Latest reasoning preserved
         assert_eq!(msgs[5]["reasoning_content"].as_str(), Some("think"));
+    }
+
+    #[test]
+    fn strip_stale_reasoning_adds_field_to_plain_assistant_missing_it() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+            json!({"role": "user", "content": "continue"}),
+            json!({"role": "assistant", "content": "done", "reasoning_content": "deep thought"}),
+        ];
+
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "deepseek",
+            "deepseek-v4-pro-official",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
+
+        assert_eq!(
+            msgs[1]["reasoning_content"].as_str(),
+            Some(""),
+            "older plain assistant messages still need explicit reasoning placeholders",
+        );
+        assert_eq!(msgs[3]["reasoning_content"].as_str(), Some("deep thought"));
+    }
+
+    #[test]
+    fn strip_stale_reasoning_moonshot_adds_placeholder_to_plain_assistant() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+            json!({"role": "user", "content": "continue"}),
+            json!({"role": "assistant", "content": "done", "reasoning_content": "deep thought"}),
+        ];
+
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "moonshot",
+            "kimi-k2.5",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
+
+        assert_eq!(msgs[1]["reasoning_content"].as_str(), Some(" "));
+        assert_eq!(msgs[3]["reasoning_content"].as_str(), Some("deep thought"));
     }
 
     // ── Thinking-model / Kimi: reasoning_content on every assistant+tool_calls ──
@@ -1179,7 +1312,14 @@ mod tests {
     #[test]
     fn mid_session_switch_to_thinking_model_all_tool_call_msgs_get_reasoning() {
         let mut msgs = build_mid_switch_session();
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert!(history_has_reasoning(&msgs));
         assert_all_assistant_tool_calls_have_reasoning(&msgs);
     }
@@ -1187,7 +1327,14 @@ mod tests {
     #[test]
     fn mid_session_switch_preserves_latest_reasoning_content() {
         let mut msgs = build_mid_switch_session();
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         let last_reasoning = msgs
             .iter()
             .rev()
@@ -1198,16 +1345,25 @@ mod tests {
                         .is_some_and(|s| !s.is_empty())
             })
             .expect("should have at least one message with non-empty reasoning");
-        assert!(!last_reasoning["reasoning_content"]
-            .as_str()
-            .unwrap()
-            .is_empty());
+        assert!(
+            !last_reasoning["reasoning_content"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn old_non_thinking_tool_call_msgs_get_empty_reasoning() {
         let mut msgs = build_mid_switch_session();
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_eq!(msgs[2]["reasoning_content"].as_str(), Some(""));
         assert_eq!(msgs[6]["reasoning_content"].as_str(), Some(""));
         assert_eq!(msgs[11]["reasoning_content"].as_str(), Some(""));
@@ -1317,7 +1473,14 @@ mod tests {
         }));
         history.push(json!({"role": "tool", "tool_call_id": "tc-new", "content": "result"}));
 
-        strip_stale_reasoning(&mut history, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &history,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut history, &policy);
         assert_all_assistant_tool_calls_have_reasoning(&history);
     }
 
@@ -1334,7 +1497,14 @@ mod tests {
             json!({"role": "assistant", "content": "done"}),
         ];
         let original = msgs.clone();
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_eq!(msgs, original);
     }
 
@@ -1357,35 +1527,39 @@ mod tests {
                 "tool_calls": [{"id": "tc-2", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]
             }),
         ];
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_all_assistant_tool_calls_have_reasoning(&msgs);
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some(""));
         assert_eq!(msgs[5]["reasoning_content"].as_str(), Some("thinking..."));
     }
 
-    // ── Moonshot / provider_preserves_reasoning tests ────────────────────
+    // ── Reasoning replay policy tests ────────────────────────────────────
 
     #[test]
-    fn provider_preserves_reasoning_moonshot() {
-        assert!(super::provider_preserves_reasoning("moonshot", "kimi-k2.5"));
-        assert!(super::provider_preserves_reasoning(
-            "moonshot",
-            "kimi-k2-thinking"
-        ));
-        assert!(super::provider_preserves_reasoning(
-            "moonshot",
-            "some-other-model"
-        ));
-        assert!(super::provider_preserves_reasoning("other", "kimi-k2.5"));
-        assert!(!super::provider_preserves_reasoning("openai", "gpt-4"));
-        assert!(!super::provider_preserves_reasoning(
-            "deepseek",
-            "deepseek-chat"
-        ));
-        assert!(!super::provider_preserves_reasoning(
-            "anthropic",
-            "claude-3"
-        ));
+    fn reasoning_replay_policy_prefers_observed_placeholder_shape() {
+        let msgs = vec![
+            json!({"role": "assistant", "content": "older", "reasoning_content": "   "}),
+            json!({"role": "assistant", "content": "newer", "reasoning_content": "think"}),
+        ];
+
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+            "openai",
+            "gpt-4",
+        );
+
+        assert_eq!(policy.placeholder, "   ");
+        assert!(policy.can_strip_unsigned_reasoning);
     }
 
     #[test]
@@ -1398,8 +1572,15 @@ mod tests {
             json!({"role": "assistant", "content": null, "reasoning_content": "think2", "tool_calls": [{"id":"t2","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
             json!({"role": "tool", "tool_call_id": "t2", "content": "r2"}),
         ];
-        strip_stale_reasoning(&mut msgs, "moonshot", "kimi-k2.5");
-        // Both reasoning_content values must be preserved (not cleared).
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+            "moonshot",
+            "kimi-k2.5",
+        );
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("think1"));
         assert_eq!(msgs[4]["reasoning_content"].as_str(), Some("think2"));
     }
@@ -1415,7 +1596,15 @@ mod tests {
             json!({"role": "assistant", "content": null, "reasoning_content": "think", "tool_calls": [{"id":"t2","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
             json!({"role": "tool", "tool_call_id": "t2", "content": "r2"}),
         ];
-        strip_stale_reasoning(&mut msgs, "moonshot", "kimi-k2.5");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+            "moonshot",
+            "kimi-k2.5",
+        );
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         // Old message gets placeholder (no reasoning to preserve).
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some(" "));
         // Thinking message keeps its content.
@@ -1423,20 +1612,35 @@ mod tests {
     }
 
     #[test]
-    fn moonshot_strip_noop_without_reasoning() {
+    fn thinking_policy_without_reasoning_backfills_assistant_messages() {
         let mut msgs = vec![
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "content": "hello"}),
         ];
-        let original = msgs.clone();
-        strip_stale_reasoning(&mut msgs, "moonshot", "kimi-k2.5");
-        assert_eq!(msgs, original);
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+            "deepseek",
+            "deepseek-v4-pro-official",
+        );
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
+        assert_eq!(msgs[1]["reasoning_content"].as_str(), Some(""));
     }
 
     #[test]
     fn moonshot_full_mid_switch_session_preserves_all() {
         let mut msgs = build_mid_switch_session();
-        strip_stale_reasoning(&mut msgs, "moonshot", "kimi-k2.5");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+            "moonshot",
+            "kimi-k2.5",
+        );
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_all_assistant_tool_calls_have_reasoning(&msgs);
         // Old non-thinking tool_call messages get space placeholder.
         assert_eq!(msgs[2]["reasoning_content"].as_str(), Some(" "));
@@ -1462,8 +1666,15 @@ mod tests {
             json!({"role": "assistant", "content": null, "reasoning_content": "think2", "tool_calls": [{"id":"t2","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
             json!({"role": "tool", "tool_call_id": "t2", "content": "r2"}),
         ];
-        // Even if provider is "other", model name "kimi-k2.5" triggers preserve.
-        strip_stale_reasoning(&mut msgs, "other", "kimi-k2.5");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+            "other",
+            "kimi-k2.5",
+        );
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("think1"));
         assert_eq!(msgs[3]["reasoning_content"].as_str(), Some("think2"));
     }

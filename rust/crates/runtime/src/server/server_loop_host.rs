@@ -2295,10 +2295,10 @@ impl ServerAgenticLoopHost {
             .await
     }
 
-    /// Thin wrapper around [`wire_assembly::assemble_llm_messages`] that
+    /// Thin wrapper around [`wire_assembly::assemble_llm_messages_with_cache_capability`] that
     /// extracts the server-path-specific attachments from `AgenticLoopState`
     /// (invoked skills + recently-read files) and delegates the rest. The
-    /// shared module handles `strip_stale_reasoning`, continuation-prompt
+    /// shared module handles `strip_stale_reasoning_with_policy`, continuation-prompt
     /// insertion, attachment ordering, and cache annotations.
     fn assemble_llm_messages(
         &self,
@@ -2313,12 +2313,14 @@ impl ServerAgenticLoopHost {
         // pipeline as an `extra_dynamic_sections` entry (RuntimeVolatile,
         // None scope). See `context_pipeline_adapter` — post-hoc injection
         // here would double up the content on the wire.
+        let thinking = state.thinking.clone();
         crate::turn::llm::context::assemble_wire_messages(
             crate::turn::llm::context::LlmWireAssemblyInput {
                 system_messages,
                 volatile_preamble,
                 compacted_messages,
                 state,
+                thinking: &thinking,
                 edge_profile: &self.edge_profile,
                 session_id: &self.session_id,
                 provider: &llm_cfg.provider,

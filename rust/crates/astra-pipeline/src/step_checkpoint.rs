@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 
 use astra_services::SessionArtifactStore;
 
+use crate::journal_crypto::JournalCrypto;
 use crate::journal_crypto::hex_decode;
 use crate::journal_crypto::hex_encode;
-use crate::journal_crypto::JournalCrypto;
 use crate::step_protocol::{
     CheckpointTier, HeavyCheckpoint, LightCheckpoint, StepCheckpoint, StepEvent, StepEventStore,
 };
@@ -130,8 +130,7 @@ pub fn read_latest_heavy_checkpoint(session_id: &str) -> std::io::Result<Option<
                 continue;
             }
         };
-        let decrypted = decrypt_checkpoint(&content)
-            .unwrap_or_else(|| content.to_string());
+        let decrypted = decrypt_checkpoint(&content).unwrap_or_else(|| content.to_string());
         let checkpoint: StepCheckpoint = match serde_json::from_str(&decrypted) {
             Ok(cp) => cp,
             Err(e) => {
@@ -190,8 +189,7 @@ pub fn read_latest_light_checkpoint(session_id: &str) -> std::io::Result<Option<
                 continue;
             }
         };
-        let decrypted = decrypt_checkpoint(&content)
-            .unwrap_or_else(|| content.to_string());
+        let decrypted = decrypt_checkpoint(&content).unwrap_or_else(|| content.to_string());
         let checkpoint: StepCheckpoint = match serde_json::from_str(&decrypted) {
             Ok(cp) => cp,
             Err(e) => {

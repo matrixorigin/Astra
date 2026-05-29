@@ -54,9 +54,7 @@ fn redact_credentials_for_storage(text: &str) -> (String, usize) {
                 || lowered.contains("credential")
                 || lowered.contains("authorization");
             let has_sk_prefix = line.contains("sk-") || line.contains("SK-");
-            if (is_sensitive || has_sk_prefix)
-                && (line.contains('=') || line.contains(':'))
-            {
+            if (is_sensitive || has_sk_prefix) && (line.contains('=') || line.contains(':')) {
                 let sep = if line.contains(':') && !line.contains("://") {
                     line.find(':')
                 } else {
@@ -1578,10 +1576,12 @@ mod tests {
         // Decrypt each line (hex-encoded encrypted JSONL)
         let decrypted: Vec<String> = persisted
             .lines()
-            .filter_map(|line| crate::step_checkpoint::decrypt_checkpoint(line))
+            .filter_map(crate::step_checkpoint::decrypt_checkpoint)
             .collect();
-        let decrypted_str = decrypted.join("
-");
+        let decrypted_str = decrypted.join(
+            "
+",
+        );
         assert!(decrypted_str.contains("\"step_id\":\"sess-adopted-turn-0-step-0\""));
         assert!(
             !tmp.path()

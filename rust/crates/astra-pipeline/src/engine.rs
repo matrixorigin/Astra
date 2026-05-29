@@ -174,10 +174,10 @@ impl ExecutionEngine {
         );
 
         // Apply retention cleanup if session is known.
-        if let Some(ref sid) = state.session_id {
-            if RetentionPolicy::default().needs_cleanup(sid) {
-                let _ = RetentionPolicy::default().cleanup(sid);
-            }
+        if let Some(ref sid) = state.session_id
+            && RetentionPolicy::default().needs_cleanup(sid)
+        {
+            let _ = RetentionPolicy::default().cleanup(sid);
         }
 
         Ok(())

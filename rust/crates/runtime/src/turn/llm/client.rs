@@ -8919,6 +8919,31 @@ mod tests {
         assert_eq!(body["stream"], true);
     }
 
+    #[test]
+    fn build_openai_body_preserves_plain_assistant_reasoning_placeholder() {
+        let messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello", "reasoning_content": ""}),
+            json!({"role": "user", "content": "continue"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "deepseek-v4-pro-official",
+            "openai",
+            Some(4096),
+            None,
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 10_000,
+            },
+        );
+
+        assert_eq!(body["messages"][1]["role"], "assistant");
+        assert_eq!(body["messages"][1]["content"], "hello");
+        assert_eq!(body["messages"][1]["reasoning_content"], "");
+    }
+
     /// Qwen models served through the *DashScope* provider use `enable_thinking`.
     /// The provider name (not model name) is the discriminator — the same Qwen model
     /// served through a generic vLLM/Ollama proxy with provider="openai" must NOT
