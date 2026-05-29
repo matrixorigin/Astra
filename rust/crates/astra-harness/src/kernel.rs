@@ -227,6 +227,27 @@ mod tests {
     }
 
     #[test]
+    fn warning_severity_does_not_pause() {
+        let sink = InMemorySnapshotSink::arc();
+        let kernel = StandardKernel::new(
+            sink.clone(),
+            vec![Box::new(ProgressVerifier {
+                max_read_only_round_streak: 10,
+                max_redundant_read_count: 3,
+                recovery_read_only_round_streak: 5,
+                min_redundant_reads_for_pause: 2,
+            })],
+        );
+
+        let mut record = make_record(HookPoint::PostTurn, 1, 0);
+        record.snapshot.final_state = Some("empty".into());
+        record.snapshot.read_only_round_streak = 1;
+        record.snapshot.redundant_read_count = 3;
+
+        assert!(matches!(kernel.on_record(&record), HookVerdict::Continue));
+    }
+
+    #[test]
     fn turn_guard_adapter_blocks_on_stall() {
         let sink = InMemorySnapshotSink::arc();
         let kernel = StandardKernel::new(

@@ -7,16 +7,16 @@
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Instant;
 
 use astra_runtime::{
     tool_registry::ToolRegistry,
     turn::agentic::headless_round::HeadlessStderrStyle,
     turn::agentic_loop::host::{
-        AgenticLoopHost, AgenticLoopState, HostTurnResult, TurnInteractionMode,
-        interaction_scoped_tool_restrictions,
+        interaction_scoped_tool_restrictions, AgenticLoopHost, AgenticLoopState, HostTurnResult,
+        TurnInteractionMode,
     },
 };
 use async_trait::async_trait;
@@ -24,14 +24,14 @@ use crossterm::style::Stylize;
 use serde_json::Value;
 
 use crate::{
-    ExplainMode,
     cli::permission_manager::{PermissionManager, PermissionMode},
     cli::stream_render::RenderPolicy,
     edge_tools::ToolExecutor,
+    ExplainMode,
 };
 
 use crate::cli::chat_stream::sse_loop::agentic_loop_turn::{
-    ChatTurnSseFetchRequest, PrepareTurnTelemetry, fetch_chat_turn_sse,
+    fetch_chat_turn_sse, ChatTurnSseFetchRequest, PrepareTurnTelemetry,
 };
 
 use astra_runtime::tool_sandbox::SandboxPolicy;
@@ -886,8 +886,17 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             Some(id) if !id.is_empty() => id.to_string(),
             _ => return,
         };
-        let model_id = self.model.unwrap_or("").to_string();
+        let model_selector = state
+            .skills
+            .model_override
+            .as_deref()
+            .or(self.model)
+            .unwrap_or("");
+        let model_id = model_selector.to_string();
         let provider = astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model_id);
+        let raw_provider = provider.raw_provider_name().to_owned();
+        let capture_thinking =
+            astra_turn_core::thinking_config::resolve_model_thinking(model_selector).1;
         // Canonical prefix bytes: JSON-serialize the messages as-is.
         // This is the format `fork_reconstruct::reconstruct_messages`
         // expects on the consuming end. System prompts and tool
@@ -915,7 +924,11 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             parent_turn_seq: self.chat_turn_index,
             provider,
             model_id,
-            thinking: None,
+            thinking: astra_turn_core::thinking_config::fork_capture_thinking_slice(
+                &capture_thinking,
+                &raw_provider,
+                model_selector,
+            ),
             system_blocks: vec![],
             tool_schemas,
             beta_headers: vec![],

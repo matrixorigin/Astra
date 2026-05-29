@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::auth::FernetTokenEncryptor;
-use astra_core::{
-    ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
-};
+use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
@@ -705,24 +703,15 @@ const RESOLVE_COLS: &str = "\
     IFNULL(CAST(tags AS CHAR), '[]') AS tags_json, \
     thinking_capability";
 
-/// Acquire a pool reference: use the provided pool, or open an ephemeral one.
-async fn acquire_pool(
+/// Require an explicitly wired pool reference.
+async fn require_pool(
     provided: Option<&sqlx::Pool<sqlx::MySql>>,
     matrixone: &MatrixOneSettings,
 ) -> Result<sqlx::Pool<sqlx::MySql>, String> {
     match provided {
         Some(p) => Ok(p.clone()),
         None => {
-            let url = format!(
-                "{}?connect_timeout=2",
-                matrixone.database_url_with_password()
-            );
-            sqlx::mysql::MySqlPoolOptions::new()
-                .max_connections(1)
-                .acquire_timeout(std::time::Duration::from_secs(3))
-                .connect(&url)
-                .await
-                .map_err(|e| format!("DB connect: {e}"))
+            Err(crate::missing_shared_pool_error("resolve_active_llm_model", matrixone).to_string())
         }
     }
 }
@@ -731,8 +720,7 @@ async fn acquire_pool(
 ///
 /// When `preferred` is `Some(name)`, the row **must** exist and be active — otherwise this
 /// returns an error (no silent fallback to another model). When `preferred` is `None`, uses
-/// the lexicographically first active model. When `pool` is `None`, opens an ephemeral
-/// single-connection pool from `matrixone`.
+/// the lexicographically first active model. `pool` must be provided explicitly by the caller.
 ///
 /// Also extracts `fallback_chain` from the `quirks` JSON column (cloud-managed config).
 pub async fn resolve_active_llm_model(
@@ -741,7 +729,7 @@ pub async fn resolve_active_llm_model(
     preferred: Option<&str>,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
 ) -> Result<ResolvedActiveLlmModel, String> {
-    let pool = acquire_pool(pool, matrixone).await?;
+    let pool = require_pool(pool, matrixone).await?;
 
     let pref = preferred
         .map(normalize_model_selector_for_resolution)
@@ -852,7 +840,7 @@ pub async fn resolve_reasoning_model(
 
     // 2. Cheapest active. MatrixOne JSON function support is uneven, so sort in Rust:
     //    pull all active rows and pick the minimum completion price.
-    let pool = acquire_pool(pool, matrixone).await?;
+    let pool = require_pool(pool, matrixone).await?;
 
     let rows = sqlx::query(&format!(
         "SELECT {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1"
@@ -987,7 +975,7 @@ pub async fn resolve_memory_models(
     encryptor: &FernetTokenEncryptor,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
 ) -> Result<Vec<ResolvedActiveLlmModel>, String> {
-    let pool = acquire_pool(pool, matrixone).await?;
+    let pool = require_pool(pool, matrixone).await?;
 
     let rows = sqlx::query(&format!(
         "SELECT {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1"
@@ -1224,10 +1212,7 @@ impl DatabaseModelService {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(self.pool.as_ref(), "DatabaseModelService", &self.matrixone)
     }
 }
 

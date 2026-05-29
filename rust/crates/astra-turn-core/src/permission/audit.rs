@@ -803,12 +803,20 @@ mod tests {
         );
 
         let events = astra_services::session_journal::read_journal(&session_id).unwrap();
-        assert_eq!(events.len(), 1);
+        // read_journal auto-prepends a SessionStart when needed.
+        let audit_events: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.event_type == astra_services::session_journal::JournalEventType::PermissionAudit
+            })
+            .collect();
+        assert_eq!(audit_events.len(), 1);
+        let event = &audit_events[0];
         assert_eq!(
-            events[0].event_type,
+            event.event_type,
             astra_services::session_journal::JournalEventType::PermissionAudit
         );
-        let metadata = events[0].metadata.as_ref().expect("metadata");
+        let metadata = event.metadata.as_ref().expect("metadata");
         assert_eq!(
             metadata.get("kind").and_then(serde_json::Value::as_str),
             Some("evaluated")

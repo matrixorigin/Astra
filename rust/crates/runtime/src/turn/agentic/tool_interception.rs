@@ -9,7 +9,7 @@ use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 
 use super::super::agentic_loop::host::{AgenticLoopState, DELEGATE_TOOL_NAME, HostTurnResult};
 
-const CONTROL_PLANE_TOOLS: &[&str] = &[
+pub(crate) const CONTROL_PLANE_TOOLS: &[&str] = &[
     "task",
     "session",
     "introspect",
@@ -25,7 +25,7 @@ pub(crate) struct PreparedToolRound {
     pub(crate) edge_tool_round: Vec<EdgeToolExecResult>,
 }
 
-fn request_allowlist_permits_tool(state: &AgenticLoopState, tool_name: &str) -> bool {
+pub(crate) fn request_allowlist_permits_tool(state: &AgenticLoopState, tool_name: &str) -> bool {
     state
         .skills
         .request_constraints
@@ -34,28 +34,17 @@ fn request_allowlist_permits_tool(state: &AgenticLoopState, tool_name: &str) -> 
         .is_none_or(|allowed| allowed.contains(tool_name))
 }
 
-fn exempt_from_request_allowlist(tool_name: &str) -> bool {
+pub(crate) fn exempt_from_request_allowlist(tool_name: &str) -> bool {
     tool_name == crate::turn::skill_tool::SKILL_TOOL_NAME
         || tool_name == crate::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME
 }
 
-fn exempt_from_skill_allowlist(tool_name: &str) -> bool {
+pub(crate) fn exempt_from_skill_allowlist(tool_name: &str) -> bool {
     exempt_from_request_allowlist(tool_name) || CONTROL_PLANE_TOOLS.contains(&tool_name)
 }
 
 fn blocked_by_request_allowlist(state: &AgenticLoopState, tool_name: &str) -> bool {
     !exempt_from_request_allowlist(tool_name) && !request_allowlist_permits_tool(state, tool_name)
-}
-
-fn blocked_by_skill_allowlist(state: &AgenticLoopState, tool_name: &str) -> bool {
-    let Some(skill_allowed) = state
-        .skill_allowlist_active()
-        .then_some(())
-        .and(state.skills.allowed_tools.as_ref())
-    else {
-        return false;
-    };
-    !exempt_from_skill_allowlist(tool_name) && !skill_allowed.contains(tool_name)
 }
 
 fn skill_allowlist_exempt_control_tools(
@@ -70,25 +59,36 @@ fn skill_allowlist_exempt_control_tools(
         .collect()
 }
 
-fn effective_runtime_allowed_tools(state: &AgenticLoopState) -> Option<HashSet<String>> {
-    let skill_allowed = state
-        .skill_allowlist_active()
-        .then_some(())
-        .and(state.skills.allowed_tools.as_ref());
+pub(crate) fn effective_runtime_allowed_tools(state: &AgenticLoopState) -> Option<HashSet<String>> {
     let effective = astra_turn_core::tool_allowlist::compute_effective_allowlist(
         state.skills.request_constraints.allowed_tools.as_ref(),
-        skill_allowed,
+        None,
     );
     if matches!(effective.as_ref(), Some(allowed) if allowed.is_empty()) {
         tracing::warn!(
-            "runtime tool allowlist intersection is empty; only skill/discover_skills remain callable"
+            "runtime request tool allowlist is empty; only skill/discover_skills remain callable"
         );
     }
     effective
 }
 
+pub(crate) fn runtime_allows_tool(state: &AgenticLoopState, tool_name: &str) -> bool {
+    if blocked_by_request_allowlist(state, tool_name) {
+        return false;
+    }
+    if exempt_from_request_allowlist(tool_name) {
+        return true;
+    }
+    let Some(allowed_tools) = effective_runtime_allowed_tools(state) else {
+        return true;
+    };
+    allowed_tools.contains(tool_name)
+        || (exempt_from_skill_allowlist(tool_name)
+            && request_allowlist_permits_tool(state, tool_name))
+}
+
 pub(crate) fn runtime_tool_allowlist_notice(state: &AgenticLoopState) -> Option<String> {
-    state.skills.allowed_tools.as_ref()?;
+    state.skills.request_constraints.allowed_tools.as_ref()?;
 
     let effective_allowed = effective_runtime_allowed_tools(state).unwrap_or_default();
     let mut allowed_display = effective_allowed.into_iter().collect::<Vec<_>>();
@@ -109,11 +109,11 @@ pub(crate) fn runtime_tool_allowlist_notice(state: &AgenticLoopState) -> Option<
     };
     if allowed_display.is_empty() {
         Some(format!(
-            "Runtime tool policy: after loading this skill, no allowlist-governed non-skill tools are currently callable because the request allowlist and the skill allowlist do not overlap. Only `skill` and `discover_skills` remain callable until you load a different skill or the request policy changes.{control_plane_notice}"
+            "Runtime tool policy: no allowlist-governed non-skill tools are currently callable because the active request policy excludes them all. Only `skill` and `discover_skills` remain callable until the request policy changes.{control_plane_notice}"
         ))
     } else {
         Some(format!(
-            "Runtime tool policy: after loading this skill, only these allowlist-governed non-skill tools are callable: {}. Other visible tools remain advertised for cache stability but will be BLOCKED at runtime.{control_plane_notice}",
+            "Runtime tool policy: only these request-allowlisted non-skill tools are callable: {}. Skill `allowed_tools` stays a prompt hint and does not hard-block additional tools.{control_plane_notice}",
             allowed_display.join(", "),
         ))
     }
@@ -163,13 +163,10 @@ fn intercept_disallowed_tool_calls(
             });
             continue;
         };
-        if !blocked_by_request_allowlist(state, &tool_name)
-            && (!blocked_by_skill_allowlist(state, &tool_name)
-                || allowed_tools.contains(&tool_name))
-        {
+        if !blocked_by_request_allowlist(state, &tool_name) {
             remaining.push(tool_call.clone());
             continue;
-        }
+        };
 
         let tool_call_id = tool_call
             .get("id")
@@ -991,7 +988,7 @@ mod tests {
         let notice = runtime_tool_allowlist_notice(&state).expect("notice should be emitted");
 
         assert!(notice.contains("read_file"));
-        assert!(notice.contains("BLOCKED at runtime"));
+        assert!(notice.contains("Skill `allowed_tools` stays a prompt hint"));
     }
 
     #[test]
@@ -1026,25 +1023,17 @@ mod tests {
 
         let notice = runtime_tool_allowlist_notice(&state).expect("notice should be emitted");
 
-        assert!(notice.contains("callable: bash"));
-        assert!(!notice.contains("read_file"));
+        // Skill allowed_tools is now a hint only; the notice reflects
+        // the request constraints (bash + read_file), ignoring the skill activation.
+        assert!(notice.contains("bash"), "notice: {notice}");
+        assert!(notice.contains("read_file"), "notice: {notice}");
     }
 
     #[test]
-    fn runtime_tool_allowlist_notice_warns_when_intersection_is_empty() {
+    fn runtime_tool_allowlist_notice_warns_when_request_policy_excludes_all() {
         let mut state = make_state();
         state.skills.request_constraints.allowed_tools =
-            Some(["bash".to_string()].into_iter().collect());
-        apply_skill_activation(
-            &mut state,
-            crate::turn::skill_tool::SkillActivation {
-                model_override: None,
-                allowed_tools: vec!["read_file".to_string()],
-                effort: None,
-                agent_type: None,
-                sandbox_policy: None,
-            },
-        );
+            Some(HashSet::new());
 
         let notice = runtime_tool_allowlist_notice(&state).expect("notice should be emitted");
 
@@ -1052,37 +1041,36 @@ mod tests {
     }
 
     #[test]
-    fn runtime_tool_allowlist_notice_mentions_control_plane_exemptions() {
+    fn runtime_tool_allowlist_notice_lists_all_request_permitted_tools() {
         let mut state = make_state();
+        state.skills.request_constraints.allowed_tools =
+            Some(
+                ["read_file", "task", "notify", "ask_user"]
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            );
+
+        let notice = runtime_tool_allowlist_notice(&state).expect("notice should be emitted");
+
+        // All requested tools appear in the callable list.
+        assert!(notice.contains("read_file"));
+        assert!(notice.contains("task"));
+        assert!(notice.contains("notify"));
+        assert!(notice.contains("ask_user"));
+        // No separate control-plane exemption clause needed — they are
+        // listed inline when permitted by the request policy.
+    }
+
+    #[test]
+    fn runtime_tool_allowlist_notice_is_absent_without_request_policy() {
+        let mut state = make_state();
+        // request_constraints.allowed_tools defaults to None in make_state()
         apply_skill_activation(
             &mut state,
             crate::turn::skill_tool::SkillActivation {
                 model_override: None,
                 allowed_tools: vec!["read_file".to_string()],
-                effort: None,
-                agent_type: None,
-                sandbox_policy: None,
-            },
-        );
-
-        let notice = runtime_tool_allowlist_notice(&state).expect("notice should be emitted");
-
-        assert!(notice.contains("read_file"));
-        assert!(notice.contains("`task`"));
-        assert!(notice.contains("`notify`"));
-        assert!(notice.contains("`ask_user`"));
-    }
-
-    #[test]
-    fn runtime_tool_allowlist_notice_is_absent_without_skill_tool_policy() {
-        let mut state = make_state();
-        state.skills.request_constraints.allowed_tools =
-            Some(["bash".to_string()].into_iter().collect());
-        apply_skill_activation(
-            &mut state,
-            crate::turn::skill_tool::SkillActivation {
-                model_override: None,
-                allowed_tools: Vec::new(),
                 effort: None,
                 agent_type: None,
                 sandbox_policy: None,
@@ -1125,7 +1113,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_intercepted_tool_round_blocks_disallowed_skill_tools_at_runtime() {
+    async fn prepare_intercepted_tool_round_does_not_block_tools_just_because_skill_hint_omits_them()
+     {
         let mut state = make_state();
         state.skills.allowed_tools = Some(
             [" Bash ".to_string(), "READ_FILE".to_string()]
@@ -1169,25 +1158,13 @@ mod tests {
             "assistant tool calls stay intact"
         );
         assert!(
-            prepared
-                .pre_resolved_results
-                .iter()
-                .any(|(call_id, result)| {
-                    call_id == "call-str-replace" && result.contains("BLOCKED:")
-                })
-        );
-        assert!(
-            prepared
-                .pre_resolved_results
-                .iter()
-                .all(|(call_id, _)| call_id != "call-bash"),
-            "allowed tools should not be pre-resolved as blocked"
+            prepared.pre_resolved_results.is_empty(),
+            "skill allowed_tools is only a hint and must not hard-block extra tools"
         );
     }
 
     #[tokio::test]
-    async fn prepare_intercepted_tool_round_allows_control_plane_tools_when_only_skill_allowlist_would_block()
-     {
+    async fn prepare_intercepted_tool_round_keeps_all_tools_when_only_skill_hint_is_present() {
         let mut state = make_state();
         state.skills.allowed_tools = Some(["bash".to_string()].into_iter().collect());
         state.skills.invoked.insert(
@@ -1237,18 +1214,8 @@ mod tests {
         .await;
 
         assert!(
-            prepared.pre_resolved_results.iter().all(|(call_id, _)| {
-                call_id != "call-task" && call_id != "call-notify" && call_id != "call-ask-user"
-            }),
-            "control-plane tools should remain callable under skill allowlists"
-        );
-        assert!(
-            prepared
-                .pre_resolved_results
-                .iter()
-                .any(|(call_id, result)| {
-                    call_id == "call-str-replace" && result.contains("BLOCKED:")
-                })
+            prepared.pre_resolved_results.is_empty(),
+            "skill hints must not block control-plane or ordinary tools"
         );
     }
 

@@ -4,9 +4,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Row, query};
 use uuid::Uuid;
 
-use astra_core::{
-    ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
-};
+use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
 const MAX_TRIGGER_LIST_ROWS: i32 = 200;
 
@@ -95,10 +93,11 @@ impl DatabaseTriggerService {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(
+            self.pool.as_ref(),
+            "DatabaseTriggerService",
+            &self.matrixone,
+        )
     }
 }
 

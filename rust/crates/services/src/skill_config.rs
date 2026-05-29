@@ -5,9 +5,7 @@ use sqlx::Row;
 use std::collections::HashMap;
 
 use crate::auth::FernetTokenEncryptor;
-use astra_core::{
-    ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
-};
+use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
 // ---------------------------------------------------------------------------
 // Trait
@@ -166,10 +164,11 @@ impl DatabaseSkillConfigService {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.settings).await
+        crate::require_shared_pool(
+            self.pool.as_ref(),
+            "DatabaseSkillConfigService",
+            &self.settings,
+        )
     }
 
     fn scope_id(user_id: &str, scope: &str) -> Option<String> {

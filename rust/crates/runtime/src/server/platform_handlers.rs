@@ -23,8 +23,8 @@ pub(super) async fn platform_snapshot_handler(
     let user = state.auth_service.current_user(&headers).await?;
 
     // Fan out all reads concurrently.
-    let (db_healthy, agents_res, sessions_res, events_res) = tokio::join!(
-        state.health_checker.database_healthy(),
+    let (database_health, agents_res, sessions_res, events_res) = tokio::join!(
+        state.health_checker.database_health(),
         state.agent_service.list_agents(user.user_id.clone()),
         state.session_service.list_sessions(SessionListFilter {
             user_id: user.user_id.clone(),
@@ -45,13 +45,8 @@ pub(super) async fn platform_snapshot_handler(
     );
 
     let health = HealthResponse {
-        status: if db_healthy { "healthy" } else { "unhealthy" }.to_string(),
-        database: if db_healthy {
-            "connected"
-        } else {
-            "disconnected"
-        }
-        .to_string(),
+        status: database_health.overall_status().to_string(),
+        database: database_health.database_label().to_string(),
         persist_ok: PERSIST_OK_COUNT.load(Ordering::Relaxed),
         persist_fail: PERSIST_FAIL_COUNT.load(Ordering::Relaxed),
     };

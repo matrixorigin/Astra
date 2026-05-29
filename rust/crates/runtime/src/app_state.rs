@@ -12,6 +12,43 @@ const DEFAULT_DOCS: &str = "";
 #[async_trait]
 pub trait HealthChecker: Send + Sync {
     async fn database_healthy(&self) -> bool;
+
+    async fn database_health(&self) -> DatabaseHealth {
+        if self.database_healthy().await {
+            DatabaseHealth::Connected
+        } else {
+            DatabaseHealth::Unavailable
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DatabaseHealth {
+    Connected,
+    Unavailable,
+    Misconfigured,
+}
+
+impl DatabaseHealth {
+    pub fn is_healthy(self) -> bool {
+        matches!(self, Self::Connected)
+    }
+
+    pub fn overall_status(self) -> &'static str {
+        if self.is_healthy() {
+            "healthy"
+        } else {
+            "unhealthy"
+        }
+    }
+
+    pub fn database_label(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Unavailable => "unavailable",
+            Self::Misconfigured => "misconfigured",
+        }
+    }
 }
 
 /// Forwards a Memoria API call (already enriched with session_id) to the Memoria backend.
@@ -828,38 +865,42 @@ impl MatrixOneHealthChecker {
 #[async_trait]
 impl HealthChecker for MatrixOneHealthChecker {
     async fn database_healthy(&self) -> bool {
+        self.database_health().await.is_healthy()
+    }
+
+    async fn database_health(&self) -> DatabaseHealth {
         let query_timeout = Duration::from_secs(2);
         if let Some(shared_pool) = &self.shared_pool {
-            return tokio::time::timeout(
+            return match tokio::time::timeout(
                 query_timeout,
                 query("SELECT 1").execute(shared_pool.get()),
             )
             .await
-            .map(|result| result.is_ok())
-            .unwrap_or(false);
+            {
+                Ok(Ok(_)) => DatabaseHealth::Connected,
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        database = %self.settings.database,
+                        %error,
+                        "matrixone health probe failed"
+                    );
+                    DatabaseHealth::Unavailable
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        database = %self.settings.database,
+                        timeout_secs = query_timeout.as_secs(),
+                        "matrixone health probe timed out"
+                    );
+                    DatabaseHealth::Unavailable
+                }
+            };
         }
-
-        let database_url = self.settings.database_url_with_password();
-        let pool = match tokio::time::timeout(
-            query_timeout,
-            MySqlPoolOptions::new()
-                .max_connections(1)
-                .acquire_timeout(Duration::from_secs(2))
-                .connect(&database_url),
-        )
-        .await
-        {
-            Ok(Ok(pool)) => pool,
-            Err(_) => return false,
-            Ok(Err(_)) => return false,
-        };
-
-        let result = tokio::time::timeout(query_timeout, query("SELECT 1").execute(&pool))
-            .await
-            .map(|result| result.is_ok())
-            .unwrap_or(false);
-        pool.close().await;
-        result
+        tracing::warn!(
+            database = %self.settings.database,
+            "matrixone health check invoked without injected SharedPool"
+        );
+        DatabaseHealth::Misconfigured
     }
 }
 
@@ -875,6 +916,16 @@ mod tests {
         async fn database_healthy(&self) -> bool {
             true
         }
+    }
+
+    #[tokio::test]
+    async fn matrixone_health_without_pool_is_misconfigured() {
+        let checker = MatrixOneHealthChecker::new(MatrixOneSettings::mock());
+        assert_eq!(
+            checker.database_health().await,
+            DatabaseHealth::Misconfigured
+        );
+        assert!(!checker.database_healthy().await);
     }
 
     /// audit-A1: ReqwestMemoriaForwarder must set connect_timeout and timeout

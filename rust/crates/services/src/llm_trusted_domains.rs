@@ -4,9 +4,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Row, query};
 use uuid::Uuid;
 
-use astra_core::{
-    ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
-};
+use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmTrustedDomainRecord {
@@ -87,10 +85,11 @@ impl DatabaseLlmTrustedDomainService {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref pool) = self.pool {
-            return Ok(pool.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(
+            self.pool.as_ref(),
+            "DatabaseLlmTrustedDomainService",
+            &self.matrixone,
+        )
     }
 
     fn normalize_domain_host(raw: &str) -> Result<String, (StatusCode, Json<ErrorResponse>)> {

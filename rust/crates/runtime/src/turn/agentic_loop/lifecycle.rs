@@ -1986,6 +1986,8 @@ mod tests {
         state.message = "review changes on current branch".into();
         state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
         state.skills.resolver = Some(Arc::new(AutoRouteResolver));
+        state.skills.request_constraints.allowed_tools =
+            Some(std::collections::HashSet::from(["read_file".to_string()]));
 
         let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
             .await
@@ -2029,7 +2031,7 @@ mod tests {
                 .as_str()
                 .is_some_and(|content| {
                     content.contains(
-                        "only these allowlist-governed non-skill tools are callable: read_file",
+                        "only these request-allowlisted non-skill tools are callable: read_file",
                     )
                 })
         );

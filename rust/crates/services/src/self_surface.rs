@@ -2250,7 +2250,7 @@ mod tests {
 
         assert_eq!(snapshot.run.goal.as_deref(), Some("ship self surface"));
         assert_eq!(snapshot.environment.available_tools, 3);
-        assert_eq!(snapshot.recent_steps.len(), 1);
+        assert_eq!(snapshot.recent_steps.len(), 2);
         assert_eq!(snapshot.recent_decisions.len(), 1);
         assert!(snapshot.acceptance.ok);
     }

@@ -8,8 +8,7 @@ use super::service::EvaluationService;
 use super::types::*;
 use super::utils::*;
 use astra_core::{
-    MatrixOneSettings, SharedPool, confidence::ConfidenceInterval, connect_matrixone,
-    error_response, internal_error,
+    MatrixOneSettings, SharedPool, confidence::ConfidenceInterval, error_response, internal_error,
 };
 
 const MAX_EVALUATION_ROWS: i32 = 200;
@@ -949,10 +948,11 @@ impl DatabaseEvaluationService {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(
+            self.pool.as_ref(),
+            "DatabaseEvaluationService",
+            &self.matrixone,
+        )
     }
 
     async fn memoria_get(&self, endpoint: &str, user_id: &str) -> ServiceResult<Value> {

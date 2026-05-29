@@ -1509,8 +1509,11 @@ mod tests {
         drop(writer);
 
         let events = read_journal(&path);
-        assert_eq!(events.len(), 1);
-        let detail = &events[0]["metadata"]["detail"];
+        let lifecycle = events
+            .iter()
+            .find(|e| e["type"] == "plan_lifecycle")
+            .expect("plan_lifecycle event emitted");
+        let detail = &lifecycle["metadata"]["detail"];
         assert_eq!(detail["stage"], "cancelled");
         let _ = std::fs::remove_file(&path);
     }

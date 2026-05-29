@@ -481,11 +481,11 @@ pub fn build_resume_guidance_with_context(
         "harness_paused" => {
             guidance.push_str(
                 "  Action: The previous run was paused by the harness due to a \
-                 read-only stall — the agent was reading files without making edits. \
-                 Stop broad exploration; use the evidence already gathered and take \
-                 ONE concrete action: edit the relevant file, run targeted verification, \
-                 or explicitly report why the task cannot be completed. Do NOT continue \
-                 broad or duplicate reading.\n",
+                 read-heavy stall without any mutation. Reuse the evidence already \
+                 gathered and take one concrete next action: edit the relevant file, \
+                 run targeted verification, or explicitly report why the task cannot \
+                 be completed. If one specific fact is still missing, fetch only that \
+                 fact instead of reopening broad or overlapping reads.\n",
             );
         }
         "approval_rejected" => {
@@ -969,6 +969,30 @@ mod tests {
         assert!(
             guidance.contains("already in context"),
             "guidance should steer the resumed turn toward reuse: {guidance}"
+        );
+    }
+
+    #[test]
+    fn resume_guidance_harness_paused_allows_single_missing_fact() {
+        let irj = serde_json::json!({
+            "kind": "harness_paused",
+            "resumable": true,
+            "has_checkpoint": true,
+            "tool_calls_completed": 28,
+            "turns_completed": 16,
+            "remaining_turns": 134,
+            "user_message": "[harness_paused] 28 tool call(s) completed. A checkpoint was saved."
+        });
+        let guidance = build_resume_guidance(&irj).expect("should produce guidance");
+        assert!(guidance.contains("read-heavy stall"), "{guidance}");
+        assert!(guidance.contains("one concrete next action"), "{guidance}");
+        assert!(
+            guidance.contains("one specific fact is still missing"),
+            "{guidance}"
+        );
+        assert!(
+            !guidance.contains("Do NOT continue broad or duplicate reading"),
+            "{guidance}"
         );
     }
 

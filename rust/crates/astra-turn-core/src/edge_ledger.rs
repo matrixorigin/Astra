@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use astra_pipeline::journal_crypto::{JournalCrypto, hex_decode, hex_encode};
+use astra_pipeline::journal_crypto::{hex_decode, hex_encode, JournalCrypto};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 /// Cap in-memory map size. New entries are REJECTED (not evicted) when this
@@ -621,18 +621,25 @@ impl ReasoningReplayPolicy {
         provider: &str,
         model: &str,
     ) -> Self {
+        let caps = crate::reasoning_capabilities::reasoning_capabilities(provider, model);
         let enforce_reasoning_field =
             !matches!(thinking, crate::thinking_config::ThinkingConfig::Off)
-                || history_has_reasoning(messages);
+                || history_has_reasoning(messages)
+                || caps.requires_replay();
         let observed_placeholder = observed_reasoning_placeholder(messages);
         let placeholder = observed_placeholder
-            .unwrap_or_else(|| fallback_reasoning_placeholder(provider, model))
+            .unwrap_or(caps.reasoning_placeholder)
             .to_string();
         Self {
             enforce_reasoning_field,
             placeholder,
-            can_strip_unsigned_reasoning: observed_placeholder.is_some()
-                || fallback_reasoning_placeholder(provider, model).is_empty(),
+            // `AlwaysReplay` providers (DeepSeek, Kimi, Moonshot) need the
+            // reasoning field preserved for API replay. `OnDemand` providers
+            // can strip unsigned reasoning to save tokens. Signed providers
+            // (Anthropic) have a separate guard in the request builder that
+            // omits malformed unsigned blocks.
+            // See also: `reasoning_capabilities.rs` (single source of truth).
+            can_strip_unsigned_reasoning: !caps.requires_replay(),
         }
     }
 
@@ -648,7 +655,7 @@ impl ReasoningReplayPolicy {
 /// we adopt it as our own placeholder so that replayed messages match what the
 /// upstream provider sent.  Falls back to `""` if the history only contains
 /// genuinely empty strings, and `None` if no reasoning_content fields exist
-/// at all (leaving the choice entirely to [`fallback_reasoning_placeholder`]).
+/// at all (leaving the choice entirely to [`reasoning_capabilities`]).
 fn observed_reasoning_placeholder(messages: &[Value]) -> Option<&str> {
     let mut saw_empty = false;
     for msg in messages {
@@ -668,14 +675,6 @@ fn observed_reasoning_placeholder(messages: &[Value]) -> Option<&str> {
     saw_empty.then_some("")
 }
 
-fn fallback_reasoning_placeholder(provider: &str, model: &str) -> &'static str {
-    if provider == "moonshot" || model.starts_with("kimi-k2") {
-        " "
-    } else {
-        ""
-    }
-}
-
 fn needs_reasoning_placeholder(msg: &Value, placeholder: &str) -> bool {
     match msg.get("reasoning_content").and_then(Value::as_str) {
         None => true,
@@ -684,10 +683,13 @@ fn needs_reasoning_placeholder(msg: &Value, placeholder: &str) -> bool {
     }
 }
 
-/// Strip `reasoning_content` values from older assistant messages to reduce token usage.
+/// Normalize assistant reasoning replay without corrupting provider-required history.
 ///
-/// Thinking-model sessions accumulate large reasoning chains on every assistant message.
-/// Since the LLM gains no benefit from re-reading old reasoning, we normalize
+/// Thinking-model sessions accumulate large reasoning chains on every assistant
+/// message. We still backfill missing placeholder fields for replay validity,
+/// but we do NOT rewrite non-empty unsigned reasoning text because several
+/// providers require the original content to be echoed verbatim on subsequent
+/// rounds.
 pub fn strip_stale_reasoning_with_policy(messages: &mut [Value], policy: &ReasoningReplayPolicy) {
     if !policy.enforce_reasoning_field {
         return;
@@ -721,6 +723,10 @@ pub fn strip_stale_reasoning_with_policy(messages: &mut [Value], policy: &Reason
     // Thinking is active — every assistant message must keep an explicit
     // `reasoning_content` field (even empty string) or providers such as
     // DeepSeek/Kimi reject the replayed history with HTTP 400.
+    // See also `anthropic_message_from_openai` in `llm/client.rs` for the
+    // request-builder-side guard that drops unsigned `reasoning_content`
+    // when converting to Anthropic protocol (Anthropic requires a
+    // `signature` for every `thinking` block).
     for (i, msg) in messages.iter_mut().enumerate() {
         if msg.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
@@ -773,7 +779,7 @@ pub fn strip_stale_reasoning_with_policy(messages: &mut [Value], policy: &Reason
 mod tests {
     use super::*;
 
-    use crate::history::{RecoveredEventRow, append_recovered_events};
+    use crate::history::{append_recovered_events, RecoveredEventRow};
     use tempfile::tempdir;
 
     #[test]
@@ -1453,12 +1459,10 @@ mod tests {
                         .is_some_and(|s| !s.is_empty())
             })
             .expect("should have at least one message with non-empty reasoning");
-        assert!(
-            !last_reasoning["reasoning_content"]
-                .as_str()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(!last_reasoning["reasoning_content"]
+            .as_str()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1667,6 +1671,7 @@ mod tests {
         );
 
         assert_eq!(policy.placeholder, "   ");
+        // Non-reasoning providers can safely strip unsigned reasoning to save tokens
         assert!(policy.can_strip_unsigned_reasoning);
     }
 
@@ -1785,6 +1790,68 @@ mod tests {
         strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("think1"));
         assert_eq!(msgs[3]["reasoning_content"].as_str(), Some("think2"));
+    }
+
+    #[test]
+    fn deepseek_full_mid_switch_session_preserves_all_reasoning_content() {
+        let mut msgs = build_mid_switch_session();
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+            "openai",
+            "deepseek-v4-pro-official",
+        );
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
+        assert_all_assistant_tool_calls_have_reasoning(&msgs);
+        assert_eq!(msgs[2]["reasoning_content"].as_str(), Some(""));
+        assert_eq!(msgs[6]["reasoning_content"].as_str(), Some(""));
+        assert_eq!(msgs[11]["reasoning_content"].as_str(), Some(""));
+        assert_eq!(
+            msgs[15]["reasoning_content"].as_str(),
+            Some("I need to read the code first, then plan the refactoring.")
+        );
+        assert_eq!(
+            msgs[17]["reasoning_content"].as_str(),
+            Some("Now I'll write the refactored version.")
+        );
+    }
+
+    #[test]
+    fn reasoning_policy_enforces_for_native_deepseek_even_without_explicit_thinking() {
+        let msgs = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+        ];
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "deepseek-v4-pro-official",
+        );
+        assert!(
+            policy.enforce_reasoning_field,
+            "native DeepSeek replay must still force explicit reasoning fields",
+        );
+    }
+
+    #[test]
+    fn reasoning_policy_does_not_force_plain_openai_without_history_or_thinking() {
+        let msgs = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+        ];
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4.1",
+        );
+        assert!(
+            !policy.enforce_reasoning_field,
+            "non-reasoning models should keep the old no-op behavior",
+        );
     }
 
     // ── Phase-R edge ledger contract pins ────────────────────────────────

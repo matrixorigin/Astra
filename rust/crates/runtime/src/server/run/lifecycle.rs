@@ -622,13 +622,9 @@ fn skill_search_from_context(
 
 fn build_runtime_evaluation_service(
     matrixone: &MatrixOneSettings,
-    shared_pool: Option<&SharedPool>,
+    shared_pool: &SharedPool,
 ) -> DatabaseEvaluationService {
-    let service = DatabaseEvaluationService::new(matrixone.clone());
-    match shared_pool {
-        Some(pool) => service.with_pool(pool.clone()),
-        None => service,
-    }
+    DatabaseEvaluationService::new(matrixone.clone()).with_pool(shared_pool.clone())
 }
 
 async fn initialize_runtime_controllers(
@@ -656,11 +652,11 @@ async fn configure_runtime_controllers(
 ) {
     let evaluation_persistence = shared_pool.map(|pool| EvaluationPersistenceContext {
         user_id: user_id.to_string(),
-        evaluation_service: build_runtime_evaluation_service(matrixone, Some(pool)),
+        evaluation_service: build_runtime_evaluation_service(matrixone, pool),
     });
     let context_trace_persistence = shared_pool.map(|pool| ContextTracePersistenceContext {
         user_id: user_id.to_string(),
-        event_service: build_runtime_event_service(matrixone, Some(pool)),
+        event_service: build_runtime_event_service(matrixone, pool),
         artifact_store: astra_services::DatabaseSessionArtifactStore::new(matrixone.clone())
             .with_pool(pool.clone()),
         agent_id: RUNTIME_CONTEXT_TRACE_AGENT_ID.to_string(),
@@ -677,13 +673,9 @@ async fn configure_runtime_controllers(
 
 fn build_runtime_event_service(
     matrixone: &MatrixOneSettings,
-    shared_pool: Option<&SharedPool>,
+    shared_pool: &SharedPool,
 ) -> DatabaseEventService {
-    let service = DatabaseEventService::new(matrixone.clone());
-    match shared_pool {
-        Some(pool) => service.with_pool(pool.clone()),
-        None => service,
-    }
+    DatabaseEventService::new(matrixone.clone()).with_pool(shared_pool.clone())
 }
 
 async fn persist_runtime_promotion_events(
@@ -705,7 +697,7 @@ async fn persist_runtime_promotion_events(
         return;
     };
 
-    let service = build_runtime_event_service(matrixone, Some(pool));
+    let service = build_runtime_event_service(matrixone, pool);
     for promotion in promotions {
         let metadata = match serde_json::to_value(promotion) {
             Ok(value) => Some(value),

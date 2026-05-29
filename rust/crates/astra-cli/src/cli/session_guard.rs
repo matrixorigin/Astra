@@ -189,9 +189,12 @@ mod tests {
             .lines()
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect();
+        let session_end_count = events
+            .iter()
+            .filter(|event| event["type"] == "session_end")
+            .count();
         assert_eq!(
-            events.len(),
-            1,
+            session_end_count, 1,
             "exactly 1 session_end event should be written"
         );
 

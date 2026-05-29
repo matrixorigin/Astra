@@ -5111,6 +5111,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(session_journal_dir)]
     async fn gate_retry_writes_journal_linkage_event() {
         let sessions_dir = std::env::temp_dir().join(format!(
             "delegation-engine-journal-{}",
@@ -5168,6 +5169,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(session_journal_dir)]
     async fn tracker_running_transition_writes_sub_run_started_event() {
         let sessions_dir = std::env::temp_dir().join(format!(
             "delegation-engine-subrun-start-{}",
@@ -5220,6 +5222,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(session_journal_dir)]
     async fn tracker_complete_sub_run_writes_sub_run_completed_event() {
         let sessions_dir = std::env::temp_dir().join(format!(
             "delegation-engine-subrun-complete-{}",

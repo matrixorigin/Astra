@@ -7,8 +7,8 @@ use std::{collections::HashSet, fmt, sync::Arc};
 
 use crate::auth::FernetTokenEncryptor;
 use astra_core::{
-    ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response_coded,
-    internal_error, is_duplicate_key_error,
+    ErrorResponse, MatrixOneSettings, SharedPool, error_response_coded, internal_error,
+    is_duplicate_key_error,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,10 +210,11 @@ impl DatabaseMcpRegistryService {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<MySql>, sqlx::Error> {
-        if let Some(ref pool) = self.pool {
-            return Ok(pool.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(
+            self.pool.as_ref(),
+            "DatabaseMcpRegistryService",
+            &self.matrixone,
+        )
     }
 
     fn encrypted_key_value(

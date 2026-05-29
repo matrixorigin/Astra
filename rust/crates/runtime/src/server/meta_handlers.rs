@@ -13,16 +13,11 @@ pub(super) async fn root_handler(State(state): State<AppState>) -> Json<RootResp
 }
 
 pub(super) async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
-    let db_healthy = state.health_checker.database_healthy().await;
+    let database_health = state.health_checker.database_health().await;
 
     Json(HealthResponse {
-        status: if db_healthy { "healthy" } else { "unhealthy" }.to_string(),
-        database: if db_healthy {
-            "connected"
-        } else {
-            "disconnected"
-        }
-        .to_string(),
+        status: database_health.overall_status().to_string(),
+        database: database_health.database_label().to_string(),
         persist_ok: PERSIST_OK_COUNT.load(Ordering::Relaxed),
         persist_fail: PERSIST_FAIL_COUNT.load(Ordering::Relaxed),
     })

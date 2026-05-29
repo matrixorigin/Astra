@@ -214,6 +214,10 @@ pub struct InheritedChildPrefix {
     /// Provider-scoped model id the prefix was captured against;
     /// required for ForkCacheEvent payload.
     pub provider: astra_turn_core::fork_prefix::ProviderKind,
+    /// Captured thinking metadata from the parent prefix. Executors use this to
+    /// keep replay normalization active even when the child model selector does
+    /// not carry an explicit `(thinking...)` suffix.
+    pub thinking: Option<astra_turn_core::fork_prefix::ThinkingConfigSlice>,
     /// Reconstructed message array to prepend to the child's
     /// `state.messages` — the output of
     /// [`astra_turn_core::fork_reconstruct::reconstruct_messages`]
@@ -1721,6 +1725,7 @@ pub(crate) fn build_inherited_child_prefix(
                 prefix_id: prefix.prefix_id.clone(),
                 parent_run_id: prefix.parent_run_id.clone(),
                 provider: prefix.provider.clone(),
+                thinking: prefix.thinking.clone(),
                 prefix_messages: r.messages,
                 frozen_tool_schemas: frozen_tools,
                 expected_cache_read_tokens: estimate_cache_read_tokens(prefix),

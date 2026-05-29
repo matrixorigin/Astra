@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use sqlx::{Row, query};
 
-use astra_core::{MatrixOneSettings, SharedPool, connect_matrixone};
+use astra_core::{MatrixOneSettings, SharedPool};
 
 /// Admin-configurable key: the preferred reasoning/judge/summary model name. Must reference
 /// an active row in `infra_llm_models`.
@@ -61,12 +61,11 @@ impl DatabaseAdminConfigService {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, String> {
-        if let Some(ref pool) = self.pool {
-            return Ok(pool.get().clone());
-        }
-        connect_matrixone(&self.matrixone)
-            .await
-            .map_err(|e| format!("DB connect: {e}"))
+        crate::require_shared_pool_message(
+            self.pool.as_ref(),
+            "DatabaseAdminConfigService",
+            &self.matrixone,
+        )
     }
 }
 

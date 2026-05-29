@@ -10,6 +10,7 @@
 //! current thread (journal JSONL, workspace, step checkpoints) without mutating `HOME`.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -85,6 +86,127 @@ fn update_cached_session_start_state_from_events(path: &Path, events: &[JournalE
     {
         update_cached_session_start_state_from_event(path, last_type);
     }
+}
+
+fn stabilize_event_order(events: &mut [JournalEvent]) {
+    events.sort_by(|left, right| left.ts.cmp(&right.ts));
+    if let Some(first_session_start) = events
+        .iter()
+        .position(|event| event.event_type == JournalEventType::SessionStart)
+        && first_session_start > 0
+    {
+        events[..=first_session_start].rotate_right(1);
+    }
+}
+
+fn journal_needs_session_start_for_path(path: &Path) -> std::io::Result<bool> {
+    let is_missing_or_empty = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.len() == 0,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(err) => return Err(err),
+    };
+    if is_missing_or_empty {
+        set_cached_session_start_state(path, false);
+        return Ok(true);
+    }
+    if let Some(has_open_session_start) = cached_session_start_state(path) {
+        return Ok(!has_open_session_start);
+    }
+    let content = std::fs::read_to_string(path)?;
+    let mut events = parse_journal_text(&content).0;
+    // Sort chronologically before inspecting the "last" event — legacy
+    // files or edge-cloud sync replays may have out-of-order lines.
+    stabilize_event_order(&mut events);
+    let last_type = events.last().map(|e| &e.event_type);
+    let needs_session_start = match last_type {
+        None | Some(JournalEventType::SessionEnd) => true,
+        _ => {
+            let last_start = events
+                .iter()
+                .rposition(|e| e.event_type == JournalEventType::SessionStart);
+            let last_end = events
+                .iter()
+                .rposition(|e| e.event_type == JournalEventType::SessionEnd);
+            let has_unmatched_start = match (last_start, last_end) {
+                (Some(s), Some(e)) => s > e,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            !has_unmatched_start
+        }
+    };
+    set_cached_session_start_state(path, !needs_session_start);
+    Ok(needs_session_start)
+}
+
+fn prepend_session_start_if_needed<'a>(
+    path: &Path,
+    events: &'a [JournalEvent],
+) -> std::io::Result<Cow<'a, [JournalEvent]>> {
+    if events.is_empty()
+        || events
+            .iter()
+            .any(|event| event.event_type == JournalEventType::SessionStart)
+        || !journal_needs_session_start_for_path(path)?
+    {
+        return Ok(Cow::Borrowed(events));
+    }
+    let Some(seed) = events
+        .iter()
+        .find(|event| event.event_type != JournalEventType::SessionStart)
+    else {
+        return Ok(Cow::Borrowed(events));
+    };
+    let mut session_start =
+        JournalEvent::session_start(seed.session_id.as_deref(), seed.model.as_deref());
+    // Set ts to 1µs before the seed event so SessionStart is guaranteed
+    // chronologically first.  On a parse failure we fall back to cloning the
+    // seed timestamp as-is rather than Utc::now(), so the prepended event
+    // never ends up *after* the seed.
+    if let Ok(seed_ts) = chrono::DateTime::parse_from_rfc3339(&seed.ts) {
+        session_start.ts = (seed_ts - chrono::Duration::microseconds(1)).to_rfc3339();
+    } else {
+        session_start.ts = seed.ts.clone();
+    }
+    let mut prefixed = Vec::with_capacity(events.len() + 1);
+    prefixed.push(session_start);
+    prefixed.extend(events.iter().cloned());
+    Ok(Cow::Owned(prefixed))
+}
+
+/// Opens a journal file with an exclusive file lock.
+///
+/// On Linux, `flock()` locks are associated with open file descriptions, and on
+/// kernels ≥ 2.6.12 same-process conflicts are detected (the second `lock_exclusive()`
+/// either blocks on the same fd or fails with `EAGAIN` on a different fd).  This
+/// guarantees that concurrent writes — including from within the same process —
+/// are serialized.  The `concurrent_first_writes_prepend_single_session_start`
+/// test validates this invariant.
+fn open_locked_journal_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use fs2::FileExt;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    file.lock_exclusive()?;
+    Ok(file)
+}
+
+fn serialize_journal_events(events: &[JournalEvent]) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    for event in events {
+        let mut line = serde_json::to_vec(event)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        line.push(b'\n');
+        buf.extend(line);
+    }
+    Ok(buf)
 }
 
 /// Validate that a session ID is safe for use as a filesystem path component.
@@ -1095,20 +1217,9 @@ impl JournalWriter {
     /// `concurrent_appends_remain_record_separated`.
     pub fn append(&self, event: &JournalEvent) -> std::io::Result<()> {
         use std::io::Write;
-        let mut buf = serde_json::to_vec(event)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        buf.push(b'\n');
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        // Restrict file permissions to owner-only (0o600) to protect sensitive
-        // conversation history from other users on shared systems.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-        }
+        let mut file = open_locked_journal_file(&self.path)?;
+        let events = prepend_session_start_if_needed(&self.path, std::slice::from_ref(event))?;
+        let buf = serialize_journal_events(events.as_ref())?;
         if let Err(e) = file.write_all(&buf) {
             if e.kind() == std::io::ErrorKind::Other
                 || e.raw_os_error() == Some(28) // ENOSPC
@@ -1120,7 +1231,7 @@ impl JournalWriter {
         }
         // Ensure durability: flush to disk so a crash doesn't lose the event.
         file.sync_data()?;
-        update_cached_session_start_state_from_event(&self.path, &event.event_type);
+        update_cached_session_start_state_from_events(&self.path, events.as_ref());
         Ok(())
     }
 
@@ -1144,27 +1255,14 @@ impl JournalWriter {
         if events.is_empty() {
             return Ok(());
         }
-        let mut buf = String::new();
-        for event in events {
-            let line = serde_json::to_string(event)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            buf.push_str(&line);
-            buf.push('\n');
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-        }
-        file.write_all(buf.as_bytes())?;
+        let mut file = open_locked_journal_file(&self.path)?;
+        let events = prepend_session_start_if_needed(&self.path, events)?;
+        let buf = serialize_journal_events(events.as_ref())?;
+        file.write_all(&buf)?;
         if sync {
             file.sync_data()?;
         }
-        update_cached_session_start_state_from_events(&self.path, events);
+        update_cached_session_start_state_from_events(&self.path, events.as_ref());
         Ok(())
     }
 }
@@ -1416,6 +1514,7 @@ fn parse_journal_text(content: &str) -> (Vec<JournalEvent>, usize, usize) {
             Err(_) => malformed_lines += 1,
         }
     }
+    stabilize_event_order(&mut events);
     (events, non_empty_lines, malformed_lines)
 }
 
@@ -1470,6 +1569,7 @@ pub fn read_journal_tail(session_id: &str, limit: usize) -> std::io::Result<Vec<
             events.push(event);
         }
     }
+    stabilize_event_order(&mut events);
     Ok(events)
 }
 
@@ -1477,45 +1577,26 @@ pub fn journal_needs_session_start(session_id: &str) -> std::io::Result<bool> {
     validate_session_id(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let path = journal_dir().join(format!("{session_id}.jsonl"));
-    let is_missing_or_empty = match std::fs::metadata(&path) {
-        Ok(metadata) => metadata.len() == 0,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
-        Err(err) => return Err(err),
-    };
-    if is_missing_or_empty {
-        set_cached_session_start_state(&path, false);
-        return Ok(true);
-    }
-    if let Some(has_open_session_start) = cached_session_start_state(&path) {
-        return Ok(!has_open_session_start);
-    }
-    let events = read_journal(session_id)?;
-    let last_type = events.last().map(|e| &e.event_type);
-    let needs_session_start = match last_type {
-        None | Some(JournalEventType::SessionEnd) => true,
-        _ => {
-            let last_start = events
-                .iter()
-                .rposition(|e| e.event_type == JournalEventType::SessionStart);
-            let last_end = events
-                .iter()
-                .rposition(|e| e.event_type == JournalEventType::SessionEnd);
-            let has_unmatched_start = match (last_start, last_end) {
-                (Some(s), Some(e)) => s > e,
-                (Some(_), None) => true,
-                _ => false,
-            };
-            !has_unmatched_start
-        }
-    };
-    set_cached_session_start_state(&path, !needs_session_start);
-    Ok(needs_session_start)
+    journal_needs_session_start_for_path(&path)
 }
 
 pub fn ensure_session_start_event(session_id: &str, model: Option<&str>) -> std::io::Result<()> {
-    if journal_needs_session_start(session_id)? {
-        let writer = JournalWriter::new(session_id)?;
-        writer.append(&JournalEvent::session_start(Some(session_id), model))?;
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let path = journal_dir().join(format!("{session_id}.jsonl"));
+
+    // Acquire the lock first — concurrent writers (including external
+    // processes or edge-cloud sync replays) may have modified the file
+    // since the last cache write; we must not return early based on a
+    // stale cache entry without holding the lock.
+    let mut file = open_locked_journal_file(&path)?;
+    if journal_needs_session_start_for_path(&path)? {
+        use std::io::Write;
+        let events = vec![JournalEvent::session_start(Some(session_id), model)];
+        let buf = serialize_journal_events(&events)?;
+        file.write_all(&buf)?;
+        file.sync_data()?;
+        update_cached_session_start_state_from_events(&path, &events);
     }
     Ok(())
 }
@@ -4031,11 +4112,12 @@ mod approval_tests {
             .unwrap();
 
         let events = read_journal("sess-permission-audit").unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, JournalEventType::PermissionAudit);
-        assert_eq!(events[0].turn, Some(3));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, JournalEventType::SessionStart);
+        assert_eq!(events[1].event_type, JournalEventType::PermissionAudit);
+        assert_eq!(events[1].turn, Some(3));
         assert_eq!(
-            events[0]
+            events[1]
                 .metadata
                 .as_ref()
                 .and_then(|value| value.get("kind"))
@@ -4863,9 +4945,10 @@ mod tests {
             JournalEvent::cloud_pull_sync_marker(Some(&sid), "default", "post_login", &[], true);
         writer.append(&evt).unwrap();
         let events = read_journal(&sid).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, JournalEventType::SyncMarker);
-        let cp = events[0]
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, JournalEventType::SessionStart);
+        assert_eq!(events[1].event_type, JournalEventType::SyncMarker);
+        let cp = events[1]
             .metadata
             .as_ref()
             .and_then(|m| m.get("cloud_pull"))
@@ -5773,13 +5856,15 @@ mod tests {
             .unwrap();
 
         let events = read_journal(&sid).unwrap();
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
 
-        let stall = &events[0];
+        assert_eq!(events[0].event_type, JournalEventType::SessionStart);
+
+        let stall = &events[1];
         assert_eq!(stall.event_type, JournalEventType::StallDetected);
         assert_eq!(stall.stall_type.as_deref(), Some("repetition_stall"));
 
-        let ckpt = &events[1];
+        let ckpt = &events[2];
         assert_eq!(ckpt.event_type, JournalEventType::Checkpoint);
         let meta = ckpt.metadata.as_ref().unwrap();
         assert_eq!(meta["summary"], "Midpoint checkpoint");
@@ -7064,14 +7149,16 @@ mod turn_event_buffer_tests {
         buf.flush(&writer).unwrap();
         assert!(buf.is_empty());
 
-        // Verify written to disk
+        // Verify written to disk — SessionStart is auto-prepended
         let content = std::fs::read_to_string(writer.path()).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
         let ev0: JournalEvent = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(ev0.event_type, JournalEventType::LlmRound);
+        assert_eq!(ev0.event_type, JournalEventType::SessionStart);
         let ev1: JournalEvent = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(ev1.event_type, JournalEventType::Turn);
+        assert_eq!(ev1.event_type, JournalEventType::LlmRound);
+        let ev2: JournalEvent = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(ev2.event_type, JournalEventType::Turn);
     }
 
     #[test]
@@ -7102,7 +7189,11 @@ mod turn_event_buffer_tests {
         assert!(buf.is_empty());
 
         let content = std::fs::read_to_string(writer.path()).unwrap();
-        let ev: JournalEvent = serde_json::from_str(content.trim()).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let ev0: JournalEvent = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(ev0.event_type, JournalEventType::SessionStart);
+        let ev: JournalEvent = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(ev.event_type, JournalEventType::LlmRound);
         let partial = ev
             .metadata
@@ -7212,10 +7303,22 @@ mod turn_event_buffer_tests {
 
         let _guard = JournalDirGuard::new(&dir);
         let events = read_journal(session_id).unwrap();
+        let session_start_count = events
+            .iter()
+            .filter(|event| event.event_type == JournalEventType::SessionStart)
+            .count();
+        let turn_count = events
+            .iter()
+            .filter(|event| event.event_type == JournalEventType::Turn)
+            .count();
         assert_eq!(
-            events.len(),
+            turn_count,
             n_threads * n_per_thread,
-            "every concurrent append should produce one parseable record"
+            "every concurrent append should produce one parseable turn record"
+        );
+        assert_eq!(
+            session_start_count, 1,
+            "concurrent first writes must not duplicate session_start"
         );
     }
 
@@ -7469,6 +7572,125 @@ mod turn_event_buffer_tests {
         let events = read_journal(sid).unwrap();
         assert_eq!(events[0].event_type, JournalEventType::SessionStart);
         assert_eq!(events[1].event_type, JournalEventType::InterruptionRecorded);
+    }
+
+    #[test]
+    fn writer_auto_prepends_session_start_for_first_non_start_event() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "auto-prepend-start-on-first-write";
+
+        let writer = JournalWriter::new(sid).unwrap();
+        writer
+            .append(&JournalEvent::interruption_recorded(
+                Some(sid),
+                1,
+                serde_json::json!({"kind":"manual_pause","resumable":true}),
+            ))
+            .unwrap();
+
+        let events = read_journal(sid).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, JournalEventType::SessionStart);
+        assert_eq!(events[1].event_type, JournalEventType::InterruptionRecorded);
+    }
+
+    #[test]
+    fn auto_prepended_session_start_precedes_seed_timestamp() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "auto-prepend-start-timestamp";
+        let path = journal_dir().join(format!("{sid}.jsonl"));
+        let mut interruption = JournalEvent::interruption_recorded(
+            Some(sid),
+            1,
+            serde_json::json!({"kind":"budget_exhausted","resumable":true}),
+        );
+        interruption.ts = "2026-01-01T00:00:02Z".to_string();
+
+        let batch = [interruption];
+        let prefixed = prepend_session_start_if_needed(&path, &batch).unwrap();
+        assert_eq!(prefixed[0].event_type, JournalEventType::SessionStart);
+        assert!(prefixed[0].ts < prefixed[1].ts);
+    }
+
+    #[test]
+    fn auto_prepended_session_start_clones_ts_on_parse_failure() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "prepend-parse-failure";
+        let path = journal_dir().join(format!("{sid}.jsonl"));
+        let mut interruption = JournalEvent::interruption_recorded(
+            Some(sid),
+            1,
+            serde_json::json!({"kind":"test"}),
+        );
+        interruption.ts = "not-a-valid-timestamp-2026".to_string();
+
+        let batch = [interruption.clone()];
+        let prefixed = prepend_session_start_if_needed(&path, &batch).unwrap();
+        assert_eq!(prefixed[0].event_type, JournalEventType::SessionStart);
+        // on parse failure, the SessionStart ts should match the seed ts rather
+        // than Utc::now(), so the prepended event never ends up after the seed
+        assert_eq!(prefixed[0].ts, prefixed[1].ts);
+    }
+
+    #[test]
+    fn concurrent_first_writes_prepend_single_session_start() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let sid = "concurrent-prepend-single-start";
+
+        std::thread::scope(|scope| {
+            for turn in 1..=8 {
+                let dir = dir.clone();
+                scope.spawn(move || {
+                    let _guard = JournalDirGuard::new(&dir);
+                    let writer = JournalWriter::new(sid).unwrap();
+                    writer
+                        .append(&JournalEvent::interruption_recorded(
+                            Some(sid),
+                            turn,
+                            serde_json::json!({"kind":"concurrent","turn":turn}),
+                        ))
+                        .unwrap();
+                });
+            }
+        });
+
+        let _guard = JournalDirGuard::new(&dir);
+        let events = read_journal(sid).unwrap();
+        let session_start_count = events
+            .iter()
+            .filter(|event| event.event_type == JournalEventType::SessionStart)
+            .count();
+        let interruption_count = events
+            .iter()
+            .filter(|event| event.event_type == JournalEventType::InterruptionRecorded)
+            .count();
+        assert_eq!(session_start_count, 1);
+        assert_eq!(interruption_count, 8);
+    }
+
+    #[test]
+    fn read_journal_returns_chronological_order_when_appends_drift() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "read-journal-chronological";
+        let writer = JournalWriter::new(sid).unwrap();
+
+        let mut later = JournalEvent::base_public(JournalEventType::ConfigChange, Some(sid));
+        later.ts = "2026-01-01T00:00:02Z".to_string();
+        let mut earlier = JournalEvent::base_public(JournalEventType::TraceSpan, Some(sid));
+        earlier.ts = "2026-01-01T00:00:01Z".to_string();
+
+        writer.append(&later).unwrap();
+        writer.append(&earlier).unwrap();
+
+        let events = read_journal(sid).unwrap();
+        assert_eq!(events[0].event_type, JournalEventType::SessionStart);
+        assert_eq!(events[1].event_type, JournalEventType::TraceSpan);
+        assert_eq!(events[2].event_type, JournalEventType::ConfigChange);
     }
 }
 
@@ -7731,9 +7953,10 @@ mod observability_serde_tests {
         writer.append(&ev).unwrap();
 
         let (events, _, _) = read_journal_for_digest(sid).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].git_head.as_deref(), Some("abc1234def5678"));
-        assert_eq!(events[0].git_branch.as_deref(), Some("main"));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, JournalEventType::SessionStart);
+        assert_eq!(events[1].git_head.as_deref(), Some("abc1234def5678"));
+        assert_eq!(events[1].git_branch.as_deref(), Some("main"));
     }
 
     #[test]

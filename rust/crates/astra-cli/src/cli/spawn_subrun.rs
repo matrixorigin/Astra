@@ -98,11 +98,25 @@ pub(crate) fn build_child_messages(
     system_prompt: &str,
     prefix_messages: Option<&[Value]>,
     child_task: &str,
+    force_reasoning_field: bool,
 ) -> Vec<Value> {
+    fn ensure_assistant_reasoning_fields(messages: &mut [Value]) {
+        for msg in messages {
+            if msg.get("role").and_then(Value::as_str) == Some("assistant")
+                && msg.get("reasoning_content").is_none()
+            {
+                msg["reasoning_content"] = Value::String(String::new());
+            }
+        }
+    }
+
     if let Some(prefix) = prefix_messages {
         // Fork mode: reuse parent prefix verbatim for cache alignment.
         let mut messages = Vec::with_capacity(prefix.len() + 2);
         messages.extend(prefix.iter().cloned());
+        if force_reasoning_field {
+            ensure_assistant_reasoning_fields(&mut messages);
+        }
         // Bedrock Converse requires strict role alternation. If the
         // prefix ends with user or tool role, inserting the child task
         // (also user) would create consecutive user messages → HTTP 400.
@@ -113,10 +127,14 @@ pub(crate) fn build_child_messages(
             .find_map(|m| m.get("role").and_then(|r| r.as_str()))
             .filter(|r| *r != "system");
         if matches!(last_role, Some("user") | Some("tool")) {
-            messages.push(json!({
+            let mut bridge = json!({
                 "role": "assistant",
                 "content": "I'll now work on the delegated task."
-            }));
+            });
+            if force_reasoning_field {
+                bridge["reasoning_content"] = Value::String(String::new());
+            }
+            messages.push(bridge);
         }
         messages.push(json!({ "role": "user", "content": child_task }));
         messages
@@ -533,6 +551,15 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         // the provider can hit in its prompt cache. The child task
         // at the tail is always fresh (cacheable only for future
         // child turns, not for this first call).
+        let force_reasoning_field = config.inherited_prefix.as_ref().is_some_and(|ip| {
+            ip.thinking
+                .as_ref()
+                .is_some_and(|thinking| thinking.enabled)
+                || astra_turn_core::edge_ledger::history_has_reasoning(&ip.prefix_messages)
+        }) || effective_model.as_deref().is_some_and(|model| {
+            astra_turn_core::reasoning_capabilities::reasoning_capabilities("", model).requires_replay()
+        });
+
         let messages = build_child_messages(
             &system_prompt,
             config
@@ -540,6 +567,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 .as_ref()
                 .map(|ip| ip.prefix_messages.as_slice()),
             &config.task,
+            force_reasoning_field,
         );
 
         // Build restricted tools based on agent type's allowed_tools
@@ -597,6 +625,11 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let has_parent_permissions = config.parent_address.is_some();
 
         let max_turns = config.max_turns as usize;
+
+        let child_thinking = effective_model
+            .as_deref()
+            .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
+            .unwrap_or_default();
 
         let mut state = AgenticLoopState {
             messages,
@@ -703,7 +736,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
-            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+            thinking: child_thinking,
             recent_file_reads: Vec::new(),
             permission_context: config.permission_context,
             permission_handler: None,
@@ -1210,7 +1243,8 @@ mod tests {
         let system_prompt = "You are a child agent.";
         let child_task = "Reply: inherited-ok";
 
-        let messages = build_child_messages(system_prompt, Some(&prefix_messages), child_task);
+        let messages =
+            build_child_messages(system_prompt, Some(&prefix_messages), child_task, false);
 
         // After system, the messages should NOT have two consecutive user roles.
         let non_system: Vec<&str> = messages
@@ -1239,7 +1273,7 @@ mod tests {
             json!({"role": "assistant", "content": "", "tool_calls": [{"id": "1", "function": {"name": "bash", "arguments": "{}"}}]}),
             json!({"role": "tool", "tool_call_id": "1", "content": "done"}),
         ];
-        let messages = build_child_messages("system", Some(&prefix_messages), "child task");
+        let messages = build_child_messages("system", Some(&prefix_messages), "child task", false);
 
         let non_system: Vec<&str> = messages
             .iter()
@@ -1267,7 +1301,7 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "content": "hello"}),
         ];
-        let messages = build_child_messages("ignored", Some(&prefix_messages), "child task");
+        let messages = build_child_messages("ignored", Some(&prefix_messages), "child task", false);
 
         // Fork mode: prefix verbatim + child task. No bridge needed
         // because prefix ends with assistant → child task (user) is valid.
@@ -1309,6 +1343,23 @@ mod tests {
             "child AgenticLoopState must consume `server_session_id` \
              (the None-typed variable above), not a fresh Some(...)"
         );
+    }
+
+    #[test]
+    fn fork_mode_backfills_reasoning_fields_when_inherited_prefix_requires_them() {
+        let prefix_messages = vec![
+            json!({"role": "user", "content": "do something"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "1", "function": {"name": "bash", "arguments": "{}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "1", "content": "done"}),
+        ];
+        let messages = build_child_messages("system", Some(&prefix_messages), "child task", true);
+        assert_eq!(messages[1]["reasoning_content"], "");
+        assert_eq!(messages[3]["role"], "assistant");
+        assert_eq!(messages[3]["reasoning_content"], "");
     }
 
     #[test]

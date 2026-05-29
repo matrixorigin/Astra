@@ -59,6 +59,36 @@ pub mod triggers;
 pub mod verification;
 pub mod workflows;
 
+fn missing_shared_pool_error(
+    service_name: &'static str,
+    settings: &astra_core::MatrixOneSettings,
+) -> sqlx::Error {
+    sqlx::Error::Configuration(Box::new(std::io::Error::new(
+        std::io::ErrorKind::NotConnected,
+        format!(
+            "{service_name} requires an injected SharedPool for database '{}'; wire .with_pool(...) at composition time instead of relying on implicit fallback connections",
+            settings.database
+        ),
+    )))
+}
+
+fn require_shared_pool(
+    pool: Option<&astra_core::SharedPool>,
+    service_name: &'static str,
+    settings: &astra_core::MatrixOneSettings,
+) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
+    pool.map(|pool| pool.get().clone())
+        .ok_or_else(|| missing_shared_pool_error(service_name, settings))
+}
+
+fn require_shared_pool_message(
+    pool: Option<&astra_core::SharedPool>,
+    service_name: &'static str,
+    settings: &astra_core::MatrixOneSettings,
+) -> Result<sqlx::Pool<sqlx::MySql>, String> {
+    require_shared_pool(pool, service_name, settings).map_err(|err| err.to_string())
+}
+
 pub use admin::{
     AdminAuditFilter, AdminAuditReader, AdminAuditRecord, AdminAuthorizer,
     AdminFeedbackStatsFilter, AdminFeedbackStatsReader, AdminFeedbackStatsRecord, AdminInitRecord,

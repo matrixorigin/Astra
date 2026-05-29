@@ -287,4 +287,22 @@ mod tests {
         // Should only find the skill once despite the symlink
         assert_eq!(manifests.len(), 1);
     }
+
+    #[tokio::test]
+    async fn review_changes_skill_keeps_agent_available_for_parallel_reviews() {
+        let repo_skills = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../skills")
+            .canonicalize()
+            .expect("repo skills dir should resolve in workspace tests");
+        let provider = LocalSkillProvider::with_paths(vec![repo_skills]);
+        let loaded = provider.load("review-changes").await.unwrap();
+        assert!(
+            loaded
+                .manifest
+                .allowed_tools
+                .iter()
+                .any(|tool| tool == "agent"),
+            "review-changes must keep the agent tool visible so user-requested parallel reviews do not degrade to serial execution"
+        );
+    }
 }

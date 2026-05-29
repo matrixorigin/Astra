@@ -67,7 +67,16 @@ mod tests {
 
         let events =
             astra_services::session_journal::read_journal("session-123").expect("read journal");
-        assert_eq!(events.len(), 1);
+        let bootstrap_count = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type,
+                    astra_services::session_journal::JournalEventType::Bootstrap
+                )
+            })
+            .count();
+        assert_eq!(bootstrap_count, 1);
         assert_eq!(
             astra_services::session_journal::journal_file_path("session-123")
                 .file_name()

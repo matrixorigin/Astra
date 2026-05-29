@@ -190,6 +190,9 @@ impl AgenticLoopHost for SubRunHost {
             .model_override
             .as_deref()
             .or(self.model.as_deref());
+        let thinking = effective_model
+            .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
+            .unwrap_or_default();
         let interaction_mode = TurnInteractionMode::NonInteractive;
         let interaction_scoped_restrictions =
             interaction_scoped_tool_restrictions(interaction_mode);
@@ -209,7 +212,7 @@ impl AgenticLoopHost for SubRunHost {
             capabilities: astra_thin_client::builtin_capability_preset(),
             project_root: &self.project_root,
             git_branch: None,
-            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+            thinking: thinking.clone(),
         });
 
         if let Some(max_tokens) = self.max_completion_tokens {
@@ -520,6 +523,10 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         let effective_model = model
             .map(String::from)
             .or_else(|| self.default_model.clone());
+        let thinking = effective_model
+            .as_deref()
+            .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
+            .unwrap_or_default();
         let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
             effective_model.as_deref().unwrap_or(""),
         );
@@ -725,7 +732,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: SUBRUN_MAX_CUMULATIVE_TOKENS,
-            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+            thinking,
             recent_file_reads: Vec::new(),
             permission_context: None,
             permission_handler: None,
@@ -1007,6 +1014,7 @@ mod tests {
             prefix_id: "p1".into(),
             parent_run_id: "r1".into(),
             provider: astra_turn_core::fork_prefix::ProviderKind::Anthropic,
+            thinking: None,
             prefix_messages: Vec::new(),
             frozen_tool_schemas: Some(frozen.clone()),
             expected_cache_read_tokens: 0,
@@ -1029,6 +1037,7 @@ mod tests {
             prefix_id: "p2".into(),
             parent_run_id: "r2".into(),
             provider: astra_turn_core::fork_prefix::ProviderKind::Anthropic,
+            thinking: None,
             prefix_messages: Vec::new(),
             frozen_tool_schemas: None,
             expected_cache_read_tokens: 0,

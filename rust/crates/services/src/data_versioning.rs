@@ -9,7 +9,7 @@ use crate::SessionArtifactStore;
 use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool,
     composite_snapshot::{CompositeSnapshot, CompositeSnapshotIndex, StateDiff},
-    connect_matrixone, error_response, internal_error,
+    error_response, internal_error,
 };
 
 const MAX_CHECKPOINT_LIST_ROWS: i32 = 200;
@@ -237,10 +237,11 @@ impl DatabaseDataVersioningService {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(
+            self.pool.as_ref(),
+            "DatabaseDataVersioningService",
+            &self.matrixone,
+        )
     }
 
     async fn hydrate_parent_event_ids(

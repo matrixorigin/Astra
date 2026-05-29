@@ -28,7 +28,7 @@ use astra_runtime::{
 use astra_services::coordination::AgentResult;
 
 use super::permission_manager::PermissionMode;
-use super::skill_subrun::{SubRunHost, persist_failed_subrun};
+use super::skill_subrun::{persist_failed_subrun, SubRunHost};
 use crate::edge_tools;
 
 const DELEGATE_MAX_TURNS: usize = 25;
@@ -226,6 +226,10 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             .model_override
             .clone()
             .or_else(|| self.default_model.clone());
+        let child_thinking = effective_model
+            .as_deref()
+            .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
+            .unwrap_or_default();
         let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
             effective_model.as_deref().unwrap_or(""),
         );
@@ -300,7 +304,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         // Build system message from agent profile.
         // Always append the non-interactive directive so sub-agents never stall
         // waiting for user input — they must make autonomous decisions.
-        const NON_INTERACTIVE: &str = "\n\nIMPORTANT: You are running as an autonomous sub-agent with no user present. \
+        const NON_INTERACTIVE: &str =
+            "\n\nIMPORTANT: You are running as an autonomous sub-agent with no user present. \
             Do NOT ask clarifying questions or prompt for input. \
             Make reasonable assumptions and proceed to completion.";
 
@@ -334,6 +339,15 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         // sits behind it as cacheable context, and the child's
         // task message is the fresh suffix. When no prefix was
         // resolved, this degenerates to the pre-fix 2-message layout.
+        let force_reasoning_field = config.inherited_prefix.as_ref().is_some_and(|ip| {
+            ip.thinking
+                .as_ref()
+                .is_some_and(|thinking| thinking.enabled)
+                || astra_turn_core::edge_ledger::history_has_reasoning(&ip.prefix_messages)
+        }) || effective_model.as_deref().is_some_and(|model| {
+            astra_turn_core::reasoning_capabilities::reasoning_capabilities("", model)
+                .requires_replay()
+        });
         let messages = crate::cli::spawn_subrun::build_child_messages(
             &system_prompt,
             config
@@ -341,6 +355,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 .as_ref()
                 .map(|ip| ip.prefix_messages.as_slice()),
             &user_message,
+            force_reasoning_field,
         );
 
         let restricted_tools = build_restricted_tools(&profile.skill_filter, &valid_tool_names);
@@ -467,7 +482,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
-            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+            thinking: child_thinking,
             recent_file_reads: Vec::new(),
             permission_context: None,
             permission_handler: None,

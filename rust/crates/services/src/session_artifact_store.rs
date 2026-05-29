@@ -8,7 +8,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use astra_core::{MatrixOneSettings, SharedPool, connect_matrixone};
+use astra_core::{MatrixOneSettings, SharedPool};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -152,10 +152,11 @@ impl DatabaseSessionArtifactStore {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref pool) = self.pool {
-            return Ok(pool.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(
+            self.pool.as_ref(),
+            "DatabaseSessionArtifactStore",
+            &self.matrixone,
+        )
     }
 }
 

@@ -4,9 +4,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Acquire, MySql, QueryBuilder, Row, query};
 use uuid::Uuid;
 
-use astra_core::{
-    ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
-};
+use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
 use crate::pagination::clamp_api_list_pagination;
 use crate::storage::{load_agent_event_count, upsert_agent_session_event_count};
@@ -181,10 +179,7 @@ impl DatabaseEventService {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(self.pool.as_ref(), "DatabaseEventService", &self.matrixone)
     }
 }
 

@@ -12,10 +12,10 @@ arguments:
     required: false
 allowed_tools:
   - git
-  - git
   - git_show
   - git_log
   - github
+  - agent
   - read_file
   - grep
   - glob

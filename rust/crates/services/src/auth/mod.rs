@@ -1,7 +1,7 @@
 use crate::storage::database_user_from_row;
 use astra_core::{
-    ErrorResponse, JwtSettings, MatrixOneSettings, SharedPool, bearer_token, connect_matrixone,
-    error_response, internal_error, is_duplicate_key_error,
+    ErrorResponse, JwtSettings, MatrixOneSettings, SharedPool, bearer_token, error_response,
+    internal_error, is_duplicate_key_error,
 };
 use async_trait::async_trait;
 use axum::{
@@ -344,10 +344,7 @@ impl DatabaseAuthService {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(self.pool.as_ref(), "DatabaseAuthService", &self.matrixone)
     }
 }
 

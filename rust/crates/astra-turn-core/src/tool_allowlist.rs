@@ -59,6 +59,17 @@ mod tests {
     }
 
     #[test]
+    fn intersection_strips_members_not_in_both_sets() {
+        let request = HashSet::from(["Bash".to_string(), "Python".to_string()]);
+        let skill = HashSet::from([" python ".to_string(), "nodejs".to_string()]);
+
+        assert_eq!(
+            compute_effective_allowlist(Some(&request), Some(&skill)),
+            Some(HashSet::from(["python".to_string()]))
+        );
+    }
+
+    #[test]
     fn explicit_empty_allowlist_is_preserved() {
         let request = HashSet::new();
 
@@ -69,20 +80,18 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_intersection_contract_is_explicit_and_preserved() {
-        let request = HashSet::from(["Bash".to_string(), "Python".to_string()]);
-        let skill = HashSet::from([" python ".to_string(), "nodejs".to_string()]);
-
-        assert_eq!(
-            compute_effective_allowlist(Some(&request), Some(&skill)),
-            Some(HashSet::from(["python".to_string()]))
-        );
-
+    fn empty_allowlist_beats_skill_scoped_set() {
         let empty = HashSet::new();
+        let skill = HashSet::from(["python".to_string()]);
+
         assert_eq!(
             compute_effective_allowlist(Some(&empty), Some(&skill)),
             Some(HashSet::new())
         );
+    }
+
+    #[test]
+    fn both_lanes_none_means_no_restriction() {
         assert_eq!(compute_effective_allowlist(None, None), None);
     }
 

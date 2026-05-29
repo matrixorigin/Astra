@@ -2069,22 +2069,17 @@ impl ServerAgenticLoopHost {
     }
 
     /// Compute the tool schemas visible for the current turn after applying
-    /// health-based restrictions. This is the server-path equivalent of the
-    /// CLI's deny-at-assembly behavior.
+    /// health-based restrictions and hard request policies.
     ///
-    /// IMPORTANT: request-level allowlists may prune schemas here, but
-    /// skill-scoped `allowed_tools` must NOT. Skill restrictions are enforced in
-    /// `tool_interception` at runtime so prompt-visible tool definitions stay
-    /// cache-stable across turns.
+    /// IMPORTANT: prompt-visible schemas must match the runtime policy the
+    /// model can actually execute. Request/delegation allowlists are hard
+    /// constraints and are pruned here; skill `allowed_tools` is only a hint
+    /// and must not silently hide otherwise-callable tools from the model.
     fn filtered_turn_tools(&self, restricted_tools: &HashSet<String>) -> Vec<Value> {
         filter_tool_schemas_by_excluded_names(self.edge_tools.clone(), restricted_tools)
     }
 
-    fn request_allowlist_restrictions(&self, state: &AgenticLoopState) -> HashSet<String> {
-        let Some(allowed) = state.skills.request_constraints.allowed_tools.as_ref() else {
-            return HashSet::new();
-        };
-
+    fn runtime_allowlist_restrictions(&self, state: &AgenticLoopState) -> HashSet<String> {
         self.edge_tools
             .iter()
             .filter_map(|tool| {
@@ -2094,9 +2089,7 @@ impl ServerAgenticLoopHost {
                     .map(String::from)
             })
             .filter(|name| {
-                name.as_str() != crate::turn::skill_tool::SKILL_TOOL_NAME
-                    && name.as_str() != crate::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME
-                    && !allowed.contains(&name.trim().to_ascii_lowercase())
+                !crate::turn::agentic::tool_interception::runtime_allows_tool(state, name)
             })
             .collect()
     }
@@ -2137,7 +2130,7 @@ impl ServerAgenticLoopHost {
             );
         }
         let mut effective_restricted = state.restricted_tools.clone();
-        effective_restricted.extend(self.request_allowlist_restrictions(state));
+        effective_restricted.extend(self.runtime_allowlist_restrictions(state));
         // Boosted tools are never hidden, even if they landed in the restricted
         // set earlier (e.g., via stall-based deprioritization).
         for boosted in &state.boosted_tools {
@@ -2554,7 +2547,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             );
         }
         let mut effective_restricted = state.restricted_tools.clone();
-        effective_restricted.extend(self.request_allowlist_restrictions(state));
+        effective_restricted.extend(self.runtime_allowlist_restrictions(state));
         let interaction_mode = self.turn_interaction_mode();
         effective_restricted.extend(interaction_scoped_tool_restrictions(interaction_mode));
         for boosted in &state.boosted_tools {
@@ -3212,7 +3205,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         if !state.widen_selection_pending {
             merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut effective_restricted);
         }
-        effective_restricted.extend(self.request_allowlist_restrictions(state));
+        effective_restricted.extend(self.runtime_allowlist_restrictions(state));
         let interaction_mode = self.turn_interaction_mode();
         effective_restricted.extend(interaction_scoped_tool_restrictions(interaction_mode));
         for boosted in &state.boosted_tools {
@@ -3338,6 +3331,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         };
         let model_id = self.model_override.clone().unwrap_or_default();
         let provider = astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model_id);
+        let raw_provider = provider.raw_provider_name().to_owned();
         let Ok(canonical_prefix_bytes) = serde_json::to_vec(&state.messages) else {
             return;
         };
@@ -3358,7 +3352,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             parent_turn_seq: state.llm_rounds_completed,
             provider,
             model_id,
-            thinking: None,
+            thinking: astra_turn_core::thinking_config::fork_capture_thinking_slice(
+                &state.thinking,
+                &raw_provider,
+                &self.model_override.clone().unwrap_or_default(),
+            ),
             system_blocks: vec![],
             tool_schemas,
             beta_headers: vec![],
@@ -5231,7 +5229,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_turn_tools_only_apply_request_allowlists() {
+    fn visible_turn_tools_apply_effective_runtime_allowlist() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -5242,7 +5240,8 @@ mod tests {
         .build();
 
         let mut state = create_test_state();
-        // Delegation restricts to bash + read_file
+        // Delegation restricts to bash + read_file, then the active skill narrows
+        // that set further to bash only.
         state.skills.request_constraints.allowed_tools = Some(
             ["bash".to_string(), "read_file".to_string()]
                 .into_iter()
@@ -5270,10 +5269,11 @@ mod tests {
             })
             .collect();
 
-        // Request allowlists still hide tools from the prompt-visible schema.
+        // With the new design, skill allowed_tools is only a hint —
+        // the visible schema reflects the request constraints directly.
         assert!(visible_names.contains("bash"));
         assert!(visible_names.contains("read_file"));
-        // Request allowlists still hide tools outside the delegation contract.
+        // Tools outside the request allowlist are hidden.
         assert!(!visible_names.contains("str_replace"));
     }
 
@@ -6480,9 +6480,8 @@ mod tests {
         ]
     }
 
-    /// Core invariant: skill allowed_tools must not prune the prompt-visible
-    /// schema. Runtime enforcement happens later in tool interception so prompt
-    /// cache prefixes stay stable.
+    /// Core invariant: the prompt-visible schema must match the active runtime
+    /// tool policy, including skill allowlists.
     #[test]
     fn skill_allowed_tools_do_not_prune_prompt_visible_tools() {
         let mut host = ServerAgenticLoopHostBuilder::new(
@@ -6523,33 +6522,32 @@ mod tests {
             })
             .collect();
 
-        // Skill allowlists no longer prune the visible schema.
         assert!(
             visible_names.contains(&"bash"),
-            "skill-listed tool must be visible"
+            "skill-hinted tool must stay visible"
         );
         assert!(
             visible_names.contains(&"read_file"),
-            "skill-listed tool must be visible"
+            "skill-hinted tool must stay visible"
         );
         assert!(
             visible_names.contains(&"grep"),
-            "skill-listed tool must be visible"
+            "skill-hinted tool must stay visible"
         );
         assert!(
             visible_names.contains(&"str_replace"),
-            "write tools stay visible; runtime interception enforces skill restrictions"
+            "skill hints must not hide otherwise-callable tools from the prompt-visible schema"
         );
         assert!(
             visible_names.contains(&"write_file"),
-            "write tools stay visible; runtime interception enforces skill restrictions"
+            "skill hints must not hide otherwise-callable tools from the prompt-visible schema"
         );
     }
 
-    /// After a skill sets allowed_tools, later turns should keep the same
-    /// prompt-visible tool set until another skill activation replaces it.
+    /// After a skill sets allowed_tools, later turns should keep the same hint
+    /// state without turning it into a hard prompt-visible restriction.
     #[test]
-    fn skill_allowed_tools_do_not_prune_prompt_schemas_across_turns() {
+    fn skill_allowed_tools_leave_prompt_schemas_unpruned_across_turns() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -6579,8 +6577,8 @@ mod tests {
         );
         let _turn1 = host.visible_turn_tools(&mut state);
 
-        // Turn 2: the loaded skill still governs the session until another
-        // activation replaces it, so the prompt-visible tool set stays stable.
+        // Turn 2: the loaded skill hint still governs the session until another
+        // activation replaces it, but the full callable schema stays visible.
         state.session_turn = 2;
         let visible = host.visible_turn_tools(&mut state);
         let visible_names: Vec<&str> = visible
@@ -6594,11 +6592,11 @@ mod tests {
 
         assert!(
             visible_names.contains(&"str_replace"),
-            "turn 2 should still advertise write tools so prompt-visible schemas stay cache-stable"
+            "turn 2 should keep the full callable schema visible"
         );
         assert!(
             visible_names.contains(&"write_file"),
-            "turn 2 should still advertise write tools so prompt-visible schemas stay cache-stable"
+            "turn 2 should keep the full callable schema visible"
         );
     }
 
@@ -6648,11 +6646,10 @@ mod tests {
     }
 
     /// Combined scenario: delegation constrains to [bash, read_file, grep, str_replace]
-    /// AND a review skill has allowed_tools = [bash, read_file, grep].
-    /// The prompt-visible schema honors only request constraints. Skill
-    /// restrictions are enforced later by runtime interception.
+    /// AND a review skill carries a narrower allowed_tools hint. The hard
+    /// request policy still wins, but the skill hint must not narrow further.
     #[test]
-    fn prompt_schema_honors_request_allowlist_but_not_skill_allowlist() {
+    fn prompt_schema_ignores_skill_hints_when_request_allowlist_is_broader() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -6698,12 +6695,9 @@ mod tests {
             })
             .collect();
 
-        // str_replace: allowed by request_constraints, but not by the active
-        // review skill. It stays visible for prompt-cache stability; runtime
-        // interception blocks it if the model tries to execute it.
         assert!(
             visible_names.contains(&"str_replace"),
-            "skill allowlist must not narrow prompt-visible schemas"
+            "request-allowlisted tools must remain visible even when the active skill hint omits them"
         );
         // write_file: NOT in request_constraints → restricted by delegation
         assert!(

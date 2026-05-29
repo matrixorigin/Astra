@@ -86,6 +86,7 @@ pub mod streaming_tool_exec;
 pub mod tail_persist;
 pub mod task;
 pub mod task_context;
+pub mod reasoning_capabilities;
 pub mod thinking_config;
 pub mod token_accounting;
 pub mod tool;

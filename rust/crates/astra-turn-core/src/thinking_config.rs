@@ -7,7 +7,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// Provider-agnostic thinking configuration.
 ///
@@ -175,6 +175,41 @@ impl ThinkingConfig {
             };
         }
         Self::default()
+    }
+}
+
+/// Convert the effective turn thinking config into the fork-prefix metadata slice.
+///
+/// Native reasoning models can require replay-safe assistant reasoning fields even
+/// when Astra did not surface an explicit `(thinking...)` selector suffix. We still
+/// encode those captures as enabled so forked children preserve valid replay.
+pub fn fork_capture_thinking_slice(
+    thinking: &ThinkingConfig,
+    provider: &str,
+    model: &str,
+) -> Option<crate::fork_prefix::ThinkingConfigSlice> {
+    match thinking {
+        ThinkingConfig::Off => {
+            crate::reasoning_capabilities::reasoning_capabilities(provider, model)
+                .requires_replay()
+                .then(|| crate::fork_prefix::ThinkingConfigSlice {
+                    enabled: true,
+                    budget_tokens: 0,
+                    kind: "native".to_string(),
+                })
+        }
+        ThinkingConfig::Enabled { budget_tokens } => {
+            Some(crate::fork_prefix::ThinkingConfigSlice {
+                enabled: true,
+                budget_tokens: *budget_tokens,
+                kind: "enabled".to_string(),
+            })
+        }
+        ThinkingConfig::Adaptive { .. } => Some(crate::fork_prefix::ThinkingConfigSlice {
+            enabled: true,
+            budget_tokens: 0,
+            kind: "adaptive".to_string(),
+        }),
     }
 }
 

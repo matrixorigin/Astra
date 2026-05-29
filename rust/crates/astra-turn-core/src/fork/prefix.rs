@@ -189,6 +189,18 @@ impl ProviderKind {
             ProviderKind::Other(name) => format!("other:{name}"),
         }
     }
+
+    /// Raw provider name without the `other:` namespace prefix.
+    /// Used by reasoning-replay policy to detect providers that need
+    /// unsigned reasoning preserved (DeepSeek, Moonshot, etc.).
+    pub fn raw_provider_name(&self) -> &str {
+        match self {
+            ProviderKind::Anthropic => "anthropic",
+            ProviderKind::OpenAi => "openai",
+            ProviderKind::Bedrock => "bedrock",
+            ProviderKind::Other(name) => name.as_str(),
+        }
+    }
 }
 
 /// Write-policy for the child's first API request. Controls whether

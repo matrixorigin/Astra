@@ -3,9 +3,7 @@ use axum::http::StatusCode;
 use serde_json::Value;
 use sqlx::{Row, query};
 
-use astra_core::{
-    MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
-};
+use astra_core::{MatrixOneSettings, SharedPool, error_response, internal_error};
 
 use super::scoring::{
     DEGRADATION_DELTA, QUALITY_DEGRADED, QUALITY_GOOD, TOKEN_CHAR_RATIO, analyze_context_health,
@@ -62,10 +60,11 @@ impl DatabaseIntrospectionService {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(
+            self.pool.as_ref(),
+            "DatabaseIntrospectionService",
+            &self.matrixone,
+        )
     }
 }
 

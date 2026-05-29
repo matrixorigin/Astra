@@ -12,9 +12,7 @@ use sqlx::{Row, query};
 
 use crate::cost_ledger::{CostLedger, CostLedgerEntry};
 use crate::models::PricingData;
-use astra_core::{
-    ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
-};
+use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
 fn normalize_tool_name(name: String) -> String {
     let trimmed = name.trim_matches('"').trim();
@@ -767,10 +765,11 @@ impl DatabaseSessionAuditService {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(
+            self.pool.as_ref(),
+            "DatabaseSessionAuditService",
+            &self.matrixone,
+        )
     }
 
     async fn verify_session_owner(

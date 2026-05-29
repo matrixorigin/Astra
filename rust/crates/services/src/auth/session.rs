@@ -1,8 +1,6 @@
 use crate::pagination::{MAX_API_LIST_OFFSET, clamp_api_list_pagination};
 use crate::storage::{log_session_audit, session_record_from_row};
-use astra_core::{
-    ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
-};
+use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use chrono::Utc;
@@ -152,10 +150,11 @@ impl DatabaseSessionService {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(
+            self.pool.as_ref(),
+            "DatabaseSessionService",
+            &self.matrixone,
+        )
     }
 }
 

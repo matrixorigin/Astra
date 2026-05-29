@@ -223,8 +223,8 @@ pub(crate) use astra_services::runs::UnconfiguredRunLifecycleService;
 // ── Re-exports: runtime app state ────────────────────────────────────────────
 
 pub use app_state::{
-    AppState, HealthChecker, MatrixOneHealthChecker, MemoriaForwarder, NoopMemoriaForwarder,
-    ReqwestMemoriaForwarder, ServiceInfo,
+    AppState, DatabaseHealth, HealthChecker, MatrixOneHealthChecker, MemoriaForwarder,
+    NoopMemoriaForwarder, ReqwestMemoriaForwarder, ServiceInfo,
 };
 
 // ── Re-exports: bridge ───────────────────────────────────────────────────────

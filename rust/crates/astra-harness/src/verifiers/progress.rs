@@ -1,9 +1,12 @@
 use crate::{DecisionRecord, HookPoint, Severity, Verifier, Violation};
 
-/// Pauses read-only churn before the loop reaches a budget or circuit-breaker
-/// terminal state.
+/// Warns on overlapping re-reads and pauses only when redundant reads persist
+/// across a sustained read-only streak.
 pub struct ProgressVerifier {
     pub max_read_only_round_streak: u32,
+    /// Single-turn warning threshold for overlapping reads with no intervening
+    /// edit. This is advisory only; it should not pause legitimate
+    /// investigation on its own.
     pub max_redundant_read_count: u32,
     /// Tighter threshold applied after recovery from a read-only pause.
     /// Prevents repeated waste if the agent doesn't act on the checkpoint.
@@ -43,26 +46,38 @@ impl Verifier for ProgressVerifier {
         let read_only_stalled = self.max_read_only_round_streak > 0
             && snap.read_only_round_streak >= self.max_read_only_round_streak
             && snap.redundant_read_count >= self.min_redundant_reads_for_pause;
-        let redundant_read_stalled = self.max_redundant_read_count > 0
+        let redundant_read_warning = self.max_redundant_read_count > 0
             && snap.read_only_round_streak > 0
             && snap.redundant_read_count >= self.max_redundant_read_count;
 
-        if !(read_only_stalled || redundant_read_stalled) {
-            return Vec::new();
+        if read_only_stalled {
+            return vec![Violation {
+                severity: Severity::Pause,
+                verifier: self.name().to_string(),
+                message: format!(
+                    "decision checkpoint: {} consecutive read-only round(s) and {} redundant read(s) passed without any mutation. Reuse the evidence already gathered; if one specific fact is still missing, fetch only that fact. Otherwise choose one concrete next action: edit, run targeted verification, or explicitly report why the task cannot be completed.",
+                    snap.read_only_round_streak, snap.redundant_read_count
+                ),
+                recovery_threshold: normalized_recovery_threshold(
+                    self.max_read_only_round_streak,
+                    self.recovery_read_only_round_streak,
+                ),
+            }];
         }
 
-        vec![Violation {
-            severity: Severity::Pause,
-            verifier: self.name().to_string(),
-            message: format!(
-                "decision checkpoint: {} consecutive read-only round(s), {} redundant read(s), and no mutation signal. Use the evidence already gathered and choose one next action: edit, run targeted verification, or explicitly report why the task cannot be completed; do not continue broad or duplicate reading.",
-                snap.read_only_round_streak, snap.redundant_read_count
-            ),
-            recovery_threshold: normalized_recovery_threshold(
-                self.max_read_only_round_streak,
-                self.recovery_read_only_round_streak,
-            ),
-        }]
+        if redundant_read_warning {
+            return vec![Violation {
+                severity: Severity::Warning,
+                verifier: self.name().to_string(),
+                message: format!(
+                    "read-loop warning: {} overlapping read(s) were repeated within a read-only streak. Reuse what is already in context before opening the same ranges again.",
+                    snap.redundant_read_count
+                ),
+                recovery_threshold: None,
+            }];
+        }
+
+        Vec::new()
     }
 }
 
@@ -124,11 +139,11 @@ mod tests {
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].severity, Severity::Pause);
         assert!(violations[0].message.contains("decision checkpoint"));
-        assert!(violations[0].message.contains("edit"));
+        assert!(violations[0].message.contains("one specific fact"));
     }
 
     #[test]
-    fn progress_verifier_pauses_on_redundant_reads_without_mutation() {
+    fn progress_verifier_warns_on_redundant_reads_without_mutation() {
         let verifier = ProgressVerifier {
             max_read_only_round_streak: 10,
             max_redundant_read_count: 3,
@@ -137,7 +152,8 @@ mod tests {
         };
         let violations = verifier.check(&record(1, 3));
         assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].severity, Severity::Pause);
+        assert_eq!(violations[0].severity, Severity::Warning);
+        assert!(violations[0].message.contains("read-loop warning"));
     }
 
     #[test]

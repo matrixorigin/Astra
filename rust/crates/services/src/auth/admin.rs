@@ -9,8 +9,8 @@ use crate::admin::{
 };
 use crate::pagination::clamp_admin_audit_limit;
 use astra_core::{
-    ErrorResponse, JwtSettings, MatrixOneSettings, SharedPool, bearer_token, connect_matrixone,
-    error_response, internal_error,
+    ErrorResponse, JwtSettings, MatrixOneSettings, SharedPool, bearer_token, error_response,
+    internal_error,
 };
 use async_trait::async_trait;
 use axum::{
@@ -108,10 +108,11 @@ impl DatabaseAdminAuthorizer {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(
+            self.pool.as_ref(),
+            "DatabaseAdminAuthorizer",
+            &self.matrixone,
+        )
     }
 }
 
@@ -177,10 +178,11 @@ impl DatabaseAdminTokenReader {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(
+            self.pool.as_ref(),
+            "DatabaseAdminTokenReader",
+            &self.matrixone,
+        )
     }
 }
 
@@ -205,10 +207,11 @@ impl DatabaseAdminTokenWriter {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(
+            self.pool.as_ref(),
+            "DatabaseAdminTokenWriter",
+            &self.matrixone,
+        )
     }
 }
 
@@ -231,10 +234,11 @@ impl DatabaseAdminAuditReader {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(
+            self.pool.as_ref(),
+            "DatabaseAdminAuditReader",
+            &self.matrixone,
+        )
     }
 }
 
@@ -257,10 +261,11 @@ impl DatabaseAdminFeedbackStatsReader {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(
+            self.pool.as_ref(),
+            "DatabaseAdminFeedbackStatsReader",
+            &self.matrixone,
+        )
     }
 }
 
@@ -283,10 +288,11 @@ impl DatabaseAdminInitializer {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(
+            self.pool.as_ref(),
+            "DatabaseAdminInitializer",
+            &self.matrixone,
+        )
     }
 }
 
@@ -333,10 +339,11 @@ impl DatabaseAdminUserRoleManager {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+        crate::require_shared_pool(
+            self.pool.as_ref(),
+            "DatabaseAdminUserRoleManager",
+            &self.matrixone,
+        )
     }
 }
 
