@@ -122,19 +122,8 @@ mod tests {
     /// `dirs::home_dir()` resolves there. Ensures tests don't scribble
     /// into the developer's real `~/.astra/`.
     fn with_tmp_home<F: FnOnce(&std::path::Path)>(f: F) {
-        use std::env;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = env::var("HOME").ok();
-        // SAFETY: tests in this module are `#[serial]` so no other
-        // thread is reading/writing HOME concurrently.
-        unsafe {
-            env::set_var("HOME", tmp.path());
-        }
-        f(tmp.path());
-        match prev {
-            Some(v) => unsafe { env::set_var("HOME", v) },
-            None => unsafe { env::remove_var("HOME") },
-        }
+        let home = crate::tests::HomeGuard::temp();
+        f(home.path());
     }
 
     #[test]

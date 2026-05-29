@@ -2692,17 +2692,8 @@ mod tests {
     /// Run a test body with `$HOME` pointed at a fresh tempdir so
     /// real `~/.astra/transcripts/` is left alone.
     fn with_tmp_home<F: FnOnce()>(f: F) {
-        use std::env;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = env::var("HOME").ok();
-        unsafe {
-            env::set_var("HOME", tmp.path());
-        }
+        let _home = crate::tests::HomeGuard::temp();
         f();
-        match prev {
-            Some(v) => unsafe { env::set_var("HOME", v) },
-            None => unsafe { env::remove_var("HOME") },
-        }
     }
 
     #[test]

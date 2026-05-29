@@ -483,52 +483,9 @@ mod tests {
         assert_eq!(p, explicit);
     }
 
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    /// Process-wide mutex that serialises every $HOME-mutating
-    /// test in the crate. Several sibling tests (edge_tools::shell,
-    /// …) read $HOME through `dirs::home_dir()` while our resolver
-    /// tests temporarily point $HOME at a tempdir — without the
-    /// mutex, `cargo test`'s default thread pool lets those races
-    /// flake the unrelated tests. This guard pairs mutex-hold with
-    /// $HOME-save/restore as a single RAII unit.
-    static HOME_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    struct HomeGuard {
-        _lock: MutexGuard<'static, ()>,
-        prev: Option<String>,
-    }
-    impl HomeGuard {
-        fn set(new: &str) -> Self {
-            let lock = HOME_TEST_LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var("HOME").ok();
-            // SAFETY: the mutex above guarantees no other test in
-            // this crate is reading or writing $HOME while we hold
-            // the guard.
-            unsafe { std::env::set_var("HOME", new) };
-            Self { _lock: lock, prev }
-        }
-    }
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            // SAFETY: still holding the lock — same guarantee as
-            // `set`. After Drop releases `_lock`, other tests can
-            // observe the restored $HOME.
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-
     #[test]
     fn resolve_path_expands_tilde() {
-        let _g = HomeGuard::set("/tmp/fake-home");
+        let _g = crate::tests::HomeGuard::set("/tmp/fake-home");
         let p = resolve_dump_path(Some("~/snap.json"), Some("sess"), 0).unwrap();
         assert_eq!(p, PathBuf::from("/tmp/fake-home/snap.json"));
     }
@@ -536,7 +493,7 @@ mod tests {
     #[test]
     fn resolve_path_synthesizes_under_home_dir_by_default() {
         let tmp = tempfile::tempdir().unwrap();
-        let _g = HomeGuard::set(tmp.path().to_str().unwrap());
+        let _g = crate::tests::HomeGuard::set(tmp.path());
         let p = resolve_dump_path(None, Some("abcdef12-full"), 7).unwrap();
         let parent = p.parent().unwrap();
         assert!(parent.ends_with(".astra/context-dumps"));
@@ -613,7 +570,7 @@ mod tests {
 
     #[test]
     fn expand_tilde_only_matches_leading_slash_prefix() {
-        let _g = HomeGuard::set("/tmp/home");
+        let _g = crate::tests::HomeGuard::set("/tmp/home");
         // `~foo` (no slash) isn't a tilde expansion — leave alone.
         assert_eq!(expand_tilde("~foo"), PathBuf::from("~foo"));
         assert_eq!(expand_tilde("~/foo"), PathBuf::from("/tmp/home/foo"));
@@ -638,7 +595,7 @@ mod tests {
     /// mtime granularity (nsec on Linux) this gives ascending
     /// mtimes; the last one written is the "newest". That's
     /// enough to cover the default-latest resolver path.
-    fn seed_sessions_tmp(ids: &[&str]) -> (HomeGuard, tempfile::TempDir) {
+    fn seed_sessions_tmp(ids: &[&str]) -> (crate::tests::HomeGuard, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join(".astra/sessions");
         fs::create_dir_all(&dir).unwrap();
@@ -653,7 +610,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
-        let g = HomeGuard::set(tmp.path().to_str().unwrap());
+        let g = crate::tests::HomeGuard::set(tmp.path());
         (g, tmp)
     }
 

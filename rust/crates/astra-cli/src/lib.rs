@@ -66,6 +66,8 @@ pub(crate) use cli::cloud_sync::post_auth_cloud_resync;
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     pub(crate) struct CredentialsGuard {
@@ -98,6 +100,61 @@ pub(crate) mod tests {
         CredentialsGuard {
             _lock: lock,
             _dir: dir,
+        }
+    }
+
+    pub(crate) struct HomeGuard {
+        _lock: MutexGuard<'static, ()>,
+        prev: Option<OsString>,
+        current: PathBuf,
+        _dir: Option<tempfile::TempDir>,
+    }
+
+    fn home_lock() -> MutexGuard<'static, ()> {
+        static HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        HOME_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    impl HomeGuard {
+        fn set_impl(path: PathBuf, dir: Option<tempfile::TempDir>) -> Self {
+            let lock = home_lock();
+            let prev = std::env::var_os("HOME");
+            unsafe {
+                std::env::set_var("HOME", &path);
+            }
+            Self {
+                _lock: lock,
+                prev,
+                current: path,
+                _dir: dir,
+            }
+        }
+
+        pub(crate) fn temp() -> Self {
+            let dir = tempfile::tempdir().expect("create temp home dir");
+            Self::set_impl(dir.path().to_path_buf(), Some(dir))
+        }
+
+        pub(crate) fn set(path: impl AsRef<Path>) -> Self {
+            Self::set_impl(path.as_ref().to_path_buf(), None)
+        }
+
+        pub(crate) fn path(&self) -> &Path {
+            &self.current
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
         }
     }
 }

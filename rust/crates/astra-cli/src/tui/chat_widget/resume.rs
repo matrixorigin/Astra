@@ -55,22 +55,13 @@ mod tests {
     use crate::tui::turn_event::TurnEvent;
     use ratatui::text::Line;
 
-    /// Run `f` with `$HOME` pointing at a fresh tempdir so the
+    /// Run `f` with `$HOME` pointed at a fresh tempdir so the
     /// append+load test doesn't scribble into the dev's real
-    /// `~/.astra/`. Mirrors `transcript_jsonl::tests::with_tmp_home`
-    /// but we can't re-use that helper (private).
+    /// `~/.astra/`. Uses the crate-wide HOME test guard so these
+    /// path-sensitive tests stay isolated under parallel execution.
     fn with_tmp_home<F: FnOnce()>(f: F) {
-        use std::env;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = env::var("HOME").ok();
-        unsafe {
-            env::set_var("HOME", tmp.path());
-        }
+        let _home = crate::tests::HomeGuard::temp();
         f();
-        match prev {
-            Some(v) => unsafe { env::set_var("HOME", v) },
-            None => unsafe { env::remove_var("HOME") },
-        }
     }
 
     fn render_history(w: &ChatWidget, width: u16) -> String {

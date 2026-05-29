@@ -577,13 +577,7 @@ mod paste_tests {
     #[test]
     #[serial_test::serial]
     fn history_persists_and_reloads() {
-        use std::env;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        // Reroute `dirs::home_dir()` by overriding HOME.
-        let prev = env::var("HOME").ok();
-        unsafe {
-            env::set_var("HOME", tmp.path());
-        }
+        let _home = crate::tests::HomeGuard::temp();
 
         {
             let mut c = ChatComposer::new();
@@ -598,22 +592,12 @@ mod paste_tests {
         assert_eq!(c2.history.len(), 2);
         assert_eq!(c2.history[0], "first command");
         assert_eq!(c2.history[1], "second command\nwith newline");
-
-        match prev {
-            Some(v) => unsafe { env::set_var("HOME", v) },
-            None => unsafe { env::remove_var("HOME") },
-        }
     }
 
     #[test]
     #[serial_test::serial]
     fn duplicate_consecutive_submits_are_deduped() {
-        use std::env;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = env::var("HOME").ok();
-        unsafe {
-            env::set_var("HOME", tmp.path());
-        }
+        let _home = crate::tests::HomeGuard::temp();
 
         let mut c = ChatComposer::new();
         c.set_text("hi");
@@ -621,11 +605,6 @@ mod paste_tests {
         c.set_text("hi");
         let _ = c.clear_and_submit();
         assert_eq!(c.history.len(), 1);
-
-        match prev {
-            Some(v) => unsafe { env::set_var("HOME", v) },
-            None => unsafe { env::remove_var("HOME") },
-        }
     }
 
     #[test]
