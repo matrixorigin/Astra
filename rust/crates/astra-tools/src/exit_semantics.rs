@@ -138,8 +138,12 @@ pub fn classify_command_result(
 }
 
 fn command_family(command: &str) -> Option<String> {
-    let mut tokens = command.split_whitespace().skip_while(|t| is_env_assignment(t));
-    let family = tokens.next().map(|s| s.trim_matches('"').to_ascii_lowercase())?;
+    let mut tokens = command
+        .split_whitespace()
+        .skip_while(|t| is_env_assignment(t));
+    let family = tokens
+        .next()
+        .map(|s| s.trim_matches('"').to_ascii_lowercase())?;
     if matches!(family.as_str(), "python" | "python3" | "uv" | "poetry") {
         let mut peek = tokens.clone();
         if peek.next() == Some("-m")

@@ -9705,24 +9705,9 @@ mod parallel_execution_tests {
             // and sets HarnessPaused. Provide enough turn results for
             // the recovery attempts plus the final exit.
             let mut host = MockHost::new(vec![
-                edge_tool_result(
-                    vec![make_edge_tool("bash", "output")],
-                    100,
-                    20,
-                    Some(50),
-                ),
-                edge_tool_result(
-                    vec![make_edge_tool("bash", "output")],
-                    100,
-                    20,
-                    Some(50),
-                ),
-                edge_tool_result(
-                    vec![make_edge_tool("bash", "output")],
-                    100,
-                    20,
-                    Some(50),
-                ),
+                edge_tool_result(vec![make_edge_tool("bash", "output")], 100, 20, Some(50)),
+                edge_tool_result(vec![make_edge_tool("bash", "output")], 100, 20, Some(50)),
+                edge_tool_result(vec![make_edge_tool("bash", "output")], 100, 20, Some(50)),
             ])
             .with_valid_tools(&["bash"]);
 
