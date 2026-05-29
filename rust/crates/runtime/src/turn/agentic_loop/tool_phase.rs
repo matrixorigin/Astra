@@ -987,6 +987,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 
     let evo_records_before = state.stall.tool_call_records.len();
     {
+        let plan_mode_active = host.plan_mode_active(state);
         let mut term_adapter = HostTerminalAdapter(host);
         let headless_quiet = prep.quiet || state.skill_produced_output;
         let obs_turn_start = state
@@ -1033,6 +1034,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             server_tool_executor: state.server_tool_executor.as_deref(),
             turn_start: obs_turn_start,
             llm_round: obs_llm_round,
+            plan_mode_active,
         })
         .await;
     }

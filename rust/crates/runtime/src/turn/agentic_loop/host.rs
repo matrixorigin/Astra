@@ -193,6 +193,14 @@ pub trait AgenticLoopHost: Send {
         TurnInteractionMode::NonInteractive
     }
 
+    /// Whether the current turn is still in read-only plan authoring mode.
+    ///
+    /// When true, headless tool execution must deny mutating tools before
+    /// they can fall through to edge/server execution resolution.
+    fn plan_mode_active(&self, _state: &AgenticLoopState) -> bool {
+        false
+    }
+
     /// Host-provided turn-start lifecycle summary for prompt/introspection.
     ///
     /// Default is empty; hosts can override to surface mode/run/resume/delegation

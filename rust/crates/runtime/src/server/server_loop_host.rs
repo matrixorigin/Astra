@@ -2379,6 +2379,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         self.render_turn_start_lifecycle_summary(state, plan_hint.as_deref())
     }
 
+    fn plan_mode_active(&self, _state: &AgenticLoopState) -> bool {
+        self.read_plan_resume_hint().is_some()
+    }
+
     fn render_final_text(&mut self, text: &str) {
         if !text.is_empty() {
             self.emit_event(json!({ "type": "text_delta", "content": text }));

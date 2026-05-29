@@ -75,6 +75,8 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     pub turn_start: Option<std::time::Instant>,
     /// Current LLM round index (0-based) within this turn.
     pub llm_round: u32,
+    /// Whether the session is still in read-only plan authoring mode.
+    pub plan_mode_active: bool,
 }
 
 struct HeadlessPreparedRound<'a> {
@@ -200,6 +202,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         server_tool_executor,
         turn_start,
         llm_round,
+        plan_mode_active,
     } = ctx;
     let HeadlessPreparedRound {
         effective_permission_timeout,
@@ -256,12 +259,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             server_tool_executor,
             turn_start,
             llm_round,
-            // Plan mode is wired by run_lifecycle when active_plan_id is
-            // set on the session row. Default false here keeps the
-            // existing test paths unaffected; runtime callers that have
-            // the signal will set it explicitly via a builder helper
-            // before invoking the pipeline.
-            plan_mode_active: false,
+            plan_mode_active,
         },
         consumed_edge,
     );

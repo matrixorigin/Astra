@@ -690,6 +690,7 @@ mod tests {
             server_tool_executor: None,
             turn_start: None,
             llm_round: 0,
+            plan_mode_active: false,
         })
         .await;
 
@@ -706,6 +707,89 @@ mod tests {
         assert_eq!(
             tool_call_records[0].error.as_deref(),
             Some("blocked_tool: Tool 'bash' not in allowed tools list"),
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_mode_blocks_mutating_tools_before_headless_protocol_fallback() {
+        let tool_calls = vec![json!({
+            "id": "call-write-plan",
+            "name": "write_file",
+            "arguments": r#"{"path":"tmp.txt","content":"hello"}"#
+        })];
+
+        let mut messages = Vec::new();
+        let mut tool_results = Vec::new();
+        let valid_tool_names = HashSet::from(["write_file".to_string()]);
+        let mut restricted_tools = HashSet::new();
+        let mut turn_guard = TurnGuard::new();
+        let mut step_recorder = StepRecorder::new("test-session", "plan-mode-write");
+        let mut idempotency_cache = InMemoryIdempotencyCache::new();
+        let mut semantic_dedup = SemanticDedup::new(0.95);
+        let mut tool_call_records = Vec::new();
+        let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
+        let mut term = NoopHeadlessTerminal;
+        let edge_callback_outputs = std::collections::HashMap::new();
+        let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
+
+        run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+            turn_index: 0,
+            quiet: true,
+            api: &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            token: "",
+            current_session_id: None,
+            tool_calls: &tool_calls,
+            edge_tool_round: &edge_tool_round,
+            reasoning_content: "",
+            reasoning_signature: "",
+            edge_callback_outputs: &edge_callback_outputs,
+            messages: &mut messages,
+            tool_results: &mut tool_results,
+            valid_tool_names: &valid_tool_names,
+            restricted_tools: &mut restricted_tools,
+            turn_guard: &mut turn_guard,
+            step_recorder: &mut step_recorder,
+            idempotency_cache: &mut idempotency_cache,
+            semantic_dedup: &mut semantic_dedup,
+            call_counts: &mut std::collections::HashMap::new(),
+            max_identical_calls: 2,
+            max_tools_per_turn: 15,
+            repeated_cache_hit_suppression: 3,
+            max_consecutive_empty_name: 3,
+            tool_call_records: &mut tool_call_records,
+            tool_event_hooks: &tool_event_hooks,
+            term: &mut term,
+            mailbox: None,
+            permission_context: None,
+            progress_emitter: None,
+            pre_resolved_results: &[],
+            server_tool_executor: None,
+            turn_start: None,
+            llm_round: 0,
+            plan_mode_active: true,
+        })
+        .await;
+
+        assert_eq!(tool_results.len(), 1);
+        assert_eq!(tool_call_records.len(), 1);
+        let record_error = tool_call_records[0].error.as_deref().unwrap_or("");
+        assert!(
+            record_error
+                .contains("blocked_tool: tool 'write_file' is blocked while plan mode is active"),
+            "unexpected journal error: {record_error}"
+        );
+        let tool_message = messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .expect("expected a tool result message");
+        let body = tool_message["content"].as_str().unwrap_or("");
+        assert!(
+            body.contains("Permission denied for tool 'write_file'"),
+            "unexpected tool body: {body}"
+        );
+        assert!(
+            !body.contains("headless edge protocol"),
+            "plan mode should short-circuit before protocol fallback: {body}"
         );
     }
 
@@ -772,6 +856,7 @@ mod tests {
             server_tool_executor: None,
             turn_start: None,
             llm_round: 0,
+            plan_mode_active: false,
         })
         .await;
 
@@ -875,6 +960,7 @@ mod tests {
             server_tool_executor: None,
             turn_start: None,
             llm_round: 0,
+            plan_mode_active: false,
         })
         .await;
 
@@ -998,6 +1084,7 @@ mod tests {
             server_tool_executor: None,
             turn_start: None,
             llm_round: 0,
+            plan_mode_active: false,
         })
         .await;
 
@@ -1110,6 +1197,7 @@ mod tests {
             server_tool_executor: None,
             turn_start: None,
             llm_round: 0,
+            plan_mode_active: false,
         })
         .await;
 
@@ -1207,6 +1295,7 @@ mod tests {
             server_tool_executor: None,
             turn_start: None,
             llm_round: 0,
+            plan_mode_active: false,
         })
         .await;
 
@@ -1332,6 +1421,7 @@ mod tests {
             server_tool_executor: None,
             turn_start: None,
             llm_round: 0,
+            plan_mode_active: false,
         })
         .await;
 
@@ -1461,6 +1551,7 @@ mod tests {
             server_tool_executor: None,
             turn_start: None,
             llm_round: 0,
+            plan_mode_active: false,
         })
         .await;
 
@@ -1543,6 +1634,7 @@ mod tests {
             server_tool_executor: None,
             turn_start: None,
             llm_round: 0,
+            plan_mode_active: false,
         })
         .await;
 

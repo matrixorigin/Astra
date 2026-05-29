@@ -790,6 +790,13 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         self.turn_interaction_mode_inherent()
     }
 
+    fn plan_mode_active(
+        &self,
+        _state: &astra_runtime::turn::agentic_loop::host::AgenticLoopState,
+    ) -> bool {
+        self.perm_manager.mode() == crate::cli::permission_manager::PermissionMode::Plan
+    }
+
     fn valid_tool_names(&self) -> &HashSet<String> {
         &self.valid_tool_names
     }
