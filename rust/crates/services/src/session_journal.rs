@@ -100,6 +100,18 @@ fn stabilize_event_order(events: &mut [JournalEvent]) {
 }
 
 fn journal_needs_session_start_for_path(path: &Path) -> std::io::Result<bool> {
+    journal_needs_session_start_impl(path, /*skip_cache=*/ false)
+}
+
+/// Core implementation shared by cached and uncached callers.
+///
+/// When `skip_cache` is true, the process-local `SESSION_START_STATE_CACHE` is
+/// not consulted for early return.  This is required when the caller already
+/// holds the file lock: between two lock acquisitions in the same process,
+/// another process (e.g. edge-cloud sync) may have written to the file and
+/// updated *its* cache — but our process-local cache still holds the old value.
+/// See `ensure_session_start_event` for the lock-protected call site.
+fn journal_needs_session_start_impl(path: &Path, skip_cache: bool) -> std::io::Result<bool> {
     let is_missing_or_empty = match std::fs::metadata(path) {
         Ok(metadata) => metadata.len() == 0,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
@@ -109,8 +121,10 @@ fn journal_needs_session_start_for_path(path: &Path) -> std::io::Result<bool> {
         set_cached_session_start_state(path, false);
         return Ok(true);
     }
-    if let Some(has_open_session_start) = cached_session_start_state(path) {
-        return Ok(!has_open_session_start);
+    if !skip_cache {
+        if let Some(has_open_session_start) = cached_session_start_state(path) {
+            return Ok(!has_open_session_start);
+        }
     }
     let content = std::fs::read_to_string(path)?;
     let mut events = parse_journal_text(&content).0;
@@ -1590,7 +1604,10 @@ pub fn ensure_session_start_event(session_id: &str, model: Option<&str>) -> std:
     // since the last cache write; we must not return early based on a
     // stale cache entry without holding the lock.
     let mut file = open_locked_journal_file(&path)?;
-    if journal_needs_session_start_for_path(&path)? {
+    // Under lock, bypass the process-local cache to avoid TOCTOU:
+    // another process may have written SessionEnd between our last
+    // cache update and this lock acquisition.
+    if journal_needs_session_start_impl(&path, /*skip_cache=*/ true)? {
         use std::io::Write;
         let events = vec![JournalEvent::session_start(Some(session_id), model)];
         let buf = serialize_journal_events(&events)?;
@@ -7670,6 +7687,16 @@ mod turn_event_buffer_tests {
             .count();
         assert_eq!(session_start_count, 1);
         assert_eq!(interruption_count, 8);
+        assert_eq!(events.len(), 9, "exactly 1 SessionStart + 8 InterruptionRecorded");
+        // SessionStart must be chronologically first (read_journal returns sorted).
+        assert_eq!(events[0].event_type, JournalEventType::SessionStart);
+        // All 8 interruption events must be present with distinct turns 1..=8.
+        let mut turns: Vec<u32> = events[1..]
+            .iter()
+            .map(|e| e.turn.unwrap())
+            .collect();
+        turns.sort();
+        assert_eq!(turns, (1..=8u32).collect::<Vec<_>>());
     }
 
     #[test]
@@ -7691,6 +7718,65 @@ mod turn_event_buffer_tests {
         assert_eq!(events[0].event_type, JournalEventType::SessionStart);
         assert_eq!(events[1].event_type, JournalEventType::TraceSpan);
         assert_eq!(events[2].event_type, JournalEventType::ConfigChange);
+    }
+}
+
+#[cfg(test)]
+mod session_start_detection_tests {
+    use super::*;
+
+    #[test]
+    fn journal_needs_session_start_when_file_does_not_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let path = journal_dir().join("nonexistent-session.jsonl");
+        assert!(journal_needs_session_start_for_path(&path).unwrap());
+    }
+
+    #[test]
+    fn journal_needs_session_start_when_file_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let path = journal_dir().join("empty-session.jsonl");
+        std::fs::write(&path, "").unwrap();
+        assert!(journal_needs_session_start_for_path(&path).unwrap());
+    }
+
+    #[test]
+    fn journal_does_not_need_session_start_when_open_session_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "open-session";
+        let path = journal_dir().join(format!("{sid}.jsonl"));
+
+        let writer = JournalWriter::new(sid).unwrap();
+        writer
+            .append(&JournalEvent::interruption_recorded(
+                Some(sid),
+                1,
+                serde_json::json!({"kind": "test"}),
+            ))
+            .unwrap();
+
+        assert!(!journal_needs_session_start_for_path(&path).unwrap());
+    }
+
+    #[test]
+    fn journal_needs_session_start_when_last_event_is_session_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "ended-session";
+        let path = journal_dir().join(format!("{sid}.jsonl"));
+
+        let writer = JournalWriter::new(sid).unwrap();
+        writer
+            .append(&JournalEvent::base_public(
+                JournalEventType::SessionEnd,
+                Some(sid),
+            ))
+            .unwrap();
+
+        assert!(journal_needs_session_start_for_path(&path).unwrap());
     }
 }
 
